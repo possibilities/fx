@@ -62,7 +62,7 @@ pub const ExternalInteractiveSignalGuard = struct {
         const action: std.posix.Sigaction = .{
             .handler = .{ .handler = externalInteractiveSignalHandler },
             .mask = std.posix.sigemptyset(),
-            .flags = 0,
+            .flags = std.posix.SA.RESTART,
         };
         var guard: ExternalInteractiveSignalGuard = .{};
         var old_sigint: std.posix.Sigaction = undefined;
@@ -636,6 +636,16 @@ fn suspendTerminalForJobControl(
     metrics: *Metrics,
 ) void {
     leaveAlternateScreens(terminal, shell, metrics);
+    suspendForExternalInteractive(terminal, shell, metrics);
+}
+
+/// Restore cooked terminal state before inherited stdio belongs to a child.
+/// The caller must first ensure that no alternate screen remains owned.
+pub fn suspendForExternalInteractive(
+    terminal: *TerminalState,
+    shell: *TranscriptRuntime,
+    metrics: *Metrics,
+) void {
     _ = writeLifecycleTerminalBytes(shell, metrics, normalExitRestoreSequence(io_mod.getenv("TMUX"))) catch {};
     finishLeavingInteractiveMode(terminal, shell, metrics);
 }
@@ -687,6 +697,32 @@ fn resumeTerminalAfterJobControl(
     try enableInteractiveTerminalModes(shell, metrics);
     try shell.requestTerminalReset(metrics);
     shell.render_requests.request(.first_frame);
+}
+
+/// Re-arm interactive terminal state after a child handoff, then request a
+/// full repaint while still reporting the first restore failure.
+pub fn resumeAfterExternalInteractive(
+    terminal: *TerminalState,
+    shell: *TranscriptRuntime,
+    metrics: *Metrics,
+    footer_rows: u16,
+) !void {
+    var first_error: ?anyerror = null;
+    shell.layout = terminal.queryLayout(footer_rows) catch shell.layout;
+    terminal.captureOriginalTermios() catch |err| {
+        first_error = err;
+    };
+    terminal.enableRawMode() catch |err| {
+        if (first_error == null) first_error = err;
+    };
+    enableInteractiveTerminalModes(shell, metrics) catch |err| {
+        if (first_error == null) first_error = err;
+    };
+    shell.requestTerminalReset(metrics) catch |err| {
+        if (first_error == null) first_error = err;
+    };
+    shell.render_requests.request(.first_frame);
+    if (first_error) |err| return err;
 }
 
 fn enableInteractiveTerminalModes(shell: *TranscriptRuntime, metrics: *Metrics) !void {
@@ -1884,6 +1920,17 @@ test "terminal keyboard stack restore stays paired with enable policy" {
     try std.testing.expect(std.mem.find(u8, tmux_abnormal_exit_restore, "\x1b[<u") == null);
     try std.testing.expect(std.mem.find(u8, tmux_restore, "\x1b[?2004l") != null);
     try std.testing.expect(std.mem.find(u8, tmux_restore, "\x1b[>4;0m") != null);
+}
+
+test "external interactive signal guard restarts interrupted syscalls" {
+    if (!shell_runtime.supports_resize_signal) return error.SkipZigTest;
+
+    const guard = ExternalInteractiveSignalGuard.install();
+    defer guard.deinit();
+
+    var action: std.posix.Sigaction = undefined;
+    std.posix.sigaction(std.posix.SIG.INT, null, &action);
+    try std.testing.expect(action.flags & std.posix.SA.RESTART != 0);
 }
 
 test "launch scrollback push creates top-of-viewport space" {
