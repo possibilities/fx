@@ -112,11 +112,16 @@ pub const GatewayObservation = struct {
         team: ?[]const u8,
     ) !void {
         const ledger = self.usage orelse return;
-        const generation_id = completion.generation_id;
+        const generation_id = if (completion.gateway_generation_expected)
+            completion.generation_id
+        else
+            null;
         const delivery: DeliveryOutcome = if (completion.delivery_ambiguous)
             .ambiguous_delivery
         else if (status == .ok)
-            if (!completion.generation_metadata_invalid and generation_id != null)
+            if (!completion.gateway_generation_expected)
+                .unbilled
+            else if (!completion.generation_metadata_invalid and generation_id != null)
                 .observed_generation
             else
                 .possibly_billed_without_identity
@@ -492,7 +497,12 @@ pub const Usage = struct {
             origin,
             team,
         ) catch |err| {
-            self.markBillingIncomplete();
+            const settled = self.finishInvocationWithResult(
+                sequence,
+                duration_ms,
+                .possibly_billed_without_identity,
+            );
+            if (!settled) self.markBillingIncomplete();
             _ = self.persistCheckpointBestEffortLocked();
             debug_trace.logf(
                 "session",
@@ -546,9 +556,18 @@ pub const Usage = struct {
         duration_ms: u64,
         outcome: DeliveryOutcome,
     ) void {
+        _ = self.finishInvocationWithResult(sequence, duration_ms, outcome);
+    }
+
+    fn finishInvocationWithResult(
+        self: *Usage,
+        sequence: u64,
+        duration_ms: u64,
+        outcome: DeliveryOutcome,
+    ) bool {
         self.mutex.lockUncancelable(io_mod.getIo());
         defer self.mutex.unlock(io_mod.getIo());
-        _ = self.finishInvocationUnlocked(sequence, duration_ms, outcome);
+        return self.finishInvocationUnlocked(sequence, duration_ms, outcome);
     }
 
     pub fn finishObservedInvocation(
@@ -3751,6 +3770,29 @@ test "successful response without generation identity marks billing incomplete" 
     try std.testing.expectEqual(@as(usize, 0), snapshot.pending.len);
 }
 
+test "successful response without Gateway generation tracking settles unbilled" {
+    const alloc = std.testing.allocator;
+    var usage = Usage.initFresh();
+    defer usage.deinit(alloc);
+
+    const observation = try GatewayObservation.begin(&usage);
+    try observation.complete(
+        alloc,
+        .ok,
+        .{ .gateway_generation_expected = false },
+        "https://chatgpt.com/backend-api/codex",
+        null,
+    );
+
+    var snapshot = try usage.snapshot(alloc);
+    defer snapshot.deinit(alloc);
+    try std.testing.expectEqual(Availability.complete, snapshot.billing);
+    try std.testing.expect(snapshot.api_duration_complete);
+    try std.testing.expectEqual(@as(u64, 1), snapshot.settled_through_sequence);
+    try std.testing.expectEqual(@as(usize, 0), snapshot.pending.len);
+    try std.testing.expectEqual(@as(usize, 0), snapshot.incidents.len);
+}
+
 const TestGenerationUsageProvider = struct {
     outcome: enum {
         found,
@@ -4661,6 +4703,38 @@ test "gateway observation checkpoints active and terminal usage states" {
     try std.testing.expectEqual(Availability.pending, capture.billing[1]);
     try std.testing.expect(capture.api_duration_complete[1]);
     try std.testing.expectEqual(@as(usize, 1), capture.pending_count[1]);
+}
+
+test "invalid generation metadata does not exhaust gateway observations" {
+    const alloc = std.testing.allocator;
+    var usage = Usage.initFresh();
+    defer usage.deinit(alloc);
+
+    for (0..max_active_invocations + 1) |index| {
+        const observation = try GatewayObservation.begin(&usage);
+        try observation.complete(
+            alloc,
+            .ok,
+            .{ .generation_id = "resp_not-a-gateway-generation" },
+            "https://chatgpt.com/backend-api/codex",
+            null,
+        );
+        if (index == 0) {
+            var first = try usage.snapshot(alloc);
+            defer first.deinit(alloc);
+            try std.testing.expectEqual(@as(usize, 1), first.incidents.len);
+        }
+    }
+
+    var snapshot = try usage.snapshot(alloc);
+    defer snapshot.deinit(alloc);
+    try std.testing.expectEqual(Availability.incomplete, snapshot.billing);
+    try std.testing.expect(snapshot.api_duration_complete);
+    try std.testing.expectEqual(
+        @as(u64, max_active_invocations + 1),
+        snapshot.settled_through_sequence,
+    );
+    try std.testing.expectEqual(@as(usize, 0), snapshot.pending.len);
 }
 
 test "gateway observation does not proceed when active checkpoint fails" {

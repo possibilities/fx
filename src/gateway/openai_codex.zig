@@ -497,8 +497,6 @@ fn consumeSse(
     defer sse.deinit(alloc);
     var finish_reason: ?types.ProviderFinishReason = null;
     var usage: types.Usage = .{};
-    var generation_id: ?[]u8 = null;
-    errdefer if (generation_id) |id| alloc.free(id);
     var terminal_seen = false;
     var saw_content_delta = false;
 
@@ -600,9 +598,6 @@ fn consumeSse(
             const status = stringField(response_value.object, "status");
             finish_reason = finishReason(status, response_value.object, tools.items.len > 0);
             usage = parseUsage(response_value.object);
-            if (stringField(response_value.object, "id")) |id| {
-                generation_id = try alloc.dupe(u8, id);
-            }
             break;
         } else if (std.mem.eql(u8, event_type, "response.failed") or
             std.mem.eql(u8, event_type, "error"))
@@ -650,7 +645,7 @@ fn consumeSse(
     return .{
         .content = owned_content,
         .tool_calls = owned_tools,
-        .generation_id = generation_id,
+        .gateway_generation_expected = false,
         .provider_state_json = owned_provider_state,
         .finish_reason = finish_reason orelse if (owned_tools.len > 0) .tool_calls else .stop,
         .usage = usage,
@@ -843,7 +838,7 @@ test "OpenAI Codex SSE maps text reasoning tools and usage" {
         "data: {\"type\":\"response.output_text.delta\",\"output_index\":1,\"delta\":\"hello\"}\n\n" ++
         "data: {\"type\":\"response.output_item.added\",\"output_index\":2,\"item\":{\"type\":\"function_call\",\"call_id\":\"call_1\",\"name\":\"read_file\"}}\n\n" ++
         "data: {\"type\":\"response.function_call_arguments.delta\",\"output_index\":2,\"delta\":\"{\\\"path\\\":\\\"README.md\\\"}\"}\n\n" ++
-        "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"usage\":{\"input_tokens\":10,\"output_tokens\":4}}}\n\n";
+        "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_123\",\"status\":\"completed\",\"usage\":{\"input_tokens\":10,\"output_tokens\":4}}}\n\n";
     var reader: std.Io.Reader = .fixed(sse_text);
     var cancelled = std.atomic.Value(bool).init(false);
     const Capture = struct {
@@ -890,6 +885,8 @@ test "OpenAI Codex SSE maps text reasoning tools and usage" {
     try std.testing.expectEqualStrings("call_1", completion.tool_calls[0].id);
     try std.testing.expectEqualStrings("{\"path\":\"README.md\"}", completion.tool_calls[0].arguments_json);
     try std.testing.expectEqual(@as(?u64, 10), completion.usage.input_tokens);
+    try std.testing.expect(!completion.gateway_generation_expected);
+    try std.testing.expectEqual(@as(?[]const u8, null), completion.generation_id);
     try std.testing.expect(completion.provider_state_json != null);
     try std.testing.expect(std.mem.find(u8, completion.provider_state_json.?, "\"encrypted_content\":\"opaque\"") != null);
     try std.testing.expectEqual(types.ProviderFinishReason.tool_calls, completion.finish_reason.?);

@@ -955,6 +955,8 @@ pub const ProviderFinishReason = enum {
 pub const GatewayCompletion = struct {
     content: ?[]const u8 = null,
     tool_calls: []const ToolCall = &.{},
+    /// Whether successful delivery should produce a Gateway generation.
+    gateway_generation_expected: bool = true,
     generation_id: ?[]const u8 = null,
     billing: ?GatewayBilling = null,
     /// Gateway generation or resolved-model metadata was malformed or conflicting.

@@ -139,6 +139,7 @@ pub fn streamGatewayCompletion(
     const status = result.status;
     const finish_reason = result.completion.finish_reason;
     const completion_usage = result.completion.usage;
+    const gateway_generation_expected = result.completion.gateway_generation_expected;
     const delivery_ambiguous = result.completion.delivery_ambiguous;
     const generation_metadata_invalid = result.completion.generation_metadata_invalid;
     const provider_result_identity_failure = result.completion.provider_result_identity_failure;
@@ -148,6 +149,7 @@ pub fn streamGatewayCompletion(
         .completion = .{
             .content = content,
             .tool_calls = tool_calls,
+            .gateway_generation_expected = gateway_generation_expected,
             .generation_id = generation_id,
             .generation_metadata_invalid = generation_metadata_invalid,
             .delivery_ambiguous = delivery_ambiguous,
