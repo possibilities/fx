@@ -1,5 +1,6 @@
 import { afterEach, expect, test } from "bun:test";
 import {
+  chmodSync,
   existsSync,
   mkdirSync,
   mkdtempSync,
@@ -29,6 +30,13 @@ const PASTE_START = ["1b", "5b", "32", "30", "30", "7e"] as const;
 const PASTE_END = ["1b", "5b", "32", "30", "31", "7e"] as const;
 const MANAGED_REVIEW_BODY = "GROUP_C_MANAGED_REVIEW_BODY";
 const WORKSPACE_REVIEW_BODY = "GROUP_C_WORKSPACE_REVIEW_BODY";
+const EXTERNAL_EDITOR_SCRIPT = `#!/bin/sh
+set -eu
+next_path="$1.next"
+printf 'externally edited: ' > "$next_path"
+cat "$1" >> "$next_path"
+mv "$next_path" "$1"
+`;
 
 let session: TmuxSession | null = null;
 let root: string | null = null;
@@ -52,6 +60,7 @@ async function startFx(
   responseCount = 1,
   duplicateReview = false,
   traceScopes?: string,
+  editorScript?: string,
 ): Promise<TmuxSession> {
   root = realpathSync(mkdtempSync(join(tmpdir(), "fx-edit-contracts-")));
   const home = join(root, "home");
@@ -66,6 +75,11 @@ async function startFx(
   writeFileSync(stderrPath, "");
   const tracePath = traceScopes ? join(root, "trace.log") : undefined;
   if (tracePath) writeFileSync(tracePath, "");
+  const editorPath = editorScript ? join(root, "editor.sh") : undefined;
+  if (editorPath) {
+    writeFileSync(editorPath, editorScript);
+    chmodSync(editorPath, 0o700);
+  }
   fixtureImagePath = join(workspace, "i.png");
   writeFileSync(
     fixtureImagePath,
@@ -121,6 +135,7 @@ async function startFx(
       FX_AUTO_UPGRADE: "0",
       FX_TRACE_LOG: tracePath,
       FX_TRACE_SCOPES: traceScopes,
+      ...(editorPath ? { VISUAL: undefined, EDITOR: editorPath } : {}),
     },
     width: 112,
     height: 32,
@@ -254,6 +269,31 @@ async function selectReviewSkill(
   if (selectWorkspace) await active.sendKeys("Down");
   await active.sendKeys("Enter");
 }
+
+tmuxTest(
+  "Ctrl+T round trips a plain-text draft through EDITOR",
+  async () => {
+    const active = await startFx(
+      true,
+      1,
+      false,
+      undefined,
+      EXTERNAL_EDITOR_SCRIPT,
+    );
+    const seed = "original editor draft";
+    const edited = `externally edited: ${seed}`;
+
+    await active.sendLiteralText(seed);
+    await active.sendHexBytes(["14"]);
+    await active.waitForText(edited, TIMEOUT);
+    await active.sendKeys("Enter");
+    await waitForGatewayRequest();
+
+    expect(finalUserText()).toBe(edited);
+    expectCleanRuntime(active);
+  },
+  TIMEOUT,
+);
 
 tmuxTest(
   "composer shortcuts pressed immediately after Escape preserve input order",
