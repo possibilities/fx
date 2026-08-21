@@ -75,6 +75,7 @@ pub const ExternalInteractiveSignalGuard = struct {
     }
 
     pub fn deinit(self: ExternalInteractiveSignalGuard) void {
+        if (!shell_runtime.supports_resize_signal) return;
         if (self.old_sigquit_action) |old| {
             std.posix.sigaction(std.posix.SIG.QUIT, &old, null);
         }
