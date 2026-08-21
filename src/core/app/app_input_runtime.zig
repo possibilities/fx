@@ -1156,19 +1156,16 @@ pub fn Runtime(comptime App: type) type {
 
         fn routeExternalEditorShortcut(app: *App, byte: u8, max_input_len: usize) !bool {
             if (byte != ctrl_t_external_editor_byte) return false;
-            if (comptime @hasField(App, "stream")) {
-                if (app.stream.active) {
+            if (comptime @hasField(App, "terminal")) {
+                if (app.terminal.alternate_screen_owner != .none) {
                     try app.writeDomainNotice(.{
                         .topic = "editor",
                         .tone = .warning,
-                        .body = "external editing is unavailable until the response finishes",
+                        .body = "external editing is unavailable while another screen owns the terminal",
                     }, true);
                     app.shell.render_requests.request(.footer);
                     return true;
                 }
-            }
-            if (comptime @hasField(App, "terminal")) {
-                if (app.terminal.alternate_screen_owner != .none) return true;
             }
             dismissActiveMenusThenRedraw(app);
             if (comptime @hasDecl(App, "editComposerWithExternalEditor")) {
@@ -7291,29 +7288,27 @@ test "app_input_runtime ctrl+t invokes external editor without composer mutation
     try std.testing.expectEqual(@as(usize, 0), app.submitted_prompt_count);
 }
 
-test "app_input_runtime ctrl+t is denied while stream or alternate screen owns state" {
+test "app_input_runtime ctrl+t remains available while a response streams" {
     const alloc = std.testing.allocator;
+    var app = try RoutingFakeApp.init(alloc);
+    defer app.deinit();
+    app.stream.active = true;
 
-    {
-        var app = try RoutingFakeApp.init(alloc);
-        defer app.deinit();
-        app.stream.active = true;
+    try Runtime(RoutingFakeApp).handleByte(&app, ctrl_t_external_editor_byte, 4096, 100);
 
-        try Runtime(RoutingFakeApp).handleByte(&app, ctrl_t_external_editor_byte, 4096, 100);
+    try std.testing.expectEqual(@as(usize, 1), app.external_editor_count);
+}
 
-        try std.testing.expectEqual(@as(usize, 0), app.external_editor_count);
-        try std.testing.expect(std.mem.find(u8, app.notice_body.items, "response finishes") != null);
-    }
+test "app_input_runtime ctrl+t is denied while an alternate screen owns the terminal" {
+    const alloc = std.testing.allocator;
+    var app = try RoutingFakeApp.init(alloc);
+    defer app.deinit();
+    app.terminal.alternate_screen_owner = .catalog_menu;
 
-    {
-        var app = try RoutingFakeApp.init(alloc);
-        defer app.deinit();
-        app.terminal.alternate_screen_owner = .catalog_menu;
+    try Runtime(RoutingFakeApp).handleByte(&app, ctrl_t_external_editor_byte, 4096, 100);
 
-        try Runtime(RoutingFakeApp).handleByte(&app, ctrl_t_external_editor_byte, 4096, 100);
-
-        try std.testing.expectEqual(@as(usize, 0), app.external_editor_count);
-    }
+    try std.testing.expectEqual(@as(usize, 0), app.external_editor_count);
+    try std.testing.expect(std.mem.find(u8, app.notice_body.items, "another screen") != null);
 }
 
 test "app_input_runtime immediate ctrl+t follows bare Escape" {
