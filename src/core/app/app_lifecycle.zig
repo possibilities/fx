@@ -48,6 +48,42 @@ const terminal_takeover_reset = "\x1b[?2026l\x1b[?1000l\x1b[?1002l\x1b[?1004l\x1
 var old_sigterm_action: ?std.posix.Sigaction = null;
 var old_sighup_action: ?std.posix.Sigaction = null;
 
+fn externalInteractiveSignalHandler(_: std.posix.SIG) callconv(.c) void {}
+
+/// Keeps terminal-generated interrupts from terminating fx while inherited
+/// stdio belongs to a child. Caught handlers reset to default across exec, so
+/// the editor still receives its normal SIGINT and SIGQUIT behavior.
+pub const ExternalInteractiveSignalGuard = struct {
+    old_sigint_action: ?std.posix.Sigaction = null,
+    old_sigquit_action: ?std.posix.Sigaction = null,
+
+    pub fn install() ExternalInteractiveSignalGuard {
+        if (!shell_runtime.supports_resize_signal) return .{};
+        const action: std.posix.Sigaction = .{
+            .handler = .{ .handler = externalInteractiveSignalHandler },
+            .mask = std.posix.sigemptyset(),
+            .flags = 0,
+        };
+        var guard: ExternalInteractiveSignalGuard = .{};
+        var old_sigint: std.posix.Sigaction = undefined;
+        std.posix.sigaction(std.posix.SIG.INT, &action, &old_sigint);
+        guard.old_sigint_action = old_sigint;
+        var old_sigquit: std.posix.Sigaction = undefined;
+        std.posix.sigaction(std.posix.SIG.QUIT, &action, &old_sigquit);
+        guard.old_sigquit_action = old_sigquit;
+        return guard;
+    }
+
+    pub fn deinit(self: ExternalInteractiveSignalGuard) void {
+        if (self.old_sigquit_action) |old| {
+            std.posix.sigaction(std.posix.SIG.QUIT, &old, null);
+        }
+        if (self.old_sigint_action) |old| {
+            std.posix.sigaction(std.posix.SIG.INT, &old, null);
+        }
+    }
+};
+
 /// Restores terminal state, installs the default disposition, and re-raises.
 /// Must remain async-signal-safe: only `write(2)`, `sigaction(2)`, and `raise(3)`.
 fn abnormalExitHandlerWithRestore(comptime restore: []const u8, sig: std.posix.SIG) void {
