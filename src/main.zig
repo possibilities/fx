@@ -916,10 +916,19 @@ const App = struct {
 
         const signal_guard = app_lifecycle.ExternalInteractiveSignalGuard.install();
         defer signal_guard.deinit();
-        self.terminal.disableRawMode();
+        app_lifecycle.suspendForExternalInteractive(
+            &self.terminal,
+            &self.shell,
+            &self.metrics,
+        );
         var terminal_restored = false;
         defer if (!terminal_restored) {
-            self.restoreAfterExternalInteractive() catch |err| {
+            app_lifecycle.resumeAfterExternalInteractive(
+                &self.terminal,
+                &self.shell,
+                &self.metrics,
+                footer_rows,
+            ) catch |err| {
                 debug_trace.logf(
                     "input",
                     "external editor terminal restore failed err={s}",
@@ -928,32 +937,16 @@ const App = struct {
             };
         };
 
-        const io = io_mod.getIo();
-        try std.Io.File.stdout().writeStreamingAll(io, "\n");
         var result = try editor.edit(self.alloc, seed, max_bytes);
         errdefer result.deinit(self.alloc);
-        try self.restoreAfterExternalInteractive();
+        try app_lifecycle.resumeAfterExternalInteractive(
+            &self.terminal,
+            &self.shell,
+            &self.metrics,
+            footer_rows,
+        );
         terminal_restored = true;
         return result;
-    }
-
-    fn restoreAfterExternalInteractive(self: *App) !void {
-        var first_error: ?anyerror = null;
-        std.Io.File.stdout().writeStreamingAll(io_mod.getIo(), "\n") catch |err| {
-            first_error = err;
-        };
-        self.terminal.captureOriginalTermios() catch |err| {
-            if (first_error == null) first_error = err;
-        };
-        self.terminal.enableRawMode() catch |err| {
-            if (first_error == null) first_error = err;
-        };
-        self.shell.layout = self.terminal.queryLayout(footer_rows) catch self.shell.layout;
-        self.shell.requestTerminalReset(&self.metrics) catch |err| {
-            if (first_error == null) first_error = err;
-        };
-        self.shell.render_requests.request(.first_frame);
-        if (first_error) |err| return err;
     }
 
     pub fn flushBeforeBlockingExternalWork(self: *App) !void {
