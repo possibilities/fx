@@ -130,7 +130,6 @@ Supported user-facing `FX_` environment variables:
 | Name | Accepted values | Override or effect |
 | --- | --- | --- |
 | `FX_MODEL` | Non-empty model ID | Overrides the configured model for the current process without saving it. |
-| `FX_EFFORT` | `default`, `auto`, `adaptive`, or a case-sensitive effort name | Overrides the configured effort for the current process without saving it. The three aliases actively select the default effort instead of falling back to the saved setting. |
 | `FX_PERMISSION_MODE` | `ask`, `auto`, or `yolo` | Overrides `permission_mode` for the current process. |
 | `FX_MAX_AGENT_STEPS` | Non-negative integer; `0` is unbounded | Overrides `max_agent_steps` for the current process. |
 | `FX_SOUND` | `0`, `false`, or `off`; `max`; any other non-empty value enables ordinary sounds | Overrides saved notification sound settings for the current process. |
