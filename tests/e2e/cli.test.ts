@@ -867,7 +867,9 @@ describe("cli: status", () => {
           timeoutMs: TIMEOUT,
         });
         expect(doctor.code).toBe(0);
-        const startup = JSON.parse(doctor.stdout.trim()).checks.find(
+        const doctorJson = JSON.parse(doctor.stdout.trim());
+        expect(doctorJson.effort).toBe("high");
+        const startup = doctorJson.checks.find(
           (check: { name: string }) => check.name === "startup",
         );
         expect(startup.detail).toContain("agent_step_limit=3");
