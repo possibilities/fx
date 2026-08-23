@@ -163,7 +163,15 @@ describe.skipIf(!tmuxAvailable())("ADE event feed", () => {
       mkdirSync(workspace);
       writeFileSync(
         join(home, ".fx", "settings.json"),
-        JSON.stringify({ sandbox: "none", permission_mode: "auto", permission: {} }),
+        JSON.stringify({
+          sandbox: "none",
+          permission_mode: "auto",
+          permission: {},
+          session_naming: {
+            gateway: { model: FAKE_GATEWAY_MODEL, effort: "low" },
+            timeout_ms: 10_000,
+          },
+        }),
       );
       writeFileSync(stderrPath, "");
 
@@ -173,6 +181,9 @@ describe.skipIf(!tmuxAvailable())("ADE event feed", () => {
       const childPrompt = "ADE_CHILD_PROMPT: run a terminal command";
       const childFinished = Promise.withResolvers<void>();
       gateway = startDynamicFakeGateway(async (body) => {
+        if (body.includes("Generate a short session title")) {
+          return fakeGatewayFinalText("ADE native session title");
+        }
         const latest = latestPrompt(body);
         if (latest.includes('"toolCallId":"ade_question_1"')) {
           return fakeGatewayFinalText("ADE_QUESTION_DONE");
@@ -243,6 +254,19 @@ describe.skipIf(!tmuxAvailable())("ADE event feed", () => {
       await receiver.waitFor((record) => record.event === "FxStarted");
 
       await session.sendText("ADE_QUESTION_REQUEST");
+      const nativeMetadata = await receiver.waitFor(
+        (record) =>
+          record.event === "SessionMetadataChanged" &&
+          record.context.agent_role === "main" &&
+          record.payload.title === "ADE native session title",
+      );
+      const metadataSessionId = nativeMetadata.context.session_id;
+      expect(metadataSessionId).not.toBeNull();
+      const display = JSON.parse(readFileSync(
+        join(home, ".fx", "sessions", metadataSessionId!, "display.json"),
+        "utf8",
+      )) as { title?: unknown };
+      expect(display.title).toBe("ADE native session title");
       await session.waitForText("Which ADE event path should continue?", TIMEOUT);
       await receiver.waitFor(
         (record) =>
@@ -299,6 +323,7 @@ describe.skipIf(!tmuxAvailable())("ADE event feed", () => {
           record.context.agent_role === "main",
       )?.context.session_id;
       expect(originalMainSession).not.toBeNull();
+      expect(metadataSessionId).toBe(originalMainSession);
       await session.sendText("/new");
       const newSession = await receiver.waitFor(
         (record) =>
