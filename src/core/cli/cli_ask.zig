@@ -244,6 +244,7 @@ pub const Config = struct {
     load_mcp_runtime: mcp_runtime.LoadRuntimeFn,
     context_limit_overrides: []const config_runtime.context_limits.Override = &.{},
     additional_directories: []const []const u8 = &.{},
+    invocation_skill_roots: []const []const u8 = &.{},
     saved_directories_suppressed: bool = false,
 };
 
@@ -385,6 +386,7 @@ const InitializeSessionStoresFn = *const fn (*AskContext) anyerror!void;
 const LoadSkillsFn = *const fn (
     Allocator,
     []const u8,
+    []const []const u8,
     skill_contract.RootPolicy,
 ) app_runtime_setup.LoadSkillsError!app_runtime_setup.LoadedSkills;
 const ProcessQueuedPromptFn = *const fn (*const agent_runtime.AgentRuntimeDeps, ?agent_runtime.SemanticPresentationSink, agent_runtime.LifecycleContext, agent_runtime.Config, worker_runtime.QueuedPrompt) anyerror!void;
@@ -989,6 +991,7 @@ const AskContext = struct {
             .session = &self.session,
             .session_allocator = self.alloc,
             .skills_dir = self.skills_dir,
+            .invocation_skill_roots = self.cfg.invocation_skill_roots,
             .context_limits = self.context_limits,
             .context_enabled = self.context_enabled,
             .context_registry = self.deps.context_registry,
@@ -1609,6 +1612,7 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
     var loaded_skills = try options.deps.load_skills(
         alloc,
         startup.workspace_root,
+        cfg.invocation_skill_roots,
         cfg.skill_root_policy,
     );
     defer loaded_skills.deinit(alloc);
@@ -4210,6 +4214,7 @@ fn testFailSessionStores(_: *AskContext) !void {
 fn testLoadNoSkills(
     _: Allocator,
     _: []const u8,
+    _: []const []const u8,
     _: skill_contract.RootPolicy,
 ) app_runtime_setup.LoadSkillsError!app_runtime_setup.LoadedSkills {
     return .{};
@@ -4218,6 +4223,7 @@ fn testLoadNoSkills(
 fn testLoadTruncatedSkillsWithDiagnostic(
     alloc: Allocator,
     _: []const u8,
+    _: []const []const u8,
     _: skill_contract.RootPolicy,
 ) app_runtime_setup.LoadSkillsError!app_runtime_setup.LoadedSkills {
     const skills = try alloc.alloc(skill_runtime.Skill, 1);

@@ -1411,7 +1411,12 @@ fn handleInitialize(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message
     state.context_enabled = startup.context_enabled;
 
     if (comptime !host_target.is_wasm) {
-        const loaded_skills = try app_runtime_setup.loadSkills(alloc, state.workspace_root, builtin_skills.root_policy);
+        const loaded_skills = try app_runtime_setup.loadSkills(
+            alloc,
+            state.workspace_root,
+            state.cfg.invocation_skill_roots,
+            builtin_skills.root_policy,
+        );
         skill_runtime.traceDiagnostics("acp_startup", loaded_skills.diagnostics);
         state.skills.replaceLoaded(alloc, loaded_skills.dir, loaded_skills.skills, loaded_skills.diagnostics);
     }

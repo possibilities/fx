@@ -129,6 +129,17 @@ Use `fx mcp list`, `fx mcp path`, and `fx mcp remove NAME` for noninteractive pr
 
 MCP servers have a 30-second startup timeout by default; set `startup_timeout_ms` on a server when its cold start needs a different bound. For direct `docker run` stdio entries, fx uses a private container ID file to remove the owned container after shutdown or startup failure. A configuration that already supplies `--cidfile` keeps ownership of its own cleanup policy.
 
+Load additional skill roots for one invocation with repeatable `--skills-dir`
+flags. Each root contains one directory per skill and is scanned before
+automatically discovered roots:
+
+```bash
+fx --skills-dir ./team-skills --skills-dir /opt/shared-skills ask "Review this change"
+```
+
+Invocation skill roots are not saved, and skill installation continues to use
+`~/.fx/skills`.
+
 ## Documentation
 
 Read the [fx documentation](https://fx.sh/docs).
