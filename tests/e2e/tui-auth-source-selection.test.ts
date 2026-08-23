@@ -1207,11 +1207,11 @@ tmuxTest(
       (request) => request.path === "/oauth/authorize",
     ).length;
     const settingsPath = join(home, ".fx", "settings.json");
-    const gatewayModelBefore = JSON.parse(readFileSync(settingsPath, "utf8")).model;
+    const gatewayModelBefore = JSON.parse(readFileSync(settingsPath, "utf8")).models.gateway;
     expect(typeof gatewayModelBefore).toBe("string");
     const savedCodex = JSON.parse(readFileSync(settingsPath, "utf8"));
-    expect(savedCodex.model).toBe(gatewayModelBefore);
-    expect(savedCodex.codex_model).toBe("gpt-5.6-sol");
+    expect(savedCodex.models.gateway).toBe(gatewayModelBefore);
+    expect(savedCodex.models.codex).toBe("gpt-5.6-sol");
     await session.sendText("/quit");
     await session.waitForSessionEnd(TIMEOUT);
     session = null;
@@ -1236,16 +1236,16 @@ tmuxTest(
     await session.waitForText("Switched to Vercel AI Gateway", TIMEOUT);
     const savedGateway = JSON.parse(readFileSync(settingsPath, "utf8"));
     expect(savedGateway.provider).toBe("gateway");
-    expect(savedGateway.model).toBe(gatewayModelBefore);
-    expect(savedGateway.codex_model).toBe("gpt-5.6-sol");
+    expect(savedGateway.models.gateway).toBe(gatewayModelBefore);
+    expect(savedGateway.models.codex).toBe("gpt-5.6-sol");
     await openProviderPicker(session);
     await session.sendKeys("Down");
     await session.sendKeys("Enter");
     await session.waitForText("Switched to Codex subscription", TIMEOUT);
     const restoredCodex = JSON.parse(readFileSync(settingsPath, "utf8"));
     expect(restoredCodex.provider).toBe("codex");
-    expect(restoredCodex.model).toBe(gatewayModelBefore);
-    expect(restoredCodex.codex_model).toBe("gpt-5.6-sol");
+    expect(restoredCodex.models.gateway).toBe(gatewayModelBefore);
+    expect(restoredCodex.models.codex).toBe("gpt-5.6-sol");
     expect(chatgptOauth.requests.filter((request) => request.path === "/oauth/authorize"))
       .toHaveLength(authorizeRequestsBeforeRoundTrip);
     await session.sendText("/logout codex");
@@ -1263,7 +1263,7 @@ tmuxTest(
     await session.waitForText("Switched to Codex subscription with gpt-5.4-mini.", TIMEOUT);
     const reauthenticated = JSON.parse(readFileSync(settingsPath, "utf8"));
     expect(reauthenticated.provider).toBe("codex");
-    expect(reauthenticated.codex_model).toBe("gpt-5.4-mini");
+    expect(reauthenticated.models.codex).toBe("gpt-5.4-mini");
     expect(chatgptOauth.requests.filter((request) => request.path === "/oauth/authorize"))
       .toHaveLength(authorizeRequestsBeforeRoundTrip + 1);
     await session.sendKeys("C-c");
@@ -1301,7 +1301,7 @@ tmuxTest(
 
     const selected = JSON.parse(readFileSync(join(home, ".fx", "settings.json"), "utf8"));
     expect(selected.provider).toBe("codex");
-    expect(selected.codex_model).toBe("gpt-5.6-sol");
+    expect(selected.models.codex).toBe("gpt-5.6-sol");
     await session.sendText("/status");
     await session.waitForText("model_source=Codex subscription", TIMEOUT);
     expect(readFileSync(stderrPath, "utf8")).toBe("");
@@ -2064,7 +2064,7 @@ test(
     const settingsPath = join(home, ".fx", "settings.json");
     const selected = JSON.parse(readFileSync(settingsPath, "utf8"));
     expect(selected.provider).toBe("codex");
-    expect(selected.codex_model).toBe("gpt-5.6-sol");
+    expect(selected.models.codex).toBe("gpt-5.6-sol");
 
     const models = await runFx(["models", "--json"], { env, timeoutMs: TIMEOUT });
     const modelIds = (JSON.parse(models.stdout) as { models: Array<{ id: string }> }).models
@@ -2160,7 +2160,7 @@ test(
       expect(statSync(authPath).mode & 0o077).toBe(0);
       const settings = JSON.parse(readFileSync(join(home, ".fx", "settings.json"), "utf8"));
       expect(settings.provider).toBe("grok");
-      expect(settings.grok_model).toBe("grok-4.20");
+      expect(settings.models.grok).toBe("grok-4.20");
 
       const models = await runFx(["models", "--json"], { env, timeoutMs: TIMEOUT });
       const modelIds = (JSON.parse(models.stdout) as { models: Array<{ id: string }> }).models
@@ -2384,11 +2384,11 @@ tmuxTest(
       await session.waitForText("Switched to Grok subscription with grok-4.20.", TIMEOUT);
       const settingsPath = join(home, ".fx", "settings.json");
       const persistenceDeadline = Date.now() + TIMEOUT;
-      let saved: { provider: string; grok_model: string } | undefined;
+      let saved: { provider: string; models: { grok: string } } | undefined;
       while (Date.now() < persistenceDeadline) {
         saved = JSON.parse(readFileSync(settingsPath, "utf8")) as {
           provider: string;
-          grok_model: string;
+          models: { grok: string };
         };
         if (saved.provider === "grok") break;
         await Bun.sleep(25);
@@ -2396,7 +2396,7 @@ tmuxTest(
       expect(saved).toBeDefined();
       expect(grok.tokenCalls()).toBe(tokenCallsAfterLogin);
       expect(saved!.provider).toBe("grok");
-      expect(saved!.grok_model).toBe("grok-4.20");
+      expect(saved!.models.grok).toBe("grok-4.20");
       const responses = grok.requests.filter((request) => request.path === "/v1/responses");
       expect(responses).toHaveLength(1);
       expect(responses[0]!.conversationId).toBeTruthy();
@@ -2840,6 +2840,7 @@ test(
       }
       expect(readSingleUsageSnapshot(home)).toMatchObject({
         billing: "complete",
+        api_duration_complete: true,
         next_sequence: 1,
         settled_through_sequence: 0,
         pending: [],
@@ -2903,6 +2904,7 @@ test(
       }
       expect(readSingleUsageSnapshot(home)).toMatchObject({
         billing: "complete",
+        api_duration_complete: true,
         next_sequence: 1,
         settled_through_sequence: 0,
         pending: [],
