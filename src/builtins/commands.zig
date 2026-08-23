@@ -342,6 +342,14 @@ pub const top_level_flags = [_]TopLevelFlag{
         .description = "Record terminal output",
     },
     .{
+        .usage = "--system-prompt-file <path>",
+        .description = "Replace launch system prompt from UTF-8 file",
+    },
+    .{
+        .usage = "--append-system-prompt-file <path>",
+        .description = "Append UTF-8 system prompt file; repeatable",
+    },
+    .{
         .usage = "--context-limit <spec>",
         .description = "Set name=bytes|off; repeatable",
     },
