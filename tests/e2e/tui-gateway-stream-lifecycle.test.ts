@@ -5350,7 +5350,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
           }
           return new Response("unexpected Gateway request", { status: 500 });
         }, {
-          classifierDecision: "allow",
+          classifierDecision: "clear",
           models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
         });
         gateway = mcpGateway;
@@ -6476,7 +6476,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
 
       expect(queuedGateway.requests).toHaveLength(2);
       expect(pane).toContain("● 1 tool call · 1 read · 1 failed");
-      expect(pane).toContain("└ Connection interrupted before read_file ran");
+      expect(pane).toContain("└ Connection interrupted before tool call ran");
       expect(pane).not.toContain("● Reading");
     },
     TIMEOUT,
@@ -6557,7 +6557,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       expect(reviewing).toMatch(/Thinking \(\d+s\)/);
       expect(reviewing).not.toContain(finalText);
 
-      releaseClassifier(fakeGatewayPermissionDecision("allow"));
+      releaseClassifier(fakeGatewayPermissionDecision("clear"));
       await session.waitForPane(
         (pane) => pane.includes(finalText) && !pane.includes("Thinking"),
         TIMEOUT,

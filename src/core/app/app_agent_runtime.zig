@@ -1157,7 +1157,7 @@ fn formatToolAction(
         );
     }
     const args = tool_args.parseToolArgsObject(arena, call.arguments_json) catch {
-        return formatInvalidArgsToolAction(arena, state, denied_label, call.name);
+        return formatInvalidArgsToolAction(arena, state, denied_label);
     };
 
     const presentation = tool_dispatch.presentationForArgs(spec.*, args);
@@ -1169,7 +1169,7 @@ fn formatToolAction(
 
 fn formatWebSearchAction(arena: Allocator, call: ToolCall, state: ToolActionState, denied_label: ?[]const u8) ![]const u8 {
     const args = tool_args.parseToolArgsObject(arena, call.arguments_json) catch {
-        return formatInvalidArgsToolAction(arena, state, denied_label, call.name);
+        return formatInvalidArgsToolAction(arena, state, denied_label);
     };
     const label = switch (state) {
         .active => "Searching",
@@ -1187,10 +1187,11 @@ fn formatMissingSpecToolAction(arena: Allocator, state: ToolActionState, denied_
     };
 }
 
-fn formatInvalidArgsToolAction(arena: Allocator, state: ToolActionState, denied_label: ?[]const u8, name: []const u8) ![]const u8 {
+fn formatInvalidArgsToolAction(arena: Allocator, state: ToolActionState, denied_label: ?[]const u8) ![]const u8 {
     return switch (state) {
         .active => std.fmt.allocPrint(arena, "● Working…\x1b[0m", .{}),
-        .completed, .denied => formatMissingSpecToolAction(arena, state, denied_label, name),
+        .completed => formatToolActionValue(arena, "Completed", "tool call"),
+        .denied => formatToolActionValue(arena, denied_label.?, "tool call"),
     };
 }
 
@@ -2008,6 +2009,30 @@ test "app agent runtime formats active completed denied and MCP tool actions" {
     const denied = try app.describeToolActionDenied(arena, run_call, "Denied");
     try std.testing.expect(std.mem.find(u8, denied, "Denied") != null);
     try std.testing.expect(std.mem.find(u8, denied, "zig build") != null);
+
+    const malformed_registered: ToolCall = .{
+        .id = "malformed_registered",
+        .name = "memory",
+        .arguments_json = "{",
+    };
+    const malformed_completed = try app.describeToolActionCompleted(arena, malformed_registered);
+    try std.testing.expectEqualStrings(
+        "● Completed\x1b[0m \x1b[38;5;245mtool call\x1b[0m",
+        malformed_completed,
+    );
+    const malformed_denied = try app.describeToolActionDenied(arena, malformed_registered, "Denied");
+    try std.testing.expectEqualStrings(
+        "● Denied\x1b[0m \x1b[38;5;245mtool call\x1b[0m",
+        malformed_denied,
+    );
+
+    const malformed_unknown: ToolCall = .{
+        .id = "malformed_unknown",
+        .name = "mcp_unknown",
+        .arguments_json = "{",
+    };
+    const malformed_unknown_completed = try app.describeToolActionCompleted(arena, malformed_unknown);
+    try std.testing.expect(std.mem.find(u8, malformed_unknown_completed, "mcp_unknown") != null);
 
     const mcp_call: ToolCall = .{ .id = "mcp", .name = "mcp_lookup", .arguments_json = "{}" };
     const mcp_action = try app.describeToolActionCompleted(arena, mcp_call);
