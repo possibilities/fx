@@ -310,6 +310,18 @@ fn runInteractiveWithDeps(comptime App: type, comptime cooperative: bool, alloc:
         app.takeUpgradeRelaunchRequest()
     else
         null;
+    const relaunch_skill_roots = try cloneInvocationSkillRootsForRelaunch(
+        App,
+        alloc,
+        &app,
+        relaunch_request != null,
+    );
+    defer freeInvocationSkillRoots(alloc, relaunch_skill_roots);
+    var relaunch_argv: std.ArrayList([]const u8) = .empty;
+    defer relaunch_argv.deinit(alloc);
+    if (relaunch_request != null) {
+        try relaunch_argv.ensureTotalCapacity(alloc, 4 + relaunch_skill_roots.len * 2);
+    }
     const resume_handoff_columns: u16 = if (comptime cooperative)
         0
     else if (comptime @hasDecl(App, "resumeHandoffColumns"))
@@ -325,16 +337,18 @@ fn runInteractiveWithDeps(comptime App: type, comptime cooperative: bool, alloc:
         if (handoff_value) |value| {
             var handoff = value;
             defer handoff.deinit(alloc);
-            var argv = [_][]const u8{
-                request.executablePath(),
-                "resume",
-                handoff.session_id,
-                cli_surface.upgrade_relaunch_arg,
-            };
+            relaunch_argv.appendAssumeCapacity(request.executablePath());
+            for (relaunch_skill_roots) |root| {
+                relaunch_argv.appendAssumeCapacity("--skills-dir");
+                relaunch_argv.appendAssumeCapacity(root);
+            }
+            relaunch_argv.appendAssumeCapacity("resume");
+            relaunch_argv.appendAssumeCapacity(handoff.session_id);
+            relaunch_argv.appendAssumeCapacity(cli_surface.upgrade_relaunch_arg);
             const replace_err = deps.replace_process(
                 deps.replace_ctx,
                 io_mod.getIo(),
-                .{ .argv = &argv },
+                .{ .argv = relaunch_argv.items },
             );
             writeUpgradeRelaunchFailure(deps, replace_err, handoff.session_id);
         } else {
@@ -360,6 +374,34 @@ fn runInteractiveWithDeps(comptime App: type, comptime cooperative: bool, alloc:
         deps.write_stdout(deps.stdout_ctx, message) catch {};
     }
     return .returned;
+}
+
+fn cloneInvocationSkillRootsForRelaunch(
+    comptime App: type,
+    alloc: Allocator,
+    app: *const App,
+    enabled: bool,
+) ![][]u8 {
+    if (!enabled) return &.{};
+    if (comptime !@hasField(App, "invocation_skill_roots")) return &.{};
+    if (app.invocation_skill_roots.len == 0) return &.{};
+
+    const roots = try alloc.alloc([]u8, app.invocation_skill_roots.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (roots[0..initialized]) |root| alloc.free(root);
+        alloc.free(roots);
+    }
+    for (app.invocation_skill_roots, 0..) |root, index| {
+        roots[index] = try alloc.dupe(u8, root);
+        initialized += 1;
+    }
+    return roots;
+}
+
+fn freeInvocationSkillRoots(alloc: Allocator, roots: [][]u8) void {
+    for (roots) |root| alloc.free(root);
+    if (roots.len > 0) alloc.free(roots);
 }
 
 fn replaceProcessDefault(
@@ -601,8 +643,8 @@ const TestCapture = struct {
     replace_error: std.process.ReplaceError = error.InvalidExe,
     replace_calls: usize = 0,
     replace_arg_count: usize = 0,
-    replace_arg_bufs: [4][128]u8 = undefined,
-    replace_arg_lens: [4]usize = .{ 0, 0, 0, 0 },
+    replace_arg_bufs: [8][128]u8 = undefined,
+    replace_arg_lens: [8]usize = .{ 0, 0, 0, 0, 0, 0, 0, 0 },
     fail_unexpected_format: bool = false,
 
     fn init(run_result: cli_surface.RunResult) TestCapture {
@@ -707,13 +749,16 @@ fn startWorkerThreadForTest(ctx: ?*anyopaque, _: *anyopaque) !void {
 
 const TestApp = struct {
     requested_resume: ?cli_surface.ResumeTarget = null,
+    invocation_skill_roots: [][]u8 = &.{},
     terminal_released: bool = false,
 
     fn init(_: Allocator, launch: *cli_surface.InteractiveLaunch) !TestApp {
         appendInitEvent(launch);
         if (active_capture.?.init_error) |err| return err;
 
-        var app = TestApp{};
+        var app = TestApp{
+            .invocation_skill_roots = launch.modifiers.takeInvocationSkillRoots(),
+        };
         if (launch.requested_resume) |target| {
             app.requested_resume = target;
             launch.requested_resume = null;
@@ -724,6 +769,7 @@ const TestApp = struct {
     fn deinit(self: *TestApp) void {
         self.releaseTerminal();
         if (self.requested_resume) |*target| target.deinit(std.testing.allocator);
+        freeInvocationSkillRoots(std.testing.allocator, self.invocation_skill_roots);
         appendTestEvent("deinit");
         self.* = undefined;
     }
@@ -957,6 +1003,49 @@ test "app entry relaunches only after teardown with the validated handoff" {
         "deinit",
         "stderr-attempt",
     });
+}
+
+test "app entry preserves invocation skill roots across an upgrade relaunch" {
+    const alloc = std.testing.allocator;
+    const roots = roots: {
+        const owned = try alloc.alloc([]u8, 2);
+        var initialized: usize = 0;
+        errdefer {
+            for (owned[0..initialized]) |root| alloc.free(root);
+            alloc.free(owned);
+        }
+        owned[0] = try alloc.dupe(u8, "/tmp/team skills");
+        initialized += 1;
+        owned[1] = try alloc.dupe(u8, "/opt/shared-skills");
+        break :roots owned;
+    };
+
+    var capture = TestCapture.init(.{ .interactive = .{
+        .modifiers = .{ .invocation_skill_roots = roots },
+    } });
+    defer capture.deinit();
+    capture.resume_handoff_id = "session-123";
+    capture.upgrade_relaunch_path = "/tmp/fx-upgraded";
+
+    const outcome = try runWithDeps(
+        TestApp,
+        alloc,
+        &.{},
+        testConfig(),
+        capture.deps(),
+    );
+
+    try std.testing.expectEqual(@as(u8, 1), outcome.exit);
+    try std.testing.expectEqual(@as(usize, 1), capture.replace_calls);
+    try std.testing.expectEqual(@as(usize, 8), capture.replace_arg_count);
+    try std.testing.expectEqualStrings("/tmp/fx-upgraded", capture.replaceArg(0));
+    try std.testing.expectEqualStrings("--skills-dir", capture.replaceArg(1));
+    try std.testing.expectEqualStrings("/tmp/team skills", capture.replaceArg(2));
+    try std.testing.expectEqualStrings("--skills-dir", capture.replaceArg(3));
+    try std.testing.expectEqualStrings("/opt/shared-skills", capture.replaceArg(4));
+    try std.testing.expectEqualStrings("resume", capture.replaceArg(5));
+    try std.testing.expectEqualStrings("session-123", capture.replaceArg(6));
+    try std.testing.expectEqualStrings("--upgrade-relaunch", capture.replaceArg(7));
 }
 
 test "app entry never relaunches without a validated handoff" {

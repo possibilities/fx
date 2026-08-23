@@ -95,6 +95,7 @@ pub fn call(ctx: tool_dispatch.DispatchContext, erased: tool_dispatch.ToolInput)
         ctx.allocator,
         ctx.workspace_root,
         ctx.skills_dir,
+        ctx.invocation_skill_roots,
         input.name,
         input.location,
         input.resource,
@@ -143,6 +144,7 @@ pub fn executeForSession(
         arena,
         workspace_root,
         skills_dir,
+        &.{},
         name,
         location,
         resource,
@@ -156,6 +158,7 @@ fn loadByIdentity(
     alloc: Allocator,
     workspace_root: []const u8,
     skills_dir: []const u8,
+    invocation_skill_roots: []const []const u8,
     name: []const u8,
     location: ?[]const u8,
     resource: ?[]const u8,
@@ -163,7 +166,12 @@ fn loadByIdentity(
     limits: context_limits.Values,
     max_tool_result_bytes: ?usize,
 ) !skill_invocation.ExecuteResult {
-    var discovery = try loadVisibleSkillsForContext(alloc, workspace_root, skills_dir);
+    var discovery = try loadVisibleSkillsForContext(
+        alloc,
+        workspace_root,
+        skills_dir,
+        invocation_skill_roots,
+    );
     defer discovery.deinit(alloc);
     skill_runtime.traceDiagnostics("skill_tool", discovery.diagnostics);
     return skill_invocation.loadByIdentity(
@@ -182,11 +190,26 @@ fn loadVisibleSkillsForContext(
     alloc: Allocator,
     workspace_root: []const u8,
     skills_dir: []const u8,
+    invocation_skill_roots: []const []const u8,
 ) !skill_runtime.SkillDiscovery {
     if (io_mod.getenv("HOME") orelse homeFromSkillsDir(skills_dir)) |home| {
-        return skill_runtime.loadVisibleSkills(alloc, workspace_root, home, skills_dir, builtin_skills.root_policy);
+        return skill_runtime.loadVisibleSkillsWithInvocationRoots(
+            alloc,
+            workspace_root,
+            home,
+            skills_dir,
+            invocation_skill_roots,
+            builtin_skills.root_policy,
+        );
     }
-    return skill_runtime.loadVisibleSkills(alloc, workspace_root, null, skills_dir, builtin_skills.root_policy);
+    return skill_runtime.loadVisibleSkillsWithInvocationRoots(
+        alloc,
+        workspace_root,
+        null,
+        skills_dir,
+        invocation_skill_roots,
+        builtin_skills.root_policy,
+    );
 }
 
 fn homeFromSkillsDir(skills_dir: []const u8) ?[]const u8 {
