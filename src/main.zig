@@ -403,8 +403,10 @@ const App = struct {
         return null;
     }
 
-    pub fn promptPolicy(_: *const Self) prompt_policy.Policy {
-        return builtin_context.prompt_policy;
+    pub fn promptPolicy(self: *const Self) prompt_policy.Policy {
+        var policy = builtin_context.prompt_policy;
+        if (self.system_prompt_override) |prompt| policy.system_prompt = prompt;
+        return policy;
     }
 
     pub fn slashRegistry(_: *const Self) command_specs.SlashRegistry {
@@ -523,6 +525,7 @@ const App = struct {
     session_persistence: app_session_runtime.Persistence = .{},
     prompt_history: PromptHistoryRuntime = .{},
     requested_resume: ?cli_surface.ResumeTarget = null,
+    system_prompt_override: ?[]u8 = null,
     approval_prompt: ApprovalPrompt = .{},
     approval_screen: ApprovalScreenState = .{},
     question_prompt: QuestionPrompt = .{},
@@ -625,6 +628,7 @@ const App = struct {
             },
         );
         errdefer app.deinit();
+        app.system_prompt_override = launch.modifiers.takeEffectiveSystemPrompt();
         try WorkspaceAppRuntime.applyLaunch(
             &app,
             launch.modifiers.additional_directories,
@@ -846,6 +850,7 @@ const App = struct {
             target.deinit(self.alloc);
             self.requested_resume = null;
         }
+        if (self.system_prompt_override) |prompt| self.alloc.free(prompt);
         self.session.deinit(self.alloc);
         self.permission_engine.deinit(self.alloc);
         self.approval_prompt.deinit(self.alloc);
@@ -3135,6 +3140,7 @@ fn hasPosixArgVector() bool {
 }
 
 fn needsFullEntryConfig(args: []const [:0]const u8) bool {
+    if (cli_surface.systemPromptFilesRequested(args)) return true;
     const command = cli_surface.commandAfterGlobalLaunchArgs(args) orelse return false;
     return std.mem.eql(u8, command, "ask") or
         std.mem.eql(u8, command, "acp") or
@@ -3203,6 +3209,12 @@ test "full entry config commands also use early threaded io" {
         @as([:0]const u8, "--context-limit=project_bytes=2048"),
         @as([:0]const u8, "--no-additional-dirs"),
         @as([:0]const u8, "acp"),
+    }));
+    try std.testing.expect(needsFullEntryConfig(&.{
+        @as([:0]const u8, "--append-system-prompt-file"),
+        @as([:0]const u8, "/tmp/prompt"),
+        @as([:0]const u8, "resume"),
+        @as([:0]const u8, "last"),
     }));
 }
 
@@ -3893,6 +3905,7 @@ test {
     _ = @import("core/background/process_supervisor.zig");
     _ = @import("core/execution/process_tree.zig");
     _ = @import("core/config/prompt_policy.zig");
+    _ = @import("core/config/system_prompt_files.zig");
     _ = @import("core/workspace/record_tape.zig");
     _ = @import("core/session/session.zig");
     _ = @import("core/session/session_commands.zig");

@@ -257,6 +257,8 @@ describe("cli: help", () => {
       expect(r.stdout).toContain("Run one noninteractive request");
       expect(r.stdout).toContain("credits|balance");
       expect(r.stdout).toContain("Flags:\n");
+      expect(r.stdout).toContain("--system-prompt-file <path>");
+      expect(r.stdout).toContain("--append-system-prompt-file <path>");
       expect(r.stdout).toContain("--context-limit <spec>");
       expect(r.stdout).toContain("Set name=bytes|off; repeatable");
       expect(r.stdout).toContain("--add-dir <path>");
@@ -3880,6 +3882,77 @@ describe("cli: issue", () => {
 });
 
 describe("cli: ask success", () => {
+  test(
+    "system prompt files replace and append in command-line order",
+    async () => {
+      const root = mkdtempSync(join(tmpdir(), "fx-e2e-system-prompt-files-"));
+      const home = join(root, "home");
+      const workspace = join(root, "workspace");
+      const replacement = join(root, "replacement.md");
+      const first = join(root, "first.md");
+      const second = join(root, "second.md");
+      const gateway = startFakeGateway([fakeGatewayFinalText("prompt files complete")]);
+      try {
+        mkdirSync(home);
+        mkdirSync(workspace);
+        writeFileSync(replacement, "REPLACEMENT_SYSTEM_SENTINEL");
+        writeFileSync(first, "FIRST_APPEND_SENTINEL");
+        writeFileSync(second, "SECOND_APPEND_SENTINEL");
+        const env = {
+          HOME: realpathSync(home),
+          AI_GATEWAY_API_KEY: "fake-system-prompt-key",
+          VERCEL_OIDC_TOKEN: undefined,
+          FX_GATEWAY_BASE_URL: gateway.baseUrl,
+          FX_GATEWAY_CHAT_URL: gateway.chatUrl,
+          FX_MODEL: FAKE_GATEWAY_MODEL,
+          FX_AUTO_UPGRADE: "0",
+        };
+        const result = await runFx(
+          [
+            "--append-system-prompt-file", first,
+            "--system-prompt-file", replacement,
+            "--append-system-prompt-file", second,
+            "ask", "--json", "--auto", "--no-save", "check the prompt",
+          ],
+          { cwd: realpathSync(workspace), env, timeoutMs: TIMEOUT },
+        );
+
+        expect(result.code).toBe(0);
+        expect(result.stderr).toBe("");
+        expect(JSON.parse(result.stdout).output.trim()).toBe("prompt files complete");
+        expect(gateway.requests).toHaveLength(1);
+        const body = gateway.requests[0]!.body;
+        const replacementIndex = body.indexOf("REPLACEMENT_SYSTEM_SENTINEL");
+        const firstIndex = body.indexOf("FIRST_APPEND_SENTINEL");
+        const secondIndex = body.indexOf("SECOND_APPEND_SENTINEL");
+        expect(replacementIndex).toBeGreaterThan(-1);
+        expect(firstIndex).toBeGreaterThan(replacementIndex);
+        expect(secondIndex).toBeGreaterThan(firstIndex);
+        expect(body).not.toContain("You are fx, a local coding CLI assistant");
+
+        const conflict = await runFx(
+          ["--system-prompt-file", replacement, "ask", "--system", "inline", "prompt"],
+          { cwd: realpathSync(workspace), env, timeoutMs: TIMEOUT },
+        );
+        expect(conflict.code).toBe(1);
+        expect(conflict.stderr).toContain("--system cannot be combined");
+        expect(gateway.requests).toHaveLength(1);
+
+        const missing = await runFx(
+          ["--system-prompt-file", join(root, "missing.md"), "ask", "prompt"],
+          { cwd: realpathSync(workspace), env, timeoutMs: TIMEOUT },
+        );
+        expect(missing.code).toBe(1);
+        expect(missing.stderr).toContain("missing.md: file is missing or unreadable");
+        expect(gateway.requests).toHaveLength(1);
+      } finally {
+        gateway.stop();
+        rmSync(root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
   test(
     "fx ask binds an explicitly invoked skill into the prompt",
     async () => {
