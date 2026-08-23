@@ -554,11 +554,15 @@ pub fn systemPromptFilesRequested(args: []const [:0]const u8) bool {
         {
             return true;
         }
-        if (std.mem.eql(u8, arg, "--context-limit") or std.mem.eql(u8, arg, "--add-dir")) {
+        if (std.mem.eql(u8, arg, "--context-limit") or
+            std.mem.eql(u8, arg, "--add-dir") or
+            std.mem.eql(u8, arg, "--skills-dir"))
+        {
             index += 1;
             if (index >= args.len) return false;
         } else if (!std.mem.startsWith(u8, arg, "--context-limit=") and
             !std.mem.startsWith(u8, arg, "--add-dir=") and
+            !std.mem.startsWith(u8, arg, "--skills-dir=") and
             !std.mem.eql(u8, arg, "--no-additional-dirs"))
         {
             return false;
@@ -962,6 +966,11 @@ fn runIfRequestedWithDeps(alloc: Allocator, args: []const [:0]const u8, cfg: Con
         try writeStderr(deps, writer.written());
         return .handled_failure;
     };
+    var parsed_launch_owned = true;
+    errdefer if (parsed_launch_owned) switch (parsed_launch) {
+        .interactive => |*launch| launch.deinit(alloc),
+        .noninteractive => |*launch| launch.deinit(alloc),
+    };
     switch (parsed_launch) {
         .interactive => |*launch| {
             if (!try prepareSystemPromptFiles(alloc, &launch.modifiers, cfg.prompt_policy.system_prompt, deps)) {
@@ -998,8 +1007,12 @@ fn runIfRequestedWithDeps(alloc: Allocator, args: []const [:0]const u8, cfg: Con
         },
     }
     switch (parsed_launch) {
-        .interactive => |launch| return .{ .interactive = launch },
+        .interactive => |launch| {
+            parsed_launch_owned = false;
+            return .{ .interactive = launch };
+        },
         .noninteractive => |value| {
+            parsed_launch_owned = false;
             var noninteractive = value;
             defer noninteractive.deinit(alloc);
             return runNonInteractiveWithDeps(alloc, &noninteractive, cfg, deps);
@@ -4033,6 +4046,48 @@ test "global launch parsing releases every owned value across allocation failure
         try std.testing.expect(failing.has_induced_failure);
         try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
     }
+}
+
+test "launch dispatch releases a composed prompt when skill root canonicalization allocation fails" {
+    const backing = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var prompt_file = try tmp.dir.createFile(std.testing.io, "prompt", .{});
+    defer prompt_file.close(std.testing.io);
+    try prompt_file.writeStreamingAll(std.testing.io, "APPENDED_PROMPT");
+    const root_path = try io_mod.dirRealpathAlloc(backing, tmp.dir, ".");
+    defer backing.free(root_path);
+    const root_path_z = try backing.dupeZ(u8, root_path);
+    defer backing.free(root_path_z);
+    const prompt_path = try io_mod.dirRealpathAlloc(backing, tmp.dir, "prompt");
+    defer backing.free(prompt_path);
+    const prompt_path_z = try backing.dupeZ(u8, prompt_path);
+    defer backing.free(prompt_path_z);
+    const args = [_][:0]const u8{
+        "--append-system-prompt-file",
+        prompt_path_z,
+        "--skills-dir",
+        root_path_z,
+    };
+    var capture = CaptureOutput.init(backing);
+    defer capture.deinit();
+
+    var probe = std.testing.FailingAllocator.init(backing, .{});
+    var probe_result = try runIfRequestedWithDeps(probe.allocator(), &args, testConfig(), capture.deps());
+    switch (probe_result) {
+        .interactive => |*launch| launch.deinit(probe.allocator()),
+        else => return error.TestExpectedInteractiveLaunch,
+    }
+    try std.testing.expectEqual(probe.allocated_bytes, probe.freed_bytes);
+
+    try std.testing.expect(probe.alloc_index > 0);
+    var failing = std.testing.FailingAllocator.init(backing, .{ .fail_index = probe.alloc_index - 1 });
+    try std.testing.expectError(
+        error.OutOfMemory,
+        runIfRequestedWithDeps(failing.allocator(), &args, testConfig(), capture.deps()),
+    );
+    try std.testing.expect(failing.has_induced_failure);
+    try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
 }
 
 test "ask inline system prompt detection stops at the prompt separator" {

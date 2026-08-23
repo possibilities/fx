@@ -3312,6 +3312,21 @@ test "full entry config commands also use early threaded io" {
     }));
 }
 
+test "skill roots before prompt files still select the full interactive config" {
+    try std.testing.expect(needsFullEntryConfig(&.{
+        @as([:0]const u8, "--skills-dir"),
+        @as([:0]const u8, "/tmp/team-skills"),
+        @as([:0]const u8, "--append-system-prompt-file"),
+        @as([:0]const u8, "/tmp/prompt"),
+    }));
+    try std.testing.expect(needsFullEntryConfig(&.{
+        @as([:0]const u8, "--skills-dir=/tmp/team-skills"),
+        @as([:0]const u8, "--append-system-prompt-file=/tmp/prompt"),
+        @as([:0]const u8, "resume"),
+        @as([:0]const u8, "last"),
+    }));
+}
+
 test "interactive and resumed launch prompts transfer into the app policy" {
     const prompt: []u8 = @constCast("INTERACTIVE_FILE_SYSTEM_PROMPT");
     for ([_]cli_surface.InteractiveLaunch{
