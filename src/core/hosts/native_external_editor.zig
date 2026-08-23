@@ -170,13 +170,18 @@ fn editWithCommand(
         return keepEditedFile(.output_invalid, temp_path, &owns_temp_path, &remove_temp);
     }
 
-    const output = io_mod.readFileToEnd(alloc, &output_file, max_bytes) catch |err| switch (err) {
+    const read_limit = std.math.add(usize, max_bytes, 1) catch max_bytes;
+    const output = io_mod.readFileToEnd(alloc, &output_file, read_limit) catch |err| switch (err) {
         error.StreamTooLong => return keepEditedFile(.output_too_large, temp_path, &owns_temp_path, &remove_temp),
         else => {
             debug_trace.logf("input", "external editor output read failed err={s}", .{@errorName(err)});
             return keepEditedFile(.editor_failed, temp_path, &owns_temp_path, &remove_temp);
         },
     };
+    if (output.len > max_bytes) {
+        alloc.free(output);
+        return keepEditedFile(.output_too_large, temp_path, &owns_temp_path, &remove_temp);
+    }
     if (!std.unicode.utf8ValidateSlice(output) or std.mem.findScalar(u8, output, 0) != null) {
         debug_trace.logf("input", "external editor output rejected reason=invalid_text", .{});
         alloc.free(output);
@@ -267,6 +272,24 @@ test "external editor returns valid text and treats nonzero exit as cancellation
     defer check_dir.close(io_mod.getIo());
     var iterator = check_dir.iterate();
     try std.testing.expect(try iterator.next(io_mod.getIo()) == null);
+}
+
+test "external editor accepts output at the exact composer byte limit" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(root);
+
+    var result = try editWithCommand(
+        alloc,
+        "/bin/sh -c 'printf exactly > \"$1\"' sh",
+        root,
+        "seed",
+        "exactly".len,
+    );
+    defer result.deinit(alloc);
+    try std.testing.expectEqualStrings("exactly", result.edited);
 }
 
 test "external editor keeps oversized saved output for recovery" {
