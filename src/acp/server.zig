@@ -1413,9 +1413,10 @@ fn handleInitialize(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message
     state.context_limits.applyCommandLine(state.cfg.context_limit_overrides);
     state.fast_mode = startup.fast_mode and
         (state.cfg.model_override == null or startup.fast_mode_source != .compiled_default);
-    state.effort = startup.effort;
+    state.effort = state.cfg.effort_override orelse startup.effort;
     state.configured_effort = startup.configured_effort;
-    state.process_effort_override = startup.effort_source == .process_override;
+    state.process_effort_override = state.cfg.effort_override != null or
+        startup.effort_source == .process_override;
     state.first_call_tool_choice = startup.first_call_tool_choice;
     state.context_enabled = startup.context_enabled;
 
