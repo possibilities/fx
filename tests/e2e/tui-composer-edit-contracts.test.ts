@@ -318,14 +318,14 @@ async function selectReviewSkill(
 }
 
 tmuxTest(
-  "Ctrl+T round trips a plain-text draft through EDITOR",
+  "Ctrl+G round trips a plain-text draft through EDITOR",
   async () => {
     const active = await startFx(true, { editorScript: EXTERNAL_EDITOR_SCRIPT });
     const seed = "original editor draft";
     const edited = `externally edited: ${seed}`;
 
     await active.sendLiteralText(seed);
-    await active.sendHexBytes(["14"]);
+    await active.sendHexBytes(["07"]);
     await active.waitForText(edited, TIMEOUT);
     await active.sendKeys("Enter");
     await waitForGatewayRequest();
@@ -337,7 +337,7 @@ tmuxTest(
 );
 
 tmuxTest(
-  "Ctrl+T keeps the active turn running while the editor owns the terminal",
+  "Ctrl+G keeps the active turn running while the editor owns the terminal",
   async () => {
     const held = heldFakeGatewayFinalText();
     const backgroundDone = "BACKGROUND_TURN_COMPLETED_DURING_EDITOR";
@@ -356,7 +356,7 @@ tmuxTest(
       const seed = "draft composed during the active turn";
       const edited = `externally edited: ${seed}`;
       await active.sendLiteralText(seed);
-      await active.sendHexBytes(["14"]);
+      await active.sendHexBytes(["07"]);
 
       const editorPath = join(root!, "editor.sh");
       await waitForPath(`${editorPath}.open`);
@@ -405,7 +405,7 @@ tmuxTest(
     const seed = "draft preserved through approval";
     const edited = `externally edited: ${seed}`;
     await active.sendLiteralText(seed);
-    await active.sendHexBytes(["14"]);
+    await active.sendHexBytes(["07"]);
 
     const editorPath = join(root!, "editor.sh");
     await waitForPath(`${editorPath}.open`);
@@ -443,7 +443,7 @@ tmuxTest(
     const pasted = "PASTE_AFTER_EDITOR_A\nPASTE_AFTER_EDITOR_B";
 
     await active.sendLiteralText(seed);
-    await active.sendHexBytes(["14"]);
+    await active.sendHexBytes(["07"]);
     await active.waitForText(edited, TIMEOUT);
     await active.pasteText(pasted);
     await active.waitForText("PASTE_AFTER_EDITOR_B", TIMEOUT);
@@ -458,7 +458,7 @@ tmuxTest(
 );
 
 tmuxTest(
-  "Ctrl+T streaming guards never launch an editor for owned draft or screen state",
+  "Ctrl+G streaming guards never launch an editor for owned draft or screen state",
   async () => {
     let releaseToolResponse: (response: Response) => void = undefined!;
     const toolResponse = new Promise<Response>((resolve) => {
@@ -482,7 +482,7 @@ tmuxTest(
 
       await pasteExact(active, "P".repeat(1001));
       await active.waitForText("[Pasted text #1, 1 line]", TIMEOUT);
-      await active.sendHexBytes(["14"]);
+      await active.sendHexBytes(["07"]);
       await active.waitForText(
         "external editing is unavailable while the draft contains pasted blocks, images, or skills",
         TIMEOUT,
@@ -496,7 +496,7 @@ tmuxTest(
         { path: "guarded.txt", content: "guarded\n" },
       ));
       await active.waitForText("Apply this change?", TIMEOUT);
-      await active.sendHexBytes(["14"]);
+      await active.sendHexBytes(["07"]);
       expect(existsSync(editorOpenPath)).toBe(false);
 
       await active.sendKeys("Enter");
@@ -504,7 +504,7 @@ tmuxTest(
       await active.waitForText("Thinking", TIMEOUT);
       await active.sendKeys("C-o");
       await active.waitForText("ctrl o close", TIMEOUT);
-      await active.sendHexBytes(["14"]);
+      await active.sendHexBytes(["07"]);
       expect(existsSync(editorOpenPath)).toBe(false);
 
       await active.sendKeys("C-o");
