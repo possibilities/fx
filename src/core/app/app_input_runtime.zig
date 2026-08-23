@@ -74,8 +74,8 @@ const ModelPickerStage = picker_state.ModelPickerStage;
 const ToolPermissionDecision = types.ToolPermissionDecision;
 
 pub const file_picker_completion_cap = input_completion_runtime.file_picker_completion_cap;
-const ctrl_g_upgrade_byte: u8 = 7;
-const ctrl_t_external_editor_byte: u8 = 20;
+const ctrl_g_external_editor_byte: u8 = 7;
+const ctrl_t_upgrade_byte: u8 = 20;
 const ctrl_x_manager_byte: u8 = 24;
 
 fn classifyResumeFailure(err: anyerror) session_catalog.ResumeFailure {
@@ -1147,7 +1147,7 @@ pub fn Runtime(comptime App: type) type {
         }
 
         fn routeUpgradeShortcut(app: *App, byte: u8) !bool {
-            if (byte != ctrl_g_upgrade_byte) return false;
+            if (byte != ctrl_t_upgrade_byte) return false;
             if (comptime @hasDecl(App, "applyReadyUpgradeShortcut")) {
                 try app.applyReadyUpgradeShortcut();
             }
@@ -1155,7 +1155,7 @@ pub fn Runtime(comptime App: type) type {
         }
 
         fn routeExternalEditorShortcut(app: *App, byte: u8, max_input_len: usize) !bool {
-            if (byte != ctrl_t_external_editor_byte) return false;
+            if (byte != ctrl_g_external_editor_byte) return false;
             if (comptime @hasField(App, "terminal")) {
                 if (app.terminal.alternate_screen_owner != .none) {
                     try app.writeDomainNotice(.{
@@ -1184,7 +1184,7 @@ pub fn Runtime(comptime App: type) type {
             max_input_len: usize,
         ) !bool {
             const byte = raw.byte;
-            if ((app.question_prompt.isActive() or approvalOwnsCurrentSurface(app)) and byte == ctrl_g_upgrade_byte) {
+            if ((app.question_prompt.isActive() or approvalOwnsCurrentSurface(app)) and byte == ctrl_t_upgrade_byte) {
                 _ = try routeUpgradeShortcut(app, byte);
                 return true;
             }
@@ -7250,65 +7250,17 @@ test "app_input_runtime remapped ctrl+c reaches prompt cancellation" {
     }
 }
 
-test "app_input_runtime ctrl+g invokes upgrade shortcut without composer mutation" {
+test "app_input_runtime ctrl+t invokes upgrade shortcut without composer mutation" {
     const alloc = std.testing.allocator;
     var app = try RoutingFakeApp.init(alloc);
     defer app.deinit();
 
-    try Runtime(RoutingFakeApp).handleByte(&app, ctrl_g_upgrade_byte, 4096, 100);
+    try Runtime(RoutingFakeApp).handleByte(&app, ctrl_t_upgrade_byte, 4096, 100);
 
     try std.testing.expectEqual(@as(usize, 1), app.upgrade_apply_count);
     try std.testing.expectEqual(@as(usize, 0), app.upgrade_denied_count);
     try std.testing.expectEqual(@as(usize, 0), app.input_runtime.edit_state.input.items.len);
     try std.testing.expectEqual(@as(usize, 0), app.submitted_prompt_count);
-}
-
-test "app_input_runtime immediate ctrl+g follows bare Escape" {
-    const alloc = std.testing.allocator;
-    var app = try RoutingFakeApp.init(alloc);
-    defer app.deinit();
-
-    try feedRoutingBytes(&app, "\x1b\x07");
-
-    try std.testing.expectEqual(@as(usize, 1), app.upgrade_apply_count);
-    try std.testing.expectEqual(@as(usize, 0), app.upgrade_denied_count);
-    try std.testing.expectEqual(@as(u8, 0), app.terminal_input_runtime.terminal_action_decoder.stage);
-}
-
-test "app_input_runtime ctrl+t invokes external editor without composer mutation" {
-    const alloc = std.testing.allocator;
-    var app = try RoutingFakeApp.init(alloc);
-    defer app.deinit();
-    try app.input_runtime.textReplacementState().replace(alloc, "draft");
-
-    try Runtime(RoutingFakeApp).handleByte(&app, ctrl_t_external_editor_byte, 4096, 100);
-
-    try std.testing.expectEqual(@as(usize, 1), app.external_editor_count);
-    try std.testing.expectEqualStrings("draft", app.input_runtime.edit_state.input.items);
-    try std.testing.expectEqual(@as(usize, 0), app.submitted_prompt_count);
-}
-
-test "app_input_runtime ctrl+t remains available while a response streams" {
-    const alloc = std.testing.allocator;
-    var app = try RoutingFakeApp.init(alloc);
-    defer app.deinit();
-    app.stream.active = true;
-
-    try Runtime(RoutingFakeApp).handleByte(&app, ctrl_t_external_editor_byte, 4096, 100);
-
-    try std.testing.expectEqual(@as(usize, 1), app.external_editor_count);
-}
-
-test "app_input_runtime ctrl+t is denied while an alternate screen owns the terminal" {
-    const alloc = std.testing.allocator;
-    var app = try RoutingFakeApp.init(alloc);
-    defer app.deinit();
-    app.terminal.alternate_screen_owner = .catalog_menu;
-
-    try Runtime(RoutingFakeApp).handleByte(&app, ctrl_t_external_editor_byte, 4096, 100);
-
-    try std.testing.expectEqual(@as(usize, 0), app.external_editor_count);
-    try std.testing.expect(std.mem.find(u8, app.notice_body.items, "another screen") != null);
 }
 
 test "app_input_runtime immediate ctrl+t follows bare Escape" {
@@ -7317,6 +7269,54 @@ test "app_input_runtime immediate ctrl+t follows bare Escape" {
     defer app.deinit();
 
     try feedRoutingBytes(&app, "\x1b\x14");
+
+    try std.testing.expectEqual(@as(usize, 1), app.upgrade_apply_count);
+    try std.testing.expectEqual(@as(usize, 0), app.upgrade_denied_count);
+    try std.testing.expectEqual(@as(u8, 0), app.terminal_input_runtime.terminal_action_decoder.stage);
+}
+
+test "app_input_runtime ctrl+g invokes external editor without composer mutation" {
+    const alloc = std.testing.allocator;
+    var app = try RoutingFakeApp.init(alloc);
+    defer app.deinit();
+    try app.input_runtime.textReplacementState().replace(alloc, "draft");
+
+    try Runtime(RoutingFakeApp).handleByte(&app, ctrl_g_external_editor_byte, 4096, 100);
+
+    try std.testing.expectEqual(@as(usize, 1), app.external_editor_count);
+    try std.testing.expectEqualStrings("draft", app.input_runtime.edit_state.input.items);
+    try std.testing.expectEqual(@as(usize, 0), app.submitted_prompt_count);
+}
+
+test "app_input_runtime ctrl+g remains available while a response streams" {
+    const alloc = std.testing.allocator;
+    var app = try RoutingFakeApp.init(alloc);
+    defer app.deinit();
+    app.stream.active = true;
+
+    try Runtime(RoutingFakeApp).handleByte(&app, ctrl_g_external_editor_byte, 4096, 100);
+
+    try std.testing.expectEqual(@as(usize, 1), app.external_editor_count);
+}
+
+test "app_input_runtime ctrl+g is denied while an alternate screen owns the terminal" {
+    const alloc = std.testing.allocator;
+    var app = try RoutingFakeApp.init(alloc);
+    defer app.deinit();
+    app.terminal.alternate_screen_owner = .catalog_menu;
+
+    try Runtime(RoutingFakeApp).handleByte(&app, ctrl_g_external_editor_byte, 4096, 100);
+
+    try std.testing.expectEqual(@as(usize, 0), app.external_editor_count);
+    try std.testing.expect(std.mem.find(u8, app.notice_body.items, "another screen") != null);
+}
+
+test "app_input_runtime immediate ctrl+g follows bare Escape" {
+    const alloc = std.testing.allocator;
+    var app = try RoutingFakeApp.init(alloc);
+    defer app.deinit();
+
+    try feedRoutingBytes(&app, "\x1b\x07");
 
     try std.testing.expectEqual(@as(usize, 1), app.external_editor_count);
     try std.testing.expectEqual(@as(u8, 0), app.terminal_input_runtime.terminal_action_decoder.stage);
@@ -7437,7 +7437,7 @@ test "app_input_runtime ctrl+d does not exit while a response is streaming" {
     try std.testing.expect(!app.should_exit);
 }
 
-test "app_input_runtime ctrl+g is denied while stream or modal owns state" {
+test "app_input_runtime ctrl+t is denied while stream or modal owns state" {
     const alloc = std.testing.allocator;
 
     {
@@ -7445,7 +7445,7 @@ test "app_input_runtime ctrl+g is denied while stream or modal owns state" {
         defer app.deinit();
         app.stream.active = true;
 
-        try Runtime(RoutingFakeApp).handleByte(&app, ctrl_g_upgrade_byte, 4096, 100);
+        try Runtime(RoutingFakeApp).handleByte(&app, ctrl_t_upgrade_byte, 4096, 100);
 
         try std.testing.expectEqual(@as(usize, 0), app.upgrade_apply_count);
         try std.testing.expectEqual(@as(usize, 1), app.upgrade_denied_count);
@@ -7463,7 +7463,7 @@ test "app_input_runtime ctrl+g is denied while stream or modal owns state" {
         };
         try app.question_prompt.syncFrom(alloc, &entries);
 
-        try Runtime(RoutingFakeApp).handleByte(&app, ctrl_g_upgrade_byte, 4096, 100);
+        try Runtime(RoutingFakeApp).handleByte(&app, ctrl_t_upgrade_byte, 4096, 100);
 
         try std.testing.expectEqual(@as(usize, 0), app.upgrade_apply_count);
         try std.testing.expectEqual(@as(usize, 1), app.upgrade_denied_count);

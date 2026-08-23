@@ -34,7 +34,7 @@
 - **MCP reload feedback:** Replace internal health details with concise server availability and recovery guidance
 - **Help layout:** Keep command descriptions close to command names on wide terminals
 - **Native binary size:** Reduce the macOS arm64 release footprint while preserving existing behavior
-- **Stable upgrades:** Restore forward-only version ordering across manual, automatic, and Ctrl+G upgrades
+- **Stable upgrades:** Restore forward-only version ordering across manual, automatic, and Ctrl+T upgrades
 
 ### Bug Fixes
 

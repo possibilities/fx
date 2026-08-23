@@ -49,7 +49,7 @@ pub fn Runtime(comptime App: type) type {
         fn reportFailure(app: *App, failure: host.ExternalEditor.Failure) !void {
             const summary = switch (failure.reason) {
                 .unavailable => "external editing is unavailable on this host",
-                .missing_editor => "set VISUAL or EDITOR to use Ctrl+T",
+                .missing_editor => "set VISUAL or EDITOR to use Ctrl+G",
                 .invalid_command => "VISUAL or EDITOR must name an executable and arguments without shell operators",
                 .editor_failed => "the external editor failed",
                 .output_invalid => "the external editor returned invalid text",
