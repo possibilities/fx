@@ -76,7 +76,7 @@ Every line has the same envelope:
   "instance_id": "instance-17",
   "context": {
     "agent_role": "main",
-    "workspace_root": "/Users/alice/src/project",
+    "workspace_root": "/workspace/project",
     "session_id": "01J...",
     "parent_session_id": null,
     "subagent_id": null,
