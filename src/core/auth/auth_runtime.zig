@@ -7,6 +7,7 @@ const host = @import("../hosts/host.zig");
 const host_target = @import("../hosts/target.zig");
 const login_flow = @import("login_flow.zig");
 const model_provider = @import("../config/model_provider.zig");
+const provider_catalog = @import("provider_catalog.zig");
 const oauth_transport = @import("oauth_transport.zig");
 const secret = @import("secret.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
@@ -480,7 +481,7 @@ pub const PickerView = struct {
 
     pub fn choiceLabel(self: PickerView, choice: Choice) []const u8 {
         return switch (choice) {
-            .provider => |provider| model_provider.label(provider),
+            .provider => |provider| provider_catalog.label(provider),
             .source => |source| credentials.sourceLabel(source),
             .action => |action| switch (action) {
                 .login => "Sign in with Vercel",
