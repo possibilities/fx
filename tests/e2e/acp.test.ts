@@ -8311,6 +8311,81 @@ describe("acp: model catalog authentication", () => {
   );
 
   test(
+    "--effort overrides FX_EFFORT for ACP without changing the saved effort",
+    async () => {
+      const root = createIsolatedRoot("fx-acp-cli-effort-override-");
+      const model = "provider/cli-effort-override";
+      const gateway = startFakeGateway(
+        [finalText("CLI override complete"), finalText("saved effort complete")],
+        {
+          models: [{
+            id: model,
+            type: "language",
+            tags: ["reasoning", "tool-use"],
+            context_window: 750_000,
+            max_tokens: 64_000,
+            reasoning_options: [{ type: "effort", values: ["low", "high"] }],
+          }],
+        },
+      );
+      writeFileSync(
+        join(root.home, ".fx", "settings.json"),
+        `${JSON.stringify({ model, effort: "low" })}\n`,
+      );
+      const env = {
+        ...fakeGatewayEnv(root, gateway),
+        FX_MODEL: undefined,
+        FX_E2E_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+        FX_EFFORT: "low",
+      };
+      try {
+        client = await AcpClient.create({
+          args: ["acp", "--effort", "high"],
+          cwd: root.workspace,
+          env,
+        });
+        const sessionId = await startCodeSession(client);
+        const overridden = await runPrompt(client, "Confirm the CLI effort override.");
+        expect(overridden.promptResult.result.stopReason).toBe("end_turn");
+        expect(gateway.requests).toHaveLength(1);
+        expect(JSON.parse(gateway.requests[0]!.body)).toMatchObject({
+          reasoning: "high",
+        });
+
+        await client.close();
+        client = await AcpClient.create({
+          cwd: root.workspace,
+          env: { ...env, FX_EFFORT: undefined },
+        });
+        await client.request("initialize", { protocolVersion: 1 }, 20);
+        client.send({
+          jsonrpc: "2.0",
+          id: 21,
+          method: "session/load",
+          params: { sessionId, mcpServers: [] },
+        });
+        let loadResponse: any = null;
+        while (loadResponse === null) {
+          const message = await client.readLine() as any;
+          if (message.id === 21) loadResponse = message;
+        }
+        expect(loadResponse.error).toBeUndefined();
+        const saved = await runPrompt(client, "Confirm the configured effort.");
+        expect(saved.promptResult.result.stopReason).toBe("end_turn");
+        expect(gateway.requests).toHaveLength(2);
+        expect(JSON.parse(gateway.requests[1]!.body)).toMatchObject({
+          reasoning: "low",
+        });
+      } finally {
+        await client?.close();
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
     "--model flag overrides selected model without inheriting the default Fast mode",
     async () => {
       const root = createIsolatedRoot("fx-acp-model-override-");
