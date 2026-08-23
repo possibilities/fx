@@ -2535,7 +2535,7 @@ describe("effect-aware command permissions", () => {
       expect(gateway.classifierRequests).toHaveLength(1);
       expect(pane).not.toContain("Auto agent denied");
       expect(pane).toContain("1 denied");
-      expect(pane).toContain(`Denied by auto agent ${command}`);
+      expect(pane).toContain(`Safety caution ${command}`);
       expect(pane).not.toContain("└ terminal");
       expect(gateway.requests).toHaveLength(2);
       const permissionResultRequest = gateway.requests[1]!.body;
@@ -2567,10 +2567,11 @@ describe("effect-aware command permissions", () => {
       });
       await activeSession.waitForComposer(TIMEOUT);
       const resumedPane = await activeSession.waitForPane(
-        (value) => value.includes(`Denied by auto agent ${command}`),
+        (value) => value.includes(`Failed ${command}`) && value.includes("tool_review_held"),
         TIMEOUT,
       );
-      expect(resumedPane).toContain("1 denied");
+      expect(resumedPane).toContain("1 failed");
+      expect(resumedPane).toContain("Action held after safety review");
       expect(resumedPane).not.toContain("└ terminal");
       expect(resumedPane).not.toContain("tool_permission_denied");
       expect(gateway.requests).toHaveLength(2);
