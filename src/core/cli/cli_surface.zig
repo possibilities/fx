@@ -386,6 +386,14 @@ const GlobalLaunchArgs = struct {
     }
 };
 
+/// Duplicates a global path argument and transfers its ownership to `paths`.
+/// If growing the list fails, this helper remains responsible for the duplicate.
+fn dupeAndAppendPath(alloc: Allocator, paths: *std.ArrayList([]u8), value: []const u8) !void {
+    const path = try alloc.dupe(u8, value);
+    errdefer alloc.free(path);
+    try paths.append(alloc, path);
+}
+
 fn parseGlobalLaunchArgs(
     alloc: Allocator,
     args: []const [:0]const u8,
@@ -418,11 +426,11 @@ fn parseGlobalLaunchArgs(
         } else if (std.mem.eql(u8, arg, "--add-dir")) {
             index += 1;
             if (index >= args.len or args[index].len == 0) return error.MissingAddDirectoryValue;
-            try directories.append(alloc, try alloc.dupe(u8, args[index]));
+            try dupeAndAppendPath(alloc, &directories, args[index]);
         } else if (std.mem.startsWith(u8, arg, "--add-dir=")) {
             const value = arg["--add-dir=".len..];
             if (value.len == 0) return error.MissingAddDirectoryValue;
-            try directories.append(alloc, try alloc.dupe(u8, value));
+            try dupeAndAppendPath(alloc, &directories, value);
         } else if (std.mem.eql(u8, arg, "--no-additional-dirs")) {
             if (suppress_saved) return error.DuplicateAdditionalDirectorySuppression;
             suppress_saved = true;
@@ -439,11 +447,11 @@ fn parseGlobalLaunchArgs(
         } else if (std.mem.eql(u8, arg, "--append-system-prompt-file")) {
             index += 1;
             if (index >= args.len or args[index].len == 0) return error.MissingAppendSystemPromptFileValue;
-            try append_paths.append(alloc, try alloc.dupe(u8, args[index]));
+            try dupeAndAppendPath(alloc, &append_paths, args[index]);
         } else if (std.mem.startsWith(u8, arg, "--append-system-prompt-file=")) {
             const value = arg["--append-system-prompt-file=".len..];
             if (value.len == 0) return error.MissingAppendSystemPromptFileValue;
-            try append_paths.append(alloc, try alloc.dupe(u8, value));
+            try dupeAndAppendPath(alloc, &append_paths, value);
         } else {
             break;
         }
