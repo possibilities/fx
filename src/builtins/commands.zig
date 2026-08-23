@@ -327,6 +327,10 @@ pub const top_level_flags = [_]TopLevelFlag{
         .description = "Append UTF-8 system prompt file; repeatable",
     },
     .{
+        .usage = "--skills-dir <path>",
+        .description = "Load an invocation skill root; repeatable",
+    },
+    .{
         .usage = "--context-limit <spec>",
         .description = "Set name=bytes|off; repeatable",
     },
