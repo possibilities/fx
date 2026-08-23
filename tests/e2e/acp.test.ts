@@ -593,7 +593,7 @@ function startAcpFakeCodex(options: {
       if (path === "/models") {
         modelRequests.push(recorded);
         return Response.json({ models: [
-          { slug: "gpt-5.6-sol", visibility: "list", supported_in_api: true, supported_reasoning_levels: [{ effort: "high" }], additional_speed_tiers: ["fast"], input_modalities: ["text", "image"], context_window: 272000 },
+          { slug: "gpt-5.6-sol", visibility: "list", supported_in_api: true, supported_reasoning_levels: [{ effort: "low" }, { effort: "high" }], additional_speed_tiers: ["fast"], input_modalities: ["text", "image"], context_window: 272000 },
           { slug: "gpt-5.4-mini", visibility: "list", supported_in_api: true, supported_reasoning_levels: [{ effort: "low" }], additional_speed_tiers: [], input_modalities: ["text"], context_window: 128000 },
         ] });
       }
@@ -8378,6 +8378,69 @@ describe("acp: model catalog authentication", () => {
         });
       } finally {
         await client?.close();
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "--effort directs Codex Responses requests without changing the saved effort",
+    async () => {
+      const root = createIsolatedRoot("fx-acp-codex-cli-effort-override-");
+      const gateway = startFakeGateway([]);
+      const codex = startAcpFakeCodex();
+      writeSeededAcpChatGptLogin(root.home, codex.accessToken);
+      writeFileSync(
+        join(root.home, ".fx", "settings.json"),
+        `${JSON.stringify({
+          provider: "codex",
+          codex_model: "gpt-5.6-sol",
+          effort: "low",
+        })}\n`,
+      );
+      const env = {
+        ...fakeGatewayEnv(root, gateway),
+        FX_MODEL: undefined,
+        FX_E2E_OPENAI_CODEX_RESPONSES_URL: codex.responsesUrl,
+        FX_E2E_OPENAI_CODEX_MODELS_URL: codex.modelsUrl,
+      };
+      try {
+        client = await AcpClient.create({
+          args: ["acp", "--effort", "high"],
+          cwd: root.workspace,
+          env,
+        });
+        const sessionId = await startCodeSession(client);
+        const overridden = await runPrompt(client, "Confirm the Codex CLI effort override.");
+        expect(overridden.promptResult.result.stopReason).toBe("end_turn");
+        expect(codex.requests).toHaveLength(1);
+        expect(JSON.parse(codex.requests[0]!.body)).toMatchObject({
+          reasoning: { effort: "high" },
+        });
+
+        await client.close();
+        client = await AcpClient.create({ cwd: root.workspace, env });
+        await client.request("initialize", { protocolVersion: 1 }, 20);
+        client.send({
+          jsonrpc: "2.0",
+          id: 21,
+          method: "session/load",
+          params: { sessionId, mcpServers: [] },
+        });
+        const loadResponse = await readResponse(client, 21);
+        expect(loadResponse.error).toBeUndefined();
+        const saved = await runPrompt(client, "Confirm the saved Codex effort.");
+        expect(saved.promptResult.result.stopReason).toBe("end_turn");
+        expect(codex.requests).toHaveLength(2);
+        expect(JSON.parse(codex.requests[1]!.body)).toMatchObject({
+          reasoning: { effort: "low" },
+        });
+        expect(client.stderr).toBe("");
+      } finally {
+        await client?.close();
+        codex.stop();
         gateway.stop();
         rmSync(root.root, { recursive: true, force: true });
       }
