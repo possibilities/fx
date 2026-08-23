@@ -1,0 +1,280 @@
+const std = @import("std");
+const io_mod = @import("../shared/io.zig");
+const text_utils = @import("../shared/text_utils.zig");
+
+const Allocator = std.mem.Allocator;
+
+pub const max_custom_bytes: usize = 256 * 1024;
+
+pub const Request = struct {
+    replacement_path: ?[]u8 = null,
+    append_paths: [][]u8 = &.{},
+
+    pub fn deinit(self: *Request, alloc: Allocator) void {
+        if (self.replacement_path) |path| alloc.free(path);
+        for (self.append_paths) |path| alloc.free(path);
+        if (self.append_paths.len > 0) alloc.free(self.append_paths);
+        self.* = .{};
+    }
+
+    pub fn requested(self: Request) bool {
+        return self.replacement_path != null or self.append_paths.len > 0;
+    }
+
+    pub fn compose(self: Request, alloc: Allocator, base: []const u8) !ComposeResult {
+        var pieces: std.ArrayList([]u8) = .empty;
+        defer {
+            for (pieces.items) |piece| alloc.free(piece);
+            pieces.deinit(alloc);
+        }
+
+        var custom_bytes: usize = 0;
+        if (self.replacement_path) |path| {
+            const loaded = try loadOne(alloc, path, custom_bytes);
+            switch (loaded) {
+                .failure => |failure| return .{ .failure = failure },
+                .content => |content| {
+                    custom_bytes += content.len;
+                    try pieces.append(alloc, content);
+                },
+            }
+        }
+        for (self.append_paths) |path| {
+            const loaded = try loadOne(alloc, path, custom_bytes);
+            switch (loaded) {
+                .failure => |failure| return .{ .failure = failure },
+                .content => |content| {
+                    custom_bytes += content.len;
+                    try pieces.append(alloc, content);
+                },
+            }
+        }
+
+        var out: std.Io.Writer.Allocating = .init(alloc);
+        errdefer out.deinit();
+        const writer = &out.writer;
+        if (self.replacement_path == null) try writer.writeAll(base);
+        for (pieces.items) |piece| {
+            if (writer.buffered().len > 0 and piece.len > 0) try writer.writeAll("\n\n");
+            try writer.writeAll(piece);
+        }
+        return .{ .prompt = try out.toOwnedSlice() };
+    }
+};
+
+pub const FailureReason = enum {
+    unreadable,
+    not_regular_file,
+    too_large,
+    invalid_text,
+};
+
+pub const Failure = struct {
+    path: []const u8,
+    reason: FailureReason,
+};
+
+pub const ComposeResult = union(enum) {
+    prompt: []u8,
+    failure: Failure,
+};
+
+const LoadResult = union(enum) {
+    content: []u8,
+    failure: Failure,
+};
+
+fn loadOne(alloc: Allocator, path: []const u8, custom_bytes: usize) !LoadResult {
+    if (custom_bytes > max_custom_bytes) return .{ .failure = .{ .path = path, .reason = .too_large } };
+
+    // Inspect the path before opening it so a directory, device, or FIFO cannot
+    // be treated as a prompt source (and, in particular, a FIFO cannot block
+    // launch while waiting for a writer). Recheck the opened handle below: a
+    // path may change between the two operations.
+    const initial_stat = std.Io.Dir.cwd().statFile(io_mod.getIo(), path, .{}) catch
+        return .{ .failure = .{ .path = path, .reason = .unreadable } };
+    if (initial_stat.kind != .file) return .{ .failure = .{ .path = path, .reason = .not_regular_file } };
+
+    var file = io_mod.openExistingReadOnlyRegularFile(
+        std.Io.Dir.cwd(),
+        path,
+        .follow,
+    ) catch |err| switch (err) {
+        error.DurablePathUnsafe => return .{ .failure = .{ .path = path, .reason = .not_regular_file } },
+        else => return .{ .failure = .{ .path = path, .reason = .unreadable } },
+    };
+    defer file.close(io_mod.getIo());
+    const stat = file.stat(io_mod.getIo()) catch
+        return .{ .failure = .{ .path = path, .reason = .unreadable } };
+    if (stat.kind != .file) return .{ .failure = .{ .path = path, .reason = .not_regular_file } };
+
+    const remaining = max_custom_bytes - custom_bytes;
+    if (stat.size > remaining) return .{ .failure = .{ .path = path, .reason = .too_large } };
+    const content = io_mod.readFileToEnd(alloc, &file, remaining + 1) catch |err| switch (err) {
+        error.StreamTooLong => return .{ .failure = .{ .path = path, .reason = .too_large } },
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return .{ .failure = .{ .path = path, .reason = .unreadable } },
+    };
+    if (content.len > remaining) {
+        alloc.free(content);
+        return .{ .failure = .{ .path = path, .reason = .too_large } };
+    }
+    if (!text_utils.isModelSafeText(content)) {
+        alloc.free(content);
+        return .{ .failure = .{ .path = path, .reason = .invalid_text } };
+    }
+    return .{ .content = content };
+}
+
+fn writeFile(dir: std.Io.Dir, path: []const u8, content: []const u8) !void {
+    var file = try dir.createFile(std.testing.io, path, .{});
+    defer file.close(std.testing.io);
+    try file.writeStreamingAll(std.testing.io, content);
+}
+
+test "compose replaces the base and appends files in CLI order" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeFile(tmp.dir, "replacement", "replacement");
+    try writeFile(tmp.dir, "first", "first");
+    try writeFile(tmp.dir, "second", "second");
+    const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(root);
+    const replacement = try std.fs.path.join(alloc, &.{ root, "replacement" });
+    defer alloc.free(replacement);
+    const first = try std.fs.path.join(alloc, &.{ root, "first" });
+    defer alloc.free(first);
+    const second = try std.fs.path.join(alloc, &.{ root, "second" });
+    defer alloc.free(second);
+
+    const result = try (Request{
+        .replacement_path = replacement,
+        .append_paths = @constCast(&[_][]u8{ first, second }),
+    }).compose(alloc, "base");
+    switch (result) {
+        .failure => return error.TestUnexpectedResult,
+        .prompt => |prompt| {
+            defer alloc.free(prompt);
+            try std.testing.expectEqualStrings("replacement\n\nfirst\n\nsecond", prompt);
+        },
+    }
+}
+
+test "compose preserves the supplied base for append-only requests" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeFile(tmp.dir, "append", "extra");
+    const path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "append");
+    defer alloc.free(path);
+    const result = try (Request{ .append_paths = @constCast(&[_][]u8{path}) }).compose(alloc, "profile base");
+    switch (result) {
+        .failure => return error.TestUnexpectedResult,
+        .prompt => |prompt| {
+            defer alloc.free(prompt);
+            try std.testing.expectEqualStrings("profile base\n\nextra", prompt);
+        },
+    }
+}
+
+test "compose rejects invalid model text" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeFile(tmp.dir, "invalid", "bad\x00prompt");
+    const path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "invalid");
+    defer alloc.free(path);
+    const result = try (Request{ .replacement_path = path }).compose(alloc, "base");
+    switch (result) {
+        .prompt => |prompt| {
+            alloc.free(prompt);
+            return error.TestUnexpectedResult;
+        },
+        .failure => |failure| try std.testing.expectEqual(FailureReason.invalid_text, failure.reason),
+    }
+}
+
+test "compose rejects non-UTF-8 text and non-regular files" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeFile(tmp.dir, "invalid-utf8", "bad\xffprompt");
+    try tmp.dir.createDir(std.testing.io, "directory", .default_dir);
+    const invalid_utf8 = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "invalid-utf8");
+    defer alloc.free(invalid_utf8);
+    const directory = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "directory");
+    defer alloc.free(directory);
+
+    const invalid_result = try (Request{ .replacement_path = invalid_utf8 }).compose(alloc, "base");
+    switch (invalid_result) {
+        .prompt => |prompt| {
+            alloc.free(prompt);
+            return error.TestUnexpectedResult;
+        },
+        .failure => |failure| try std.testing.expectEqual(FailureReason.invalid_text, failure.reason),
+    }
+
+    const directory_result = try (Request{ .replacement_path = directory }).compose(alloc, "base");
+    switch (directory_result) {
+        .prompt => |prompt| {
+            alloc.free(prompt);
+            return error.TestUnexpectedResult;
+        },
+        .failure => |failure| try std.testing.expectEqual(FailureReason.not_regular_file, failure.reason),
+    }
+}
+
+test "compose bounds the combined custom prompt bytes" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const exact_limit = try alloc.alloc(u8, max_custom_bytes);
+    defer alloc.free(exact_limit);
+    @memset(exact_limit, 'a');
+    try writeFile(tmp.dir, "replacement", exact_limit);
+    try writeFile(tmp.dir, "append", "x");
+    const replacement = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "replacement");
+    defer alloc.free(replacement);
+    const append = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "append");
+    defer alloc.free(append);
+
+    const result = try (Request{
+        .replacement_path = replacement,
+        .append_paths = @constCast(&[_][]u8{append}),
+    }).compose(alloc, "base");
+    switch (result) {
+        .prompt => |prompt| {
+            alloc.free(prompt);
+            return error.TestUnexpectedResult;
+        },
+        .failure => |failure| try std.testing.expectEqual(FailureReason.too_large, failure.reason),
+    }
+}
+
+test "compose permits an empty file at the exact combined byte limit" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const exact_limit = try alloc.alloc(u8, max_custom_bytes);
+    defer alloc.free(exact_limit);
+    @memset(exact_limit, 'a');
+    try writeFile(tmp.dir, "replacement", exact_limit);
+    try writeFile(tmp.dir, "empty-append", "");
+    const replacement = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "replacement");
+    defer alloc.free(replacement);
+    const append = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "empty-append");
+    defer alloc.free(append);
+
+    const result = try (Request{
+        .replacement_path = replacement,
+        .append_paths = @constCast(&[_][]u8{append}),
+    }).compose(alloc, "base");
+    switch (result) {
+        .failure => return error.TestUnexpectedResult,
+        .prompt => |prompt| {
+            defer alloc.free(prompt);
+            try std.testing.expectEqual(max_custom_bytes, prompt.len);
+        },
+    }
+}

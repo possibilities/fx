@@ -99,6 +99,22 @@ Use `fx ask` for a single request:
 fx ask "explain the changes in this repository"
 ```
 
+Customize the system prompt for one model-launching invocation with global
+file options placed before the command:
+
+```bash
+fx --system-prompt-file ./base-prompt.md ask "review this change"
+fx --append-system-prompt-file ./team-rules.md --append-system-prompt-file ./task-rules.md
+```
+
+`--system-prompt-file` replaces the effective base prompt and may be supplied
+once. `--append-system-prompt-file` preserves that base and adds files in CLI
+order, separated by blank lines. The options also apply to interactive and
+resumed sessions, ACP, `pr`, and `issue`. Custom prompt files must be regular
+UTF-8 files without NUL bytes and may contain at most 256 KiB combined. File
+errors stop the launch. For `fx ask`, these options cannot be combined with
+the inline `--system` option.
+
 fx starts in `auto` permission mode. Routine understood development actions run directly; unresolved sensitive actions receive one bounded automatic review. A blocked action may return an exact approval request that the agent can send to fx's real permission screen. Ordinary question text never grants permission. See [Permissions](https://fx.sh/docs/configure-fx/permissions) for other modes and persistent rules.
 
 JSON and quiet requests stay noninteractive by default. Add `--prompt-permissions` to allow the existing Y/N approval prompt when stdin is a TTY. Prompt text is written to stderr, so JSON stdout stays parseable and quiet stdout stays empty. Piped or redirected stdin remains noninteractive and fails instead of waiting for approval.
