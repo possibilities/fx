@@ -11,6 +11,7 @@ const mode_registry = @import("../modes/mode_registry.zig");
 const permission_auto_classifier = @import("../permissions/auto_classifier.zig");
 const prompt_policy = @import("../config/prompt_policy.zig");
 const context_contract = @import("../workspace/context_contract.zig");
+const types = @import("../shared/types.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -43,6 +44,7 @@ pub const Config = struct {
     codex_permission_reviewer_provider: ?permission_auto_classifier.Provider = null,
     grok_permission_reviewer_provider: ?permission_auto_classifier.Provider = null,
     model_override: ?[]const u8 = null,
+    effort_override: ?types.ReasoningEffort = null,
     credential_override: ?[]const u8 = null,
     home_override: ?[]const u8 = null,
     workspace_root_override: ?[]const u8 = null,
