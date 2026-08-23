@@ -32,8 +32,12 @@ pub const PostTurnEndCheckpoint = struct {
 };
 
 pub const AttentionRequiredCheckpoint = struct {
-    turn_id: u64,
+    turn_id: ?u64,
     kind: hooks.AttentionKind,
+};
+
+pub const TurnStartedCheckpoint = struct {
+    turn_id: u64,
 };
 
 const PreToolUseCheckpoint = struct {
@@ -201,6 +205,18 @@ pub fn dispatchPostTurnEndCheckpoint(
         },
         .outcome = checkpoint.outcome,
         .provider_disposition = checkpoint.provider_disposition,
+    });
+}
+
+pub fn dispatchTurnStartedCheckpoint(
+    lifecycle: LifecycleContext,
+    checkpoint: TurnStartedCheckpoint,
+) void {
+    lifecycle.view.runTurnStarted(.{
+        .invocation = .{
+            .scope = lifecycle.scope,
+            .turn_id = checkpoint.turn_id,
+        },
     });
 }
 

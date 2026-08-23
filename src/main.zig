@@ -382,6 +382,7 @@ const App = struct {
         Self,
         builtin_hooks.notifications.provider(Self),
     );
+    const AdeAppRuntime = builtin_hooks.ade_events.Runtime(Self);
     const HerdrAppRuntime = builtin_hooks.Runtime(Self);
     const RenderAppRuntime = app_render_runtime.Runtime(Self);
     const SessionAppRuntime = app_session_runtime.Runtime(Self);
@@ -511,6 +512,7 @@ const App = struct {
     lifecycle_runtime: hooks.Runtime = hooks.Runtime.init(std.heap.c_allocator),
     lifecycle_view: hooks.RuntimeView = hooks.RuntimeView.empty(),
     notifications: builtin_hooks.notifications.State = .{},
+    ade_events: builtin_hooks.ade_events.Client = .{},
     herdr: builtin_hooks.Client = .{},
 
     session: SessionRuntime = SessionRuntime.init(
@@ -669,10 +671,16 @@ const App = struct {
     }
 
     pub fn configureNotifications(self: *App) !void {
-        // Register herdr hooks before NotificationAppRuntime.configure freezes
-        // the lifecycle runtime (its call to freeze() is the sole freeze site).
+        // Register built-in observers before NotificationAppRuntime.configure
+        // freezes the lifecycle runtime (its call to freeze() is the sole
+        // freeze site).
         try HerdrAppRuntime.configure(self, SessionAppRuntime.activeSessionId(self));
+        try AdeAppRuntime.configure(self, SessionAppRuntime.activeSessionId(self));
         try NotificationAppRuntime.configure(self);
+    }
+
+    pub fn reportSessionIdentityChanged(self: *App, session_id: ?[]const u8) void {
+        AdeAppRuntime.reportSessionChanged(self, session_id);
     }
 
     pub fn rebindAfterInit(self: *App) void {
@@ -741,6 +749,42 @@ const App = struct {
         kind: hooks.AttentionKind,
     ) void {
         NotificationAppRuntime.dispatchAttentionRequired(self, turn_id, kind);
+    }
+
+    pub fn reportAdeMainAttentionRequired(
+        self: *App,
+        turn_id: u64,
+        kind: hooks.AttentionKind,
+    ) void {
+        AdeAppRuntime.reportAttentionRequired(self, .{
+            .invocation = .{
+                .scope = .{
+                    .kind = .interactive,
+                    .workspace_root = self.workspace_root,
+                    .session_id = SessionAppRuntime.activeSessionId(self),
+                },
+                .turn_id = turn_id,
+            },
+            .kind = kind,
+        });
+    }
+
+    pub fn reportAdeSubagentAttentionRequired(
+        self: *App,
+        child_session_id: []const u8,
+        kind: hooks.AttentionKind,
+    ) void {
+        AdeAppRuntime.reportAttentionRequired(self, .{
+            .invocation = .{
+                .scope = .{
+                    .kind = .subagent,
+                    .workspace_root = self.workspace_root,
+                    .session_id = child_session_id,
+                },
+                .turn_id = null,
+            },
+            .kind = kind,
+        });
     }
 
     /// Must be called after init() returns so the AutoUpgrade thread
@@ -831,6 +875,7 @@ const App = struct {
         self.web_fetch_runtime.deinit(self.alloc);
         self.web_search_runtime.deinit();
         self.subagents.deinit(self.alloc);
+        self.ade_events.deinit();
         self.queued_prompt_review.deinit(self.alloc);
         self.prompt_history.deinit(self.alloc);
         self.clearPendingImages();
@@ -1344,7 +1389,7 @@ const App = struct {
                 review,
             );
 
-        try self.worker.enqueuePrompt(std.heap.c_allocator, .{
+        try self.worker.enqueuePromptObserved(std.heap.c_allocator, .{
             .turn_id = if (recovery_checkpoint) |checkpoint| checkpoint.turn_id else 0,
             .prompt = prompt_copy,
             .images = images_copy,
@@ -1365,9 +1410,17 @@ const App = struct {
             .context_snapshot = context_snapshot_copy,
             .recovery_checkpoint = recovery_checkpoint_copy,
             .recovery_source_already_presented = recovery_checkpoint != null,
+        }, .{
+            .ctx = self,
+            .report = reportAdePromptAdmission,
         });
         HerdrAppRuntime.reportWorking(self);
         return true;
+    }
+
+    fn reportAdePromptAdmission(raw: *anyopaque) void {
+        const self: *App = @ptrCast(@alignCast(raw));
+        AdeAppRuntime.reportPromptQueued(self);
     }
 
     pub fn installInitialMcpRuntime(self: *App, runtime: ?*mcp_runtime_mod.McpRuntime) void {
