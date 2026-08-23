@@ -780,7 +780,21 @@ pub const WorkerRuntime = struct {
         return self.takeEventBatch().events;
     }
 
+    pub const PromptAdmissionObserver = struct {
+        ctx: *anyopaque,
+        report: *const fn (ctx: *anyopaque) void,
+    };
+
     pub fn enqueuePrompt(self: *WorkerRuntime, alloc: std.mem.Allocator, prompt: QueuedPrompt) !void {
+        return self.enqueuePromptObserved(alloc, prompt, null);
+    }
+
+    pub fn enqueuePromptObserved(
+        self: *WorkerRuntime,
+        alloc: std.mem.Allocator,
+        prompt: QueuedPrompt,
+        observer: ?PromptAdmissionObserver,
+    ) !void {
         var queued = prompt;
         if (queued.turn_id == 0) queued.turn_id = debug_trace.nextTurnId();
 
@@ -812,6 +826,7 @@ pub const WorkerRuntime = struct {
             "prompt_bytes={d} queue_depth={d} fast_mode={s} effort={s}",
             .{ queued.prompt.len, self.queued_prompt_count, if (queued.agent_settings.fast_mode) "true" else "false", queued.agent_settings.effort.label() },
         );
+        if (observer) |admitted| admitted.report(admitted.ctx);
         self.worker_cond.broadcast(io_mod.getIo());
     }
 
@@ -3101,6 +3116,45 @@ test "state snapshot allocation failures preserve pending event ownership" {
         checkStateSnapshotFailurePreservesPendingEvents,
         .{},
     );
+}
+
+test "prompt admission observer runs exactly once only after queue admission" {
+    const AdmissionCapture = struct {
+        calls: usize = 0,
+
+        fn report(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+        }
+    };
+
+    const alloc = std.testing.allocator;
+    var runtime = WorkerRuntime{};
+    defer runtime.deinit(alloc);
+    var capture = AdmissionCapture{};
+    try runtime.enqueuePromptObserved(
+        alloc,
+        try makePrompt(alloc, "accepted", "model"),
+        .{ .ctx = &capture, .report = AdmissionCapture.report },
+    );
+    try std.testing.expectEqual(@as(usize, 1), capture.calls);
+    try std.testing.expectEqual(@as(usize, 1), runtime.queued_prompt_count);
+
+    runtime.latchFinalizationFailure(.{
+        .turn_id = 40,
+        .outcome = .failed,
+    });
+    const rejected = try makePrompt(alloc, "rejected", "model");
+    try std.testing.expectError(
+        error.TurnFinalizationDeliveryFailed,
+        runtime.enqueuePromptObserved(
+            alloc,
+            rejected,
+            .{ .ctx = &capture, .report = AdmissionCapture.report },
+        ),
+    );
+    freeQueuedPrompt(alloc, rejected);
+    try std.testing.expectEqual(@as(usize, 1), capture.calls);
 }
 
 test "finalization failure latches fixed metadata and closes interactive admission" {

@@ -475,6 +475,26 @@ pub fn Runtime(comptime App: type) type {
                 if (comptime @hasDecl(App, "dispatchAttentionRequired")) {
                     app.dispatchAttentionRequired(snapshot.active_turn_id, .permission);
                 }
+                var attributed_to_child = false;
+                if (child_pending_request) |child_request| {
+                    if (comptime @hasDecl(
+                        @TypeOf(app.subagents),
+                        "mainApprovalBinding",
+                    ) and @hasDecl(App, "reportAdeSubagentAttentionRequired")) {
+                        if (app.subagents.mainApprovalBinding(child_request.id)) |binding| {
+                            app.reportAdeSubagentAttentionRequired(
+                                binding.child_id,
+                                .permission,
+                            );
+                            attributed_to_child = true;
+                        }
+                    }
+                }
+                if (!attributed_to_child and
+                    comptime @hasDecl(App, "reportAdeMainAttentionRequired"))
+                {
+                    app.reportAdeMainAttentionRequired(snapshot.active_turn_id, .permission);
+                }
             }
 
             if (app.question_prompt.isActive()) {
@@ -817,6 +837,15 @@ pub fn Runtime(comptime App: type) type {
                                 app.shell.render_requests.request(.modal);
                                 if (comptime @hasDecl(App, "dispatchAttentionRequired")) {
                                     app.dispatchAttentionRequired(
+                                        app.worker.activeTurnId(),
+                                        switch (question_snapshot.source) {
+                                            .agent_question, .mcp_elicitation => .question,
+                                            .route_recovery => .route_recovery,
+                                        },
+                                    );
+                                }
+                                if (comptime @hasDecl(App, "reportAdeMainAttentionRequired")) {
+                                    app.reportAdeMainAttentionRequired(
                                         app.worker.activeTurnId(),
                                         switch (question_snapshot.source) {
                                             .agent_question, .mcp_elicitation => .question,
@@ -1541,8 +1570,15 @@ const FakePacer = struct {
 const FakeSubagents = struct {
     view_active: bool = false,
     child_busy: bool = false,
+    pending_approval: ?permission_request.PermissionRequest = null,
+    pending_child_session_id: ?[]const u8 = null,
+    approval_presented: bool = false,
     child_shell: FakeShell = .{},
     child_render_requests: render_request.RenderRequestState = .{},
+
+    const MainApprovalBinding = struct {
+        child_id: []const u8,
+    };
 
     const ChildPresentationView = struct {
         chat: struct {
@@ -1570,6 +1606,21 @@ const FakeSubagents = struct {
 
     fn activeRenderRequests(self: *FakeSubagents) *render_request.RenderRequestState {
         return &self.child_render_requests;
+    }
+
+    fn mainApprovalRequest(self: *const FakeSubagents) ?permission_request.PermissionRequest {
+        return self.pending_approval;
+    }
+
+    fn markMainApprovalPresented(self: *FakeSubagents, presented: bool) void {
+        self.approval_presented = presented;
+    }
+
+    fn mainApprovalBinding(self: *const FakeSubagents, prompt_id: u64) ?MainApprovalBinding {
+        if (!self.approval_presented) return null;
+        const request = self.pending_approval orelse return null;
+        if (request.id != prompt_id) return null;
+        return .{ .child_id = self.pending_child_session_id orelse return null };
     }
 
     fn deinit(self: *FakeSubagents, alloc: std.mem.Allocator) void {
@@ -1625,6 +1676,8 @@ const FakeApp = struct {
     attention_count: usize = 0,
     last_attention_turn_id: u64 = 0,
     last_attention_kind: ?@import("../hooks/hooks.zig").AttentionKind = null,
+    child_attention_count: usize = 0,
+    last_attention_child_session_id: ?[]const u8 = null,
 
     fn init(alloc: std.mem.Allocator) FakeApp {
         return .{ .alloc = alloc };
@@ -1707,6 +1760,22 @@ const FakeApp = struct {
         self.last_attention_turn_id = turn_id;
         self.last_attention_kind = kind;
     }
+
+    fn reportAdeSubagentAttentionRequired(
+        self: *FakeApp,
+        child_session_id: []const u8,
+        kind: @import("../hooks/hooks.zig").AttentionKind,
+    ) void {
+        self.child_attention_count += 1;
+        self.last_attention_child_session_id = child_session_id;
+        self.last_attention_kind = kind;
+    }
+
+    fn reportAdeMainAttentionRequired(
+        _: *FakeApp,
+        _: u64,
+        _: @import("../hooks/hooks.zig").AttentionKind,
+    ) void {}
 };
 
 fn noopTaskCompletion(ctx: *anyopaque, completion: task_helpers.TaskCompletion) void {
@@ -2920,6 +2989,36 @@ test "core.app_worker_runtime emits permission attention once when approval open
     Runtime(FakeApp).syncState(&app, NoopBridge.lifecyclePresenter(&app));
     Runtime(FakeApp).syncState(&app, NoopBridge.lifecyclePresenter(&app));
     try std.testing.expectEqual(@as(usize, 1), app.attention_count);
+}
+
+test "core.app_worker_runtime attributes surfaced child permission attention to the child session" {
+    var app = FakeApp.init(std.testing.allocator);
+    defer app.deinit();
+    app.worker.processing = true;
+    app.worker.active_turn_id = 73;
+    app.subagents.pending_approval = .{
+        .id = 19,
+        .label = "subagent command",
+        .origin = .{ .subagent = "child-name" },
+    };
+    app.subagents.pending_child_session_id = "child-session-19";
+
+    Runtime(FakeApp).syncState(&app, NoopBridge.lifecyclePresenter(&app));
+
+    try std.testing.expectEqual(@as(usize, 1), app.attention_count);
+    try std.testing.expectEqual(@as(usize, 1), app.child_attention_count);
+    try std.testing.expectEqualStrings(
+        "child-session-19",
+        app.last_attention_child_session_id.?,
+    );
+    try std.testing.expectEqual(
+        @as(?@import("../hooks/hooks.zig").AttentionKind, .permission),
+        app.last_attention_kind,
+    );
+
+    Runtime(FakeApp).syncState(&app, NoopBridge.lifecyclePresenter(&app));
+    try std.testing.expectEqual(@as(usize, 1), app.attention_count);
+    try std.testing.expectEqual(@as(usize, 1), app.child_attention_count);
 }
 
 test "core.app_worker_runtime emits question and route recovery attention only for active prompts" {
