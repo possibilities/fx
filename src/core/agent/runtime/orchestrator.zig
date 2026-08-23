@@ -2044,6 +2044,9 @@ pub fn processQueuedPrompt(
         effective_job.turn_id,
         lifecycle,
     );
+    runtime_lifecycle.dispatchTurnStartedCheckpoint(lifecycle, .{
+        .turn_id = effective_job.turn_id,
+    });
 
     processQueuedPromptInner(deps, semantic_presentation, lifecycle, config, effective_job, &finalization) catch |err| {
         if (finalization.state == .open) {

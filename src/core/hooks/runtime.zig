@@ -38,9 +38,11 @@ fn RegisteredSideEffectHandler(comptime Input: type) type {
 
 const RegisteredPostTurnEndHandler = RegisteredSideEffectHandler(definitions.PostTurnEndInput);
 const RegisteredAttentionRequiredHandler = RegisteredSideEffectHandler(definitions.AttentionRequiredInput);
+const RegisteredTurnStartedHandler = RegisteredSideEffectHandler(definitions.TurnStartedInput);
 
 pub const Runtime = struct {
     alloc: Allocator,
+    turn_started_handlers: std.ArrayList(RegisteredTurnStartedHandler) = .empty,
     pre_tool_use_handlers: std.ArrayList(RegisteredPreToolUseHandler) = .empty,
     stop_handlers: std.ArrayList(RegisteredStopHandler) = .empty,
     post_turn_end_handlers: std.ArrayList(RegisteredPostTurnEndHandler) = .empty,
@@ -52,6 +54,8 @@ pub const Runtime = struct {
     }
 
     pub fn deinit(self: *Runtime) void {
+        deinitRegisteredHooks(self.alloc, self.turn_started_handlers.items);
+        self.turn_started_handlers.deinit(self.alloc);
         deinitRegisteredHooks(self.alloc, self.pre_tool_use_handlers.items);
         self.pre_tool_use_handlers.deinit(self.alloc);
         deinitRegisteredHooks(self.alloc, self.stop_handlers.items);
@@ -61,6 +65,17 @@ pub const Runtime = struct {
         deinitRegisteredHooks(self.alloc, self.attention_required_handlers.items);
         self.attention_required_handlers.deinit(self.alloc);
         self.* = undefined;
+    }
+
+    pub fn registerTurnStarted(
+        self: *Runtime,
+        handler: definitions.TurnStartedHandler,
+    ) (Allocator.Error || definitions.RegistrationError)!void {
+        try self.registerSideEffect(
+            .turn_started,
+            handler,
+            &self.turn_started_handlers,
+        );
     }
 
     pub fn registerPreToolUse(
@@ -148,6 +163,7 @@ pub const Runtime = struct {
 
     fn currentView(self: *const Runtime) RuntimeView {
         return .{
+            .turn_started_handlers = self.turn_started_handlers.items,
             .pre_tool_use_handlers = self.pre_tool_use_handlers.items,
             .stop_handlers = self.stop_handlers.items,
             .post_turn_end_handlers = self.post_turn_end_handlers.items,
@@ -184,6 +200,7 @@ pub const Runtime = struct {
 };
 
 pub const RuntimeView = struct {
+    turn_started_handlers: []const RegisteredTurnStartedHandler,
     pre_tool_use_handlers: []const RegisteredPreToolUseHandler,
     stop_handlers: []const RegisteredStopHandler,
     post_turn_end_handlers: []const RegisteredPostTurnEndHandler,
@@ -191,11 +208,23 @@ pub const RuntimeView = struct {
 
     pub fn empty() RuntimeView {
         return .{
+            .turn_started_handlers = &.{},
             .pre_tool_use_handlers = &.{},
             .stop_handlers = &.{},
             .post_turn_end_handlers = &.{},
             .attention_required_handlers = &.{},
         };
+    }
+
+    pub fn hasTurnStarted(self: RuntimeView) bool {
+        return self.turn_started_handlers.len != 0;
+    }
+
+    pub fn runTurnStarted(
+        self: RuntimeView,
+        input: definitions.TurnStartedInput,
+    ) void {
+        runSideEffectHandlers(input, self.turn_started_handlers);
     }
 
     pub fn hasPreToolUse(self: RuntimeView) bool {
@@ -612,6 +641,8 @@ fn testInvocation() definitions.Invocation {
 }
 
 const TestHandler = struct {
+    fn noteTurnStarted(_: *anyopaque, _: definitions.TurnStartedInput) definitions.HandlerError!void {}
+
     fn continueTool(_: *anyopaque, _: definitions.PreToolUseInput) definitions.HandlerError!definitions.PreToolUseAction {
         return .continue_;
     }
@@ -651,6 +682,16 @@ test "runtime validates names owns copies freezes and exposes lifecycle events" 
     }));
 
     var mutable_name = [_]u8{ 'a', 'l', 'p', 'h', 'a' };
+    try runtime.registerTurnStarted(.{
+        .name = "alpha",
+        .ctx = undefined,
+        .run = TestHandler.noteTurnStarted,
+    });
+    try std.testing.expectError(error.DuplicateHandlerName, runtime.registerTurnStarted(.{
+        .name = "alpha",
+        .ctx = undefined,
+        .run = TestHandler.noteTurnStarted,
+    }));
     try runtime.registerPreToolUse(.{
         .name = &mutable_name,
         .ctx = undefined,
@@ -690,10 +731,12 @@ test "runtime validates names owns copies freezes and exposes lifecycle events" 
 
     const view = runtime.freeze();
     const second_view = runtime.freeze();
+    try std.testing.expect(view.hasTurnStarted());
     try std.testing.expect(view.hasPreToolUse());
     try std.testing.expect(view.hasStop());
     try std.testing.expect(view.hasPostTurnEnd());
     try std.testing.expect(view.hasAttentionRequired());
+    try std.testing.expect(second_view.hasTurnStarted());
     try std.testing.expect(second_view.hasPreToolUse());
     try std.testing.expect(second_view.hasStop());
     try std.testing.expect(second_view.hasPostTurnEnd());
@@ -702,6 +745,11 @@ test "runtime validates names owns copies freezes and exposes lifecycle events" 
         .name = "late",
         .ctx = undefined,
         .run = TestHandler.allowStop,
+    }));
+    try std.testing.expectError(error.RuntimeFrozen, runtime.registerTurnStarted(.{
+        .name = "late",
+        .ctx = undefined,
+        .run = TestHandler.noteTurnStarted,
     }));
     try std.testing.expectError(error.RuntimeFrozen, runtime.registerPostTurnEnd(.{
         .name = "late",
@@ -728,11 +776,13 @@ test "empty views dispatch without allocation" {
 
     for (views) |view| {
         var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+        try std.testing.expect(!view.hasTurnStarted());
         try std.testing.expect(!view.hasPreToolUse());
         try std.testing.expect(!view.hasStop());
         try std.testing.expect(!view.hasPostTurnEnd());
         try std.testing.expect(!view.hasAttentionRequired());
 
+        view.runTurnStarted(.{ .invocation = testInvocation() });
         var pre = try view.runPreToolUse(failing.allocator(), .{
             .invocation = testInvocation(),
             .step_index = 1,
