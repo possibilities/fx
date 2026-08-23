@@ -450,7 +450,10 @@ fn parseGlobalLaunchArgs(
     const override_slice = try overrides.toOwnedSlice(alloc);
     errdefer if (override_slice.len > 0) alloc.free(override_slice);
     const directory_slice = try directories.toOwnedSlice(alloc);
-    errdefer if (directory_slice.len > 0) alloc.free(directory_slice);
+    errdefer {
+        for (directory_slice) |path| alloc.free(path);
+        if (directory_slice.len > 0) alloc.free(directory_slice);
+    }
     const append_slice = try append_paths.toOwnedSlice(alloc);
     return .{
         .remaining = args[index..],
@@ -3860,6 +3863,37 @@ test "global system prompt file modifiers reject missing and duplicate replaceme
     );
 }
 
+test "global launch parsing releases every owned value across allocation failures" {
+    const backing = std.testing.allocator;
+    const args = [_][:0]const u8{
+        "--add-dir",
+        "/tmp/first",
+        "--add-dir",
+        "/tmp/second",
+        "--append-system-prompt-file",
+        "/tmp/prompt",
+        "ask",
+    };
+
+    var probe = std.testing.FailingAllocator.init(backing, .{});
+    var parsed = try parseGlobalLaunchArgs(probe.allocator(), &args);
+    parsed.deinit(probe.allocator());
+    try std.testing.expectEqual(probe.allocated_bytes, probe.freed_bytes);
+
+    for (0..probe.alloc_index) |fail_index| {
+        var failing = std.testing.FailingAllocator.init(backing, .{ .fail_index = fail_index });
+        if (parseGlobalLaunchArgs(failing.allocator(), &args)) |value| {
+            var owned = value;
+            owned.deinit(failing.allocator());
+        } else |err| switch (err) {
+            error.OutOfMemory => {},
+            else => return err,
+        }
+        try std.testing.expect(failing.has_induced_failure);
+        try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+    }
+}
+
 test "ask inline system prompt detection stops at the prompt separator" {
     try std.testing.expect(askHasSystemOverride(&.{ @constCast("--system"), @constCast("inline"), @constCast("prompt") }));
     try std.testing.expect(!askHasSystemOverride(&.{ @constCast("--"), @constCast("--system"), @constCast("is prompt text") }));
@@ -3904,6 +3938,18 @@ test "system prompt files are prepared for interactive and resumed launches" {
             try std.testing.expectEqualStrings("file system prompt", launch.modifiers.effective_system_prompt.?);
         },
         else => return error.TestExpectedInteractiveLaunch,
+    }
+}
+
+test "workflow launch config preserves the effective prompt for PR and issue" {
+    const modifiers = LaunchModifiers{ .effective_system_prompt = @constCast("WORKFLOW_FILE_SYSTEM_PROMPT") };
+    for ([_]Command{ .{ .pr = &.{} }, .{ .issue = &.{} } }) |command| {
+        try std.testing.expect(commandSupportsPromptFileModifiers(command));
+        const workflow_cfg = workflowConfigWithLaunchModifiers(testConfig(), modifiers);
+        try std.testing.expectEqualStrings(
+            "WORKFLOW_FILE_SYSTEM_PROMPT",
+            workflow_cfg.prompt_policy.system_prompt,
+        );
     }
 }
 

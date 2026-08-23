@@ -3879,6 +3879,62 @@ describe("cli: issue", () => {
     },
     TIMEOUT,
   );
+
+  test(
+    "system prompt files reach issue and PR model launches",
+    async () => {
+      const root = mkdtempSync(join(tmpdir(), "fx-e2e-workflow-system-prompts-"));
+      const home = join(root, "home");
+      const workspace = join(root, "workspace");
+      const replacement = join(root, "replacement.md");
+      const appended = join(root, "appended.md");
+      const gateway = startFakeGateway([
+        fakeGatewayFinalText("issue prompt complete"),
+        fakeGatewayFinalText("pr prompt complete"),
+      ]);
+      try {
+        mkdirSync(home);
+        mkdirSync(workspace);
+        writeFileSync(replacement, "ISSUE_FILE_SYSTEM_PROMPT");
+        writeFileSync(appended, "PR_FILE_SYSTEM_PROMPT");
+        const gitInit = spawnSync("git", ["init", "--quiet"], { cwd: workspace });
+        expect(gitInit.status).toBe(0);
+
+        const env = {
+          HOME: realpathSync(home),
+          AI_GATEWAY_API_KEY: "fake-workflow-system-prompt-key",
+          VERCEL_OIDC_TOKEN: undefined,
+          FX_GATEWAY_BASE_URL: gateway.baseUrl,
+          FX_GATEWAY_CHAT_URL: gateway.chatUrl,
+          FX_MODEL: FAKE_GATEWAY_MODEL,
+          FX_AUTO_UPGRADE: "0",
+        };
+        const issue = await runFx(
+          ["--system-prompt-file", replacement, "issue", "--auto"],
+          { cwd: realpathSync(workspace), env, timeoutMs: TIMEOUT },
+        );
+        const pr = await runFx(
+          ["--append-system-prompt-file", appended, "pr", "--auto"],
+          { cwd: realpathSync(workspace), env, timeoutMs: TIMEOUT },
+        );
+
+        expect(issue.code).toBe(0);
+        expect(pr.code).toBe(0);
+        expect(issue.stderr).toBe("");
+        expect(pr.stderr).toBe("");
+        expect(gateway.requests).toHaveLength(2);
+        expect(gateway.requests[0]!.body).toContain("ISSUE_FILE_SYSTEM_PROMPT");
+        expect(gateway.requests[1]!.body).toContain("PR_FILE_SYSTEM_PROMPT");
+        expect(gateway.requests[1]!.body).toContain(
+          "You are fx, a local coding CLI assistant",
+        );
+      } finally {
+        gateway.stop();
+        rmSync(root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
 });
 
 describe("cli: ask success", () => {

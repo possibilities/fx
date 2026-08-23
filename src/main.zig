@@ -3218,6 +3218,24 @@ test "full entry config commands also use early threaded io" {
     }));
 }
 
+test "interactive and resumed launch prompts transfer into the app policy" {
+    const prompt: []u8 = @constCast("INTERACTIVE_FILE_SYSTEM_PROMPT");
+    for ([_]cli_surface.InteractiveLaunch{
+        .{ .modifiers = .{ .effective_system_prompt = prompt } },
+        .{ .requested_resume = .last, .modifiers = .{ .effective_system_prompt = prompt } },
+    }) |launch_value| {
+        var launch = launch_value;
+        var app = App{ .alloc = std.testing.allocator };
+        app.system_prompt_override = launch.modifiers.takeEffectiveSystemPrompt();
+
+        try std.testing.expect(launch.modifiers.effective_system_prompt == null);
+        try std.testing.expectEqualStrings(
+            "INTERACTIVE_FILE_SYSTEM_PROMPT",
+            app.promptPolicy().system_prompt,
+        );
+    }
+}
+
 test "lightweight local commands do not request early threaded io" {
     try std.testing.expect(!needsEarlyThreadedIo(&.{}));
     for ([_][:0]const u8{ "help", "sessions", "tasks", "permissions" }) |command| {
