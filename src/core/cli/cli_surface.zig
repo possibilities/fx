@@ -1212,11 +1212,11 @@ fn runNonInteractiveWithDeps(
                     return .handled_failure;
                 },
             };
-            var ids = loaded.ids;
-            defer collections.freeStringList(alloc, &ids);
+            var catalog = loaded.catalog;
+            defer model_catalog.freeModelCatalog(alloc, &catalog);
 
             const text = try (output_contracts.ModelListSnapshot{
-                .ids = ids.items,
+                .catalog = catalog.items,
                 .provider = startup.provider,
                 .private_models_hidden = loaded.provenance.access.private_models_may_be_hidden,
                 .public_only_reason = loaded.provenance.access.public_only_reason,
@@ -5456,7 +5456,7 @@ test "runIfRequested models passes startup team to fetch seam" {
     try std.testing.expectEqual(RunResult.handled_success, result);
     try std.testing.expect(probe.called);
     try std.testing.expectEqualStrings(
-        "{\"kind\":\"models\",\"count\":1,\"shown_count\":1,\"more_count\":0,\"private_models_hidden\":false,\"ids\":[\"private/blue-hornbill\"]}\n",
+        "{\"kind\":\"models\",\"count\":1,\"shown_count\":1,\"more_count\":0,\"private_models_hidden\":false,\"ids\":[\"private/blue-hornbill\"],\"models\":[{\"id\":\"private/blue-hornbill\",\"source\":\"Vercel AI Gateway\",\"reasoning_efforts\":[\"low\",\"high\"]}]}\n",
         capture.stdout.written(),
     );
 }
@@ -6032,16 +6032,35 @@ const ModelFetchProbe = struct {
             .success => {},
         }
 
-        var ids: std.ArrayList([]u8) = .empty;
+        var catalog: std.ArrayList(model_catalog.ModelCatalogEntry) = .empty;
         const id = alloc.dupe(u8, "private/blue-hornbill") catch {
             return failure(input, .resource_exhausted);
         };
-        ids.append(alloc, id) catch {
+        const model_type = alloc.dupe(u8, "language") catch {
+            alloc.free(id);
+            return failure(input, .resource_exhausted);
+        };
+        var reasoning_efforts: std.ArrayList(types.ReasoningEffort) = .empty;
+        reasoning_efforts.appendSlice(alloc, &.{
+            types.ReasoningEffort.literal("low"),
+            types.ReasoningEffort.literal("high"),
+        }) catch {
+            alloc.free(model_type);
+            alloc.free(id);
+            return failure(input, .resource_exhausted);
+        };
+        catalog.append(alloc, .{
+            .id = id,
+            .model_type = model_type,
+            .reasoning_efforts = reasoning_efforts,
+        }) catch {
+            reasoning_efforts.deinit(alloc);
+            alloc.free(model_type);
             alloc.free(id);
             return failure(input, .resource_exhausted);
         };
         return .{ .loaded = .{
-            .ids = ids,
+            .catalog = catalog,
             .provenance = .{ .access = .init(input.access) },
         } };
     }

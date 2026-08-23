@@ -3574,7 +3574,14 @@ describe("cli: models", () => {
               (!scenario.seedFxLogin || url.searchParams.get("teamId") === "team_123");
             return Response.json({
               data: [
-                { id: "public/sentinel", type: "language", tags: ["tool-use"] },
+                {
+                  id: "public/sentinel",
+                  type: "language",
+                  tags: ["tool-use"],
+                  reasoning_options: [
+                    { type: "effort", values: ["low", "future-tier", "high"] },
+                  ],
+                },
                 ...(seededAuth
                   ? [{ id: "private/blue-hornbill", type: "language", tags: ["tool-use"] }]
                   : []),
@@ -3621,6 +3628,11 @@ describe("cli: models", () => {
           const json = JSON.parse(r.stdout.trim());
           expect(json.kind).toBe("models");
           expect(json.ids).toContain("public/sentinel");
+          expect(json.models).toContainEqual({
+            id: "public/sentinel",
+            source: "Vercel AI Gateway",
+            reasoning_efforts: ["low", "future-tier", "high"],
+          });
           if (scenario.expectPrivate) {
             expect(json.ids).toContain("private/blue-hornbill");
           } else {
