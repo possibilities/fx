@@ -1478,6 +1478,10 @@ pub fn Handlers(comptime App: type) type {
 
             var result = try provider.executeCommand(app.alloc, command, .{
                 .skills_dir = app.skills.dir,
+                .invocation_skill_roots = if (comptime @hasField(App, "invocation_skill_roots"))
+                    app.invocation_skill_roots
+                else
+                    &.{},
                 .find_ctx = @ptrCast(app),
                 .find_skill = findSkillForProvider,
             });

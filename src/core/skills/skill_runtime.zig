@@ -313,6 +313,24 @@ pub fn loadVisibleSkills(
     skills_dir: []const u8,
     root_policy: skill_contract.RootPolicy,
 ) !SkillDiscovery {
+    return loadVisibleSkillsWithInvocationRoots(
+        alloc,
+        workspace_root,
+        home,
+        skills_dir,
+        &.{},
+        root_policy,
+    );
+}
+
+pub fn loadVisibleSkillsWithInvocationRoots(
+    alloc: Allocator,
+    workspace_root: ?[]const u8,
+    home: ?[]const u8,
+    skills_dir: []const u8,
+    invocation_skill_roots: []const []const u8,
+    root_policy: skill_contract.RootPolicy,
+) !SkillDiscovery {
     var skills: std.ArrayList(Skill) = .empty;
     errdefer {
         for (skills.items) |skill| freeSkill(alloc, skill);
@@ -332,12 +350,18 @@ pub fn loadVisibleSkills(
         roots.deinit(alloc);
     }
 
+    for (invocation_skill_roots) |root| {
+        try appendInvocationRoot(alloc, &roots, root);
+    }
+
     if (workspace_root) |root| {
         try appendWorkspaceRoots(alloc, &roots, root, home, root_policy.workspace_roots);
     }
 
-    if (root_policy.managed_root_source) |source| {
-        try appendDupeRoot(alloc, &roots, source, skills_dir);
+    if (skills_dir.len > 0) {
+        if (root_policy.managed_root_source) |source| {
+            try appendManagedRoot(alloc, &roots, source, skills_dir);
+        }
     }
 
     if (home) |home_root| {
@@ -357,6 +381,18 @@ pub fn loadVisibleSkills(
         .skills = owned_skills,
         .diagnostics = owned_diagnostics,
     };
+}
+
+fn appendInvocationRoot(
+    alloc: Allocator,
+    roots: *std.ArrayList(SkillRoot),
+    path: []const u8,
+) !void {
+    // The CLI validates and canonicalizes invocation roots once. Preserve that
+    // launch-time authority across reloads so replacing the path with a symlink
+    // cannot silently authorize a different filesystem tree.
+    const owned_path = try alloc.dupe(u8, path);
+    try appendOwnedRoot(alloc, roots, owned_path, .invocation, owned_path);
 }
 
 fn appendWorkspaceRoots(
@@ -382,7 +418,16 @@ fn appendSpecRoot(alloc: Allocator, roots: *std.ArrayList(SkillRoot), base: []co
     try appendOwnedRoot(alloc, roots, try std.fs.path.join(alloc, &.{ base, spec.path }), spec.source, base);
 }
 
-fn appendDupeRoot(alloc: Allocator, roots: *std.ArrayList(SkillRoot), source: SkillSource, path: []const u8) !void {
+fn appendManagedRoot(alloc: Allocator, roots: *std.ArrayList(SkillRoot), source: SkillSource, path: []const u8) !void {
+    for (roots.items) |*root| {
+        if (!std.mem.eql(u8, root.path, path)) continue;
+        // An explicitly supplied managed install root keeps its intrinsic
+        // managed identity and strict no-follow behavior. Discovery order does
+        // not turn an install destination into an invocation-only source.
+        root.source = source;
+        root.read_authority = null;
+        return;
+    }
     try appendOwnedRoot(alloc, roots, try alloc.dupe(u8, path), source, null);
 }
 
@@ -890,6 +935,7 @@ pub fn isManagedInstallSkill(skill: Skill) bool {
 
 pub fn skillGroupLabel(source: SkillSource) []const u8 {
     return switch (source) {
+        .invocation => "Invocation roots",
         .global_fx => "Managed installs",
         .workspace_fx => "Workspace skills",
         .workspace_shared => "Workspace skills",
@@ -909,9 +955,10 @@ pub fn skillGroupLabel(source: SkillSource) []const u8 {
 
 pub fn skillGroupRank(source: SkillSource) usize {
     return switch (source) {
-        .global_fx => 0,
-        .workspace_fx => 1,
-        .workspace_shared => 1,
+        .invocation => 0,
+        .global_fx => 1,
+        .workspace_fx => 2,
+        .workspace_shared => 2,
         .workspace_opencode,
         .workspace_codex,
         .workspace_claude,
@@ -922,14 +969,15 @@ pub fn skillGroupRank(source: SkillSource) usize {
         .global_claude,
         .global_agents,
         .global_claw,
-        => 2,
+        => 3,
     };
 }
 
-const skill_group_count: usize = 3;
+const skill_group_count: usize = 4;
 
 pub fn skillSourceLabel(source: SkillSource) []const u8 {
     return switch (source) {
+        .invocation => "invocation --skills-dir",
         .workspace_fx => "workspace .fx/skills",
         .workspace_shared => "workspace skills/",
         .workspace_opencode => "workspace .opencode/skills",
@@ -948,6 +996,7 @@ pub fn skillSourceLabel(source: SkillSource) []const u8 {
 
 pub fn skillSourceShortLabel(source: SkillSource) []const u8 {
     return switch (source) {
+        .invocation => "invocation",
         .workspace_fx => "workspace .fx",
         .workspace_shared => "workspace skills/",
         .workspace_opencode => "workspace .opencode",
@@ -979,6 +1028,7 @@ pub fn skillMenuFilterLabel(filter: SkillMenuSourceFilter) []const u8 {
 
 pub fn skillMenuFilterForSource(source: SkillSource) SkillMenuSourceFilter {
     return switch (source) {
+        .invocation => .fx,
         .global_fx => .fx,
         .workspace_fx => .fx,
         .workspace_shared => .workspace,
@@ -1567,6 +1617,7 @@ pub fn listSkillsSummaryStyled(alloc: Allocator, skills: []const Skill, styles: 
     defer out.deinit();
 
     const group_order = [_][]const u8{
+        "Invocation roots",
         "Managed installs",
         "Workspace skills",
         "Compatibility roots",
@@ -2628,6 +2679,91 @@ test "loadVisibleSkills scans only roots supplied by policy" {
     try std.testing.expectEqual(SkillSource.workspace_claw, discovery.skills[0].source);
     try std.testing.expect(findSkillByName(discovery.skills, "ignored") == null);
     try std.testing.expect(findSkillByName(discovery.skills, "ignored-managed") == null);
+}
+
+test "invocation root authority stays fixed after the selected path is rebound" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try writeTempFile(
+        &tmp,
+        "selected/review/SKILL.md",
+        "---\nname: review\ndescription: selected root\n---\n\nSELECTED_BODY\n",
+    );
+    try writeTempFile(
+        &tmp,
+        "outside/escape/SKILL.md",
+        "---\nname: escape\ndescription: outside root\n---\n\nOUTSIDE_BODY_MUST_NOT_LOAD\n",
+    );
+
+    const selected_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "selected");
+    defer alloc.free(selected_root);
+    const invocation_roots = [_][]const u8{selected_root};
+
+    var initial = try loadVisibleSkillsWithInvocationRoots(
+        alloc,
+        null,
+        null,
+        "",
+        &invocation_roots,
+        test_root_policy,
+    );
+    defer initial.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), initial.skills.len);
+    try std.testing.expectEqualStrings("review", initial.skills[0].name);
+    try std.testing.expectEqualStrings(selected_root, initial.skills[0].read_authority.?);
+
+    try tmp.dir.rename("selected", tmp.dir, "selected-original", io_mod.getIo());
+    try createTempSymlinkOrSkip(&tmp, "outside", "selected");
+
+    var rebound = try loadVisibleSkillsWithInvocationRoots(
+        alloc,
+        null,
+        null,
+        "",
+        &invocation_roots,
+        test_root_policy,
+    );
+    defer rebound.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 0), rebound.skills.len);
+    try std.testing.expectEqual(@as(usize, 1), rebound.diagnostics.len);
+    try std.testing.expectEqual(SkillSource.invocation, rebound.diagnostics[0].source);
+    try std.testing.expectEqual(SkillDiagnosticScope.root, rebound.diagnostics[0].scope);
+    try std.testing.expectEqual(SkillDiagnosticCause.unreadable, rebound.diagnostics[0].cause);
+}
+
+test "an explicitly supplied managed install root keeps managed identity" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try writeTempFile(
+        &tmp,
+        "home/.fx/skills/review/SKILL.md",
+        "---\nname: review\ndescription: managed review\n---\n\nMANAGED_BODY\n",
+    );
+    const home_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
+    defer alloc.free(home_root);
+    const managed_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home/.fx/skills");
+    defer alloc.free(managed_root);
+    const invocation_roots = [_][]const u8{managed_root};
+
+    var discovery = try loadVisibleSkillsWithInvocationRoots(
+        alloc,
+        null,
+        home_root,
+        managed_root,
+        &invocation_roots,
+        test_root_policy,
+    );
+    defer discovery.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 1), discovery.skills.len);
+    try std.testing.expectEqualStrings("review", discovery.skills[0].name);
+    try std.testing.expectEqual(SkillSource.global_fx, discovery.skills[0].source);
+    try std.testing.expect(isManagedInstallSkill(discovery.skills[0]));
+    try std.testing.expect(discovery.skills[0].read_authority == null);
 }
 
 test "loadVisibleSkills preserves root-distinct duplicate skill names" {

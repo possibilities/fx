@@ -3908,6 +3908,7 @@ test "admission snapshot is isolated owned and preserves configured permission m
         .target_path = @constCast("/tmp/a"),
     }};
     var snapshot = try domain.captureAdmission(alloc, .{
+        .root_id = "root",
         .parent_id = "parent",
         .source_id = "source",
         .model = "test/model",
@@ -3919,6 +3920,8 @@ test "admission snapshot is isolated owned and preserves configured permission m
         .integration_names = &.{"mcp:test"},
     });
     defer snapshot.deinit(alloc);
+    try std.testing.expectEqualStrings("root", snapshot.root_id);
+    try std.testing.expectEqualStrings("parent", snapshot.parent_id);
     try std.testing.expectEqual(types.PermissionMode.ask, snapshot.permission_mode);
     try std.testing.expectEqualStrings("test/model", snapshot.model);
     try std.testing.expectEqualStrings("write_file", snapshot.tool_names[1]);
@@ -4256,6 +4259,7 @@ const FakeExecution = struct {
             .target_path = @constCast(if (current == 0) "/tmp/old.txt" else "/tmp/new.txt"),
         }};
         return domain.captureAdmission(alloc, .{
+            .root_id = "root",
             .parent_id = request.parent_id,
             .source_id = request.source_id,
             .model = request.preferences.model,
@@ -4376,6 +4380,7 @@ const ApprovalBlockingExecution = struct {
         request: CaptureRequest,
     ) ServiceError!domain.AdmissionSnapshot {
         return domain.captureAdmission(alloc, .{
+            .root_id = "root",
             .parent_id = request.parent_id,
             .source_id = request.source_id,
             .model = request.preferences.model,
@@ -6883,6 +6888,7 @@ const ToolEffectExecution = struct {
         request: CaptureRequest,
     ) ServiceError!domain.AdmissionSnapshot {
         return domain.captureAdmission(alloc, .{
+            .root_id = "root",
             .parent_id = request.parent_id,
             .source_id = request.source_id,
             .model = request.preferences.model,
@@ -7391,6 +7397,7 @@ const ProcessBoundaryExecution = struct {
         request: CaptureRequest,
     ) ServiceError!domain.AdmissionSnapshot {
         return domain.captureAdmission(alloc, .{
+            .root_id = "root",
             .parent_id = request.parent_id,
             .source_id = request.source_id,
             .model = request.preferences.model,
@@ -8509,6 +8516,7 @@ const GatewayExecution = struct {
             .target_path = @constCast("/tmp/workspace/file.txt"),
         }};
         return domain.captureAdmission(alloc, .{
+            .root_id = "root",
             .parent_id = request.parent_id,
             .source_id = request.source_id,
             .model = request.preferences.model,
@@ -8952,6 +8960,7 @@ test "completed one off reconciles one stable final result message" {
 
 fn checkAdmissionAllocationFailures(alloc: Allocator) !void {
     var snapshot = try domain.captureAdmission(alloc, .{
+        .root_id = "root",
         .parent_id = "parent",
         .source_id = "source",
         .model = "model",

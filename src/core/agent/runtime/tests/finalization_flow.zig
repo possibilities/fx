@@ -70,6 +70,66 @@ const PostTurnEndFinalizationCapture = struct {
     }
 };
 
+const TurnStartedCapture = struct {
+    calls: usize = 0,
+    scope_kinds: [4]lifecycle_hooks.ScopeKind = undefined,
+    turn_ids: [4]u64 = undefined,
+
+    fn run(raw: *anyopaque, input: lifecycle_hooks.TurnStartedInput) lifecycle_hooks.HandlerError!void {
+        const self: *TurnStartedCapture = @ptrCast(@alignCast(raw));
+        const index = self.calls;
+        self.calls += 1;
+        self.scope_kinds[index] = input.invocation.scope.kind;
+        self.turn_ids[index] = input.invocation.turn_id orelse 0;
+    }
+};
+
+test "processQueuedPrompt emits exactly one TurnStarted for each main and child turn" {
+    const alloc = std.testing.allocator;
+    var capture = TurnStartedCapture{};
+    var hook_runtime = lifecycle_hooks.Runtime.init(alloc);
+    defer hook_runtime.deinit();
+    try hook_runtime.registerTurnStarted(.{
+        .name = "capture-turn-start",
+        .ctx = &capture,
+        .run = TurnStartedCapture.run,
+    });
+    const view = hook_runtime.freeze();
+
+    const scopes = [_]lifecycle_hooks.ScopeKind{ .interactive, .subagent };
+    for (scopes) |scope| {
+        const chunks = [_][]const u8{"done"};
+        const completions = [_]FakeCompletion{.{
+            .chunks = &chunks,
+            .content = "done",
+        }};
+        var gateway = FakeGateway.init(alloc, &completions);
+        defer gateway.deinit();
+        var deps = FakeAgentRuntimeDeps.init(alloc);
+        defer deps.deinit();
+        var fixture = PromptFixture{};
+        var lifecycle = testLifecycleContext(view, alloc, fixture.workspace_root);
+        lifecycle.scope.kind = scope;
+        if (scope == .subagent) lifecycle.scope.session_id = "child-session";
+        try runFakePromptWithLifecycle(
+            &gateway,
+            &deps,
+            fixture.config(),
+            fixture.job(),
+            lifecycle,
+        );
+    }
+
+    try std.testing.expectEqual(scopes.len, capture.calls);
+    try std.testing.expectEqualSlices(
+        lifecycle_hooks.ScopeKind,
+        &scopes,
+        capture.scope_kinds[0..capture.calls],
+    );
+    try std.testing.expect(capture.turn_ids[0] != 0);
+    try std.testing.expect(capture.turn_ids[1] != 0);
+}
+
 test "processQueuedPrompt normal final completion propagates normalized history before finish event" {
     const alloc = std.testing.allocator;
     const chunks = [_][]const u8{" **Hello** "};

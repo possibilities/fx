@@ -9,6 +9,7 @@ const workspace_access = @import("../workspace/workspace_access.zig");
 const settings_store = @import("settings_store.zig");
 const model_provider = @import("model_provider.zig");
 const model_preferences = @import("model_preferences.zig");
+const session_naming = @import("../session/session_naming.zig");
 const update_target = @import("../upgrade/update_target.zig");
 pub const context_limits = @import("context_limits.zig");
 
@@ -59,11 +60,13 @@ pub const Settings = struct {
     notification_turn_end: ?bool = null,
     notification_attention_required: ?bool = null,
     notification_max: ?bool = null,
+    session_naming: session_naming.Settings = .{},
     permission_rules: types.PermissionRuleSet = .{},
     has_permission_rules: bool = false,
 
     pub fn deinit(self: *Settings, alloc: Allocator) void {
         self.models.deinit(alloc);
+        self.session_naming.deinit(alloc);
         self.permission_rules.deinit(alloc);
         self.* = .{};
     }
@@ -129,6 +132,21 @@ pub fn resolveContextLimits(settings: *const Settings, command_line: []const con
     values.apply(settings.context_limits);
     values.applyCommandLine(command_line);
     return values;
+}
+
+/// Reasoning effort requested through `FX_EFFORT`, or null when the variable is
+/// unset, blank, or not a valid effort name. An invalid value never blocks startup.
+pub fn processEffortOverride() ?types.ReasoningEffort {
+    const raw = io_mod.getenv("FX_EFFORT") orelse return null;
+    const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+    if (trimmed.len == 0) return null;
+    if (types.ReasoningEffort.parse(trimmed)) |effort| return effort;
+    debug_trace.logf("config", "ignoring invalid FX_EFFORT value={s}", .{trimmed});
+    return null;
+}
+
+pub fn resolveEffort(configured: ?types.ReasoningEffort) types.ReasoningEffort {
+    return processEffortOverride() orelse configured orelse .auto;
 }
 
 pub const PermissionSourceViews = struct {
@@ -448,6 +466,7 @@ fn loadMergedSettingsDetailedWithOptionalHome(
             sources.models.set(settings.provider orelse .gateway, .process_override);
         }
     }
+    if (processEffortOverride() != null) sources.effort = .process_override;
 
     return .{
         .settings = settings,
@@ -545,6 +564,7 @@ fn isProfileOnlySettingKey(key: []const u8) bool {
         "provider",
         "codex_model",
         "grok_model",
+        "session_naming",
         "effort",
         "fast_mode",
         "slash_menu_categories",
@@ -1301,6 +1321,10 @@ fn parseProfileOnlyFields(
         }
     }
 
+    if (root.object.get("session_naming")) |value| {
+        settings.session_naming = try parseSessionNamingSettings(alloc, value);
+    }
+
     if (root.object.get("permission_mode")) |permission_mode_value| {
         const value = permission_mode_value;
         if (value != .string) return error.InvalidPermissionModeType;
@@ -1452,6 +1476,11 @@ fn parseProjectSafeFields(settings: *Settings, root: std.json.Value) !void {
 fn mergeSettings(target: *Settings, incoming: *Settings, alloc: Allocator) void {
     target.models.mergeOwnedFrom(alloc, &incoming.models);
     if (incoming.provider) |value| target.provider = value;
+    mergeSessionNamingSettings(
+        &target.session_naming,
+        &incoming.session_naming,
+        alloc,
+    );
     if (incoming.permission_mode) |value| target.permission_mode = value;
     if (incoming.credential_source) |value| target.credential_source = value;
     if (incoming.yolo_acknowledged) |value| target.yolo_acknowledged = value;
@@ -1482,6 +1511,76 @@ fn mergeSettings(target: *Settings, incoming: *Settings, alloc: Allocator) void 
         target.has_permission_rules = true;
         incoming.has_permission_rules = false;
     }
+}
+
+fn parseSessionNamingSettings(
+    alloc: Allocator,
+    value: std.json.Value,
+) !session_naming.Settings {
+    if (value != .object) return error.InvalidSessionNamingType;
+    var result = session_naming.Settings{};
+    errdefer result.deinit(alloc);
+
+    const provider_entries = [_]struct {
+        key: []const u8,
+        provider: model_provider.ProviderId,
+    }{
+        .{ .key = "gateway", .provider = .gateway },
+        .{ .key = "codex", .provider = .codex },
+        .{ .key = "grok", .provider = .grok },
+    };
+    for (provider_entries) |entry| {
+        const provider_value = value.object.get(entry.key) orelse continue;
+        const setting = result.setting(entry.provider);
+        setting.specified = true;
+        if (provider_value == .null) continue;
+        if (provider_value != .object) return error.InvalidSessionNamingProviderType;
+
+        const model_value = provider_value.object.get("model") orelse
+            return error.MissingSessionNamingModel;
+        if (model_value != .string) return error.InvalidSessionNamingModelType;
+        settings_store.validateModel(model_value.string) catch
+            return error.InvalidSessionNamingModelValue;
+        setting.model = try alloc.dupe(u8, model_value.string);
+
+        if (provider_value.object.get("effort")) |effort_value| {
+            if (effort_value != .string) return error.InvalidSessionNamingEffortType;
+            setting.effort = types.ReasoningEffort.parse(effort_value.string) orelse
+                return error.InvalidSessionNamingEffortValue;
+        }
+    }
+
+    if (value.object.get("timeout_ms")) |timeout_value| {
+        if (timeout_value != .integer) return error.InvalidSessionNamingTimeoutType;
+        if (timeout_value.integer < session_naming.min_timeout_ms or
+            timeout_value.integer > session_naming.max_timeout_ms)
+        {
+            return error.InvalidSessionNamingTimeoutValue;
+        }
+        result.timeout_ms = @intCast(timeout_value.integer);
+    }
+    return result;
+}
+
+fn mergeSessionNamingSettings(
+    target: *session_naming.Settings,
+    incoming: *session_naming.Settings,
+    alloc: Allocator,
+) void {
+    const providers = [_]model_provider.ProviderId{
+        model_provider.ProviderId.gateway,
+        model_provider.ProviderId.codex,
+        model_provider.ProviderId.grok,
+    };
+    for (providers) |provider| {
+        const source = incoming.setting(provider);
+        if (!source.specified) continue;
+        const destination = target.setting(provider);
+        destination.deinit(alloc);
+        destination.* = source.*;
+        source.* = .{};
+    }
+    if (incoming.timeout_ms) |timeout_ms| target.timeout_ms = timeout_ms;
 }
 
 fn parsePermissionConfig(alloc: Allocator, value: std.json.Value) !types.PermissionRuleSet {
@@ -2913,6 +3012,67 @@ test "project profile-only settings are ignored and diagnosed by key" {
     }
 }
 
+test "profile session naming config resolves per provider with workspace overrides" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
+    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
+    const home_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "home");
+    defer std.testing.allocator.free(home_root);
+    const workspace_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "workspace");
+    defer std.testing.allocator.free(workspace_root);
+    const fixture = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "{{\"session_naming\":{{\"gateway\":{{\"model\":\"openai/gpt-5-mini\",\"effort\":\"medium\"}},\"codex\":{{\"model\":\"gpt-custom\",\"effort\":\"high\"}}}},\"workspaces\":{{\"{s}\":{{\"session_naming\":{{\"codex\":null,\"timeout_ms\":120000}}}}}}}}\n",
+        .{workspace_root},
+    );
+    defer std.testing.allocator.free(fixture);
+    try writeFixtureFile(tmp.dir, "home/.fx/settings.json", fixture);
+
+    var detailed = try loadMergedSettingsDetailedFromHome(
+        std.testing.allocator,
+        home_root,
+        workspace_root,
+    );
+    defer detailed.deinit(std.testing.allocator);
+    var naming = try session_naming.resolveConfig(
+        std.testing.allocator,
+        &detailed.settings.session_naming,
+    );
+    defer naming.deinit(std.testing.allocator);
+
+    try std.testing.expectEqualStrings("openai/gpt-5-mini", naming.gateway.model.?);
+    try std.testing.expect(naming.gateway.effort.eql(types.ReasoningEffort.literal("medium")));
+    try std.testing.expect(naming.codex.model == null);
+    try std.testing.expectEqual(@as(u64, 120_000), naming.timeout_ms);
+}
+
+test "project session naming config is ignored and diagnosed" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
+    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
+    try writeFixtureFile(tmp.dir, "home/.fx/settings.json", "{}\n");
+    try writeFixtureFile(
+        tmp.dir,
+        "workspace/.fx.json",
+        "{\"session_naming\":{\"codex\":null}}\n",
+    );
+    const home_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "home");
+    defer std.testing.allocator.free(home_root);
+    const workspace_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "workspace");
+    defer std.testing.allocator.free(workspace_root);
+
+    var detailed = try loadMergedSettingsDetailedFromHome(
+        std.testing.allocator,
+        home_root,
+        workspace_root,
+    );
+    defer detailed.deinit(std.testing.allocator);
+    try std.testing.expect(!detailed.settings.session_naming.codex.specified);
+    try expectIgnoredProjectKey(detailed.diagnostics, "session_naming");
+}
+
 test "malformed project profile-only settings are ignored before value parsing" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -3302,6 +3462,60 @@ test "detailed settings report non-empty process model override as winning sourc
     try std.testing.expectEqual(ConfigSource.process_override, result.sources.models.get(.gateway));
     try std.testing.expectEqual(ModelSource.process_override, result.model_source.?);
     try std.testing.expectEqualStrings("user/model", result.settings.models.get(.gateway).?);
+}
+
+test "detailed settings report valid process effort override as winning source" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
+    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
+
+    const home_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "home");
+    defer std.testing.allocator.free(home_root);
+    const workspace_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "workspace");
+    defer std.testing.allocator.free(workspace_root);
+    try writeFixtureFile(tmp.dir, "home/.fx/settings.json", "{\"effort\":\"low\"}\n");
+
+    const home = try TestHome.install(std.testing.allocator, home_root);
+    defer home.deinit();
+    try home.map.put("FX_EFFORT", " high ");
+
+    var result = try loadMergedSettingsDetailedFromHome(std.testing.allocator, home_root, workspace_root);
+    defer result.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(ConfigSource.process_override, result.sources.effort);
+    try std.testing.expect(result.settings.effort.?.eql(types.ReasoningEffort.literal("low")));
+    try std.testing.expect(processEffortOverride().?.eql(types.ReasoningEffort.literal("high")));
+    try std.testing.expect(resolveEffort(result.settings.effort).eql(types.ReasoningEffort.literal("high")));
+}
+
+test "blank or invalid process effort override is ignored" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
+    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
+
+    const home_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "home");
+    defer std.testing.allocator.free(home_root);
+    const workspace_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "workspace");
+    defer std.testing.allocator.free(workspace_root);
+    try writeFixtureFile(tmp.dir, "home/.fx/settings.json", "{\"effort\":\"low\"}\n");
+
+    const home = try TestHome.install(std.testing.allocator, home_root);
+    defer home.deinit();
+
+    inline for (&.{ "", "   ", "not valid!", "x" ** (types.ReasoningEffort.max_name_bytes + 1) }) |raw| {
+        try home.map.put("FX_EFFORT", raw);
+        var result = try loadMergedSettingsDetailedFromHome(std.testing.allocator, home_root, workspace_root);
+        defer result.deinit(std.testing.allocator);
+        try std.testing.expectEqual(ConfigSource.user_global, result.sources.effort);
+        try std.testing.expect(processEffortOverride() == null);
+        try std.testing.expect(resolveEffort(result.settings.effort).eql(types.ReasoningEffort.literal("low")));
+    }
+
+    try home.map.put("FX_EFFORT", "default");
+    try std.testing.expectEqual(types.ReasoningEffort.auto, processEffortOverride().?);
+    try std.testing.expectEqual(types.ReasoningEffort.auto, resolveEffort(types.ReasoningEffort.literal("low")));
 }
 
 test "invalid user model emits typed diagnostic and project model is ignored" {

@@ -56,10 +56,11 @@ pub const top_level_specs = [_]TopLevelSpec{
     .{
         .kind = .acp,
         .token = "acp",
-        .usage = "acp [--model <id>] [--log-file <path>]",
+        .usage = "acp [--model <id>] [--effort <name>] [--log-file <path>]",
         .summary = "Start an ACP server over stdio",
         .options = &.{
             .{ .flag = "--model <id>", .description = "Override the default model" },
+            .{ .flag = "--effort <name>", .description = "Override reasoning effort without saving" },
             .{ .flag = "--log-file <path>", .description = "Write ACP logs to a file" },
         },
     },
@@ -316,6 +317,18 @@ pub const top_level_flags = [_]TopLevelFlag{
     .{
         .usage = "--record",
         .description = "Record terminal output",
+    },
+    .{
+        .usage = "--system-prompt-file <path>",
+        .description = "Replace launch system prompt from UTF-8 file",
+    },
+    .{
+        .usage = "--append-system-prompt-file <path>",
+        .description = "Append UTF-8 system prompt file; repeatable",
+    },
+    .{
+        .usage = "--skills-dir <path>",
+        .description = "Load an invocation skill root; repeatable",
     },
     .{
         .usage = "--context-limit <spec>",

@@ -1180,7 +1180,9 @@ tmuxTest(
     await session.sendText("Use the Codex subscription directly.");
     await session.waitForText("CHATGPT_DIRECT_RESPONSE", TIMEOUT);
     const directRequest = chatgptOauth.requests.find(
-      (request) => request.path === "/chatgpt/responses",
+      (request) =>
+        request.path === "/chatgpt/responses" &&
+        !request.body?.includes("Generate a short session title"),
     );
     expect(directRequest?.authorization).toBe(`Bearer ${chatgptOauth.accessToken}`);
     const directBody = JSON.parse(directRequest?.body ?? "{}") as {

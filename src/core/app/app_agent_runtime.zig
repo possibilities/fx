@@ -1,4 +1,6 @@
 const std = @import("std");
+const ade_events = @import("../../builtins/hooks/ade_events.zig");
+const ade_git_roots = @import("../../builtins/hooks/ade_git_roots.zig");
 const agent_runtime = @import("../agent/agent_runtime.zig");
 const agent_stream_provider = @import("../agent/stream_provider.zig");
 const command_admission = @import("../permissions/command_admission.zig");
@@ -25,10 +27,14 @@ const prompt_policy_contract = @import("../config/prompt_policy.zig");
 const model_provider = @import("../config/model_provider.zig");
 const session_runtime = @import("../session/session.zig");
 const session_child_store = @import("../session/session_child_store.zig");
+const session_codec = @import("../session/session_codec.zig");
+const session_store = @import("../session/session_store.zig");
 const skill_runtime = @import("../skills/skill_runtime.zig");
 const subagent_agent_adapter = @import("../subagent/agent_adapter.zig");
+const subagent_authority = @import("../subagent/authority.zig");
 const subagent_domain = @import("../subagent/domain.zig");
 const subagent_execution = @import("../subagent/execution.zig");
+const subagent_tool_host = @import("../subagent/tool_host.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const text_utils = @import("../shared/text_utils.zig");
 const tool_args = @import("../tooling/tool_args.zig");
@@ -95,9 +101,27 @@ pub fn Runtime(comptime App: type) type {
             return app.context_snapshot.modelVisibleBytes();
         }
 
-        fn childToolContext(root_context: tool_runtime.Context) tool_runtime.Context {
+        fn childToolContext(
+            root_context: tool_runtime.Context,
+            root_session_id: []const u8,
+        ) tool_runtime.Context {
             var child_context = root_context;
             child_context.tracker = null;
+            child_context.lifecycle_parent_session_id = root_session_id;
+            return child_context;
+        }
+
+        fn childToolContextForAdmission(
+            root_context: tool_runtime.Context,
+            admission: subagent_domain.AdmissionSnapshot,
+            child_session_id: ?[]const u8,
+        ) tool_runtime.Context {
+            var child_context = childToolContext(root_context, admission.root_id);
+            child_context.lifecycle_scope = .{
+                .kind = .subagent,
+                .workspace_root = child_context.workspace_root,
+                .session_id = child_session_id,
+            };
             return child_context;
         }
 
@@ -260,6 +284,10 @@ pub fn Runtime(comptime App: type) type {
                 .session = &app.session,
                 .session_allocator = app.alloc,
                 .skills_dir = app.skills.dir,
+                .invocation_skill_roots = if (comptime @hasField(App, "invocation_skill_roots"))
+                    app.invocation_skill_roots
+                else
+                    &.{},
                 .context_limits = if (comptime @hasField(App, "context_limits")) app.context_limits else .{},
                 .context_enabled = if (comptime @hasField(App, "context_enabled")) app.context_enabled else true,
                 .context_registry = app.contextRegistry(),
@@ -285,6 +313,10 @@ pub fn Runtime(comptime App: type) type {
                 .on_mcp_progress = app_callbacks.Bindings(App).onMcpProgress,
                 .lifecycle_view = app.lifecycle_view,
                 .lifecycle_scope = lifecycleContext(app).scope,
+                .edited_path_observer = if (comptime @hasDecl(App, "editedPathObserver"))
+                    app.editedPathObserver()
+                else
+                    null,
             };
             if (comptime @hasField(App, "web_fetch_runtime")) {
                 ctx.web_fetch_runtime = &app.web_fetch_runtime;
@@ -1016,7 +1048,11 @@ pub fn Runtime(comptime App: type) type {
             ) catch return error.OutOfMemory;
             defer explicit_skills.deinit(alloc);
             const prompt_policy = app.promptPolicy();
-            const tool_context = childToolContext(app.subagentToolContextForAdmission(admission));
+            const tool_context = childToolContextForAdmission(
+                app.subagentToolContextForAdmission(admission),
+                admission,
+                turn.child_id,
+            );
             const providers = if (comptime @hasDecl(App, "providerSet"))
                 app.providerSet()
             else
@@ -1458,6 +1494,7 @@ const FakeApp = struct {
     web_search_models_path: []const u8 = "/models",
     lifecycle_runtime: hooks.Runtime,
     lifecycle_view: hooks.RuntimeView,
+    test_edited_path_observer: ?tool_runtime.EditedPathObserver = null,
     tool_registry: tool_dispatch.Registry = test_tool_registry,
     context_registry: context_contract.Registry = test_context_registry,
 
@@ -1548,6 +1585,10 @@ const FakeApp = struct {
             test_gateway_chat_url,
             admission,
         );
+    }
+
+    fn editedPathObserver(self: *FakeApp) ?tool_runtime.EditedPathObserver {
+        return self.test_edited_path_observer;
     }
 
     fn snapshotModelToolProjection(
@@ -1784,8 +1825,12 @@ test "app agent runtime builds tool context from app state and MCP callbacks" {
     try std.testing.expect(ctx.subagent_caller_id == null);
     try std.testing.expectEqual(&app.session, ctx.session);
     try std.testing.expectEqual(&app.change_tracker, ctx.tracker.?);
-    const child_ctx = Runtime(FakeApp).childToolContext(ctx);
+    const child_ctx = Runtime(FakeApp).childToolContext(ctx, "root-session");
     try std.testing.expect(child_ctx.tracker == null);
+    try std.testing.expectEqualStrings(
+        "root-session",
+        child_ctx.lifecycle_parent_session_id.?,
+    );
     try std.testing.expect(ctx.mcp_has_tool.?(ctx.mcp_ctx.?, "mcp_lookup", .unrestricted));
 
     const result = try ctx.mcp_call_tool.?(
@@ -2614,6 +2659,7 @@ test "subagent tool projection uses immutable admission permission rules" {
         .action = .allow,
     }};
     var admission = try subagent_domain.captureAdmission(alloc, .{
+        .root_id = "root-session",
         .parent_id = "parent",
         .source_id = "parent",
         .model = "test-model",
@@ -2725,7 +2771,8 @@ test "subagent tool context uses immutable admission authority" {
         .target_path = @constCast("/tmp/workspace::zig build"),
     }};
     var admission = try subagent_domain.captureAdmission(alloc, .{
-        .parent_id = "parent",
+        .root_id = "root-session",
+        .parent_id = "direct-parent-session",
         .source_id = "parent",
         .model = "test-model",
         .effort = .auto,
@@ -2735,7 +2782,21 @@ test "subagent tool context uses immutable admission authority" {
     });
     defer admission.deinit(alloc);
 
-    const ctx = app.subagentToolContextForAdmission(admission);
+    const ctx = Runtime(FakeApp).childToolContextForAdmission(
+        app.subagentToolContextForAdmission(admission),
+        admission,
+        "nested-session",
+    );
+    try std.testing.expectEqualStrings("direct-parent-session", admission.parent_id);
+    try std.testing.expectEqualStrings(
+        "root-session",
+        ctx.lifecycle_parent_session_id.?,
+    );
+    try std.testing.expectEqual(hooks.ScopeKind.subagent, ctx.lifecycle_scope.kind);
+    try std.testing.expectEqualStrings(
+        "nested-session",
+        ctx.lifecycle_scope.session_id.?,
+    );
     try std.testing.expectEqual(PermissionMode.auto, ctx.permission_mode);
     try std.testing.expectEqual(@as(usize, 1), ctx.permission_rules.rules.len);
     try std.testing.expectEqualStrings(
@@ -2746,6 +2807,384 @@ test "subagent tool context uses immutable admission authority" {
     try std.testing.expectEqualStrings(
         "run_command",
         ctx.permission_grants[0].tool_name,
+    );
+}
+
+const NestedTestHostAuthority = struct {
+    root_id: []const u8,
+    parent_id: ?[]const u8 = null,
+    nested_id: ?[]const u8 = null,
+    saw_root_host_resolution: std.atomic.Value(bool) = .init(false),
+    saw_attached_host_resolution: std.atomic.Value(bool) = .init(false),
+
+    fn resolver(self: *NestedTestHostAuthority) subagent_authority.HostResolver {
+        return .{ .context = self, .resolve_fn = resolve };
+    }
+
+    fn resolve(
+        raw: ?*anyopaque,
+        alloc: Allocator,
+        root_id: []const u8,
+    ) subagent_authority.HostResolveError!subagent_authority.HostAuthority {
+        const self: *NestedTestHostAuthority = @ptrCast(@alignCast(raw.?));
+        const is_root = std.mem.eql(u8, self.root_id, root_id);
+        const is_parent = if (self.parent_id) |parent_id|
+            std.mem.eql(u8, parent_id, root_id)
+        else
+            false;
+        const is_nested = if (self.nested_id) |nested_id|
+            std.mem.eql(u8, nested_id, root_id)
+        else
+            false;
+        if (!is_root and !is_parent and !is_nested) {
+            return error.HostAuthorityUnavailable;
+        }
+        if (is_root) {
+            self.saw_root_host_resolution.store(true, .release);
+        } else {
+            self.saw_attached_host_resolution.store(true, .release);
+        }
+        return subagent_authority.HostAuthority.capture(
+            alloc,
+            &.{"subagent"},
+            &.{},
+            .{},
+            &.{},
+        );
+    }
+};
+
+const DelayedGitRootClientSink = struct {
+    client: *ade_events.Client,
+    entered: std.atomic.Value(bool) = .init(false),
+    release: std.atomic.Value(bool) = .init(false),
+    delivered: std.atomic.Value(bool) = .init(false),
+
+    fn report(raw: *anyopaque, discovery: ade_git_roots.Discovery) void {
+        const self: *DelayedGitRootClientSink = @ptrCast(@alignCast(raw));
+        if (discovery.reason == .launch_directory) return;
+        self.entered.store(true, .release);
+        while (!self.release.load(.acquire)) io_mod.sleep(std.time.ns_per_ms);
+        ade_events.TestAdapter.reportGitRootDiscovered(self.client, discovery);
+        self.delivered.store(true, .release);
+    }
+};
+
+const NestedGitRootObservationRunner = struct {
+    app: *FakeApp,
+    client: *ade_events.Client,
+    edited_path: []const u8,
+    expected_root_id: []const u8,
+    expected_parent_id: []const u8 = "",
+    authority_matches: std.atomic.Value(bool) = .init(false),
+    observation_reported: std.atomic.Value(bool) = .init(false),
+
+    fn run(
+        raw: ?*anyopaque,
+        turn: *subagent_execution.TurnContext,
+        message: subagent_domain.QueuedMessage,
+        admission: subagent_domain.AdmissionSnapshot,
+        cancel: *std.atomic.Value(bool),
+    ) subagent_execution.ServiceError!subagent_execution.RunOutcome {
+        const self: *NestedGitRootObservationRunner = @ptrCast(@alignCast(raw.?));
+        if (cancel.load(.acquire)) return error.Cancelled;
+        self.authority_matches.store(
+            std.mem.eql(u8, admission.root_id, self.expected_root_id) and
+                std.mem.eql(u8, admission.parent_id, self.expected_parent_id),
+            .release,
+        );
+
+        const child_context = Runtime(FakeApp).childToolContextForAdmission(
+            self.app.subagentToolContextForAdmission(admission),
+            admission,
+            turn.child_id,
+        );
+        self.client.reportTurnStarted(.{
+            .scope = child_context.lifecycle_scope,
+            .turn_id = 42,
+        });
+        const observer = child_context.edited_path_observer orelse
+            return error.ProviderFailed;
+        observer.report(tool_runtime.TestAdapter.editedPathObservationForContext(
+            child_context,
+            .file_mutation,
+            &.{self.edited_path},
+        ));
+        self.observation_reported.store(true, .release);
+
+        const history_turn = session_runtime.makeAssistantTurn(
+            turn.alloc,
+            message.content,
+            "completed",
+        ) catch return error.OutOfMemory;
+        defer session_runtime.freeHistoryTurn(turn.alloc, history_turn);
+        turn.commit(message.id, history_turn, 1, 1, io_mod.milliTimestamp()) catch
+            return error.ProviderFailed;
+        return .completed;
+    }
+};
+
+fn makeNestedTestSessionState(
+    alloc: Allocator,
+    id: []const u8,
+    workspace_root: []const u8,
+) !session_codec.DurableSessionState {
+    const owned_id = try alloc.dupe(u8, id);
+    errdefer alloc.free(owned_id);
+    const origin = try alloc.dupe(u8, workspace_root);
+    errdefer alloc.free(origin);
+    const workspace = try alloc.dupe(u8, workspace_root);
+    errdefer alloc.free(workspace);
+    const model = try alloc.dupe(u8, "test/model");
+    errdefer alloc.free(model);
+    const history = try alloc.alloc(types.HistoryTurn, 0);
+    return .{
+        .id = owned_id,
+        .origin_workspace_root = origin,
+        .workspace_root = workspace,
+        .created_at_ms = 1,
+        .updated_at_ms = 1,
+        .conversation_language = session_runtime.ConversationLanguage.literal("en"),
+        .preferences = .{
+            .model = model,
+            .effort = types.ReasoningEffort.literal("high"),
+            .fast_mode = false,
+        },
+        .history = history,
+        .total_input_tokens = 0,
+        .total_output_tokens = 0,
+    };
+}
+
+fn createNestedTestSession(
+    alloc: Allocator,
+    store: *session_store.Store,
+    id: []const u8,
+    workspace_root: []const u8,
+) !void {
+    var state = try makeNestedTestSessionState(alloc, id, workspace_root);
+    defer state.deinit(alloc);
+    var loaded = try store.startWritableSession(alloc, state);
+    loaded.deinit(alloc);
+}
+
+fn nestedHostOptions(
+    caller_id: []const u8,
+    invocation_id: []const u8,
+) subagent_tool_host.ExecuteOptions {
+    return .{
+        .caller_id = caller_id,
+        .invocation_id = invocation_id,
+        .defaults = .{
+            .provider = .gateway,
+            .model = "test/model",
+            .effort = types.ReasoningEffort.literal("high"),
+            .conversation_language = session_runtime.ConversationLanguage.literal("en"),
+        },
+        .max_result_bytes = 64 * 1024,
+        .timestamp_ms = 10,
+    };
+}
+
+fn nestedResultChildIdAlloc(alloc: Allocator, encoded: []const u8) ![]u8 {
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, encoded, .{});
+    defer parsed.deinit();
+    const child_id = parsed.value.object.get("child_id") orelse
+        return error.TestUnexpectedResult;
+    if (child_id != .string) return error.TestUnexpectedResult;
+    return alloc.dupe(u8, child_id.string);
+}
+
+test "nested host ADE observation keeps root parent through delayed discovery" {
+    const alloc = std.testing.allocator;
+    const root_id = "01J00000000000000000000000";
+    const next_root_id = "01J00000000000000000000001";
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "home/.fx");
+    try tmp.dir.createDirPath(std.testing.io, "workspace");
+    try tmp.dir.createDirPath(std.testing.io, "launch");
+    try tmp.dir.createDirPath(std.testing.io, "repository/.git");
+    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
+    defer alloc.free(home);
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
+    defer alloc.free(workspace);
+    const launch = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "launch");
+    defer alloc.free(launch);
+    const repository = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "repository");
+    defer alloc.free(repository);
+    const edited_path = try std.fs.path.join(alloc, &.{ repository, "edited.txt" });
+    defer alloc.free(edited_path);
+
+    var client = ade_events.Client{
+        .enabled = true,
+        .alloc = alloc,
+        .socket_path = try alloc.dupe(u8, "/tmp/unused-ade.sock"),
+        .instance_id = try alloc.dupe(u8, "instance-nested"),
+        .workspace_root = try alloc.dupe(u8, repository),
+        .main_session_id = try alloc.dupe(u8, root_id),
+    };
+    defer client.deinit();
+    var delayed_sink = DelayedGitRootClientSink{ .client = &client };
+    try client.git_roots.init(
+        alloc,
+        "instance-nested",
+        null,
+        .{ .context = &delayed_sink, .report_fn = DelayedGitRootClientSink.report },
+        .{ .kind = .interactive, .workspace_root = launch },
+    );
+
+    var app = try FakeApp.init(alloc);
+    defer app.deinit();
+    app.workspace_root = repository;
+    app.test_edited_path_observer = client.git_roots.editedPathObserver();
+    var store = try session_store.Store.initFromHome(alloc, home, workspace);
+    defer store.deinit(alloc);
+    try createNestedTestSession(alloc, &store, root_id, workspace);
+    var authority = NestedTestHostAuthority{ .root_id = root_id };
+    var runner = NestedGitRootObservationRunner{
+        .app = &app,
+        .client = &client,
+        .edited_path = edited_path,
+        .expected_root_id = root_id,
+    };
+    const subagent_host = try subagent_tool_host.Runtime.create(
+        alloc,
+        &store,
+        root_id,
+        authority.resolver(),
+        .{ .context = &runner, .run_fn = NestedGitRootObservationRunner.run },
+    );
+    defer subagent_host.deinit();
+    defer delayed_sink.release.store(true, .release);
+
+    var parent_command = try subagent_domain.validateCommand(alloc, .{ .create = .{
+        .name = "parent-child",
+        .mode = .persistent,
+    } });
+    defer parent_command.deinit(alloc);
+    const parent_result = try subagent_host.execute(
+        alloc,
+        &parent_command,
+        nestedHostOptions(root_id, "create-parent-child"),
+    );
+    defer alloc.free(parent_result);
+    const parent_id = try nestedResultChildIdAlloc(alloc, parent_result);
+    defer alloc.free(parent_id);
+    authority.parent_id = parent_id;
+    runner.expected_parent_id = parent_id;
+
+    var nested_command = try subagent_domain.validateCommand(alloc, .{ .create = .{
+        .name = "nested-child",
+        .mode = .persistent,
+    } });
+    defer nested_command.deinit(alloc);
+    const nested_result = try subagent_host.execute(
+        alloc,
+        &nested_command,
+        nestedHostOptions(parent_id, "create-nested-child"),
+    );
+    defer alloc.free(nested_result);
+    const nested_id = try nestedResultChildIdAlloc(alloc, nested_result);
+    defer alloc.free(nested_id);
+    authority.nested_id = nested_id;
+
+    var send_command = try subagent_domain.validateCommand(alloc, .{ .message = .{ .send = .{
+        .id = nested_id,
+        .content = "observe one edited path",
+    } } });
+    defer send_command.deinit(alloc);
+    const send_result = try subagent_host.execute(
+        alloc,
+        &send_command,
+        nestedHostOptions(parent_id, "message-nested-child"),
+    );
+    defer alloc.free(send_result);
+
+    const delivery_deadline = io_mod.milliTimestamp() + 5_000;
+    while (!delayed_sink.entered.load(.acquire) and
+        io_mod.milliTimestamp() < delivery_deadline)
+    {
+        io_mod.sleep(std.time.ns_per_ms);
+    }
+    if (!delayed_sink.entered.load(.acquire)) return error.TestUnexpectedResult;
+    client.reportSessionChanged(next_root_id);
+    delayed_sink.release.store(true, .release);
+    try std.testing.expectEqual(
+        subagent_execution.ChildResult.idle,
+        try subagent_host.owner.join(nested_id),
+    );
+
+    const serialization_deadline = io_mod.milliTimestamp() + 5_000;
+    while (!delayed_sink.delivered.load(.acquire) and
+        io_mod.milliTimestamp() < serialization_deadline)
+    {
+        io_mod.sleep(std.time.ns_per_ms);
+    }
+    if (!delayed_sink.delivered.load(.acquire)) return error.TestUnexpectedResult;
+    try std.testing.expect(runner.authority_matches.load(.acquire));
+    try std.testing.expect(runner.observation_reported.load(.acquire));
+    // Runtime accepts a HostResolver: the production authority resolver walks
+    // attached child IDs and calls the host only with their canonical root.
+    try std.testing.expect(authority.saw_root_host_resolution.load(.acquire));
+    try std.testing.expect(!authority.saw_attached_host_resolution.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 3), client.queue_len);
+
+    var lifecycle = try std.json.parseFromSlice(
+        std.json.Value,
+        alloc,
+        client.queue[0].?.bytes,
+        .{},
+    );
+    defer lifecycle.deinit();
+    var session_changed = try std.json.parseFromSlice(
+        std.json.Value,
+        alloc,
+        client.queue[1].?.bytes,
+        .{},
+    );
+    defer session_changed.deinit();
+    var discovery = try std.json.parseFromSlice(
+        std.json.Value,
+        alloc,
+        client.queue[2].?.bytes,
+        .{},
+    );
+    defer discovery.deinit();
+    try std.testing.expectEqualStrings(
+        "TurnStarted",
+        lifecycle.value.object.get("event").?.string,
+    );
+    try std.testing.expectEqualStrings(
+        "SessionChanged",
+        session_changed.value.object.get("event").?.string,
+    );
+    try std.testing.expectEqualStrings(
+        "GitRootDiscovered",
+        discovery.value.object.get("event").?.string,
+    );
+    const lifecycle_context = lifecycle.value.object.get("context").?.object;
+    const session_context = session_changed.value.object.get("context").?.object;
+    const discovery_context = discovery.value.object.get("context").?.object;
+    try std.testing.expectEqualStrings(
+        next_root_id,
+        session_context.get("session_id").?.string,
+    );
+    try std.testing.expectEqualStrings(
+        root_id,
+        lifecycle_context.get("parent_session_id").?.string,
+    );
+    try std.testing.expectEqualStrings(
+        nested_id,
+        lifecycle_context.get("session_id").?.string,
+    );
+    try std.testing.expectEqualStrings(
+        lifecycle_context.get("parent_session_id").?.string,
+        discovery_context.get("parent_session_id").?.string,
+    );
+    try std.testing.expectEqualStrings(
+        nested_id,
+        discovery_context.get("session_id").?.string,
     );
 }
 

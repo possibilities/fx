@@ -29,8 +29,8 @@ pub const CliModelCatalogInput = struct {
 
 pub const CliModelCatalogResult = union(enum) {
     loaded: struct {
-        /// Owned model id strings; the caller frees them with `collections.freeStringList`.
-        ids: std.ArrayList([]u8),
+        /// Owned catalog entries; the caller frees them with `model_catalog.freeModelCatalog`.
+        catalog: std.ArrayList(model_catalog.ModelCatalogEntry),
         provenance: model_catalog.Provenance,
     },
     failure: model_catalog.FailedOutcome,
