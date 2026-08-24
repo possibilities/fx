@@ -303,7 +303,8 @@ describe.skipIf(!tmuxAvailable())("ADE event feed", () => {
         (record) =>
           record.event === "SessionMetadataChanged" &&
           record.context.agent_role === "main" &&
-          record.payload.title === "ADE native session title",
+          // The provider answers in words; fx publishes the slug it made of them.
+          record.payload.title === "ade-native-session-title",
       );
       const metadataSessionId = nativeMetadata.context.session_id;
       expect(metadataSessionId).not.toBeNull();
@@ -311,7 +312,7 @@ describe.skipIf(!tmuxAvailable())("ADE event feed", () => {
         join(home, ".fx", "sessions", metadataSessionId!, "display.json"),
         "utf8",
       )) as { title?: unknown };
-      expect(display.title).toBe("ADE native session title");
+      expect(display.title).toBe("ade-native-session-title");
       await session.waitForText("Which ADE event path should continue?", TIMEOUT);
       await receiver.waitFor(
         (record) =>
