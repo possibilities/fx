@@ -15,8 +15,12 @@ const types = @import("../shared/types.zig");
 const Allocator = std.mem.Allocator;
 
 pub const excerpt_max_bytes: usize = 1600;
-pub const mentioned_file_max_bytes: usize = 32 * 1024;
+pub const mentioned_file_max_bytes: usize = 2 * 1024;
 pub const generated_title_max_bytes: usize = 64;
+/// Bytes kept from one naming stream before it is stopped. Twice the slug
+/// bound leaves room for a wrapping quote or a short preamble, and is small
+/// enough that a chatty model is cut off almost immediately.
+pub const capture_max_bytes: usize = generated_title_max_bytes * 2;
 pub const default_timeout_ms: u64 = 60_000;
 pub const min_timeout_ms: u64 = 1_000;
 pub const max_timeout_ms: u64 = 300_000;
@@ -199,7 +203,12 @@ const Task = struct {
     credential_source: ?types.CredentialSource,
     account_id: ?[]u8,
     team: ?[]u8,
+    /// Ends the task. Set only from outside the naming thread.
     cancel_flag: std.atomic.Value(bool) = .init(false),
+    /// Stops the provider call in flight, whether because the task ended or
+    /// because the attempt already captured everything a slug needs.
+    attempt_cancel: std.atomic.Value(bool) = .init(false),
+    captured_title: std.atomic.Value(bool) = .init(false),
     done: std.atomic.Value(bool) = .init(false),
     title: ?[]u8 = null,
     thread: ?std.Thread = null,
@@ -224,6 +233,14 @@ const Task = struct {
         };
         prepared.* = .{};
         return task;
+    }
+
+    /// Ends the task and stops the attempt in flight. `cancel_flag` is set
+    /// first so a naming thread that observes the stopped attempt also sees
+    /// that the task itself is over.
+    fn cancel(self: *Task) void {
+        self.cancel_flag.store(true, .seq_cst);
+        self.attempt_cancel.store(true, .seq_cst);
     }
 
     /// Milliseconds left of the admission's one budget; zero once spent.
@@ -349,7 +366,7 @@ pub const Runtime = struct {
     pub fn invalidate(self: *Runtime) void {
         self.generation +%= 1;
         if (self.generation == 0) self.generation = 1;
-        for (self.tasks.items) |task| task.cancel_flag.store(true, .seq_cst);
+        for (self.tasks.items) |task| task.cancel();
     }
 
     pub fn collect(
@@ -361,7 +378,7 @@ pub const Runtime = struct {
         var index: usize = 0;
         while (index < self.tasks.items.len) {
             const task = self.tasks.items[index];
-            if (now_ns >= task.deadline_ns) task.cancel_flag.store(true, .seq_cst);
+            if (now_ns >= task.deadline_ns) task.cancel();
             if (!task.done.load(.seq_cst)) {
                 index += 1;
                 continue;
@@ -452,8 +469,10 @@ fn requestTitle(task: *Task, excerpt: []const u8, timeout_ms: u64) !?[]u8 {
     var delivery = agent_stream_provider.DeliveryCertainty.init();
     var evidence: agent_stream_provider.AttemptEvidence = .{};
     var admission = NamingAdmission{ .evidence = &evidence };
-    var event_context: u8 = 0;
-    var result = try task.provider.stream(task.alloc, .{
+    task.captured_title.store(false, .seq_cst);
+    task.attempt_cancel.store(task.cancel_flag.load(.seq_cst), .seq_cst);
+    var capture = TitleCapture{ .task = task };
+    var result = task.provider.stream(task.alloc, .{
         .credential = .{
             .secret = task.api_key,
             .source = task.credential_source,
@@ -469,19 +488,29 @@ fn requestTitle(task: *Task, excerpt: []const u8, timeout_ms: u64) !?[]u8 {
         .vision_mode = .unavailable,
         .provider_options = .{ .reasoning = task.effort },
         .max_output_tokens = 64,
-        .budget = .{ .deadline = deadline, .cancel_flag = &task.cancel_flag },
+        .budget = .{ .deadline = deadline, .cancel_flag = &task.attempt_cancel },
         .trace_ctx = .{},
-        .content_capture_limit = 4096,
+        .content_capture_limit = capture_max_bytes,
         .deadline = deadline,
         .delivery = &delivery,
         .attempt_evidence = &evidence,
-        .events = .{ .context = &event_context, .emit_fn = ignoreEvent },
+        .events = .{ .context = &capture, .emit_fn = TitleCapture.emit },
         .admission = .{ .context = &admission, .admit_fn = NamingAdmission.admit },
-        .cancel_flag = &task.cancel_flag,
+        .cancel_flag = &task.attempt_cancel,
         .provider_attempt_owner = .transport,
-    });
+    }) catch |err| {
+        if (task.cancel_flag.load(.seq_cst)) return error.Cancelled;
+        // Stopping the stream ourselves is a completed answer, not a fault.
+        if (task.captured_title.load(.seq_cst)) {
+            return try slugifyTitle(task.alloc, capture.captured());
+        }
+        return err;
+    };
     defer result.deinit(task.alloc);
     if (task.cancel_flag.load(.seq_cst)) return error.Cancelled;
+    if (task.captured_title.load(.seq_cst)) {
+        return try slugifyTitle(task.alloc, capture.captured());
+    }
     const content = switch (result) {
         .completed => |completed| completed.completion.content orelse return null,
         .failed => return null,
@@ -499,7 +528,54 @@ const NamingAdmission = struct {
     }
 };
 
-fn ignoreEvent(_: *anyopaque, _: agent_stream_provider.Event) void {}
+/// Keeps the opening bytes of one naming stream and stops the provider as
+/// soon as a slug can be built from them. The Codex endpoint refuses the
+/// Responses API output bound, so stopping the stream is the only thing that
+/// keeps a naming answer short.
+const TitleCapture = struct {
+    task: *Task,
+    buffer: [capture_max_bytes]u8 = undefined,
+    len: usize = 0,
+
+    fn captured(self: *const TitleCapture) []const u8 {
+        return self.buffer[0..self.len];
+    }
+
+    fn emit(raw: *anyopaque, event: agent_stream_provider.Event) void {
+        const self: *TitleCapture = @ptrCast(@alignCast(raw));
+        const delta = switch (event) {
+            .content_delta => |text| text,
+            else => return,
+        };
+        // Each appended run is cut on a codepoint boundary, so the buffer
+        // stays valid UTF-8 for the slug.
+        const room = self.buffer.len - self.len;
+        const kept = text_utils.utf8PrefixByBytes(delta, @min(room, delta.len));
+        @memcpy(self.buffer[self.len..][0..kept.len], kept);
+        self.len += kept.len;
+        // Anything the buffer could not take is already more than a slug
+        // needs, so a dropped byte stops the stream as surely as a full
+        // buffer or a finished first line.
+        const overflowed = kept.len < delta.len or self.len == self.buffer.len;
+        if (!overflowed and !firstLineComplete(self.captured())) return;
+        self.task.captured_title.store(true, .seq_cst);
+        self.task.attempt_cancel.store(true, .seq_cst);
+    }
+};
+
+/// True once a line break follows text, because the slug only ever uses the
+/// first non-empty line.
+fn firstLineComplete(text: []const u8) bool {
+    var seen_text = false;
+    for (text) |byte| {
+        if (byte == '\n') {
+            if (seen_text) return true;
+            continue;
+        }
+        if (!std.ascii.isWhitespace(byte)) seen_text = true;
+    }
+    return false;
+}
 
 pub fn buildExcerpt(
     alloc: Allocator,
@@ -775,6 +851,105 @@ test "a completion with nothing sluggable is null so the caller may retry" {
     const alloc = std.testing.allocator;
     try std.testing.expect((try slugifyTitle(alloc, "  \n \xe2\x80\xa6 \n")) == null);
     try std.testing.expect((try slugifyTitle(alloc, "")) == null);
+}
+
+/// Emits its chunks in order and reports whether the naming task stopped it.
+const TestChattyProvider = struct {
+    chunks: []const []const u8,
+    emitted: usize = 0,
+    stopped: std.atomic.Value(bool) = .init(false),
+
+    fn provider(self: *@This()) agent_stream_provider.Provider {
+        return .{
+            .context = self,
+            .stream_fn = stream,
+        };
+    }
+
+    fn stream(
+        raw: ?*anyopaque,
+        _: Allocator,
+        request: agent_stream_provider.ModelRequest,
+    ) anyerror!agent_stream_provider.Result {
+        const self: *@This() = @ptrCast(@alignCast(raw.?));
+        try request.admission.admit();
+        for (self.chunks) |chunk| {
+            if (request.cancel_flag.load(.seq_cst)) break;
+            request.events.emit(.{ .content_delta = chunk });
+            self.emitted += 1;
+        }
+        if (request.cancel_flag.load(.seq_cst)) {
+            self.stopped.store(true, .seq_cst);
+            return error.Cancelled;
+        }
+        return .{ .completed = .{
+            .completion = .{ .content = "a whole answer the task must never need" },
+            .usage = .{ .immediate = null },
+        } };
+    }
+};
+
+fn runOneNaming(
+    runtime: *Runtime,
+    provider: agent_stream_provider.Provider,
+    session_id: []const u8,
+) !?CompletedName {
+    var prepared = (try runtime.prepareAdmission(testAdmission(provider, session_id))).?;
+    defer prepared.deinit();
+    runtime.admit(&prepared);
+    var spins: usize = 0;
+    while (spins < 5_000) : (spins += 1) {
+        if (runtime.collect(session_id)) |completed| return completed;
+        if (runtime.tasks.items.len == 0) return null;
+        io_mod.sleep(std.time.ns_per_ms);
+    }
+    return null;
+}
+
+test "a naming stream is stopped once its first line is complete" {
+    const alloc = std.testing.allocator;
+    var settings = Settings{};
+    var config = try resolveConfig(alloc, &settings);
+    var runtime = Runtime{};
+    runtime.configure(alloc, config);
+    config = .{};
+    defer runtime.deinit();
+
+    var fake = TestChattyProvider{ .chunks = &.{
+        "Fix the tray",
+        " width\n",
+        "and every further word the provider would have billed",
+    } };
+    var completed = (try runOneNaming(&runtime, fake.provider(), "session-a")).?;
+    defer completed.deinit();
+
+    try std.testing.expectEqualStrings("fix-the-tray-width", completed.title);
+    try std.testing.expect(fake.stopped.load(.seq_cst));
+    try std.testing.expectEqual(@as(usize, 2), fake.emitted);
+}
+
+test "a naming stream without a line break is stopped at the capture bound" {
+    const alloc = std.testing.allocator;
+    var settings = Settings{};
+    var config = try resolveConfig(alloc, &settings);
+    var runtime = Runtime{};
+    runtime.configure(alloc, config);
+    config = .{};
+    defer runtime.deinit();
+
+    // The multibyte codepoint straddles the bound, so the kept bytes must be
+    // cut before it for the slug to survive.
+    var fake = TestChattyProvider{ .chunks = &.{
+        ("x" ** (capture_max_bytes - 1)) ++ "\u{e9}" ++ " trailing prose",
+        "and every further word the provider would have billed",
+    } };
+    var completed = (try runOneNaming(&runtime, fake.provider(), "session-b")).?;
+    defer completed.deinit();
+
+    try std.testing.expectEqual(generated_title_max_bytes, completed.title.len);
+    try std.testing.expectEqualStrings("x" ** generated_title_max_bytes, completed.title);
+    try std.testing.expect(fake.stopped.load(.seq_cst));
+    try std.testing.expectEqual(@as(usize, 1), fake.emitted);
 }
 
 const TestNamingProvider = struct {
