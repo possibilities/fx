@@ -28,6 +28,7 @@ const glob_pattern = @import("../workspace/glob_pattern.zig");
 const permission_prompter = @import("../permissions/permission_prompter.zig");
 const permission_request = @import("../permissions/permission_request.zig");
 const command_admission = @import("../permissions/command_admission.zig");
+const command_effect = @import("../shell_command/command_effect.zig");
 const pathing = @import("../workspace/pathing.zig");
 const execution_router = @import("../execution/router.zig");
 const skill_runtime = @import("../skills/skill_runtime.zig");
@@ -122,6 +123,26 @@ test {
     _ = file_mutation_execution;
     _ = tool_presentation;
 }
+
+pub const EditedPathSource = enum {
+    file_mutation,
+    terminal_write,
+};
+
+pub const EditedPathObservation = struct {
+    scope: hooks.Scope,
+    source: EditedPathSource,
+    paths: []const []const u8,
+};
+
+pub const EditedPathObserver = struct {
+    context: *anyopaque,
+    report_fn: *const fn (*anyopaque, EditedPathObservation) void,
+
+    pub fn report(self: EditedPathObserver, observation: EditedPathObservation) void {
+        self.report_fn(self.context, observation);
+    }
+};
 
 pub const Context = struct {
     workspace_root: []const u8,
@@ -230,6 +251,7 @@ pub const Context = struct {
         .kind = .interactive,
         .workspace_root = "",
     },
+    edited_path_observer: ?EditedPathObserver = null,
 
     /// Projects only the borrowed capabilities consumed by admission.
     pub fn admissionInput(self: Context) tool_admission.Input {
@@ -393,6 +415,12 @@ pub fn executeToolCallAuthorized(
     execution_ctx.command_replay_unavailable = request.command_replay_unavailable;
 
     const started_at_ms = io_mod.milliTimestamp();
+    const edited_paths = prepareEditedPathObservation(
+        execution_ctx,
+        request.call_allocator,
+        request.call,
+        request.authority,
+    );
     const uses_file_mutation_contract = if (registeredToolSpec(
         execution_ctx,
         request.call.name,
@@ -449,10 +477,311 @@ pub fn executeToolCallAuthorized(
         .ok = ok,
         .started_at_ms = started_at_ms,
     });
+    reportEditedPathObservation(execution_ctx, result, edited_paths);
     if (request.command_replay_capture) |continued| {
         replay_continuation_transferred = result.command_replay_capture == continued;
     }
     return result;
+}
+
+const PreparedEditedPathObservation = struct {
+    source: EditedPathSource,
+    paths: [2][]const u8 = undefined,
+    path_count: usize = 0,
+    require_committed_file_handoff: bool = false,
+
+    fn slice(self: *const PreparedEditedPathObservation) []const []const u8 {
+        return self.paths[0..self.path_count];
+    }
+};
+
+fn prepareEditedPathObservation(
+    ctx: Context,
+    alloc: Allocator,
+    call: ToolCall,
+    authority: command_admission.ToolExecutionAuthority,
+) ?PreparedEditedPathObservation {
+    if (ctx.edited_path_observer == null) return null;
+
+    switch (authority) {
+        .file_mutation => |file_authority| return prepareAuthorizedFileMutationObservation(
+            file_authority.policy_targets.canonical_target_path,
+        ),
+        .run_command => |command_authority| {
+            if (!commandAuthorityIsFilesystemWriting(alloc, command_authority)) return null;
+            return .{
+                .source = .terminal_write,
+                .paths = .{ commandAuthorityFingerprint(command_authority).resolved_cwd, undefined },
+                .path_count = 1,
+            };
+        },
+        .ordinary, .vision_paths => {},
+    }
+
+    const spec = registeredToolSpec(ctx, call.name) orelse return null;
+    return prepareOrdinaryEditedPathObservation(
+        alloc,
+        ctx.workspace_root,
+        spec.executor_kind,
+        call.arguments_json,
+    );
+}
+
+fn prepareAuthorizedFileMutationObservation(
+    canonical_target_path: []const u8,
+) PreparedEditedPathObservation {
+    return .{
+        .source = .file_mutation,
+        .paths = .{ canonical_target_path, undefined },
+        .path_count = 1,
+        .require_committed_file_handoff = true,
+    };
+}
+
+fn prepareOrdinaryEditedPathObservation(
+    alloc: Allocator,
+    workspace_root: []const u8,
+    executor_kind: tool_dispatch.ExecutorKind,
+    arguments_json: []const u8,
+) ?PreparedEditedPathObservation {
+    const args = tool_args.parseToolArgsObject(alloc, arguments_json) catch return null;
+    return switch (executor_kind) {
+        .delete_file => blk: {
+            const raw_path = tool_args.requiredStringArg(args, "path") catch break :blk null;
+            const path = pathing.resolveWorkspaceOrExternalPath(
+                alloc,
+                workspace_root,
+                raw_path,
+            ) catch break :blk null;
+            break :blk .{
+                .source = .file_mutation,
+                .paths = .{ path, undefined },
+                .path_count = 1,
+            };
+        },
+        .rename_file => blk: {
+            const raw_source = tool_args.requiredStringArg(args, "old_path") catch break :blk null;
+            const raw_destination = tool_args.requiredStringArg(args, "new_path") catch break :blk null;
+            const source = pathing.resolveWorkspaceOrExternalPath(
+                alloc,
+                workspace_root,
+                raw_source,
+            ) catch break :blk null;
+            const destination = pathing.resolveWorkspaceOrExternalCreatePath(
+                alloc,
+                workspace_root,
+                raw_destination,
+            ) catch break :blk null;
+            break :blk .{
+                .source = .file_mutation,
+                .paths = .{ source, destination },
+                .path_count = 2,
+            };
+        },
+        .copy_file => blk: {
+            const raw_destination = tool_args.requiredStringArg(args, "destination") catch break :blk null;
+            const destination = pathing.resolveWorkspaceOrExternalCreatePath(
+                alloc,
+                workspace_root,
+                raw_destination,
+            ) catch break :blk null;
+            break :blk .{
+                .source = .file_mutation,
+                .paths = .{ destination, undefined },
+                .path_count = 1,
+            };
+        },
+        else => null,
+    };
+}
+
+fn commandAuthorityFingerprint(
+    authority: command_admission.CommandExecutionAuthority,
+) command_admission.AdmissionFingerprint {
+    return switch (authority) {
+        .direct_only => |fingerprint| fingerprint,
+        .shell_allowed => |allowed| allowed.fingerprint,
+    };
+}
+
+fn commandAuthorityIsFilesystemWriting(
+    alloc: Allocator,
+    authority: command_admission.CommandExecutionAuthority,
+) bool {
+    const shell = switch (authority) {
+        .direct_only => return false,
+        .shell_allowed => |allowed| allowed,
+    };
+    const fingerprint = shell.fingerprint;
+    var admission = command_effect.plan(
+        alloc,
+        fingerprint.command,
+        fingerprint.resolved_cwd,
+        fingerprint.background,
+        fingerprint.target_os,
+    ) catch return false;
+    defer admission.deinit(alloc);
+    return switch (admission) {
+        .direct_read_only => false,
+        .approval_required => |reason| reason == .filesystem_write,
+    };
+}
+
+fn reportEditedPathObservation(
+    ctx: Context,
+    result: ToolExecutionResult,
+    maybe_observation: ?PreparedEditedPathObservation,
+) void {
+    const observation = maybe_observation orelse return;
+    if (!shouldReportEditedPathObservation(
+        result.status,
+        observation.require_committed_file_handoff,
+        result.committed_file_handoff != null,
+    )) return;
+    const observer = ctx.edited_path_observer orelse return;
+    observer.report(.{
+        .scope = ctx.lifecycle_scope,
+        .source = observation.source,
+        .paths = observation.slice(),
+    });
+}
+
+fn shouldReportEditedPathObservation(
+    status: tool_contracts.ToolExecutionStatus,
+    require_committed_file_handoff: bool,
+    has_committed_file_handoff: bool,
+) bool {
+    return status == .success and
+        (!require_committed_file_handoff or has_committed_file_handoff);
+}
+
+test "ADE edited path preparation preserves exact file-operation mutation targets" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "workspace/source");
+    try tmp.dir.createDirPath(std.testing.io, "workspace/destination");
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "workspace/source/delete.txt",
+        .data = "delete",
+    });
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "workspace/source/rename.txt",
+        .data = "rename",
+    });
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "workspace/source/copy.txt",
+        .data = "copy",
+    });
+
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
+    defer alloc.free(workspace);
+    const delete_path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace/source/delete.txt");
+    defer alloc.free(delete_path);
+    const rename_source = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace/source/rename.txt");
+    defer alloc.free(rename_source);
+    const rename_destination = try std.fs.path.join(alloc, &.{ workspace, "destination", "renamed.txt" });
+    defer alloc.free(rename_destination);
+    const copy_destination = try std.fs.path.join(alloc, &.{ workspace, "destination", "copied.txt" });
+    defer alloc.free(copy_destination);
+
+    const delete = prepareOrdinaryEditedPathObservation(
+        arena,
+        workspace,
+        .delete_file,
+        "{\"path\":\"source/delete.txt\"}",
+    ).?;
+    try std.testing.expectEqual(@as(usize, 1), delete.slice().len);
+    try std.testing.expectEqualStrings(delete_path, delete.slice()[0]);
+
+    const rename = prepareOrdinaryEditedPathObservation(
+        arena,
+        workspace,
+        .rename_file,
+        "{\"old_path\":\"source/rename.txt\",\"new_path\":\"destination/renamed.txt\"}",
+    ).?;
+    try std.testing.expectEqual(@as(usize, 2), rename.slice().len);
+    try std.testing.expectEqualStrings(rename_source, rename.slice()[0]);
+    try std.testing.expectEqualStrings(rename_destination, rename.slice()[1]);
+
+    const copy = prepareOrdinaryEditedPathObservation(
+        arena,
+        workspace,
+        .copy_file,
+        "{\"source\":\"source/copy.txt\",\"destination\":\"destination/copied.txt\"}",
+    ).?;
+    try std.testing.expectEqual(@as(usize, 1), copy.slice().len);
+    try std.testing.expectEqualStrings(copy_destination, copy.slice()[0]);
+
+    const write = prepareAuthorizedFileMutationObservation(copy_destination);
+    try std.testing.expectEqual(@as(usize, 1), write.slice().len);
+    try std.testing.expectEqualStrings(copy_destination, write.slice()[0]);
+    try std.testing.expect(write.require_committed_file_handoff);
+}
+
+test "ADE edited path reporting requires successful committed mutation results" {
+    try std.testing.expect(shouldReportEditedPathObservation(.success, false, false));
+    try std.testing.expect(!shouldReportEditedPathObservation(.failure, false, false));
+    try std.testing.expect(shouldReportEditedPathObservation(.success, true, true));
+    try std.testing.expect(!shouldReportEditedPathObservation(.success, true, false));
+    try std.testing.expect(!shouldReportEditedPathObservation(.failure, true, true));
+}
+
+test "ADE terminal root tracking follows only filesystem-write classification" {
+    const fingerprint = command_admission.AdmissionFingerprint{
+        .command = "touch edited.txt",
+        .resolved_cwd = "/tmp/workspace",
+        .background = false,
+        .target_os = builtin.os.tag,
+    };
+    try std.testing.expect(commandAuthorityIsFilesystemWriting(
+        std.testing.allocator,
+        .{ .shell_allowed = .{ .fingerprint = fingerprint, .source = .yolo } },
+    ));
+    try std.testing.expect(commandAuthorityIsFilesystemWriting(
+        std.testing.allocator,
+        .{ .shell_allowed = .{
+            .fingerprint = .{
+                .command = fingerprint.command,
+                .resolved_cwd = fingerprint.resolved_cwd,
+                .background = fingerprint.background,
+                .target_os = fingerprint.target_os,
+                .environment = .{ .clean = "/bin/sh" },
+            },
+            .source = .yolo,
+        } },
+    ));
+    try std.testing.expect(!commandAuthorityIsFilesystemWriting(
+        std.testing.allocator,
+        .{ .direct_only = fingerprint },
+    ));
+    try std.testing.expect(!commandAuthorityIsFilesystemWriting(
+        std.testing.allocator,
+        .{ .shell_allowed = .{
+            .fingerprint = .{
+                .command = "git status --short",
+                .resolved_cwd = fingerprint.resolved_cwd,
+                .background = false,
+                .target_os = fingerprint.target_os,
+            },
+            .source = .yolo,
+        } },
+    ));
+    try std.testing.expect(!commandAuthorityIsFilesystemWriting(
+        std.testing.allocator,
+        .{ .shell_allowed = .{
+            .fingerprint = .{
+                .command = "cd ../other && touch edited.txt",
+                .resolved_cwd = fingerprint.resolved_cwd,
+                .background = false,
+                .target_os = fingerprint.target_os,
+            },
+            .source = .yolo,
+        } },
+    ));
 }
 
 fn rebindMcpAuthorityGeneration(

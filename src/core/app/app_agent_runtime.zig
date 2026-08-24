@@ -289,6 +289,10 @@ pub fn Runtime(comptime App: type) type {
                 .on_mcp_progress = app_callbacks.Bindings(App).onMcpProgress,
                 .lifecycle_view = app.lifecycle_view,
                 .lifecycle_scope = lifecycleContext(app).scope,
+                .edited_path_observer = if (comptime @hasDecl(App, "editedPathObserver"))
+                    app.editedPathObserver()
+                else
+                    null,
             };
             if (comptime @hasField(App, "web_fetch_runtime")) {
                 ctx.web_fetch_runtime = &app.web_fetch_runtime;
