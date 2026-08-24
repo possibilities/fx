@@ -23,6 +23,12 @@ pub const max_timeout_ms: u64 = 300_000;
 pub const default_codex_model = "gpt-5.4-mini";
 pub const default_effort = types.ReasoningEffort.literal("low");
 
+/// One retry. A completion that slugs to nothing is usually formatting
+/// noise rather than a provider fault, and asking a second time is what
+/// makes the slug reliable. Both attempts spend the admission's single
+/// deadline, so retrying never extends a task's life.
+pub const naming_attempts: usize = 2;
+
 const naming_instruction =
     "Generate a short session title of three to six words that summarizes " ++
     "the work requested in the conversation-opening prompt. Prioritize the " ++
@@ -193,7 +199,6 @@ const Task = struct {
     credential_source: ?types.CredentialSource,
     account_id: ?[]u8,
     team: ?[]u8,
-    timeout_ms: u64,
     cancel_flag: std.atomic.Value(bool) = .init(false),
     done: std.atomic.Value(bool) = .init(false),
     title: ?[]u8 = null,
@@ -216,10 +221,16 @@ const Task = struct {
             .credential_source = prepared.credential_source,
             .account_id = prepared.account_id,
             .team = prepared.team,
-            .timeout_ms = prepared.timeout_ms,
         };
         prepared.* = .{};
         return task;
+    }
+
+    /// Milliseconds left of the admission's one budget; zero once spent.
+    fn remainingMs(self: *const Task) u64 {
+        const left = self.deadline_ns - io_mod.nanoTimestamp();
+        if (left <= 0) return 0;
+        return @intCast(@divTrunc(left, std.time.ns_per_ms));
     }
 
     fn run(self: *Task) void {
@@ -416,13 +427,27 @@ fn inferTitle(task: *Task) !?[]u8 {
     defer task.alloc.free(excerpt);
     if (excerpt.len == 0 or task.cancel_flag.load(.seq_cst)) return null;
 
+    var attempt: usize = 0;
+    while (attempt < naming_attempts) : (attempt += 1) {
+        if (task.cancel_flag.load(.seq_cst)) return error.Cancelled;
+        const remaining_ms = task.remainingMs();
+        if (remaining_ms == 0) return null;
+        if (try requestTitle(task, excerpt, remaining_ms)) |title| return title;
+    }
+    return null;
+}
+
+/// One bounded provider request, normalized. A refused, empty, or
+/// unsluggable answer is null so the caller may ask again; cancellation and
+/// transport faults stay errors and end the task.
+fn requestTitle(task: *Task, excerpt: []const u8, timeout_ms: u64) !?[]u8 {
     const messages = [_]types.ChatMessage{
         .{ .role = .system, .content = naming_instruction },
         .{ .role = .user, .content = excerpt },
     };
     const deadline = std.Io.Clock.Timestamp.fromNow(io_mod.getIo(), .{
         .clock = .awake,
-        .raw = .fromMilliseconds(@intCast(task.timeout_ms)),
+        .raw = .fromMilliseconds(@intCast(timeout_ms)),
     });
     var delivery = agent_stream_provider.DeliveryCertainty.init();
     var evidence: agent_stream_provider.AttemptEvidence = .{};
@@ -461,7 +486,7 @@ fn inferTitle(task: *Task) !?[]u8 {
         .completed => |completed| completed.completion.content orelse return null,
         .failed => return null,
     };
-    return try sanitizeTitle(task.alloc, content);
+    return try slugifyTitle(task.alloc, content);
 }
 
 const NamingAdmission = struct {
@@ -613,7 +638,17 @@ fn readMention(
     return alloc.dupe(u8, content);
 }
 
-pub fn sanitizeTitle(alloc: Allocator, raw: []const u8) !?[]u8 {
+/// Normalizes one completion into a `[a-z0-9-]+` slug, or null when nothing
+/// survives. The shape is the one agentsurface's `slugify` established:
+/// ASCII only, lowercase, every other run collapsed to a single hyphen,
+/// bounded and then re-trimmed so a cut never leaves a trailing separator.
+/// Fx carries no Unicode normalizer, so an accented letter is dropped where
+/// agentsurface's NFKD pass folds it to its ASCII base.
+///
+/// The first non-empty line and the surrounding quotes come off first. That
+/// is hygiene agentsurface does not need and never changes a well-behaved
+/// one-line answer, but it keeps a chatty model's second line out of the slug.
+pub fn slugifyTitle(alloc: Allocator, raw: []const u8) !?[]u8 {
     if (!std.unicode.utf8ValidateSlice(raw)) return null;
     var line_it = std.mem.splitScalar(u8, raw, '\n');
     var candidate: ?[]const u8 = null;
@@ -634,37 +669,25 @@ pub fn sanitizeTitle(alloc: Allocator, raw: []const u8) !?[]u8 {
 
     var out: std.ArrayList(u8) = .empty;
     defer out.deinit(alloc);
-    var index: usize = 0;
-    var pending_space = false;
-    while (index < text.len) {
-        const width = std.unicode.utf8ByteSequenceLength(text[index]) catch return null;
-        if (index + width > text.len) return null;
-        const sequence = text[index .. index + width];
-        const codepoint = std.unicode.utf8Decode(sequence) catch return null;
-        index += width;
-        if (isUnsafeTitleCodepoint(codepoint)) continue;
-        if (codepoint <= 0x7f and std.ascii.isWhitespace(@intCast(codepoint))) {
-            pending_space = out.items.len > 0;
+    var pending_separator = false;
+    for (text) |byte| {
+        // A continuation byte is never ASCII, so dropping the high half by
+        // byte can not split a sequence the validation above accepted.
+        if (byte >= 0x80) continue;
+        if (!std.ascii.isAlphanumeric(byte)) {
+            pending_separator = true;
             continue;
         }
-        const separator_bytes: usize = if (pending_space) 1 else 0;
-        if (out.items.len + separator_bytes + sequence.len > generated_title_max_bytes) break;
-        if (pending_space) try out.append(alloc, ' ');
-        try out.appendSlice(alloc, sequence);
-        pending_space = false;
+        if (pending_separator and out.items.len > 0) try out.append(alloc, '-');
+        pending_separator = false;
+        try out.append(alloc, std.ascii.toLower(byte));
     }
-    while (out.items.len > 0 and std.ascii.isWhitespace(out.items[out.items.len - 1])) {
-        _ = out.pop();
+    if (out.items.len > generated_title_max_bytes) {
+        out.shrinkRetainingCapacity(generated_title_max_bytes);
     }
+    while (out.items.len > 0 and out.items[out.items.len - 1] == '-') _ = out.pop();
     if (out.items.len == 0) return null;
     return try out.toOwnedSlice(alloc);
-}
-
-fn isUnsafeTitleCodepoint(codepoint: u21) bool {
-    if (codepoint <= 0x1f or codepoint == 0x7f) return true;
-    return (codepoint >= 0x200b and codepoint <= 0x200f) or
-        (codepoint >= 0x202a and codepoint <= 0x202e) or
-        (codepoint >= 0x2066 and codepoint <= 0x2069);
 }
 
 test "session naming resolves the Codex default and skips other providers" {
@@ -727,17 +750,31 @@ test "unresolved mentions stay literal and email addresses are not mentions" {
     );
 }
 
-test "generated titles keep native text while removing unsafe controls and bounding bytes" {
+test "generated titles slug to lowercase hyphens, bounded and re-trimmed" {
     const alloc = std.testing.allocator;
-    const title = (try sanitizeTitle(
+    const title = (try slugifyTitle(
         alloc,
         "  \"Plan \x07release \xe2\x80\xaeacross every deployment environment with careful verification\"\nignored",
     )).?;
     defer alloc.free(title);
-    try std.testing.expect(std.mem.findScalar(u8, title, 0x07) == null);
-    try std.testing.expect(std.mem.find(u8, title, "\xe2\x80\xae") == null);
-    try std.testing.expect(title.len <= generated_title_max_bytes);
-    try std.testing.expect(std.mem.startsWith(u8, title, "Plan release across"));
+    try std.testing.expectEqual(generated_title_max_bytes, title.len);
+    try std.testing.expectEqualStrings(
+        "plan-release-across-every-deployment-environment-with-careful-ve",
+        title,
+    );
+}
+
+test "a slug keeps no separator at either end and never runs two together" {
+    const alloc = std.testing.allocator;
+    const title = (try slugifyTitle(alloc, "  ---Fix   the  TRAY --- width---  ")).?;
+    defer alloc.free(title);
+    try std.testing.expectEqualStrings("fix-the-tray-width", title);
+}
+
+test "a completion with nothing sluggable is null so the caller may retry" {
+    const alloc = std.testing.allocator;
+    try std.testing.expect((try slugifyTitle(alloc, "  \n \xe2\x80\xa6 \n")) == null);
+    try std.testing.expect((try slugifyTitle(alloc, "")) == null);
 }
 
 const TestNamingProvider = struct {
