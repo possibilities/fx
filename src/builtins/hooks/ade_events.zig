@@ -313,7 +313,7 @@ pub const Client = struct {
         self.reportGitRootDiscovered(discovery);
     }
 
-    fn reportGitRootDiscovered(self: *Client, discovery: ade_git_roots.Discovery) void {
+    pub fn reportGitRootDiscovered(self: *Client, discovery: ade_git_roots.Discovery) void {
         if (!self.enabled) return;
         const role = roleForScope(discovery.scope.kind) orelse return;
         const io = io_mod.getIo();
@@ -569,19 +569,7 @@ pub fn Runtime(comptime App: type) type {
         }
 
         pub fn editedPathObserver(app: *App) ?tool_runtime.EditedPathObserver {
-            if (!app.ade_events.git_roots.enabled) return null;
-            return .{
-                .context = &app.ade_events.git_roots,
-                .report_fn = reportEditedPathsRaw,
-            };
-        }
-
-        fn reportEditedPathsRaw(
-            raw: *anyopaque,
-            observation: tool_runtime.EditedPathObservation,
-        ) void {
-            const tracker: *ade_git_roots.Tracker = @ptrCast(@alignCast(raw));
-            tracker.reportEditedPaths(observation);
+            return app.ade_events.git_roots.editedPathObserver();
         }
 
         fn turnStarted(raw: *anyopaque, input: hooks.TurnStartedInput) hooks.HandlerError!void {

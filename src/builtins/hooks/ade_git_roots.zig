@@ -178,6 +178,22 @@ pub const Tracker = struct {
         );
     }
 
+    pub fn editedPathObserver(self: *Tracker) ?tool_runtime.EditedPathObserver {
+        if (!self.enabled) return null;
+        return .{
+            .context = self,
+            .report_fn = reportEditedPathsRaw,
+        };
+    }
+
+    fn reportEditedPathsRaw(
+        raw: *anyopaque,
+        observation: tool_runtime.EditedPathObservation,
+    ) void {
+        const self: *Tracker = @ptrCast(@alignCast(raw));
+        self.reportEditedPaths(observation);
+    }
+
     fn enqueueBatch(
         self: *Tracker,
         scope: hooks.Scope,
