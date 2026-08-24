@@ -313,7 +313,7 @@ pub const Client = struct {
         self.reportGitRootDiscovered(discovery);
     }
 
-    pub fn reportGitRootDiscovered(self: *Client, discovery: ade_git_roots.Discovery) void {
+    fn reportGitRootDiscovered(self: *Client, discovery: ade_git_roots.Discovery) void {
         if (!self.enabled) return;
         const role = roleForScope(discovery.scope.kind) orelse return;
         const io = io_mod.getIo();
@@ -513,6 +513,15 @@ pub const Client = struct {
         return output.toOwnedSlice();
     }
 };
+
+pub const TestAdapter = if (builtin.is_test) struct {
+    pub fn reportGitRootDiscovered(
+        client: *Client,
+        discovery: ade_git_roots.Discovery,
+    ) void {
+        client.reportGitRootDiscovered(discovery);
+    }
+} else struct {};
 
 pub fn Runtime(comptime App: type) type {
     return struct {

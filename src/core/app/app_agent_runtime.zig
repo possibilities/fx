@@ -2812,6 +2812,10 @@ test "subagent tool context uses immutable admission authority" {
 
 const NestedTestHostAuthority = struct {
     root_id: []const u8,
+    parent_id: ?[]const u8 = null,
+    nested_id: ?[]const u8 = null,
+    saw_root_host_resolution: std.atomic.Value(bool) = .init(false),
+    saw_attached_host_resolution: std.atomic.Value(bool) = .init(false),
 
     fn resolver(self: *NestedTestHostAuthority) subagent_authority.HostResolver {
         return .{ .context = self, .resolve_fn = resolve };
@@ -2823,8 +2827,22 @@ const NestedTestHostAuthority = struct {
         root_id: []const u8,
     ) subagent_authority.HostResolveError!subagent_authority.HostAuthority {
         const self: *NestedTestHostAuthority = @ptrCast(@alignCast(raw.?));
-        if (!std.mem.eql(u8, self.root_id, root_id)) {
+        const is_root = std.mem.eql(u8, self.root_id, root_id);
+        const is_parent = if (self.parent_id) |parent_id|
+            std.mem.eql(u8, parent_id, root_id)
+        else
+            false;
+        const is_nested = if (self.nested_id) |nested_id|
+            std.mem.eql(u8, nested_id, root_id)
+        else
+            false;
+        if (!is_root and !is_parent and !is_nested) {
             return error.HostAuthorityUnavailable;
+        }
+        if (is_root) {
+            self.saw_root_host_resolution.store(true, .release);
+        } else {
+            self.saw_attached_host_resolution.store(true, .release);
         }
         return subagent_authority.HostAuthority.capture(
             alloc,
@@ -2847,7 +2865,7 @@ const DelayedGitRootClientSink = struct {
         if (discovery.reason == .launch_directory) return;
         self.entered.store(true, .release);
         while (!self.release.load(.acquire)) io_mod.sleep(std.time.ns_per_ms);
-        self.client.reportGitRootDiscovered(discovery);
+        ade_events.TestAdapter.reportGitRootDiscovered(self.client, discovery);
         self.delivered.store(true, .release);
     }
 };
@@ -2887,7 +2905,7 @@ const NestedGitRootObservationRunner = struct {
         });
         const observer = child_context.edited_path_observer orelse
             return error.ProviderFailed;
-        observer.report(tool_runtime.editedPathObservation(
+        observer.report(tool_runtime.TestAdapter.editedPathObservationForContext(
             child_context,
             .file_mutation,
             &.{self.edited_path},
@@ -3053,12 +3071,12 @@ test "nested host ADE observation keeps root parent through delayed discovery" {
     defer alloc.free(parent_result);
     const parent_id = try nestedResultChildIdAlloc(alloc, parent_result);
     defer alloc.free(parent_id);
+    authority.parent_id = parent_id;
     runner.expected_parent_id = parent_id;
 
     var nested_command = try subagent_domain.validateCommand(alloc, .{ .create = .{
         .name = "nested-child",
         .mode = .persistent,
-        .prompt = "observe one edited path",
     } });
     defer nested_command.deinit(alloc);
     const nested_result = try subagent_host.execute(
@@ -3069,6 +3087,19 @@ test "nested host ADE observation keeps root parent through delayed discovery" {
     defer alloc.free(nested_result);
     const nested_id = try nestedResultChildIdAlloc(alloc, nested_result);
     defer alloc.free(nested_id);
+    authority.nested_id = nested_id;
+
+    var send_command = try subagent_domain.validateCommand(alloc, .{ .message = .{ .send = .{
+        .id = nested_id,
+        .content = "observe one edited path",
+    } } });
+    defer send_command.deinit(alloc);
+    const send_result = try subagent_host.execute(
+        alloc,
+        &send_command,
+        nestedHostOptions(parent_id, "message-nested-child"),
+    );
+    defer alloc.free(send_result);
 
     const delivery_deadline = io_mod.milliTimestamp() + 5_000;
     while (!delayed_sink.entered.load(.acquire) and
@@ -3093,6 +3124,10 @@ test "nested host ADE observation keeps root parent through delayed discovery" {
     if (!delayed_sink.delivered.load(.acquire)) return error.TestUnexpectedResult;
     try std.testing.expect(runner.authority_matches.load(.acquire));
     try std.testing.expect(runner.observation_reported.load(.acquire));
+    // Runtime accepts a HostResolver: the production authority resolver walks
+    // attached child IDs and calls the host only with their canonical root.
+    try std.testing.expect(authority.saw_root_host_resolution.load(.acquire));
+    try std.testing.expect(!authority.saw_attached_host_resolution.load(.acquire));
     try std.testing.expectEqual(@as(usize, 3), client.queue_len);
 
     var lifecycle = try std.json.parseFromSlice(
@@ -3119,6 +3154,10 @@ test "nested host ADE observation keeps root parent through delayed discovery" {
     try std.testing.expectEqualStrings(
         "TurnStarted",
         lifecycle.value.object.get("event").?.string,
+    );
+    try std.testing.expectEqualStrings(
+        "SessionChanged",
+        session_changed.value.object.get("event").?.string,
     );
     try std.testing.expectEqualStrings(
         "GitRootDiscovered",
