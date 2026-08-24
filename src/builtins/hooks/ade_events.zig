@@ -12,6 +12,11 @@ const debug_trace = @import("../../core/shared/debug_trace.zig");
 const host_target = @import("../../core/hosts/target.zig");
 const jsonrpc = @import("../../acp/jsonrpc.zig");
 const lifecycle_state = @import("lifecycle_state.zig");
+const ade_git_roots = @import("ade_git_roots.zig");
+
+test {
+    _ = ade_git_roots;
+}
 
 pub const schema_version: u8 = 1;
 
@@ -22,6 +27,7 @@ const max_record_bytes: usize = 2 * 1024 * 1024;
 
 const Event = enum {
     fx_started,
+    git_root_discovered,
     session_changed,
     prompt_queued,
     turn_started,
@@ -35,6 +41,7 @@ const Event = enum {
     fn wireName(self: Event) []const u8 {
         return switch (self) {
             .fx_started => "FxStarted",
+            .git_root_discovered => "GitRootDiscovered",
             .session_changed => "SessionChanged",
             .prompt_queued => "PromptQueued",
             .turn_started => "TurnStarted",
@@ -63,6 +70,11 @@ const Context = struct {
 
 const Payload = union(Event) {
     fx_started,
+    git_root_discovered: struct {
+        git_root: []const u8,
+        revision: u64,
+        reason: []const u8,
+    },
     session_changed: struct {
         previous_session_id: ?[]const u8,
         session_id: ?[]const u8,
@@ -113,6 +125,7 @@ pub const Client = struct {
     stopping: bool = false,
     sender_thread: if (host_target.is_wasm) void else ?std.Thread = if (host_target.is_wasm) {} else null,
     lifecycle: ?*lifecycle_state.Reducer = null,
+    git_roots: ade_git_roots.Tracker = .{},
 
     pub fn shouldEnable(socket_path: ?[]const u8, instance_id: ?[]const u8) bool {
         const path = socket_path orelse return false;
@@ -130,24 +143,47 @@ pub const Client = struct {
         if (comptime host_target.is_wasm or builtin.os.tag == .windows) return;
         const socket_path = io_mod.getenv("FX_ADE_SOCKET_PATH");
         const instance_id = io_mod.getenv("FX_ADE_INSTANCE_ID");
-        if (!shouldEnable(socket_path, instance_id)) {
-            debug_trace.logf("ade_events", "disabled socket={s} instance={s}", .{
-                socket_path orelse "(unset)",
-                instance_id orelse "(unset)",
-            });
-            return;
+        const checkpoint_path = io_mod.getenv("FX_ADE_CHECKPOINT_PATH");
+        const valid_instance = if (instance_id) |value| value.len > 0 else false;
+
+        if (shouldEnable(socket_path, instance_id)) {
+            self.init(
+                alloc,
+                socket_path.?,
+                instance_id.?,
+                workspace_root,
+                main_session_id,
+                lifecycle,
+            ) catch |err| {
+                debug_trace.logf("ade_events", "initialization failed err={s}", .{@errorName(err)});
+            };
         }
 
-        self.init(
+        const root_sink: ?ade_git_roots.EventSink = if (self.enabled) .{
+            .context = self,
+            .report_fn = reportGitRootDiscoveredRaw,
+        } else null;
+        self.git_roots.init(
             alloc,
-            socket_path.?,
-            instance_id.?,
-            workspace_root,
-            main_session_id,
-            lifecycle,
+            if (valid_instance) instance_id.? else "",
+            checkpoint_path,
+            root_sink,
+            .{
+                .kind = .interactive,
+                .workspace_root = workspace_root,
+                .session_id = main_session_id,
+            },
         ) catch |err| {
-            debug_trace.logf("ade_events", "initialization failed err={s}", .{@errorName(err)});
+            debug_trace.logf("ade_events", "Git root tracker initialization failed err={s}", .{@errorName(err)});
         };
+
+        if (!self.enabled and !self.git_roots.enabled) {
+            debug_trace.logf("ade_events", "disabled socket={s} instance={s} checkpoint={s}", .{
+                socket_path orelse "(unset)",
+                instance_id orelse "(unset)",
+                checkpoint_path orelse "(unset)",
+            });
+        }
     }
 
     fn init(
@@ -189,6 +225,7 @@ pub const Client = struct {
 
     pub fn deinit(self: *Client) void {
         if (comptime host_target.is_wasm) return;
+        self.git_roots.deinit();
         const alloc = self.alloc orelse return;
         const io = io_mod.getIo();
         self.mutex.lockUncancelable(io);
@@ -265,6 +302,33 @@ pub const Client = struct {
         self.reportInvocation(.{ .attention_resolved = .{
             .kind = @tagName(input.kind),
         } }, input.invocation);
+    }
+
+    fn reportGitRootDiscoveredRaw(raw: *anyopaque, discovery: ade_git_roots.Discovery) void {
+        const self: *Client = @ptrCast(@alignCast(raw));
+        self.reportGitRootDiscovered(discovery);
+    }
+
+    fn reportGitRootDiscovered(self: *Client, discovery: ade_git_roots.Discovery) void {
+        if (!self.enabled) return;
+        const role = roleForScope(discovery.scope.kind) orelse return;
+        const io = io_mod.getIo();
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        const snapshot = self.stateFor(role, discovery.scope.session_id, discovery.scope.subagent_id);
+        self.emitLocked(.{ .git_root_discovered = .{
+            .git_root = discovery.root,
+            .revision = discovery.revision,
+            .reason = discovery.reason.wireName(),
+        } }, .{
+            .agent_role = role,
+            .workspace_root = discovery.scope.workspace_root,
+            .session_id = discovery.scope.session_id,
+            .parent_session_id = if (role == .subagent) self.main_session_id else null,
+            .subagent_id = discovery.scope.subagent_id,
+            .agent_state = snapshot.agent_state,
+            .attention_kind = snapshot.attention_kind,
+        });
     }
 
     fn reportInvocation(self: *Client, payload: Payload, invocation: hooks.Invocation) void {
@@ -499,6 +563,10 @@ fn recordUpperBound(
             if (value.previous_session_id) |session_id| total +|= escapedUpperBound(session_id);
             if (value.session_id) |session_id| total +|= escapedUpperBound(session_id);
         },
+        .git_root_discovered => |value| {
+            total +|= escapedUpperBound(value.git_root);
+            total +|= escapedUpperBound(value.reason);
+        },
         .pre_tool_use => |value| {
             total +|= escapedUpperBound(value.call_id);
             total +|= escapedUpperBound(value.tool_name);
@@ -724,6 +792,13 @@ fn writePayload(
 ) !void {
     switch (payload) {
         .fx_started, .prompt_queued, .turn_started, .fx_stopped => try writer.writeAll("{}"),
+        .git_root_discovered => |value| {
+            try writer.writeAll("{\"git_root\":");
+            try jsonrpc.writeJsonStr(value.git_root, writer);
+            try writer.print(",\"revision\":{d},\"reason\":", .{value.revision});
+            try jsonrpc.writeJsonStr(value.reason, writer);
+            try writer.writeAll("}");
+        },
         .session_changed => |value| {
             try writer.writeAll("{\"previous_session_id\":");
             try writeOptionalString(writer, value.previous_session_id);
@@ -900,6 +975,32 @@ test "ADE feed serializes attention resolution with a working snapshot" {
     try std.testing.expectEqualStrings("route_recovery", payload.get("kind").?.string);
 }
 
+test "ADE feed serializes an additive Git root discovery record" {
+    var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+    try writeRecord(&output.writer, 2, "instance-17", .{ .git_root_discovered = .{
+        .git_root = "/workspace/linked-root",
+        .revision = 3,
+        .reason = "subagent_file_mutation",
+    } }, .{
+        .agent_role = .subagent,
+        .workspace_root = "/workspace/project",
+        .session_id = "child-session",
+        .parent_session_id = "main-session",
+        .subagent_id = 9,
+    });
+
+    try std.testing.expectEqualStrings(
+        "{\"schema_version\":1,\"sequence\":2,\"event\":\"GitRootDiscovered\"," ++
+            "\"instance_id\":\"instance-17\",\"context\":{\"agent_role\":\"subagent\"," ++
+            "\"workspace_root\":\"/workspace/project\",\"session_id\":\"child-session\"," ++
+            "\"parent_session_id\":\"main-session\",\"subagent_id\":9,\"turn_id\":null," ++
+            "\"agent_state\":\"idle\",\"attention_kind\":null}," ++
+            "\"payload\":{\"git_root\":\"/workspace/linked-root\",\"revision\":3," ++
+            "\"reason\":\"subagent_file_mutation\"}}\n",
+        output.written(),
+    );
+}
 test "ADE feed keeps child and parent identities on subagent tool events" {
     var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer output.deinit();

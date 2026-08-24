@@ -8,7 +8,9 @@ const std = @import("std");
 const worker_runtime = @import("../core/agent/worker_runtime.zig");
 const hooks = @import("../core/hooks/hooks.zig");
 const permission_request = @import("../core/permissions/permission_request.zig");
+const tool_runtime = @import("../core/tooling/tool_runtime.zig");
 const herdr = @import("hooks/herdr.zig");
+const ade_git_roots = @import("hooks/ade_git_roots.zig");
 
 pub const ade_events = @import("hooks/ade_events.zig");
 pub const lifecycle_state = @import("hooks/lifecycle_state.zig");
@@ -82,6 +84,22 @@ pub fn Runtime(comptime App: type) type {
 
         pub fn reportPromptWorking(app: *App) void {
             if (app.herdr.enabled) app.herdr.reportState(.working, null);
+        }
+
+        pub fn editedPathObserver(app: *App) ?tool_runtime.EditedPathObserver {
+            if (!app.ade_events.git_roots.enabled) return null;
+            return .{
+                .context = &app.ade_events.git_roots,
+                .report_fn = reportEditedPathsRaw,
+            };
+        }
+
+        fn reportEditedPathsRaw(
+            raw: *anyopaque,
+            observation: tool_runtime.EditedPathObservation,
+        ) void {
+            const tracker: *ade_git_roots.Tracker = @ptrCast(@alignCast(raw));
+            tracker.reportEditedPaths(observation);
         }
 
         pub fn reportSessionChanged(app: *App, session_id: ?[]const u8) void {

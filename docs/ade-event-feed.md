@@ -9,11 +9,13 @@ turn, answer a question, or grant a permission through this socket.
 
 ## Bind an Fx instance
 
-The ADE binds a Unix socket before launching Fx and sets both variables:
+The ADE assigns an instance identity before launching Fx. It can bind the
+event socket, the recoverable Git-root checkpoint, or both:
 
 ```text
 FX_ADE_SOCKET_PATH=/tmp/example-ade.sock
 FX_ADE_INSTANCE_ID=instance-17
+FX_ADE_CHECKPOINT_PATH=/tmp/example-ade-instance-17-git-roots.json
 ```
 
 `FX_ADE_SOCKET_PATH` may be shared by every Fx TUI the ADE owns.
@@ -22,10 +24,51 @@ unique among the instances using that socket. Fx returns it unchanged on every
 record, allowing the receiver to associate an accepted connection with the
 terminal, sidebar row, and focus state it already owns.
 
-Both values must be non-empty. If either is absent, the feed is disabled. The
-feed is installed only by the interactive TUI. `fx ask` and `fx acp` do not
-publish to it. The schema 1 transport requires POSIX Unix sockets and is
-disabled on Windows.
+`FX_ADE_INSTANCE_ID` must be non-empty for either interface.
+`FX_ADE_SOCKET_PATH` enables event delivery when it is also non-empty.
+`FX_ADE_CHECKPOINT_PATH` independently enables Git-root checkpoints when it is
+non-empty, so a missing or unavailable socket does not prevent checkpoint
+updates. These interfaces are installed only by the interactive TUI. `fx ask`
+and `fx acp` do not publish to them. Schema 1 requires a native POSIX host and
+is disabled on Windows.
+
+## Edited Git worktree checkpoint
+
+Fx keeps the process-lifetime, first-discovery-ordered set of canonical Git
+worktree checkout roots associated with one interactive process. When
+`FX_ADE_CHECKPOINT_PATH` is set, Fx atomically replaces that consumer-owned
+path with a mode-0600 JSON file whenever the set changes:
+
+```json
+{
+  "schema": 1,
+  "instance_id": "instance-17",
+  "revision": 3,
+  "git_roots": [
+    "/workspace/project",
+    "/workspace/linked-worktree"
+  ]
+}
+```
+
+Field types are fixed: `schema` is the integer `1`, `instance_id` is the
+unchanged ADE string, `revision` is an unsigned integer, and `git_roots` is an
+array of canonical absolute strings. `revision` begins at `0` and advances by
+one only when Fx commits a newly deduplicated root. The array retains
+first-discovery order. A non-Git launch writes an empty revision-0 checkpoint.
+
+The checkpoint is output only. Fx does not restore or trust previous contents;
+it replaces malformed, stale, or identity-mismatched state. Replacement uses a
+mode-0600 temporary file in the destination directory followed by an atomic
+rename. Serialization, creation, permission, and replacement failures are
+best-effort and never fail tool execution. Root discovery and checkpoint I/O
+run on a separate worker from tool execution.
+
+The set is seeded from the launch directory's enclosing worktree, when one
+exists, and remains intact across `/new`, `/resume`, session changes, and event
+delivery failures. Both a `.git` directory and a linked-worktree `.git` file
+identify the checkout root; Fx reports the linked checkout, not its common Git
+directory.
 
 ## Transport
 
@@ -114,6 +157,50 @@ The first attempted event. It says that the TUI has initialized its lifecycle
 observer and includes its current main session and workspace in `context`.
 The ADE remains authoritative for process and terminal readiness. The payload
 is empty.
+
+### `GitRootDiscovered`
+
+Emitted once for each newly deduplicated Git worktree root. `FxStarted` remains
+the first attempted event; launch-directory discovery follows it. When a
+checkpoint is enabled, Fx attempts to replace the checkpoint with the new
+revision before enqueueing this event:
+
+```json
+{
+  "git_root": "/workspace/linked-worktree",
+  "revision": 3,
+  "reason": "subagent_file_mutation"
+}
+```
+
+`git_root` is the canonical absolute checkout root. `revision` is the unsigned
+root-set revision committed in the checkpoint. The complete schema-1 reason
+vocabulary is:
+
+- `launch_directory`
+- `file_mutation`
+- `terminal_write`
+- `subagent_file_mutation`
+- `subagent_terminal_write`
+
+The event uses the ordinary ADE envelope. `context.agent_role` and its session
+fields identify whether the successful operation came from the main agent or a
+subagent. Root state belongs to the parent Fx instance and is not reset by
+session changes. Existing schema-1 consumers must ignore this unknown additive
+event if they do not use edited-root discovery.
+
+Built-in file tracking covers successful write/create, edit, delete, rename,
+and copy calls. Write/edit no-ops, denied calls, and failed calls add nothing.
+Rename observes the pre-resolved source followed by the destination because
+both repositories can be mutated; copy observes only its destination because
+its source is read-only.
+
+Terminal tracking uses the command's declared, resolved working directory only
+when Fx's existing command-effect classifier returns `filesystem_write` and
+the command succeeds. Read-only, failed, dynamic-shell, and other classifier
+results add nothing. Fx does not inspect hidden shell directory changes: for
+example, a command declared in repository A that internally changes to
+repository B does not provide reliable evidence for B.
 
 ### `SessionChanged`
 
@@ -259,6 +346,7 @@ how Fx derives it:
 | Feed event | ADE projection |
 | --- | --- |
 | `FxStarted` | Bind the instance's main session and seed its lifecycle state as idle |
+| `GitRootDiscovered` | Add the canonical root at the stated root-set revision, or recover the ordered set from the checkpoint |
 | `SessionChanged` | Replace the instance's main session identity |
 | `PromptQueued` | Mark the main agent working as soon as Fx accepts its prompt |
 | `TurnStarted` | Confirm execution for the identified main agent or mark a subagent working |
@@ -276,6 +364,8 @@ The socket receives workspace paths, tool names, complete tool arguments, and
 assistant text. Those values can contain secrets. The launching ADE is
 responsible for protecting the socket, authenticating its local clients, and
 applying any persistence, redaction, or forwarding policy.
+The checkpoint also exposes canonical workspace paths; its parent directory
+must be private even though Fx creates each replacement with mode 0600.
 
 The ADE feed and the Herdr integration are independent projections of the same
 lifecycle observations. Setting `FX_ADE_*` does not enable, disable, filter, or
