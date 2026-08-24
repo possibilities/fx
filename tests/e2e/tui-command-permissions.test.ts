@@ -2567,7 +2567,7 @@ describe("effect-aware command permissions", () => {
       });
       await activeSession.waitForComposer(TIMEOUT);
       const resumedPane = await activeSession.waitForPane(
-        (value) => value.includes(`Failed ${command}`) && value.includes("tool_review_held"),
+        (value) => value.includes(`Safety caution ${command}`),
         TIMEOUT,
       );
       expect(resumedPane).toContain("1 failed");

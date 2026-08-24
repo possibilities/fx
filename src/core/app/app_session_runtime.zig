@@ -6697,12 +6697,16 @@ test "execution replay preserves permission denial reasons" {
         .auto_denied,
         .policy_denied,
         .permission_required,
+        .review_caution,
+        .review_unavailable,
     };
     const call_ids = [_][]const u8{
         "call_user_denied",
         "call_auto_denied",
         "call_policy_denied",
         "call_permission_required",
+        "call_review_caution",
+        "call_review_unavailable",
     };
     var outputs: [reasons.len][]u8 = undefined;
     var allocated_outputs: usize = 0;
@@ -6710,11 +6714,19 @@ test "execution replay preserves permission denial reasons" {
     var calls: [reasons.len]types.ToolCall = undefined;
     var results: [reasons.len]types.PersistedToolResult = undefined;
     for (reasons, 0..) |reason, index| {
-        outputs[index] = try tool_result_errors.toolPermissionDeniedJson(
-            alloc,
-            "run_command",
-            reason,
-        );
+        outputs[index] = switch (reason) {
+            .review_caution, .review_unavailable => try tool_result_errors.toolReviewHeldJson(
+                alloc,
+                "run_command",
+                reason,
+                null,
+            ),
+            .user_denied, .auto_denied, .policy_denied, .permission_required => try tool_result_errors.toolPermissionDeniedJson(
+                alloc,
+                "run_command",
+                reason,
+            ),
+        };
         allocated_outputs += 1;
         calls[index] = .{
             .id = call_ids[index],
@@ -6739,14 +6751,16 @@ test "execution replay preserves permission denial reasons" {
 
     try std.testing.expectEqualSlices(
         types.ToolOutcomeKind,
-        &.{ .denied, .denied, .denied, .denied },
+        &.{ .denied, .denied, .denied, .denied, .denied, .denied },
         app.completed_tool_outcomes.items,
     );
-    try std.testing.expectEqual(@as(usize, 4), app.completed_tool_statuses.items.len);
+    try std.testing.expectEqual(@as(usize, 6), app.completed_tool_statuses.items.len);
     try std.testing.expectEqualStrings("● Denied run_command\n", app.completed_tool_statuses.items[0]);
     try std.testing.expectEqualStrings("● Denied by auto agent run_command\n", app.completed_tool_statuses.items[1]);
     try std.testing.expectEqualStrings("● Denied run_command\n", app.completed_tool_statuses.items[2]);
     try std.testing.expectEqualStrings("● Permission required run_command\n", app.completed_tool_statuses.items[3]);
+    try std.testing.expectEqualStrings("● Safety caution run_command\n", app.completed_tool_statuses.items[4]);
+    try std.testing.expectEqualStrings("● Review unavailable run_command\n", app.completed_tool_statuses.items[5]);
     try std.testing.expectEqual(@as(usize, 0), app.transcript.items.len);
 }
 
