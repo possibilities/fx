@@ -131,6 +131,7 @@ pub const EditedPathSource = enum {
 
 pub const EditedPathObservation = struct {
     scope: hooks.Scope,
+    parent_session_id: ?[]const u8 = null,
     source: EditedPathSource,
     paths: []const []const u8,
 };
@@ -251,6 +252,7 @@ pub const Context = struct {
         .kind = .interactive,
         .workspace_root = "",
     },
+    lifecycle_parent_session_id: ?[]const u8 = null,
     edited_path_observer: ?EditedPathObserver = null,
 
     /// Projects only the borrowed capabilities consumed by admission.
@@ -477,7 +479,12 @@ pub fn executeToolCallAuthorized(
         .ok = ok,
         .started_at_ms = started_at_ms,
     });
-    reportEditedPathObservation(execution_ctx, result, edited_paths);
+    reportEditedPathObservation(
+        execution_ctx,
+        request.call_allocator,
+        result,
+        edited_paths,
+    );
     if (request.command_replay_capture) |continued| {
         replay_continuation_transferred = result.command_replay_capture == continued;
     }
@@ -485,10 +492,16 @@ pub fn executeToolCallAuthorized(
 }
 
 const PreparedEditedPathObservation = struct {
+    const CompletionProof = enum {
+        successful_tool,
+        terminal_start_zero_exit,
+    };
+
     source: EditedPathSource,
     paths: [2][]const u8 = undefined,
     path_count: usize = 0,
     require_committed_file_handoff: bool = false,
+    completion_proof: CompletionProof = .successful_tool,
 
     fn slice(self: *const PreparedEditedPathObservation) []const []const u8 {
         return self.paths[0..self.path_count];
@@ -509,16 +522,28 @@ fn prepareEditedPathObservation(
         ),
         .run_command => |command_authority| {
             if (!commandAuthorityIsFilesystemWriting(alloc, command_authority)) return null;
+            const completion_proof = terminalCommandCompletionProof(
+                alloc,
+                call,
+            ) orelse return null;
             return .{
                 .source = .terminal_write,
                 .paths = .{ commandAuthorityFingerprint(command_authority).resolved_cwd, undefined },
                 .path_count = 1,
+                .completion_proof = completion_proof,
             };
         },
         .ordinary, .vision_paths => {},
     }
 
     const spec = registeredToolSpec(ctx, call.name) orelse return null;
+    if (spec.executor_kind == .terminal) {
+        return prepareTerminalStartEditedPathObservation(
+            alloc,
+            if (ctx.access_scope) |scope| scope.primary_directory else ctx.workspace_root,
+            call.arguments_json,
+        );
+    }
     return prepareOrdinaryEditedPathObservation(
         alloc,
         ctx.workspace_root,
@@ -613,12 +638,28 @@ fn commandAuthorityIsFilesystemWriting(
         .shell_allowed => |allowed| allowed,
     };
     const fingerprint = shell.fingerprint;
-    var admission = command_effect.plan(
+    return commandIsFilesystemWriting(
         alloc,
         fingerprint.command,
         fingerprint.resolved_cwd,
         fingerprint.background,
         fingerprint.target_os,
+    );
+}
+
+fn commandIsFilesystemWriting(
+    alloc: Allocator,
+    command: []const u8,
+    resolved_cwd: []const u8,
+    background: bool,
+    target_os: std.Target.Os.Tag,
+) bool {
+    var admission = command_effect.plan(
+        alloc,
+        command,
+        resolved_cwd,
+        background,
+        target_os,
     ) catch return false;
     defer admission.deinit(alloc);
     return switch (admission) {
@@ -627,32 +668,174 @@ fn commandAuthorityIsFilesystemWriting(
     };
 }
 
+fn prepareTerminalStartEditedPathObservation(
+    alloc: Allocator,
+    primary_directory: []const u8,
+    arguments_json: []const u8,
+) ?PreparedEditedPathObservation {
+    var parsed = std.json.parseFromSlice(
+        std.json.Value,
+        alloc,
+        arguments_json,
+        .{},
+    ) catch return null;
+    defer parsed.deinit();
+    const arguments = terminalArguments(parsed.value) orelse return null;
+    if (terminalCompletionProofFromArguments(
+        alloc,
+        arguments,
+    ) != .terminal_start_zero_exit) return null;
+    const command_value = arguments.object.get("command") orelse return null;
+    if (command_value != .string or command_value.string.len == 0) return null;
+
+    const raw_cwd: ?[]const u8 = if (arguments.object.get("cwd")) |cwd|
+        switch (cwd) {
+            .null => null,
+            .string => |value| value,
+            else => return null,
+        }
+    else
+        null;
+    const resolved_cwd = if (raw_cwd) |cwd|
+        if (std.mem.eql(u8, cwd, "."))
+            alloc.dupe(u8, primary_directory) catch return null
+        else
+            pathing.resolveWorkspaceOrExternalPath(
+                alloc,
+                primary_directory,
+                cwd,
+            ) catch return null
+    else
+        alloc.dupe(u8, primary_directory) catch return null;
+    if (!commandIsFilesystemWriting(
+        alloc,
+        command_value.string,
+        resolved_cwd,
+        false,
+        builtin.os.tag,
+    )) return null;
+    return .{
+        .source = .terminal_write,
+        .paths = .{ resolved_cwd, undefined },
+        .path_count = 1,
+        .completion_proof = .terminal_start_zero_exit,
+    };
+}
+
+fn terminalCommandCompletionProof(
+    alloc: Allocator,
+    call: ToolCall,
+) ?PreparedEditedPathObservation.CompletionProof {
+    if (!std.mem.eql(u8, call.name, "terminal")) return .successful_tool;
+
+    var parsed = std.json.parseFromSlice(
+        std.json.Value,
+        alloc,
+        call.arguments_json,
+        .{},
+    ) catch return null;
+    defer parsed.deinit();
+    const arguments = terminalArguments(parsed.value) orelse return null;
+    return terminalCompletionProofFromArguments(alloc, arguments);
+}
+
+fn terminalArguments(root: std.json.Value) ?std.json.Value {
+    if (root != .object) return null;
+    return if (root.object.count() == 1)
+        if (root.object.get("request")) |request|
+            if (request == .object) request else root
+        else
+            root
+    else
+        root;
+}
+
+fn terminalCompletionProofFromArguments(
+    alloc: Allocator,
+    arguments: std.json.Value,
+) ?PreparedEditedPathObservation.CompletionProof {
+    const action = arguments.object.get("action") orelse return null;
+    if (action != .string) return null;
+    if (std.mem.eql(u8, action.string, "exec")) return .successful_tool;
+    if (!std.mem.eql(u8, action.string, "start")) return null;
+
+    const return_when = arguments.object.get("return_when") orelse return null;
+    if (!returnConditionIsExit(alloc, return_when)) return null;
+    return .terminal_start_zero_exit;
+}
+
+fn returnConditionIsExit(alloc: Allocator, value: std.json.Value) bool {
+    if (value == .object) return returnConditionObjectIsExit(value);
+    if (value != .string) return false;
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, value.string, .{}) catch
+        return false;
+    defer parsed.deinit();
+    return parsed.value == .object and returnConditionObjectIsExit(parsed.value);
+}
+
+fn returnConditionObjectIsExit(value: std.json.Value) bool {
+    const kind = value.object.get("kind") orelse return false;
+    return kind == .string and std.mem.eql(u8, kind.string, "exit");
+}
+
 fn reportEditedPathObservation(
     ctx: Context,
+    alloc: Allocator,
     result: ToolExecutionResult,
     maybe_observation: ?PreparedEditedPathObservation,
 ) void {
     const observation = maybe_observation orelse return;
     if (!shouldReportEditedPathObservation(
-        result.status,
+        alloc,
+        result,
         observation.require_committed_file_handoff,
         result.committed_file_handoff != null,
+        observation.completion_proof,
     )) return;
     const observer = ctx.edited_path_observer orelse return;
     observer.report(.{
         .scope = ctx.lifecycle_scope,
+        .parent_session_id = ctx.lifecycle_parent_session_id,
         .source = observation.source,
         .paths = observation.slice(),
     });
 }
 
 fn shouldReportEditedPathObservation(
-    status: tool_contracts.ToolExecutionStatus,
+    alloc: Allocator,
+    result: ToolExecutionResult,
     require_committed_file_handoff: bool,
     has_committed_file_handoff: bool,
+    completion_proof: PreparedEditedPathObservation.CompletionProof,
 ) bool {
-    return status == .success and
-        (!require_committed_file_handoff or has_committed_file_handoff);
+    if (result.status != .success or
+        (require_committed_file_handoff and !has_committed_file_handoff)) return false;
+    return switch (completion_proof) {
+        .successful_tool => true,
+        .terminal_start_zero_exit => terminalStartExitedZero(
+            alloc,
+            result.model_output,
+        ),
+    };
+}
+
+fn terminalStartExitedZero(alloc: Allocator, model_output: []const u8) bool {
+    var parsed = std.json.parseFromSlice(
+        std.json.Value,
+        alloc,
+        model_output,
+        .{},
+    ) catch return false;
+    defer parsed.deinit();
+    if (parsed.value != .object) return false;
+    const success = parsed.value.object.get("success") orelse return false;
+    if (success != .object) return false;
+    const start = success.object.get("start") orelse return false;
+    if (start != .object) return false;
+    const outcome = start.object.get("outcome") orelse return false;
+    if (outcome != .object) return false;
+    const exited = outcome.object.get("exited") orelse return false;
+    return exited == .integer and exited.integer == 0;
 }
 
 test "ADE edited path preparation preserves exact file-operation mutation targets" {
@@ -723,11 +906,142 @@ test "ADE edited path preparation preserves exact file-operation mutation target
 }
 
 test "ADE edited path reporting requires successful committed mutation results" {
-    try std.testing.expect(shouldReportEditedPathObservation(.success, false, false));
-    try std.testing.expect(!shouldReportEditedPathObservation(.failure, false, false));
-    try std.testing.expect(shouldReportEditedPathObservation(.success, true, true));
-    try std.testing.expect(!shouldReportEditedPathObservation(.success, true, false));
-    try std.testing.expect(!shouldReportEditedPathObservation(.failure, true, true));
+    const success = ToolExecutionResult{ .status = .success, .model_output = "ok" };
+    const failure = ToolExecutionResult{ .status = .failure, .model_output = "failed" };
+    try std.testing.expect(shouldReportEditedPathObservation(
+        std.testing.allocator,
+        success,
+        false,
+        false,
+        .successful_tool,
+    ));
+    try std.testing.expect(!shouldReportEditedPathObservation(
+        std.testing.allocator,
+        failure,
+        false,
+        false,
+        .successful_tool,
+    ));
+    try std.testing.expect(shouldReportEditedPathObservation(
+        std.testing.allocator,
+        success,
+        true,
+        true,
+        .successful_tool,
+    ));
+    try std.testing.expect(!shouldReportEditedPathObservation(
+        std.testing.allocator,
+        success,
+        true,
+        false,
+        .successful_tool,
+    ));
+    try std.testing.expect(!shouldReportEditedPathObservation(
+        std.testing.allocator,
+        failure,
+        true,
+        true,
+        .successful_tool,
+    ));
+}
+
+test "ADE terminal mutation completion requires exit-zero proof for durable starts" {
+    const alloc = std.testing.allocator;
+    const cases = [_]struct {
+        arguments_json: []const u8,
+        expected: ?PreparedEditedPathObservation.CompletionProof,
+    }{
+        .{ .arguments_json = "{\"action\":\"exec\",\"command\":\"touch edited\"}", .expected = .successful_tool },
+        .{ .arguments_json = "{\"request\":{\"action\":\"exec\",\"command\":\"touch edited\"}}", .expected = .successful_tool },
+        .{ .arguments_json = "{\"action\":\"start\",\"command\":\"touch edited\"}", .expected = null },
+        .{ .arguments_json = "{\"action\":\"start\",\"command\":\"touch edited\",\"return_when\":{\"kind\":\"started\"}}", .expected = null },
+        .{ .arguments_json = "{\"action\":\"start\",\"command\":\"touch edited\",\"return_when\":{\"kind\":\"quiet\",\"duration_ms\":10}}", .expected = null },
+        .{ .arguments_json = "{\"action\":\"start\",\"command\":\"touch edited\",\"return_when\":{\"kind\":\"match\",\"pattern\":\"ready\"}}", .expected = null },
+        .{ .arguments_json = "{\"request\":{\"action\":\"start\",\"command\":\"touch edited\",\"return_when\":{\"kind\":\"exit\"}}}", .expected = .terminal_start_zero_exit },
+        .{ .arguments_json = "{\"action\":\"start\",\"command\":\"touch edited\",\"return_when\":\"{\\\"kind\\\":\\\"exit\\\"}\"}", .expected = .terminal_start_zero_exit },
+        .{ .arguments_json = "{\"action\":\"start\",\"command\":\"touch edited\",\"return_when\":\"\\\"{\\\\\\\"kind\\\\\\\":\\\\\\\"exit\\\\\\\"}\\\"\"}", .expected = null },
+        .{ .arguments_json = "{", .expected = null },
+    };
+    for (cases) |case| {
+        try std.testing.expectEqual(
+            case.expected,
+            terminalCommandCompletionProof(alloc, .{
+                .id = "terminal-proof",
+                .name = "terminal",
+                .arguments_json = case.arguments_json,
+            }),
+        );
+    }
+
+    const zero = ToolExecutionResult{
+        .status = .success,
+        .model_output = "{\"success\":{\"start\":{\"outcome\":{\"exited\":0}}}}",
+    };
+    const nonzero = ToolExecutionResult{
+        .status = .success,
+        .model_output = "{\"success\":{\"start\":{\"outcome\":{\"exited\":7}}}}",
+    };
+    const malformed = ToolExecutionResult{ .status = .success, .model_output = "ok" };
+    try std.testing.expect(shouldReportEditedPathObservation(
+        alloc,
+        zero,
+        false,
+        false,
+        .terminal_start_zero_exit,
+    ));
+    try std.testing.expect(!shouldReportEditedPathObservation(
+        alloc,
+        nonzero,
+        false,
+        false,
+        .terminal_start_zero_exit,
+    ));
+    try std.testing.expect(!shouldReportEditedPathObservation(
+        alloc,
+        malformed,
+        false,
+        false,
+        .terminal_start_zero_exit,
+    ));
+}
+
+test "ADE durable terminal start classifies the declared working directory" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "workspace/repository");
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
+    defer alloc.free(workspace);
+    const repository = try io_mod.dirRealpathAlloc(
+        alloc,
+        tmp.dir,
+        "workspace/repository",
+    );
+    defer alloc.free(repository);
+
+    const mutating = prepareTerminalStartEditedPathObservation(
+        arena,
+        workspace,
+        "{\"request\":{\"action\":\"start\",\"command\":\"touch edited\",\"cwd\":\"repository\",\"return_when\":{\"kind\":\"exit\"}}}",
+    ).?;
+    try std.testing.expectEqual(
+        PreparedEditedPathObservation.CompletionProof.terminal_start_zero_exit,
+        mutating.completion_proof,
+    );
+    try std.testing.expectEqualStrings(repository, mutating.slice()[0]);
+    try std.testing.expect(prepareTerminalStartEditedPathObservation(
+        arena,
+        workspace,
+        "{\"action\":\"start\",\"command\":\"touch edited\",\"cwd\":\"repository\",\"return_when\":{\"kind\":\"started\"}}",
+    ) == null);
+    try std.testing.expect(prepareTerminalStartEditedPathObservation(
+        arena,
+        workspace,
+        "{\"action\":\"start\",\"command\":\"git status --short\",\"cwd\":\"repository\",\"return_when\":{\"kind\":\"exit\"}}",
+    ) == null);
 }
 
 test "ADE terminal root tracking follows only filesystem-write classification" {

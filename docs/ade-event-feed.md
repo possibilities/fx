@@ -54,21 +54,37 @@ path with a mode-0600 JSON file whenever the set changes:
 Field types are fixed: `schema` is the integer `1`, `instance_id` is the
 unchanged ADE string, `revision` is an unsigned integer, and `git_roots` is an
 array of canonical absolute strings. `revision` begins at `0` and advances by
-one only when Fx commits a newly deduplicated root. The array retains
-first-discovery order. A non-Git launch writes an empty revision-0 checkpoint.
+one only when Fx adds a newly deduplicated root to its in-memory set. The array
+retains first-discovery order. A non-Git launch writes an empty revision-0
+checkpoint.
 
 The checkpoint is output only. Fx does not restore or trust previous contents;
 it replaces malformed, stale, or identity-mismatched state. Replacement uses a
 mode-0600 temporary file in the destination directory followed by an atomic
 rename. Serialization, creation, permission, and replacement failures are
 best-effort and never fail tool execution. Root discovery and checkpoint I/O
-run on a separate worker from tool execution.
+run on a separate worker from tool execution. Fx attempts checkpoint
+replacement before enqueueing the corresponding discovery event. A successful
+replacement gives the checkpoint and event the same revision. A best-effort
+replacement failure can leave the checkpoint absent or behind while the event
+still publishes; the next successful full replacement restores the current
+ordered set and revision.
+
+The discovery worker accepts at most 128 queued observations and 1 MiB of
+owned observation data. Tool completion drops an observation when either cap
+would be exceeded. During shutdown Fx discards queued observations and joins
+only the one discovery or checkpoint operation already in progress. Native
+filesystem operations are synchronous and cannot be cancelled safely, so a
+hung in-flight operation can still extend shutdown; arbitrary queued backlog
+cannot delay `FxStopped`.
 
 The set is seeded from the launch directory's enclosing worktree, when one
 exists, and remains intact across `/new`, `/resume`, session changes, and event
 delivery failures. Both a `.git` directory and a linked-worktree `.git` file
 identify the checkout root; Fx reports the linked checkout, not its common Git
-directory.
+directory. A `.git` file is accepted only when its bounded contents contain a
+`gitdir:` pointer whose absolute or checkout-relative target resolves to an
+existing directory.
 
 ## Transport
 
@@ -164,8 +180,10 @@ revision before enqueueing this event:
 ```
 
 `git_root` is the canonical absolute checkout root. `revision` is the unsigned
-root-set revision committed in the checkpoint. The complete schema-1 reason
-vocabulary is:
+in-memory root-set revision. When checkpoint replacement for that discovery
+succeeds, it is also the revision committed in the checkpoint; after a
+best-effort replacement failure the checkpoint can temporarily lag. The
+complete schema-1 reason vocabulary is:
 
 - `launch_directory`
 - `file_mutation`
@@ -175,9 +193,11 @@ vocabulary is:
 
 The event uses the ordinary ADE envelope. `context.agent_role` and its session
 fields identify whether the successful operation came from the main agent or a
-subagent. Root state belongs to the parent Fx instance and is not reset by
-session changes. Existing schema-1 consumers must ignore this unknown additive
-event if they do not use edited-root discovery.
+subagent. A subagent discovery retains the parent session identity captured
+with that observation; a later `/new` or resume cannot reattribute queued work
+to another main session. Root state belongs to the parent Fx instance and is
+not reset by session changes. Existing schema-1 consumers must ignore this
+unknown additive event if they do not use edited-root discovery.
 
 Built-in file tracking covers successful write/create, edit, delete, rename,
 and copy calls. Write/edit no-ops, denied calls, and failed calls add nothing.
@@ -187,7 +207,11 @@ its source is read-only.
 
 Terminal tracking uses the command's declared, resolved working directory only
 when Fx's existing command-effect classifier returns `filesystem_write` and
-the command succeeds. Read-only, failed, dynamic-shell, and other classifier
+the command proves successful completion. Foreground `exec` requires its
+ordinary zero-exit success. Durable `start` requires an explicit
+`return_when.kind` of `exit` and a zero exit in the returned terminal result;
+the default or explicit `started`, `quiet`, and `match` conditions add nothing.
+Read-only, failed, dynamic-shell, background-start-only, and other classifier
 results add nothing. Fx does not inspect hidden shell directory changes: for
 example, a command declared in repository A that internally changes to
 repository B does not provide reliable evidence for B.

@@ -12,6 +12,9 @@ const debug_trace = @import("../../core/shared/debug_trace.zig");
 const tool_runtime = @import("../../core/tooling/tool_runtime.zig");
 
 const private_file_permissions = std.Io.File.Permissions.fromMode(0o600);
+const max_queued_observations: usize = 128;
+const max_queued_observation_bytes: usize = 1024 * 1024;
+const max_gitdir_marker_bytes: usize = 4096;
 
 pub const DiscoveryReason = enum {
     launch_directory,
@@ -36,6 +39,7 @@ pub const Discovery = struct {
     revision: u64,
     reason: DiscoveryReason,
     scope: hooks.Scope,
+    parent_session_id: ?[]const u8 = null,
 };
 
 pub const EventSink = struct {
@@ -55,11 +59,14 @@ const QueuedObservation = struct {
     kind: PathKind,
     reason: DiscoveryReason,
     scope: hooks.Scope,
+    parent_session_id: ?[]u8,
+    charge: usize,
 
     fn deinit(self: QueuedObservation, alloc: std.mem.Allocator) void {
         alloc.free(self.path);
         alloc.free(@constCast(self.scope.workspace_root));
         if (self.scope.session_id) |session_id| alloc.free(@constCast(session_id));
+        if (self.parent_session_id) |parent_session_id| alloc.free(parent_session_id);
     }
 };
 
@@ -72,6 +79,9 @@ pub const Tracker = struct {
     checkpoint_path: []u8 = &.{},
     event_sink: ?EventSink = null,
     queue: std.DoublyLinkedList = .{},
+    queue_len: usize = 0,
+    queued_bytes: usize = 0,
+    in_flight: bool = false,
     stopping: bool = false,
     worker_thread: ?std.Thread = null,
     roots: std.ArrayList([]u8) = .empty,
@@ -103,6 +113,7 @@ pub const Tracker = struct {
         self.enabled = true;
         self.enqueueBatch(
             launch_scope,
+            null,
             .launch_directory,
             .directory,
             &.{launch_scope.workspace_root},
@@ -122,18 +133,18 @@ pub const Tracker = struct {
             self.* = .{};
             return;
         }
-        const io = io_mod.getIo();
-        self.mutex.lockUncancelable(io);
-        self.stopping = true;
-        self.wake.broadcast(io);
-        self.mutex.unlock(io);
-        if (self.worker_thread) |thread| thread.join();
-
-        self.clearQueue();
         const alloc = self.alloc orelse {
             self.* = .{};
             return;
         };
+        const io = io_mod.getIo();
+        self.mutex.lockUncancelable(io);
+        self.stopping = true;
+        self.clearQueueLocked(alloc);
+        self.wake.broadcast(io);
+        self.mutex.unlock(io);
+        if (self.worker_thread) |thread| thread.join();
+
         for (self.roots.items) |root| alloc.free(root);
         self.roots.deinit(alloc);
         self.freeConfiguration();
@@ -155,15 +166,22 @@ pub const Tracker = struct {
             },
             .ask, .acp => return,
         };
-        self.enqueueBatch(observation.scope, reason, switch (observation.source) {
-            .file_mutation => .file,
-            .terminal_write => .directory,
-        }, observation.paths);
+        self.enqueueBatch(
+            observation.scope,
+            observation.parent_session_id,
+            reason,
+            switch (observation.source) {
+                .file_mutation => .file,
+                .terminal_write => .directory,
+            },
+            observation.paths,
+        );
     }
 
     fn enqueueBatch(
         self: *Tracker,
         scope: hooks.Scope,
+        parent_session_id: ?[]const u8,
         reason: DiscoveryReason,
         kind: PathKind,
         paths: []const []const u8,
@@ -177,6 +195,13 @@ pub const Tracker = struct {
 
         for (paths) |path| {
             if (path.len == 0) continue;
+            const charge = observationCharge(path, scope, parent_session_id);
+            if (self.queue_len == max_queued_observations or
+                charge > max_queued_observation_bytes -| self.queued_bytes)
+            {
+                debug_trace.logf("ade_git_roots", "observation dropped reason=queue_full", .{});
+                continue;
+            }
             const owned_path = alloc.dupe(u8, path) catch {
                 debug_trace.logf("ade_git_roots", "observation dropped reason=out_of_memory", .{});
                 break;
@@ -195,7 +220,18 @@ pub const Tracker = struct {
                 }
             else
                 null;
+            const owned_parent_session = if (parent_session_id) |parent_id|
+                alloc.dupe(u8, parent_id) catch {
+                    if (owned_session) |session_id| alloc.free(session_id);
+                    alloc.free(owned_workspace);
+                    alloc.free(owned_path);
+                    debug_trace.logf("ade_git_roots", "observation dropped reason=out_of_memory", .{});
+                    break;
+                }
+            else
+                null;
             const queued = alloc.create(QueuedObservation) catch {
+                if (owned_parent_session) |parent_id| alloc.free(parent_id);
                 if (owned_session) |session_id| alloc.free(session_id);
                 alloc.free(owned_workspace);
                 alloc.free(owned_path);
@@ -212,8 +248,12 @@ pub const Tracker = struct {
                     .session_id = owned_session,
                     .subagent_id = scope.subagent_id,
                 },
+                .parent_session_id = owned_parent_session,
+                .charge = charge,
             };
             self.queue.append(&queued.node);
+            self.queue_len += 1;
+            self.queued_bytes += charge;
         }
         if (self.queue.first != null) self.wake.signal(io);
     }
@@ -226,56 +266,69 @@ pub const Tracker = struct {
             while (self.queue.first == null and !self.stopping) {
                 self.wake.waitUncancelable(io, &self.mutex);
             }
-            const observation = self.takeLocked();
-            const should_stop = self.stopping and observation == null;
-            self.mutex.unlock(io);
-            if (should_stop) return;
-            if (observation) |queued| {
-                defer {
-                    queued.deinit(alloc);
-                    alloc.destroy(queued);
-                }
-                const maybe_root = discoverGitRoot(alloc, queued.path, queued.kind) catch |err| {
-                    debug_trace.logf("ade_git_roots", "discovery failed err={s}", .{@errorName(err)});
-                    if (queued.reason == .launch_directory) self.replaceInitialEmptyCheckpoint();
-                    continue;
-                };
-                const root = maybe_root orelse {
-                    if (queued.reason == .launch_directory) self.replaceInitialEmptyCheckpoint();
-                    continue;
-                };
-                if (self.containsRoot(root)) {
-                    alloc.free(root);
-                    continue;
-                }
-                self.roots.append(alloc, root) catch {
-                    alloc.free(root);
-                    continue;
-                };
-                self.revision += 1;
-
-                if (self.checkpoint_path.len > 0) {
-                    self.replaceCheckpoint() catch |err| {
-                        debug_trace.logf(
-                            "ade_git_roots",
-                            "checkpoint replace failed revision={d} err={s}",
-                            .{ self.revision, @errorName(err) },
-                        );
-                    };
-                }
-                if (self.event_sink) |sink| sink.report(.{
-                    .root = root,
-                    .revision = self.revision,
-                    .reason = queued.reason,
-                    .scope = queued.scope,
-                });
+            if (self.stopping) {
+                self.mutex.unlock(io);
+                return;
             }
+            const observation = self.takeLocked().?;
+            self.in_flight = true;
+            self.mutex.unlock(io);
+            self.processObservation(observation);
+            observation.deinit(alloc);
+            alloc.destroy(observation);
+
+            self.mutex.lockUncancelable(io);
+            self.in_flight = false;
+            self.wake.broadcast(io);
+            self.mutex.unlock(io);
         }
+    }
+
+    fn processObservation(self: *Tracker, queued: *QueuedObservation) void {
+        const alloc = self.alloc orelse return;
+        const maybe_root = discoverGitRoot(alloc, queued.path, queued.kind) catch |err| {
+            debug_trace.logf("ade_git_roots", "discovery failed err={s}", .{@errorName(err)});
+            if (queued.reason == .launch_directory) self.replaceInitialEmptyCheckpoint();
+            return;
+        };
+        const root = maybe_root orelse {
+            if (queued.reason == .launch_directory) self.replaceInitialEmptyCheckpoint();
+            return;
+        };
+        if (self.containsRoot(root)) {
+            alloc.free(root);
+            return;
+        }
+        self.roots.append(alloc, root) catch {
+            alloc.free(root);
+            return;
+        };
+        self.revision += 1;
+
+        if (self.checkpoint_path.len > 0) {
+            self.replaceCheckpoint() catch |err| {
+                debug_trace.logf(
+                    "ade_git_roots",
+                    "checkpoint replace failed revision={d} err={s}",
+                    .{ self.revision, @errorName(err) },
+                );
+            };
+        }
+        if (self.event_sink) |sink| sink.report(.{
+            .root = root,
+            .revision = self.revision,
+            .reason = queued.reason,
+            .scope = queued.scope,
+            .parent_session_id = queued.parent_session_id,
+        });
     }
 
     fn takeLocked(self: *Tracker) ?*QueuedObservation {
         const node = self.queue.popFirst() orelse return null;
-        return @fieldParentPtr("node", node);
+        const observation: *QueuedObservation = @fieldParentPtr("node", node);
+        self.queue_len -= 1;
+        self.queued_bytes -= observation.charge;
+        return observation;
     }
 
     fn clearQueue(self: *Tracker) void {
@@ -283,9 +336,24 @@ pub const Tracker = struct {
         const io = io_mod.getIo();
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
+        self.clearQueueLocked(alloc);
+    }
+
+    fn clearQueueLocked(self: *Tracker, alloc: std.mem.Allocator) void {
         while (self.takeLocked()) |observation| {
             observation.deinit(alloc);
             alloc.destroy(observation);
+        }
+        self.queue_len = 0;
+        self.queued_bytes = 0;
+    }
+
+    fn waitUntilIdle(self: *Tracker) void {
+        const io = io_mod.getIo();
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        while (self.queue_len > 0 or self.in_flight) {
+            self.wake.waitUncancelable(io, &self.mutex);
         }
     }
 
@@ -333,6 +401,19 @@ pub const Tracker = struct {
     }
 };
 
+fn observationCharge(
+    path: []const u8,
+    scope: hooks.Scope,
+    parent_session_id: ?[]const u8,
+) usize {
+    var total: usize = @sizeOf(QueuedObservation);
+    total +|= path.len;
+    total +|= scope.workspace_root.len;
+    if (scope.session_id) |session_id| total +|= session_id.len;
+    if (parent_session_id) |parent_id| total +|= parent_id.len;
+    return total;
+}
+
 fn discoverGitRoot(
     alloc: std.mem.Allocator,
     path: []const u8,
@@ -351,7 +432,12 @@ fn discoverGitRoot(
         if (std.Io.Dir.cwd().statFile(io_mod.getIo(), marker, .{
             .follow_symlinks = false,
         })) |stat| {
-            if (stat.kind == .directory or stat.kind == .file) return current;
+            if (stat.kind == .directory) return current;
+            if (stat.kind == .file and try validGitDirMarker(
+                alloc,
+                current,
+                marker,
+            )) return current;
         } else |_| {}
 
         const parent = std.fs.path.dirname(current) orelse break;
@@ -362,6 +448,37 @@ fn discoverGitRoot(
     }
     alloc.free(current);
     return null;
+}
+
+fn validGitDirMarker(
+    alloc: std.mem.Allocator,
+    checkout_root: []const u8,
+    marker_path: []const u8,
+) !bool {
+    const io = io_mod.getIo();
+    var file = std.Io.Dir.openFileAbsolute(io, marker_path, .{}) catch return false;
+    defer file.close(io);
+    const bytes = io_mod.readFileToEnd(alloc, &file, max_gitdir_marker_bytes) catch
+        return false;
+    defer alloc.free(bytes);
+
+    const line = std.mem.trimEnd(u8, bytes, "\r\n");
+    const prefix = "gitdir:";
+    if (!std.mem.startsWith(u8, line, prefix)) return false;
+    const raw_target = std.mem.trim(u8, line[prefix.len..], " \t");
+    if (raw_target.len == 0 or
+        std.mem.findScalar(u8, raw_target, '\n') != null or
+        std.mem.findScalar(u8, raw_target, '\r') != null) return false;
+
+    const candidate = if (std.fs.path.isAbsolute(raw_target))
+        try alloc.dupe(u8, raw_target)
+    else
+        try std.fs.path.join(alloc, &.{ checkout_root, raw_target });
+    defer alloc.free(candidate);
+    const canonical = io_mod.realpathAlloc(alloc, candidate) catch return false;
+    defer alloc.free(canonical);
+    const stat = std.Io.Dir.cwd().statFile(io, canonical, .{}) catch return false;
+    return stat.kind == .directory;
 }
 
 fn replacePrivateFileAtomic(
@@ -434,9 +551,24 @@ test "ADE Git roots discover normal and linked worktree markers" {
     try tmp.dir.createDirPath(std.testing.io, "normal/.git");
     try tmp.dir.createDirPath(std.testing.io, "normal/nested");
     try tmp.dir.createDirPath(std.testing.io, "linked/nested");
+    try tmp.dir.createDirPath(std.testing.io, "linked-absolute/nested");
+    try tmp.dir.createDirPath(std.testing.io, "metadata/worktrees/linked");
+    try tmp.dir.createDirPath(std.testing.io, "metadata/worktrees/linked-absolute");
     try tmp.dir.writeFile(std.testing.io, .{
         .sub_path = "linked/.git",
-        .data = "gitdir: /tmp/example.git/worktrees/linked\n",
+        .data = "gitdir: ../metadata/worktrees/linked\n",
+    });
+    const absolute_gitdir = try io_mod.dirRealpathAlloc(
+        alloc,
+        tmp.dir,
+        "metadata/worktrees/linked-absolute",
+    );
+    defer alloc.free(absolute_gitdir);
+    const absolute_marker = try std.fmt.allocPrint(alloc, "gitdir: {s}\n", .{absolute_gitdir});
+    defer alloc.free(absolute_marker);
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "linked-absolute/.git",
+        .data = absolute_marker,
     });
 
     const normal_nested = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "normal/nested");
@@ -447,6 +579,18 @@ test "ADE Git roots discover normal and linked worktree markers" {
     defer alloc.free(linked_nested);
     const linked_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "linked");
     defer alloc.free(linked_root);
+    const linked_absolute_nested = try io_mod.dirRealpathAlloc(
+        alloc,
+        tmp.dir,
+        "linked-absolute/nested",
+    );
+    defer alloc.free(linked_absolute_nested);
+    const linked_absolute_root = try io_mod.dirRealpathAlloc(
+        alloc,
+        tmp.dir,
+        "linked-absolute",
+    );
+    defer alloc.free(linked_absolute_root);
 
     const discovered_normal = (try discoverGitRoot(alloc, normal_nested, .directory)).?;
     defer alloc.free(discovered_normal);
@@ -454,6 +598,40 @@ test "ADE Git roots discover normal and linked worktree markers" {
     const discovered_linked = (try discoverGitRoot(alloc, linked_nested, .directory)).?;
     defer alloc.free(discovered_linked);
     try std.testing.expectEqualStrings(linked_root, discovered_linked);
+    const discovered_linked_absolute = (try discoverGitRoot(
+        alloc,
+        linked_absolute_nested,
+        .directory,
+    )).?;
+    defer alloc.free(discovered_linked_absolute);
+    try std.testing.expectEqualStrings(linked_absolute_root, discovered_linked_absolute);
+}
+
+test "ADE Git roots reject regular markers without a valid Git directory pointer" {
+    const alloc = std.testing.allocator;
+    var tmp = try OutsideGitTmp.init();
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "invalid/nested");
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "invalid/.git",
+        .data = "ordinary file\n",
+    });
+    try tmp.dir.createDirPath(std.testing.io, "target-file/nested");
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "not-a-directory",
+        .data = "not a directory",
+    });
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "target-file/.git",
+        .data = "gitdir: ../not-a-directory\n",
+    });
+
+    const invalid = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "invalid/nested");
+    defer alloc.free(invalid);
+    const target_file = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "target-file/nested");
+    defer alloc.free(target_file);
+    try std.testing.expect((try discoverGitRoot(alloc, invalid, .directory)) == null);
+    try std.testing.expect((try discoverGitRoot(alloc, target_file, .directory)) == null);
 }
 
 test "ADE Git root checkpoint atomically replaces stale content with private schema one state" {
@@ -518,6 +696,7 @@ test "ADE Git roots retain first discovery order and checkpoint without a socket
         revisions: [4]u64 = @splat(0),
         reasons: [4]DiscoveryReason = undefined,
         scopes: [4]hooks.ScopeKind = undefined,
+        parent_session_ids: [4]?[]u8 = @splat(null),
         count: usize = 0,
 
         fn report(raw: *anyopaque, discovery: Discovery) void {
@@ -526,12 +705,19 @@ test "ADE Git roots retain first discovery order and checkpoint without a socket
             self.revisions[self.count] = discovery.revision;
             self.reasons[self.count] = discovery.reason;
             self.scopes[self.count] = discovery.scope.kind;
+            self.parent_session_ids[self.count] = if (discovery.parent_session_id) |parent_id|
+                self.alloc.dupe(u8, parent_id) catch return
+            else
+                null;
             self.count += 1;
         }
 
         fn deinit(self: *@This()) void {
             for (self.roots) |maybe_root| {
                 if (maybe_root) |root| self.alloc.free(root);
+            }
+            for (self.parent_session_ids) |maybe_parent| {
+                if (maybe_parent) |parent_id| self.alloc.free(parent_id);
             }
         }
     };
@@ -566,6 +752,7 @@ test "ADE Git roots retain first discovery order and checkpoint without a socket
             .session_id = "child-session",
             .subagent_id = 7,
         },
+        .parent_session_id = "captured-parent-session",
         .source = .file_mutation,
         .paths = &.{edited_path},
     });
@@ -578,6 +765,7 @@ test "ADE Git roots retain first discovery order and checkpoint without a socket
         .source = .terminal_write,
         .paths = &.{repo_b_nested},
     });
+    tracker.waitUntilIdle();
     tracker.deinit();
 
     try std.testing.expectEqual(@as(usize, 2), recorder.count);
@@ -593,6 +781,11 @@ test "ADE Git roots retain first discovery order and checkpoint without a socket
         hooks.ScopeKind,
         &.{ .interactive, .subagent },
         recorder.scopes[0..2],
+    );
+    try std.testing.expect(recorder.parent_session_ids[0] == null);
+    try std.testing.expectEqualStrings(
+        "captured-parent-session",
+        recorder.parent_session_ids[1].?,
     );
 
     var checkpoint_file = try std.Io.Dir.openFileAbsolute(std.testing.io, checkpoint_path, .{});
@@ -638,6 +831,7 @@ test "ADE Git roots replace stale output with an empty non-Git launch checkpoint
         null,
         .{ .kind = .interactive, .workspace_root = plain },
     );
+    tracker.waitUntilIdle();
     tracker.deinit();
 
     var file = try std.Io.Dir.openFileAbsolute(std.testing.io, checkpoint_path, .{});
@@ -681,5 +875,55 @@ test "ADE Git roots ignore an unwritable checkpoint target" {
         null,
         .{ .kind = .interactive, .workspace_root = repo },
     );
+    tracker.waitUntilIdle();
     tracker.deinit();
+}
+
+test "ADE Git roots cap queued observations and discard backlog on shutdown" {
+    const alloc = std.testing.allocator;
+    var tracker = Tracker{
+        .enabled = true,
+        .alloc = alloc,
+    };
+    const scope = hooks.Scope{
+        .kind = .subagent,
+        .workspace_root = "/tmp/workspace",
+        .session_id = "child-session",
+    };
+    for (0..max_queued_observations + 16) |_| {
+        tracker.enqueueBatch(
+            scope,
+            "parent-session",
+            .subagent_terminal_write,
+            .directory,
+            &.{"/tmp/workspace"},
+        );
+    }
+    try std.testing.expectEqual(max_queued_observations, tracker.queue_len);
+    try std.testing.expect(tracker.queued_bytes <= max_queued_observation_bytes);
+
+    tracker.clearQueue();
+    const oversized = try alloc.alloc(u8, max_queued_observation_bytes);
+    defer alloc.free(oversized);
+    @memset(oversized, 'x');
+    tracker.enqueueBatch(
+        scope,
+        "parent-session",
+        .subagent_terminal_write,
+        .directory,
+        &.{oversized},
+    );
+    try std.testing.expectEqual(@as(usize, 0), tracker.queue_len);
+    try std.testing.expectEqual(@as(usize, 0), tracker.queued_bytes);
+
+    tracker.enqueueBatch(
+        scope,
+        "parent-session",
+        .subagent_terminal_write,
+        .directory,
+        &.{"/tmp/workspace"},
+    );
+    try std.testing.expectEqual(@as(usize, 1), tracker.queue_len);
+    tracker.deinit();
+    try std.testing.expect(!tracker.enabled);
 }
