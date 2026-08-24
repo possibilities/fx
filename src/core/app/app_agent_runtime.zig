@@ -95,9 +95,13 @@ pub fn Runtime(comptime App: type) type {
             return app.context_snapshot.modelVisibleBytes();
         }
 
-        fn childToolContext(root_context: tool_runtime.Context) tool_runtime.Context {
+        fn childToolContext(
+            root_context: tool_runtime.Context,
+            root_session_id: []const u8,
+        ) tool_runtime.Context {
             var child_context = root_context;
             child_context.tracker = null;
+            child_context.lifecycle_parent_session_id = root_session_id;
             return child_context;
         }
 
@@ -1024,8 +1028,10 @@ pub fn Runtime(comptime App: type) type {
             ) catch return error.OutOfMemory;
             defer explicit_skills.deinit(alloc);
             const prompt_policy = app.promptPolicy();
-            var tool_context = childToolContext(app.subagentToolContextForAdmission(admission));
-            tool_context.lifecycle_parent_session_id = admission.parent_id;
+            const tool_context = childToolContext(
+                app.subagentToolContextForAdmission(admission),
+                admission.root_id,
+            );
             const providers = if (comptime @hasDecl(App, "providerSet"))
                 app.providerSet()
             else
@@ -1793,8 +1799,12 @@ test "app agent runtime builds tool context from app state and MCP callbacks" {
     try std.testing.expect(ctx.subagent_caller_id == null);
     try std.testing.expectEqual(&app.session, ctx.session);
     try std.testing.expectEqual(&app.change_tracker, ctx.tracker.?);
-    const child_ctx = Runtime(FakeApp).childToolContext(ctx);
+    const child_ctx = Runtime(FakeApp).childToolContext(ctx, "root-session");
     try std.testing.expect(child_ctx.tracker == null);
+    try std.testing.expectEqualStrings(
+        "root-session",
+        child_ctx.lifecycle_parent_session_id.?,
+    );
     try std.testing.expect(ctx.mcp_has_tool.?(ctx.mcp_ctx.?, "mcp_lookup", .unrestricted));
 
     const result = try ctx.mcp_call_tool.?(
@@ -2623,6 +2633,7 @@ test "subagent tool projection uses immutable admission permission rules" {
         .action = .allow,
     }};
     var admission = try subagent_domain.captureAdmission(alloc, .{
+        .root_id = "root-session",
         .parent_id = "parent",
         .source_id = "parent",
         .model = "test-model",
@@ -2734,7 +2745,8 @@ test "subagent tool context uses immutable admission authority" {
         .target_path = @constCast("/tmp/workspace::zig build"),
     }};
     var admission = try subagent_domain.captureAdmission(alloc, .{
-        .parent_id = "parent",
+        .root_id = "root-session",
+        .parent_id = "direct-parent-session",
         .source_id = "parent",
         .model = "test-model",
         .effort = .auto,
@@ -2744,7 +2756,15 @@ test "subagent tool context uses immutable admission authority" {
     });
     defer admission.deinit(alloc);
 
-    const ctx = app.subagentToolContextForAdmission(admission);
+    const ctx = Runtime(FakeApp).childToolContext(
+        app.subagentToolContextForAdmission(admission),
+        admission.root_id,
+    );
+    try std.testing.expectEqualStrings("direct-parent-session", admission.parent_id);
+    try std.testing.expectEqualStrings(
+        "root-session",
+        ctx.lifecycle_parent_session_id.?,
+    );
     try std.testing.expectEqual(PermissionMode.auto, ctx.permission_mode);
     try std.testing.expectEqual(@as(usize, 1), ctx.permission_rules.rules.len);
     try std.testing.expectEqualStrings(

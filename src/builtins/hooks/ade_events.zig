@@ -1117,7 +1117,7 @@ test "ADE session changes publish eagerly before child lifecycle context" {
     }
 }
 
-test "ADE Git root discovery preserves the parent captured with subagent work" {
+test "ADE nested-child Git root discovery preserves owning root lifecycle parent" {
     const alloc = std.testing.allocator;
     var client = Client{
         .enabled = true,
@@ -1125,39 +1125,69 @@ test "ADE Git root discovery preserves the parent captured with subagent work" {
         .socket_path = try alloc.dupe(u8, "/tmp/unused-ade.sock"),
         .instance_id = try alloc.dupe(u8, "instance-4"),
         .workspace_root = try alloc.dupe(u8, "/tmp/workspace"),
-        .main_session_id = try alloc.dupe(u8, "main-session-b"),
+        .main_session_id = try alloc.dupe(u8, "root-session-a"),
     };
     defer client.deinit();
 
+    client.reportTurnStarted(.{
+        .scope = .{
+            .kind = .subagent,
+            .workspace_root = "/tmp/workspace",
+            .session_id = "grandchild-session",
+            .subagent_id = 7,
+        },
+        .turn_id = 42,
+    });
+    client.reportSessionChanged("root-session-b");
     client.reportGitRootDiscovered(.{
-        .root = "/tmp/workspace/child-repository",
+        .root = "/tmp/workspace/grandchild-repository",
         .revision = 2,
         .reason = .subagent_file_mutation,
         .scope = .{
             .kind = .subagent,
             .workspace_root = "/tmp/workspace",
-            .session_id = "child-session-a",
+            .session_id = "grandchild-session",
             .subagent_id = 7,
         },
-        .parent_session_id = "main-session-a",
+        .parent_session_id = "root-session-a",
     });
 
-    try std.testing.expectEqual(@as(usize, 1), client.queue_len);
-    var parsed = try std.json.parseFromSlice(
+    try std.testing.expectEqual(@as(usize, 3), client.queue_len);
+    var lifecycle = try std.json.parseFromSlice(
         std.json.Value,
         alloc,
         client.queue[0].?.bytes,
         .{},
     );
-    defer parsed.deinit();
-    const context = parsed.value.object.get("context").?.object;
+    defer lifecycle.deinit();
+    var discovery = try std.json.parseFromSlice(
+        std.json.Value,
+        alloc,
+        client.queue[2].?.bytes,
+        .{},
+    );
+    defer discovery.deinit();
     try std.testing.expectEqualStrings(
-        "main-session-a",
-        context.get("parent_session_id").?.string,
+        "TurnStarted",
+        lifecycle.value.object.get("event").?.string,
     );
     try std.testing.expectEqualStrings(
-        "child-session-a",
-        context.get("session_id").?.string,
+        "GitRootDiscovered",
+        discovery.value.object.get("event").?.string,
+    );
+    const lifecycle_context = lifecycle.value.object.get("context").?.object;
+    const discovery_context = discovery.value.object.get("context").?.object;
+    try std.testing.expectEqualStrings(
+        lifecycle_context.get("parent_session_id").?.string,
+        discovery_context.get("parent_session_id").?.string,
+    );
+    try std.testing.expectEqualStrings(
+        "root-session-a",
+        discovery_context.get("parent_session_id").?.string,
+    );
+    try std.testing.expectEqualStrings(
+        "grandchild-session",
+        discovery_context.get("session_id").?.string,
     );
 }
 
