@@ -68,6 +68,8 @@ fx
 
 The current directory becomes the primary workspace. Enter a prompt, or run `/help` to browse interactive commands.
 
+Press `Ctrl+G` to edit the current prompt with `VISUAL`, falling back to `EDITOR`, even while a response is streaming; drafts containing pasted blocks, images, or skills are left unchanged. When an automatic upgrade is ready, press `Ctrl+T` to reload it.
+
 The status line hides the workspace path and Git branch by default. Enable the `Status line workspace` option in `/settings`, run `/statusline workspace`, or set it in `~/.fx/settings.json`:
 
 ```json
@@ -87,6 +89,31 @@ fx session resume --id <id>
 
 Each interactive session names its terminal tab. The title prefers the session name, falls back to the workspace name, and keeps the active model as secondary context. Renaming or resuming a session updates the tab, and exiting clears the fx-owned title. Noninteractive commands do not emit terminal-title controls.
 
+On the first submitted prompt, fx starts a small naming request alongside the
+main agent and installs the result as the session's native name without
+delaying the turn. The Codex route defaults to `gpt-5.4-mini` at low effort;
+other providers are skipped unless configured. Naming settings are profile
+settings in `~/.fx/settings.json` and are ignored in project `.fx.json` files:
+
+```json
+{
+  "session_naming": {
+    "codex": {
+      "model": "gpt-5.4-mini",
+      "effort": "low"
+    },
+    "timeout_ms": 60000
+  }
+}
+```
+
+Set `codex` to `null` to disable its compiled default. Configure `gateway` or
+`grok` with the same `model` and optional `effort` fields to opt those providers
+in. Before naming, fx removes a leading slash command and its `--flag` tokens,
+expands readable `@path` mentions up to 32 KiB each, and then limits the model
+input to 1600 bytes. Generated names are limited to 64 bytes. `/rename` always
+wins over an in-flight generated result.
+
 Run `/feedback` to open the feedback form at `fx.sh/feedback`. It does not create a diagnostic or change the clipboard.
 
 Run `/trace` to create a private Markdown diagnostic with logs, session context, runtime state, permissions, and recent activity. On macOS, fx copies the `.md` file to the clipboard; on other platforms, it saves the file and prints its path. Review and redact the trace before sharing it.
@@ -96,6 +123,22 @@ Use `fx ask` for a single request:
 ```bash
 fx ask "explain the changes in this repository"
 ```
+
+Customize the system prompt for one model-launching invocation with global
+file options placed before the command:
+
+```bash
+fx --system-prompt-file ./base-prompt.md ask "review this change"
+fx --append-system-prompt-file ./team-rules.md --append-system-prompt-file ./task-rules.md
+```
+
+`--system-prompt-file` replaces the effective base prompt and may be supplied
+once. `--append-system-prompt-file` preserves that base and adds files in CLI
+order, separated by blank lines. The options also apply to interactive and
+resumed sessions, ACP, `pr`, and `issue`. Custom prompt files must be regular
+UTF-8 files without NUL bytes and may contain at most 256 KiB combined. File
+errors stop the launch. For `fx ask`, these options cannot be combined with
+the inline `--system` option.
 
 fx starts in `auto` permission mode. Routine understood development actions run directly. Each unresolved action receives one narrow safety review based on the current user request and the exact pending action. A clear result authorizes only that action. A caution or unavailable review holds the action and returns advice to the agent without opening a permission prompt or ending the turn. See [Permissions](https://fx.sh/docs/configure-fx/permissions) for other modes and persistent rules.
 
@@ -117,7 +160,18 @@ The WebAssembly SDK is experimental. See the [WebAssembly SDK](sdk/README.md) an
 
 ## Extend fx
 
-Add reusable instructions with [skills](https://fx.sh/docs/capabilities/skills), connect external tools through [MCP](https://fx.sh/docs/capabilities/mcp), or delegate independent work to [subagents](https://fx.sh/docs/capabilities/subagents). Project instruction files may link within their scope, and read-only workspace or compatibility skill directories and their primary `SKILL.md` files may link within their owning workspace or home; managed skills, secondary resources, and escaping links remain no-follow. Skills installed via symlinks that resolve outside home or workspace (e.g. Nix store paths) are loaded when their resolved target is inside a directory listed in the `FX_SKILL_SYMLINK_AUTHORITIES` environment variable (colon-separated absolute paths). `fx status` and `fx doctor` report an invalid trusted MCP profile without starting its servers.
+Add reusable instructions with [skills](https://fx.sh/docs/capabilities/skills), connect external tools through [MCP](https://fx.sh/docs/capabilities/mcp), observe hosted TUI agents through the [ADE event feed](docs/ade-event-feed.md), or delegate independent work to [subagents](https://fx.sh/docs/capabilities/subagents). Project instruction files may link within their scope, and read-only workspace or compatibility skill directories and their primary `SKILL.md` files may link within their owning workspace or home; managed skills, secondary resources, and escaping links remain no-follow. Skills installed via symlinks that resolve outside home or workspace (e.g. Nix store paths) are loaded when their resolved target is inside a directory listed in the `FX_SKILL_SYMLINK_AUTHORITIES` environment variable (colon-separated absolute paths). `fx status` and `fx doctor` report an invalid trusted MCP profile without starting its servers.
+
+Load additional skill roots for one invocation with repeatable `--skills-dir`
+flags. Each root contains one directory per skill and is scanned before
+automatically discovered roots:
+
+```bash
+fx --skills-dir ./team-skills --skills-dir /opt/shared-skills ask "Review this change"
+```
+
+Invocation skill roots are not saved, and skill installation continues to use
+`~/.fx/skills`.
 
 ## Documentation
 

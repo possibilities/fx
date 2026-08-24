@@ -8,6 +8,7 @@ const std = @import("std");
 const hooks = @import("../core/hooks/hooks.zig");
 const herdr = @import("hooks/herdr.zig");
 
+pub const ade_events = @import("hooks/ade_events.zig");
 pub const notifications = @import("hooks/notifications.zig");
 pub const Client = herdr.Client;
 

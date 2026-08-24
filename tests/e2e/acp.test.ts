@@ -593,7 +593,7 @@ function startAcpFakeCodex(options: {
       if (path === "/models") {
         modelRequests.push(recorded);
         return Response.json({ models: [
-          { slug: "gpt-5.6-sol", visibility: "list", supported_in_api: true, supported_reasoning_levels: [{ effort: "high" }], additional_speed_tiers: ["fast"], input_modalities: ["text", "image"], context_window: 272000 },
+          { slug: "gpt-5.6-sol", visibility: "list", supported_in_api: true, supported_reasoning_levels: [{ effort: "low" }, { effort: "high" }], additional_speed_tiers: ["fast"], input_modalities: ["text", "image"], context_window: 272000 },
           { slug: "gpt-5.4-mini", visibility: "list", supported_in_api: true, supported_reasoning_levels: [{ effort: "low" }], additional_speed_tiers: [], input_modalities: ["text"], context_window: 128000 },
         ] });
       }
@@ -5748,6 +5748,53 @@ describe("acp: model-independent", () => {
   );
 
   test(
+    "ACP loads an invocation skill root from --skills-dir",
+    async () => {
+      const root = createIsolatedRoot("fx-acp-invocation-skill-");
+      const invocationRoot = join(root.root, "invocation-skills");
+      const skillDirectory = join(invocationRoot, "acp-invocation");
+      const skillBody = "ACP_INVOCATION_SKILL_BODY";
+      mkdirSync(skillDirectory, { recursive: true });
+      writeFileSync(
+        join(skillDirectory, "SKILL.md"),
+        `---\nname: acp-invocation\ndescription: invocation ACP fixture\n---\n\n${skillBody}\n`,
+      );
+      const gateway = startFakeGateway([
+        finalText("ACP invocation skill complete"),
+      ]);
+      try {
+        client = await AcpClient.create({
+          cwd: root.workspace,
+          args: ["--skills-dir", invocationRoot, "acp"],
+          env: fakeGatewayEnv(root, gateway),
+        });
+        await startCodeSession(client);
+        const result = await runPrompt(
+          client,
+          "$acp-invocation apply the selected skill.",
+          TIMEOUT,
+        );
+
+        expect(result.promptResult.error).toBeUndefined();
+        expect(result.promptResult.result.stopReason).toBe("end_turn");
+        expect(gateway.requests).toHaveLength(1);
+        const promptText = acpPromptText(gateway.requests[0]!.body);
+        expect(promptText).toContain("invocation ACP fixture");
+        expect(promptText).toContain(
+          '<skill_content name="acp-invocation" resource="SKILL.md"',
+        );
+        expect(promptText).toContain(skillBody);
+        expect(client.stderr).toBe("");
+      } finally {
+        await client?.close();
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
     "ACP rejects an explicitly invoked skill deleted after session startup",
     async () => {
       const root = createIsolatedRoot("fx-acp-stale-explicit-skill-");
@@ -7431,6 +7478,241 @@ describe("acp: model catalog authentication", () => {
       TIMEOUT,
     );
   }
+
+  test(
+    "FX_EFFORT overrides the configured effort for new and loaded ACP sessions",
+    async () => {
+      const root = createIsolatedRoot("fx-acp-effort-override-");
+      const model = "provider/effort-override";
+      const gateway = startFakeGateway(
+        [
+          finalText("override complete"),
+          finalText("reload complete"),
+          finalText("plain reload complete"),
+        ],
+        {
+          models: [{
+            id: model,
+            type: "language",
+            tags: ["reasoning", "tool-use"],
+            context_window: 750_000,
+            max_tokens: 64_000,
+            reasoning_options: [{ type: "effort", values: ["low", "high"] }],
+          }],
+        },
+      );
+      writeFileSync(
+        join(root.home, ".fx", "settings.json"),
+        `${JSON.stringify({ model, effort: "low" })}\n`,
+      );
+      const env = {
+        ...fakeGatewayEnv(root, gateway),
+        FX_MODEL: undefined,
+        FX_E2E_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+        FX_EFFORT: "high",
+      };
+      try {
+        client = await AcpClient.create({ cwd: root.workspace, env });
+        const sessionId = await startCodeSession(client);
+        const first = await runPrompt(client, "Confirm the effort override.");
+        expect(first.promptResult.result.stopReason).toBe("end_turn");
+        expect(gateway.requests).toHaveLength(1);
+        expect(JSON.parse(gateway.requests[0]!.body)).toMatchObject({
+          reasoning: "high",
+        });
+
+        await client.close();
+        client = await AcpClient.create({ cwd: root.workspace, env });
+        await client.request("initialize", { protocolVersion: 1 }, 10);
+        client.send({
+          jsonrpc: "2.0",
+          id: 11,
+          method: "session/load",
+          params: { sessionId, mcpServers: [] },
+        });
+        let loadResponse: any = null;
+        while (loadResponse === null) {
+          const message = await client.readLine() as any;
+          if (message.id === 11) loadResponse = message;
+        }
+        expect(loadResponse.error).toBeUndefined();
+        const reloaded = await runPrompt(client, "Confirm the effort override again.");
+        expect(reloaded.promptResult.result.stopReason).toBe("end_turn");
+        expect(gateway.requests).toHaveLength(2);
+        expect(JSON.parse(gateway.requests[1]!.body)).toMatchObject({
+          reasoning: "high",
+        });
+
+        await client.close();
+        client = await AcpClient.create({
+          cwd: root.workspace,
+          env: { ...env, FX_EFFORT: undefined },
+        });
+        await client.request("initialize", { protocolVersion: 1 }, 20);
+        client.send({
+          jsonrpc: "2.0",
+          id: 21,
+          method: "session/load",
+          params: { sessionId, mcpServers: [] },
+        });
+        let plainLoadResponse: any = null;
+        while (plainLoadResponse === null) {
+          const message = await client.readLine() as any;
+          if (message.id === 21) plainLoadResponse = message;
+        }
+        expect(plainLoadResponse.error).toBeUndefined();
+        const plain = await runPrompt(client, "Confirm the saved effort.");
+        expect(plain.promptResult.result.stopReason).toBe("end_turn");
+        expect(gateway.requests).toHaveLength(3);
+        expect(JSON.parse(gateway.requests[2]!.body)).toMatchObject({
+          reasoning: "low",
+        });
+      } finally {
+        await client?.close();
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "--effort overrides FX_EFFORT for ACP without changing the saved effort",
+    async () => {
+      const root = createIsolatedRoot("fx-acp-cli-effort-override-");
+      const model = "provider/cli-effort-override";
+      const gateway = startFakeGateway(
+        [finalText("CLI override complete"), finalText("saved effort complete")],
+        {
+          models: [{
+            id: model,
+            type: "language",
+            tags: ["reasoning", "tool-use"],
+            context_window: 750_000,
+            max_tokens: 64_000,
+            reasoning_options: [{ type: "effort", values: ["low", "high"] }],
+          }],
+        },
+      );
+      writeFileSync(
+        join(root.home, ".fx", "settings.json"),
+        `${JSON.stringify({ model, effort: "low" })}\n`,
+      );
+      const env = {
+        ...fakeGatewayEnv(root, gateway),
+        FX_MODEL: undefined,
+        FX_E2E_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+        FX_EFFORT: "low",
+      };
+      try {
+        client = await AcpClient.create({
+          args: ["acp", "--effort", "high"],
+          cwd: root.workspace,
+          env,
+        });
+        const sessionId = await startCodeSession(client);
+        const overridden = await runPrompt(client, "Confirm the CLI effort override.");
+        expect(overridden.promptResult.result.stopReason).toBe("end_turn");
+        expect(gateway.requests).toHaveLength(1);
+        expect(JSON.parse(gateway.requests[0]!.body)).toMatchObject({
+          reasoning: "high",
+        });
+
+        await client.close();
+        client = await AcpClient.create({
+          cwd: root.workspace,
+          env: { ...env, FX_EFFORT: undefined },
+        });
+        await client.request("initialize", { protocolVersion: 1 }, 20);
+        client.send({
+          jsonrpc: "2.0",
+          id: 21,
+          method: "session/load",
+          params: { sessionId, mcpServers: [] },
+        });
+        let loadResponse: any = null;
+        while (loadResponse === null) {
+          const message = await client.readLine() as any;
+          if (message.id === 21) loadResponse = message;
+        }
+        expect(loadResponse.error).toBeUndefined();
+        const saved = await runPrompt(client, "Confirm the configured effort.");
+        expect(saved.promptResult.result.stopReason).toBe("end_turn");
+        expect(gateway.requests).toHaveLength(2);
+        expect(JSON.parse(gateway.requests[1]!.body)).toMatchObject({
+          reasoning: "low",
+        });
+      } finally {
+        await client?.close();
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "--effort directs Codex Responses requests without changing the saved effort",
+    async () => {
+      const root = createIsolatedRoot("fx-acp-codex-cli-effort-override-");
+      const gateway = startFakeGateway([]);
+      const codex = startAcpFakeCodex();
+      writeSeededAcpChatGptLogin(root.home, codex.accessToken);
+      writeFileSync(
+        join(root.home, ".fx", "settings.json"),
+        `${JSON.stringify({
+          provider: "codex",
+          codex_model: "gpt-5.6-sol",
+          effort: "low",
+        })}\n`,
+      );
+      const env = {
+        ...fakeGatewayEnv(root, gateway),
+        FX_MODEL: undefined,
+        FX_E2E_OPENAI_CODEX_RESPONSES_URL: codex.responsesUrl,
+        FX_E2E_OPENAI_CODEX_MODELS_URL: codex.modelsUrl,
+      };
+      try {
+        client = await AcpClient.create({
+          args: ["acp", "--effort", "high"],
+          cwd: root.workspace,
+          env,
+        });
+        const sessionId = await startCodeSession(client);
+        const overridden = await runPrompt(client, "Confirm the Codex CLI effort override.");
+        expect(overridden.promptResult.result.stopReason).toBe("end_turn");
+        expect(codex.requests).toHaveLength(1);
+        expect(JSON.parse(codex.requests[0]!.body)).toMatchObject({
+          reasoning: { effort: "high" },
+        });
+
+        await client.close();
+        client = await AcpClient.create({ cwd: root.workspace, env });
+        await client.request("initialize", { protocolVersion: 1 }, 20);
+        client.send({
+          jsonrpc: "2.0",
+          id: 21,
+          method: "session/load",
+          params: { sessionId, mcpServers: [] },
+        });
+        const loadResponse = await readResponse(client, 21);
+        expect(loadResponse.error).toBeUndefined();
+        const saved = await runPrompt(client, "Confirm the saved Codex effort.");
+        expect(saved.promptResult.result.stopReason).toBe("end_turn");
+        expect(codex.requests).toHaveLength(2);
+        expect(JSON.parse(codex.requests[1]!.body)).toMatchObject({
+          reasoning: { effort: "low" },
+        });
+        expect(client.stderr).toBe("");
+      } finally {
+        await client?.close();
+        codex.stop();
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
 
   test(
     "--model flag overrides selected model without inheriting the default Fast mode",

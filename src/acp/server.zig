@@ -223,6 +223,7 @@ pub const ServerState = struct {
     provider: model_provider.ProviderId = .gateway,
     configured_model: []u8 = &.{},
     process_model_override: bool = false,
+    process_effort_override: bool = false,
     permission_mode: types.PermissionMode = .ask,
     permission_rules: types.PermissionRuleSet = .{},
     agent_step_limit: usize = 0,
@@ -230,6 +231,7 @@ pub const ServerState = struct {
     context_limits: config_runtime.context_limits.Values = .{},
     fast_mode: bool = false,
     effort: types.ReasoningEffort = .auto,
+    configured_effort: types.ReasoningEffort = .auto,
     first_call_tool_choice: types.ToolChoice = .auto,
     context_enabled: bool = true,
     active_session: ?ActiveSessionState = null,
@@ -1406,12 +1408,20 @@ fn handleInitialize(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message
     state.context_limits.applyCommandLine(state.cfg.context_limit_overrides);
     state.fast_mode = startup.fast_mode and
         (state.cfg.model_override == null or startup.fast_mode_source != .compiled_default);
-    state.effort = startup.effort;
+    state.effort = state.cfg.effort_override orelse startup.effort;
+    state.configured_effort = startup.configured_effort;
+    state.process_effort_override = state.cfg.effort_override != null or
+        startup.effort_source == .process_override;
     state.first_call_tool_choice = startup.first_call_tool_choice;
     state.context_enabled = startup.context_enabled;
 
     if (comptime !host_target.is_wasm) {
-        const loaded_skills = try app_runtime_setup.loadSkills(alloc, state.workspace_root, builtin_skills.root_policy);
+        const loaded_skills = try app_runtime_setup.loadSkills(
+            alloc,
+            state.workspace_root,
+            state.cfg.invocation_skill_roots,
+            builtin_skills.root_policy,
+        );
         skill_runtime.traceDiagnostics("acp_startup", loaded_skills.diagnostics);
         state.skills.replaceLoaded(alloc, loaded_skills.dir, loaded_skills.skills, loaded_skills.diagnostics);
     }

@@ -108,16 +108,25 @@ fn executeCommand(alloc: Allocator, command: Command, request: CommandRequest) !
         .install => |install| installCommandResult(alloc, request.skills_dir, install),
         .create => |name| createCommandResult(alloc, request.skills_dir, name),
         .remove => |name| removeCommandResult(alloc, request, name),
-        .path => noticeFmt(
-            alloc,
-            "fx workspace roots are auto-discovered from .fx/skills and skills/.\n" ++
-                "fx managed install root: {s}\n" ++
-                "compatibility roots are auto-discovered from workspace and home (.opencode/.codex/.claude/.agents/.claw).",
-            .{request.skills_dir},
-            false,
-        ),
+        .path => pathCommandResult(alloc, request),
         .usage => noticeLiteral(alloc, "Usage: /skills [list|add|install|show|create|remove|path] [name|url|path]", false),
     };
+}
+
+fn pathCommandResult(alloc: Allocator, request: CommandRequest) !CommandResult {
+    var text: std.Io.Writer.Allocating = .init(alloc);
+    defer text.deinit();
+
+    try text.writer.writeAll("fx workspace roots are auto-discovered from .fx/skills and skills/.\n");
+    try text.writer.print("fx managed install root: {s}\n", .{request.skills_dir});
+    if (request.invocation_skill_roots.len > 0) {
+        try text.writer.writeAll("invocation skill roots:\n");
+        for (request.invocation_skill_roots) |root| {
+            try text.writer.print("  - {s}\n", .{root});
+        }
+    }
+    try text.writer.writeAll("compatibility roots are auto-discovered from workspace and home (.opencode/.codex/.claude/.agents/.claw).");
+    return .{ .notice = .{ .text = try text.toOwnedSlice() } };
 }
 
 fn focusSkillResult(alloc: Allocator, name: []const u8, request: CommandRequest) !CommandResult {
@@ -1961,6 +1970,24 @@ test "built-in skills path reports native workspace roots" {
                 "compatibility roots are auto-discovered from workspace and home (.opencode/.codex/.claude/.agents/.claw).",
             notice.text,
         ),
+        else => return error.TestExpectedEqual,
+    }
+}
+
+test "built-in skills path reports invocation roots without changing the install root" {
+    const alloc = std.testing.allocator;
+    var static_ctx = StaticSkillCtx{ .skills = &.{} };
+    const invocation_roots = [_][]const u8{ "/tmp/team-skills", "/opt/shared-skills" };
+    var request = staticCommandRequest("/tmp/managed-skills", &static_ctx);
+    request.invocation_skill_roots = &invocation_roots;
+    var result = try executeCommand(alloc, parseCommand("path"), request);
+    defer result.deinit(alloc);
+
+    switch (result) {
+        .notice => |notice| {
+            try std.testing.expect(std.mem.find(u8, notice.text, "fx managed install root: /tmp/managed-skills") != null);
+            try std.testing.expect(std.mem.find(u8, notice.text, "invocation skill roots:\n  - /tmp/team-skills\n  - /opt/shared-skills") != null);
+        },
         else => return error.TestExpectedEqual,
     }
 }

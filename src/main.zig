@@ -15,6 +15,7 @@ const credentials = @import("core/auth/credentials.zig");
 const secret = @import("core/auth/secret.zig");
 const model_cache_runtime = @import("core/app/model_cache_runtime.zig");
 const app_auth_runtime = @import("core/app/app_auth_runtime.zig");
+const app_external_editor_runtime = @import("core/app/app_external_editor_runtime.zig");
 const app_host_config_runtime = @import("core/app/app_host_config_runtime.zig");
 const app_entry_runtime = @import("core/app/app_entry_runtime.zig");
 const acp_runner = @import("core/cli/acp_runner.zig");
@@ -31,6 +32,7 @@ const app_agent_runtime = @import("core/app/app_agent_runtime.zig");
 const app_runtime_setup = @import("core/app/app_runtime_setup.zig");
 const app_render_runtime = @import("core/app/app_render_runtime.zig");
 const app_session_runtime = @import("core/app/app_session_runtime.zig");
+const app_session_naming_runtime = @import("core/app/app_session_naming_runtime.zig");
 const app_upgrade_runtime = @import("core/app/app_upgrade_runtime.zig");
 const app_worker_runtime = @import("core/app/app_worker_runtime.zig");
 const app_workspace_runtime = @import("core/app/app_workspace_runtime.zig");
@@ -56,6 +58,7 @@ const provider_set = @import("core/gateway/provider_set.zig");
 const provider_catalog = @import("core/auth/provider_catalog.zig");
 const vercel_model_policy = @import("gateway/vercel_model_policy.zig");
 const model_catalog = @import("core/gateway/model_catalog.zig");
+const session_naming_runtime = @import("core/session/session_naming.zig");
 const agent_stream_provider = @import("core/agent/stream_provider.zig");
 const builtin_hooks = @import("builtins/hooks.zig");
 const builtin_mcp = @import("builtins/mcp.zig");
@@ -67,6 +70,7 @@ const js_host_url_opener = @import("core/hosts/js_host_url_opener.zig");
 const js_host_workspace = @import("core/hosts/js_host_workspace.zig");
 const host_target = @import("core/hosts/target.zig");
 const native_host = @import("core/hosts/native.zig");
+const native_external_editor = @import("core/hosts/native_external_editor.zig");
 const debug_trace = @import("core/shared/debug_trace.zig");
 const display_width = @import("core/shared/display_width.zig");
 const file_index_mod = @import("core/workspace/file_index.zig");
@@ -372,6 +376,7 @@ const App = struct {
     const Self = @This();
     const AgentAppRuntime = app_agent_runtime.Runtime(Self);
     const AuthAppRuntime = app_auth_runtime.Runtime(Self);
+    const ExternalEditorAppRuntime = app_external_editor_runtime.Runtime(Self);
     const HostConfigAppRuntime = app_host_config_runtime.Runtime(Self);
     const BootstrapAppRuntime = app_bootstrap_runtime.Runtime(Self);
     const InputAppRuntime = app_input_runtime.Runtime(Self);
@@ -379,9 +384,11 @@ const App = struct {
         Self,
         builtin_hooks.notifications.provider(Self),
     );
+    const AdeAppRuntime = builtin_hooks.ade_events.Runtime(Self);
     const HerdrAppRuntime = builtin_hooks.Runtime(Self);
     const RenderAppRuntime = app_render_runtime.Runtime(Self);
     const SessionAppRuntime = app_session_runtime.Runtime(Self);
+    const SessionNamingAppRuntime = app_session_naming_runtime.Runtime(Self);
     const UpgradeAppRuntime = app_upgrade_runtime.Runtime(Self);
     const WorkerAppRuntime = app_worker_runtime.Runtime(Self);
     const WorkspaceAppRuntime = app_workspace_runtime.Runtime(Self);
@@ -400,8 +407,10 @@ const App = struct {
         return null;
     }
 
-    pub fn promptPolicy(_: *const Self) prompt_policy.Policy {
-        return builtin_context.prompt_policy;
+    pub fn promptPolicy(self: *const Self) prompt_policy.Policy {
+        var policy = builtin_context.prompt_policy;
+        if (self.system_prompt_override) |prompt| policy.system_prompt = prompt;
+        return policy;
     }
 
     pub fn slashRegistry(_: *const Self) command_specs.SlashRegistry {
@@ -423,6 +432,13 @@ const App = struct {
             js_host_url_opener.opener
         else
             host.unavailable_url_opener;
+    }
+
+    pub fn externalEditor(_: *const Self) host.ExternalEditor {
+        return if (comptime host_profile.external_editor)
+            native_external_editor.external_editor
+        else
+            host.unavailable_external_editor;
     }
 
     pub fn creditsProvider(self: *const Self) gateway_provider.CreditsProvider {
@@ -512,6 +528,7 @@ const App = struct {
     lifecycle_runtime: hooks.Runtime = hooks.Runtime.init(std.heap.c_allocator),
     lifecycle_view: hooks.RuntimeView = hooks.RuntimeView.empty(),
     notifications: builtin_hooks.notifications.State = .{},
+    ade_events: builtin_hooks.ade_events.Client = .{},
     herdr: builtin_hooks.Client = .{},
 
     session: SessionRuntime = SessionRuntime.initWithProviders(
@@ -522,8 +539,10 @@ const App = struct {
             .{},
     ),
     session_persistence: app_session_runtime.Persistence = .{},
+    session_naming: session_naming_runtime.Runtime = .{},
     prompt_history: PromptHistoryRuntime = .{},
     requested_resume: ?cli_surface.ResumeTarget = null,
+    system_prompt_override: ?[]u8 = null,
     approval_prompt: ApprovalPrompt = .{},
     approval_screen: ApprovalScreenState = .{},
     question_prompt: QuestionPrompt = .{},
@@ -548,6 +567,7 @@ const App = struct {
     change_tracker: change_tracker_mod.ChangeTracker = .{},
     mcp: app_mcp_runtime.State = .{},
     skills: skill_runtime.Runtime = .{},
+    invocation_skill_roots: [][]u8 = &.{},
     context_snapshot: context_contract.GatheredContextSnapshot = .{},
     file_index: file_index_mod.FileIndex = .{},
     context_enabled: bool = true,
@@ -622,10 +642,13 @@ const App = struct {
             .{
                 .load_mcp_runtime = if (comptime host_target.is_wasm) loadNoMcpRuntime else builtin_mcp.loadRuntime,
                 .skill_root_policy = if (comptime host_target.is_wasm) wasm_skill_root_policy else builtin_skills.root_policy,
+                .invocation_skill_roots = launch.modifiers.invocation_skill_roots,
                 .terminal_title = app.terminalTitle(),
             },
         );
+        app.invocation_skill_roots = launch.modifiers.takeInvocationSkillRoots();
         errdefer app.deinit();
+        app.system_prompt_override = launch.modifiers.takeEffectiveSystemPrompt();
         try WorkspaceAppRuntime.applyLaunch(
             &app,
             launch.modifiers.additional_directories,
@@ -670,10 +693,38 @@ const App = struct {
     }
 
     pub fn configureNotifications(self: *App) !void {
-        // Register herdr hooks before NotificationAppRuntime.configure freezes
-        // the lifecycle runtime (its call to freeze() is the sole freeze site).
+        // Register built-in observers before NotificationAppRuntime.configure
+        // freezes the lifecycle runtime (its call to freeze() is the sole
+        // freeze site).
         try HerdrAppRuntime.configure(self, SessionAppRuntime.activeSessionId(self));
+        try AdeAppRuntime.configure(self, SessionAppRuntime.activeSessionId(self));
+        if (SessionAppRuntime.durableCachedSessionTitle(self)) |title| {
+            AdeAppRuntime.reportSessionMetadataChanged(self, title);
+        }
         try NotificationAppRuntime.configure(self);
+    }
+
+    pub fn configureSessionNaming(
+        self: *App,
+        config: session_naming_runtime.Config,
+    ) void {
+        SessionNamingAppRuntime.configure(self, config);
+    }
+
+    pub fn reportSessionIdentityChanged(self: *App, session_id: ?[]const u8) void {
+        SessionNamingAppRuntime.invalidate(self);
+        AdeAppRuntime.reportSessionChanged(self, session_id);
+        if (SessionAppRuntime.durableCachedSessionTitle(self)) |title| {
+            AdeAppRuntime.reportSessionMetadataChanged(self, title);
+        }
+    }
+
+    pub fn reportSessionMetadataChanged(self: *App, title: []const u8) void {
+        AdeAppRuntime.reportSessionMetadataChanged(self, title);
+    }
+
+    pub fn cancelPendingSessionName(self: *App) void {
+        SessionNamingAppRuntime.invalidate(self);
     }
 
     pub fn rebindAfterInit(self: *App) void {
@@ -744,6 +795,42 @@ const App = struct {
         NotificationAppRuntime.dispatchAttentionRequired(self, turn_id, kind);
     }
 
+    pub fn reportAdeMainAttentionRequired(
+        self: *App,
+        turn_id: u64,
+        kind: hooks.AttentionKind,
+    ) void {
+        AdeAppRuntime.reportAttentionRequired(self, .{
+            .invocation = .{
+                .scope = .{
+                    .kind = .interactive,
+                    .workspace_root = self.workspace_root,
+                    .session_id = SessionAppRuntime.activeSessionId(self),
+                },
+                .turn_id = turn_id,
+            },
+            .kind = kind,
+        });
+    }
+
+    pub fn reportAdeSubagentAttentionRequired(
+        self: *App,
+        child_session_id: []const u8,
+        kind: hooks.AttentionKind,
+    ) void {
+        AdeAppRuntime.reportAttentionRequired(self, .{
+            .invocation = .{
+                .scope = .{
+                    .kind = .subagent,
+                    .workspace_root = self.workspace_root,
+                    .session_id = child_session_id,
+                },
+                .turn_id = null,
+            },
+            .kind = kind,
+        });
+    }
+
     /// Must be called after init() returns so the AutoUpgrade thread
     /// captures a pointer to the final App location (not a temporary).
     pub fn startAutoUpgrade(self: *App) void {
@@ -804,6 +891,7 @@ const App = struct {
         self.stopStream();
 
         self.worker.requestShutdown();
+        SessionNamingAppRuntime.requestStop(self);
         self.background.requestStop();
         self.upgrader.stop();
         self.file_index.requestStop();
@@ -811,6 +899,7 @@ const App = struct {
         self.terminal_takeover.shutdown(App, self);
         self.releaseTerminal();
         if (self.worker_thread) |thread| thread.join();
+        SessionNamingAppRuntime.deinit(self);
         self.terminal_takeover.deinit(self.alloc);
         const direct_deinit_disposition = if (capture_resume_handoff)
             self.terminal_direct.deinitSettled(self.alloc)
@@ -832,6 +921,7 @@ const App = struct {
         self.web_fetch_runtime.deinit(self.alloc);
         self.web_search_runtime.deinit();
         self.subagents.deinit(self.alloc);
+        self.ade_events.deinit();
         self.queued_prompt_review.deinit(self.alloc);
         self.prompt_history.deinit(self.alloc);
         self.clearPendingImages();
@@ -847,6 +937,7 @@ const App = struct {
             target.deinit(self.alloc);
             self.requested_resume = null;
         }
+        if (self.system_prompt_override) |prompt| self.alloc.free(prompt);
         self.session.deinit(self.alloc);
         self.permission_engine.deinit(self.alloc);
         self.approval_prompt.deinit(self.alloc);
@@ -857,6 +948,8 @@ const App = struct {
         self.diff_entries.deinit(std.heap.c_allocator);
         self.mcp.deinit(self.alloc);
         self.skills.deinit(std.heap.c_allocator);
+        for (self.invocation_skill_roots) |path| self.alloc.free(path);
+        if (self.invocation_skill_roots.len > 0) self.alloc.free(self.invocation_skill_roots);
         self.context_snapshot.deinit(self.alloc);
         self.file_index.deinit(std.heap.c_allocator);
         self.lifecycle_runtime.deinit();
@@ -878,37 +971,55 @@ const App = struct {
         );
     }
 
-    pub fn runExternalInteractive(self: *App, argv: []const []const u8) !void {
+    pub fn editComposerWithExternalEditor(self: *App, max_bytes: usize) !bool {
+        return ExternalEditorAppRuntime.editComposer(
+            self,
+            self.externalEditor(),
+            max_bytes,
+        );
+    }
+
+    pub fn runExternalInteractive(
+        self: *App,
+        editor: host.ExternalEditor,
+        seed: []const u8,
+        max_bytes: usize,
+    ) !host.ExternalEditor.EditResult {
         try self.flushBeforeBlockingExternalWork();
 
-        self.terminal.disableRawMode();
-        var raw_restored = false;
-        defer if (!raw_restored) {
-            self.terminal.enableRawMode() catch {};
+        const signal_guard = app_lifecycle.ExternalInteractiveSignalGuard.install();
+        defer signal_guard.deinit();
+        app_lifecycle.suspendForExternalInteractive(
+            &self.terminal,
+            &self.shell,
+            &self.metrics,
+        );
+        var terminal_restored = false;
+        defer if (!terminal_restored) {
+            app_lifecycle.resumeAfterExternalInteractive(
+                &self.terminal,
+                &self.shell,
+                &self.metrics,
+                footer_rows,
+            ) catch |err| {
+                debug_trace.logf(
+                    "input",
+                    "external editor terminal restore failed err={s}",
+                    .{@errorName(err)},
+                );
+            };
         };
 
-        const io = io_mod.getIo();
-        try std.Io.File.stdout().writeStreamingAll(io, "\n");
-        var child = std.process.spawn(io, .{
-            .argv = argv,
-            .stdin = .inherit,
-            .stdout = .inherit,
-            .stderr = .inherit,
-        }) catch return error.ExternalInteractiveFailed;
-        const term = child.wait(io) catch return error.ExternalInteractiveFailed;
-        try std.Io.File.stdout().writeStreamingAll(io, "\n");
-
-        try self.terminal.captureOriginalTermios();
-        try self.terminal.enableRawMode();
-        raw_restored = true;
-        self.shell.layout = self.terminal.queryLayout(footer_rows) catch self.shell.layout;
-        try self.shell.requestTerminalReset(&self.metrics);
-        self.shell.render_requests.request(.first_frame);
-
-        switch (term) {
-            .exited => |code| if (code != 0) return error.ExternalInteractiveFailed,
-            else => return error.ExternalInteractiveFailed,
-        }
+        var result = try editor.edit(self.alloc, seed, max_bytes);
+        errdefer result.deinit(self.alloc);
+        try app_lifecycle.resumeAfterExternalInteractive(
+            &self.terminal,
+            &self.shell,
+            &self.metrics,
+            footer_rows,
+        );
+        terminal_restored = true;
+        return result;
     }
 
     pub fn flushBeforeBlockingExternalWork(self: *App) !void {
@@ -1345,7 +1456,14 @@ const App = struct {
                 review,
             );
 
-        try self.worker.enqueuePrompt(std.heap.c_allocator, .{
+        var naming_admission = SessionNamingAppRuntime.prepareAdmission(self, prompt);
+        defer if (naming_admission) |*prepared| prepared.deinit();
+        var admission_context = PromptAdmissionContext{
+            .app = self,
+            .naming_admission = &naming_admission,
+        };
+
+        try self.worker.enqueuePromptObserved(std.heap.c_allocator, .{
             .turn_id = if (recovery_checkpoint) |checkpoint| checkpoint.turn_id else 0,
             .prompt = prompt_copy,
             .images = images_copy,
@@ -1366,9 +1484,26 @@ const App = struct {
             .context_snapshot = context_snapshot_copy,
             .recovery_checkpoint = recovery_checkpoint_copy,
             .recovery_source_already_presented = recovery_checkpoint != null,
+        }, .{
+            .ctx = &admission_context,
+            .report = reportPromptAdmission,
         });
         HerdrAppRuntime.reportWorking(self);
         return true;
+    }
+
+    const PromptAdmissionContext = struct {
+        app: *App,
+        naming_admission: *?session_naming_runtime.PreparedAdmission,
+    };
+
+    fn reportPromptAdmission(raw: *anyopaque) void {
+        const context: *PromptAdmissionContext = @ptrCast(@alignCast(raw));
+        AdeAppRuntime.reportPromptQueued(context.app);
+        if (context.naming_admission.*) |*prepared| {
+            SessionNamingAppRuntime.admit(context.app, prepared);
+            context.naming_admission.* = null;
+        }
     }
 
     pub fn installInitialMcpRuntime(self: *App, runtime: ?*mcp_runtime_mod.McpRuntime) void {
@@ -1584,7 +1719,12 @@ const App = struct {
     }
 
     pub fn reloadSkills(self: *App) !void {
-        const loaded = try app_runtime_setup.loadSkills(std.heap.c_allocator, self.workspace_root, builtin_skills.root_policy);
+        const loaded = try app_runtime_setup.loadSkills(
+            std.heap.c_allocator,
+            self.workspace_root,
+            self.invocation_skill_roots,
+            builtin_skills.root_policy,
+        );
         skill_runtime.traceDiagnostics("interactive_reload", loaded.diagnostics);
         self.skills.replaceLoaded(std.heap.c_allocator, loaded.dir, loaded.skills, loaded.diagnostics);
     }
@@ -2517,6 +2657,7 @@ const App = struct {
         if (try self.model_cache.pollLoadTransition()) {
             RenderAppRuntime.requestActiveSurfaceFrame(self, .footer);
         }
+        SessionNamingAppRuntime.collectFacts(self);
         try app_commands.Handlers(App).collectMcpAuthenticationFacts(self);
         try app_commands.Handlers(App).collectMcpReloadFacts(self);
         if (comptime host_profile.native_auth or host_profile.js_host_auth) {
@@ -2787,6 +2928,9 @@ pub fn runWasmTerminal(init: std.process.Init) !void {
         },
     };
     defer launch.deinit(alloc);
+    if (launch.modifiers.hasInvocationSkillRoots()) {
+        return error.WasmTerminalInvocationSkillRootsUnsupported;
+    }
     const outcome = try app_entry_runtime.runInteractiveCooperative(App, alloc, &launch);
     switch (outcome) {
         .returned => {},
@@ -3132,6 +3276,7 @@ fn hasPosixArgVector() bool {
 }
 
 fn needsFullEntryConfig(args: []const [:0]const u8) bool {
+    if (cli_surface.systemPromptFilesRequested(args)) return true;
     const command = cli_surface.commandAfterGlobalLaunchArgs(args) orelse return false;
     return std.mem.eql(u8, command, "ask") or
         std.mem.eql(u8, command, "acp") or
@@ -3201,6 +3346,45 @@ test "full entry config commands also use early threaded io" {
         @as([:0]const u8, "--no-additional-dirs"),
         @as([:0]const u8, "acp"),
     }));
+    try std.testing.expect(needsFullEntryConfig(&.{
+        @as([:0]const u8, "--append-system-prompt-file"),
+        @as([:0]const u8, "/tmp/prompt"),
+        @as([:0]const u8, "resume"),
+        @as([:0]const u8, "last"),
+    }));
+}
+
+test "skill roots before prompt files still select the full interactive config" {
+    try std.testing.expect(needsFullEntryConfig(&.{
+        @as([:0]const u8, "--skills-dir"),
+        @as([:0]const u8, "/tmp/team-skills"),
+        @as([:0]const u8, "--append-system-prompt-file"),
+        @as([:0]const u8, "/tmp/prompt"),
+    }));
+    try std.testing.expect(needsFullEntryConfig(&.{
+        @as([:0]const u8, "--skills-dir=/tmp/team-skills"),
+        @as([:0]const u8, "--append-system-prompt-file=/tmp/prompt"),
+        @as([:0]const u8, "resume"),
+        @as([:0]const u8, "last"),
+    }));
+}
+
+test "interactive and resumed launch prompts transfer into the app policy" {
+    const prompt: []u8 = @constCast("INTERACTIVE_FILE_SYSTEM_PROMPT");
+    for ([_]cli_surface.InteractiveLaunch{
+        .{ .modifiers = .{ .effective_system_prompt = prompt } },
+        .{ .requested_resume = .last, .modifiers = .{ .effective_system_prompt = prompt } },
+    }) |launch_value| {
+        var launch = launch_value;
+        var app = App{ .alloc = std.testing.allocator };
+        app.system_prompt_override = launch.modifiers.takeEffectiveSystemPrompt();
+
+        try std.testing.expect(launch.modifiers.effective_system_prompt == null);
+        try std.testing.expectEqualStrings(
+            "INTERACTIVE_FILE_SYSTEM_PROMPT",
+            app.promptPolicy().system_prompt,
+        );
+    }
 }
 
 test "lightweight local commands do not request early threaded io" {
@@ -3784,6 +3968,7 @@ test {
     _ = @import("core/app/app_callbacks.zig");
     _ = @import("core/app/app_commands.zig");
     _ = @import("core/app/app_entry_runtime.zig");
+    _ = @import("core/app/app_external_editor_runtime.zig");
     _ = @import("core/app/app_input_runtime.zig");
     _ = @import("core/app/app_lifecycle.zig");
     _ = @import("core/app/model_cache_runtime.zig");
@@ -3846,6 +4031,7 @@ test {
     _ = @import("core/github/github_publish.zig");
     _ = @import("core/github/github_workflows.zig");
     _ = @import("core/hosts/host.zig");
+    _ = @import("core/hosts/native_external_editor.zig");
     _ = @import("core/hooks/common.zig");
     _ = @import("core/hooks/definitions.zig");
     _ = @import("core/hooks/prompt.zig");
@@ -3874,6 +4060,7 @@ test {
     _ = @import("core/background/process_supervisor.zig");
     _ = @import("core/execution/process_tree.zig");
     _ = @import("core/config/prompt_policy.zig");
+    _ = @import("core/config/system_prompt_files.zig");
     _ = @import("core/workspace/record_tape.zig");
     _ = @import("core/session/session.zig");
     _ = @import("core/session/session_commands.zig");

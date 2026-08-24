@@ -9,6 +9,7 @@ const grok_oauth = @import("../auth/grok_oauth.zig");
 const acp_runner = @import("acp_runner.zig");
 const cli_ask = @import("cli_ask.zig");
 const cli_replay = @import("cli_replay.zig");
+const fxnk_identity = @import("fxnk_identity.zig");
 const command_specs = @import("../slash_commands/command_specs.zig");
 const collections = @import("../shared/collections.zig");
 const config_runtime = @import("../config/config_runtime.zig");
@@ -31,6 +32,7 @@ const provider_catalog = @import("../auth/provider_catalog.zig");
 const secret = @import("../auth/secret.zig");
 const output_contracts = @import("../output/output_contracts.zig");
 const prompt_policy = @import("../config/prompt_policy.zig");
+const system_prompt_files = @import("../config/system_prompt_files.zig");
 const session_store = @import("../session/session_store.zig");
 const usage_report = @import("../session/usage_report.zig");
 const skill_contract = @import("../skills/skill_contract.zig");
@@ -110,17 +112,44 @@ pub const ResumeTarget = union(enum) {
 pub const LaunchModifiers = struct {
     context_limit_overrides: []config_runtime.context_limits.Override = &.{},
     additional_directories: [][]u8 = &.{},
+    invocation_skill_roots: [][]u8 = &.{},
     saved_directories_suppressed: bool = false,
+    prompt_files: system_prompt_files.Request = .{},
+    effective_system_prompt: ?[]u8 = null,
 
     pub fn deinit(self: *LaunchModifiers, alloc: Allocator) void {
         if (self.context_limit_overrides.len > 0) alloc.free(self.context_limit_overrides);
         for (self.additional_directories) |path| alloc.free(path);
         if (self.additional_directories.len > 0) alloc.free(self.additional_directories);
+        for (self.invocation_skill_roots) |path| alloc.free(path);
+        if (self.invocation_skill_roots.len > 0) alloc.free(self.invocation_skill_roots);
+        self.prompt_files.deinit(alloc);
+        if (self.effective_system_prompt) |prompt| alloc.free(prompt);
         self.* = .{};
     }
 
     pub fn hasWorkspaceModifiers(self: LaunchModifiers) bool {
         return self.additional_directories.len > 0 or self.saved_directories_suppressed;
+    }
+
+    pub fn hasPromptFileModifiers(self: LaunchModifiers) bool {
+        return self.prompt_files.requested();
+    }
+
+    pub fn takeEffectiveSystemPrompt(self: *LaunchModifiers) ?[]u8 {
+        const prompt = self.effective_system_prompt;
+        self.effective_system_prompt = null;
+        return prompt;
+    }
+
+    pub fn hasInvocationSkillRoots(self: LaunchModifiers) bool {
+        return self.invocation_skill_roots.len > 0;
+    }
+
+    pub fn takeInvocationSkillRoots(self: *LaunchModifiers) [][]u8 {
+        const roots = self.invocation_skill_roots;
+        self.invocation_skill_roots = &.{};
+        return roots;
     }
 };
 
@@ -146,6 +175,7 @@ pub const RunResult = union(enum) {
 
 pub const record_modifier_usage = "usage: fx --record is only supported for interactive startup\n";
 const version_usage = "usage: fx --version\n";
+const fxnk_version_usage = "usage: fx --fxnk-version\n";
 
 pub fn recordRequested(args: []const [:0]const u8) error{RecordModifierRequiresInteractive}!bool {
     var count: usize = 0;
@@ -301,6 +331,7 @@ const SessionRecoveryOptions = struct {
 
 const AcpOptions = struct {
     model: ?[]const u8 = null,
+    effort: ?types.ReasoningEffort = null,
     log_file: ?[]const u8 = null,
 };
 
@@ -359,6 +390,14 @@ const GlobalLaunchArgs = struct {
     }
 };
 
+/// Duplicates a global path argument and transfers its ownership to `paths`.
+/// If growing the list fails, this helper remains responsible for the duplicate.
+fn dupeAndAppendPath(alloc: Allocator, paths: *std.ArrayList([]u8), value: []const u8) !void {
+    const path = try alloc.dupe(u8, value);
+    errdefer alloc.free(path);
+    try paths.append(alloc, path);
+}
+
 fn parseGlobalLaunchArgs(
     alloc: Allocator,
     args: []const [:0]const u8,
@@ -370,7 +409,19 @@ fn parseGlobalLaunchArgs(
         for (directories.items) |path| alloc.free(path);
         directories.deinit(alloc);
     }
+    var skill_roots: std.ArrayList([]u8) = .empty;
+    errdefer {
+        for (skill_roots.items) |path| alloc.free(path);
+        skill_roots.deinit(alloc);
+    }
     var suppress_saved = false;
+    var replacement_path: ?[]u8 = null;
+    errdefer if (replacement_path) |path| alloc.free(path);
+    var append_paths: std.ArrayList([]u8) = .empty;
+    errdefer {
+        for (append_paths.items) |path| alloc.free(path);
+        append_paths.deinit(alloc);
+    }
 
     var index: usize = 0;
     while (index < args.len) {
@@ -384,14 +435,40 @@ fn parseGlobalLaunchArgs(
         } else if (std.mem.eql(u8, arg, "--add-dir")) {
             index += 1;
             if (index >= args.len or args[index].len == 0) return error.MissingAddDirectoryValue;
-            try directories.append(alloc, try alloc.dupe(u8, args[index]));
+            try dupeAndAppendPath(alloc, &directories, args[index]);
         } else if (std.mem.startsWith(u8, arg, "--add-dir=")) {
             const value = arg["--add-dir=".len..];
             if (value.len == 0) return error.MissingAddDirectoryValue;
-            try directories.append(alloc, try alloc.dupe(u8, value));
+            try dupeAndAppendPath(alloc, &directories, value);
+        } else if (std.mem.eql(u8, arg, "--skills-dir")) {
+            index += 1;
+            if (index >= args.len or args[index].len == 0) return error.MissingSkillsDirectoryValue;
+            try dupeAndAppendPath(alloc, &skill_roots, args[index]);
+        } else if (std.mem.startsWith(u8, arg, "--skills-dir=")) {
+            const value = arg["--skills-dir=".len..];
+            if (value.len == 0) return error.MissingSkillsDirectoryValue;
+            try dupeAndAppendPath(alloc, &skill_roots, value);
         } else if (std.mem.eql(u8, arg, "--no-additional-dirs")) {
             if (suppress_saved) return error.DuplicateAdditionalDirectorySuppression;
             suppress_saved = true;
+        } else if (std.mem.eql(u8, arg, "--system-prompt-file")) {
+            if (replacement_path != null) return error.DuplicateSystemPromptFile;
+            index += 1;
+            if (index >= args.len or args[index].len == 0) return error.MissingSystemPromptFileValue;
+            replacement_path = try alloc.dupe(u8, args[index]);
+        } else if (std.mem.startsWith(u8, arg, "--system-prompt-file=")) {
+            if (replacement_path != null) return error.DuplicateSystemPromptFile;
+            const value = arg["--system-prompt-file=".len..];
+            if (value.len == 0) return error.MissingSystemPromptFileValue;
+            replacement_path = try alloc.dupe(u8, value);
+        } else if (std.mem.eql(u8, arg, "--append-system-prompt-file")) {
+            index += 1;
+            if (index >= args.len or args[index].len == 0) return error.MissingAppendSystemPromptFileValue;
+            try dupeAndAppendPath(alloc, &append_paths, args[index]);
+        } else if (std.mem.startsWith(u8, arg, "--append-system-prompt-file=")) {
+            const value = arg["--append-system-prompt-file=".len..];
+            if (value.len == 0) return error.MissingAppendSystemPromptFileValue;
+            try dupeAndAppendPath(alloc, &append_paths, value);
         } else {
             break;
         }
@@ -401,12 +478,27 @@ fn parseGlobalLaunchArgs(
     const override_slice = try overrides.toOwnedSlice(alloc);
     errdefer if (override_slice.len > 0) alloc.free(override_slice);
     const directory_slice = try directories.toOwnedSlice(alloc);
+    errdefer {
+        for (directory_slice) |path| alloc.free(path);
+        if (directory_slice.len > 0) alloc.free(directory_slice);
+    }
+    const skill_root_slice = try skill_roots.toOwnedSlice(alloc);
+    errdefer {
+        for (skill_root_slice) |path| alloc.free(path);
+        if (skill_root_slice.len > 0) alloc.free(skill_root_slice);
+    }
+    const append_slice = try append_paths.toOwnedSlice(alloc);
     return .{
         .remaining = args[index..],
         .modifiers = .{
             .context_limit_overrides = override_slice,
             .additional_directories = directory_slice,
+            .invocation_skill_roots = skill_root_slice,
             .saved_directories_suppressed = suppress_saved,
+            .prompt_files = .{
+                .replacement_path = replacement_path,
+                .append_paths = append_slice,
+            },
         },
     };
 }
@@ -418,11 +510,17 @@ pub fn commandAfterGlobalLaunchArgs(args: []const [:0]const u8) ?[]const u8 {
     var index: usize = 0;
     while (index < args.len) {
         const arg = args[index];
-        if (std.mem.eql(u8, arg, "--context-limit") or std.mem.eql(u8, arg, "--add-dir")) {
+        if (std.mem.eql(u8, arg, "--context-limit") or std.mem.eql(u8, arg, "--add-dir") or
+            std.mem.eql(u8, arg, "--system-prompt-file") or std.mem.eql(u8, arg, "--append-system-prompt-file") or
+            std.mem.eql(u8, arg, "--skills-dir"))
+        {
             index += 1;
             if (index >= args.len) return null;
         } else if (!std.mem.startsWith(u8, arg, "--context-limit=") and
             !std.mem.startsWith(u8, arg, "--add-dir=") and
+            !std.mem.startsWith(u8, arg, "--system-prompt-file=") and
+            !std.mem.startsWith(u8, arg, "--append-system-prompt-file=") and
+            !std.mem.startsWith(u8, arg, "--skills-dir=") and
             !std.mem.eql(u8, arg, "--no-additional-dirs"))
         {
             return arg;
@@ -430,6 +528,39 @@ pub fn commandAfterGlobalLaunchArgs(args: []const [:0]const u8) ?[]const u8 {
         index += 1;
     }
     return null;
+}
+
+/// Reports whether a system prompt file modifier occurs in the leading global
+/// launch argument segment. Startup uses this before choosing its configuration
+/// so interactive and resume launches compose against the same base prompt the
+/// app will later use.
+pub fn systemPromptFilesRequested(args: []const [:0]const u8) bool {
+    var index: usize = 0;
+    while (index < args.len) {
+        const arg = args[index];
+        if (std.mem.eql(u8, arg, "--system-prompt-file") or
+            std.mem.eql(u8, arg, "--append-system-prompt-file") or
+            std.mem.startsWith(u8, arg, "--system-prompt-file=") or
+            std.mem.startsWith(u8, arg, "--append-system-prompt-file="))
+        {
+            return true;
+        }
+        if (std.mem.eql(u8, arg, "--context-limit") or
+            std.mem.eql(u8, arg, "--add-dir") or
+            std.mem.eql(u8, arg, "--skills-dir"))
+        {
+            index += 1;
+            if (index >= args.len) return false;
+        } else if (!std.mem.startsWith(u8, arg, "--context-limit=") and
+            !std.mem.startsWith(u8, arg, "--add-dir=") and
+            !std.mem.startsWith(u8, arg, "--skills-dir=") and
+            !std.mem.eql(u8, arg, "--no-additional-dirs"))
+        {
+            return false;
+        }
+        index += 1;
+    }
+    return false;
 }
 
 pub fn parse(command_catalog: CommandCatalog, args: []const [:0]const u8) Command {
@@ -798,7 +929,7 @@ fn activateProviderSelection(
 }
 
 fn runIfRequestedWithDeps(alloc: Allocator, args: []const [:0]const u8, cfg: Config, deps: RunDeps) !RunResult {
-    const parsed_launch = parseInteractiveLaunch(alloc, args, cfg.command_catalog) catch |err| {
+    var parsed_launch = parseInteractiveLaunch(alloc, args, cfg.command_catalog) catch |err| {
         if (err == error.RecordModifierRequiresInteractive) {
             try writeStderr(deps, record_modifier_usage);
             return .handled_failure;
@@ -814,13 +945,57 @@ fn runIfRequestedWithDeps(alloc: Allocator, args: []const [:0]const u8, cfg: Con
         } else {
             try writer.writer.print("fx: invalid global launch option: {s}\n", .{@errorName(err)});
         }
-        try writer.writer.writeAll("usage: fx [--context-limit NAME=BYTES|off] [--add-dir PATH]... [--no-additional-dirs] <command>\n");
+        try writer.writer.writeAll("usage: fx [--system-prompt-file PATH] [--append-system-prompt-file PATH]... [--skills-dir PATH]... [--context-limit NAME=BYTES|off] [--add-dir PATH]... [--no-additional-dirs] <command>\n");
         try writeStderr(deps, writer.written());
         return .handled_failure;
     };
+    var parsed_launch_owned = true;
+    errdefer if (parsed_launch_owned) switch (parsed_launch) {
+        .interactive => |*launch| launch.deinit(alloc),
+        .noninteractive => |*launch| launch.deinit(alloc),
+    };
     switch (parsed_launch) {
-        .interactive => |launch| return .{ .interactive = launch },
+        .interactive => |*launch| {
+            if (!try prepareSystemPromptFiles(alloc, &launch.modifiers, cfg.prompt_policy.system_prompt, deps)) {
+                launch.deinit(alloc);
+                return .handled_failure;
+            }
+            if (!try prepareInvocationSkillRoots(alloc, &launch.modifiers, deps)) {
+                launch.deinit(alloc);
+                return .handled_failure;
+            }
+        },
+        .noninteractive => |*launch| {
+            if (launch.global_args.modifiers.hasPromptFileModifiers() and
+                !commandSupportsPromptFileModifiers(launch.command))
+            {
+                try writePromptFileModifierUsage(deps);
+                launch.deinit(alloc);
+                return .handled_failure;
+            }
+            if (launch.global_args.modifiers.hasPromptFileModifiers() and
+                switch (launch.command) {
+                    .ask => |rest| askHasSystemOverride(rest),
+                    else => false,
+                })
+            {
+                try writeAskSystemPromptConflict(deps);
+                launch.deinit(alloc);
+                return .handled_failure;
+            }
+            if (!try prepareSystemPromptFiles(alloc, &launch.global_args.modifiers, cfg.prompt_policy.system_prompt, deps)) {
+                launch.deinit(alloc);
+                return .handled_failure;
+            }
+        },
+    }
+    switch (parsed_launch) {
+        .interactive => |launch| {
+            parsed_launch_owned = false;
+            return .{ .interactive = launch };
+        },
         .noninteractive => |value| {
+            parsed_launch_owned = false;
             var noninteractive = value;
             defer noninteractive.deinit(alloc);
             return runNonInteractiveWithDeps(alloc, &noninteractive, cfg, deps);
@@ -844,6 +1019,15 @@ fn runNonInteractiveWithDeps(
         try writeWorkspaceModifierUsage(deps);
         return .handled_failure;
     }
+    if (global_args.modifiers.hasInvocationSkillRoots() and
+        !commandSupportsInvocationSkillRoots(parsed_command))
+    {
+        try writeInvocationSkillRootUsage(deps);
+        return .handled_failure;
+    }
+    if (!try prepareInvocationSkillRoots(alloc, &global_args.modifiers, deps)) {
+        return .handled_failure;
+    }
 
     if (isVersionFlag(effective_args[0])) {
         if (effective_args.len != 1) {
@@ -852,6 +1036,21 @@ fn runNonInteractiveWithDeps(
         }
         try writeStdout(deps, cfg.version);
         try writeStdout(deps, "\n");
+        return .handled_success;
+    }
+
+    if (isFxnkVersionFlag(effective_args[0])) {
+        if (effective_args.len != 1) {
+            try writeStderr(deps, fxnk_version_usage);
+            return .handled_failure;
+        }
+        const line = try std.fmt.allocPrint(
+            alloc,
+            "fxnk {s} (fx {s})\n",
+            .{ fxnk_identity.version, cfg.version },
+        );
+        defer alloc.free(line);
+        try writeStdout(deps, line);
         return .handled_success;
     }
 
@@ -874,7 +1073,7 @@ fn runNonInteractiveWithDeps(
         },
         .acp => |rest| {
             const acp_opts = parseAcpArgs(rest) catch {
-                try writeStderr(deps, "usage: fx acp [--model <id>] [--log-file <path>]\n");
+                try writeStderr(deps, "usage: fx acp [--model <id>] [--effort <name>] [--log-file <path>]\n");
                 return .handled_failure;
             };
             try cfg.acp_runner.run(alloc, .{
@@ -887,7 +1086,7 @@ fn runNonInteractiveWithDeps(
                 .provider_set = cfg.provider_set,
                 .background_process_provider = cfg.background_process_provider,
                 .secret_store = cfg.secret_store,
-                .prompt_policy = cfg.prompt_policy,
+                .prompt_policy = promptPolicyWithLaunchModifiers(cfg.prompt_policy, global_args.modifiers),
                 .ignored_list_entries = cfg.ignored_list_entries,
                 .max_list_entries = cfg.max_list_entries,
                 .max_read_file_bytes = cfg.max_read_file_bytes,
@@ -900,8 +1099,10 @@ fn runNonInteractiveWithDeps(
                 .mode_registry = cfg.mode_registry,
                 .context_limit_overrides = global_args.modifiers.context_limit_overrides,
                 .additional_directories = global_args.modifiers.additional_directories,
+                .invocation_skill_roots = global_args.modifiers.invocation_skill_roots,
                 .saved_directories_suppressed = global_args.modifiers.saved_directories_suppressed,
                 .model_override = acp_opts.model,
+                .effort_override = acp_opts.effort,
                 .log_file = acp_opts.log_file,
             });
             return .handled_success;
@@ -1182,11 +1383,11 @@ fn runNonInteractiveWithDeps(
                     return .handled_failure;
                 },
             };
-            var ids = loaded.ids;
-            defer collections.freeStringList(alloc, &ids);
+            var catalog = loaded.catalog;
+            defer model_catalog.freeModelCatalog(alloc, &catalog);
 
             const text = try (output_contracts.ModelListSnapshot{
-                .ids = ids.items,
+                .catalog = catalog.items,
                 .provider = startup.provider,
                 .private_models_hidden = loaded.provenance.access.private_models_may_be_hidden,
                 .public_only_reason = loaded.provenance.access.public_only_reason,
@@ -2026,6 +2227,7 @@ fn doctorSnapshotFromRuntime(snapshot: doctor_runtime.Snapshot) output_contracts
     return .{
         .workspace_root = snapshot.workspace_root,
         .model = snapshot.model,
+        .effort = snapshot.effort,
         .provider = snapshot.provider,
         .auth = snapshot.auth,
         .permission_mode = permissionModeForSnapshot(snapshot.permission_mode),
@@ -2990,7 +3192,15 @@ fn workflowConfigWithLaunchModifiers(
     var result = workflowConfig(cfg);
     result.context_limit_overrides = modifiers.context_limit_overrides;
     result.additional_directories = modifiers.additional_directories;
+    result.invocation_skill_roots = modifiers.invocation_skill_roots;
     result.saved_directories_suppressed = modifiers.saved_directories_suppressed;
+    result.prompt_policy = promptPolicyWithLaunchModifiers(result.prompt_policy, modifiers);
+    return result;
+}
+
+fn promptPolicyWithLaunchModifiers(base: prompt_policy.Policy, modifiers: LaunchModifiers) prompt_policy.Policy {
+    var result = base;
+    if (modifiers.effective_system_prompt) |prompt| result.system_prompt = prompt;
     return result;
 }
 
@@ -3001,6 +3211,96 @@ fn commandSupportsWorkspaceModifiers(command: Command) bool {
     };
 }
 
+fn commandSupportsPromptFileModifiers(command: Command) bool {
+    return switch (command) {
+        .interactive, .ask, .acp, .pr, .issue, .resume_session => true,
+        else => false,
+    };
+}
+
+fn commandSupportsInvocationSkillRoots(command: Command) bool {
+    return switch (command) {
+        .interactive, .ask, .acp, .pr, .issue, .resume_session => true,
+        else => false,
+    };
+}
+
+fn askHasSystemOverride(args: []const [:0]const u8) bool {
+    for (args) |arg| {
+        if (std.mem.eql(u8, arg, "--")) return false;
+        if (std.mem.eql(u8, arg, "--system")) return true;
+    }
+    return false;
+}
+
+fn prepareSystemPromptFiles(alloc: Allocator, modifiers: *LaunchModifiers, base: []const u8, deps: RunDeps) !bool {
+    if (!modifiers.hasPromptFileModifiers()) return true;
+    const result = try modifiers.prompt_files.compose(alloc, base);
+    switch (result) {
+        .prompt => |prompt| {
+            modifiers.effective_system_prompt = prompt;
+            return true;
+        },
+        .failure => |failure| {
+            var message: std.Io.Writer.Allocating = .init(alloc);
+            defer message.deinit();
+            try message.writer.print("fx: could not use system prompt file {s}: {s}\n", .{ failure.path, switch (failure.reason) {
+                .unreadable => "file is missing or unreadable",
+                .not_regular_file => "path is not a regular file",
+                .too_large => "custom system prompt files exceed the 256 KiB combined limit",
+                .invalid_text => "content must be valid UTF-8 and contain no NUL bytes",
+            } });
+            try writeStderr(deps, message.written());
+            return false;
+        },
+    }
+}
+
+fn writePromptFileModifierUsage(deps: RunDeps) !void {
+    try writeStderr(deps, "fx: system prompt file options are only supported for interactive, resume, ask, ACP, PR, and issue launches\n");
+}
+
+fn writeAskSystemPromptConflict(deps: RunDeps) !void {
+    try writeStderr(deps, "fx ask: --system cannot be combined with --system-prompt-file or --append-system-prompt-file\n");
+}
+
+fn prepareInvocationSkillRoots(
+    alloc: Allocator,
+    modifiers: *LaunchModifiers,
+    deps: RunDeps,
+) !bool {
+    for (modifiers.invocation_skill_roots, 0..) |path, index| {
+        const canonical_path = io_mod.realpathAlloc(alloc, path) catch |err| {
+            if (err == error.OutOfMemory) return error.OutOfMemory;
+            const message = try std.fmt.allocPrint(
+                alloc,
+                "fx: could not use skills directory {s}: directory is missing or unreadable\n",
+                .{path},
+            );
+            defer alloc.free(message);
+            try writeStderr(deps, message);
+            return false;
+        };
+        var dir = io_mod.openDirAbsoluteNoFollow(canonical_path, .{}) catch |err| {
+            defer alloc.free(canonical_path);
+            if (err == error.OutOfMemory) return error.OutOfMemory;
+            const message = try std.fmt.allocPrint(
+                alloc,
+                "fx: could not use skills directory {s}: path is not a readable directory\n",
+                .{path},
+            );
+            defer alloc.free(message);
+            try writeStderr(deps, message);
+            return false;
+        };
+        dir.close(io_mod.getIo());
+
+        alloc.free(path);
+        modifiers.invocation_skill_roots[index] = canonical_path;
+    }
+    return true;
+}
+
 fn writeWorkspaceModifierUsage(deps: RunDeps) !void {
     try writeStderr(
         deps,
@@ -3008,10 +3308,21 @@ fn writeWorkspaceModifierUsage(deps: RunDeps) !void {
     );
 }
 
+fn writeInvocationSkillRootUsage(deps: RunDeps) !void {
+    try writeStderr(
+        deps,
+        "fx: --skills-dir is only supported for interactive, resume, ask, ACP, PR, and issue launches\n",
+    );
+}
+
 fn globalLaunchErrorMessage(err: anyerror) ?[]const u8 {
     return switch (err) {
         error.MissingAddDirectoryValue => "--add-dir requires a directory path",
+        error.MissingSkillsDirectoryValue => "--skills-dir requires a directory path",
         error.DuplicateAdditionalDirectorySuppression => "--no-additional-dirs may only be specified once",
+        error.MissingSystemPromptFileValue => "--system-prompt-file requires a file path",
+        error.DuplicateSystemPromptFile => "--system-prompt-file may only be specified once",
+        error.MissingAppendSystemPromptFileValue => "--append-system-prompt-file requires a file path",
         else => null,
     };
 }
@@ -3024,6 +3335,10 @@ fn parseAcpArgs(args: []const [:0]const u8) !AcpOptions {
             if (opts.model != null or i + 1 >= args.len) return error.InvalidAcpArgs;
             i += 1;
             opts.model = args[i];
+        } else if (std.mem.eql(u8, args[i], "--effort")) {
+            if (opts.effort != null or i + 1 >= args.len) return error.InvalidAcpArgs;
+            i += 1;
+            opts.effort = types.ReasoningEffort.parse(args[i]) orelse return error.InvalidAcpArgs;
         } else if (std.mem.eql(u8, args[i], "--log-file")) {
             if (opts.log_file != null or i + 1 >= args.len) return error.InvalidAcpArgs;
             i += 1;
@@ -3435,6 +3750,10 @@ fn isVersionFlag(arg: []const u8) bool {
     return std.mem.eql(u8, arg, "--version") or std.mem.eql(u8, arg, "-v");
 }
 
+fn isFxnkVersionFlag(arg: []const u8) bool {
+    return std.mem.eql(u8, arg, "--fxnk-version");
+}
+
 fn testCommandCatalog() CommandCatalog {
     const builtin_commands = @import("../../builtins/commands.zig");
     return builtin_commands.top_level_registry;
@@ -3629,18 +3948,298 @@ test "additional directory flags fail closed when malformed" {
     );
 }
 
+test "global system prompt file modifiers preserve replacement and append order" {
+    var parsed = try parseGlobalLaunchArgs(std.testing.allocator, &.{
+        @constCast("--append-system-prompt-file"),
+        @constCast("first.md"),
+        @constCast("--system-prompt-file=base.md"),
+        @constCast("--append-system-prompt-file=second.md"),
+        @constCast("acp"),
+    });
+    defer parsed.deinit(std.testing.allocator);
+
+    try std.testing.expectEqualStrings("base.md", parsed.modifiers.prompt_files.replacement_path.?);
+    try std.testing.expectEqual(@as(usize, 2), parsed.modifiers.prompt_files.append_paths.len);
+    try std.testing.expectEqualStrings("first.md", parsed.modifiers.prompt_files.append_paths[0]);
+    try std.testing.expectEqualStrings("second.md", parsed.modifiers.prompt_files.append_paths[1]);
+    try std.testing.expectEqualStrings("acp", parsed.remaining[0]);
+}
+
+test "global system prompt file modifiers reject missing and duplicate replacement values" {
+    try std.testing.expectError(
+        error.MissingSystemPromptFileValue,
+        parseGlobalLaunchArgs(std.testing.allocator, &.{@constCast("--system-prompt-file")}),
+    );
+    try std.testing.expectError(
+        error.MissingAppendSystemPromptFileValue,
+        parseGlobalLaunchArgs(std.testing.allocator, &.{@constCast("--append-system-prompt-file=")}),
+    );
+    try std.testing.expectError(
+        error.DuplicateSystemPromptFile,
+        parseGlobalLaunchArgs(std.testing.allocator, &.{
+            @constCast("--system-prompt-file=one"),
+            @constCast("--system-prompt-file=two"),
+        }),
+    );
+}
+
+test "global launch parsing releases every owned value across allocation failures" {
+    const backing = std.testing.allocator;
+    const args = [_][:0]const u8{
+        "--add-dir",
+        "/tmp/first",
+        "--add-dir",
+        "/tmp/second",
+        "--skills-dir",
+        "/tmp/skills",
+        "--system-prompt-file",
+        "/tmp/base-prompt",
+        "--append-system-prompt-file",
+        "/tmp/prompt",
+        "ask",
+    };
+
+    var probe = std.testing.FailingAllocator.init(backing, .{});
+    var parsed = try parseGlobalLaunchArgs(probe.allocator(), &args);
+    parsed.deinit(probe.allocator());
+    try std.testing.expectEqual(probe.allocated_bytes, probe.freed_bytes);
+
+    for (0..probe.alloc_index) |fail_index| {
+        var failing = std.testing.FailingAllocator.init(backing, .{ .fail_index = fail_index });
+        if (parseGlobalLaunchArgs(failing.allocator(), &args)) |value| {
+            var owned = value;
+            owned.deinit(failing.allocator());
+        } else |err| switch (err) {
+            error.OutOfMemory => {},
+            else => return err,
+        }
+        try std.testing.expect(failing.has_induced_failure);
+        try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+    }
+}
+
+test "launch dispatch releases a composed prompt when skill root canonicalization allocation fails" {
+    const backing = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var prompt_file = try tmp.dir.createFile(std.testing.io, "prompt", .{});
+    defer prompt_file.close(std.testing.io);
+    try prompt_file.writeStreamingAll(std.testing.io, "APPENDED_PROMPT");
+    const root_path = try io_mod.dirRealpathAlloc(backing, tmp.dir, ".");
+    defer backing.free(root_path);
+    const root_path_z = try backing.dupeZ(u8, root_path);
+    defer backing.free(root_path_z);
+    const prompt_path = try io_mod.dirRealpathAlloc(backing, tmp.dir, "prompt");
+    defer backing.free(prompt_path);
+    const prompt_path_z = try backing.dupeZ(u8, prompt_path);
+    defer backing.free(prompt_path_z);
+    const args = [_][:0]const u8{
+        "--append-system-prompt-file",
+        prompt_path_z,
+        "--skills-dir",
+        root_path_z,
+    };
+    var capture = CaptureOutput.init(backing);
+    defer capture.deinit();
+
+    var probe = std.testing.FailingAllocator.init(backing, .{});
+    var probe_result = try runIfRequestedWithDeps(probe.allocator(), &args, testConfig(), capture.deps());
+    switch (probe_result) {
+        .interactive => |*launch| launch.deinit(probe.allocator()),
+        else => return error.TestExpectedInteractiveLaunch,
+    }
+    try std.testing.expectEqual(probe.allocated_bytes, probe.freed_bytes);
+
+    try std.testing.expect(probe.alloc_index > 0);
+    var failing = std.testing.FailingAllocator.init(backing, .{ .fail_index = probe.alloc_index - 1 });
+    try std.testing.expectError(
+        error.OutOfMemory,
+        runIfRequestedWithDeps(failing.allocator(), &args, testConfig(), capture.deps()),
+    );
+    try std.testing.expect(failing.has_induced_failure);
+    try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+}
+
+test "ask inline system prompt detection stops at the prompt separator" {
+    try std.testing.expect(askHasSystemOverride(&.{ @constCast("--system"), @constCast("inline"), @constCast("prompt") }));
+    try std.testing.expect(!askHasSystemOverride(&.{ @constCast("--"), @constCast("--system"), @constCast("is prompt text") }));
+}
+
+test "system prompt files are prepared for interactive and resumed launches" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var file = try tmp.dir.createFile(std.testing.io, "prompt", .{});
+    defer file.close(std.testing.io);
+    try file.writeStreamingAll(std.testing.io, "file system prompt");
+    const path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "prompt");
+    defer alloc.free(path);
+    const path_z = try alloc.dupeZ(u8, path);
+    defer alloc.free(path_z);
+
+    var interactive = try runIfRequestedWithDeps(
+        alloc,
+        &.{ @constCast("--system-prompt-file"), path_z },
+        testConfig(),
+        .{},
+    );
+    switch (interactive) {
+        .interactive => |*launch| {
+            defer launch.deinit(alloc);
+            try std.testing.expectEqualStrings("file system prompt", launch.modifiers.effective_system_prompt.?);
+        },
+        else => return error.TestExpectedInteractiveLaunch,
+    }
+
+    var resumed = try runIfRequestedWithDeps(
+        alloc,
+        &.{ @constCast("--system-prompt-file"), path_z, @constCast("resume"), @constCast("last") },
+        testConfig(),
+        .{},
+    );
+    switch (resumed) {
+        .interactive => |*launch| {
+            defer launch.deinit(alloc);
+            try std.testing.expect(launch.requested_resume != null);
+            try std.testing.expectEqualStrings("file system prompt", launch.modifiers.effective_system_prompt.?);
+        },
+        else => return error.TestExpectedInteractiveLaunch,
+    }
+}
+
+test "workflow launch config preserves the effective prompt for PR and issue" {
+    const modifiers = LaunchModifiers{ .effective_system_prompt = @constCast("WORKFLOW_FILE_SYSTEM_PROMPT") };
+    for ([_]Command{ .{ .pr = &.{} }, .{ .issue = &.{} } }) |command| {
+        try std.testing.expect(commandSupportsPromptFileModifiers(command));
+        const workflow_cfg = workflowConfigWithLaunchModifiers(testConfig(), modifiers);
+        try std.testing.expectEqualStrings(
+            "WORKFLOW_FILE_SYSTEM_PROMPT",
+            workflow_cfg.prompt_policy.system_prompt,
+        );
+    }
+}
+
+test "ask system prompt conflict is fatal before file access" {
+    var capture = CaptureOutput.init(std.testing.allocator);
+    defer capture.deinit();
+    const result = try runIfRequestedWithDeps(
+        std.testing.allocator,
+        &.{
+            @constCast("--system-prompt-file"),
+            @constCast("does-not-exist"),
+            @constCast("ask"),
+            @constCast("--system"),
+            @constCast("inline"),
+            @constCast("prompt"),
+        },
+        testConfig(),
+        capture.deps(),
+    );
+    try std.testing.expectEqual(RunResult.handled_failure, result);
+    try std.testing.expectEqualStrings("", capture.stdout.written());
+    try std.testing.expectEqualStrings(
+        "fx ask: --system cannot be combined with --system-prompt-file or --append-system-prompt-file\n",
+        capture.stderr.written(),
+    );
+}
+
+test "global launch modifiers own ordered invocation skill roots" {
+    var parsed = try parseGlobalLaunchArgs(std.testing.allocator, &.{
+        @constCast("--skills-dir"),
+        @constCast("./team skills"),
+        @constCast("--skills-dir=/opt/shared-skills"),
+        @constCast("ask"),
+        @constCast("inspect"),
+    });
+    defer parsed.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 2), parsed.modifiers.invocation_skill_roots.len);
+    try std.testing.expectEqualStrings("./team skills", parsed.modifiers.invocation_skill_roots[0]);
+    try std.testing.expectEqualStrings("/opt/shared-skills", parsed.modifiers.invocation_skill_roots[1]);
+    try std.testing.expectEqualStrings("ask", parsed.remaining[0]);
+}
+
+test "invocation skill root flags fail closed when malformed" {
+    try std.testing.expectError(
+        error.MissingSkillsDirectoryValue,
+        parseGlobalLaunchArgs(std.testing.allocator, &.{@constCast("--skills-dir")}),
+    );
+    try std.testing.expectError(
+        error.MissingSkillsDirectoryValue,
+        parseGlobalLaunchArgs(std.testing.allocator, &.{@constCast("--skills-dir=")}),
+    );
+}
+
+test "invocation skill root canonicalization preserves allocator failure" {
+    const alloc = std.testing.allocator;
+    const roots = try alloc.alloc([]u8, 1);
+    roots[0] = try alloc.dupe(u8, "/tmp");
+    var modifiers = LaunchModifiers{ .invocation_skill_roots = roots };
+    defer modifiers.deinit(alloc);
+
+    var failing = std.testing.FailingAllocator.init(alloc, .{ .fail_index = 0 });
+    try std.testing.expectError(
+        error.OutOfMemory,
+        prepareInvocationSkillRoots(failing.allocator(), &modifiers, .{}),
+    );
+}
+
+test "invocation skill root command support is limited to launch surfaces" {
+    for ([_]Command{
+        .interactive,
+        .{ .ask = &.{} },
+        .{ .acp = &.{} },
+        .{ .pr = &.{} },
+        .{ .issue = &.{} },
+    }) |command| {
+        try std.testing.expect(commandSupportsInvocationSkillRoots(command));
+    }
+    try std.testing.expect(commandSupportsInvocationSkillRoots(.{ .resume_session = .{
+        .args = &.{},
+        .top_level_alias = false,
+    } }));
+    for ([_]Command{
+        .help,
+        .{ .models = &.{} },
+        .{ .status = &.{} },
+        .{ .doctor = &.{} },
+        .{ .upgrade = &.{} },
+    }) |command| {
+        try std.testing.expect(!commandSupportsInvocationSkillRoots(command));
+    }
+}
+
+test "workflow launch config preserves ordered invocation skill roots" {
+    var roots = [_][]u8{
+        @constCast("/tmp/team-skills"),
+        @constCast("/opt/shared-skills"),
+    };
+    const workflow_cfg = workflowConfigWithLaunchModifiers(testConfig(), .{
+        .invocation_skill_roots = &roots,
+    });
+
+    try std.testing.expectEqual(@as(usize, 2), workflow_cfg.invocation_skill_roots.len);
+    try std.testing.expectEqualStrings("/tmp/team-skills", workflow_cfg.invocation_skill_roots[0]);
+    try std.testing.expectEqualStrings("/opt/shared-skills", workflow_cfg.invocation_skill_roots[1]);
+}
+
 test "parse acp args extracts known flags and rejects invalid arguments" {
     const opts = try parseAcpArgs(&.{
         @constCast("--model"),
         @constCast("openai/gpt-4o"),
+        @constCast("--effort"),
+        @constCast("high"),
         @constCast("--log-file"),
         @constCast("/tmp/fx.log"),
     });
     try std.testing.expectEqualStrings("openai/gpt-4o", opts.model.?);
+    try std.testing.expect(opts.effort.?.eql(types.ReasoningEffort.literal("high")));
     try std.testing.expectEqualStrings("/tmp/fx.log", opts.log_file.?);
 
     try std.testing.expectError(error.InvalidAcpArgs, parseAcpArgs(&.{@constCast("--unknown")}));
     try std.testing.expectError(error.InvalidAcpArgs, parseAcpArgs(&.{@constCast("--model")}));
+    try std.testing.expectError(error.InvalidAcpArgs, parseAcpArgs(&.{@constCast("--effort")}));
+    try std.testing.expectError(error.InvalidAcpArgs, parseAcpArgs(&.{ @constCast("--effort"), @constCast("not valid") }));
     try std.testing.expectError(error.InvalidAcpArgs, parseAcpArgs(&.{@constCast("--log-file")}));
     try std.testing.expectError(
         error.InvalidAcpArgs,
@@ -3651,6 +4250,7 @@ test "parse acp args extracts known flags and rejects invalid arguments" {
 test "ACP command routes parsed options and launch config through the injected runner" {
     const Capture = struct {
         expected: Config,
+        expected_invocation_root: []const u8,
         calls: usize = 0,
         config_matches: bool = false,
         launch_matches: bool = false,
@@ -3697,19 +4297,44 @@ test "ACP command routes parsed options and launch config through the injected r
                 limit_matches and
                 cfg.additional_directories.len == 1 and
                 std.mem.eql(u8, cfg.additional_directories[0], "/tmp/acp-extra") and
+                cfg.invocation_skill_roots.len == 1 and
+                std.mem.eql(u8, cfg.invocation_skill_roots[0], self.expected_invocation_root) and
                 cfg.saved_directories_suppressed and
                 std.mem.eql(u8, cfg.model_override.?, "model-override") and
+                cfg.effort_override.?.eql(types.ReasoningEffort.literal("high")) and
                 std.mem.eql(u8, cfg.log_file.?, "/tmp/acp.log");
         }
     };
 
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var prompt_file = try tmp.dir.createFile(std.testing.io, "acp-system-prompt", .{});
+    defer prompt_file.close(std.testing.io);
+    try prompt_file.writeStreamingAll(std.testing.io, "ACP_FILE_SYSTEM_PROMPT");
+    const prompt_path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "acp-system-prompt");
+    defer alloc.free(prompt_path);
+    const prompt_path_z = try alloc.dupeZ(u8, prompt_path);
+    defer alloc.free(prompt_path_z);
+
+    const invocation_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(invocation_root);
+    const invocation_root_z = try alloc.dupeZ(u8, invocation_root);
+    defer alloc.free(invocation_root_z);
+
     var cfg = testConfig();
     cfg.provider_set.gateway.permission_reviewer = test_builtin_gateway.permission_reviewer.provider;
-    var capture = Capture{ .expected = cfg };
+    var expected = cfg;
+    expected.prompt_policy.system_prompt = "ACP_FILE_SYSTEM_PROMPT";
+    var capture = Capture{ .expected = expected, .expected_invocation_root = invocation_root };
     cfg.acp_runner = .{ .context = &capture, .run_fn = Capture.run };
     const result = try runIfRequestedWithDeps(
-        std.testing.allocator,
+        alloc,
         &.{
+            @constCast("--system-prompt-file"),
+            prompt_path_z,
+            @constCast("--skills-dir"),
+            invocation_root_z,
             @constCast("--context-limit"),
             @constCast("project_instructions_total_bytes=1234"),
             @constCast("--add-dir"),
@@ -3718,6 +4343,8 @@ test "ACP command routes parsed options and launch config through the injected r
             @constCast("acp"),
             @constCast("--model"),
             @constCast("model-override"),
+            @constCast("--effort"),
+            @constCast("high"),
             @constCast("--log-file"),
             @constCast("/tmp/acp.log"),
         },
@@ -4851,7 +5478,7 @@ test "runIfRequested models passes startup team to fetch seam" {
     try std.testing.expectEqual(RunResult.handled_success, result);
     try std.testing.expect(probe.called);
     try std.testing.expectEqualStrings(
-        "{\"kind\":\"models\",\"count\":1,\"shown_count\":1,\"more_count\":0,\"private_models_hidden\":false,\"ids\":[\"private/blue-hornbill\"]}\n",
+        "{\"kind\":\"models\",\"count\":1,\"shown_count\":1,\"more_count\":0,\"private_models_hidden\":false,\"ids\":[\"private/blue-hornbill\"],\"models\":[{\"id\":\"private/blue-hornbill\",\"source\":\"Vercel AI Gateway\",\"reasoning_efforts\":[\"low\",\"high\"]}]}\n",
         capture.stdout.written(),
     );
 }
@@ -5039,6 +5666,7 @@ test "writeRenderedJsonLine renders doctor json through output contract" {
     const snapshot = doctor_runtime.Snapshot{
         .workspace_root = @constCast("/tmp/fx"),
         .model = "test-model",
+        .effort = types.ReasoningEffort.literal("low"),
         .auth = .{ .active_source = .ai_gateway_api_key },
         .permission_mode = .auto,
         .agent_step_limit = 42,
@@ -5054,7 +5682,7 @@ test "writeRenderedJsonLine renders doctor json through output contract" {
     );
 
     try std.testing.expectEqualStrings(
-        "{\"kind\":\"doctor\",\"ok_count\":1,\"warn_count\":1,\"fail_count\":0,\"workspace\":\"/tmp/fx\",\"model\":\"test-model\",\"auth\":\"AI_GATEWAY_API_KEY\",\"auth_refreshable\":false,\"permission_mode\":\"auto\",\"agent_step_limit\":42,\"checks\":[{\"name\":\"auth\",\"status\":\"ok\",\"detail\":\"AI_GATEWAY_API_KEY is configured\"},{\"name\":\"gh\",\"status\":\"warn\",\"detail\":\"GitHub CLI not found in PATH\"}]}\n",
+        "{\"kind\":\"doctor\",\"ok_count\":1,\"warn_count\":1,\"fail_count\":0,\"workspace\":\"/tmp/fx\",\"model\":\"test-model\",\"effort\":\"low\",\"auth\":\"AI_GATEWAY_API_KEY\",\"auth_refreshable\":false,\"permission_mode\":\"auto\",\"agent_step_limit\":42,\"checks\":[{\"name\":\"auth\",\"status\":\"ok\",\"detail\":\"AI_GATEWAY_API_KEY is configured\"},{\"name\":\"gh\",\"status\":\"warn\",\"detail\":\"GitHub CLI not found in PATH\"}]}\n",
         capture.stdout.written(),
     );
 }
@@ -5363,16 +5991,35 @@ const ModelFetchProbe = struct {
             .success => {},
         }
 
-        var ids: std.ArrayList([]u8) = .empty;
+        var catalog: std.ArrayList(model_catalog.ModelCatalogEntry) = .empty;
         const id = alloc.dupe(u8, "private/blue-hornbill") catch {
             return failure(input, .resource_exhausted);
         };
-        ids.append(alloc, id) catch {
+        const model_type = alloc.dupe(u8, "language") catch {
+            alloc.free(id);
+            return failure(input, .resource_exhausted);
+        };
+        var reasoning_efforts: std.ArrayList(types.ReasoningEffort) = .empty;
+        reasoning_efforts.appendSlice(alloc, &.{
+            types.ReasoningEffort.literal("low"),
+            types.ReasoningEffort.literal("high"),
+        }) catch {
+            alloc.free(model_type);
+            alloc.free(id);
+            return failure(input, .resource_exhausted);
+        };
+        catalog.append(alloc, .{
+            .id = id,
+            .model_type = model_type,
+            .reasoning_efforts = reasoning_efforts,
+        }) catch {
+            reasoning_efforts.deinit(alloc);
+            alloc.free(model_type);
             alloc.free(id);
             return failure(input, .resource_exhausted);
         };
         return .{ .loaded = .{
-            .ids = ids,
+            .catalog = catalog,
             .provenance = .{ .access = .init(input.access) },
         } };
     }

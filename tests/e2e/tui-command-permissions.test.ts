@@ -2570,7 +2570,8 @@ describe("effect-aware command permissions", () => {
         (value) => value.includes(`Safety caution ${command}`),
         TIMEOUT,
       );
-      expect(resumedPane).toContain("1 denied");
+      expect(resumedPane).toContain("1 failed");
+      expect(resumedPane).toContain("Action held after safety review");
       expect(resumedPane).not.toContain("└ terminal");
       expect(resumedPane).not.toContain("tool_permission_denied");
       expect(gateway.requests).toHaveLength(2);
