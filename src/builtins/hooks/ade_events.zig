@@ -309,7 +309,7 @@ pub const Client = struct {
         self.reportGitRootDiscovered(discovery);
     }
 
-    fn reportGitRootDiscovered(self: *Client, discovery: ade_git_roots.Discovery) void {
+    pub fn reportGitRootDiscovered(self: *Client, discovery: ade_git_roots.Discovery) void {
         if (!self.enabled) return;
         const role = roleForScope(discovery.scope.kind) orelse return;
         const io = io_mod.getIo();

@@ -796,12 +796,24 @@ fn reportEditedPathObservation(
         observation.completion_proof,
     )) return;
     const observer = ctx.edited_path_observer orelse return;
-    observer.report(.{
+    observer.report(editedPathObservation(
+        ctx,
+        observation.source,
+        observation.slice(),
+    ));
+}
+
+pub fn editedPathObservation(
+    ctx: Context,
+    source: EditedPathSource,
+    paths: []const []const u8,
+) EditedPathObservation {
+    return .{
         .scope = ctx.lifecycle_scope,
         .parent_session_id = ctx.lifecycle_parent_session_id,
-        .source = observation.source,
-        .paths = observation.slice(),
-    });
+        .source = source,
+        .paths = paths,
+    };
 }
 
 fn shouldReportEditedPathObservation(
