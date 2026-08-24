@@ -213,11 +213,12 @@ describe.skipIf(!tmuxAvailable())("ADE event feed", () => {
         }
         if (latest.includes(childPrompt)) {
           return fakeGatewayToolCall("ade_child_terminal_1", "terminal", {
-            action: "exec",
+            action: "start",
             command: "touch ADE_CHILD_EDITED",
             cwd: secondWorkspace,
             profile: "clean",
-            timeout_ms: 600_000,
+            return_when: { kind: "exit" },
+            wait_ceiling_ms: 10_000,
           });
         }
         if (latest.includes("ADE_QUESTION_REQUEST")) {
@@ -335,7 +336,7 @@ describe.skipIf(!tmuxAvailable())("ADE event feed", () => {
         (pane) =>
           pane.includes("Subagent: ade-child") &&
           pane.includes("status: approval") &&
-          pane.includes("touch ADE_CHILD_EDITED") &&
+          pane.includes("terminal start") &&
           pane.includes("❯ 1. Yes"),
         TIMEOUT,
       );

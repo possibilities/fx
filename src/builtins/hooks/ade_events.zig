@@ -324,7 +324,10 @@ pub const Client = struct {
             .agent_role = role,
             .workspace_root = discovery.scope.workspace_root,
             .session_id = discovery.scope.session_id,
-            .parent_session_id = if (role == .subagent) self.main_session_id else null,
+            .parent_session_id = if (role == .subagent)
+                discovery.parent_session_id
+            else
+                null,
             .subagent_id = discovery.scope.subagent_id,
             .agent_state = snapshot.agent_state,
             .attention_kind = snapshot.attention_kind,
@@ -1113,6 +1116,49 @@ test "ADE session changes publish eagerly before child lifecycle context" {
     }
 }
 
+test "ADE Git root discovery preserves the parent captured with subagent work" {
+    const alloc = std.testing.allocator;
+    var client = Client{
+        .enabled = true,
+        .alloc = alloc,
+        .socket_path = try alloc.dupe(u8, "/tmp/unused-ade.sock"),
+        .instance_id = try alloc.dupe(u8, "instance-4"),
+        .workspace_root = try alloc.dupe(u8, "/tmp/workspace"),
+        .main_session_id = try alloc.dupe(u8, "main-session-b"),
+    };
+    defer client.deinit();
+
+    client.reportGitRootDiscovered(.{
+        .root = "/tmp/workspace/child-repository",
+        .revision = 2,
+        .reason = .subagent_file_mutation,
+        .scope = .{
+            .kind = .subagent,
+            .workspace_root = "/tmp/workspace",
+            .session_id = "child-session-a",
+            .subagent_id = 7,
+        },
+        .parent_session_id = "main-session-a",
+    });
+
+    try std.testing.expectEqual(@as(usize, 1), client.queue_len);
+    var parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        alloc,
+        client.queue[0].?.bytes,
+        .{},
+    );
+    defer parsed.deinit();
+    const context = parsed.value.object.get("context").?.object;
+    try std.testing.expectEqualStrings(
+        "main-session-a",
+        context.get("parent_session_id").?.string,
+    );
+    try std.testing.expectEqualStrings(
+        "child-session-a",
+        context.get("session_id").?.string,
+    );
+}
 fn testUnixSocketPath(alloc: std.mem.Allocator, dir: std.Io.Dir) ![]u8 {
     const root = try io_mod.dirRealpathAlloc(alloc, dir, ".");
     defer alloc.free(root);

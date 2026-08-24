@@ -1078,7 +1078,8 @@ pub fn Runtime(comptime App: type) type {
             ) catch return error.OutOfMemory;
             defer explicit_skills.deinit(alloc);
             const prompt_policy = app.promptPolicy();
-            const tool_context = childToolContext(app.subagentToolContextForAdmission(admission));
+            var tool_context = childToolContext(app.subagentToolContextForAdmission(admission));
+            tool_context.lifecycle_parent_session_id = admission.parent_id;
             const providers = if (comptime @hasDecl(App, "providerSet"))
                 app.providerSet()
             else
