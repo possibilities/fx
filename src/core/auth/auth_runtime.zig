@@ -2,6 +2,8 @@ const std = @import("std");
 const api_key_validator = @import("api_key_validator.zig");
 const credentials = @import("credentials.zig");
 const chatgpt_oauth = @import("chatgpt_oauth.zig");
+const chatgpt_session = @import("chatgpt_session.zig");
+const js_host_auth = @import("js_host_auth.zig");
 const grok_oauth = @import("grok_oauth.zig");
 const host = @import("../hosts/host.zig");
 const host_target = @import("../hosts/target.zig");
@@ -44,6 +46,81 @@ const max_team_query_bytes: usize = 256;
 
 fn sourceLabelOrMissing(source: ?credentials.Source) []const u8 {
     return credentials.sourceLabel(source orelse return "missing");
+}
+
+test "pinned ChatGPT account rejects a swapped host session before refresh side effects" {
+    const Fixture = struct {
+        load_calls: usize = 0,
+        commit_calls: usize = 0,
+        oauth_calls: usize = 0,
+
+        const session_bytes =
+            "{\"version\":1,\"access_token\":\"access-b\",\"refresh_token\":\"refresh-b\"," ++
+            "\"expires_at_ms\":0,\"account_id\":\"account-b\"}\n";
+
+        fn load(raw: ?*anyopaque, alloc: Allocator) !?js_host_auth.StoredSession {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.load_calls += 1;
+            const bytes = try alloc.dupe(u8, session_bytes);
+            errdefer alloc.free(bytes);
+            return .{
+                .bytes = bytes,
+                .revision = try alloc.dupe(u8, "revision-b"),
+            };
+        }
+
+        fn commit(
+            raw: ?*anyopaque,
+            alloc: Allocator,
+            _: []const u8,
+            _: ?[]const u8,
+        ) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.commit_calls += 1;
+            return alloc.dupe(u8, "unexpected-revision");
+        }
+
+        fn remove(_: ?*anyopaque, _: ?[]const u8) !js_host_auth.RemoveOutcome {
+            return .missing;
+        }
+
+        fn execute(
+            raw: ?*anyopaque,
+            _: Allocator,
+            _: oauth_transport.Request,
+        ) !oauth_transport.Response {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.oauth_calls += 1;
+            return error.UnexpectedOAuthRequest;
+        }
+    };
+
+    var fixture: Fixture = .{};
+    const store: chatgpt_session.Store = .{ .host = .{
+        .context = @ptrCast(&fixture),
+        .load_fn = Fixture.load,
+        .commit_fn = Fixture.commit,
+        .remove_fn = Fixture.remove,
+    } };
+    const transport: oauth_transport.Provider = .{
+        .context = @ptrCast(&fixture),
+        .execute_fn = Fixture.execute,
+    };
+
+    try std.testing.expectError(
+        error.ChatGptAccountChanged,
+        refreshCredentialTokenForAccountWithStore(
+            transport,
+            std.testing.allocator,
+            .chatgpt_subscription,
+            .force,
+            "account-a",
+            store,
+        ),
+    );
+    try std.testing.expectEqual(@as(usize, 1), fixture.load_calls);
+    try std.testing.expectEqual(@as(usize, 0), fixture.oauth_calls);
+    try std.testing.expectEqual(@as(usize, 0), fixture.commit_calls);
 }
 
 pub const FailureReason = enum {
@@ -122,6 +199,24 @@ pub fn refreshCredentialTokenForAccount(
     mode: CredentialRefreshMode,
     expected_account_id: ?[]const u8,
 ) !?[]u8 {
+    return refreshCredentialTokenForAccountWithStore(
+        transport,
+        alloc,
+        source,
+        mode,
+        expected_account_id,
+        chatgpt_session.default_store,
+    );
+}
+
+pub fn refreshCredentialTokenForAccountWithStore(
+    transport: oauth_transport.Provider,
+    alloc: Allocator,
+    source: credentials.Source,
+    mode: CredentialRefreshMode,
+    expected_account_id: ?[]const u8,
+    chatgpt_store: chatgpt_session.Store,
+) !?[]u8 {
     if (!credentials.sourceRefreshable(source)) return null;
 
     var credential = switch (source) {
@@ -130,8 +225,20 @@ pub fn refreshCredentialTokenForAccount(
             .force => (try credentials.refreshFxLoginCredential(alloc, transport)) orelse return null,
         },
         .chatgpt_subscription => switch (mode) {
-            .if_needed => (try credentials.loadSource(alloc, transport, host.unavailable_secret_store, source)) orelse return null,
-            .force => (try credentials.refreshChatGptCredential(alloc, transport)) orelse return null,
+            .if_needed => (try credentials.loadChatGptCredentialForAccountFromStore(
+                alloc,
+                transport,
+                .if_needed,
+                expected_account_id,
+                chatgpt_store,
+            )) orelse return null,
+            .force => (try credentials.loadChatGptCredentialForAccountFromStore(
+                alloc,
+                transport,
+                .force,
+                expected_account_id,
+                chatgpt_store,
+            )) orelse return null,
         },
         .grok_subscription => switch (mode) {
             .if_needed => (try credentials.loadSource(alloc, transport, host.unavailable_secret_store, source)) orelse return null,
