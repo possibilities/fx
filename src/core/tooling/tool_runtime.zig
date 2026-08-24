@@ -803,7 +803,7 @@ fn reportEditedPathObservation(
     ));
 }
 
-pub fn editedPathObservation(
+fn editedPathObservation(
     ctx: Context,
     source: EditedPathSource,
     paths: []const []const u8,
@@ -815,6 +815,16 @@ pub fn editedPathObservation(
         .paths = paths,
     };
 }
+
+pub const TestAdapter = if (builtin.is_test) struct {
+    pub fn editedPathObservationForContext(
+        ctx: Context,
+        source: EditedPathSource,
+        paths: []const []const u8,
+    ) EditedPathObservation {
+        return editedPathObservation(ctx, source, paths);
+    }
+} else struct {};
 
 fn shouldReportEditedPathObservation(
     alloc: Allocator,

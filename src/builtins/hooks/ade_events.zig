@@ -309,7 +309,7 @@ pub const Client = struct {
         self.reportGitRootDiscovered(discovery);
     }
 
-    pub fn reportGitRootDiscovered(self: *Client, discovery: ade_git_roots.Discovery) void {
+    fn reportGitRootDiscovered(self: *Client, discovery: ade_git_roots.Discovery) void {
         if (!self.enabled) return;
         const role = roleForScope(discovery.scope.kind) orelse return;
         const io = io_mod.getIo();
@@ -538,6 +538,14 @@ pub const Client = struct {
     }
 };
 
+pub const TestAdapter = if (builtin.is_test) struct {
+    pub fn reportGitRootDiscovered(
+        client: *Client,
+        discovery: ade_git_roots.Discovery,
+    ) void {
+        client.reportGitRootDiscovered(discovery);
+    }
+} else struct {};
 fn roleForScope(scope: hooks.ScopeKind) ?AgentRole {
     return switch (scope) {
         .interactive => .main,
@@ -1138,7 +1146,7 @@ test "ADE nested-child Git root discovery preserves owning root lifecycle parent
         .turn_id = 42,
     });
     client.reportSessionChanged("root-session-b");
-    client.reportGitRootDiscovered(.{
+    TestAdapter.reportGitRootDiscovered(&client, .{
         .root = "/tmp/workspace/grandchild-repository",
         .revision = 2,
         .reason = .subagent_file_mutation,
