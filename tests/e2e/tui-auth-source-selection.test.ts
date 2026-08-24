@@ -1247,8 +1247,12 @@ tmuxTest(
     await session.waitForText("Fast: on", TIMEOUT);
     await session.sendText("Use the Codex subscription directly.");
     await session.waitForText("CHATGPT_DIRECT_RESPONSE", TIMEOUT);
+    // Native session naming also posts to the direct Codex endpoint, and its
+    // request carries no tools; the turn's request is the one advertising them.
     const directRequest = chatgptOauth.requests.find(
-      (request) => request.path === "/chatgpt/responses",
+      (request) =>
+        request.path === "/chatgpt/responses" &&
+        ((JSON.parse(request.body ?? "{}") as { tools?: unknown[] }).tools?.length ?? 0) > 0,
     );
     expect(directRequest?.authorization).toBe(`Bearer ${chatgptOauth.accessToken}`);
     const directBody = JSON.parse(directRequest?.body ?? "{}") as {
