@@ -17,9 +17,9 @@ const Allocator = std.mem.Allocator;
 pub const excerpt_max_bytes: usize = 1600;
 pub const mentioned_file_max_bytes: usize = 2 * 1024;
 pub const generated_title_max_bytes: usize = 64;
-/// Bytes kept from one naming stream before it is stopped. Twice the slug
-/// bound leaves room for a wrapping quote or a short preamble, and is small
-/// enough that a chatty model is cut off almost immediately.
+/// Bytes kept from one naming stream. Twice the slug bound leaves room for a
+/// wrapping quote or a short preamble; everything past it is read and dropped
+/// rather than kept, so a chatty model costs bytes we ignore and never memory.
 pub const capture_max_bytes: usize = generated_title_max_bytes * 2;
 pub const default_timeout_ms: u64 = 60_000;
 pub const min_timeout_ms: u64 = 1_000;
@@ -205,8 +205,8 @@ const Task = struct {
     team: ?[]u8,
     /// Ends the task. Set only from outside the naming thread.
     cancel_flag: std.atomic.Value(bool) = .init(false),
-    /// Stops the provider call in flight, whether because the task ended or
-    /// because the attempt already captured everything a slug needs.
+    /// Stops the provider call in flight when the task ends. A settled title
+    /// does not set it: the stream is read to its own completion.
     attempt_cancel: std.atomic.Value(bool) = .init(false),
     captured_title: std.atomic.Value(bool) = .init(false),
     done: std.atomic.Value(bool) = .init(false),
@@ -500,7 +500,8 @@ fn requestTitle(task: *Task, excerpt: []const u8, timeout_ms: u64) !?[]u8 {
         .provider_attempt_owner = .transport,
     }) catch |err| {
         if (task.cancel_flag.load(.seq_cst)) return error.Cancelled;
-        // Stopping the stream ourselves is a completed answer, not a fault.
+        // A title already settled outlives a later transport fault, because
+        // the captured bytes are the whole answer a slug needs.
         if (task.captured_title.load(.seq_cst)) {
             return try slugifyTitle(task.alloc, capture.captured());
         }
@@ -547,6 +548,9 @@ const TitleCapture = struct {
             .content_delta => |text| text,
             else => return,
         };
+        // A settled title is frozen: later deltas are read and dropped so the
+        // stream can finish without changing the answer already captured.
+        if (self.task.captured_title.load(.seq_cst)) return;
         // Each appended run is cut on a codepoint boundary, so the buffer
         // stays valid UTF-8 for the slug.
         const room = self.buffer.len - self.len;
@@ -554,12 +558,13 @@ const TitleCapture = struct {
         @memcpy(self.buffer[self.len..][0..kept.len], kept);
         self.len += kept.len;
         // Anything the buffer could not take is already more than a slug
-        // needs, so a dropped byte stops the stream as surely as a full
-        // buffer or a finished first line.
+        // needs, so a dropped byte settles the title as surely as a full
+        // buffer or a finished first line. The stream is left to finish on
+        // its own: the endpoint refuses a Responses API output bound, and
+        // cancelling the read stops neither the generation nor its billing.
         const overflowed = kept.len < delta.len or self.len == self.buffer.len;
         if (!overflowed and !firstLineComplete(self.captured())) return;
         self.task.captured_title.store(true, .seq_cst);
-        self.task.attempt_cancel.store(true, .seq_cst);
     }
 };
 
@@ -906,7 +911,7 @@ fn runOneNaming(
     return null;
 }
 
-test "a naming stream is stopped once its first line is complete" {
+test "a settled first line freezes the title and lets the stream finish" {
     const alloc = std.testing.allocator;
     var settings = Settings{};
     var config = try resolveConfig(alloc, &settings);
@@ -924,11 +929,13 @@ test "a naming stream is stopped once its first line is complete" {
     defer completed.deinit();
 
     try std.testing.expectEqualStrings("fix-the-tray-width", completed.title);
-    try std.testing.expect(fake.stopped.load(.seq_cst));
-    try std.testing.expectEqual(@as(usize, 2), fake.emitted);
+    // The stream is never cancelled, so every chunk is delivered and the
+    // provider's own completion is reached; the frozen capture still wins.
+    try std.testing.expect(!fake.stopped.load(.seq_cst));
+    try std.testing.expectEqual(@as(usize, 3), fake.emitted);
 }
 
-test "a naming stream without a line break is stopped at the capture bound" {
+test "a stream without a line break freezes the title at the capture bound" {
     const alloc = std.testing.allocator;
     var settings = Settings{};
     var config = try resolveConfig(alloc, &settings);
@@ -948,8 +955,8 @@ test "a naming stream without a line break is stopped at the capture bound" {
 
     try std.testing.expectEqual(generated_title_max_bytes, completed.title.len);
     try std.testing.expectEqualStrings("x" ** generated_title_max_bytes, completed.title);
-    try std.testing.expect(fake.stopped.load(.seq_cst));
-    try std.testing.expectEqual(@as(usize, 1), fake.emitted);
+    try std.testing.expect(!fake.stopped.load(.seq_cst));
+    try std.testing.expectEqual(@as(usize, 2), fake.emitted);
 }
 
 const TestNamingProvider = struct {
