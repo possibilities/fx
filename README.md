@@ -101,8 +101,6 @@ fx ask "explain the changes in this repository"
 
 With `--json`, `output` contains accumulated assistant Markdown across the request, while `final_output` contains only a completed final assistant response and is `""` for interrupted, failed, background, or otherwise absent final responses.
 
-Foreground terminal commands run with an explicit finite deadline. fx uses durable terminal sessions for services, watchers, GUI applications, and other long-lived work, and keeps captured foreground output available through an opaque bounded-read handle for the active session or `--no-save` process.
-
 Customize the system prompt for one model-launching invocation with global
 file options placed before the command:
 
@@ -118,6 +116,11 @@ resumed sessions, ACP, `pr`, and `issue`. Custom prompt files must be regular
 UTF-8 files without NUL bytes and may contain at most 256 KiB combined. File
 errors stop the launch. For `fx ask`, these options cannot be combined with
 the inline `--system` option.
+
+Foreground terminal commands run with an explicit finite deadline. fx uses
+durable terminal sessions for services, watchers, GUI applications, and other
+long-lived work, and keeps captured foreground output available through an
+opaque bounded-read handle for the active session or `--no-save` process.
 
 fx starts in `auto` permission mode. Routine understood development actions run directly. Each unresolved action receives one narrow safety review based on the current user request and the exact pending action. A clear result authorizes only that action. A caution or unavailable review holds the action and returns advice to the agent without opening a permission prompt or ending the turn. See [Permissions](https://fx.sh/docs/configure-fx/permissions) for other modes and persistent rules.
 
