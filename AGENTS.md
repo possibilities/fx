@@ -262,17 +262,18 @@ development or publication targets.
 Develop each carried feature on its durable `carry/<feature>` branch in a
 dedicated worktree, based on the exact current `main` mirror or a declared
 carry dependency. Do not work in the bound checkout or put downstream commits
-on `main`. Before publishing a changed carry, run:
+on `main`. Run focused checks in the carry worktree, compose every current
+carry into a clean candidate, then run before publishing any affected carry:
 
 ```bash
-~/code/fxnk/scripts/local-gate.sh --worktree "$PWD"
+~/code/fxnk/scripts/local-gate.sh --worktree "$composition_worktree"
 ```
 
 The gate builds ReleaseSafe, runs narrow carried-unit canaries and focused
 macOS-arm64 integration tests, exercises `./zig-out/bin/fx`, and explicitly
 classifies the known fragile terminal probes. A failure outside the declared
-quarantine blocks. Publish the exact gated carry head, compose every current
-carry into `integration`, and gate the exact composition before publication.
+quarantine blocks. Publish the proved carry heads and exact Integration
+composition together under leases.
 The fxnk Workshop records and verifies the exact Integration SHA before
 publication and installation. Full CI can continue after publication as late
 cross-platform observability, but nobody waits for it to ship.
@@ -451,7 +452,10 @@ The canonical repository is `vercel-labs/fx` on GitHub. All URLs, links, and ref
 ## Before Merging to Integration
 
 1. Run the focused tests for the changed path.
-2. Run `~/code/fxnk/scripts/local-gate.sh --worktree "$PWD"`.
-3. Exercise the change locally with the freshly built `./zig-out/bin/fx`.
-4. Commit and publish the exact carry head, then compose it into Integration.
-5. Update docs if behavior changed.
+2. Compose every current carry head into a clean Integration candidate.
+3. Run `~/code/fxnk/scripts/local-gate.sh --worktree "$PWD"` from that exact
+   composition worktree.
+4. Exercise the composition locally with the freshly built `./zig-out/bin/fx`.
+5. Commit the clean result and publish affected carries with Integration under
+   exact leases.
+6. Update docs if behavior changed.
