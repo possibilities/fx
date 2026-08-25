@@ -10,9 +10,14 @@ Before reporting the work as ready:
 
 1. Build succeeds.
 2. Focused tests for the changed path pass locally.
-3. The **Full CI** run for the exact current commit passes on every required Linux and macOS runner.
+3. The fxnk Local development gate passes on the current worktree.
 4. Run the built binary locally and drive at least one real interaction that exercises the change end to end.
 5. Confirm the process did not abort, stderr is clean, and the behavior matches what you are about to tell the user.
+
+This is the maintained downstream fork. `integration` is its development and
+installation branch; `main` remains an exact upstream mirror. Hosted Full CI is
+nonblocking observability and never authorizes or prevents a downstream merge,
+publication, or install.
 
 If you cannot run the binary in your environment, say so explicitly and ask the user to verify. Do not silently skip this step and declare the work ready. "The tests pass" is not a substitute for running the app.
 
@@ -37,6 +42,7 @@ Build and test commands:
 ```bash
 zig build          # build the binary
 zig build test     # run all unit tests
+zig build test-fxnk -Doptimize=ReleaseSafe # narrow downstream unit canaries
 zig build run      # build and run
 zig fmt src/       # format all source files
 ```
@@ -210,7 +216,10 @@ Do not bypass the permission system for new tools.
 
 * Zig unit tests go inside the source file they test, using `test "description" { ... }` blocks.
 
-* Run the narrowest relevant tests while developing. The complete `zig build test` suite runs in ReleaseSafe in **Full CI** after the feature branch is pushed, and it must pass before the draft PR is marked ready.
+* Run the narrowest relevant tests while developing. Downstream work also runs
+  `zig build test-fxnk -Doptimize=ReleaseSafe` through the fxnk Local
+  development gate. The complete `zig build test` suite is hosted
+  observability, not a downstream shipping requirement.
 
 * Use `std.testing.expect`, `std.testing.expectEqual`, `std.testing.expectEqualStrings` for assertions.
 
@@ -244,42 +253,29 @@ cd tests/e2e && bun test tui-*.test.ts               # just TUI tests (requires 
 
 TUI tests use tmux to drive the interactive terminal. They require `tmux` to be installed.
 
-## Pull Request Classification
+## Downstream Fork Workflow
 
-Every pull request must have exactly one `type:` label, chosen by its primary intent:
+Regular maintenance does not open, update, or support upstream pull requests.
+Existing requests are historical evidence only, and their branches are not
+development or publication targets.
 
-* `type: bug`: fixes incorrect behavior
+Develop each carried feature on its durable `carry/<feature>` branch in a
+dedicated worktree, based on the exact current `main` mirror or a declared
+carry dependency. Do not work in the bound checkout or put downstream commits
+on `main`. Before publishing a changed carry, run:
 
-* `type: feature`: adds a new user-facing capability
+```bash
+~/code/fxnk/scripts/local-gate.sh --worktree "$PWD"
+```
 
-* `type: improvement`: improves existing user-facing behavior
-
-* `type: docs`: changes documentation only
-
-* `type: maintenance`: changes internal tooling, dependencies, CI, or implementation structure without a user-facing behavior change
-
-* `type: release`: prepares or repairs a release
-
-* `type: security`: fixes or hardens a security boundary
-
-Assign the label when the PR is opened and keep it accurate when the PR changes. If the authenticated contributor cannot manage labels, state the required label and keep the PR in draft until a maintainer or repository agent applies it. For a mixed PR, choose the label that describes the primary reason the PR exists. If that is ambiguous, ask before applying or changing the label.
-
-Keep PR titles as clean imperative sentences, such as `Restore feedback report file clipboard`. Do not add bracketed prefixes such as `[bug]`, `[feature]`, or `[improvement]`. Type belongs in the label, not the title.
-
-## Full CI on Feature Branches
-
-Do not run the complete deterministic test suite locally as the default development loop. Run the focused test for the changed path, build the binary, and exercise that path with `./zig-out/bin/fx`.
-
-After the focused checks pass, create a clean checkpoint commit, push the non-`main` feature branch, and open a draft PR immediately. `.github/workflows/full-ci.yml` runs the following on all four supported native runner architectures:
-
-* `ubuntu-24.04` (x86_64)
-* `ubuntu-24.04-arm` (aarch64)
-* `macos-15-intel` (x86_64)
-* `macos-15` (aarch64)
-
-The native matrix builds, tests, and smoke-tests ReleaseSafe on every platform; formatting and the public-surface audit run in those ReleaseSafe jobs. The E2E matrix runs four duration-balanced, isolated ReleaseSafe shards per platform with Bun and tmux. Checked-in weights assign every test file to exactly one shard on each platform, and files inside each shard run sequentially in separate Bun processes so terminal fixtures and process state cannot leak between files. A failed file receives one bounded retry after its tmux server is reset. Live model evals remain separate because they require credentials and are not deterministic.
-
-A Full CI result is valid only when it belongs to the exact current commit and all four `Full suite (...)` jobs succeed. Each platform aggregate requires its ReleaseSafe native check plus all four ReleaseSafe E2E shards. Do not mark the draft PR ready or request review from a stale, partial, queued, cancelled, skipped, or failed run. If Full CI fails, make the smallest repair, rerun the focused local proof, push the new commit to the same draft PR, and wait for Full CI on the new exact commit. After CI passes, run the final ship gate and mark the PR ready only when it reports `SHIP` for that exact commit.
+The gate builds ReleaseSafe, runs narrow carried-unit canaries and focused
+macOS-arm64 integration tests, exercises `./zig-out/bin/fx`, and explicitly
+classifies the known fragile terminal probes. A failure outside the declared
+quarantine blocks. Publish the exact gated carry head, compose every current
+carry into `integration`, and gate the exact composition before publication.
+The fxnk Workshop records and verifies the exact Integration SHA before
+publication and installation. Full CI can continue after publication as late
+cross-platform observability, but nobody waits for it to ship.
 
 ## Reproducing Render Bugs
 
@@ -452,10 +448,10 @@ The canonical repository is `vercel-labs/fx` on GitHub. All URLs, links, and ref
 
 * Do not report work as ready without running the binary. See **Declaring Work Ready**.
 
-## Before Marking a PR Ready
+## Before Merging to Integration
 
-1. Run `zig fmt --check src/` and the focused tests for the changed path.
-2. Build and exercise the change locally with `./zig-out/bin/fx`.
-3. Push a clean checkpoint commit and open a draft PR immediately.
-4. Require **Full CI** and the final ship gate to pass on the exact current commit across all four native runners.
+1. Run the focused tests for the changed path.
+2. Run `~/code/fxnk/scripts/local-gate.sh --worktree "$PWD"`.
+3. Exercise the change locally with the freshly built `./zig-out/bin/fx`.
+4. Commit and publish the exact carry head, then compose it into Integration.
 5. Update docs if behavior changed.

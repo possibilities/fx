@@ -90,6 +90,65 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&run_exe_tests.step);
 
+    const fxnk_gate_module = b.createModule(.{
+        .root_source_file = b.path("src/fxnk_gate_tests.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .stack_check = false,
+        .stack_protector = false,
+        .omit_frame_pointer = true,
+        .unwind_tables = .none,
+        .error_tracing = false,
+    });
+    // The production binary embeds its exact Git SHA. These tests do not use
+    // that identity, so keep their options stable across clean checkpoint
+    // commits instead of invalidating the entire canary compile graph.
+    const fxnk_gate_build_options = b.addOptions();
+    fxnk_gate_build_options.addOption(
+        []const u8,
+        "git_commit",
+        "0000000000000000000000000000000000000000",
+    );
+    fxnk_gate_build_options.addOption([]const u8, "app_version", app_version);
+    fxnk_gate_build_options.addOption([]const u8, "update_channel", @tagName(update_channel));
+    fxnk_gate_build_options.addOption(WasmSurface, "wasm_surface", .none);
+    fxnk_gate_module.addImport("build_options", fxnk_gate_build_options.createModule());
+    const fxnk_gate_tests = b.addTest(.{
+        .root_module = fxnk_gate_module,
+        .test_runner = .{
+            .path = b.path("tests/fxnk/runner.zig"),
+            .mode = .simple,
+        },
+        .filters = &.{
+            "global system prompt file modifiers preserve replacement and append order",
+            "ACP command routes parsed options and launch config through the injected runner",
+            "loadStartupState lets FX_EFFORT win over the configured effort without rewriting it",
+            "model list JSON preserves ordered reasoning efforts per provider model",
+            "ADE feed serializes a main turn as one versioned JSON line",
+            "ADE Git roots retain first discovery order and checkpoint without a socket",
+            "ADE edited path reporting requires successful committed mutation results",
+            "ADE terminal mutation completion requires exit-zero proof for durable starts",
+            "ADE durable terminal start classifies the declared working directory",
+            "ADE terminal root tracking follows only filesystem-write classification",
+            "generated titles slug to lowercase hyphens, bounded and re-trimmed",
+            "a settled first line freezes the title and lets the stream finish",
+            "a stream without a line break freezes the title at the capture bound",
+            "invocation root authority stays fixed after the selected path is rebound",
+            "external editor returns valid text and treats nonzero exit as cancellation",
+            "app_input_runtime ctrl+t invokes upgrade shortcut without composer mutation",
+            "app_input_runtime ctrl+g invokes external editor without composer mutation",
+            "pending resume projection accepts candidate row below base content through recovery",
+            "provider-local immediate usage bypasses durable Gateway observations",
+        },
+    });
+    const run_fxnk_gate_tests = b.addRunArtifact(fxnk_gate_tests);
+    const fxnk_gate_step = b.step(
+        "test-fxnk",
+        "Run the fast local fxnk acceptance tests",
+    );
+    fxnk_gate_step.dependOn(&run_fxnk_gate_tests.step);
+
     if (wasm_surface != .none) {
         addWasmArtifact(b, wasm_surface, git_commit, app_version, update_channel);
     }
