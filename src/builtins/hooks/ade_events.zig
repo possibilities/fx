@@ -1076,3 +1076,217 @@ test "ADE client shutdown stays bounded with a non-reading listener" {
     client.deinit();
     try std.testing.expect(elapsedAwakeMillis(started) < 2_000);
 }
+
+test "ADE feed resolves subagent attention with the child's own working snapshot" {
+    const alloc = std.testing.allocator;
+    var lifecycle = lifecycle_state.Reducer{};
+    lifecycle.init(alloc);
+    defer lifecycle.deinit();
+    var client = Client{
+        .enabled = true,
+        .alloc = alloc,
+        .socket_path = try alloc.dupe(u8, "/tmp/unused-ade.sock"),
+        .instance_id = try alloc.dupe(u8, "instance-9"),
+        .workspace_root = try alloc.dupe(u8, "/tmp/workspace"),
+        .main_session_id = try alloc.dupe(u8, "main-session"),
+        .lifecycle = &lifecycle,
+    };
+    defer client.deinit();
+
+    const child = lifecycle_state.Agent{ .subagent_session = "child-session" };
+    _ = lifecycle.transition(child, .turn_started, null);
+    _ = lifecycle.transition(child, .attention_required, .permission);
+    _ = lifecycle.transition(child, .attention_resolved, .permission);
+    client.reportAttentionResolved(.{
+        .invocation = .{
+            .scope = .{
+                .kind = .subagent,
+                .workspace_root = "/tmp/workspace",
+                .session_id = "child-session",
+                .subagent_id = 4,
+            },
+            .turn_id = null,
+        },
+        .kind = .permission,
+    });
+
+    try std.testing.expectEqual(@as(usize, 1), client.queue_len);
+    var parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        alloc,
+        client.queue[0].?.bytes,
+        .{},
+    );
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings(
+        "AttentionResolved",
+        parsed.value.object.get("event").?.string,
+    );
+    const context = parsed.value.object.get("context").?.object;
+    try std.testing.expectEqualStrings("subagent", context.get("agent_role").?.string);
+    try std.testing.expectEqualStrings("child-session", context.get("session_id").?.string);
+    try std.testing.expectEqualStrings("main-session", context.get("parent_session_id").?.string);
+    try std.testing.expectEqualStrings("working", context.get("agent_state").?.string);
+    try std.testing.expect(context.get("attention_kind").? == .null);
+    try std.testing.expectEqualStrings(
+        "permission",
+        parsed.value.object.get("payload").?.object.get("kind").?.string,
+    );
+}
+
+test "ADE feed carries each agent's own snapshot rather than the main agent's" {
+    const alloc = std.testing.allocator;
+    var lifecycle = lifecycle_state.Reducer{};
+    lifecycle.init(alloc);
+    defer lifecycle.deinit();
+    var client = Client{
+        .enabled = true,
+        .alloc = alloc,
+        .socket_path = try alloc.dupe(u8, "/tmp/unused-ade.sock"),
+        .instance_id = try alloc.dupe(u8, "instance-9"),
+        .workspace_root = try alloc.dupe(u8, "/tmp/workspace"),
+        .main_session_id = try alloc.dupe(u8, "main-session"),
+        .lifecycle = &lifecycle,
+    };
+    defer client.deinit();
+
+    // Three agents in three different states at the same instant.
+    _ = lifecycle.transition(.main, .prompt_queued, null);
+    _ = lifecycle.transition(
+        .{ .subagent_session = "child-blocked" },
+        .attention_required,
+        .question,
+    );
+    _ = lifecycle.transition(.{ .subagent_session = "child-working" }, .turn_started, null);
+
+    client.reportTurnStarted(.{
+        .scope = .{
+            .kind = .subagent,
+            .workspace_root = "/tmp/workspace",
+            .session_id = "child-blocked",
+            .subagent_id = 1,
+        },
+        .turn_id = 7,
+    });
+    client.reportTurnStarted(.{
+        .scope = .{
+            .kind = .subagent,
+            .workspace_root = "/tmp/workspace",
+            .session_id = "child-working",
+            .subagent_id = 2,
+        },
+        .turn_id = 8,
+    });
+    client.reportPromptQueued();
+
+    try std.testing.expectEqual(@as(usize, 3), client.queue_len);
+    const Expected = struct {
+        session_id: ?[]const u8,
+        role: []const u8,
+        agent_state: []const u8,
+        attention_kind: ?[]const u8,
+    };
+    const expected = [_]Expected{
+        .{
+            .session_id = "child-blocked",
+            .role = "subagent",
+            .agent_state = "blocked",
+            .attention_kind = "question",
+        },
+        .{
+            .session_id = "child-working",
+            .role = "subagent",
+            .agent_state = "working",
+            .attention_kind = null,
+        },
+        .{
+            .session_id = "main-session",
+            .role = "main",
+            .agent_state = "working",
+            .attention_kind = null,
+        },
+    };
+    for (expected, 0..) |want, index| {
+        var parsed = try std.json.parseFromSlice(
+            std.json.Value,
+            alloc,
+            client.queue[index].?.bytes,
+            .{},
+        );
+        defer parsed.deinit();
+        const context = parsed.value.object.get("context").?.object;
+        try std.testing.expectEqualStrings(want.role, context.get("agent_role").?.string);
+        try std.testing.expectEqualStrings(
+            want.session_id.?,
+            context.get("session_id").?.string,
+        );
+        try std.testing.expectEqualStrings(
+            want.agent_state,
+            context.get("agent_state").?.string,
+        );
+        if (want.attention_kind) |kind| {
+            try std.testing.expectEqualStrings(kind, context.get("attention_kind").?.string);
+        } else {
+            try std.testing.expect(context.get("attention_kind").? == .null);
+        }
+    }
+}
+
+test "ADE sequence advances through record_too_large and queue_full drops" {
+    const alloc = std.testing.allocator;
+    var client = Client{
+        .enabled = true,
+        .alloc = alloc,
+        .socket_path = try alloc.dupe(u8, "/tmp/unused-ade.sock"),
+        .instance_id = try alloc.dupe(u8, "instance-9"),
+        .workspace_root = try alloc.dupe(u8, "/tmp/workspace"),
+        .main_session_id = try alloc.dupe(u8, "main-session"),
+    };
+    defer client.deinit();
+
+    const oversized = try alloc.alloc(u8, max_record_bytes + 1);
+    defer alloc.free(oversized);
+    @memset(oversized, 'x');
+
+    // Sequence 1 is consumed by a record rejected before serialization.
+    client.reportPreToolUse(.{
+        .invocation = .{
+            .scope = .{
+                .kind = .interactive,
+                .workspace_root = "/tmp/workspace",
+                .session_id = "main-session",
+            },
+            .turn_id = 3,
+        },
+        .step_index = 1,
+        .call_id = "call-1",
+        .tool_name = "terminal",
+        .arguments_json = oversized,
+    });
+    try std.testing.expectEqual(@as(usize, 0), client.queue_len);
+
+    // The next admitted record therefore starts at 2: the consumer sees a
+    // gap and knows a record was lost rather than never attempted.
+    client.reportPromptQueued();
+    try std.testing.expectEqual(@as(usize, 1), client.queue_len);
+    try std.testing.expectEqual(@as(u64, 2), client.queue[0].?.sequence);
+
+    // Fill the queue to its record bound, then overflow it once. Sequences
+    // 2 through 129 are admitted, so the next attempt is 130.
+    while (client.queue_len < max_queued_records) client.reportPromptQueued();
+    try std.testing.expectEqual(@as(usize, max_queued_records), client.queue_len);
+    try std.testing.expectEqual(@as(u64, 129), client.queue[client.queue_len - 1].?.sequence);
+    try std.testing.expectEqual(@as(u64, 130), client.next_sequence);
+    client.reportPromptQueued();
+    try std.testing.expectEqual(@as(usize, max_queued_records), client.queue_len);
+    try std.testing.expectEqual(@as(u64, 131), client.next_sequence);
+
+    // Draining the backlog lets the next record show the queue_full gap on
+    // the wire: 129 was queued, 130 was dropped, 131 is the next admission.
+    client.mutex.lockUncancelable(io_mod.getIo());
+    client.clearQueueLocked(alloc);
+    client.mutex.unlock(io_mod.getIo());
+    client.reportPromptQueued();
+    try std.testing.expectEqual(@as(usize, 1), client.queue_len);
+    try std.testing.expectEqual(@as(u64, 131), client.queue[client.queue_head].?.sequence);
+}

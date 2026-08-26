@@ -238,3 +238,45 @@ test "lifecycle reducer keeps main and subagent states independent" {
     try std.testing.expectEqual(AgentState.blocked, reducer.snapshot(second).agent_state);
     try std.testing.expectEqual(hooks.AttentionKind.question, reducer.snapshot(second).attention_kind.?);
 }
+
+test "lifecycle reducer pairs a non-null attention kind only with blocked" {
+    // fmx's decoder rejects a whole record whose snapshot carries an
+    // attention kind without `blocked`, so this pairing is load-bearing on
+    // the wire rather than merely tidy.
+    const seeds = [_]Snapshot{
+        .{},
+        .{ .agent_state = .working },
+        .{ .agent_state = .blocked, .attention_kind = .permission },
+        .{ .agent_state = .blocked, .attention_kind = .question },
+        .{ .agent_state = .blocked, .attention_kind = .route_recovery },
+    };
+    const kinds = [_]?hooks.AttentionKind{
+        null,
+        .permission,
+        .question,
+        .route_recovery,
+    };
+
+    for (seeds) |seed| {
+        for (std.enums.values(Event)) |event| {
+            for (kinds) |kind| {
+                const current = reduce(seed, event, kind);
+                if (current.attention_kind != null) {
+                    try std.testing.expectEqual(AgentState.blocked, current.agent_state);
+                }
+                if (current.agent_state != .blocked) {
+                    try std.testing.expect(current.attention_kind == null);
+                }
+            }
+        }
+    }
+
+    // A blocked snapshot always names the kind that blocked it: an
+    // `attention_required` with no kind would publish `blocked`/null and
+    // lose which decision the human owes.
+    for (seeds) |seed| {
+        const blocked = reduce(seed, .attention_required, .question);
+        try std.testing.expectEqual(AgentState.blocked, blocked.agent_state);
+        try std.testing.expectEqual(hooks.AttentionKind.question, blocked.attention_kind.?);
+    }
+}
