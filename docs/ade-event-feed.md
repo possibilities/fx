@@ -162,6 +162,18 @@ This event is passive. Its arguments are exactly the structured arguments at
 that lifecycle point; insignificant JSON whitespace is compacted so one event
 remains one physical line. The receiver cannot rewrite or block them.
 
+Fx guarantees the record's framing regardless of what those arguments contain.
+Before splicing them in it requires that no raw byte below `0x20` appears
+inside a string, since a raw newline there would split one record across two
+physical lines, and that the whole value parses as JSON. Arguments that fail
+either check are replaced with an empty object `{}` and the failure is recorded
+only in Fx debug traces. The record itself still publishes, with its event,
+context, and remaining payload fields intact, so a malformed tool argument
+costs its own `arguments` value rather than the record or the line after it.
+Receivers therefore never need to defend against a partial line, but an empty
+`arguments` object can mean either genuinely empty arguments or a rejected
+value.
+
 ### `Stop`
 
 Emitted when Fx has a terminal assistant candidate before turn finalization:

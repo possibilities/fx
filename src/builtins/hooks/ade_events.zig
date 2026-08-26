@@ -466,7 +466,7 @@ pub const Client = struct {
     ) ![]u8 {
         var output: std.Io.Writer.Allocating = .init(alloc);
         defer output.deinit();
-        try writeRecord(&output.writer, sequence, instance_id, payload, context);
+        try writeRecord(alloc, &output.writer, sequence, instance_id, payload, context);
         return output.toOwnedSlice();
     }
 };
@@ -678,6 +678,7 @@ fn closeSocket(socket: std.posix.socket_t) void {
 }
 
 fn writeRecord(
+    alloc: std.mem.Allocator,
     writer: *std.Io.Writer,
     sequence: u64,
     instance_id: []const u8,
@@ -712,11 +713,15 @@ fn writeRecord(
     else
         try writer.writeAll("null");
     try writer.writeAll("},\"payload\":");
-    try writePayload(writer, payload);
+    try writePayload(alloc, writer, payload);
     try writer.writeAll("}\n");
 }
 
-fn writePayload(writer: *std.Io.Writer, payload: Payload) !void {
+fn writePayload(
+    alloc: std.mem.Allocator,
+    writer: *std.Io.Writer,
+    payload: Payload,
+) !void {
     switch (payload) {
         .fx_started, .prompt_queued, .turn_started, .fx_stopped => try writer.writeAll("{}"),
         .session_changed => |value| {
@@ -734,7 +739,7 @@ fn writePayload(writer: *std.Io.Writer, payload: Payload) !void {
             try writer.writeAll(",\"tool_name\":");
             try jsonrpc.writeJsonStr(value.tool_name, writer);
             try writer.writeAll(",\"arguments\":");
-            try writeCompactJson(writer, value.arguments_json);
+            try writeCompactJson(alloc, writer, value.arguments_json);
             try writer.writeAll("}");
         },
         .stop => |value| {
@@ -767,7 +772,55 @@ fn writePayload(writer: *std.Io.Writer, payload: Payload) !void {
     }
 }
 
-fn writeCompactJson(writer: *std.Io.Writer, value: []const u8) !void {
+/// Answers whether these caller-supplied bytes can be spliced into a record.
+///
+/// Two questions, in this order. Framing: no raw byte below 0x20 may appear
+/// inside a string, because a raw newline there splits one record into two
+/// physical lines and the consumer decodes the remainder as garbage. The
+/// emitter asks that itself rather than inheriting whatever a scanner chooses
+/// to tolerate, because the NDJSON framing invariant is the emitter's own.
+/// Validity: the bytes must parse, because splicing a malformed value in
+/// corrupts the enclosing record just as surely as a broken line does.
+///
+/// The emitter does not trust its caller here. The integrity flag fx relies
+/// on elsewhere defaults to valid and is not set on every path that builds
+/// tool arguments, so unclassified bytes are the ordinary case rather than
+/// the exception.
+fn compactJsonIsAdmissible(alloc: std.mem.Allocator, value: []const u8) bool {
+    if (value.len == 0) return false;
+    var in_string = false;
+    var escaped = false;
+    for (value) |byte| {
+        if (in_string) {
+            if (byte < 0x20) return false;
+            if (escaped) {
+                escaped = false;
+            } else if (byte == '\\') {
+                escaped = true;
+            } else if (byte == '"') {
+                in_string = false;
+            }
+            continue;
+        }
+        if (byte == '"') in_string = true;
+    }
+    return std.json.validate(alloc, value) catch false;
+}
+
+fn writeCompactJson(
+    alloc: std.mem.Allocator,
+    writer: *std.Io.Writer,
+    value: []const u8,
+) !void {
+    if (!compactJsonIsAdmissible(alloc, value)) {
+        debug_trace.logf(
+            "ade_events",
+            "tool arguments replaced bytes={d} reason=unframable_json",
+            .{value.len},
+        );
+        try writer.writeAll("{}");
+        return;
+    }
     var in_string = false;
     var escaped = false;
     for (value) |byte| {
@@ -807,7 +860,7 @@ test "ADE feed requires a socket and opaque instance identity" {
 test "ADE feed serializes a main turn as one versioned JSON line" {
     var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer output.deinit();
-    try writeRecord(&output.writer, 7, "pane-3", .turn_started, .{
+    try writeRecord(std.testing.allocator, &output.writer, 7, "pane-3", .turn_started, .{
         .agent_role = .main,
         .workspace_root = "/tmp/workspace",
         .session_id = "main-session",
@@ -827,7 +880,7 @@ test "ADE feed serializes a main turn as one versioned JSON line" {
 test "ADE feed serializes attention resolution with a working snapshot" {
     var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer output.deinit();
-    try writeRecord(&output.writer, 12, "pane-3", .{ .attention_resolved = .{
+    try writeRecord(std.testing.allocator, &output.writer, 12, "pane-3", .{ .attention_resolved = .{
         .kind = "route_recovery",
     } }, .{
         .agent_role = .main,
@@ -850,7 +903,7 @@ test "ADE feed serializes attention resolution with a working snapshot" {
 test "ADE feed keeps child and parent identities on subagent tool events" {
     var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer output.deinit();
-    try writeRecord(&output.writer, 8, "pane-3", .{ .pre_tool_use = .{
+    try writeRecord(std.testing.allocator, &output.writer, 8, "pane-3", .{ .pre_tool_use = .{
         .step_index = 2,
         .call_id = "call-1",
         .tool_name = "read_file",
@@ -881,7 +934,7 @@ test "ADE feed keeps child and parent identities on subagent tool events" {
 test "ADE feed compacts tool JSON so valid whitespace cannot split NDJSON framing" {
     var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer output.deinit();
-    try writeRecord(&output.writer, 9, "pane-3", .{ .pre_tool_use = .{
+    try writeRecord(std.testing.allocator, &output.writer, 9, "pane-3", .{ .pre_tool_use = .{
         .step_index = 1,
         .call_id = "call-2",
         .tool_name = "terminal",
@@ -1289,4 +1342,82 @@ test "ADE sequence advances through record_too_large and queue_full drops" {
     client.reportPromptQueued();
     try std.testing.expectEqual(@as(usize, 1), client.queue_len);
     try std.testing.expectEqual(@as(u64, 131), client.queue[client.queue_head].?.sequence);
+}
+
+test "ADE feed refuses tool arguments that would break record framing" {
+    // Every case here is bytes the emitter was handed, not bytes it built.
+    // The guard fx relies on upstream defaults to `valid` and the
+    // Responses path never sets it, so the emitter cannot assume a caller
+    // classified anything.
+    const unframable = [_][]const u8{
+        // A raw newline inside a string is the framing killer: it ends the
+        // record early and leaves the remainder as a second, garbage line.
+        "{\"command\":\"printf hi\nrm -rf /\"}",
+        // Other raw control bytes are equally invalid JSON in a string.
+        "{\"command\":\"a\tb\"}",
+        "{\"command\":\"a\x00b\"}",
+        // Unbalanced or mismatched structure swallows the enclosing record.
+        "{\"a\":1",
+        "{\"a\":1}}",
+        "{\"a\":[1,2}",
+        "[1,2)]",
+        // An unterminated string runs into the envelope that follows.
+        "{\"a\":\"unterminated}",
+        // A trailing escape consumes the closing quote.
+        "{\"a\":\"trailing\\",
+        // Empty bytes would have emitted nothing at all, leaving the
+        // record's `arguments` value missing entirely.
+        "",
+        "   ",
+    };
+
+    for (unframable) |arguments_json| {
+        var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+        defer output.deinit();
+        try writeRecord(std.testing.allocator, &output.writer, 3, "pane-1", .{ .pre_tool_use = .{
+            .step_index = 1,
+            .call_id = "call-1",
+            .tool_name = "terminal",
+            .arguments_json = arguments_json,
+        } }, .{
+            .agent_role = .main,
+            .workspace_root = "/tmp/workspace",
+            .session_id = "main-session",
+            .turn_id = 5,
+        });
+
+        // One record, one line, and still decodable: the bad arguments cost
+        // themselves rather than the whole record.
+        try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, output.written(), "\n"));
+        var parsed = try std.json.parseFromSlice(
+            std.json.Value,
+            std.testing.allocator,
+            output.written(),
+            .{},
+        );
+        defer parsed.deinit();
+        try std.testing.expectEqualStrings("PreToolUse", parsed.value.object.get("event").?.string);
+        const payload = parsed.value.object.get("payload").?.object;
+        try std.testing.expectEqualStrings("terminal", payload.get("tool_name").?.string);
+        try std.testing.expectEqual(@as(usize, 0), payload.get("arguments").?.object.count());
+    }
+
+    // Sound arguments still pass through, including escaped control bytes,
+    // nesting, and the whitespace the compactor removes.
+    const framable = [_][]const u8{
+        "{\"command\":\"printf hi\\nrm\"}",
+        "{ \"a\" : [ 1 , { \"b\" : \"c\" } ] }",
+        "{\"a\":\"brace } and bracket ] inside a string\"}",
+        "{\"a\":\"trailing backslash \\\\\"}",
+    };
+    for (framable) |arguments_json| {
+        try std.testing.expect(compactJsonIsAdmissible(std.testing.allocator, arguments_json));
+    }
+
+    // Deep but sound nesting is admitted; the emitter declines what it
+    // cannot prove, not what is merely large.
+    var deep: [130]u8 = undefined;
+    @memset(deep[0..65], '[');
+    @memset(deep[65..130], ']');
+    try std.testing.expect(compactJsonIsAdmissible(std.testing.allocator, &deep));
 }
