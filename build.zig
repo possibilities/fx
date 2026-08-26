@@ -135,11 +135,12 @@ pub fn build(b: *std.Build) void {
             "a settled first line freezes the title and lets the stream finish",
             "a stream without a line break freezes the title at the capture bound",
             "invocation root authority stays fixed after the selected path is rebound",
+            "skill search includes invocation-only roots",
             "external editor returns valid text and treats nonzero exit as cancellation",
             "app_input_runtime ctrl+t invokes upgrade shortcut without composer mutation",
             "app_input_runtime ctrl+g invokes external editor without composer mutation",
             "pending resume projection accepts candidate row below base content through recovery",
-            "provider-local immediate usage bypasses durable Gateway observations",
+            "provider-local exact usage reaches session accounting",
         },
     });
     const run_fxnk_gate_tests = b.addRunArtifact(fxnk_gate_tests);

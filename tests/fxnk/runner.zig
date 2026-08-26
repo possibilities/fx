@@ -8,7 +8,7 @@ const expected_names = [_][]const u8{
     "core.tooling.tool_runtime.test.ADE terminal mutation completion requires exit-zero proof for durable starts",
     "core.tooling.tool_runtime.test.ADE durable terminal start classifies the declared working directory",
     "core.tooling.tool_runtime.test.ADE terminal root tracking follows only filesystem-write classification",
-    "core.agent.runtime.gateway_step.test.provider-local immediate usage bypasses durable Gateway observations",
+    "core.agent.runtime.gateway_step.test.provider-local exact usage reaches session accounting",
     "core.app.app_input_runtime.test.app_input_runtime ctrl+t invokes upgrade shortcut without composer mutation",
     "core.app.app_input_runtime.test.app_input_runtime ctrl+g invokes external editor without composer mutation",
     "core.app.app_lifecycle.test.loadStartupState lets FX_EFFORT win over the configured effort without rewriting it",
@@ -20,6 +20,7 @@ const expected_names = [_][]const u8{
     "core.session.session_naming.test.a settled first line freezes the title and lets the stream finish",
     "core.session.session_naming.test.a stream without a line break freezes the title at the capture bound",
     "core.skills.skill_runtime.test.invocation root authority stays fixed after the selected path is rebound",
+    "tools.skills.skill_search.test.skill search includes invocation-only roots",
     "ui.transcript.runtime.test.pending resume projection accepts candidate row below base content through recovery",
 };
 
