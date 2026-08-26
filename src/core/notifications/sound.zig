@@ -119,7 +119,7 @@ const Platform = enum {
 };
 
 const SpawnFn = *const fn (?*anyopaque, []const []const u8) std.process.SpawnError!Process;
-const StartWaiterFn = *const fn (?*anyopaque, Process) std.Thread.SpawnError!void;
+const StartWaiterFn = *const fn (?*anyopaque, *Player, Process) std.Thread.SpawnError!void;
 const SoundPathFn = *const fn (?*anyopaque, Cue) ?[]const u8;
 
 const Dependencies = struct {
@@ -152,6 +152,8 @@ const Dependencies = struct {
 pub const Player = struct {
     bell: BellSink,
     dependencies: Dependencies = Dependencies.production(),
+    in_flight_mutex: std.Io.Mutex = .init,
+    in_flight: ?Process = null,
 
     pub fn init(bell: BellSink) Player {
         return .{ .bell = bell };
@@ -174,39 +176,54 @@ pub const Player = struct {
     }
 
     fn playMacos(self: *Player, cue: Cue, bell_on_failure: bool) void {
-        const sound_path = self.dependencies.sound_path(self.dependencies.ctx, cue) orelse {
-            if (bell_on_failure) self.emitBell();
-            return;
+        const process = claimed: {
+            self.in_flight_mutex.lockUncancelable(io_mod.getIo());
+            defer self.in_flight_mutex.unlock(io_mod.getIo());
+            if (self.in_flight != null) return;
+
+            const sound_path = self.dependencies.sound_path(self.dependencies.ctx, cue) orelse {
+                if (bell_on_failure) self.emitBell();
+                return;
+            };
+            const argv = [_][]const u8{ macos_player_path, sound_path };
+            const process = self.dependencies.spawn(
+                self.dependencies.ctx,
+                &argv,
+            ) catch |err| {
+                if (bell_on_failure) {
+                    debug_trace.logf(
+                        "notifications",
+                        "sound spawn failed err={s}; using terminal bell",
+                        .{@errorName(err)},
+                    );
+                    self.emitBell();
+                } else {
+                    debug_trace.logf(
+                        "notifications",
+                        "sound spawn failed err={s}; terminal bell already emitted",
+                        .{@errorName(err)},
+                    );
+                }
+                return;
+            };
+            self.in_flight = process;
+            break :claimed process;
         };
-        const argv = [_][]const u8{ macos_player_path, sound_path };
-        const process = self.dependencies.spawn(
-            self.dependencies.ctx,
-            &argv,
-        ) catch |err| {
-            if (bell_on_failure) {
-                debug_trace.logf(
-                    "notifications",
-                    "sound spawn failed err={s}; using terminal bell",
-                    .{@errorName(err)},
-                );
-                self.emitBell();
-            } else {
-                debug_trace.logf(
-                    "notifications",
-                    "sound spawn failed err={s}; terminal bell already emitted",
-                    .{@errorName(err)},
-                );
-            }
-            return;
-        };
-        self.dependencies.start_waiter(self.dependencies.ctx, process) catch |err| {
+        self.dependencies.start_waiter(self.dependencies.ctx, self, process) catch |err| {
             debug_trace.logf(
                 "notifications",
                 "sound waiter start failed err={s}; reaping synchronously",
                 .{@errorName(err)},
             );
-            process.reap();
+            self.reapAndClear(process);
         };
+    }
+
+    fn reapAndClear(self: *Player, process: Process) void {
+        process.reap();
+        self.in_flight_mutex.lockUncancelable(io_mod.getIo());
+        defer self.in_flight_mutex.unlock(io_mod.getIo());
+        self.in_flight = null;
     }
 
     fn emitBell(self: *Player) void {
@@ -266,7 +283,7 @@ fn unsupportedSpawnSoundProcess(_: ?*anyopaque, _: []const []const u8) std.proce
     return error.SystemResources;
 }
 
-fn unsupportedStartWaiter(_: ?*anyopaque, _: Process) std.Thread.SpawnError!void {
+fn unsupportedStartWaiter(_: ?*anyopaque, _: *Player, _: Process) std.Thread.SpawnError!void {
     return error.SystemResources;
 }
 
@@ -287,8 +304,8 @@ fn spawnSoundProcess(_: ?*anyopaque, argv: []const []const u8) std.process.Spawn
     };
 }
 
-fn startDetachedWaiter(_: ?*anyopaque, process: Process) std.Thread.SpawnError!void {
-    const thread = try std.Thread.spawn(.{}, Process.reap, .{process});
+fn startDetachedWaiter(_: ?*anyopaque, player: *Player, process: Process) std.Thread.SpawnError!void {
+    const thread = try std.Thread.spawn(.{}, Player.reapAndClear, .{ player, process });
     thread.detach();
 }
 
@@ -302,9 +319,11 @@ const TestState = struct {
     sound_path_count: usize = 0,
     fail_spawn: bool = false,
     fail_waiter: bool = false,
+    hold_waiter: bool = false,
     no_sound_path: bool = false,
     argv_matches: bool = false,
     last_cue: ?Cue = null,
+    held_process: ?Process = null,
 
     fn emitBell(raw: *anyopaque) void {
         const self: *TestState = @ptrCast(@alignCast(raw));
@@ -329,11 +348,21 @@ const TestState = struct {
         return .{ .ctx = self, .wait = reap };
     }
 
-    fn startWaiter(raw: ?*anyopaque, process: Process) std.Thread.SpawnError!void {
+    fn startWaiter(raw: ?*anyopaque, player: *Player, process: Process) std.Thread.SpawnError!void {
         const self: *TestState = @ptrCast(@alignCast(raw.?));
         self.waiter_count += 1;
         if (self.fail_waiter) return error.ThreadQuotaExceeded;
-        process.reap();
+        if (self.hold_waiter) {
+            self.held_process = process;
+            return;
+        }
+        player.reapAndClear(process);
+    }
+
+    fn finishHeld(self: *TestState, player: *Player) void {
+        const process = self.held_process orelse return;
+        self.held_process = null;
+        player.reapAndClear(process);
     }
 
     fn reap(raw: *anyopaque) void {
@@ -479,6 +508,29 @@ test "macOS attention emits one terminal bell and plays the chime" {
     try std.testing.expectEqual(@as(usize, 1), state.waiter_count);
     try std.testing.expectEqual(@as(usize, 1), state.reap_count);
     try std.testing.expectEqual(@as(usize, 1), state.bell_count);
+}
+
+test "macOS attention keeps one sound in flight while emitting every terminal bell" {
+    var state = TestState{ .hold_waiter = true };
+    var player = testPlayer(&state, .macos);
+
+    player.playAttention(.success);
+    player.playAttention(.bloom);
+    player.playAttention(.@"error");
+
+    try std.testing.expectEqual(@as(usize, 3), state.bell_count);
+    try std.testing.expectEqual(@as(usize, 1), state.sound_path_count);
+    try std.testing.expectEqual(@as(usize, 1), state.spawn_count);
+    try std.testing.expectEqual(@as(usize, 1), state.waiter_count);
+    try std.testing.expectEqual(@as(usize, 0), state.reap_count);
+
+    state.finishHeld(&player);
+    player.playAttention(.release);
+
+    try std.testing.expectEqual(@as(usize, 4), state.bell_count);
+    try std.testing.expectEqual(@as(usize, 2), state.spawn_count);
+    try std.testing.expectEqual(@as(usize, 2), state.waiter_count);
+    try std.testing.expectEqual(@as(usize, 1), state.reap_count);
 }
 
 test "macOS attention emits only one bell when the chime is unavailable" {
