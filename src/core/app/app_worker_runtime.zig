@@ -166,6 +166,62 @@ fn batchSegmentEndsInterrupted(events: []const WorkerEvent) bool {
 
 pub fn Runtime(comptime App: type) type {
     return struct {
+        const QuestionPresentationObserver = struct {
+            app: *App,
+
+            fn interface(self: *@This()) worker_runtime.QuestionPresentationObserver {
+                return .{
+                    .context = self,
+                    .observe_fn = observe,
+                };
+            }
+
+            fn observe(
+                raw: *anyopaque,
+                turn_id: u64,
+                source: worker_runtime.QuestionPromptSource,
+            ) void {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                if (comptime @hasDecl(App, "dispatchAttentionRequired")) {
+                    self.app.dispatchAttentionRequired(
+                        turn_id,
+                        switch (source) {
+                            .agent_question, .mcp_elicitation => .question,
+                            .route_recovery => .route_recovery,
+                        },
+                        null,
+                    );
+                }
+            }
+        };
+
+        fn presentQuestionAttention(
+            app: *App,
+            source: worker_runtime.QuestionPromptSource,
+        ) bool {
+            const Worker = switch (@typeInfo(@TypeOf(app.worker))) {
+                .pointer => |pointer| pointer.child,
+                else => @TypeOf(app.worker),
+            };
+            if (comptime @hasDecl(Worker, "presentPendingQuestionBatchObserved")) {
+                var observation = QuestionPresentationObserver{ .app = app };
+                return app.worker.presentPendingQuestionBatchObserved(
+                    observation.interface(),
+                );
+            }
+            if (comptime @hasDecl(App, "dispatchAttentionRequired")) {
+                app.dispatchAttentionRequired(
+                    app.worker.activeTurnId(),
+                    switch (source) {
+                        .agent_question, .mcp_elicitation => .question,
+                        .route_recovery => .route_recovery,
+                    },
+                    null,
+                );
+            }
+            return true;
+        }
+
         fn cancelledToolStartAdmission(
             presenter: activity_runtime.LifecyclePresenter,
             id: types.ToolLifecycleId,
@@ -829,15 +885,12 @@ pub fn Runtime(comptime App: type) type {
                                 return err;
                             };
                             if (!was_active and app.question_prompt.isActive()) {
-                                app.shell.render_requests.request(.modal);
-                                if (comptime @hasDecl(App, "dispatchAttentionRequired")) {
-                                    app.dispatchAttentionRequired(
-                                        app.worker.activeTurnId(),
-                                        switch (question_snapshot.source) {
-                                            .agent_question, .mcp_elicitation => .question,
-                                            .route_recovery => .route_recovery,
-                                        },
-                                        null,
+                                if (presentQuestionAttention(app, question_snapshot.source)) {
+                                    app.shell.render_requests.request(.modal);
+                                } else {
+                                    app.question_prompt.discard(
+                                        app.alloc,
+                                        "worker_cleared_before_presentation",
                                     );
                                 }
                             }
@@ -1186,6 +1239,8 @@ const FakeWorker = struct {
     pending_permission_review: ?*const diff_mod.FileReview = null,
     pending_question: bool = false,
     pending_question_source: worker_runtime.QuestionPromptSource = .agent_question,
+    question_presentation_allowed: bool = true,
+    question_presentation_count: usize = 0,
     active_turn_id: u64 = 1,
     propagated_history_turns: usize = 0,
     propagated_grants: usize = 0,
@@ -1271,6 +1326,20 @@ const FakeWorker = struct {
         return if (self.pending_question) FakeQuestionSnapshot{
             .source = self.pending_question_source,
         } else null;
+    }
+
+    fn presentPendingQuestionBatchObserved(
+        self: *FakeWorker,
+        observer: worker_runtime.QuestionPresentationObserver,
+    ) bool {
+        if (!self.pending_question or !self.question_presentation_allowed) return false;
+        self.question_presentation_count += 1;
+        observer.observe_fn(
+            observer.context,
+            self.active_turn_id,
+            self.pending_question_source,
+        );
+        return true;
     }
 
     fn syncQueuedPromptModel(self: *FakeWorker, alloc: std.mem.Allocator, model: []const u8) !void {
@@ -3032,6 +3101,22 @@ test "core.app_worker_runtime emits question and route recovery attention only f
     try invalid.worker.pushEvent(std.heap.c_allocator, .question_requested);
     try Runtime(FakeApp).tick(&invalid, noopTaskCompletion, NoopBridge.handlers(&invalid));
     try std.testing.expectEqual(@as(usize, 0), invalid.attention_count);
+}
+
+test "core.app_worker_runtime drops a question resolved before attention presentation" {
+    var app = FakeApp.init(std.testing.allocator);
+    defer app.deinit();
+    app.worker.processing = true;
+    app.worker.pending_question = true;
+    app.worker.question_presentation_allowed = false;
+    try app.worker.pushEvent(std.heap.c_allocator, .question_requested);
+
+    try Runtime(FakeApp).tick(&app, noopTaskCompletion, NoopBridge.handlers(&app));
+
+    try std.testing.expectEqual(@as(usize, 0), app.worker.question_presentation_count);
+    try std.testing.expectEqual(@as(usize, 0), app.attention_count);
+    try std.testing.expect(!app.question_prompt.isActive());
+    try std.testing.expectEqual(@as(usize, 1), app.question_prompt.clear_count);
 }
 
 test "core.app_worker_runtime syncState clears a completed question" {

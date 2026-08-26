@@ -161,16 +161,20 @@ fn reduce(
     event: Event,
     attention_kind: ?hooks.AttentionKind,
 ) Snapshot {
-    _ = previous;
     return switch (event) {
         .fx_started, .post_turn_end, .fx_stopped => .{},
-        .prompt_queued, .turn_started, .pre_tool_use, .stop, .attention_resolved => .{
+        .prompt_queued, .turn_started, .pre_tool_use, .stop => .{
             .agent_state = .working,
         },
         .attention_required => .{
             .agent_state = .blocked,
             .attention_kind = attention_kind,
         },
+        .attention_resolved => if (previous.agent_state == .blocked and
+            previous.attention_kind == attention_kind)
+            .{ .agent_state = .working }
+        else
+            previous,
     };
 }
 
@@ -192,6 +196,31 @@ test "lifecycle reducer carries attention through resolution and turn end" {
     try std.testing.expect(resumed.attention_kind == null);
     _ = reducer.transition(.main, .post_turn_end, null);
     try std.testing.expectEqual(AgentState.idle, reducer.snapshot(.main).agent_state);
+}
+
+test "lifecycle reducer ignores unmatched attention resolution" {
+    var reducer = Reducer{};
+    reducer.init(std.testing.allocator);
+    defer reducer.deinit();
+
+    _ = reducer.transition(.main, .prompt_queued, null);
+    const absent = reducer.transition(.main, .attention_resolved, .question);
+    try std.testing.expect(!absent.changed());
+    try std.testing.expectEqual(AgentState.working, absent.current.agent_state);
+
+    _ = reducer.transition(.main, .attention_required, .route_recovery);
+    const wrong_kind = reducer.transition(.main, .attention_resolved, .question);
+    try std.testing.expect(!wrong_kind.changed());
+    try std.testing.expectEqual(AgentState.blocked, wrong_kind.current.agent_state);
+    try std.testing.expectEqual(
+        @as(?hooks.AttentionKind, .route_recovery),
+        wrong_kind.current.attention_kind,
+    );
+
+    const matching = reducer.transition(.main, .attention_resolved, .route_recovery);
+    try std.testing.expect(matching.changed());
+    try std.testing.expectEqual(AgentState.working, matching.current.agent_state);
+    try std.testing.expect(matching.current.attention_kind == null);
 }
 
 test "lifecycle reducer keeps main and subagent states independent" {

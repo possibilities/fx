@@ -225,6 +225,12 @@ releases the waiting agent only after the lifecycle projection returns. A
 subsequent `Stop` or `PostTurnEnd` from that agent therefore cannot overtake its
 `AttentionResolved` record.
 
+`AttentionResolved` is not synthesized when no decision was accepted. If an
+orderly turn or process shutdown abandons active attention, `PostTurnEnd` or
+`FxStopped` closes that state instead; the terminal record's snapshot clears
+the attention, and no later resolution record follows. Process exit remains
+the final fallback when an orderly terminal record cannot be delivered.
+
 ### `FxStopped`
 
 The last attempted event during an orderly shutdown. Fx sends it after the

@@ -166,13 +166,21 @@ pub fn Runtime(comptime App: type) type {
         ) hooks.HandlerError!void {
             const app: *App = @ptrCast(@alignCast(raw));
             const agent = lifecycle_state.Agent.fromScope(input.invocation.scope) orelse return;
+            var projected = false;
             {
                 app.lifecycle_state.lockProjection();
                 defer app.lifecycle_state.unlockProjection();
-                _ = app.lifecycle_state.transition(agent, .attention_required, input.kind);
-                app.ade_events.reportAttentionRequired(input);
+                const update = app.lifecycle_state.transition(
+                    agent,
+                    .attention_required,
+                    input.kind,
+                );
+                if (update.changed()) {
+                    app.ade_events.reportAttentionRequired(input);
+                    projected = true;
+                }
             }
-            if (app.herdr.enabled and input.presented_interactively) {
+            if (projected and app.herdr.enabled and input.presented_interactively) {
                 app.herdr.reportState(.blocked, attentionStatus(input.kind));
             }
         }
@@ -183,13 +191,21 @@ pub fn Runtime(comptime App: type) type {
         ) hooks.HandlerError!void {
             const app: *App = @ptrCast(@alignCast(raw));
             const agent = lifecycle_state.Agent.fromScope(input.invocation.scope) orelse return;
+            var projected = false;
             {
                 app.lifecycle_state.lockProjection();
                 defer app.lifecycle_state.unlockProjection();
-                _ = app.lifecycle_state.transition(agent, .attention_resolved, input.kind);
-                app.ade_events.reportAttentionResolved(input);
+                const update = app.lifecycle_state.transition(
+                    agent,
+                    .attention_resolved,
+                    input.kind,
+                );
+                if (update.changed()) {
+                    app.ade_events.reportAttentionResolved(input);
+                    projected = true;
+                }
             }
-            if (app.herdr.enabled and input.presented_interactively) {
+            if (projected and app.herdr.enabled and input.presented_interactively) {
                 app.herdr.reportState(.working, null);
             }
         }
@@ -413,6 +429,117 @@ test "lifecycle coordinator projects full ADE state and interactive Herdr state 
         lifecycle_state.AgentState.working,
         app.lifecycle_state.snapshot(.{ .subagent_session = "session" }).agent_state,
     );
+}
+
+test "lifecycle coordinator suppresses unmatched attention resolution for ADE and Herdr" {
+    const TestApp = struct {
+        alloc: std.mem.Allocator,
+        workspace_root: []const u8 = "/tmp/workspace",
+        lifecycle_runtime: hooks.Runtime,
+        lifecycle_state: lifecycle_state.Reducer = .{},
+        ade_events: RecordingAdeClient = .{},
+        herdr: RecordingClient = .{},
+    };
+    const Provider = Runtime(TestApp);
+
+    var app = TestApp{
+        .alloc = std.testing.allocator,
+        .lifecycle_runtime = hooks.Runtime.init(std.testing.allocator),
+    };
+    defer app.lifecycle_runtime.deinit();
+    defer Provider.deinit(&app);
+    try Provider.configure(&app, "session-42");
+    const view = app.lifecycle_runtime.freeze();
+
+    Provider.reportPromptQueued(&app);
+    Provider.reportPromptWorking(&app);
+    const ade_count_before = app.ade_events.event_count;
+    const herdr_count_before = app.herdr.report_count;
+    view.runAttentionResolved(.{
+        .invocation = testInvocation(.interactive),
+        .kind = .question,
+        .presented_interactively = true,
+    });
+
+    try std.testing.expectEqual(ade_count_before, app.ade_events.event_count);
+    try std.testing.expectEqual(herdr_count_before, app.herdr.report_count);
+    try std.testing.expectEqual(
+        lifecycle_state.AgentState.working,
+        app.lifecycle_state.snapshot(.main).agent_state,
+    );
+
+    view.runAttentionRequired(.{
+        .invocation = testInvocation(.interactive),
+        .kind = .question,
+        .presented_interactively = true,
+    });
+    view.runAttentionResolved(.{
+        .invocation = testInvocation(.interactive),
+        .kind = .question,
+        .presented_interactively = true,
+    });
+    try std.testing.expectEqual(ade_count_before + 2, app.ade_events.event_count);
+    try std.testing.expectEqual(herdr_count_before + 2, app.herdr.report_count);
+    try std.testing.expectEqual(
+        RecordingAdeClient.Event.attention_required,
+        app.ade_events.events[ade_count_before],
+    );
+    try std.testing.expectEqual(
+        RecordingAdeClient.Event.attention_resolved,
+        app.ade_events.events[ade_count_before + 1],
+    );
+    try expectReport(app.herdr.reports[herdr_count_before], .blocked, "question");
+    try expectReport(app.herdr.reports[herdr_count_before + 1], .working, null);
+}
+
+test "terminal turn closure clears unresolved attention without a synthetic resolution" {
+    const TestApp = struct {
+        alloc: std.mem.Allocator,
+        workspace_root: []const u8 = "/tmp/workspace",
+        lifecycle_runtime: hooks.Runtime,
+        lifecycle_state: lifecycle_state.Reducer = .{},
+        ade_events: RecordingAdeClient = .{},
+        herdr: RecordingClient = .{},
+    };
+    const Provider = Runtime(TestApp);
+
+    var app = TestApp{
+        .alloc = std.testing.allocator,
+        .lifecycle_runtime = hooks.Runtime.init(std.testing.allocator),
+    };
+    defer app.lifecycle_runtime.deinit();
+    defer Provider.deinit(&app);
+    try Provider.configure(&app, "session-42");
+    const view = app.lifecycle_runtime.freeze();
+
+    Provider.reportPromptQueued(&app);
+    Provider.reportPromptWorking(&app);
+    view.runAttentionRequired(.{
+        .invocation = testInvocation(.interactive),
+        .kind = .question,
+        .presented_interactively = true,
+    });
+    view.runPostTurnEnd(.{
+        .invocation = testInvocation(.interactive),
+        .outcome = .interrupted,
+        .provider_disposition = .interrupted,
+    });
+
+    try std.testing.expectEqual(@as(usize, 4), app.ade_events.event_count);
+    try std.testing.expectEqual(
+        RecordingAdeClient.Event.attention_required,
+        app.ade_events.events[2],
+    );
+    try std.testing.expectEqual(
+        RecordingAdeClient.Event.post_turn_end,
+        app.ade_events.events[3],
+    );
+    try std.testing.expectEqual(@as(usize, 4), app.herdr.report_count);
+    try expectReport(app.herdr.reports[2], .blocked, "question");
+    try expectReport(app.herdr.reports[3], .idle, null);
+    const snapshot = app.lifecycle_state.snapshot(.main);
+    try std.testing.expectEqual(lifecycle_state.AgentState.idle, snapshot.agent_state);
+    try std.testing.expect(snapshot.attention_kind == null);
 }
 
 test "accepted decision projects resolution before an immediately finishing worker" {
