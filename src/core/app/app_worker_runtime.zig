@@ -472,28 +472,23 @@ pub fn Runtime(comptime App: type) type {
                 app.shell.render_requests.request(.modal);
             }
             if (!was_approval_active and app.approval_prompt.isActive()) {
-                if (comptime @hasDecl(App, "dispatchAttentionRequired")) {
-                    app.dispatchAttentionRequired(snapshot.active_turn_id, .permission);
-                }
-                var attributed_to_child = false;
+                var child_session_id: ?[]const u8 = null;
                 if (child_pending_request) |child_request| {
                     if (comptime @hasDecl(
                         @TypeOf(app.subagents),
                         "mainApprovalBinding",
-                    ) and @hasDecl(App, "reportAdeSubagentAttentionRequired")) {
+                    )) {
                         if (app.subagents.mainApprovalBinding(child_request.id)) |binding| {
-                            app.reportAdeSubagentAttentionRequired(
-                                binding.child_id,
-                                .permission,
-                            );
-                            attributed_to_child = true;
+                            child_session_id = binding.child_id;
                         }
                     }
                 }
-                if (!attributed_to_child and
-                    comptime @hasDecl(App, "reportAdeMainAttentionRequired"))
-                {
-                    app.reportAdeMainAttentionRequired(snapshot.active_turn_id, .permission);
+                if (comptime @hasDecl(App, "dispatchAttentionRequired")) {
+                    app.dispatchAttentionRequired(
+                        snapshot.active_turn_id,
+                        .permission,
+                        child_session_id,
+                    );
                 }
             }
 
@@ -842,15 +837,7 @@ pub fn Runtime(comptime App: type) type {
                                             .agent_question, .mcp_elicitation => .question,
                                             .route_recovery => .route_recovery,
                                         },
-                                    );
-                                }
-                                if (comptime @hasDecl(App, "reportAdeMainAttentionRequired")) {
-                                    app.reportAdeMainAttentionRequired(
-                                        app.worker.activeTurnId(),
-                                        switch (question_snapshot.source) {
-                                            .agent_question, .mcp_elicitation => .question,
-                                            .route_recovery => .route_recovery,
-                                        },
+                                        null,
                                     );
                                 }
                             }
@@ -1755,27 +1742,16 @@ const FakeApp = struct {
         self: *FakeApp,
         turn_id: u64,
         kind: @import("../hooks/hooks.zig").AttentionKind,
+        child_session_id: ?[]const u8,
     ) void {
         self.attention_count += 1;
         self.last_attention_turn_id = turn_id;
         self.last_attention_kind = kind;
+        if (child_session_id) |session_id| {
+            self.child_attention_count += 1;
+            self.last_attention_child_session_id = session_id;
+        }
     }
-
-    fn reportAdeSubagentAttentionRequired(
-        self: *FakeApp,
-        child_session_id: []const u8,
-        kind: @import("../hooks/hooks.zig").AttentionKind,
-    ) void {
-        self.child_attention_count += 1;
-        self.last_attention_child_session_id = child_session_id;
-        self.last_attention_kind = kind;
-    }
-
-    fn reportAdeMainAttentionRequired(
-        _: *FakeApp,
-        _: u64,
-        _: @import("../hooks/hooks.zig").AttentionKind,
-    ) void {}
 };
 
 fn noopTaskCompletion(ctx: *anyopaque, completion: task_helpers.TaskCompletion) void {

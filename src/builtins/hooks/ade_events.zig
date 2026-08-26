@@ -11,6 +11,7 @@ const io_mod = @import("../../core/shared/io.zig");
 const debug_trace = @import("../../core/shared/debug_trace.zig");
 const host_target = @import("../../core/hosts/target.zig");
 const jsonrpc = @import("../../acp/jsonrpc.zig");
+const lifecycle_state = @import("lifecycle_state.zig");
 
 pub const schema_version: u8 = 1;
 
@@ -28,6 +29,7 @@ const Event = enum {
     stop,
     post_turn_end,
     attention_required,
+    attention_resolved,
     fx_stopped,
 
     fn wireName(self: Event) []const u8 {
@@ -40,6 +42,7 @@ const Event = enum {
             .stop => "Stop",
             .post_turn_end => "PostTurnEnd",
             .attention_required => "AttentionRequired",
+            .attention_resolved => "AttentionResolved",
             .fx_stopped => "FxStopped",
         };
     }
@@ -54,6 +57,8 @@ const Context = struct {
     parent_session_id: ?[]const u8 = null,
     subagent_id: ?u64 = null,
     turn_id: ?u64 = null,
+    agent_state: lifecycle_state.AgentState = .idle,
+    attention_kind: ?hooks.AttentionKind = null,
 };
 
 const Payload = union(Event) {
@@ -81,6 +86,7 @@ const Payload = union(Event) {
         provider_disposition: ?[]const u8,
     },
     attention_required: struct { kind: []const u8 },
+    attention_resolved: struct { kind: []const u8 },
     fx_stopped,
 };
 
@@ -106,6 +112,7 @@ pub const Client = struct {
     queued_bytes: usize = 0,
     stopping: bool = false,
     sender_thread: if (host_target.is_wasm) void else ?std.Thread = if (host_target.is_wasm) {} else null,
+    lifecycle: ?*lifecycle_state.Reducer = null,
 
     pub fn shouldEnable(socket_path: ?[]const u8, instance_id: ?[]const u8) bool {
         const path = socket_path orelse return false;
@@ -118,6 +125,7 @@ pub const Client = struct {
         alloc: std.mem.Allocator,
         workspace_root: []const u8,
         main_session_id: ?[]const u8,
+        lifecycle: *lifecycle_state.Reducer,
     ) void {
         if (comptime host_target.is_wasm or builtin.os.tag == .windows) return;
         const socket_path = io_mod.getenv("FX_ADE_SOCKET_PATH");
@@ -136,6 +144,7 @@ pub const Client = struct {
             instance_id.?,
             workspace_root,
             main_session_id,
+            lifecycle,
         ) catch |err| {
             debug_trace.logf("ade_events", "initialization failed err={s}", .{@errorName(err)});
         };
@@ -148,6 +157,7 @@ pub const Client = struct {
         instance_id: []const u8,
         workspace_root: []const u8,
         main_session_id: ?[]const u8,
+        lifecycle: *lifecycle_state.Reducer,
     ) !void {
         const path_copy = try alloc.dupe(u8, socket_path);
         errdefer alloc.free(path_copy);
@@ -166,6 +176,7 @@ pub const Client = struct {
             .instance_id = instance_copy,
             .workspace_root = workspace_copy,
             .main_session_id = session_copy,
+            .lifecycle = lifecycle,
         };
         self.sender_thread = std.Thread.spawn(.{}, senderMain, .{self}) catch |err| {
             self.freeConfiguration();
@@ -250,6 +261,12 @@ pub const Client = struct {
         } }, input.invocation);
     }
 
+    pub fn reportAttentionResolved(self: *Client, input: hooks.AttentionResolvedInput) void {
+        self.reportInvocation(.{ .attention_resolved = .{
+            .kind = @tagName(input.kind),
+        } }, input.invocation);
+    }
+
     fn reportInvocation(self: *Client, payload: Payload, invocation: hooks.Invocation) void {
         if (!self.enabled) return;
         const role = roleForScope(invocation.scope.kind) orelse return;
@@ -265,6 +282,7 @@ pub const Client = struct {
                 invocation.scope.workspace_root,
             );
         }
+        const snapshot = self.stateFor(role, invocation.scope.session_id, invocation.scope.subagent_id);
         self.emitLocked(payload, .{
             .agent_role = role,
             .workspace_root = invocation.scope.workspace_root,
@@ -272,6 +290,8 @@ pub const Client = struct {
             .parent_session_id = if (role == .subagent) self.main_session_id else null,
             .subagent_id = invocation.scope.subagent_id,
             .turn_id = invocation.turn_id,
+            .agent_state = snapshot.agent_state,
+            .attention_kind = snapshot.attention_kind,
         });
     }
 
@@ -288,6 +308,7 @@ pub const Client = struct {
             null;
         const previous_session_id = self.main_session_id;
         self.main_session_id = next_session_id;
+        const snapshot = self.stateFor(.main, self.main_session_id, null);
         self.emitLocked(.{ .session_changed = .{
             .previous_session_id = previous_session_id,
             .session_id = self.main_session_id,
@@ -295,17 +316,41 @@ pub const Client = struct {
             .agent_role = .main,
             .workspace_root = workspace_root,
             .session_id = self.main_session_id,
+            .agent_state = snapshot.agent_state,
+            .attention_kind = snapshot.attention_kind,
         });
         if (previous_session_id) |session_id| alloc.free(session_id);
     }
 
     fn mainContext(self: *const Client, turn_id: ?u64) Context {
+        const snapshot = self.stateFor(.main, self.main_session_id, null);
         return .{
             .agent_role = .main,
             .workspace_root = self.workspace_root,
             .session_id = self.main_session_id,
             .turn_id = turn_id,
+            .agent_state = snapshot.agent_state,
+            .attention_kind = snapshot.attention_kind,
         };
+    }
+
+    fn stateFor(
+        self: *const Client,
+        role: AgentRole,
+        session_id: ?[]const u8,
+        subagent_id: ?u64,
+    ) lifecycle_state.Snapshot {
+        const lifecycle = self.lifecycle orelse return .{};
+        const agent: lifecycle_state.Agent = switch (role) {
+            .main => .main,
+            .subagent => if (session_id) |value|
+                .{ .subagent_session = value }
+            else if (subagent_id) |value|
+                .{ .subagent_id = value }
+            else
+                .anonymous_subagent,
+        };
+        return lifecycle.snapshot(agent);
     }
 
     fn enqueue(self: *Client, payload: Payload, context: Context) void {
@@ -426,80 +471,6 @@ pub const Client = struct {
     }
 };
 
-pub fn Runtime(comptime App: type) type {
-    return struct {
-        pub fn configure(
-            app: *App,
-            active_session_id: ?[]const u8,
-        ) !void {
-            app.ade_events.initFromEnv(
-                app.alloc,
-                app.workspace_root,
-                active_session_id,
-            );
-            if (!app.ade_events.enabled) return;
-
-            try app.lifecycle_runtime.registerTurnStarted(.{
-                .name = "fx.ade.turn_started",
-                .ctx = app,
-                .run = turnStarted,
-            });
-            try app.lifecycle_runtime.registerPreToolUse(.{
-                .name = "fx.ade.pre_tool_use",
-                .ctx = app,
-                .run = preToolUse,
-            });
-            try app.lifecycle_runtime.registerStop(.{
-                .name = "fx.ade.stop",
-                .ctx = app,
-                .run = stop,
-            });
-            try app.lifecycle_runtime.registerPostTurnEnd(.{
-                .name = "fx.ade.post_turn_end",
-                .ctx = app,
-                .run = postTurnEnd,
-            });
-        }
-
-        pub fn reportPromptQueued(app: *App) void {
-            app.ade_events.reportPromptQueued();
-        }
-
-        pub fn reportSessionChanged(app: *App, session_id: ?[]const u8) void {
-            app.ade_events.reportSessionChanged(session_id);
-        }
-
-        pub fn reportAttentionRequired(
-            app: *App,
-            input: hooks.AttentionRequiredInput,
-        ) void {
-            app.ade_events.reportAttentionRequired(input);
-        }
-
-        fn turnStarted(raw: *anyopaque, input: hooks.TurnStartedInput) hooks.HandlerError!void {
-            const app: *App = @ptrCast(@alignCast(raw));
-            app.ade_events.reportTurnStarted(input.invocation);
-        }
-
-        fn preToolUse(raw: *anyopaque, input: hooks.PreToolUseInput) hooks.HandlerError!hooks.PreToolUseAction {
-            const app: *App = @ptrCast(@alignCast(raw));
-            app.ade_events.reportPreToolUse(input);
-            return .continue_;
-        }
-
-        fn stop(raw: *anyopaque, input: hooks.StopInput) hooks.HandlerError!hooks.StopAction {
-            const app: *App = @ptrCast(@alignCast(raw));
-            app.ade_events.reportStop(input);
-            return .allow;
-        }
-
-        fn postTurnEnd(raw: *anyopaque, input: hooks.PostTurnEndInput) hooks.HandlerError!void {
-            const app: *App = @ptrCast(@alignCast(raw));
-            app.ade_events.reportPostTurnEnd(input);
-        }
-    };
-}
-
 fn roleForScope(scope: hooks.ScopeKind) ?AgentRole {
     return switch (scope) {
         .interactive => .main,
@@ -542,6 +513,7 @@ fn recordUpperBound(
             if (value.provider_disposition) |disposition| total +|= escapedUpperBound(disposition);
         },
         .attention_required => |value| total +|= escapedUpperBound(value.kind),
+        .attention_resolved => |value| total +|= escapedUpperBound(value.kind),
         .fx_started, .prompt_queued, .turn_started, .fx_stopped => {},
     }
     return total;
@@ -732,6 +704,13 @@ fn writeRecord(
     try writeOptionalInteger(writer, context.subagent_id);
     try writer.writeAll(",\"turn_id\":");
     try writeOptionalInteger(writer, context.turn_id);
+    try writer.writeAll(",\"agent_state\":");
+    try jsonrpc.writeJsonStr(@tagName(context.agent_state), writer);
+    try writer.writeAll(",\"attention_kind\":");
+    if (context.attention_kind) |kind|
+        try jsonrpc.writeJsonStr(@tagName(kind), writer)
+    else
+        try writer.writeAll("null");
     try writer.writeAll("},\"payload\":");
     try writePayload(writer, payload);
     try writer.writeAll("}\n");
@@ -776,6 +755,11 @@ fn writePayload(writer: *std.Io.Writer, payload: Payload) !void {
             try writer.writeAll("}");
         },
         .attention_required => |value| {
+            try writer.writeAll("{\"kind\":");
+            try jsonrpc.writeJsonStr(value.kind, writer);
+            try writer.writeAll("}");
+        },
+        .attention_resolved => |value| {
             try writer.writeAll("{\"kind\":");
             try jsonrpc.writeJsonStr(value.kind, writer);
             try writer.writeAll("}");
@@ -834,9 +818,33 @@ test "ADE feed serializes a main turn as one versioned JSON line" {
         "{\"schema_version\":1,\"sequence\":7,\"event\":\"TurnStarted\"," ++
             "\"instance_id\":\"pane-3\",\"context\":{\"agent_role\":\"main\"," ++
             "\"workspace_root\":\"/tmp/workspace\",\"session_id\":\"main-session\"," ++
-            "\"parent_session_id\":null,\"subagent_id\":null,\"turn_id\":42},\"payload\":{}}\n",
+            "\"parent_session_id\":null,\"subagent_id\":null,\"turn_id\":42," ++
+            "\"agent_state\":\"idle\",\"attention_kind\":null},\"payload\":{}}\n",
         output.written(),
     );
+}
+
+test "ADE feed serializes attention resolution with a working snapshot" {
+    var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+    try writeRecord(&output.writer, 12, "pane-3", .{ .attention_resolved = .{
+        .kind = "route_recovery",
+    } }, .{
+        .agent_role = .main,
+        .workspace_root = "/tmp/workspace",
+        .session_id = "main-session",
+        .turn_id = 42,
+        .agent_state = .working,
+    });
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, output.written(), .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("AttentionResolved", parsed.value.object.get("event").?.string);
+    const context = parsed.value.object.get("context").?.object;
+    try std.testing.expectEqualStrings("working", context.get("agent_state").?.string);
+    try std.testing.expect(context.get("attention_kind").? == .null);
+    const payload = parsed.value.object.get("payload").?.object;
+    try std.testing.expectEqualStrings("route_recovery", payload.get("kind").?.string);
 }
 
 test "ADE feed keeps child and parent identities on subagent tool events" {
@@ -864,6 +872,8 @@ test "ADE feed keeps child and parent identities on subagent tool events" {
     try std.testing.expectEqualStrings("child-session", context.get("session_id").?.string);
     try std.testing.expectEqualStrings("main-session", context.get("parent_session_id").?.string);
     try std.testing.expectEqual(@as(i64, 11), context.get("subagent_id").?.integer);
+    try std.testing.expectEqualStrings("idle", context.get("agent_state").?.string);
+    try std.testing.expect(context.get("attention_kind").? == .null);
     const arguments = parsed.value.object.get("payload").?.object.get("arguments").?.object;
     try std.testing.expectEqualStrings("a\"b", arguments.get("path").?.string);
 }
@@ -900,6 +910,9 @@ test "ADE scope projection excludes ask and ACP processes" {
 
 test "ADE session changes publish eagerly before child lifecycle context" {
     const alloc = std.testing.allocator;
+    var lifecycle = lifecycle_state.Reducer{};
+    lifecycle.init(alloc);
+    defer lifecycle.deinit();
     var client = Client{
         .enabled = true,
         .alloc = alloc,
@@ -907,11 +920,14 @@ test "ADE session changes publish eagerly before child lifecycle context" {
         .instance_id = try alloc.dupe(u8, "instance-4"),
         .workspace_root = try alloc.dupe(u8, "/tmp/workspace"),
         .main_session_id = try alloc.dupe(u8, "old-main"),
+        .lifecycle = &lifecycle,
     };
     defer client.deinit();
 
+    _ = lifecycle.transition(.main, .prompt_queued, null);
     client.reportPromptQueued();
     client.reportSessionChanged("new-main");
+    _ = lifecycle.transition(.{ .subagent_session = "child-session" }, .turn_started, null);
     client.reportTurnStarted(.{
         .scope = .{
             .kind = .subagent,
@@ -934,6 +950,11 @@ test "ADE session changes publish eagerly before child lifecycle context" {
             const context = parsed.value.object.get("context").?.object;
             try std.testing.expectEqualStrings("child-session", context.get("session_id").?.string);
             try std.testing.expectEqualStrings("new-main", context.get("parent_session_id").?.string);
+            try std.testing.expectEqualStrings("working", context.get("agent_state").?.string);
+            try std.testing.expect(context.get("attention_kind").? == .null);
+        } else {
+            const context = parsed.value.object.get("context").?.object;
+            try std.testing.expectEqualStrings("working", context.get("agent_state").?.string);
         }
     }
 }
@@ -1026,8 +1047,11 @@ test "ADE client shutdown stays bounded with a non-reading listener" {
     var server = try address.listen(io_mod.getIo(), .{});
     defer server.deinit(io_mod.getIo());
 
+    var lifecycle = lifecycle_state.Reducer{};
+    lifecycle.init(alloc);
+    defer lifecycle.deinit();
     var client: Client = .{};
-    try client.init(alloc, socket_path, "instance-5", "/tmp/workspace", "main-session");
+    try client.init(alloc, socket_path, "instance-5", "/tmp/workspace", "main-session", &lifecycle);
     errdefer client.deinit();
     const arguments = try alloc.alloc(u8, 1024 * 1024);
     defer alloc.free(arguments);
@@ -1051,152 +1075,4 @@ test "ADE client shutdown stays bounded with a non-reading listener" {
     const started = std.Io.Timestamp.now(io_mod.getIo(), .awake);
     client.deinit();
     try std.testing.expect(elapsedAwakeMillis(started) < 2_000);
-}
-
-const RecordingClient = struct {
-    enabled: bool = false,
-    events: [8]Event = undefined,
-    roles: [8]AgentRole = undefined,
-    count: usize = 0,
-    configured_workspace: ?[]const u8 = null,
-    configured_session: ?[]const u8 = null,
-    reported_session: ?[]const u8 = null,
-
-    fn initFromEnv(
-        self: *RecordingClient,
-        _: std.mem.Allocator,
-        workspace_root: []const u8,
-        main_session_id: ?[]const u8,
-    ) void {
-        self.enabled = true;
-        self.configured_workspace = workspace_root;
-        self.configured_session = main_session_id;
-    }
-
-    fn record(self: *RecordingClient, event: Event, invocation: hooks.Invocation) void {
-        const role = roleForScope(invocation.scope.kind) orelse return;
-        self.events[self.count] = event;
-        self.roles[self.count] = role;
-        self.count += 1;
-    }
-
-    fn reportTurnStarted(self: *RecordingClient, invocation: hooks.Invocation) void {
-        self.record(.turn_started, invocation);
-    }
-
-    fn reportPromptQueued(self: *RecordingClient) void {
-        self.events[self.count] = .prompt_queued;
-        self.roles[self.count] = .main;
-        self.count += 1;
-    }
-
-    fn reportSessionChanged(self: *RecordingClient, session_id: ?[]const u8) void {
-        self.reported_session = session_id;
-    }
-
-    fn reportPreToolUse(self: *RecordingClient, input: hooks.PreToolUseInput) void {
-        self.record(.pre_tool_use, input.invocation);
-    }
-
-    fn reportStop(self: *RecordingClient, input: hooks.StopInput) void {
-        self.record(.stop, input.invocation);
-    }
-
-    fn reportPostTurnEnd(self: *RecordingClient, input: hooks.PostTurnEndInput) void {
-        self.record(.post_turn_end, input.invocation);
-    }
-
-    fn reportAttentionRequired(self: *RecordingClient, input: hooks.AttentionRequiredInput) void {
-        self.record(.attention_required, input.invocation);
-    }
-};
-
-fn testInvocation(scope: hooks.ScopeKind) hooks.Invocation {
-    return .{
-        .scope = .{
-            .kind = scope,
-            .workspace_root = "/tmp/workspace",
-            .session_id = if (scope == .subagent) "child-session" else "main-session",
-        },
-        .turn_id = 42,
-    };
-}
-
-test "ADE runtime forwards main and subagent lifecycle without installing other process scopes" {
-    const TestApp = struct {
-        alloc: std.mem.Allocator,
-        workspace_root: []const u8,
-        lifecycle_runtime: hooks.Runtime,
-        ade_events: RecordingClient = .{},
-    };
-
-    var app = TestApp{
-        .alloc = std.testing.allocator,
-        .workspace_root = "/tmp/workspace",
-        .lifecycle_runtime = hooks.Runtime.init(std.testing.allocator),
-    };
-    defer app.lifecycle_runtime.deinit();
-    try Runtime(TestApp).configure(&app, "main-session");
-    try std.testing.expectEqualStrings("/tmp/workspace", app.ade_events.configured_workspace.?);
-    try std.testing.expectEqualStrings("main-session", app.ade_events.configured_session.?);
-    Runtime(TestApp).reportPromptQueued(&app);
-    Runtime(TestApp).reportSessionChanged(&app, "next-main-session");
-    try std.testing.expectEqualStrings("next-main-session", app.ade_events.reported_session.?);
-
-    const view = app.lifecycle_runtime.freeze();
-    view.runTurnStarted(.{ .invocation = testInvocation(.interactive) });
-    view.runTurnStarted(.{ .invocation = testInvocation(.subagent) });
-    view.runTurnStarted(.{ .invocation = testInvocation(.ask) });
-    var pre = try view.runPreToolUse(std.testing.allocator, .{
-        .invocation = testInvocation(.subagent),
-        .step_index = 1,
-        .call_id = "call",
-        .tool_name = "read_file",
-        .arguments_json = "{}",
-    });
-    defer pre.deinit(std.testing.allocator);
-    try std.testing.expect(pre == .unchanged);
-    var stop_result = view.runStop(std.testing.allocator, .{
-        .invocation = testInvocation(.interactive),
-        .step_index = 2,
-        .assistant_text = "done",
-        .provider_disposition = .completed,
-        .can_continue = true,
-    });
-    defer stop_result.deinit(std.testing.allocator);
-    try std.testing.expect(stop_result == .allow);
-    view.runPostTurnEnd(.{
-        .invocation = testInvocation(.subagent),
-        .outcome = .completed,
-    });
-    Runtime(TestApp).reportAttentionRequired(&app, .{
-        .invocation = testInvocation(.subagent),
-        .kind = .permission,
-    });
-    Runtime(TestApp).reportAttentionRequired(&app, .{
-        .invocation = testInvocation(.acp),
-        .kind = .question,
-    });
-
-    try std.testing.expectEqual(@as(usize, 7), app.ade_events.count);
-    const expected_events = [_]Event{
-        .prompt_queued,
-        .turn_started,
-        .turn_started,
-        .pre_tool_use,
-        .stop,
-        .post_turn_end,
-        .attention_required,
-    };
-    const expected_roles = [_]AgentRole{
-        .main,
-        .main,
-        .subagent,
-        .subagent,
-        .main,
-        .subagent,
-        .subagent,
-    };
-    try std.testing.expectEqualSlices(Event, &expected_events, app.ade_events.events[0..app.ade_events.count]);
-    try std.testing.expectEqualSlices(AgentRole, &expected_roles, app.ade_events.roles[0..app.ade_events.count]);
 }

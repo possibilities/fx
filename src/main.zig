@@ -382,8 +382,7 @@ const App = struct {
         Self,
         builtin_hooks.notifications.provider(Self),
     );
-    const AdeAppRuntime = builtin_hooks.ade_events.Runtime(Self);
-    const HerdrAppRuntime = builtin_hooks.Runtime(Self);
+    const LifecycleAppRuntime = builtin_hooks.Runtime(Self);
     const RenderAppRuntime = app_render_runtime.Runtime(Self);
     const SessionAppRuntime = app_session_runtime.Runtime(Self);
     const UpgradeAppRuntime = app_upgrade_runtime.Runtime(Self);
@@ -516,6 +515,7 @@ const App = struct {
     lifecycle_runtime: hooks.Runtime = hooks.Runtime.init(std.heap.c_allocator),
     lifecycle_view: hooks.RuntimeView = hooks.RuntimeView.empty(),
     notifications: builtin_hooks.notifications.State = .{},
+    lifecycle_state: builtin_hooks.lifecycle_state.Reducer = .{},
     ade_events: builtin_hooks.ade_events.Client = .{},
     herdr: builtin_hooks.Client = .{},
 
@@ -679,13 +679,12 @@ const App = struct {
         // Register built-in observers before NotificationAppRuntime.configure
         // freezes the lifecycle runtime (its call to freeze() is the sole
         // freeze site).
-        try HerdrAppRuntime.configure(self, SessionAppRuntime.activeSessionId(self));
-        try AdeAppRuntime.configure(self, SessionAppRuntime.activeSessionId(self));
+        try LifecycleAppRuntime.configure(self, SessionAppRuntime.activeSessionId(self));
         try NotificationAppRuntime.configure(self);
     }
 
     pub fn reportSessionIdentityChanged(self: *App, session_id: ?[]const u8) void {
-        AdeAppRuntime.reportSessionChanged(self, session_id);
+        LifecycleAppRuntime.reportSessionChanged(self, session_id);
     }
 
     pub fn rebindAfterInit(self: *App) void {
@@ -752,44 +751,49 @@ const App = struct {
         self: *App,
         turn_id: u64,
         kind: hooks.AttentionKind,
+        child_session_id: ?[]const u8,
     ) void {
-        NotificationAppRuntime.dispatchAttentionRequired(self, turn_id, kind);
+        agent_runtime.dispatchAttentionRequiredCheckpoint(.{
+            .view = self.lifecycle_view,
+            .scope = self.attentionScope(child_session_id),
+            .outcome_allocator = self.alloc,
+        }, .{
+            .turn_id = if (child_session_id == null) turn_id else null,
+            .kind = kind,
+            .presented_interactively = true,
+        });
     }
 
-    pub fn reportAdeMainAttentionRequired(
+    pub fn dispatchAttentionResolved(
         self: *App,
         turn_id: u64,
         kind: hooks.AttentionKind,
+        child_session_id: ?[]const u8,
     ) void {
-        AdeAppRuntime.reportAttentionRequired(self, .{
-            .invocation = .{
-                .scope = .{
-                    .kind = .interactive,
-                    .workspace_root = self.workspace_root,
-                    .session_id = SessionAppRuntime.activeSessionId(self),
-                },
-                .turn_id = turn_id,
-            },
+        agent_runtime.dispatchAttentionResolvedCheckpoint(.{
+            .view = self.lifecycle_view,
+            .scope = self.attentionScope(child_session_id),
+            .outcome_allocator = self.alloc,
+        }, .{
+            .turn_id = if (child_session_id == null) turn_id else null,
             .kind = kind,
+            .presented_interactively = true,
         });
     }
 
-    pub fn reportAdeSubagentAttentionRequired(
+    fn attentionScope(
         self: *App,
-        child_session_id: []const u8,
-        kind: hooks.AttentionKind,
-    ) void {
-        AdeAppRuntime.reportAttentionRequired(self, .{
-            .invocation = .{
-                .scope = .{
-                    .kind = .subagent,
-                    .workspace_root = self.workspace_root,
-                    .session_id = child_session_id,
-                },
-                .turn_id = null,
-            },
-            .kind = kind,
-        });
+        child_session_id: ?[]const u8,
+    ) hooks.Scope {
+        return if (child_session_id) |session_id| .{
+            .kind = .subagent,
+            .workspace_root = self.workspace_root,
+            .session_id = session_id,
+        } else .{
+            .kind = .interactive,
+            .workspace_root = self.workspace_root,
+            .session_id = SessionAppRuntime.activeSessionId(self),
+        };
     }
 
     /// Must be called after init() returns so the AutoUpgrade thread
@@ -881,6 +885,7 @@ const App = struct {
         self.web_fetch_runtime.deinit(self.alloc);
         self.web_search_runtime.deinit();
         self.subagents.deinit(self.alloc);
+        LifecycleAppRuntime.prepareStopped(self);
         self.ade_events.deinit();
         self.queued_prompt_review.deinit(self.alloc);
         self.prompt_history.deinit(self.alloc);
@@ -910,6 +915,7 @@ const App = struct {
         self.context_snapshot.deinit(self.alloc);
         self.file_index.deinit(std.heap.c_allocator);
         self.lifecycle_runtime.deinit();
+        LifecycleAppRuntime.deinit(self);
 
         self.auth.deinit(self.alloc);
         WorkspaceAppRuntime.deinit(self);
@@ -1492,15 +1498,14 @@ const App = struct {
             .user_prompt_already_presented = user_prompt_already_presented,
         }, .{
             .ctx = self,
-            .report = reportAdePromptAdmission,
+            .report = reportPromptAdmission,
         });
-        HerdrAppRuntime.reportWorking(self);
         return true;
     }
 
-    fn reportAdePromptAdmission(raw: *anyopaque) void {
+    fn reportPromptAdmission(raw: *anyopaque) void {
         const self: *App = @ptrCast(@alignCast(raw));
-        AdeAppRuntime.reportPromptQueued(self);
+        LifecycleAppRuntime.reportPromptQueued(self);
     }
 
     pub fn installInitialMcpRuntime(self: *App, runtime: ?*mcp_runtime_mod.McpRuntime) void {

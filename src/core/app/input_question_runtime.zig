@@ -9,6 +9,7 @@ const question_ui = @import("../../ui/footer/question_ui.zig");
 const question_freeform_layout = @import("../../ui/footer/question_freeform_layout.zig");
 const input_interrupt_runtime = @import("input_interrupt_runtime.zig");
 const input_queue_runtime = @import("input_queue_runtime.zig");
+const hooks = @import("../hooks/hooks.zig");
 
 pub fn QuestionRuntime(comptime App: type) type {
     return struct {
@@ -83,6 +84,7 @@ pub fn QuestionRuntime(comptime App: type) type {
         }
 
         pub fn submitQuestionBatch(app: *App) !void {
+            const attention_kind = currentAttentionKind(app);
             var labels: std.ArrayList([]const u8) = .empty;
             defer labels.deinit(app.alloc);
             try labels.ensureTotalCapacity(app.alloc, app.question_prompt.entries.items.len);
@@ -97,6 +99,13 @@ pub fn QuestionRuntime(comptime App: type) type {
             app.question_prompt.resetAfterSubmission(app.alloc);
             app.input_runtime.input_limit_rejection = input_limit_rejection.clear();
             app.shell.render_requests.request(.modal);
+            if (comptime @hasDecl(App, "dispatchAttentionResolved")) {
+                app.dispatchAttentionResolved(
+                    app.worker.activeTurnId(),
+                    attention_kind,
+                    null,
+                );
+            }
         }
 
         pub fn rerenderQuestionBlock(app: *App) !void {
@@ -117,6 +126,17 @@ pub fn QuestionRuntime(comptime App: type) type {
                 return app.worker.pendingQuestionBatchSource() == worker_runtime.QuestionPromptSource.mcp_elicitation;
             }
             return false;
+        }
+
+        fn currentAttentionKind(app: *App) hooks.AttentionKind {
+            const Worker = @TypeOf(app.worker);
+            if (comptime @hasDecl(Worker, "pendingQuestionBatchSource")) {
+                return switch (app.worker.pendingQuestionBatchSource()) {
+                    .agent_question, .mcp_elicitation => .question,
+                    .route_recovery => .route_recovery,
+                };
+            }
+            return .question;
         }
 
         fn finalizeQuestionTranscript(app: *App, cancelled: bool) !void {

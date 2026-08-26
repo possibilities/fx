@@ -32,6 +32,7 @@ pub const PreparedToolBlockKind = runtime_lifecycle.PreparedToolBlockKind;
 pub const PreparedToolCall = runtime_lifecycle.PreparedToolCall;
 pub const prepareToolCallForLifecycle = runtime_lifecycle.prepareToolCallForLifecycle;
 pub const dispatchAttentionRequiredCheckpoint = runtime_lifecycle.dispatchAttentionRequiredCheckpoint;
+pub const dispatchAttentionResolvedCheckpoint = runtime_lifecycle.dispatchAttentionResolvedCheckpoint;
 pub const TurnFinalizationGuard = runtime_finalization.TurnFinalizationGuard;
 pub const Config = runtime_config.Config;
 pub const processQueuedPrompt = runtime_orchestrator.processQueuedPrompt;

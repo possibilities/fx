@@ -80,7 +80,9 @@ Every line has the same envelope:
     "session_id": "01J...",
     "parent_session_id": null,
     "subagent_id": null,
-    "turn_id": 42
+    "turn_id": 42,
+    "agent_state": "working",
+    "attention_kind": null
   },
   "payload": {}
 }
@@ -95,6 +97,14 @@ session in `session_id` and the owning main session in `parent_session_id`.
 `subagent_id` is an optional Fx-local numeric identity; consumers must use the
 session IDs for durable identity. Main and child records always retain the same
 ADE-assigned `instance_id`.
+
+Every schema 1 record carries Fx's current semantic snapshot for the agent in
+that record. `agent_state` is `idle`, `working`, or `blocked`.
+`attention_kind` is `permission`, `question`, `route_recovery`, or `null`, and
+is non-null only while that agent is blocked. Consumers should apply this
+snapshot even when they do not recognize the event name. A later record can
+therefore repair state after a dropped record or a sequence gap without a
+heartbeat or replay channel.
 
 ## Events
 
@@ -196,6 +206,20 @@ When a surfaced child permission has no child turn identity at the TUI
 projection boundary, its `turn_id` is `null`; its child `session_id` and parent
 main-session identity remain authoritative.
 
+### `AttentionResolved`
+
+Emitted after Fx accepts the active permission, question, or recovery decision
+and agent work can continue:
+
+```json
+{ "kind": "permission" }
+```
+
+The payload uses the same `kind` values as `AttentionRequired`. The record's
+snapshot has `agent_state` set to `working` and `attention_kind` set to `null`.
+It is emitted for the main agent or subagent that owned the decision, even when
+the decision was presented in the main TUI.
+
 ### `FxStopped`
 
 The last attempted event during an orderly shutdown. Fx sends it after the
@@ -205,8 +229,9 @@ can prevent this event; the ADE remains authoritative for process exit.
 
 ## Deriving ADE state
 
-An ADE can reproduce the state previously available through Fx's Herdr
-integration without speaking the Herdr protocol:
+An ADE can reproduce Fx lifecycle state without speaking the Herdr protocol.
+The snapshot in each record is authoritative; the transition table explains
+how Fx derives it:
 
 | Feed event | ADE projection |
 | --- | --- |
@@ -215,6 +240,7 @@ integration without speaking the Herdr protocol:
 | `PromptQueued` | Mark the main agent working as soon as Fx accepts its prompt |
 | `TurnStarted` | Confirm execution for the identified main agent or mark a subagent working |
 | `AttentionRequired` | Mark that agent blocked and retain `kind` |
+| `AttentionResolved` | Mark that agent working and clear its attention kind |
 | `PostTurnEnd` | Mark that agent idle; the ADE may project unseen idle as done |
 | `FxStopped` or process exit | Remove or detach the instance according to ADE policy |
 
@@ -228,6 +254,9 @@ assistant text. Those values can contain secrets. The launching ADE is
 responsible for protecting the socket, authenticating its local clients, and
 applying any persistence, redaction, or forwarding policy.
 
-The ADE feed and the Herdr integration are independent. Setting `FX_ADE_*`
-does not enable, disable, or alter `HERDR_*` behavior, and both integrations
-may operate in the same Fx process.
+The ADE feed and the Herdr integration are independent projections of the same
+lifecycle observations. Setting `FX_ADE_*` does not enable, disable, filter, or
+alter `HERDR_*` behavior, and setting `HERDR_*` does not alter the ADE feed.
+Both integrations may operate in the same Fx process. Herdr socket I/O and its
+bounded reply wait occur only after ADE has had the opportunity to admit the
+corresponding in-memory record.

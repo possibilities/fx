@@ -38,6 +38,7 @@ fn RegisteredSideEffectHandler(comptime Input: type) type {
 
 const RegisteredPostTurnEndHandler = RegisteredSideEffectHandler(definitions.PostTurnEndInput);
 const RegisteredAttentionRequiredHandler = RegisteredSideEffectHandler(definitions.AttentionRequiredInput);
+const RegisteredAttentionResolvedHandler = RegisteredSideEffectHandler(definitions.AttentionResolvedInput);
 const RegisteredTurnStartedHandler = RegisteredSideEffectHandler(definitions.TurnStartedInput);
 
 pub const Runtime = struct {
@@ -47,6 +48,7 @@ pub const Runtime = struct {
     stop_handlers: std.ArrayList(RegisteredStopHandler) = .empty,
     post_turn_end_handlers: std.ArrayList(RegisteredPostTurnEndHandler) = .empty,
     attention_required_handlers: std.ArrayList(RegisteredAttentionRequiredHandler) = .empty,
+    attention_resolved_handlers: std.ArrayList(RegisteredAttentionResolvedHandler) = .empty,
     frozen: bool = false,
 
     pub fn init(alloc: Allocator) Runtime {
@@ -64,6 +66,8 @@ pub const Runtime = struct {
         self.post_turn_end_handlers.deinit(self.alloc);
         deinitRegisteredHooks(self.alloc, self.attention_required_handlers.items);
         self.attention_required_handlers.deinit(self.alloc);
+        deinitRegisteredHooks(self.alloc, self.attention_resolved_handlers.items);
+        self.attention_resolved_handlers.deinit(self.alloc);
         self.* = undefined;
     }
 
@@ -136,6 +140,17 @@ pub const Runtime = struct {
         );
     }
 
+    pub fn registerAttentionResolved(
+        self: *Runtime,
+        handler: definitions.AttentionResolvedHandler,
+    ) (Allocator.Error || definitions.RegistrationError)!void {
+        try self.registerSideEffect(
+            .attention_resolved,
+            handler,
+            &self.attention_resolved_handlers,
+        );
+    }
+
     fn registerSideEffect(
         self: *Runtime,
         event: HookEvent,
@@ -168,6 +183,7 @@ pub const Runtime = struct {
             .stop_handlers = self.stop_handlers.items,
             .post_turn_end_handlers = self.post_turn_end_handlers.items,
             .attention_required_handlers = self.attention_required_handlers.items,
+            .attention_resolved_handlers = self.attention_resolved_handlers.items,
         };
     }
 
@@ -205,6 +221,7 @@ pub const RuntimeView = struct {
     stop_handlers: []const RegisteredStopHandler,
     post_turn_end_handlers: []const RegisteredPostTurnEndHandler,
     attention_required_handlers: []const RegisteredAttentionRequiredHandler,
+    attention_resolved_handlers: []const RegisteredAttentionResolvedHandler,
 
     pub fn empty() RuntimeView {
         return .{
@@ -213,6 +230,7 @@ pub const RuntimeView = struct {
             .stop_handlers = &.{},
             .post_turn_end_handlers = &.{},
             .attention_required_handlers = &.{},
+            .attention_resolved_handlers = &.{},
         };
     }
 
@@ -284,6 +302,17 @@ pub const RuntimeView = struct {
         input: definitions.AttentionRequiredInput,
     ) void {
         runSideEffectHandlers(input, self.attention_required_handlers);
+    }
+
+    pub fn hasAttentionResolved(self: RuntimeView) bool {
+        return self.attention_resolved_handlers.len != 0;
+    }
+
+    pub fn runAttentionResolved(
+        self: RuntimeView,
+        input: definitions.AttentionResolvedInput,
+    ) void {
+        runSideEffectHandlers(input, self.attention_resolved_handlers);
     }
 };
 
@@ -654,6 +683,8 @@ const TestHandler = struct {
     fn notePostTurnEnd(_: *anyopaque, _: definitions.PostTurnEndInput) definitions.HandlerError!void {}
 
     fn noteAttentionRequired(_: *anyopaque, _: definitions.AttentionRequiredInput) definitions.HandlerError!void {}
+
+    fn noteAttentionResolved(_: *anyopaque, _: definitions.AttentionResolvedInput) definitions.HandlerError!void {}
 };
 
 test "runtime validates names owns copies freezes and exposes lifecycle events" {
@@ -728,6 +759,16 @@ test "runtime validates names owns copies freezes and exposes lifecycle events" 
         .ctx = undefined,
         .run = TestHandler.noteAttentionRequired,
     }));
+    try runtime.registerAttentionResolved(.{
+        .name = "alpha",
+        .ctx = undefined,
+        .run = TestHandler.noteAttentionResolved,
+    });
+    try std.testing.expectError(error.DuplicateHandlerName, runtime.registerAttentionResolved(.{
+        .name = "alpha",
+        .ctx = undefined,
+        .run = TestHandler.noteAttentionResolved,
+    }));
 
     const view = runtime.freeze();
     const second_view = runtime.freeze();
@@ -736,11 +777,13 @@ test "runtime validates names owns copies freezes and exposes lifecycle events" 
     try std.testing.expect(view.hasStop());
     try std.testing.expect(view.hasPostTurnEnd());
     try std.testing.expect(view.hasAttentionRequired());
+    try std.testing.expect(view.hasAttentionResolved());
     try std.testing.expect(second_view.hasTurnStarted());
     try std.testing.expect(second_view.hasPreToolUse());
     try std.testing.expect(second_view.hasStop());
     try std.testing.expect(second_view.hasPostTurnEnd());
     try std.testing.expect(second_view.hasAttentionRequired());
+    try std.testing.expect(second_view.hasAttentionResolved());
     try std.testing.expectError(error.RuntimeFrozen, runtime.registerStop(.{
         .name = "late",
         .ctx = undefined,
@@ -760,6 +803,11 @@ test "runtime validates names owns copies freezes and exposes lifecycle events" 
         .name = "late",
         .ctx = undefined,
         .run = TestHandler.noteAttentionRequired,
+    }));
+    try std.testing.expectError(error.RuntimeFrozen, runtime.registerAttentionResolved(.{
+        .name = "late",
+        .ctx = undefined,
+        .run = TestHandler.noteAttentionResolved,
     }));
 
     try std.testing.expect(!@hasDecl(Runtime, "registerSessionStart"));
@@ -781,6 +829,7 @@ test "empty views dispatch without allocation" {
         try std.testing.expect(!view.hasStop());
         try std.testing.expect(!view.hasPostTurnEnd());
         try std.testing.expect(!view.hasAttentionRequired());
+        try std.testing.expect(!view.hasAttentionResolved());
 
         view.runTurnStarted(.{ .invocation = testInvocation() });
         var pre = try view.runPreToolUse(failing.allocator(), .{
@@ -809,6 +858,10 @@ test "empty views dispatch without allocation" {
             .provider_disposition = .completed,
         });
         view.runAttentionRequired(.{
+            .invocation = testInvocation(),
+            .kind = .permission,
+        });
+        view.runAttentionResolved(.{
             .invocation = testInvocation(),
             .kind = .permission,
         });
@@ -1248,6 +1301,66 @@ test "AttentionRequired runs in order propagates input and fails open" {
     runtime.freeze().runAttentionRequired(.{
         .invocation = testInvocation(),
         .kind = .route_recovery,
+    });
+
+    try std.testing.expectEqualSlices(u8, &.{ 1, 2, 3, 4 }, capture.order[0..capture.count]);
+    try std.testing.expect(capture.saw_input);
+}
+
+const AttentionResolvedCapture = struct {
+    order: [4]u8 = undefined,
+    count: usize = 0,
+    saw_input: bool = false,
+
+    fn note(self: *AttentionResolvedCapture, value: u8) void {
+        self.order[self.count] = value;
+        self.count += 1;
+    }
+
+    fn first(raw: *anyopaque, input: definitions.AttentionResolvedInput) definitions.HandlerError!void {
+        const self: *AttentionResolvedCapture = @ptrCast(@alignCast(raw));
+        self.note(1);
+        self.saw_input = input.invocation.scope.kind == .subagent and
+            input.invocation.turn_id == null and
+            input.kind == .permission and
+            input.presented_interactively;
+    }
+
+    fn failing(raw: *anyopaque, _: definitions.AttentionResolvedInput) definitions.HandlerError!void {
+        const self: *AttentionResolvedCapture = @ptrCast(@alignCast(raw));
+        self.note(2);
+        return error.Failed;
+    }
+
+    fn cancelled(raw: *anyopaque, _: definitions.AttentionResolvedInput) definitions.HandlerError!void {
+        const self: *AttentionResolvedCapture = @ptrCast(@alignCast(raw));
+        self.note(3);
+        return error.Cancelled;
+    }
+
+    fn fourth(raw: *anyopaque, _: definitions.AttentionResolvedInput) definitions.HandlerError!void {
+        const self: *AttentionResolvedCapture = @ptrCast(@alignCast(raw));
+        self.note(4);
+    }
+};
+
+test "AttentionResolved runs in order propagates input and fails open" {
+    var capture = AttentionResolvedCapture{};
+    var runtime = Runtime.init(std.testing.allocator);
+    defer runtime.deinit();
+
+    try runtime.registerAttentionResolved(.{ .name = "first", .ctx = &capture, .run = AttentionResolvedCapture.first });
+    try runtime.registerAttentionResolved(.{ .name = "failing", .ctx = &capture, .run = AttentionResolvedCapture.failing });
+    try runtime.registerAttentionResolved(.{ .name = "cancelled", .ctx = &capture, .run = AttentionResolvedCapture.cancelled });
+    try runtime.registerAttentionResolved(.{ .name = "fourth", .ctx = &capture, .run = AttentionResolvedCapture.fourth });
+
+    var invocation = testInvocation();
+    invocation.scope.kind = .subagent;
+    invocation.turn_id = null;
+    runtime.freeze().runAttentionResolved(.{
+        .invocation = invocation,
+        .kind = .permission,
+        .presented_interactively = true,
     });
 
     try std.testing.expectEqualSlices(u8, &.{ 1, 2, 3, 4 }, capture.order[0..capture.count]);

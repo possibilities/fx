@@ -24,6 +24,8 @@ const TIMEOUT = 30_000;
 const INSTANCE_ID = "ade-e2e-instance";
 
 type AgentRole = "main" | "subagent";
+type AgentState = "idle" | "working" | "blocked";
+type AttentionKind = "permission" | "question" | "route_recovery";
 
 type AdeRecord = {
   schema_version: number;
@@ -37,6 +39,8 @@ type AdeRecord = {
     parent_session_id: string | null;
     subagent_id: number | null;
     turn_id: number | null;
+    agent_state: AgentState;
+    attention_kind: AttentionKind | null;
   };
   payload: Record<string, unknown>;
 };
@@ -163,7 +167,7 @@ describe.skipIf(!tmuxAvailable())("ADE event feed", () => {
       mkdirSync(workspace);
       writeFileSync(
         join(home, ".fx", "settings.json"),
-        JSON.stringify({ sandbox: "none", permission_mode: "auto", permission: {} }),
+        JSON.stringify({ sandbox: "none", permission_mode: "ask", permission: {} }),
       );
       writeFileSync(stderrPath, "");
 
@@ -188,7 +192,8 @@ describe.skipIf(!tmuxAvailable())("ADE event feed", () => {
         if (latest.includes(childPrompt)) {
           return fakeGatewayToolCall("ade_child_terminal_1", "terminal", {
             action: "exec",
-            command: "printf ADE_CHILD_TOOL",
+            command: "printf ADE_CHILD_TOOL > ade-child.txt",
+            timeout_ms: 600_000,
           });
         }
         if (latest.includes("ADE_QUESTION_REQUEST")) {
@@ -208,7 +213,7 @@ describe.skipIf(!tmuxAvailable())("ADE event feed", () => {
             command: {
               create: {
                 name: "ade-child",
-                mode: "one_off",
+                mode: "persistent",
                 prompt: childPrompt,
                 permission_mode: "ask",
               },
@@ -217,7 +222,7 @@ describe.skipIf(!tmuxAvailable())("ADE event feed", () => {
         }
         return new Response("unexpected ADE fixture request", { status: 500 });
       }, {
-        classifierDecision: "ask",
+        classifierDecision: "caution",
         models: [{ id: FAKE_GATEWAY_MODEL, type: "language", tags: ["tool-use"] }],
       });
 
@@ -251,6 +256,14 @@ describe.skipIf(!tmuxAvailable())("ADE event feed", () => {
           record.payload.kind === "question",
       );
       await session.sendKeys("1");
+      const questionResolution = await receiver.waitFor(
+        (record) =>
+          record.event === "AttentionResolved" &&
+          record.context.agent_role === "main" &&
+          record.payload.kind === "question",
+      );
+      expect(questionResolution.context.agent_state).toBe("working");
+      expect(questionResolution.context.attention_kind).toBeNull();
       await session.waitForText("ADE_QUESTION_DONE", TIMEOUT);
       await session.waitForComposer(TIMEOUT);
 
@@ -278,11 +291,20 @@ describe.skipIf(!tmuxAvailable())("ADE event feed", () => {
         (pane) =>
           pane.includes("Subagent: ade-child") &&
           pane.includes("status: approval") &&
-          pane.includes("printf ADE_CHILD_TOOL") &&
+          pane.includes("printf ADE_CHILD_TOOL > ade-child.txt") &&
           pane.includes("❯ 1. Yes"),
         TIMEOUT,
       );
       await session.sendKeys("1");
+      const childResolution = await receiver.waitFor(
+        (record) =>
+          record.event === "AttentionResolved" &&
+          record.context.agent_role === "subagent" &&
+          record.payload.kind === "permission",
+      );
+      expect(childResolution.context.session_id).toBe(childAttention.context.session_id);
+      expect(childResolution.context.agent_state).toBe("working");
+      expect(childResolution.context.attention_kind).toBeNull();
       await session.waitForText("ADE_CHILD_DONE", TIMEOUT);
       await session.sendKeys("C-x");
       await session.waitForText("ADE_PARENT_DONE", TIMEOUT);
@@ -331,6 +353,14 @@ describe.skipIf(!tmuxAvailable())("ADE event feed", () => {
       );
       expect(records.every((record) => record.schema_version === 1)).toBe(true);
       expect(records.every((record) => record.instance_id === INSTANCE_ID)).toBe(true);
+      expect(records.every(
+        (record) => ["idle", "working", "blocked"].includes(record.context.agent_state),
+      )).toBe(true);
+      expect(records.every(
+        (record) => record.context.agent_state === "blocked"
+          ? record.context.attention_kind !== null
+          : record.context.attention_kind === null,
+      )).toBe(true);
       expect(records[0]?.event).toBe("FxStarted");
       expect(records.at(-1)?.event).toBe("FxStopped");
 
@@ -353,13 +383,16 @@ describe.skipIf(!tmuxAvailable())("ADE event feed", () => {
       const firstPromptQueued = eventIndex(records, "PromptQueued", "main");
       const questionTool = eventIndex(records, "PreToolUse", "main", firstMainStart);
       const attention = eventIndex(records, "AttentionRequired", "main", questionTool);
-      const firstMainEnd = eventIndex(records, "PostTurnEnd", "main", attention);
+      const resolution = eventIndex(records, "AttentionResolved", "main", attention);
+      const firstMainEnd = eventIndex(records, "PostTurnEnd", "main", resolution);
       const secondPromptQueued = eventIndex(records, "PromptQueued", "main", firstMainEnd);
       const secondMainStart = eventIndex(records, "TurnStarted", "main", firstMainEnd);
       const subagentTool = eventIndex(records, "PreToolUse", "main", secondMainStart);
       const childStart = eventIndex(records, "TurnStarted", "subagent", subagentTool);
       const childTool = eventIndex(records, "PreToolUse", "subagent", childStart);
-      const childStop = eventIndex(records, "Stop", "subagent", childTool);
+      const childAttentionIndex = eventIndex(records, "AttentionRequired", "subagent", childTool);
+      const childResolutionIndex = eventIndex(records, "AttentionResolved", "subagent", childAttentionIndex);
+      const childStop = eventIndex(records, "Stop", "subagent", childResolutionIndex);
       const childEnd = eventIndex(records, "PostTurnEnd", "subagent", childStop);
       const secondMainStop = eventIndex(records, "Stop", "main", subagentTool);
       const secondMainEnd = eventIndex(records, "PostTurnEnd", "main", secondMainStop);
@@ -368,12 +401,15 @@ describe.skipIf(!tmuxAvailable())("ADE event feed", () => {
         firstPromptQueued,
         questionTool,
         attention,
+        resolution,
         firstMainEnd,
         secondPromptQueued,
         secondMainStart,
         subagentTool,
         childStart,
         childTool,
+        childAttentionIndex,
+        childResolutionIndex,
         childStop,
         childEnd,
         secondMainStop,

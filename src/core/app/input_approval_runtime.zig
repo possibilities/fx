@@ -260,6 +260,13 @@ pub fn ApprovalRuntime(comptime App: type) type {
                     clearApprovalPromptAfterSubmission(app);
                     app.input_runtime.input_limit_rejection = input_limit_rejection.clear();
                     requestActiveSurfaceFrame(app);
+                    if (comptime @hasDecl(App, "dispatchAttentionResolved")) {
+                        app.dispatchAttentionResolved(
+                            app.worker.activeTurnId(),
+                            .permission,
+                            null,
+                        );
+                    }
                 },
                 .stale, .no_pending => {},
             }
@@ -378,6 +385,13 @@ pub fn ApprovalRuntime(comptime App: type) type {
                 return true;
             };
             if (resolved == .accepted) {
+                if (comptime @hasDecl(App, "dispatchAttentionResolved")) {
+                    app.dispatchAttentionResolved(
+                        app.worker.activeTurnId(),
+                        .permission,
+                        binding.child_id,
+                    );
+                }
                 clearApprovalPromptAfterSubmission(app);
                 app.subagents.markMainApprovalPresented(false);
                 if (comptime @hasDecl(App, "refreshSubagentManagerProjection")) {
