@@ -889,7 +889,7 @@ const TestChattyProvider = struct {
         }
         return .{ .completed = .{
             .completion = .{ .content = "a whole answer the task must never need" },
-            .usage = .{ .immediate = null },
+            .usage = .{ .unavailable = .unbilled },
         } };
     }
 };
@@ -993,7 +993,7 @@ const TestNamingProvider = struct {
         if (request.cancel_flag.load(.seq_cst)) return error.Cancelled;
         return .{ .completed = .{
             .completion = .{ .content = "Native generated title" },
-            .usage = .{ .immediate = null },
+            .usage = .{ .unavailable = .unbilled },
         } };
     }
 };
