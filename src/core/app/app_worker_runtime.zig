@@ -1,6 +1,7 @@
 const std = @import("std");
 const activity_status = @import("../output/activity_status.zig");
 const app_session_runtime = @import("app_session_runtime.zig");
+const approval_registry = @import("../subagent/approval_registry.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const diff_mod = @import("../output/diff.zig");
 const file_mutation_contract = @import("../tooling/file_mutation_contract.zig");
@@ -467,6 +468,32 @@ pub fn Runtime(comptime App: type) type {
             try pushOwnedEvent(app, .{ .diff_block = payload });
         }
 
+        /// Announces every child holding an unresolved approval as blocked.
+        ///
+        /// The edge above fires once, when the main approval prompt becomes
+        /// active, and attributes it to whichever child
+        /// `mainApprovalRequest` happens to be mirroring. The prompt mirrors
+        /// one child at a time, so with two children blocked at the same
+        /// instant only the mirrored one ever produced a record while the
+        /// second waited in fx with a feed snapshot still saying working.
+        ///
+        /// The registry is the only place that knows all of them. Asking it
+        /// on every sync is cheap and allocation-free, and the reducer drops
+        /// a child that is already blocked, so this stays one record per
+        /// child rather than one per sync. The edge is left in place: it is
+        /// what tells Herdr a decision is now presented, and a child it
+        /// already named is suppressed here.
+        pub fn syncBlockedSubagentAttention(app: *App) void {
+            if (comptime !@hasDecl(App, "dispatchAttentionRequired")) return;
+            if (comptime !@hasField(App, "session_persistence")) return;
+            const host = app_session_runtime.Runtime(App).subagentHost(app) orelse return;
+            var pending: approval_registry.PendingChildren = .{};
+            host.approvals.snapshotPendingChildren(&pending);
+            for (0..pending.len) |index| {
+                app.dispatchAttentionRequired(0, .permission, pending.at(index));
+            }
+        }
+
         pub fn syncState(
             app: *App,
             presenter: activity_runtime.LifecyclePresenter,
@@ -547,6 +574,7 @@ pub fn Runtime(comptime App: type) type {
                     );
                 }
             }
+            syncBlockedSubagentAttention(app);
 
             if (app.question_prompt.isActive()) {
                 if (app.worker.snapshotPendingQuestionBatch(app.alloc) catch return) |question_snapshot| {

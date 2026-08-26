@@ -1284,6 +1284,29 @@ fn runTwoApprovalBridgeScenario() !void {
     try app.refreshSubagentManagerProjection();
     try std.testing.expectEqual(@as(usize, 2), app.subagents.runtime.snapshot.?.pending_approval_total);
 
+    // Both children are genuinely blocked at this instant. The main prompt
+    // mirrors one at a time, so nothing on that surface can name the second;
+    // the registry names both.
+    {
+        const worker_rt = @import("app_worker_runtime.zig");
+        worker_rt.Runtime(ApprovalBridgeApp).syncBlockedSubagentAttention(&app);
+        try std.testing.expectEqual(@as(usize, 2), app.attention_required.len);
+        try std.testing.expectEqual(
+            @as(usize, 1),
+            app.attention_required.countFor(ApprovalBridgeWaiter.child_id),
+        );
+        try std.testing.expectEqual(
+            @as(usize, 1),
+            app.attention_required.countFor(second_child_id),
+        );
+        for (0..app.attention_required.len) |index| {
+            try std.testing.expectEqual(
+                hooks.AttentionKind.permission,
+                app.attention_required.kinds[index],
+            );
+        }
+    }
+
     const first_request = app.subagents.mainApprovalRequest() orelse
         return error.TestMainApprovalMissing;
     try std.testing.expect(try app.approval_prompt.syncRequest(alloc, first_request));
@@ -1364,6 +1387,14 @@ fn runTwoApprovalBridgeScenario() !void {
     try std.testing.expectEqual(@as(u64, 4), host.approvals.pendingRevision());
     try std.testing.expectEqual(@as(usize, 0), app.subagents.runtime.snapshot.?.pending_approval_total);
     try std.testing.expect(app.subagents.runtime.mainApprovalRequest() == null);
+
+    // With both answered the registry holds no unresolved binding, so a
+    // later sync announces nobody.
+    {
+        const worker_rt = @import("app_worker_runtime.zig");
+        worker_rt.Runtime(ApprovalBridgeApp).syncBlockedSubagentAttention(&app);
+        try std.testing.expectEqual(@as(usize, 2), app.attention_required.len);
+    }
 
     // One resolution per child, each attributed to the child that was
     // waiting, whichever surface answered it.

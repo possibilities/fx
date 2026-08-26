@@ -98,6 +98,31 @@ pub const Persistence = struct {
     }
 };
 
+/// A bounded, allocation-free copy of the children currently holding an
+/// unresolved approval. Sized well above any realistic count of subagents
+/// blocked at one instant; a snapshot that would exceed it reports
+/// `truncated` rather than silently naming a subset as the whole set.
+pub const max_pending_child_snapshot: usize = 32;
+pub const max_pending_child_id_bytes: usize = 64;
+
+pub const PendingChildren = struct {
+    storage: [max_pending_child_snapshot][max_pending_child_id_bytes]u8 = undefined,
+    lengths: [max_pending_child_snapshot]usize = @splat(0),
+    len: usize = 0,
+    truncated: bool = false,
+
+    pub fn at(self: *const PendingChildren, index: usize) []const u8 {
+        return self.storage[index][0..self.lengths[index]];
+    }
+
+    fn contains(self: *const PendingChildren, child_id: []const u8) bool {
+        for (0..self.len) |index| {
+            if (std.mem.eql(u8, self.at(index), child_id)) return true;
+        }
+        return false;
+    }
+};
+
 const Binding = struct {
     request_id: []u8,
     child_id: []u8,
@@ -297,6 +322,46 @@ pub const Registry = struct {
             .worker = null,
             .worker_request_id = null,
         });
+    }
+
+    /// Copies each distinct child holding an unresolved approval into the
+    /// caller's bounded buffer.
+    ///
+    /// The main approval prompt mirrors one child at a time, so nothing on
+    /// that surface can name a second child blocked at the same instant. The
+    /// registry is the one place that knows all of them. Copying happens under
+    /// the mutex so a concurrent resolution cannot free the bytes, and the
+    /// call returns before the caller projects anything: no reducer,
+    /// projection, or transport work may run under this lock.
+    pub fn snapshotPendingChildren(self: *Registry, out: *PendingChildren) void {
+        self.mutex.lockUncancelable(io_mod.getIo());
+        defer self.mutex.unlock(io_mod.getIo());
+        out.len = 0;
+        out.truncated = false;
+        if (self.closed) return;
+        for (self.bindings.items) |binding| {
+            // A detached route has no waiter left to unblock.
+            if (binding.worker_route_detached) continue;
+            if (binding.child_id.len > max_pending_child_id_bytes) {
+                out.truncated = true;
+                continue;
+            }
+            if (out.contains(binding.child_id)) continue;
+            if (out.len == max_pending_child_snapshot) {
+                out.truncated = true;
+                break;
+            }
+            @memcpy(out.storage[out.len][0..binding.child_id.len], binding.child_id);
+            out.lengths[out.len] = binding.child_id.len;
+            out.len += 1;
+        }
+        if (out.truncated) {
+            debug_trace.logf(
+                "subagent",
+                "pending child attention snapshot truncated bindings={d} captured={d}",
+                .{ self.bindings.items.len, out.len },
+            );
+        }
     }
 
     pub fn resolve(
