@@ -1500,6 +1500,7 @@ const App = struct {
             .ctx = self,
             .report = reportPromptAdmission,
         });
+        LifecycleAppRuntime.reportPromptWorking(self);
         return true;
     }
 

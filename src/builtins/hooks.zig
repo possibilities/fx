@@ -72,12 +72,13 @@ pub fn Runtime(comptime App: type) type {
         }
 
         pub fn reportPromptQueued(app: *App) void {
-            {
-                app.lifecycle_state.lockProjection();
-                defer app.lifecycle_state.unlockProjection();
-                _ = app.lifecycle_state.transition(.main, .prompt_queued, null);
-                app.ade_events.reportPromptQueued();
-            }
+            app.lifecycle_state.lockProjection();
+            defer app.lifecycle_state.unlockProjection();
+            _ = app.lifecycle_state.transition(.main, .prompt_queued, null);
+            app.ade_events.reportPromptQueued();
+        }
+
+        pub fn reportPromptWorking(app: *App) void {
             if (app.herdr.enabled) app.herdr.reportState(.working, null);
         }
 
@@ -351,6 +352,7 @@ test "lifecycle coordinator projects full ADE state and interactive Herdr state 
 
     app.herdr.ade_event_count = &app.ade_events.event_count;
     Provider.reportPromptQueued(&app);
+    Provider.reportPromptWorking(&app);
     view.runPostTurnEnd(.{
         .invocation = testInvocation(.ask),
         .outcome = .completed,
@@ -428,6 +430,7 @@ test "enabling either lifecycle projection does not control the other" {
     defer Runtime(HerdrOnlyApp).deinit(&herdr_only);
     try Runtime(HerdrOnlyApp).configure(&herdr_only, "session-42");
     Runtime(HerdrOnlyApp).reportPromptQueued(&herdr_only);
+    Runtime(HerdrOnlyApp).reportPromptWorking(&herdr_only);
     try std.testing.expectEqual(@as(usize, 0), herdr_only.ade_events.event_count);
     try std.testing.expectEqual(@as(usize, 2), herdr_only.herdr.report_count);
     try expectReport(herdr_only.herdr.reports[1], .working, null);
@@ -448,6 +451,7 @@ test "enabling either lifecycle projection does not control the other" {
     defer Runtime(AdeOnlyApp).deinit(&ade_only);
     try Runtime(AdeOnlyApp).configure(&ade_only, "session-42");
     Runtime(AdeOnlyApp).reportPromptQueued(&ade_only);
+    Runtime(AdeOnlyApp).reportPromptWorking(&ade_only);
     try std.testing.expectEqual(@as(usize, 2), ade_only.ade_events.event_count);
     try std.testing.expectEqual(lifecycle_state.AgentState.working, ade_only.ade_events.snapshots[1].agent_state);
     try std.testing.expectEqual(@as(usize, 0), ade_only.herdr.report_count);
