@@ -264,6 +264,7 @@ describe.skipIf(!tmuxAvailable())("ADE event feed", () => {
       );
       expect(questionResolution.context.agent_state).toBe("working");
       expect(questionResolution.context.attention_kind).toBeNull();
+      expect(questionResolution.context.turn_id).toBeGreaterThan(0);
       await session.waitForText("ADE_QUESTION_DONE", TIMEOUT);
       await session.waitForComposer(TIMEOUT);
 
@@ -423,6 +424,9 @@ describe.skipIf(!tmuxAvailable())("ADE event feed", () => {
       }
       expect(firstPromptQueued).toBeLessThan(firstMainStart);
       expect(secondPromptQueued).toBeLessThan(secondMainStart);
+      expect(records[firstMainEnd]?.context.agent_state).toBe("idle");
+      expect(records[childEnd]?.context.agent_state).toBe("idle");
+      expect(records[secondMainEnd]?.context.agent_state).toBe("idle");
 
       const mainSession = mainStarts[0]?.context.session_id;
       const childContext = childStarts[0]!.context;

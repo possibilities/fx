@@ -16,6 +16,29 @@ pub fn QuestionRuntime(comptime App: type) type {
         const interrupt = input_interrupt_runtime.InterruptRuntime(App);
         const queue_rt = input_queue_runtime.Runtime(App);
 
+        const AttentionResolutionObserver = struct {
+            app: *App,
+            kind: hooks.AttentionKind,
+
+            fn interface(self: *@This()) worker_runtime.DecisionObserver {
+                return .{
+                    .context = self,
+                    .observe_fn = observe,
+                };
+            }
+
+            fn observe(raw: *anyopaque, turn_id: u64) void {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                if (comptime @hasDecl(App, "dispatchAttentionResolved")) {
+                    self.app.dispatchAttentionResolved(
+                        turn_id,
+                        self.kind,
+                        null,
+                    );
+                }
+            }
+        };
+
         pub fn handleQuestionAction(app: *App, action: question_prompt.Action) !bool {
             return switch (try handleQuestionActionWithLimit(app, action, null)) {
                 .consumed => true,
@@ -95,17 +118,39 @@ pub fn QuestionRuntime(comptime App: type) type {
             if (!isRouteRecoveryPrompt(app) and !isMcpElicitationPrompt(app)) {
                 try finalizeQuestionTranscript(app, false);
             }
-            try app.worker.submitQuestionBatchAnswer(std.heap.c_allocator, labels.items);
+            const Worker = switch (@typeInfo(@TypeOf(app.worker))) {
+                .pointer => |pointer| pointer.child,
+                else => @TypeOf(app.worker),
+            };
+            _ = if (comptime @hasDecl(Worker, "submitQuestionBatchAnswerObserved") and
+                @hasDecl(App, "dispatchAttentionResolved"))
+            observed: {
+                var observation = AttentionResolutionObserver{
+                    .app = app,
+                    .kind = attention_kind,
+                };
+                break :observed try app.worker.submitQuestionBatchAnswerObserved(
+                    std.heap.c_allocator,
+                    labels.items,
+                    observation.interface(),
+                );
+            } else fallback: {
+                try app.worker.submitQuestionBatchAnswer(
+                    std.heap.c_allocator,
+                    labels.items,
+                );
+                if (comptime @hasDecl(App, "dispatchAttentionResolved")) {
+                    app.dispatchAttentionResolved(
+                        app.worker.activeTurnId(),
+                        attention_kind,
+                        null,
+                    );
+                }
+                break :fallback worker_runtime.QuestionSubmissionResult.accepted;
+            };
             app.question_prompt.resetAfterSubmission(app.alloc);
             app.input_runtime.input_limit_rejection = input_limit_rejection.clear();
             app.shell.render_requests.request(.modal);
-            if (comptime @hasDecl(App, "dispatchAttentionResolved")) {
-                app.dispatchAttentionResolved(
-                    app.worker.activeTurnId(),
-                    attention_kind,
-                    null,
-                );
-            }
         }
 
         pub fn rerenderQuestionBlock(app: *App) !void {

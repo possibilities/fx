@@ -2,6 +2,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const approval_persistence = @import("approval_persistence.zig");
 const approval_registry = @import("approval_registry.zig");
+const worker_runtime = @import("../agent/worker_runtime.zig");
 const authority = @import("authority.zig");
 const auto_classifier_context = @import("../permissions/auto_classifier_context.zig");
 const communication = @import("communication.zig");
@@ -912,12 +913,21 @@ pub const Runtime = struct {
         self: *Runtime,
         options: ApprovalResolveOptions,
     ) approval_registry.Error!approval_registry.ResolveResult {
-        const resolved = self.approvals.resolve(
+        return self.resolveApprovalObserved(options, null);
+    }
+
+    pub fn resolveApprovalObserved(
+        self: *Runtime,
+        options: ApprovalResolveOptions,
+        observer: ?worker_runtime.DecisionObserver,
+    ) approval_registry.Error!approval_registry.ResolveResult {
+        const observed = self.approvals.resolveObserved(
             options.request_id,
             options.child_id,
             options.decision,
             options.feedback,
             options.timestamp_ms,
+            observer,
         ) catch |err| {
             if (self.relationshipApprovalIsTerminal(
                 options.child_id,
@@ -928,18 +938,25 @@ pub const Runtime = struct {
             }
             return err;
         };
-        switch (resolved) {
+        switch (observed.result) {
             .accepted => {
                 if (options.decision == .deny) {
                     self.completeOperationIdentity(options.request_id) catch
                         return error.CommitFailed;
                 }
+                if (!observed.observer_ran) {
+                    if (observer) |value| value.observe_fn(value.context, 0);
+                }
                 return .accepted;
             },
             .rejected => return .rejected,
-            .relationship_ready => return self.continueApprovedRelationship(
-                options,
-            ),
+            .relationship_ready => {
+                const resolved = try self.continueApprovedRelationship(options);
+                if (resolved == .accepted and !observed.observer_ran) {
+                    if (observer) |value| value.observe_fn(value.context, 0);
+                }
+                return resolved;
+            },
         }
     }
 

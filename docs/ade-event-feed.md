@@ -220,6 +220,11 @@ snapshot has `agent_state` set to `working` and `attention_kind` set to `null`.
 It is emitted for the main agent or subagent that owned the decision, even when
 the decision was presented in the main TUI.
 
+Fx reserves an accepted interactive decision before publishing this record and
+releases the waiting agent only after the lifecycle projection returns. A
+subsequent `Stop` or `PostTurnEnd` from that agent therefore cannot overtake its
+`AttentionResolved` record.
+
 ### `FxStopped`
 
 The last attempted event during an orderly shutdown. Fx sends it after the

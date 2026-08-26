@@ -5,7 +5,9 @@
 //! outside the Core hook harness.
 
 const std = @import("std");
+const worker_runtime = @import("../core/agent/worker_runtime.zig");
 const hooks = @import("../core/hooks/hooks.zig");
+const permission_request = @import("../core/permissions/permission_request.zig");
 const herdr = @import("hooks/herdr.zig");
 
 pub const ade_events = @import("hooks/ade_events.zig");
@@ -411,6 +413,185 @@ test "lifecycle coordinator projects full ADE state and interactive Herdr state 
         lifecycle_state.AgentState.working,
         app.lifecycle_state.snapshot(.{ .subagent_session = "session" }).agent_state,
     );
+}
+
+test "accepted decision projects resolution before an immediately finishing worker" {
+    const TestApp = struct {
+        alloc: std.mem.Allocator,
+        workspace_root: []const u8 = "/tmp/workspace",
+        lifecycle_runtime: hooks.Runtime,
+        lifecycle_state: lifecycle_state.Reducer = .{},
+        ade_events: RecordingAdeClient = .{},
+        herdr: RecordingClient = .{},
+    };
+    const Provider = Runtime(TestApp);
+    const Waiter = struct {
+        worker: *worker_runtime.WorkerRuntime,
+        view: hooks.RuntimeView,
+        completed: *std.atomic.Value(bool),
+        decision: ?@import("../core/shared/types.zig").ToolPermissionDecision = null,
+        err: ?anyerror = null,
+
+        fn run(self: *@This()) void {
+            var response = self.worker.requestPermissionBlocking(
+                std.testing.allocator,
+                .{ .label = "finish immediately" },
+            ) catch |err| {
+                self.err = err;
+                self.completed.store(true, .seq_cst);
+                return;
+            };
+            defer response.deinit();
+            self.decision = response.decision;
+            self.worker.finishProcessing();
+            var stop = self.view.runStop(std.testing.allocator, .{
+                .invocation = testInvocation(.interactive),
+                .step_index = 1,
+                .assistant_text = "done",
+                .provider_disposition = .completed,
+                .can_continue = false,
+            });
+            stop.deinit(std.testing.allocator);
+            self.view.runPostTurnEnd(.{
+                .invocation = testInvocation(.interactive),
+                .outcome = .completed,
+                .provider_disposition = .completed,
+            });
+            self.completed.store(true, .seq_cst);
+        }
+    };
+    const Observer = struct {
+        view: hooks.RuntimeView,
+        entered: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+        release: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+        turn_id: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+
+        fn interface(self: *@This()) worker_runtime.DecisionObserver {
+            return .{
+                .context = self,
+                .observe_fn = observe,
+            };
+        }
+
+        fn observe(raw: *anyopaque, turn_id: u64) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.turn_id.store(turn_id, .seq_cst);
+            self.view.runAttentionResolved(.{
+                .invocation = testInvocation(.interactive),
+                .kind = .permission,
+                .presented_interactively = true,
+            });
+            self.entered.store(true, .seq_cst);
+            while (!self.release.load(.seq_cst)) {
+                std.Thread.yield() catch std.atomic.spinLoopHint();
+            }
+        }
+    };
+    const Submitter = struct {
+        worker: *worker_runtime.WorkerRuntime,
+        request_id: u64,
+        observer: *Observer,
+        result: ?worker_runtime.PermissionSubmissionResult = null,
+
+        fn run(self: *@This()) void {
+            self.result = self.worker.submitPermissionResponseObserved(
+                self.request_id,
+                permission_request.OwnedPermissionResponse.init(
+                    std.testing.allocator,
+                    .once,
+                    null,
+                ),
+                self.observer.interface(),
+            );
+        }
+    };
+
+    var app = TestApp{
+        .alloc = std.testing.allocator,
+        .lifecycle_runtime = hooks.Runtime.init(std.testing.allocator),
+    };
+    defer app.lifecycle_runtime.deinit();
+    defer Provider.deinit(&app);
+    try Provider.configure(&app, "session-42");
+    const view = app.lifecycle_runtime.freeze();
+    Provider.reportPromptQueued(&app);
+    Provider.reportPromptWorking(&app);
+
+    var worker = worker_runtime.WorkerRuntime{};
+    defer worker.deinit(std.testing.allocator);
+    worker.worker_processing = true;
+    worker.active_turn_id = 42;
+    var completed = std.atomic.Value(bool).init(false);
+    var waiter = Waiter{
+        .worker = &worker,
+        .view = view,
+        .completed = &completed,
+    };
+    const waiter_thread = try std.Thread.spawn(.{}, Waiter.run, .{&waiter});
+    var request_id: u64 = 0;
+    var attempts: usize = 0;
+    while (attempts < 100) : (attempts += 1) {
+        var snapshot = try worker.snapshotState(std.testing.allocator);
+        defer snapshot.deinit(std.testing.allocator);
+        if (snapshot.pending_permission_request) |request| {
+            request_id = request.id;
+            break;
+        }
+        std.Thread.yield() catch std.atomic.spinLoopHint();
+    }
+    try std.testing.expect(request_id != 0);
+    view.runAttentionRequired(.{
+        .invocation = testInvocation(.interactive),
+        .kind = .permission,
+        .presented_interactively = true,
+    });
+
+    var observer = Observer{ .view = view };
+    var submitter = Submitter{
+        .worker = &worker,
+        .request_id = request_id,
+        .observer = &observer,
+    };
+    const submitter_thread = try std.Thread.spawn(.{}, Submitter.run, .{&submitter});
+    while (!observer.entered.load(.seq_cst)) {
+        std.Thread.yield() catch std.atomic.spinLoopHint();
+    }
+
+    try std.testing.expect(!completed.load(.seq_cst));
+    try std.testing.expectEqual(@as(u64, 42), observer.turn_id.load(.seq_cst));
+    try std.testing.expectEqual(@as(usize, 4), app.ade_events.event_count);
+    try std.testing.expectEqual(
+        RecordingAdeClient.Event.attention_resolved,
+        app.ade_events.events[3],
+    );
+    try std.testing.expectEqual(
+        lifecycle_state.AgentState.working,
+        app.lifecycle_state.snapshot(.main).agent_state,
+    );
+    try expectReport(app.herdr.reports[3], .working, null);
+
+    observer.release.store(true, .seq_cst);
+    submitter_thread.join();
+    waiter_thread.join();
+
+    try std.testing.expectEqual(
+        worker_runtime.PermissionSubmissionResult.accepted,
+        submitter.result.?,
+    );
+    try std.testing.expect(waiter.err == null);
+    try std.testing.expectEqual(
+        @import("../core/shared/types.zig").ToolPermissionDecision.once,
+        waiter.decision.?,
+    );
+    try std.testing.expectEqual(@as(usize, 6), app.ade_events.event_count);
+    try std.testing.expectEqual(RecordingAdeClient.Event.stop, app.ade_events.events[4]);
+    try std.testing.expectEqual(RecordingAdeClient.Event.post_turn_end, app.ade_events.events[5]);
+    try std.testing.expectEqual(
+        lifecycle_state.AgentState.idle,
+        app.lifecycle_state.snapshot(.main).agent_state,
+    );
+    try std.testing.expectEqual(@as(usize, 5), app.herdr.report_count);
+    try expectReport(app.herdr.reports[4], .idle, null);
 }
 
 test "enabling either lifecycle projection does not control the other" {
