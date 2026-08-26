@@ -153,6 +153,16 @@ record. Nullable identifiers are JSON `null`.
 `agent_role` is `main` or `subagent`. A main record carries the TUI's active
 session in `session_id` and has no parent. A subagent record carries the child
 session in `session_id` and the owning main session in `parent_session_id`.
+
+That parent identity is captured when the child's work is admitted, not read
+live when the record is emitted. A `/new` or resume can install a different
+active main session while a child is still running; every record about that
+child continues to name the session that owned it, so two records about one
+child never disagree about its parent across a session change. A receiver
+should therefore expect a child's `parent_session_id` to lag the instance's
+current main session after a `SessionChanged`, and must not treat the
+difference as an error. Where Fx has no captured identity to offer, the record
+falls back to the instance's current main session.
 `subagent_id` is an optional Fx-local numeric identity; consumers must use the
 session IDs for durable identity. Main and child records always retain the same
 ADE-assigned `instance_id`.

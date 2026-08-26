@@ -354,7 +354,16 @@ pub const Client = struct {
             .agent_role = role,
             .workspace_root = invocation.scope.workspace_root,
             .session_id = invocation.scope.session_id,
-            .parent_session_id = if (role == .subagent) self.main_session_id else null,
+            // Prefer the parent the caller captured when the work was
+            // admitted. Reading the live main session here reattributed a
+            // running child to whatever session a `/new` had just installed,
+            // so a lifecycle record and a discovery record about the same
+            // child disagreed across that boundary. Fall back to the live
+            // session only for a caller that carries no captured identity.
+            .parent_session_id = if (role == .subagent)
+                (invocation.scope.parent_session_id orelse self.main_session_id)
+            else
+                null,
             .subagent_id = invocation.scope.subagent_id,
             .turn_id = invocation.turn_id,
             .agent_state = snapshot.agent_state,
@@ -1605,4 +1614,108 @@ test "ADE feed refuses tool arguments that would break record framing" {
     @memset(deep[0..65], '[');
     @memset(deep[65..130], ']');
     try std.testing.expect(compactJsonIsAdmissible(std.testing.allocator, &deep));
+}
+
+test "ADE child records keep their captured parent across a main session change" {
+    const alloc = std.testing.allocator;
+    var client = Client{
+        .enabled = true,
+        .alloc = alloc,
+        .socket_path = try alloc.dupe(u8, "/tmp/unused-ade.sock"),
+        .instance_id = try alloc.dupe(u8, "instance-6"),
+        .workspace_root = try alloc.dupe(u8, "/tmp/workspace"),
+        .main_session_id = try alloc.dupe(u8, "root-session-a"),
+    };
+    defer client.deinit();
+
+    // A child admitted under root-session-a carries that identity for the
+    // life of its work, whatever the TUI installs afterwards.
+    const child_scope = hooks.Scope{
+        .kind = .subagent,
+        .workspace_root = "/tmp/workspace",
+        .session_id = "child-session",
+        .subagent_id = 3,
+        .parent_session_id = "root-session-a",
+    };
+
+    client.reportTurnStarted(.{ .scope = child_scope, .turn_id = 11 });
+    client.reportSessionChanged("root-session-b");
+    // The `/new` lands mid-flight. This record is emitted after it, which is
+    // exactly the ordering the existing agreement test cannot reach: reading
+    // the live main session here reattributed a running child to a session
+    // that never owned it.
+    client.reportPostTurnEnd(.{
+        .invocation = .{ .scope = child_scope, .turn_id = 11 },
+        .outcome = .completed,
+        .provider_disposition = null,
+    });
+    // A discovery for the same child carries its own captured parent, and the
+    // two must still agree.
+    TestAdapter.reportGitRootDiscovered(&client, .{
+        .root = "/tmp/workspace/child-repository",
+        .revision = 1,
+        .reason = .subagent_file_mutation,
+        .scope = child_scope,
+        .parent_session_id = "root-session-a",
+    });
+
+    try std.testing.expectEqual(@as(usize, 4), client.queue_len);
+    const expected_events = [_][]const u8{
+        "TurnStarted",
+        "SessionChanged",
+        "PostTurnEnd",
+        "GitRootDiscovered",
+    };
+    for (expected_events, 0..) |expected_event, index| {
+        var parsed = try std.json.parseFromSlice(
+            std.json.Value,
+            alloc,
+            client.queue[index].?.bytes,
+            .{},
+        );
+        defer parsed.deinit();
+        try std.testing.expectEqualStrings(
+            expected_event,
+            parsed.value.object.get("event").?.string,
+        );
+        const context = parsed.value.object.get("context").?.object;
+        if (index == 1) {
+            // The main record itself does move: that is the whole event.
+            try std.testing.expectEqualStrings("main", context.get("agent_role").?.string);
+            try std.testing.expectEqualStrings(
+                "root-session-b",
+                context.get("session_id").?.string,
+            );
+            try std.testing.expect(context.get("parent_session_id").? == .null);
+            continue;
+        }
+        try std.testing.expectEqualStrings("subagent", context.get("agent_role").?.string);
+        try std.testing.expectEqualStrings("child-session", context.get("session_id").?.string);
+        try std.testing.expectEqualStrings(
+            "root-session-a",
+            context.get("parent_session_id").?.string,
+        );
+    }
+
+    // A child scope carrying no captured identity still falls back to the
+    // live main session, so a caller with nothing to offer is unchanged.
+    client.reportTurnStarted(.{
+        .scope = .{
+            .kind = .subagent,
+            .workspace_root = "/tmp/workspace",
+            .session_id = "uncaptured-child",
+        },
+        .turn_id = 12,
+    });
+    var fallback = try std.json.parseFromSlice(
+        std.json.Value,
+        alloc,
+        client.queue[4].?.bytes,
+        .{},
+    );
+    defer fallback.deinit();
+    try std.testing.expectEqualStrings(
+        "root-session-b",
+        fallback.value.object.get("context").?.object.get("parent_session_id").?.string,
+    );
 }

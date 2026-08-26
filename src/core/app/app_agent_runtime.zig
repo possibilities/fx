@@ -143,6 +143,7 @@ pub fn Runtime(comptime App: type) type {
                 .kind = .subagent,
                 .workspace_root = child_context.workspace_root,
                 .session_id = child_session_id,
+                .parent_session_id = admission.root_id,
             };
             return child_context;
         }
