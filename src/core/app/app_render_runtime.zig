@@ -3126,17 +3126,29 @@ pub fn Runtime(comptime App: type) type {
         }
 
         pub fn resolveSubagentApproval(app: *App) !void {
+            const approval_input_runtime = @import("input_approval_runtime.zig");
             const submission = app.subagents.prepareApprovalResolution() orelse return;
             const host = app_session_runtime.Runtime(App).subagentHost(app) orelse {
                 try app.subagents.approvalRejected(app.alloc, false);
                 return;
             };
-            const resolved = host.resolveApproval(.{
-                .request_id = submission.request_id,
-                .child_id = submission.child_id,
-                .decision = submission.decision,
-                .timestamp_ms = io_mod.milliTimestamp(),
-            }) catch |err| {
+            // Answering from the panel owes the child the same attribution the
+            // mirrored main prompt owes it. `resolveApproval` is the
+            // unobserved wrapper, so releasing the child through it left that
+            // child's snapshot blocked until its next record repaired it, and
+            // a next record of `PostTurnEnd` took it from blocked to idle
+            // without ever passing through working.
+            const resolved = approval_input_runtime.ApprovalRuntime(App).resolveSubagentApproval(
+                app,
+                host,
+                .{
+                    .request_id = submission.request_id,
+                    .child_id = submission.child_id,
+                    .decision = submission.decision,
+                    .timestamp_ms = io_mod.milliTimestamp(),
+                },
+                submission.child_id,
+            ) catch |err| {
                 try app.subagents.approvalRejected(
                     app.alloc,
                     err == error.RequestNotFound or err == error.StaleRequest or err == error.WrongChild,

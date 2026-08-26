@@ -5,6 +5,7 @@ const input_action = @import("../input/input_action.zig");
 const input_limit_rejection = @import("../input/input_limit_rejection.zig");
 const io_mod = @import("../shared/io.zig");
 const approval_decision = @import("../permissions/approval_decision.zig");
+const hooks = @import("../hooks/hooks.zig");
 const approval_screen = @import("../../ui/approval_screen.zig");
 const approval_ui = @import("../../ui/footer/approval_ui.zig");
 const types = @import("../shared/types.zig");
@@ -65,7 +66,12 @@ pub fn ApprovalRuntime(comptime App: type) type {
             }
         };
 
-        fn resolveSubagentApproval(
+        /// Answers one child's permission on that child's behalf and
+        /// attributes the resolution to the child, not to the surface the
+        /// human used. The subagent panel and the mirrored main prompt both
+        /// route here so a child cannot be released without its
+        /// `AttentionResolved`.
+        pub fn resolveSubagentApproval(
             app: *App,
             host: anytype,
             options: subagent_tool_host.ApprovalResolveOptions,
@@ -822,8 +828,55 @@ const ApprovalBridgeWaiter = struct {
     }
 };
 
+/// Records the attention lifecycle the bridge app publishes. Declaring
+/// `dispatchAttentionRequired` and `dispatchAttentionResolved` also selects
+/// the observed resolve path in both approval surfaces, which is the behavior
+/// under test rather than an incidental harness detail.
+const RecordedAttention = struct {
+    const max_records: usize = 8;
+    const max_child_bytes: usize = 64;
+
+    kinds: [max_records]hooks.AttentionKind = undefined,
+    children: [max_records][max_child_bytes]u8 = undefined,
+    child_lens: [max_records]?usize = @splat(null),
+    len: usize = 0,
+
+    fn record(
+        self: *RecordedAttention,
+        kind: hooks.AttentionKind,
+        child_session_id: ?[]const u8,
+    ) void {
+        if (self.len == max_records) return;
+        self.kinds[self.len] = kind;
+        if (child_session_id) |value| {
+            const copied = @min(value.len, max_child_bytes);
+            @memcpy(self.children[self.len][0..copied], value[0..copied]);
+            self.child_lens[self.len] = copied;
+        } else {
+            self.child_lens[self.len] = null;
+        }
+        self.len += 1;
+    }
+
+    fn childAt(self: *const RecordedAttention, index: usize) ?[]const u8 {
+        const length = self.child_lens[index] orelse return null;
+        return self.children[index][0..length];
+    }
+
+    fn countFor(self: *const RecordedAttention, child_session_id: []const u8) usize {
+        var total: usize = 0;
+        for (0..self.len) |index| {
+            const child = self.childAt(index) orelse continue;
+            if (std.mem.eql(u8, child, child_session_id)) total += 1;
+        }
+        return total;
+    }
+};
+
 const ApprovalBridgeApp = struct {
     alloc: std.mem.Allocator,
+    attention_required: RecordedAttention = .{},
+    attention_resolved: RecordedAttention = .{},
     session_persistence: app_session_runtime.Persistence = .{},
     subagents: subagent_controller.Controller = .{},
     approval_prompt: approval_prompt.ApprovalPrompt = .{},
@@ -853,6 +906,24 @@ const ApprovalBridgeApp = struct {
         self.subagents.deinit(self.alloc);
         self.approval_prompt.deinit(self.alloc);
         self.input_runtime.deinit(self.alloc);
+    }
+
+    pub fn dispatchAttentionRequired(
+        self: *ApprovalBridgeApp,
+        _: u64,
+        kind: hooks.AttentionKind,
+        child_session_id: ?[]const u8,
+    ) void {
+        self.attention_required.record(kind, child_session_id);
+    }
+
+    pub fn dispatchAttentionResolved(
+        self: *ApprovalBridgeApp,
+        _: u64,
+        kind: hooks.AttentionKind,
+        child_session_id: ?[]const u8,
+    ) void {
+        self.attention_resolved.record(kind, child_session_id);
     }
 
     fn refreshSubagentManagerProjection(self: *ApprovalBridgeApp) !void {
@@ -1107,6 +1178,22 @@ fn runApprovalBridgeScenario(
         );
     }
 
+    // Both surfaces answer on the child's behalf, so both owe the child an
+    // attributed resolution. The panel path used the unobserved wrapper and
+    // published nothing, leaving that child blocked until its next record.
+    // A denial resolves too: the human decided and the child continues with
+    // the denial as its tool result. Only a stale or rejected submission
+    // publishes nothing.
+    try std.testing.expectEqual(@as(usize, 1), app.attention_resolved.len);
+    try std.testing.expectEqual(
+        hooks.AttentionKind.permission,
+        app.attention_resolved.kinds[0],
+    );
+    try std.testing.expectEqualStrings(
+        ApprovalBridgeWaiter.child_id,
+        app.attention_resolved.childAt(0).?,
+    );
+
     thread.join();
     joined = true;
     try std.testing.expect(!waiter.failed.load(.seq_cst));
@@ -1277,6 +1364,18 @@ fn runTwoApprovalBridgeScenario() !void {
     try std.testing.expectEqual(@as(u64, 4), host.approvals.pendingRevision());
     try std.testing.expectEqual(@as(usize, 0), app.subagents.runtime.snapshot.?.pending_approval_total);
     try std.testing.expect(app.subagents.runtime.mainApprovalRequest() == null);
+
+    // One resolution per child, each attributed to the child that was
+    // waiting, whichever surface answered it.
+    try std.testing.expectEqual(@as(usize, 2), app.attention_resolved.len);
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        app.attention_resolved.countFor(ApprovalBridgeWaiter.child_id),
+    );
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        app.attention_resolved.countFor(second_child_id),
+    );
 }
 
 test "production approval bridge keeps exact identity and first winner across both surfaces" {
