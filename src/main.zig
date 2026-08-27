@@ -554,6 +554,7 @@ const App = struct {
     change_tracker: change_tracker_mod.ChangeTracker = .{},
     mcp: app_mcp_runtime.State = .{},
     skills: skill_runtime.Runtime = .{},
+    skill_root_policy: @import("core/skills/skill_contract.zig").RootPolicy = builtin_skills.root_policy,
     context_snapshot: context_contract.GatheredContextSnapshot = .{},
     file_index: file_index_mod.FileIndex = .{},
     context_enabled: bool = true,
@@ -598,6 +599,10 @@ const App = struct {
             else
                 background_process.provider),
         };
+        app.skill_root_policy = launch.modifiers.skillRootPolicy(if (comptime host_target.is_wasm)
+            wasm_skill_root_policy
+        else
+            builtin_skills.root_policy);
         if (comptime host_profile.js_host_workspace) {
             app.workspace_host = js_host_workspace.Runtime.init(alloc) catch |err| blk: {
                 if (err != error.WorkspaceUnavailable) {
@@ -629,7 +634,7 @@ const App = struct {
             launch.record_requested,
             .{
                 .load_mcp_runtime = if (comptime host_target.is_wasm) loadNoMcpRuntime else builtin_mcp.loadRuntime,
-                .skill_root_policy = if (comptime host_target.is_wasm) wasm_skill_root_policy else builtin_skills.root_policy,
+                .skill_root_policy = app.skill_root_policy,
                 .terminal_title = app.terminalTitle(),
             },
         );
@@ -1728,7 +1733,7 @@ const App = struct {
     }
 
     pub fn reloadSkills(self: *App) !void {
-        const loaded = try app_runtime_setup.loadSkills(std.heap.c_allocator, self.workspace_root, builtin_skills.root_policy);
+        const loaded = try app_runtime_setup.loadSkills(std.heap.c_allocator, self.workspace_root, self.skill_root_policy);
         skill_runtime.traceDiagnostics("interactive_reload", loaded.diagnostics);
         self.skills.replaceLoaded(std.heap.c_allocator, loaded.dir, loaded.skills, loaded.diagnostics);
     }
@@ -3393,6 +3398,8 @@ test "full entry config commands also use early threaded io" {
     try std.testing.expect(needsEarlyThreadedIo(&.{
         @as([:0]const u8, "--context-limit=project_bytes=2048"),
         @as([:0]const u8, "--no-additional-dirs"),
+        @as([:0]const u8, "--no-default-skills"),
+        @as([:0]const u8, "--skills-dir=/tmp/acp-skills"),
         @as([:0]const u8, "acp"),
     }));
 }

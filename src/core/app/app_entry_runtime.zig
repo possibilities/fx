@@ -323,16 +323,23 @@ fn runInteractiveWithDeps(comptime App: type, comptime cooperative: bool, alloc:
         if (handoff_value) |value| {
             var handoff = value;
             defer handoff.deinit(alloc);
-            var argv = [_][]const u8{
-                request.executablePath(),
-                "resume",
-                handoff.session_id,
-                cli_surface.upgrade_relaunch_arg,
-            };
+            var argv: std.ArrayList([]const u8) = .empty;
+            defer argv.deinit(alloc);
+            try argv.append(alloc, request.executablePath());
+            if (launch.modifiers.no_default_skills) {
+                try argv.append(alloc, "--no-default-skills");
+            }
+            for (launch.modifiers.skill_directories) |path| {
+                try argv.append(alloc, "--skills-dir");
+                try argv.append(alloc, path);
+            }
+            try argv.append(alloc, "resume");
+            try argv.append(alloc, handoff.session_id);
+            try argv.append(alloc, cli_surface.upgrade_relaunch_arg);
             const replace_err = deps.replace_process(
                 deps.replace_ctx,
                 io_mod.getIo(),
-                .{ .argv = &argv },
+                .{ .argv = argv.items },
             );
             writeUpgradeRelaunchFailure(deps, replace_err, handoff.session_id);
         } else {
@@ -595,8 +602,8 @@ const TestCapture = struct {
     replace_error: std.process.ReplaceError = error.InvalidExe,
     replace_calls: usize = 0,
     replace_arg_count: usize = 0,
-    replace_arg_bufs: [4][128]u8 = undefined,
-    replace_arg_lens: [4]usize = .{ 0, 0, 0, 0 },
+    replace_arg_bufs: [10][128]u8 = undefined,
+    replace_arg_lens: [10]usize = .{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
     fail_unexpected_format: bool = false,
 
     fn init(run_result: cli_surface.RunResult) TestCapture {
@@ -951,6 +958,41 @@ test "app entry relaunches only after teardown with the validated handoff" {
         "deinit",
         "stderr-attempt",
     });
+}
+
+test "app entry relaunch preserves exclusive skill roots" {
+    const alloc = std.testing.allocator;
+    var capture = TestCapture.init(.{ .interactive = .{} });
+    defer capture.deinit();
+    const skill_directories = try alloc.alloc([]u8, 2);
+    skill_directories[0] = try alloc.dupe(u8, "/tmp/first-skills");
+    skill_directories[1] = try alloc.dupe(u8, "/tmp/second-skills");
+    capture.run_result = .{ .interactive = .{ .modifiers = .{
+        .skill_directories = skill_directories,
+        .no_default_skills = true,
+    } } };
+    capture.resume_handoff_id = "session-123";
+    capture.upgrade_relaunch_path = "/tmp/fx-upgraded";
+
+    const outcome = try runWithDeps(
+        TestApp,
+        alloc,
+        &.{},
+        testConfig(),
+        capture.deps(),
+    );
+
+    try std.testing.expectEqual(@as(u8, 1), outcome.exit);
+    try std.testing.expectEqual(@as(usize, 9), capture.replace_arg_count);
+    try std.testing.expectEqualStrings("/tmp/fx-upgraded", capture.replaceArg(0));
+    try std.testing.expectEqualStrings("--no-default-skills", capture.replaceArg(1));
+    try std.testing.expectEqualStrings("--skills-dir", capture.replaceArg(2));
+    try std.testing.expectEqualStrings("/tmp/first-skills", capture.replaceArg(3));
+    try std.testing.expectEqualStrings("--skills-dir", capture.replaceArg(4));
+    try std.testing.expectEqualStrings("/tmp/second-skills", capture.replaceArg(5));
+    try std.testing.expectEqualStrings("resume", capture.replaceArg(6));
+    try std.testing.expectEqualStrings("session-123", capture.replaceArg(7));
+    try std.testing.expectEqualStrings("--upgrade-relaunch", capture.replaceArg(8));
 }
 
 test "app entry never relaunches without a validated handoff" {

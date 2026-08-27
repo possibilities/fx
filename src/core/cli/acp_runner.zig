@@ -8,6 +8,7 @@ const provider_set = @import("../gateway/provider_set.zig");
 const host = @import("../hosts/host.zig");
 const mode_registry = @import("../modes/mode_registry.zig");
 const prompt_policy = @import("../config/prompt_policy.zig");
+const skill_contract = @import("../skills/skill_contract.zig");
 const context_contract = @import("../workspace/context_contract.zig");
 
 const Allocator = std.mem.Allocator;
@@ -42,6 +43,7 @@ pub const Config = struct {
     context_limit_overrides: []const config_runtime.context_limits.Override = &.{},
     additional_directories: []const []const u8 = &.{},
     saved_directories_suppressed: bool = false,
+    skill_root_policy: skill_contract.RootPolicy = .{ .managed_root_source = null },
     allow_acp_mcp: bool = true,
     allow_native_tools: bool = true,
 };
