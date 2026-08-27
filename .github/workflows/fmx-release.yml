@@ -19,6 +19,7 @@ jobs:
     env:
       RELEASE_BASE_URL: ${{ vars.FMX_RELEASE_BASE_URL }}
       RELEASE_PROJECT: ${{ vars.FMX_RELEASE_PROJECT }}
+      RELEASE_SCOPE: ${{ vars.FMX_RELEASE_SCOPE }}
       VERCEL_CLI_VERSION: "59.9.1"
       VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
       VERCEL_TELEMETRY_DISABLED: "1"
@@ -47,10 +48,14 @@ jobs:
             exit 1
           fi
           echo "version=$GITHUB_SHA" >> "$GITHUB_OUTPUT"
-          if [[ -z "$VERCEL_TOKEN" || -z "$RELEASE_BASE_URL" ]]; then
+          if [[ -z "$VERCEL_TOKEN" || -z "$RELEASE_BASE_URL" || -z "$RELEASE_SCOPE" ]]; then
             echo "configured=false" >> "$GITHUB_OUTPUT"
-            echo "::warning::Set VERCEL_TOKEN and FMX_RELEASE_BASE_URL, then rerun this workflow."
+            echo "::warning::Set VERCEL_TOKEN, FMX_RELEASE_BASE_URL, and FMX_RELEASE_SCOPE, then rerun this workflow."
             exit 0
+          fi
+          if [[ ! "$RELEASE_SCOPE" =~ ^[A-Za-z0-9][A-Za-z0-9-]*$ ]]; then
+            echo "::error::FMX_RELEASE_SCOPE must be a Vercel team slug"
+            exit 1
           fi
           if [[ "$RELEASE_BASE_URL" == */ ]] \
             || [[ ! "$RELEASE_BASE_URL" =~ ^https://[A-Za-z0-9][A-Za-z0-9.-]*\.public\.blob\.vercel-storage\.com(/[A-Za-z0-9._/-]+)?$ ]]; then
@@ -63,7 +68,7 @@ jobs:
           stores_json="$(mktemp)"
           trap 'rm -f "$stores_json"' EXIT
           npx --yes "vercel@$VERCEL_CLI_VERSION" blob list-stores --all --json \
-            --token "$VERCEL_TOKEN" > "$stores_json"
+            --scope "$RELEASE_SCOPE" --token "$VERCEL_TOKEN" > "$stores_json"
           store_count="$(jq --arg id "$release_store_id" \
             '[.stores[] | select((.id | sub("^store_"; "")) == $id)] | length' \
             "$stores_json")"
@@ -135,6 +140,7 @@ jobs:
     runs-on: ubuntu-24.04
     env:
       RELEASE_BASE_URL: ${{ vars.FMX_RELEASE_BASE_URL }}
+      RELEASE_SCOPE: ${{ vars.FMX_RELEASE_SCOPE }}
       STORE_ID: ${{ needs.configure.outputs.store_id }}
       VERCEL_CLI_VERSION: "59.9.1"
       VERCEL_PROJECT_ID: ${{ needs.configure.outputs.project_id }}
@@ -167,7 +173,7 @@ jobs:
           set -euo pipefail
           npx --yes "vercel@$VERCEL_CLI_VERSION" env pull .env.local --yes \
             --environment=production --project "$VERCEL_PROJECT_ID" \
-            --token "$VERCEL_TOKEN"
+            --scope "$RELEASE_SCOPE" --token "$VERCEL_TOKEN"
           pulled_store="$(sed -n 's/^BLOB_STORE_ID=//p' .env.local | tail -n 1)"
           pulled_store="${pulled_store#\"}"
           pulled_store="${pulled_store%\"}"
