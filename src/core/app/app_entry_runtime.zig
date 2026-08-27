@@ -13,6 +13,7 @@ const provider_set = @import("../gateway/provider_set.zig");
 const host = @import("../hosts/host.zig");
 const host_target = @import("../hosts/target.zig");
 const io_mod = @import("../shared/io.zig");
+const config_runtime = @import("../config/config_runtime.zig");
 const prompt_policy = @import("../config/prompt_policy.zig");
 const skill_contract = @import("../skills/skill_contract.zig");
 const command_specs = @import("../slash_commands/command_specs.zig");
@@ -323,18 +324,60 @@ fn runInteractiveWithDeps(comptime App: type, comptime cooperative: bool, alloc:
         if (handoff_value) |value| {
             var handoff = value;
             defer handoff.deinit(alloc);
-            var argv = [_][]const u8{
-                request.executablePath(),
-                "resume",
-                handoff.session_id,
-                cli_surface.upgrade_relaunch_arg,
-            };
+            var argv: std.ArrayList([]const u8) = .empty;
+            defer argv.deinit(alloc);
+            var owned_argv: std.ArrayList([]u8) = .empty;
+            defer {
+                for (owned_argv.items) |arg| alloc.free(arg);
+                owned_argv.deinit(alloc);
+            }
+            try argv.append(alloc, request.executablePath());
+            for (launch.modifiers.context_limit_overrides) |override| {
+                try argv.append(alloc, "--context-limit");
+                const rendered = switch (override.value) {
+                    .bytes => |bytes| try std.fmt.allocPrint(
+                        alloc,
+                        "{s}={d}",
+                        .{ @tagName(override.name), bytes },
+                    ),
+                    .off => try std.fmt.allocPrint(
+                        alloc,
+                        "{s}=off",
+                        .{@tagName(override.name)},
+                    ),
+                };
+                owned_argv.append(alloc, rendered) catch |err| {
+                    alloc.free(rendered);
+                    return err;
+                };
+                try argv.append(alloc, rendered);
+            }
+            for (launch.modifiers.additional_directories) |path| {
+                try argv.append(alloc, "--add-dir");
+                try argv.append(alloc, path);
+            }
+            if (launch.modifiers.saved_directories_suppressed) {
+                try argv.append(alloc, "--no-additional-dirs");
+            }
+            if (launch.modifiers.state_home) |home| {
+                try argv.append(alloc, "--state-dir");
+                try argv.append(alloc, home);
+            }
+            try argv.append(alloc, "resume");
+            try argv.append(alloc, handoff.session_id);
+            try argv.append(alloc, cli_surface.upgrade_relaunch_arg);
+            if (launch.record_requested) try argv.append(alloc, "--record");
             const replace_err = deps.replace_process(
                 deps.replace_ctx,
                 io_mod.getIo(),
-                .{ .argv = &argv },
+                .{ .argv = argv.items },
             );
-            writeUpgradeRelaunchFailure(deps, replace_err, handoff.session_id);
+            writeUpgradeRelaunchFailure(
+                deps,
+                replace_err,
+                handoff.session_id,
+                launch.modifiers.state_home,
+            );
         } else {
             writeStderr(
                 deps,
@@ -372,13 +415,21 @@ fn writeUpgradeRelaunchFailure(
     deps: RunDeps,
     err: std.process.ReplaceError,
     session_id: []const u8,
+    state_home: ?[]const u8,
 ) void {
     var buffer: [768]u8 = undefined;
-    const message = std.fmt.bufPrint(
-        &buffer,
-        "fx: upgrade installed, but relaunch failed: {s}\nContinue session with: fx --resume {s}\n",
-        .{ @errorName(err), session_id },
-    ) catch "fx: upgrade installed, but relaunch failed; run `fx doctor`.\n";
+    const message = if (state_home) |home|
+        std.fmt.bufPrint(
+            &buffer,
+            "fx: upgrade installed, but relaunch failed: {s}\nContinue session with: fx --state-dir {s} resume {s}\n",
+            .{ @errorName(err), home, session_id },
+        ) catch "fx: upgrade installed, but relaunch failed; run `fx doctor`.\n"
+    else
+        std.fmt.bufPrint(
+            &buffer,
+            "fx: upgrade installed, but relaunch failed: {s}\nContinue session with: fx --resume {s}\n",
+            .{ @errorName(err), session_id },
+        ) catch "fx: upgrade installed, but relaunch failed; run `fx doctor`.\n";
     writeStderr(deps, message);
 }
 
@@ -491,7 +542,12 @@ const test_entry_context_registry = context_contract.Registry{ .default_provider
     .append_transient_fn = appendNoopTransientContextForTest,
 } };
 
-fn noMcpRuntimeForTest(_: Allocator, _: []const u8, _: @import("../mcp/elicitation.zig").Capabilities) !?*mcp_runtime.McpRuntime {
+fn noMcpRuntimeForTest(
+    _: Allocator,
+    _: []const u8,
+    _: @import("../mcp/elicitation.zig").Capabilities,
+    _: ?[]const u8,
+) !?*mcp_runtime.McpRuntime {
     return null;
 }
 
@@ -595,8 +651,8 @@ const TestCapture = struct {
     replace_error: std.process.ReplaceError = error.InvalidExe,
     replace_calls: usize = 0,
     replace_arg_count: usize = 0,
-    replace_arg_bufs: [4][128]u8 = undefined,
-    replace_arg_lens: [4]usize = .{ 0, 0, 0, 0 },
+    replace_arg_bufs: [16][128]u8 = undefined,
+    replace_arg_lens: [16]usize = [_]usize{0} ** 16,
     fail_unexpected_format: bool = false,
 
     fn init(run_result: cli_surface.RunResult) TestCapture {
@@ -951,6 +1007,65 @@ test "app entry relaunches only after teardown with the validated handoff" {
         "deinit",
         "stderr-attempt",
     });
+}
+
+test "app entry preserves launch controls across upgrade relaunch" {
+    const alloc = std.testing.allocator;
+    const overrides = try alloc.dupe(
+        config_runtime.context_limits.Override,
+        &.{.{
+            .name = .skill_chunk_bytes,
+            .value = .{ .bytes = 4096 },
+        }},
+    );
+    const directories = try alloc.alloc([]u8, 1);
+    directories[0] = try alloc.dupe(u8, "/tmp/fx-extra");
+    const state_home = try alloc.dupe(u8, "/tmp/fx-state");
+    var capture = TestCapture.init(.{ .interactive = .{
+        .record_requested = true,
+        .modifiers = .{
+            .context_limit_overrides = overrides,
+            .additional_directories = directories,
+            .saved_directories_suppressed = true,
+            .state_home = state_home,
+        },
+    } });
+    defer capture.deinit();
+    capture.resume_handoff_id = "session-123";
+    capture.upgrade_relaunch_path = "/tmp/fx-upgraded";
+
+    const outcome = try runWithDeps(
+        TestApp,
+        alloc,
+        &.{},
+        testConfig(),
+        capture.deps(),
+    );
+
+    try std.testing.expectEqual(@as(u8, 1), outcome.exit);
+    const expected = [_][]const u8{
+        "/tmp/fx-upgraded",
+        "--context-limit",
+        "skill_chunk_bytes=4096",
+        "--add-dir",
+        "/tmp/fx-extra",
+        "--no-additional-dirs",
+        "--state-dir",
+        "/tmp/fx-state",
+        "resume",
+        "session-123",
+        "--upgrade-relaunch",
+        "--record",
+    };
+    try std.testing.expectEqual(expected.len, capture.replace_arg_count);
+    for (expected, 0..) |arg, index| {
+        try std.testing.expectEqualStrings(arg, capture.replaceArg(index));
+    }
+    try std.testing.expect(std.mem.find(
+        u8,
+        capture.stderr.written(),
+        "fx --state-dir /tmp/fx-state resume session-123",
+    ) != null);
 }
 
 test "app entry never relaunches without a validated handoff" {

@@ -1,5 +1,6 @@
 const std = @import("std");
 const app_permission_runtime = @import("../app/app_permission_runtime.zig");
+const app_profile_runtime = @import("../app/app_profile_runtime.zig");
 const app_session_runtime = @import("../app/app_session_runtime.zig");
 const auth_runtime = @import("../auth/auth_runtime.zig");
 const collections = @import("../shared/collections.zig");
@@ -137,7 +138,7 @@ fn loadDetailedSettingsForNotice(app: anytype) !config_runtime.DetailedSettings 
     if (comptime @hasDecl(@TypeOf(app.*), "loadDetailedSettingsForNotice")) {
         return app.loadDetailedSettingsForNotice();
     }
-    return config_runtime.loadMergedSettingsDetailed(app.alloc, app.workspace_root);
+    return app_profile_runtime.loadMergedSettingsDetailed(app);
 }
 
 fn postCommitResolutionError(
@@ -324,7 +325,7 @@ pub fn Commands(comptime App: type) type {
                 return;
             }
 
-            var settings = config_runtime.loadMergedSettings(app.alloc, app.workspace_root) catch |err| {
+            var settings = app_profile_runtime.loadMergedSettings(app) catch |err| {
                 try writeSettingsLoadError(app, err);
                 return;
             };
@@ -428,8 +429,8 @@ pub fn Commands(comptime App: type) type {
             const trimmed = std.mem.trim(u8, rest, " \t");
             if (std.ascii.eqlIgnoreCase(trimmed, "off")) {
                 app.prompt_history.disable();
-                var attempt = config_runtime.attemptUserPreferences(
-                    app.alloc,
+                var attempt = app_profile_runtime.attemptUserPreferences(
+                    app,
                     .{ .prompt_history_enabled = false },
                 );
                 defer attempt.deinit(app.alloc);
@@ -457,8 +458,8 @@ pub fn Commands(comptime App: type) type {
             }
 
             if (std.ascii.eqlIgnoreCase(trimmed, "on")) {
-                var attempt = config_runtime.attemptUserPreferences(
-                    app.alloc,
+                var attempt = app_profile_runtime.attemptUserPreferences(
+                    app,
                     .{ .prompt_history_enabled = true },
                 );
                 defer attempt.deinit(app.alloc);
@@ -515,8 +516,8 @@ pub fn Commands(comptime App: type) type {
             };
             defer target.deinit(app.alloc);
 
-            var outcome = config_runtime.addPermissionRule(
-                app.alloc,
+            var outcome = app_profile_runtime.addPermissionRule(
+                app,
                 permission_scope,
                 permissionWorkspaceRoot(app, permission_scope),
                 target.category,
@@ -557,8 +558,8 @@ pub fn Commands(comptime App: type) type {
             };
             defer target.deinit(app.alloc);
 
-            var outcome = config_runtime.removePermissionRule(
-                app.alloc,
+            var outcome = app_profile_runtime.removePermissionRule(
+                app,
                 permission_scope,
                 permissionWorkspaceRoot(app, permission_scope),
                 target.category,
@@ -603,8 +604,8 @@ pub fn Commands(comptime App: type) type {
                 return;
             };
 
-            var outcome = config_runtime.removeAllowlistRules(
-                app.alloc,
+            var outcome = app_profile_runtime.removeAllowlistRules(
+                app,
                 permission_scope,
                 permissionWorkspaceRoot(app, permission_scope),
                 reset_scope,
@@ -922,7 +923,7 @@ pub fn Commands(comptime App: type) type {
         }
 
         fn writeSettingsStatus(app: *App) !void {
-            var detailed = config_runtime.loadMergedSettingsDetailed(app.alloc, app.workspace_root) catch |err| {
+            var detailed = app_profile_runtime.loadMergedSettingsDetailed(app) catch |err| {
                 try writeSettingsLoadError(app, err);
                 return;
             };
@@ -943,8 +944,8 @@ pub fn Commands(comptime App: type) type {
         }
 
         fn saveStartupScrollbackSetting(app: *App, enabled: bool) !void {
-            var attempt = config_runtime.attemptUserPreferences(
-                app.alloc,
+            var attempt = app_profile_runtime.attemptUserPreferences(
+                app,
                 .{ .startup_scrollback = enabled },
             );
             defer attempt.deinit(app.alloc);
@@ -1058,8 +1059,8 @@ pub fn Commands(comptime App: type) type {
                 break :blk app.persistRuntimePreferences(patch);
             } else blk: {
                 var committed = app_session_runtime.PreferenceCommitResult{};
-                const attempt = config_runtime.attemptUserPreferences(
-                    app.alloc,
+                const attempt = app_profile_runtime.attemptUserPreferences(
+                    app,
                     patch.userSettingsPatch(),
                 );
                 switch (attempt) {

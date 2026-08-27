@@ -6,6 +6,7 @@ const grok_oauth = @import("grok_oauth.zig");
 const host = @import("../hosts/host.zig");
 const host_target = @import("../hosts/target.zig");
 const login_flow = @import("login_flow.zig");
+const oauth_session = @import("oauth_session.zig");
 const oauth = @import("oauth.zig");
 const model_provider = @import("../config/model_provider.zig");
 const provider_catalog = @import("provider_catalog.zig");
@@ -136,6 +137,58 @@ pub fn refreshCredentialTokenForAccount(
         .grok_subscription => switch (mode) {
             .if_needed => (try credentials.loadSource(alloc, transport, host.unavailable_secret_store, source)) orelse return null,
             .force => (try credentials.refreshGrokCredential(alloc, transport)) orelse return null,
+        },
+        else => unreachable,
+    };
+    defer credential.deinit(alloc);
+    if (expected_account_id) |expected| {
+        const actual = credential.accountId() orelse return error.ChatGptAccountChanged;
+        if (!std.mem.eql(u8, expected, actual)) return error.ChatGptAccountChanged;
+    }
+
+    const token = credential.token;
+    credential.token = &.{};
+    return token;
+}
+
+/// Refreshes only authorization rooted beneath an explicit Fx profile home.
+/// The returned token is owned by the caller and must be zero-freed.
+pub fn refreshCredentialTokenForAccountFromHome(
+    transport: oauth_transport.Provider,
+    alloc: Allocator,
+    source: credentials.Source,
+    mode: CredentialRefreshMode,
+    expected_account_id: ?[]const u8,
+    home: []const u8,
+) !?[]u8 {
+    if (!credentials.sourceRefreshable(source)) return null;
+
+    var credential = switch (source) {
+        .fx_login => switch (mode) {
+            .if_needed => (try credentials.loadFxLoginCredentialFromHome(alloc, transport, home)) orelse return null,
+            .force => (try credentials.refreshFxLoginCredentialFromHome(alloc, transport, home)) orelse return null,
+        },
+        .chatgpt_subscription => switch (mode) {
+            .if_needed => (try credentials.resolveForProviderFromHome(
+                alloc,
+                transport,
+                .refresh_if_needed,
+                .codex,
+                source,
+                home,
+            )).credential orelse return null,
+            .force => (try credentials.refreshChatGptCredentialFromHome(alloc, transport, home)) orelse return null,
+        },
+        .grok_subscription => switch (mode) {
+            .if_needed => (try credentials.resolveForProviderFromHome(
+                alloc,
+                transport,
+                .refresh_if_needed,
+                .grok,
+                source,
+                home,
+            )).credential orelse return null,
+            .force => (try credentials.refreshGrokCredentialFromHome(alloc, transport, home)) orelse return null,
         },
         else => unreachable,
     };
@@ -769,6 +822,8 @@ pub const Runtime = struct {
     api_key_validator: api_key_validator.Provider = api_key_validator.unavailable_provider,
     oauth_transport: oauth_transport.Provider = oauth_transport.unavailable_provider,
     secret_store: host.SecretStore = host.unavailable_secret_store,
+    /// Borrowed explicit Fx profile home; never exported as process HOME.
+    profile_home: ?[]const u8 = null,
     selected_credential: ?credentials.Credential = null,
     credential_refresh_failure_source: ?credentials.Source = null,
     source_inventory: SourceSet = .empty,
@@ -840,6 +895,10 @@ pub const Runtime = struct {
 
     pub fn secretStore(self: *const Self) host.SecretStore {
         return self.secret_store;
+    }
+
+    pub fn setProfileHome(self: *Self, home: ?[]const u8) void {
+        self.profile_home = home;
     }
 
     pub fn modelCatalogAccess(self: *const Self) credentials.CatalogAccess {
@@ -937,7 +996,7 @@ pub const Runtime = struct {
     }
 
     pub fn refreshChatGptSourceInventory(self: *Self, alloc: Allocator) !void {
-        if (try credentials.sourceExists(alloc, self.secret_store, .chatgpt_subscription)) {
+        if (try probeCredentialSource(self, alloc, .chatgpt_subscription)) {
             self.source_inventory.insert(.chatgpt_subscription);
         } else if (self.credentialSource() != .chatgpt_subscription) {
             self.source_inventory.remove(.chatgpt_subscription);
@@ -945,7 +1004,7 @@ pub const Runtime = struct {
     }
 
     pub fn refreshGrokSourceInventory(self: *Self, alloc: Allocator) !void {
-        if (try credentials.sourceExists(alloc, self.secret_store, .grok_subscription)) {
+        if (try probeCredentialSource(self, alloc, .grok_subscription)) {
             self.source_inventory.insert(.grok_subscription);
         } else if (self.credentialSource() != .grok_subscription) {
             self.source_inventory.remove(.grok_subscription);
@@ -1170,9 +1229,31 @@ pub const Runtime = struct {
     ) !bool {
         self.exitSignInStage(alloc);
         const started = switch (source) {
-            .fx_login => try self.sign_in_flow.start(alloc, self.oauth_transport),
-            .chatgpt_subscription => try chatgpt_oauth.startSignIn(&self.sign_in_flow, alloc, self.oauth_transport),
-            .grok_subscription => try grok_oauth.startSignIn(&self.sign_in_flow, alloc, self.oauth_transport),
+            .fx_login => if (self.profile_home != null)
+                try self.sign_in_flow.startWithDeps(alloc, self.oauth_transport, .{
+                    .ctx = self,
+                    .save = saveRuntimeSignIn,
+                })
+            else
+                try self.sign_in_flow.start(alloc, self.oauth_transport),
+            .chatgpt_subscription => if (self.profile_home) |home|
+                try chatgpt_oauth.startSignInFromHome(
+                    &self.sign_in_flow,
+                    alloc,
+                    self.oauth_transport,
+                    home,
+                )
+            else
+                try chatgpt_oauth.startSignIn(&self.sign_in_flow, alloc, self.oauth_transport),
+            .grok_subscription => if (self.profile_home) |home|
+                try grok_oauth.startSignInFromHome(
+                    &self.sign_in_flow,
+                    alloc,
+                    self.oauth_transport,
+                    home,
+                )
+            else
+                try grok_oauth.startSignIn(&self.sign_in_flow, alloc, self.oauth_transport),
             else => return error.InvalidSignInSource,
         };
         if (!started) return false;
@@ -1612,7 +1693,7 @@ pub const Runtime = struct {
         const source = self.credentialSource() orelse return false;
         if (!credentials.sourceRefreshable(source)) return false;
 
-        const loaded = (try credentials.loadSource(alloc, self.oauth_transport, self.secret_store, source)) orelse {
+        const loaded = (try loadRuntimeCredentialSource(self, alloc, source)) orelse {
             if (self.credentialNeedsRefresh()) return error.CredentialRefreshUnavailable;
             return false;
         };
@@ -1754,6 +1835,9 @@ pub const Runtime = struct {
 
 fn probeCredentialSource(raw_context: ?*anyopaque, alloc: Allocator, source: credentials.Source) !bool {
     const self: *Runtime = @ptrCast(@alignCast(raw_context.?));
+    if (self.profile_home) |home| {
+        return credentials.sourceExistsFromHome(alloc, source, home);
+    }
     return credentials.sourceExists(alloc, self.secret_store, source);
 }
 
@@ -1768,12 +1852,34 @@ fn loadCredentialSource(_: ?*anyopaque, alloc: Allocator, source: credentials.So
 
 fn loadRuntimeCredentialSource(raw: ?*anyopaque, alloc: Allocator, source: credentials.Source) !?credentials.Credential {
     const self: *Runtime = @ptrCast(@alignCast(raw.?));
+    if (self.profile_home) |home| {
+        return credentials.loadSourceFromHome(alloc, self.oauth_transport, source, home);
+    }
     return credentials.loadSource(alloc, self.oauth_transport, self.secret_store, source);
 }
 
 fn storeRuntimeSecret(raw: ?*anyopaque, alloc: Allocator, value: []const u8) !void {
     const self: *Runtime = @ptrCast(@alignCast(raw.?));
+    if (self.profile_home) |home| {
+        return credentials.storeKeyFromHome(alloc, home, value);
+    }
     return self.secret_store.store(alloc, value);
+}
+
+fn saveRuntimeSignIn(
+    raw: ?*anyopaque,
+    alloc: Allocator,
+    completion: login_flow.SignInCompletion,
+) !void {
+    const self: *Runtime = @ptrCast(@alignCast(raw.?));
+    const session = switch (completion) {
+        .vercel => |selection| selection.session orelse return login_flow.LoginError.NoSession,
+        .chatgpt, .grok => return error.InvalidSignInCompletion,
+    };
+    if (self.profile_home) |home| {
+        return oauth_session.saveNewSessionFromHome(alloc, home, session);
+    }
+    return oauth_session.saveNewSession(alloc, session);
 }
 
 fn storeUnavailableSecret(_: ?*anyopaque, _: Allocator, _: []const u8) !void {
