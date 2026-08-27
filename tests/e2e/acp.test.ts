@@ -6876,6 +6876,85 @@ describe("acp: model-independent", () => {
   );
 
   test(
+    "launch permission policy replaces ambient ACP rules and keeps command parsing fail closed",
+    async () => {
+      const root = createIsolatedRoot("fx-acp-launch-permission-");
+      const policyPath = join(root.root, "launch-permissions.json");
+      const allowedMarker = join(root.workspace, "launch-allowed.txt");
+      const deniedTarget = join(root.external, "launch-denied.txt");
+      const compoundMarker = join(root.workspace, "compound.txt");
+      const compoundBypass = join(root.workspace, "compound-bypass.txt");
+      writeFileSync(
+        join(root.home, ".fx", "settings.json"),
+        JSON.stringify({
+          permission_mode: "ask",
+          permission: { edit: "allow", bash: "deny" },
+        }),
+      );
+      writeFileSync(
+        policyPath,
+        JSON.stringify({
+          edit: "deny",
+          bash: { "touch *": "allow" },
+        }),
+      );
+      const gateway = startFakeGateway([
+        fakeGatewayToolCall("launch_allow_command", "terminal", {
+          action: "exec",
+          command: `touch '${allowedMarker}'`,
+          timeout_ms: 5_000,
+        }),
+        fileToolCall("launch_deny_write", deniedTarget, "blocked\n"),
+        fakeGatewayToolCall("launch_compound_command", "terminal", {
+          action: "exec",
+          command: `touch '${compoundMarker}' && touch '${compoundBypass}'`,
+          timeout_ms: 5_000,
+        }),
+        finalText("launch permission policy complete"),
+      ]);
+      try {
+        client = await AcpClient.create({
+          cwd: root.workspace,
+          args: ["--permissions-file", policyPath, "acp"],
+          env: fakeGatewayEnv(root, gateway),
+        });
+        await startCodeSession(client);
+        await client.request("session/set_mode", { modeId: "ask" }, 4);
+        client.setPermissionOption("reject_once");
+
+        const result = await runPrompt(
+          client,
+          "Exercise the launch permission policy.",
+          TIMEOUT,
+        );
+
+        expect(result.promptResult.result.stopReason).toBe("end_turn");
+        expect(existsSync(allowedMarker)).toBe(true);
+        expect(existsSync(deniedTarget)).toBe(false);
+        expect(existsSync(compoundMarker)).toBe(false);
+        expect(existsSync(compoundBypass)).toBe(false);
+        const permissionRequests = result.messages.filter(
+          (message: any) => message.method === "session/request_permission",
+        );
+        expect(permissionRequests).toHaveLength(1);
+        expect(permissionRequests[0]!.params.toolCall.toolCallId).toBe(
+          "launch_compound_command",
+        );
+        const wire = JSON.stringify(result.messages);
+        expect(wire).toContain('"toolCallId":"launch_allow_command"');
+        expect(wire).toContain('"toolCallId":"launch_deny_write"');
+        expect(wire).toContain('"toolCallId":"launch_compound_command"');
+        expect(client.stderr).toBe("");
+      } finally {
+        await client?.close();
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
     "permission requests reuse tool ids and session grants",
     async () => {
       const root = createIsolatedRoot("fx-acp-permission-parity-");
