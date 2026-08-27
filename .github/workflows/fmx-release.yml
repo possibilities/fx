@@ -19,13 +19,13 @@ jobs:
     env:
       RELEASE_BASE_URL: ${{ vars.FMX_RELEASE_BASE_URL }}
       RELEASE_PROJECT: ${{ vars.FMX_RELEASE_PROJECT }}
-      RELEASE_SCOPE: ${{ vars.FMX_RELEASE_SCOPE }}
       VERCEL_CLI_VERSION: "59.9.1"
       VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
       VERCEL_TELEMETRY_DISABLED: "1"
     outputs:
       configured: ${{ steps.release.outputs.configured }}
       project_id: ${{ steps.release.outputs.project_id }}
+      release_scope: ${{ steps.release.outputs.release_scope }}
       store_id: ${{ steps.release.outputs.store_id }}
       version: ${{ steps.release.outputs.version }}
     steps:
@@ -48,14 +48,10 @@ jobs:
             exit 1
           fi
           echo "version=$GITHUB_SHA" >> "$GITHUB_OUTPUT"
-          if [[ -z "$VERCEL_TOKEN" || -z "$RELEASE_BASE_URL" || -z "$RELEASE_SCOPE" ]]; then
+          if [[ -z "$VERCEL_TOKEN" || -z "$RELEASE_BASE_URL" ]]; then
             echo "configured=false" >> "$GITHUB_OUTPUT"
-            echo "::warning::Set VERCEL_TOKEN, FMX_RELEASE_BASE_URL, and FMX_RELEASE_SCOPE, then rerun this workflow."
+            echo "::warning::Set VERCEL_TOKEN and FMX_RELEASE_BASE_URL, then rerun this workflow."
             exit 0
-          fi
-          if [[ ! "$RELEASE_SCOPE" =~ ^[A-Za-z0-9][A-Za-z0-9-]*$ ]]; then
-            echo "::error::FMX_RELEASE_SCOPE must be a Vercel team slug"
-            exit 1
           fi
           if [[ "$RELEASE_BASE_URL" == */ ]] \
             || [[ ! "$RELEASE_BASE_URL" =~ ^https://[A-Za-z0-9][A-Za-z0-9.-]*\.public\.blob\.vercel-storage\.com(/[A-Za-z0-9._/-]+)?$ ]]; then
@@ -65,10 +61,29 @@ jobs:
           release_host="${RELEASE_BASE_URL#https://}"
           release_host="${release_host%%/*}"
           release_store_id="${release_host%%.*}"
+          scopes_json="$(mktemp)"
           stores_json="$(mktemp)"
-          trap 'rm -f "$stores_json"' EXIT
-          npx --yes "vercel@$VERCEL_CLI_VERSION" blob list-stores --all --json \
-            --scope "$RELEASE_SCOPE" --token "$VERCEL_TOKEN" > "$stores_json"
+          scope_stores="$(mktemp)"
+          combined_stores="$(mktemp)"
+          trap 'rm -f "$scopes_json" "$stores_json" "$scope_stores" "$combined_stores"' EXIT
+          npx --yes "vercel@$VERCEL_CLI_VERSION" teams list --json --limit 100 \
+            --token "$VERCEL_TOKEN" > "$scopes_json"
+          if [[ "$(jq -r '.pagination.next // empty' "$scopes_json")" != "" ]]; then
+            echo "::error::VERCEL_TOKEN sees more than 100 account scopes; narrow discovery before publishing"
+            exit 1
+          fi
+          jq -n '{stores: []}' > "$stores_json"
+          while IFS= read -r release_scope; do
+            npx --yes "vercel@$VERCEL_CLI_VERSION" blob list-stores --all --json \
+              --scope "$release_scope" --token "$VERCEL_TOKEN" > "$scope_stores"
+            jq --arg scope "$release_scope" \
+              '{stores: [.stores[] | . + {release_scope: $scope}]}' \
+              "$scope_stores" > "$combined_stores"
+            jq -s '{stores: (.[0].stores + .[1].stores)}' \
+              "$stores_json" "$combined_stores" > "$scope_stores"
+            mv "$scope_stores" "$stores_json"
+            scope_stores="$(mktemp)"
+          done < <(jq -r '.teams[].slug' "$scopes_json")
           store_count="$(jq --arg id "$release_store_id" \
             '[.stores[] | select((.id | sub("^store_"; "")) == $id)] | length' \
             "$stores_json")"
@@ -78,6 +93,9 @@ jobs:
           fi
           store_id="$(jq -r --arg id "$release_store_id" \
             '.stores[] | select((.id | sub("^store_"; "")) == $id) | .id' \
+            "$stores_json")"
+          release_scope="$(jq -r --arg id "$release_store_id" \
+            '.stores[] | select((.id | sub("^store_"; "")) == $id) | .release_scope' \
             "$stores_json")"
           if [[ -n "$RELEASE_PROJECT" ]]; then
             project_count="$(jq --arg id "$release_store_id" --arg project "$RELEASE_PROJECT" \
@@ -99,6 +117,7 @@ jobs:
             exit 1
           fi
           echo "project_id=$project_id" >> "$GITHUB_OUTPUT"
+          echo "release_scope=$release_scope" >> "$GITHUB_OUTPUT"
           echo "store_id=$store_id" >> "$GITHUB_OUTPUT"
           echo "configured=true" >> "$GITHUB_OUTPUT"
 
@@ -140,7 +159,7 @@ jobs:
     runs-on: ubuntu-24.04
     env:
       RELEASE_BASE_URL: ${{ vars.FMX_RELEASE_BASE_URL }}
-      RELEASE_SCOPE: ${{ vars.FMX_RELEASE_SCOPE }}
+      RELEASE_SCOPE: ${{ needs.configure.outputs.release_scope }}
       STORE_ID: ${{ needs.configure.outputs.store_id }}
       VERCEL_CLI_VERSION: "59.9.1"
       VERCEL_PROJECT_ID: ${{ needs.configure.outputs.project_id }}
