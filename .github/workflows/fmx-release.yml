@@ -20,6 +20,9 @@ jobs:
       configured: ${{ steps.release.outputs.configured }}
       version: ${{ steps.release.outputs.version }}
     steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
       - name: Resolve exact Integration release
         id: release
         env:
@@ -28,6 +31,16 @@ jobs:
         run: |
           set -euo pipefail
           [[ "$GITHUB_SHA" =~ ^[0-9a-f]{40}$ ]]
+          if [[ "$GITHUB_REF" != "refs/heads/integration" ]]; then
+            echo "::error::fmx Fx releases may only run from the Integration branch"
+            exit 1
+          fi
+          git fetch --no-tags origin refs/heads/integration:refs/remotes/origin/integration
+          integration_sha="$(git rev-parse refs/remotes/origin/integration)"
+          if [[ "$GITHUB_SHA" != "$integration_sha" || "$(git rev-parse HEAD)" != "$integration_sha" ]]; then
+            echo "::error::release SHA is not the fetched Integration tip"
+            exit 1
+          fi
           echo "version=$GITHUB_SHA" >> "$GITHUB_OUTPUT"
           if [[ -z "$BLOB_READ_WRITE_TOKEN" || -z "$RELEASE_BASE_URL" ]]; then
             echo "configured=false" >> "$GITHUB_OUTPUT"

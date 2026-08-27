@@ -3,6 +3,11 @@
 set -euo pipefail
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# These are literal workflow guards; expansion here would defeat the test.
+# shellcheck disable=SC2016
+grep -F '[[ "$GITHUB_REF" != "refs/heads/integration" ]]' "$root/.github/workflows/fmx-release.yml" >/dev/null
+# shellcheck disable=SC2016
+grep -F '[[ "$GITHUB_SHA" != "$integration_sha"' "$root/.github/workflows/fmx-release.yml" >/dev/null
 scratch="$(mktemp -d "${TMPDIR:-/tmp}/fmx-fx-setup-test.XXXXXX")"
 cleanup() {
   rm -rf "$scratch"
