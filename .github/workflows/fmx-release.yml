@@ -19,6 +19,7 @@ jobs:
     env:
       RELEASE_BASE_URL: ${{ vars.FMX_RELEASE_BASE_URL }}
       RELEASE_PROJECT: ${{ vars.FMX_RELEASE_PROJECT }}
+      RELEASE_STORE: ${{ vars.FMX_RELEASE_STORE }}
       VERCEL_CLI_VERSION: "59.9.1"
       VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
       VERCEL_TELEMETRY_DISABLED: "1"
@@ -48,9 +49,9 @@ jobs:
             exit 1
           fi
           echo "version=$GITHUB_SHA" >> "$GITHUB_OUTPUT"
-          if [[ -z "$VERCEL_TOKEN" || -z "$RELEASE_BASE_URL" ]]; then
+          if [[ -z "$VERCEL_TOKEN" || -z "$RELEASE_BASE_URL" || -z "$RELEASE_STORE" ]]; then
             echo "configured=false" >> "$GITHUB_OUTPUT"
-            echo "::warning::Set VERCEL_TOKEN and FMX_RELEASE_BASE_URL, then rerun this workflow."
+            echo "::warning::Set VERCEL_TOKEN, FMX_RELEASE_BASE_URL, and FMX_RELEASE_STORE, then rerun this workflow."
             exit 0
           fi
           if [[ "$RELEASE_BASE_URL" == */ ]] \
@@ -58,9 +59,6 @@ jobs:
             echo "::error::FMX_RELEASE_BASE_URL must be a public Vercel Blob URL without a trailing slash"
             exit 1
           fi
-          release_host="${RELEASE_BASE_URL#https://}"
-          release_host="${release_host%%/*}"
-          release_store_id="${release_host%%.*}"
           scopes_json="$(mktemp)"
           stores_json="$(mktemp)"
           scope_stores="$(mktemp)"
@@ -84,32 +82,33 @@ jobs:
             mv "$scope_stores" "$stores_json"
             scope_stores="$(mktemp)"
           done < <(jq -r '.teams[].slug' "$scopes_json")
-          store_count="$(jq --arg id "$release_store_id" \
-            '[.stores[] | select((.id | sub("^store_"; "")) == $id)] | length' \
+          store_count="$(jq --arg store "$RELEASE_STORE" \
+            '[.stores[] | select(.id == $store or (.id | sub("^store_"; "")) == $store or .name == $store)] | length' \
             "$stores_json")"
           if [[ "$store_count" != 1 ]]; then
-            echo "::error::FMX_RELEASE_BASE_URL must identify exactly one Blob store visible to VERCEL_TOKEN"
+            visible_stores="$(jq -c '[.stores[] | {id, name, release_scope}]' "$stores_json")"
+            echo "::error::FMX_RELEASE_STORE must identify exactly one Blob store visible to VERCEL_TOKEN; visible stores: $visible_stores"
             exit 1
           fi
-          store_id="$(jq -r --arg id "$release_store_id" \
-            '.stores[] | select((.id | sub("^store_"; "")) == $id) | .id' \
+          store_id="$(jq -r --arg store "$RELEASE_STORE" \
+            '.stores[] | select(.id == $store or (.id | sub("^store_"; "")) == $store or .name == $store) | .id' \
             "$stores_json")"
-          release_scope="$(jq -r --arg id "$release_store_id" \
-            '.stores[] | select((.id | sub("^store_"; "")) == $id) | .release_scope' \
+          release_scope="$(jq -r --arg store "$RELEASE_STORE" \
+            '.stores[] | select(.id == $store or (.id | sub("^store_"; "")) == $store or .name == $store) | .release_scope' \
             "$stores_json")"
           if [[ -n "$RELEASE_PROJECT" ]]; then
-            project_count="$(jq --arg id "$release_store_id" --arg project "$RELEASE_PROJECT" \
-              '[.stores[] | select((.id | sub("^store_"; "")) == $id) | .projects[] | select(.id == $project or .name == $project)] | length' \
+            project_count="$(jq --arg store "$RELEASE_STORE" --arg project "$RELEASE_PROJECT" \
+              '[.stores[] | select(.id == $store or (.id | sub("^store_"; "")) == $store or .name == $store) | .projects[] | select(.id == $project or .name == $project)] | length' \
               "$stores_json")"
-            project_id="$(jq -r --arg id "$release_store_id" --arg project "$RELEASE_PROJECT" \
-              '.stores[] | select((.id | sub("^store_"; "")) == $id) | .projects[] | select(.id == $project or .name == $project) | .id' \
+            project_id="$(jq -r --arg store "$RELEASE_STORE" --arg project "$RELEASE_PROJECT" \
+              '.stores[] | select(.id == $store or (.id | sub("^store_"; "")) == $store or .name == $store) | .projects[] | select(.id == $project or .name == $project) | .id' \
               "$stores_json")"
           else
-            project_count="$(jq --arg id "$release_store_id" \
-              '[.stores[] | select((.id | sub("^store_"; "")) == $id) | .projects[]] | length' \
+            project_count="$(jq --arg store "$RELEASE_STORE" \
+              '[.stores[] | select(.id == $store or (.id | sub("^store_"; "")) == $store or .name == $store) | .projects[]] | length' \
               "$stores_json")"
-            project_id="$(jq -r --arg id "$release_store_id" \
-              '.stores[] | select((.id | sub("^store_"; "")) == $id) | .projects[].id' \
+            project_id="$(jq -r --arg store "$RELEASE_STORE" \
+              '.stores[] | select(.id == $store or (.id | sub("^store_"; "")) == $store or .name == $store) | .projects[].id' \
               "$stores_json")"
           fi
           if [[ "$project_count" != 1 || ! "$project_id" =~ ^prj_[A-Za-z0-9]+$ ]]; then
