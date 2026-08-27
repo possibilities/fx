@@ -16,8 +16,16 @@ jobs:
   configure:
     name: Check release configuration
     runs-on: ubuntu-24.04
+    env:
+      RELEASE_BASE_URL: ${{ vars.FMX_RELEASE_BASE_URL }}
+      RELEASE_PROJECT: ${{ vars.FMX_RELEASE_PROJECT }}
+      VERCEL_CLI_VERSION: "59.9.1"
+      VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+      VERCEL_TELEMETRY_DISABLED: "1"
     outputs:
       configured: ${{ steps.release.outputs.configured }}
+      project_id: ${{ steps.release.outputs.project_id }}
+      store_id: ${{ steps.release.outputs.store_id }}
       version: ${{ steps.release.outputs.version }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -25,9 +33,6 @@ jobs:
           fetch-depth: 0
       - name: Resolve exact Integration release
         id: release
-        env:
-          BLOB_READ_WRITE_TOKEN: ${{ secrets.BLOB_READ_WRITE_TOKEN }}
-          RELEASE_BASE_URL: ${{ vars.FMX_RELEASE_BASE_URL }}
         run: |
           set -euo pipefail
           [[ "$GITHUB_SHA" =~ ^[0-9a-f]{40}$ ]]
@@ -42,9 +47,9 @@ jobs:
             exit 1
           fi
           echo "version=$GITHUB_SHA" >> "$GITHUB_OUTPUT"
-          if [[ -z "$BLOB_READ_WRITE_TOKEN" || -z "$RELEASE_BASE_URL" ]]; then
+          if [[ -z "$VERCEL_TOKEN" || -z "$RELEASE_BASE_URL" ]]; then
             echo "configured=false" >> "$GITHUB_OUTPUT"
-            echo "::warning::Set BLOB_READ_WRITE_TOKEN and FMX_RELEASE_BASE_URL, then rerun this workflow."
+            echo "::warning::Set VERCEL_TOKEN and FMX_RELEASE_BASE_URL, then rerun this workflow."
             exit 0
           fi
           if [[ "$RELEASE_BASE_URL" == */ ]] \
@@ -52,6 +57,44 @@ jobs:
             echo "::error::FMX_RELEASE_BASE_URL must be a public Vercel Blob URL without a trailing slash"
             exit 1
           fi
+          release_host="${RELEASE_BASE_URL#https://}"
+          release_host="${release_host%%/*}"
+          release_store_id="${release_host%%.*}"
+          stores_json="$(mktemp)"
+          trap 'rm -f "$stores_json"' EXIT
+          npx --yes "vercel@$VERCEL_CLI_VERSION" blob list-stores --all --json \
+            --token "$VERCEL_TOKEN" > "$stores_json"
+          store_count="$(jq --arg id "$release_store_id" \
+            '[.stores[] | select((.id | sub("^store_"; "")) == $id)] | length' \
+            "$stores_json")"
+          if [[ "$store_count" != 1 ]]; then
+            echo "::error::FMX_RELEASE_BASE_URL must identify exactly one Blob store visible to VERCEL_TOKEN"
+            exit 1
+          fi
+          store_id="$(jq -r --arg id "$release_store_id" \
+            '.stores[] | select((.id | sub("^store_"; "")) == $id) | .id' \
+            "$stores_json")"
+          if [[ -n "$RELEASE_PROJECT" ]]; then
+            project_count="$(jq --arg id "$release_store_id" --arg project "$RELEASE_PROJECT" \
+              '[.stores[] | select((.id | sub("^store_"; "")) == $id) | .projects[] | select(.id == $project or .name == $project)] | length' \
+              "$stores_json")"
+            project_id="$(jq -r --arg id "$release_store_id" --arg project "$RELEASE_PROJECT" \
+              '.stores[] | select((.id | sub("^store_"; "")) == $id) | .projects[] | select(.id == $project or .name == $project) | .id' \
+              "$stores_json")"
+          else
+            project_count="$(jq --arg id "$release_store_id" \
+              '[.stores[] | select((.id | sub("^store_"; "")) == $id) | .projects[]] | length' \
+              "$stores_json")"
+            project_id="$(jq -r --arg id "$release_store_id" \
+              '.stores[] | select((.id | sub("^store_"; "")) == $id) | .projects[].id' \
+              "$stores_json")"
+          fi
+          if [[ "$project_count" != 1 || ! "$project_id" =~ ^prj_[A-Za-z0-9]+$ ]]; then
+            echo "::error::Blob store must have one release project; set FMX_RELEASE_PROJECT to its name or id when several are connected"
+            exit 1
+          fi
+          echo "project_id=$project_id" >> "$GITHUB_OUTPUT"
+          echo "store_id=$store_id" >> "$GITHUB_OUTPUT"
           echo "configured=true" >> "$GITHUB_OUTPUT"
 
   build:
@@ -91,8 +134,12 @@ jobs:
     name: Publish fmx Fx release
     runs-on: ubuntu-24.04
     env:
-      BLOB_READ_WRITE_TOKEN: ${{ secrets.BLOB_READ_WRITE_TOKEN }}
       RELEASE_BASE_URL: ${{ vars.FMX_RELEASE_BASE_URL }}
+      STORE_ID: ${{ needs.configure.outputs.store_id }}
+      VERCEL_CLI_VERSION: "59.9.1"
+      VERCEL_PROJECT_ID: ${{ needs.configure.outputs.project_id }}
+      VERCEL_TELEMETRY_DISABLED: "1"
+      VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
       VERSION: ${{ needs.configure.outputs.version }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -115,6 +162,24 @@ jobs:
             done
           done
           test "$(find . -maxdepth 1 -type f | wc -l)" -eq 16
+      - name: Acquire short-lived Blob credentials
+        run: |
+          set -euo pipefail
+          npx --yes "vercel@$VERCEL_CLI_VERSION" env pull .env.local --yes \
+            --environment=production --project "$VERCEL_PROJECT_ID" \
+            --token "$VERCEL_TOKEN"
+          pulled_store="$(sed -n 's/^BLOB_STORE_ID=//p' .env.local | tail -n 1)"
+          pulled_store="${pulled_store#\"}"
+          pulled_store="${pulled_store%\"}"
+          if [[ ! "$pulled_store" =~ ^store_[A-Za-z0-9]+$ ]] \
+            || [[ "${pulled_store#store_}" != "${STORE_ID#store_}" ]]; then
+            echo "::error::Pulled OIDC credentials do not identify the configured release store"
+            exit 1
+          fi
+          if ! grep -Eq '^VERCEL_OIDC_TOKEN="?[A-Za-z0-9_.-]+"?$' .env.local; then
+            echo "::error::Vercel did not issue a Blob OIDC token for the release project"
+            exit 1
+          fi
       - name: Publish immutable artifacts and installer
         id: blob
         run: |
@@ -134,52 +199,33 @@ jobs:
           }
           upload_immutable() {
             local local_path="$1" relative_path="$2" content_type="$3"
-            local remote_url="$RELEASE_BASE_URL/$relative_path" existing response http_code
+            local remote_url="$RELEASE_BASE_URL/$relative_path" existing
             existing="$(mktemp)"
-            response="$(mktemp)"
             if curl --fail --silent --location "$remote_url" -o "$existing"; then
               if cmp -s "$local_path" "$existing"; then
                 echo "Already published: $relative_path"
-                rm -f "$existing" "$response"
+                rm -f "$existing"
                 return 0
               fi
               echo "::error::Immutable Blob path has different content: $relative_path"
-              rm -f "$existing" "$response"
+              rm -f "$existing"
               return 1
             fi
             rm -f "$existing"
-            http_code="$(curl --silent --show-error -o "$response" -w '%{http_code}' \
-              -X PUT "https://blob.vercel-storage.com/$(blob_path "$relative_path")" \
-              -H "Authorization: Bearer $BLOB_READ_WRITE_TOKEN" \
-              -H 'x-api-version: 7' -H "x-content-type: $content_type" \
-              -H 'x-add-random-suffix: 0' -H 'x-cache-control-max-age: 31536000' \
-              --data-binary "@$local_path")"
-            if [[ "$http_code" -lt 200 || "$http_code" -ge 300 ]]; then
-              cat "$response" >&2
-              rm -f "$response"
-              echo "::error::Blob upload failed for $relative_path ($http_code)"
-              return 1
-            fi
-            rm -f "$response"
+            npx --yes "vercel@$VERCEL_CLI_VERSION" blob put "$local_path" \
+              --access public --pathname "$(blob_path "$relative_path")" \
+              --content-type "$content_type" --add-random-suffix=false \
+              --allow-overwrite=false --cache-control-max-age=31536000 \
+              --token "$VERCEL_TOKEN"
             echo "Published: $relative_path"
           }
           upload_mutable() {
             local local_path="$1" relative_path="$2" content_type="$3" max_age="$4"
-            local response http_code
-            response="$(mktemp)"
-            http_code="$(curl --silent --show-error -o "$response" -w '%{http_code}' \
-              -X PUT "https://blob.vercel-storage.com/$(blob_path "$relative_path")" \
-              -H "Authorization: Bearer $BLOB_READ_WRITE_TOKEN" \
-              -H 'x-api-version: 7' -H "x-content-type: $content_type" \
-              -H 'x-add-random-suffix: 0' -H 'x-allow-overwrite: 1' \
-              -H "x-cache-control-max-age: $max_age" --data-binary "@$local_path")"
-            if [[ "$http_code" -lt 200 || "$http_code" -ge 300 ]]; then
-              cat "$response" >&2
-              rm -f "$response"
-              echo "::error::Blob upload failed for $relative_path ($http_code)"
-              return 1
-            fi
-            rm -f "$response"
+            npx --yes "vercel@$VERCEL_CLI_VERSION" blob put "$local_path" \
+              --access public --pathname "$(blob_path "$relative_path")" \
+              --content-type "$content_type" --add-random-suffix=false \
+              --allow-overwrite=true --cache-control-max-age="$max_age" \
+              --token "$VERCEL_TOKEN"
             echo "Published: $relative_path"
           }
           for platform in linux-x86_64 linux-aarch64 macos-x86_64 macos-aarch64; do
@@ -197,6 +243,9 @@ jobs:
           printf '%s' "$VERSION" > dist/fmx-fx-latest.txt
           upload_mutable dist/fmx-fx-latest.txt fx/latest.txt text/plain 60
           echo "setup_url=$RELEASE_BASE_URL/fx/setup.sh" >> "$GITHUB_OUTPUT"
+      - name: Remove short-lived credentials
+        if: always()
+        run: rm -f .env.local
       - name: Write release summary
         env:
           SETUP_URL: ${{ steps.blob.outputs.setup_url }}
