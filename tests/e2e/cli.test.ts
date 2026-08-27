@@ -265,6 +265,7 @@ describe("cli: help", () => {
       expect(r.stdout).toContain("--context-limit <spec>");
       expect(r.stdout).toContain("Set name=bytes|off; repeatable");
       expect(r.stdout).toContain("--add-dir <path>");
+      expect(r.stdout).toContain("--no-project-instructions");
       expect(r.stdout).toContain("-c, --continue");
       expect(r.stdout).toContain("-r");
       expect(r.stdout).toContain("Open the saved-session picker");
@@ -4677,6 +4678,24 @@ describe("cli: workspace access", () => {
       );
       expect(duplicate.stderr).not.toContain(
         "DuplicateAdditionalDirectorySuppression",
+      );
+
+      const duplicateProjectInstructionGate = await runFx(
+        ["--no-project-instructions", "--no-project-instructions"],
+        { env: enabled },
+      );
+      expect(duplicateProjectInstructionGate.code).toBe(1);
+      expect(duplicateProjectInstructionGate.stderr).toContain(
+        "--no-project-instructions may only be specified once",
+      );
+
+      const unsupportedProjectInstructionGate = await runFx(
+        ["--no-project-instructions", "ask", "hello"],
+        { env: enabled },
+      );
+      expect(unsupportedProjectInstructionGate.code).toBe(1);
+      expect(unsupportedProjectInstructionGate.stderr).toContain(
+        "--no-project-instructions is only supported for interactive, resume, and ACP launches",
       );
     },
     TIMEOUT,

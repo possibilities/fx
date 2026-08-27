@@ -557,6 +557,7 @@ const App = struct {
     context_snapshot: context_contract.GatheredContextSnapshot = .{},
     file_index: file_index_mod.FileIndex = .{},
     context_enabled: bool = true,
+    project_instructions_enabled: bool = true,
     context_limits: config_runtime.context_limits.Values = .{},
     fast_mode: bool = false,
     auto_upgrade_enabled: bool = true,
@@ -597,6 +598,7 @@ const App = struct {
                 background_process_provider.unavailable_provider
             else
                 background_process.provider),
+            .project_instructions_enabled = launch.modifiers.project_instructions_enabled,
         };
         if (comptime host_profile.js_host_workspace) {
             app.workspace_host = js_host_workspace.Runtime.init(alloc) catch |err| blk: {
@@ -3393,6 +3395,7 @@ test "full entry config commands also use early threaded io" {
     try std.testing.expect(needsEarlyThreadedIo(&.{
         @as([:0]const u8, "--context-limit=project_bytes=2048"),
         @as([:0]const u8, "--no-additional-dirs"),
+        @as([:0]const u8, "--no-project-instructions"),
         @as([:0]const u8, "acp"),
     }));
 }
