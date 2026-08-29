@@ -775,6 +775,14 @@ describe.skipIf(SKIP_TMUX)("tui: selected state root", () => {
       writeFileSync(join(stateHome, ".fx", "AGENTS.md"), "SELECTED_PROFILE_INSTRUCTIONS\n");
       writeFileSync(join(home, ".fx", "AGENTS.md"), "AMBIENT_PROFILE_INSTRUCTIONS\n");
       writeFileSync(
+        join(stateHome, ".fx", "SYSTEM_APPEND.md"),
+        "SELECTED_STATE_SYSTEM_APPEND\n",
+      );
+      writeFileSync(
+        join(home, ".fx", "SYSTEM_APPEND.md"),
+        "AMBIENT_STATE_SYSTEM_APPEND\n",
+      );
+      writeFileSync(
         join(stateHome, ".fx", "skills", "isolated-state-skill", "SKILL.md"),
         "---\nname: isolated-state-skill\ndescription: selected state skill\n---\n\nSELECTED_STATE_SKILL_BODY\n",
       );
@@ -871,9 +879,14 @@ describe.skipIf(SKIP_TMUX)("tui: selected state root", () => {
         expect(gateway.requests[0]!.body).toContain("SELECTED_PROFILE_SKILL_BODY");
         expect(gateway.requests[0]!.body).toContain("isolated-state-skill");
         expect(gateway.requests[0]!.body).toContain("SELECTED_PROFILE_INSTRUCTIONS");
+        expect(gateway.requests[0]!.body).toContain("SELECTED_STATE_SYSTEM_APPEND");
+        expect(gateway.requests[0]!.body).toContain(
+          "You are fx, a local coding CLI assistant",
+        );
         expect(gateway.requests[0]!.body).not.toContain("ambient-state-skill");
         expect(gateway.requests[0]!.body).not.toContain("ambient-profile-skill");
         expect(gateway.requests[0]!.body).not.toContain("AMBIENT_PROFILE_INSTRUCTIONS");
+        expect(gateway.requests[0]!.body).not.toContain("AMBIENT_STATE_SYSTEM_APPEND");
         expect(gateway.requests[1]!.body).toContain("selected state memory");
         expect(gateway.requests[1]!.body).not.toContain(
           "ambient memory must not load",
