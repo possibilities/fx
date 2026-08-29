@@ -321,6 +321,7 @@ test "selected skill profile preserves workspace roots without ambient global ro
         alloc,
         workspace,
         selected_home,
+        &.{},
         test_split_home_root_policy,
     );
     defer loaded.deinit(alloc);
