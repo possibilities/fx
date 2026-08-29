@@ -31,6 +31,7 @@ const provider_catalog = @import("../auth/provider_catalog.zig");
 const secret = @import("../auth/secret.zig");
 const output_contracts = @import("../output/output_contracts.zig");
 const prompt_policy = @import("../config/prompt_policy.zig");
+const system_prompt_files = @import("../config/system_prompt_files.zig");
 const session_store = @import("../session/session_store.zig");
 const usage_report = @import("../session/usage_report.zig");
 const skill_contract = @import("../skills/skill_contract.zig");
@@ -117,16 +118,30 @@ pub const LaunchModifiers = struct {
     context_limit_overrides: []config_runtime.context_limits.Override = &.{},
     additional_directories: [][]u8 = &.{},
     saved_directories_suppressed: bool = false,
+    prompt_files: system_prompt_files.Request = .{},
+    effective_system_prompt: ?[]u8 = null,
 
     pub fn deinit(self: *LaunchModifiers, alloc: Allocator) void {
         if (self.context_limit_overrides.len > 0) alloc.free(self.context_limit_overrides);
         for (self.additional_directories) |path| alloc.free(path);
         if (self.additional_directories.len > 0) alloc.free(self.additional_directories);
+        self.prompt_files.deinit(alloc);
+        if (self.effective_system_prompt) |prompt| alloc.free(prompt);
         self.* = .{};
     }
 
     pub fn hasWorkspaceModifiers(self: LaunchModifiers) bool {
         return self.additional_directories.len > 0 or self.saved_directories_suppressed;
+    }
+
+    pub fn hasPromptFileModifiers(self: LaunchModifiers) bool {
+        return self.prompt_files.requested();
+    }
+
+    pub fn takeEffectiveSystemPrompt(self: *LaunchModifiers) ?[]u8 {
+        const prompt = self.effective_system_prompt;
+        self.effective_system_prompt = null;
+        return prompt;
     }
 };
 
@@ -371,6 +386,14 @@ const GlobalLaunchArgs = struct {
     }
 };
 
+/// Duplicates a global path argument and transfers its ownership to `paths`.
+/// If growing the list fails, this helper remains responsible for the duplicate.
+fn dupeAndAppendPath(alloc: Allocator, paths: *std.ArrayList([]u8), value: []const u8) !void {
+    const path = try alloc.dupe(u8, value);
+    errdefer alloc.free(path);
+    try paths.append(alloc, path);
+}
+
 fn parseGlobalLaunchArgs(
     alloc: Allocator,
     args: []const [:0]const u8,
@@ -383,6 +406,13 @@ fn parseGlobalLaunchArgs(
         directories.deinit(alloc);
     }
     var suppress_saved = false;
+    var replacement_path: ?[]u8 = null;
+    errdefer if (replacement_path) |path| alloc.free(path);
+    var append_paths: std.ArrayList([]u8) = .empty;
+    errdefer {
+        for (append_paths.items) |path| alloc.free(path);
+        append_paths.deinit(alloc);
+    }
 
     var index: usize = 0;
     while (index < args.len) {
@@ -396,14 +426,32 @@ fn parseGlobalLaunchArgs(
         } else if (std.mem.eql(u8, arg, "--add-dir")) {
             index += 1;
             if (index >= args.len or args[index].len == 0) return error.MissingAddDirectoryValue;
-            try directories.append(alloc, try alloc.dupe(u8, args[index]));
+            try dupeAndAppendPath(alloc, &directories, args[index]);
         } else if (std.mem.startsWith(u8, arg, "--add-dir=")) {
             const value = arg["--add-dir=".len..];
             if (value.len == 0) return error.MissingAddDirectoryValue;
-            try directories.append(alloc, try alloc.dupe(u8, value));
+            try dupeAndAppendPath(alloc, &directories, value);
         } else if (std.mem.eql(u8, arg, "--no-additional-dirs")) {
             if (suppress_saved) return error.DuplicateAdditionalDirectorySuppression;
             suppress_saved = true;
+        } else if (std.mem.eql(u8, arg, "--system-prompt-file")) {
+            if (replacement_path != null) return error.DuplicateSystemPromptFile;
+            index += 1;
+            if (index >= args.len or args[index].len == 0) return error.MissingSystemPromptFileValue;
+            replacement_path = try alloc.dupe(u8, args[index]);
+        } else if (std.mem.startsWith(u8, arg, "--system-prompt-file=")) {
+            if (replacement_path != null) return error.DuplicateSystemPromptFile;
+            const value = arg["--system-prompt-file=".len..];
+            if (value.len == 0) return error.MissingSystemPromptFileValue;
+            replacement_path = try alloc.dupe(u8, value);
+        } else if (std.mem.eql(u8, arg, "--append-system-prompt-file")) {
+            index += 1;
+            if (index >= args.len or args[index].len == 0) return error.MissingAppendSystemPromptFileValue;
+            try dupeAndAppendPath(alloc, &append_paths, args[index]);
+        } else if (std.mem.startsWith(u8, arg, "--append-system-prompt-file=")) {
+            const value = arg["--append-system-prompt-file=".len..];
+            if (value.len == 0) return error.MissingAppendSystemPromptFileValue;
+            try dupeAndAppendPath(alloc, &append_paths, value);
         } else {
             break;
         }
@@ -413,12 +461,21 @@ fn parseGlobalLaunchArgs(
     const override_slice = try overrides.toOwnedSlice(alloc);
     errdefer if (override_slice.len > 0) alloc.free(override_slice);
     const directory_slice = try directories.toOwnedSlice(alloc);
+    errdefer {
+        for (directory_slice) |path| alloc.free(path);
+        if (directory_slice.len > 0) alloc.free(directory_slice);
+    }
+    const append_slice = try append_paths.toOwnedSlice(alloc);
     return .{
         .remaining = args[index..],
         .modifiers = .{
             .context_limit_overrides = override_slice,
             .additional_directories = directory_slice,
             .saved_directories_suppressed = suppress_saved,
+            .prompt_files = .{
+                .replacement_path = replacement_path,
+                .append_paths = append_slice,
+            },
         },
     };
 }
@@ -435,11 +492,15 @@ pub fn argsAfterGlobalLaunchArgs(args: []const [:0]const u8) []const [:0]const u
     var index: usize = 0;
     while (index < args.len) {
         const arg = args[index];
-        if (std.mem.eql(u8, arg, "--context-limit") or std.mem.eql(u8, arg, "--add-dir")) {
+        if (std.mem.eql(u8, arg, "--context-limit") or std.mem.eql(u8, arg, "--add-dir") or
+            std.mem.eql(u8, arg, "--system-prompt-file") or std.mem.eql(u8, arg, "--append-system-prompt-file"))
+        {
             index += 1;
             if (index >= args.len) return &.{};
         } else if (!std.mem.startsWith(u8, arg, "--context-limit=") and
             !std.mem.startsWith(u8, arg, "--add-dir=") and
+            !std.mem.startsWith(u8, arg, "--system-prompt-file=") and
+            !std.mem.startsWith(u8, arg, "--append-system-prompt-file=") and
             !std.mem.eql(u8, arg, "--no-additional-dirs"))
         {
             return args[index..];
@@ -447,6 +508,35 @@ pub fn argsAfterGlobalLaunchArgs(args: []const [:0]const u8) []const [:0]const u
         index += 1;
     }
     return &.{};
+}
+
+/// Reports whether a system prompt file modifier occurs in the leading global
+/// launch argument segment. Startup uses this before choosing its configuration
+/// so interactive and resume launches compose against the same base prompt the
+/// app will later use.
+pub fn systemPromptFilesRequested(args: []const [:0]const u8) bool {
+    var index: usize = 0;
+    while (index < args.len) {
+        const arg = args[index];
+        if (std.mem.eql(u8, arg, "--system-prompt-file") or
+            std.mem.eql(u8, arg, "--append-system-prompt-file") or
+            std.mem.startsWith(u8, arg, "--system-prompt-file=") or
+            std.mem.startsWith(u8, arg, "--append-system-prompt-file="))
+        {
+            return true;
+        }
+        if (std.mem.eql(u8, arg, "--context-limit") or std.mem.eql(u8, arg, "--add-dir")) {
+            index += 1;
+            if (index >= args.len) return false;
+        } else if (!std.mem.startsWith(u8, arg, "--context-limit=") and
+            !std.mem.startsWith(u8, arg, "--add-dir=") and
+            !std.mem.eql(u8, arg, "--no-additional-dirs"))
+        {
+            return false;
+        }
+        index += 1;
+    }
+    return false;
 }
 
 pub fn parse(command_catalog: CommandCatalog, args: []const [:0]const u8) Command {
@@ -816,7 +906,7 @@ fn activateProviderSelection(
 }
 
 fn runIfRequestedWithDeps(alloc: Allocator, args: []const [:0]const u8, cfg: Config, deps: RunDeps) !RunResult {
-    const parsed_launch = parseInteractiveLaunch(alloc, args, cfg.command_catalog) catch |err| {
+    var parsed_launch = parseInteractiveLaunch(alloc, args, cfg.command_catalog) catch |err| {
         if (err == error.RecordModifierRequiresInteractive) {
             try writeStderr(deps, record_modifier_usage);
             return .handled_failure;
@@ -832,15 +922,44 @@ fn runIfRequestedWithDeps(alloc: Allocator, args: []const [:0]const u8, cfg: Con
         } else {
             try writer.writer.print("fx: invalid global launch option: {s}\n", .{@errorName(err)});
         }
-        try writer.writer.writeAll("usage: fx [--context-limit NAME=BYTES|off] [--add-dir PATH]... [--no-additional-dirs] <command>\n");
+        try writer.writer.writeAll("usage: fx [--system-prompt-file PATH] [--append-system-prompt-file PATH]... [--context-limit NAME=BYTES|off] [--add-dir PATH]... [--no-additional-dirs] <command>\n");
         try writeStderr(deps, writer.written());
         return .handled_failure;
     };
     switch (parsed_launch) {
-        .interactive => |launch| {
+        .interactive => |*launch| {
+            if (!try prepareSystemPromptFiles(alloc, &launch.modifiers, cfg.prompt_policy.system_prompt, deps)) {
+                launch.deinit(alloc);
+                return .handled_failure;
+            }
             try writeMcpProfileWarningIfPresent(alloc, cfg, deps);
-            return .{ .interactive = launch };
         },
+        .noninteractive => |*launch| {
+            if (launch.global_args.modifiers.hasPromptFileModifiers() and
+                !commandSupportsPromptFileModifiers(launch.command))
+            {
+                try writePromptFileModifierUsage(deps);
+                launch.deinit(alloc);
+                return .handled_failure;
+            }
+            if (launch.global_args.modifiers.hasPromptFileModifiers() and
+                switch (launch.command) {
+                    .ask => |rest| askHasSystemOverride(rest),
+                    else => false,
+                })
+            {
+                try writeAskSystemPromptConflict(deps);
+                launch.deinit(alloc);
+                return .handled_failure;
+            }
+            if (!try prepareSystemPromptFiles(alloc, &launch.global_args.modifiers, cfg.prompt_policy.system_prompt, deps)) {
+                launch.deinit(alloc);
+                return .handled_failure;
+            }
+        },
+    }
+    switch (parsed_launch) {
+        .interactive => |launch| return .{ .interactive = launch },
         .noninteractive => |value| {
             var noninteractive = value;
             defer noninteractive.deinit(alloc);
@@ -909,7 +1028,7 @@ fn runNonInteractiveWithDeps(
                 .provider_set = cfg.provider_set,
                 .background_process_provider = cfg.background_process_provider,
                 .secret_store = cfg.secret_store,
-                .prompt_policy = cfg.prompt_policy,
+                .prompt_policy = promptPolicyWithLaunchModifiers(cfg.prompt_policy, global_args.modifiers),
                 .ignored_list_entries = cfg.ignored_list_entries,
                 .max_list_entries = cfg.max_list_entries,
                 .max_read_file_bytes = cfg.max_read_file_bytes,
@@ -3465,6 +3584,13 @@ fn workflowConfigWithLaunchModifiers(
     result.context_limit_overrides = modifiers.context_limit_overrides;
     result.additional_directories = modifiers.additional_directories;
     result.saved_directories_suppressed = modifiers.saved_directories_suppressed;
+    result.prompt_policy = promptPolicyWithLaunchModifiers(result.prompt_policy, modifiers);
+    return result;
+}
+
+fn promptPolicyWithLaunchModifiers(base: prompt_policy.Policy, modifiers: LaunchModifiers) prompt_policy.Policy {
+    var result = base;
+    if (modifiers.effective_system_prompt) |prompt| result.system_prompt = prompt;
     return result;
 }
 
@@ -3473,6 +3599,52 @@ fn commandSupportsWorkspaceModifiers(command: Command) bool {
         .interactive, .ask, .acp, .pr, .issue, .resume_session => true,
         else => false,
     };
+}
+
+fn commandSupportsPromptFileModifiers(command: Command) bool {
+    return switch (command) {
+        .interactive, .ask, .acp, .pr, .issue, .resume_session => true,
+        else => false,
+    };
+}
+
+fn askHasSystemOverride(args: []const [:0]const u8) bool {
+    for (args) |arg| {
+        if (std.mem.eql(u8, arg, "--")) return false;
+        if (std.mem.eql(u8, arg, "--system")) return true;
+    }
+    return false;
+}
+
+fn prepareSystemPromptFiles(alloc: Allocator, modifiers: *LaunchModifiers, base: []const u8, deps: RunDeps) !bool {
+    if (!modifiers.hasPromptFileModifiers()) return true;
+    const result = try modifiers.prompt_files.compose(alloc, base);
+    switch (result) {
+        .prompt => |prompt| {
+            modifiers.effective_system_prompt = prompt;
+            return true;
+        },
+        .failure => |failure| {
+            var message: std.Io.Writer.Allocating = .init(alloc);
+            defer message.deinit();
+            try message.writer.print("fx: could not use system prompt file {s}: {s}\n", .{ failure.path, switch (failure.reason) {
+                .unreadable => "file is missing or unreadable",
+                .not_regular_file => "path is not a regular file",
+                .too_large => "custom system prompt files exceed the 256 KiB combined limit",
+                .invalid_text => "content must be valid UTF-8 and contain no NUL bytes",
+            } });
+            try writeStderr(deps, message.written());
+            return false;
+        },
+    }
+}
+
+fn writePromptFileModifierUsage(deps: RunDeps) !void {
+    try writeStderr(deps, "fx: system prompt file options are only supported for interactive, resume, ask, ACP, PR, and issue launches\n");
+}
+
+fn writeAskSystemPromptConflict(deps: RunDeps) !void {
+    try writeStderr(deps, "fx ask: --system cannot be combined with --system-prompt-file or --append-system-prompt-file\n");
 }
 
 fn writeWorkspaceModifierUsage(deps: RunDeps) !void {
@@ -3486,6 +3658,9 @@ fn globalLaunchErrorMessage(err: anyerror) ?[]const u8 {
     return switch (err) {
         error.MissingAddDirectoryValue => "--add-dir requires a directory path",
         error.DuplicateAdditionalDirectorySuppression => "--no-additional-dirs may only be specified once",
+        error.MissingSystemPromptFileValue => "--system-prompt-file requires a file path",
+        error.DuplicateSystemPromptFile => "--system-prompt-file may only be specified once",
+        error.MissingAppendSystemPromptFileValue => "--append-system-prompt-file requires a file path",
         else => null,
     };
 }
@@ -4107,6 +4282,155 @@ test "additional directory flags fail closed when malformed" {
     );
 }
 
+test "global system prompt file modifiers preserve replacement and append order" {
+    var parsed = try parseGlobalLaunchArgs(std.testing.allocator, &.{
+        @constCast("--append-system-prompt-file"),
+        @constCast("first.md"),
+        @constCast("--system-prompt-file=base.md"),
+        @constCast("--append-system-prompt-file=second.md"),
+        @constCast("acp"),
+    });
+    defer parsed.deinit(std.testing.allocator);
+
+    try std.testing.expectEqualStrings("base.md", parsed.modifiers.prompt_files.replacement_path.?);
+    try std.testing.expectEqual(@as(usize, 2), parsed.modifiers.prompt_files.append_paths.len);
+    try std.testing.expectEqualStrings("first.md", parsed.modifiers.prompt_files.append_paths[0]);
+    try std.testing.expectEqualStrings("second.md", parsed.modifiers.prompt_files.append_paths[1]);
+    try std.testing.expectEqualStrings("acp", parsed.remaining[0]);
+}
+
+test "global system prompt file modifiers reject missing and duplicate replacement values" {
+    try std.testing.expectError(
+        error.MissingSystemPromptFileValue,
+        parseGlobalLaunchArgs(std.testing.allocator, &.{@constCast("--system-prompt-file")}),
+    );
+    try std.testing.expectError(
+        error.MissingAppendSystemPromptFileValue,
+        parseGlobalLaunchArgs(std.testing.allocator, &.{@constCast("--append-system-prompt-file=")}),
+    );
+    try std.testing.expectError(
+        error.DuplicateSystemPromptFile,
+        parseGlobalLaunchArgs(std.testing.allocator, &.{
+            @constCast("--system-prompt-file=one"),
+            @constCast("--system-prompt-file=two"),
+        }),
+    );
+}
+
+test "global launch parsing releases every owned value across allocation failures" {
+    const backing = std.testing.allocator;
+    const args = [_][:0]const u8{
+        "--add-dir",
+        "/tmp/first",
+        "--add-dir",
+        "/tmp/second",
+        "--append-system-prompt-file",
+        "/tmp/prompt",
+        "ask",
+    };
+
+    var probe = std.testing.FailingAllocator.init(backing, .{});
+    var parsed = try parseGlobalLaunchArgs(probe.allocator(), &args);
+    parsed.deinit(probe.allocator());
+    try std.testing.expectEqual(probe.allocated_bytes, probe.freed_bytes);
+
+    for (0..probe.alloc_index) |fail_index| {
+        var failing = std.testing.FailingAllocator.init(backing, .{ .fail_index = fail_index });
+        if (parseGlobalLaunchArgs(failing.allocator(), &args)) |value| {
+            var owned = value;
+            owned.deinit(failing.allocator());
+        } else |err| switch (err) {
+            error.OutOfMemory => {},
+            else => return err,
+        }
+        try std.testing.expect(failing.has_induced_failure);
+        try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+    }
+}
+
+test "ask inline system prompt detection stops at the prompt separator" {
+    try std.testing.expect(askHasSystemOverride(&.{ @constCast("--system"), @constCast("inline"), @constCast("prompt") }));
+    try std.testing.expect(!askHasSystemOverride(&.{ @constCast("--"), @constCast("--system"), @constCast("is prompt text") }));
+}
+
+test "system prompt files are prepared for interactive and resumed launches" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var file = try tmp.dir.createFile(std.testing.io, "prompt", .{});
+    defer file.close(std.testing.io);
+    try file.writeStreamingAll(std.testing.io, "file system prompt");
+    const path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "prompt");
+    defer alloc.free(path);
+    const path_z = try alloc.dupeZ(u8, path);
+    defer alloc.free(path_z);
+
+    var interactive = try runIfRequestedWithDeps(
+        alloc,
+        &.{ @constCast("--system-prompt-file"), path_z },
+        testConfig(),
+        .{},
+    );
+    switch (interactive) {
+        .interactive => |*launch| {
+            defer launch.deinit(alloc);
+            try std.testing.expectEqualStrings("file system prompt", launch.modifiers.effective_system_prompt.?);
+        },
+        else => return error.TestExpectedInteractiveLaunch,
+    }
+
+    var resumed = try runIfRequestedWithDeps(
+        alloc,
+        &.{ @constCast("--system-prompt-file"), path_z, @constCast("resume"), @constCast("last") },
+        testConfig(),
+        .{},
+    );
+    switch (resumed) {
+        .interactive => |*launch| {
+            defer launch.deinit(alloc);
+            try std.testing.expect(launch.requested_resume != null);
+            try std.testing.expectEqualStrings("file system prompt", launch.modifiers.effective_system_prompt.?);
+        },
+        else => return error.TestExpectedInteractiveLaunch,
+    }
+}
+
+test "workflow launch config preserves the effective prompt for PR and issue" {
+    const modifiers = LaunchModifiers{ .effective_system_prompt = @constCast("WORKFLOW_FILE_SYSTEM_PROMPT") };
+    for ([_]Command{ .{ .pr = &.{} }, .{ .issue = &.{} } }) |command| {
+        try std.testing.expect(commandSupportsPromptFileModifiers(command));
+        const workflow_cfg = workflowConfigWithLaunchModifiers(testConfig(), modifiers);
+        try std.testing.expectEqualStrings(
+            "WORKFLOW_FILE_SYSTEM_PROMPT",
+            workflow_cfg.prompt_policy.system_prompt,
+        );
+    }
+}
+
+test "ask system prompt conflict is fatal before file access" {
+    var capture = CaptureOutput.init(std.testing.allocator);
+    defer capture.deinit();
+    const result = try runIfRequestedWithDeps(
+        std.testing.allocator,
+        &.{
+            @constCast("--system-prompt-file"),
+            @constCast("does-not-exist"),
+            @constCast("ask"),
+            @constCast("--system"),
+            @constCast("inline"),
+            @constCast("prompt"),
+        },
+        testConfig(),
+        capture.deps(),
+    );
+    try std.testing.expectEqual(RunResult.handled_failure, result);
+    try std.testing.expectEqualStrings("", capture.stdout.written());
+    try std.testing.expectEqualStrings(
+        "fx ask: --system cannot be combined with --system-prompt-file or --append-system-prompt-file\n",
+        capture.stderr.written(),
+    );
+}
+
 test "parse acp args extracts known flags and rejects invalid arguments" {
     const opts = try parseAcpArgs(&.{
         @constCast("--model"),
@@ -4181,13 +4505,28 @@ test "ACP command routes parsed options and launch config through the injected r
         }
     };
 
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var prompt_file = try tmp.dir.createFile(std.testing.io, "acp-system-prompt", .{});
+    defer prompt_file.close(std.testing.io);
+    try prompt_file.writeStreamingAll(std.testing.io, "ACP_FILE_SYSTEM_PROMPT");
+    const prompt_path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "acp-system-prompt");
+    defer alloc.free(prompt_path);
+    const prompt_path_z = try alloc.dupeZ(u8, prompt_path);
+    defer alloc.free(prompt_path_z);
+
     var cfg = testConfig();
     cfg.provider_set.gateway.permission_reviewer = test_builtin_gateway.permission_reviewer.provider;
-    var capture = Capture{ .expected = cfg };
+    var expected = cfg;
+    expected.prompt_policy.system_prompt = "ACP_FILE_SYSTEM_PROMPT";
+    var capture = Capture{ .expected = expected };
     cfg.acp_runner = .{ .context = &capture, .run_fn = Capture.run };
     const result = try runIfRequestedWithDeps(
-        std.testing.allocator,
+        alloc,
         &.{
+            @constCast("--system-prompt-file"),
+            prompt_path_z,
             @constCast("--context-limit"),
             @constCast("project_instructions_total_bytes=1234"),
             @constCast("--add-dir"),
