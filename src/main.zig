@@ -842,6 +842,7 @@ const App = struct {
         self.terminal_takeover.shutdown(App, self);
         self.releaseTerminal();
         if (self.worker_thread) |thread| thread.join();
+        self.notifications.deinit();
         self.terminal_takeover.deinit(self.alloc);
         const direct_deinit_disposition = if (capture_resume_handoff)
             self.terminal_direct.deinitSettled(self.alloc)
