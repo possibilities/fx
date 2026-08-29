@@ -27,7 +27,21 @@ pub fn loadSkills(
     root_policy: skill_contract.RootPolicy,
 ) LoadSkillsError!LoadedSkills {
     const configured_home = io_mod.getenv("HOME");
-    const selected_home = configured_home orelse return .{};
+    const selected_home = configured_home orelse {
+        const discovery = try skill_runtime.loadVisibleSkillsWithHomes(
+            alloc,
+            workspace_root,
+            null,
+            null,
+            "",
+            invocation_skill_roots,
+            root_policy,
+        );
+        return .{
+            .skills = discovery.skills,
+            .diagnostics = discovery.diagnostics,
+        };
+    };
     return loadSkillsFromHomes(
         alloc,
         workspace_root,
