@@ -170,10 +170,11 @@ pub fn Runtime(comptime App: type) type {
             {
                 app.lifecycle_state.lockProjection();
                 defer app.lifecycle_state.unlockProjection();
-                const update = app.lifecycle_state.transition(
+                const update = app.lifecycle_state.transitionWithToken(
                     agent,
                     .attention_required,
                     input.kind,
+                    input.attention_token,
                 );
                 if (update.changed()) {
                     app.ade_events.reportAttentionRequired(input);
@@ -195,10 +196,11 @@ pub fn Runtime(comptime App: type) type {
             {
                 app.lifecycle_state.lockProjection();
                 defer app.lifecycle_state.unlockProjection();
-                const update = app.lifecycle_state.transition(
+                const update = app.lifecycle_state.transitionWithToken(
                     agent,
                     .attention_resolved,
                     input.kind,
+                    input.attention_token,
                 );
                 if (update.changed()) {
                     app.ade_events.reportAttentionResolved(input);
@@ -379,15 +381,26 @@ test "lifecycle coordinator projects full ADE state and interactive Herdr state 
         .invocation = testInvocation(.interactive),
         .outcome = .completed,
     });
+    const child_attention_token = [_]u8{0x41} ** 32;
     view.runAttentionRequired(.{
         .invocation = testInvocation(.subagent),
         .kind = .permission,
         .presented_interactively = true,
+        .attention_token = child_attention_token,
     });
     view.runAttentionResolved(.{
         .invocation = testInvocation(.subagent),
         .kind = .permission,
         .presented_interactively = true,
+        .attention_token = child_attention_token,
+    });
+    // Models a registry snapshot copied before resolution and dispatched
+    // afterward. The delayed edge must not reopen either projection.
+    view.runAttentionRequired(.{
+        .invocation = testInvocation(.subagent),
+        .kind = .permission,
+        .presented_interactively = true,
+        .attention_token = child_attention_token,
     });
     view.runAttentionRequired(.{
         .invocation = testInvocation(.interactive),

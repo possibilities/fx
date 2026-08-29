@@ -104,15 +104,31 @@ pub const Persistence = struct {
 /// `truncated` rather than silently naming a subset as the whole set.
 pub const max_pending_child_snapshot: usize = 32;
 pub const max_pending_child_id_bytes: usize = 64;
+pub const AttentionToken = [32]u8;
+
+pub fn attentionToken(child_id: []const u8, request_id: []const u8) AttentionToken {
+    var hash = std.crypto.hash.sha2.Sha256.init(.{});
+    hash.update(child_id);
+    hash.update(&.{0});
+    hash.update(request_id);
+    var digest: AttentionToken = undefined;
+    hash.final(&digest);
+    return digest;
+}
 
 pub const PendingChildren = struct {
     storage: [max_pending_child_snapshot][max_pending_child_id_bytes]u8 = undefined,
     lengths: [max_pending_child_snapshot]usize = @splat(0),
+    attention_tokens: [max_pending_child_snapshot]AttentionToken = undefined,
     len: usize = 0,
     truncated: bool = false,
 
     pub fn at(self: *const PendingChildren, index: usize) []const u8 {
         return self.storage[index][0..self.lengths[index]];
+    }
+
+    pub fn attentionTokenAt(self: *const PendingChildren, index: usize) AttentionToken {
+        return self.attention_tokens[index];
     }
 
     fn contains(self: *const PendingChildren, child_id: []const u8) bool {
@@ -353,6 +369,7 @@ pub const Registry = struct {
             }
             @memcpy(out.storage[out.len][0..binding.child_id.len], binding.child_id);
             out.lengths[out.len] = binding.child_id.len;
+            out.attention_tokens[out.len] = attentionToken(binding.child_id, binding.request_id);
             out.len += 1;
         }
         if (out.truncated) {

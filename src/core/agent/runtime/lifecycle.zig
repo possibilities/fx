@@ -35,12 +35,14 @@ pub const AttentionRequiredCheckpoint = struct {
     turn_id: ?u64,
     kind: hooks.AttentionKind,
     presented_interactively: bool = false,
+    attention_token: ?hooks.AttentionToken = null,
 };
 
 pub const AttentionResolvedCheckpoint = struct {
     turn_id: ?u64,
     kind: hooks.AttentionKind,
     presented_interactively: bool = false,
+    attention_token: ?hooks.AttentionToken = null,
 };
 
 pub const TurnStartedCheckpoint = struct {
@@ -238,6 +240,7 @@ pub fn dispatchAttentionRequiredCheckpoint(
         },
         .kind = checkpoint.kind,
         .presented_interactively = checkpoint.presented_interactively,
+        .attention_token = checkpoint.attention_token,
     });
 }
 
@@ -252,6 +255,7 @@ pub fn dispatchAttentionResolvedCheckpoint(
         },
         .kind = checkpoint.kind,
         .presented_interactively = checkpoint.presented_interactively,
+        .attention_token = checkpoint.attention_token,
     });
 }
 

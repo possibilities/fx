@@ -237,10 +237,16 @@ pub const AttentionKind = enum {
     route_recovery,
 };
 
+/// Internal identity for one attention request. First-party lifecycle
+/// projections use it to reject a delayed edge after that exact request was
+/// already resolved; it is not part of any external event schema.
+pub const AttentionToken = [32]u8;
+
 pub const AttentionRequiredInput = struct {
     invocation: Invocation,
     kind: AttentionKind,
     presented_interactively: bool = false,
+    attention_token: ?AttentionToken = null,
 };
 
 pub const AttentionRequiredHandler = struct {
@@ -256,6 +262,7 @@ pub const AttentionResolvedInput = struct {
     invocation: Invocation,
     kind: AttentionKind,
     presented_interactively: bool = false,
+    attention_token: ?AttentionToken = null,
 };
 
 pub const AttentionResolvedHandler = struct {

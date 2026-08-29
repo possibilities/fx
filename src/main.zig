@@ -757,6 +757,16 @@ const App = struct {
         kind: hooks.AttentionKind,
         child_session_id: ?[]const u8,
     ) void {
+        self.dispatchAttentionRequiredTokenized(turn_id, kind, child_session_id, null);
+    }
+
+    pub fn dispatchAttentionRequiredTokenized(
+        self: *App,
+        turn_id: u64,
+        kind: hooks.AttentionKind,
+        child_session_id: ?[]const u8,
+        attention_token: ?hooks.AttentionToken,
+    ) void {
         agent_runtime.dispatchAttentionRequiredCheckpoint(.{
             .view = self.lifecycle_view,
             .scope = self.attentionScope(child_session_id),
@@ -765,6 +775,7 @@ const App = struct {
             .turn_id = if (child_session_id == null) turn_id else null,
             .kind = kind,
             .presented_interactively = true,
+            .attention_token = attention_token,
         });
     }
 
@@ -774,6 +785,16 @@ const App = struct {
         kind: hooks.AttentionKind,
         child_session_id: ?[]const u8,
     ) void {
+        self.dispatchAttentionResolvedTokenized(turn_id, kind, child_session_id, null);
+    }
+
+    pub fn dispatchAttentionResolvedTokenized(
+        self: *App,
+        turn_id: u64,
+        kind: hooks.AttentionKind,
+        child_session_id: ?[]const u8,
+        attention_token: ?hooks.AttentionToken,
+    ) void {
         agent_runtime.dispatchAttentionResolvedCheckpoint(.{
             .view = self.lifecycle_view,
             .scope = self.attentionScope(child_session_id),
@@ -782,6 +803,7 @@ const App = struct {
             .turn_id = if (child_session_id == null) turn_id else null,
             .kind = kind,
             .presented_interactively = true,
+            .attention_token = attention_token,
         });
     }
 

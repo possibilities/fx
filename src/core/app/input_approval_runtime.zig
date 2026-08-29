@@ -46,6 +46,7 @@ pub fn ApprovalRuntime(comptime App: type) type {
         const AttentionResolutionObserver = struct {
             app: *App,
             child_session_id: ?[]const u8,
+            attention_token: ?approval_registry.AttentionToken = null,
 
             fn interface(self: *@This()) worker_runtime.DecisionObserver {
                 return .{
@@ -56,7 +57,14 @@ pub fn ApprovalRuntime(comptime App: type) type {
 
             fn observe(raw: *anyopaque, turn_id: u64) void {
                 const self: *@This() = @ptrCast(@alignCast(raw));
-                if (comptime @hasDecl(App, "dispatchAttentionResolved")) {
+                if (comptime @hasDecl(App, "dispatchAttentionResolvedTokenized")) {
+                    self.app.dispatchAttentionResolvedTokenized(
+                        turn_id,
+                        .permission,
+                        self.child_session_id,
+                        self.attention_token,
+                    );
+                } else if (comptime @hasDecl(App, "dispatchAttentionResolved")) {
                     self.app.dispatchAttentionResolved(
                         turn_id,
                         .permission,
@@ -84,6 +92,10 @@ pub fn ApprovalRuntime(comptime App: type) type {
                 var observation = AttentionResolutionObserver{
                     .app = app,
                     .child_session_id = child_session_id,
+                    .attention_token = approval_registry.attentionToken(
+                        child_session_id,
+                        options.request_id,
+                    ),
                 };
                 return host.resolveApprovalObserved(
                     options,
@@ -93,7 +105,14 @@ pub fn ApprovalRuntime(comptime App: type) type {
 
             const result = try host.resolveApproval(options);
             if (result == .accepted) {
-                if (comptime @hasDecl(App, "dispatchAttentionResolved")) {
+                if (comptime @hasDecl(App, "dispatchAttentionResolvedTokenized")) {
+                    app.dispatchAttentionResolvedTokenized(
+                        app.worker.activeTurnId(),
+                        .permission,
+                        child_session_id,
+                        approval_registry.attentionToken(child_session_id, options.request_id),
+                    );
+                } else if (comptime @hasDecl(App, "dispatchAttentionResolved")) {
                     app.dispatchAttentionResolved(
                         app.worker.activeTurnId(),
                         .permission,

@@ -35,6 +35,7 @@ pub const PostTurnEndHandler = definitions.PostTurnEndHandler;
 pub const PostTurnEndInput = definitions.PostTurnEndInput;
 
 pub const AttentionKind = definitions.AttentionKind;
+pub const AttentionToken = definitions.AttentionToken;
 pub const AttentionRequiredHandler = definitions.AttentionRequiredHandler;
 pub const AttentionRequiredInput = definitions.AttentionRequiredInput;
 pub const AttentionResolvedHandler = definitions.AttentionResolvedHandler;

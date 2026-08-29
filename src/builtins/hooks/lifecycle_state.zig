@@ -17,6 +17,8 @@ pub const AgentState = enum {
 pub const Snapshot = struct {
     agent_state: AgentState = .idle,
     attention_kind: ?hooks.AttentionKind = null,
+    attention_token: ?hooks.AttentionToken = null,
+    resolved_attention_tokens: [3]?hooks.AttentionToken = @splat(null),
 };
 
 pub const Event = enum {
@@ -103,6 +105,16 @@ pub const Reducer = struct {
         event: Event,
         attention_kind: ?hooks.AttentionKind,
     ) Update {
+        return self.transitionWithToken(agent, event, attention_kind, null);
+    }
+
+    pub fn transitionWithToken(
+        self: *Reducer,
+        agent: Agent,
+        event: Event,
+        attention_kind: ?hooks.AttentionKind,
+        attention_token: ?hooks.AttentionToken,
+    ) Update {
         self.mutex.lockUncancelable(io_mod.getIo());
         defer self.mutex.unlock(io_mod.getIo());
 
@@ -110,11 +122,11 @@ pub const Reducer = struct {
             const previous = self.snapshotLocked(agent);
             return .{
                 .previous = previous,
-                .current = reduce(previous, event, attention_kind),
+                .current = reduceWithToken(previous, event, attention_kind, attention_token),
             };
         };
         const previous = state.*;
-        state.* = reduce(previous, event, attention_kind);
+        state.* = reduceWithToken(previous, event, attention_kind, attention_token);
         return .{ .previous = previous, .current = state.* };
     }
 
@@ -161,20 +173,64 @@ fn reduce(
     event: Event,
     attention_kind: ?hooks.AttentionKind,
 ) Snapshot {
-    return switch (event) {
-        .fx_started, .post_turn_end, .fx_stopped => .{},
-        .prompt_queued, .turn_started, .pre_tool_use, .stop => .{
-            .agent_state = .working,
+    return reduceWithToken(previous, event, attention_kind, null);
+}
+
+fn reduceWithToken(
+    previous: Snapshot,
+    event: Event,
+    attention_kind: ?hooks.AttentionKind,
+    attention_token: ?hooks.AttentionToken,
+) Snapshot {
+    var next = previous;
+    switch (event) {
+        .fx_started, .fx_stopped => return .{},
+        .post_turn_end => {
+            next.agent_state = .idle;
+            next.attention_kind = null;
+            next.attention_token = null;
         },
-        .attention_required => .{
-            .agent_state = .blocked,
-            .attention_kind = attention_kind,
+        .prompt_queued, .turn_started, .pre_tool_use, .stop => {
+            next.agent_state = .working;
+            next.attention_kind = null;
+            next.attention_token = null;
         },
-        .attention_resolved => if (previous.agent_state == .blocked and
-            previous.attention_kind == attention_kind)
-            .{ .agent_state = .working }
-        else
-            previous,
+        .attention_required => {
+            if (attention_kind) |kind| {
+                if (attention_token) |token| {
+                    if (next.resolved_attention_tokens[attentionKindIndex(kind)]) |resolved| {
+                        if (std.mem.eql(u8, resolved[0..], token[0..])) return previous;
+                    }
+                }
+            }
+            next.agent_state = .blocked;
+            next.attention_kind = attention_kind;
+            next.attention_token = attention_token;
+        },
+        .attention_resolved => {
+            if (previous.agent_state != .blocked or previous.attention_kind != attention_kind) {
+                return previous;
+            }
+            if (attention_token) |token| {
+                const active = previous.attention_token orelse return previous;
+                if (!std.mem.eql(u8, active[0..], token[0..])) return previous;
+                if (attention_kind) |kind| {
+                    next.resolved_attention_tokens[attentionKindIndex(kind)] = token;
+                }
+            }
+            next.agent_state = .working;
+            next.attention_kind = null;
+            next.attention_token = null;
+        },
+    }
+    return next;
+}
+
+fn attentionKindIndex(kind: hooks.AttentionKind) usize {
+    return switch (kind) {
+        .permission => 0,
+        .question => 1,
+        .route_recovery => 2,
     };
 }
 
@@ -196,6 +252,28 @@ test "lifecycle reducer carries attention through resolution and turn end" {
     try std.testing.expect(resumed.attention_kind == null);
     _ = reducer.transition(.main, .post_turn_end, null);
     try std.testing.expectEqual(AgentState.idle, reducer.snapshot(.main).agent_state);
+
+    const child = Agent{ .subagent_session = "tokenized-child" };
+    const first_token = [_]u8{0x11} ** 32;
+    const next_token = [_]u8{0x22} ** 32;
+    _ = reducer.transitionWithToken(child, .attention_required, .permission, first_token);
+    _ = reducer.transitionWithToken(child, .attention_resolved, .permission, first_token);
+    const delayed = reducer.transitionWithToken(
+        child,
+        .attention_required,
+        .permission,
+        first_token,
+    );
+    try std.testing.expect(!delayed.changed());
+    try std.testing.expectEqual(AgentState.working, delayed.current.agent_state);
+    const fresh = reducer.transitionWithToken(
+        child,
+        .attention_required,
+        .permission,
+        next_token,
+    );
+    try std.testing.expect(fresh.changed());
+    try std.testing.expectEqual(AgentState.blocked, fresh.current.agent_state);
 }
 
 test "lifecycle reducer ignores unmatched attention resolution" {

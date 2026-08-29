@@ -490,26 +490,17 @@ pub fn Runtime(comptime App: type) type {
             var pending: approval_registry.PendingChildren = .{};
             host.approvals.snapshotPendingChildren(&pending);
             for (0..pending.len) |index| {
-                app.dispatchAttentionRequired(0, .permission, pending.at(index));
+                if (comptime @hasDecl(App, "dispatchAttentionRequiredTokenized")) {
+                    app.dispatchAttentionRequiredTokenized(
+                        0,
+                        .permission,
+                        pending.at(index),
+                        pending.attentionTokenAt(index),
+                    );
+                } else {
+                    app.dispatchAttentionRequired(0, .permission, pending.at(index));
+                }
             }
-        }
-
-        /// A mirrored approval can outlive the registry route it was copied
-        /// from by one UI sync. Do not let that stale presentation reopen ADE
-        /// attention after the accepted decision already published its
-        /// resolution.
-        fn childApprovalIsPending(app: *App, child_session_id: []const u8) bool {
-            if (comptime !@hasField(App, "session_persistence")) return true;
-            const host = app_session_runtime.Runtime(App).subagentHost(app) orelse return true;
-            var pending: approval_registry.PendingChildren = .{};
-            host.approvals.snapshotPendingChildren(&pending);
-            for (0..pending.len) |index| {
-                if (std.mem.eql(u8, pending.at(index), child_session_id)) return true;
-            }
-            // A truncated snapshot cannot prove absence, so preserve the
-            // interactively presented edge and let the lifecycle reducer
-            // suppress it when the child is already blocked.
-            return pending.truncated;
         }
 
         pub fn syncState(
@@ -574,6 +565,7 @@ pub fn Runtime(comptime App: type) type {
             }
             if (!was_approval_active and app.approval_prompt.isActive()) {
                 var child_session_id: ?[]const u8 = null;
+                var child_attention_token: ?approval_registry.AttentionToken = null;
                 if (child_pending_request) |child_request| {
                     if (comptime @hasDecl(
                         @TypeOf(app.subagents),
@@ -581,15 +573,24 @@ pub fn Runtime(comptime App: type) type {
                     )) {
                         if (app.subagents.mainApprovalBinding(child_request.id)) |binding| {
                             child_session_id = binding.child_id;
+                            if (comptime @hasField(@TypeOf(binding), "approval_id")) {
+                                child_attention_token = approval_registry.attentionToken(
+                                    binding.child_id,
+                                    binding.approval_id,
+                                );
+                            }
                         }
                     }
                 }
                 if (comptime @hasDecl(App, "dispatchAttentionRequired")) {
-                    const current = if (child_session_id) |session_id|
-                        childApprovalIsPending(app, session_id)
-                    else
-                        true;
-                    if (current) {
+                    if (comptime @hasDecl(App, "dispatchAttentionRequiredTokenized")) {
+                        app.dispatchAttentionRequiredTokenized(
+                            snapshot.active_turn_id,
+                            .permission,
+                            child_session_id,
+                            child_attention_token,
+                        );
+                    } else {
                         app.dispatchAttentionRequired(
                             snapshot.active_turn_id,
                             .permission,
