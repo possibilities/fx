@@ -11,10 +11,11 @@ import {
   libfxApiVersion,
 } from "../node.js";
 import * as browser from "../browser.js";
+import { createFxAgent as createDirectWasmAgent } from "../fx-sdk.js";
 
-assert.equal(libfxApiVersion, 2);
+assert.equal(libfxApiVersion, 3);
 assert.equal(fxSdkApiVersion, 1);
-assert.equal(browser.libfxApiVersion, 2);
+assert.equal(browser.libfxApiVersion, 3);
 assert.equal(typeof browser.createFxAgent, "function");
 assert.equal(typeof browser.createFxTerminal, "function");
 
@@ -25,6 +26,35 @@ await writeFile(nativePath, `
   export async function createFxTerminal(options) { return { backend: "native-terminal", options }; }
 `);
 const nativeUrl = pathToFileURL(nativePath);
+const codexStore = {
+  async load() { return null; },
+  async commit() { return { revision: "1" }; },
+};
+
+assert.throws(
+  () => browser.createFxAgent({ auth: { provider: "codex", session: codexStore } }),
+  (error) => error?.code === "LIBFX_CODEX_NATIVE_REQUIRED",
+);
+assert.throws(
+  () => browser.createFxAgent({ auth: { provider: "gateway", apiKey: "key", session: codexStore } }),
+  /Gateway auth accepts only provider and apiKey/,
+);
+await assert.rejects(
+  createDirectWasmAgent({ auth: { provider: "gateway", apiKey: "key", session: codexStore } }),
+  /Gateway auth accepts only provider and apiKey/,
+);
+await assert.rejects(
+  createFxAgent({ nativeAddon: nativeUrl, backend: "wasm", auth: { provider: "codex", session: codexStore } }),
+  (error) => error?.code === "LIBFX_CODEX_NATIVE_REQUIRED",
+);
+await assert.rejects(
+  createFxAgent({
+    nativeAddon: nativeUrl,
+    backend: "wasm",
+    auth: { provider: "gateway", apiKey: "key", session: codexStore },
+  }),
+  /Gateway auth accepts only provider and apiKey/,
+);
 
 for (const gatewayChatUrl of [
   "http://attacker.example/chat",
@@ -44,6 +74,22 @@ assert.equal(agent.options.marker, 1);
 assert.equal("nativeAddon" in agent.options, false);
 assert.equal("backend" in agent.options, false);
 
+const highLevelCodex = await createFxAgent({
+  nativeAddon: nativeUrl,
+  backend: "native",
+  auth: { provider: "codex", session: codexStore },
+});
+assert.equal(highLevelCodex.options.auth.provider, "codex");
+assert.equal(highLevelCodex.options.auth.session, codexStore);
+
+await assert.rejects(
+  createFxAgent({
+    nativeAddon: nativeUrl,
+    auth: { provider: "gateway", apiKey: "key", session: codexStore },
+  }),
+  /Gateway auth accepts only provider and apiKey/,
+);
+
 const terminal = await createFxTerminal({ nativeAddon: nativeUrl, marker: 2 });
 assert.equal(terminal.backend, "native-terminal");
 assert.equal(terminal.options.marker, 2);
@@ -56,7 +102,7 @@ await assert.rejects(
 
 const coreOnlyPath = resolve(dir, "core-only.mjs");
 await writeFile(coreOnlyPath, `
-  export const libfxApiVersion = 2;
+  export const libfxApiVersion = 3;
   export async function createFxAgent() { return { backend: "core-only" }; }
 `);
 await assert.rejects(
@@ -67,7 +113,7 @@ await assert.rejects(
 
 const incompatiblePath = resolve(dir, "incompatible.mjs");
 await writeFile(incompatiblePath, `
-  export const libfxApiVersion = 3;
+  export const libfxApiVersion = 2;
   export async function createFxAgent() {}
 `);
 await assert.rejects(
@@ -81,7 +127,7 @@ for (const [name, source] of [
     export function createCore() { throw new Error("missing-version createCore invoked"); }
   `],
   ["unequal-version", `
-    export const libfxApiVersion = 3;
+    export const libfxApiVersion = 2;
     export function createCore() { throw new Error("unequal-version createCore invoked"); }
   `],
 ]) {
@@ -98,7 +144,7 @@ for (const [name, source] of [
 
 const matchingVersionPath = resolve(dir, "matching-version.mjs");
 await writeFile(matchingVersionPath, `
-  export const libfxApiVersion = 2;
+  export const libfxApiVersion = 3;
   export function createCore() {
     const error = new Error("matching-version createCore invoked");
     error.code = "MATCHING_VERSION_INVOKED";
@@ -108,7 +154,7 @@ await writeFile(matchingVersionPath, `
 await assert.rejects(
   createFxAgent({ nativeAddon: pathToFileURL(matchingVersionPath), backend: "native" }),
   (error) => error?.code === "MATCHING_VERSION_INVOKED",
-  "matching v2 low-level addon must reach createCore",
+  "matching v3 low-level addon must reach createCore",
 );
 
 console.log("libfx loader passed: browser exports, native preference, fallback diagnostics, and strict low-level API validation");

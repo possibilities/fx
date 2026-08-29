@@ -12,6 +12,7 @@ const scripts = [
   "test-native-core.mjs",
   "test-native-core-config-isolation.mjs",
   "test-native-core-stream.mjs",
+  "test-native-core-codex.mjs",
   "test-native-core-fetch-failure.mjs",
   "test-native-core-cancel-before-fetch.mjs",
   "test-native-core-cancel.mjs",
