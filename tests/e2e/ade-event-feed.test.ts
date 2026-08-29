@@ -336,8 +336,20 @@ describe.skipIf(!tmuxAvailable())("ADE event feed", () => {
       await session.waitForText("Sessions", TIMEOUT);
       await session.sendKeys("Tab");
       await session.waitForText("[All workspaces]", TIMEOUT);
-      await session.sendLiteralText("ADE_QUESTION_REQUEST");
-      await session.waitForPane((pane) => pane.includes("Sessions 1"), TIMEOUT);
+      const resumePane = await session.waitForPane(
+        (pane) =>
+          pane.includes("Sessions 2") &&
+          pane.includes("ADE_QUESTION_REQUEST") &&
+          pane.includes("ADE_CHILD_PROMPT: run a terminal command"),
+        TIMEOUT,
+      );
+      expect(resumePane.indexOf("ADE_QUESTION_REQUEST")).toBeLessThan(
+        resumePane.indexOf("ADE_CHILD_PROMPT: run a terminal command"),
+      );
+      // The picker can preserve its prior selection while the all-workspaces
+      // page loads. With exactly two rows, Up selects (or stays on) the first,
+      // original main session deterministically.
+      await session.sendKeys("Up");
       await session.sendKeys("Enter");
       await receiver.waitFor(
         (record) =>
