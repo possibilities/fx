@@ -42,6 +42,7 @@ pub fn loadVisibleSkillsForTool(
     alloc: Allocator,
     workspace_root: []const u8,
     skills_dir: []const u8,
+    selected_root_policy: skill_contract.RootPolicy,
 ) !skill_runtime.SkillDiscovery {
     const home = io_mod.getenv("HOME") orelse homeFromSkillsDir(skills_dir);
     return skill_runtime.loadVisibleSkills(
@@ -49,7 +50,7 @@ pub fn loadVisibleSkillsForTool(
         workspace_root,
         home,
         skills_dir,
-        root_policy,
+        selected_root_policy,
     );
 }
 

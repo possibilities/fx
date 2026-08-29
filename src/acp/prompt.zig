@@ -263,6 +263,7 @@ const AcpContext = struct {
             .session = &session.session_rt,
             .session_allocator = self.alloc,
             .skills_dir = self.state.skills.dir,
+            .skill_root_policy = self.state.cfg.skill_root_policy,
             .context_limits = self.state.context_limits,
             .context_enabled = self.state.context_enabled,
             .context_registry = self.state.cfg.context_registry,
