@@ -334,6 +334,10 @@ describe.skipIf(!tmuxAvailable())("ADE event feed", () => {
       await session.waitForComposer(TIMEOUT);
       await session.sendText("/resume");
       await session.waitForText("Sessions", TIMEOUT);
+      await session.sendKeys("Tab");
+      await session.waitForText("[All workspaces]", TIMEOUT);
+      await session.sendLiteralText("ADE_QUESTION_REQUEST");
+      await session.waitForPane((pane) => pane.includes("Sessions 1"), TIMEOUT);
       await session.sendKeys("Enter");
       await receiver.waitFor(
         (record) =>
@@ -436,6 +440,13 @@ describe.skipIf(!tmuxAvailable())("ADE event feed", () => {
       expect(childContext.parent_session_id).toBe(mainSession);
       expect(childAttention.context.session_id).toBe(childContext.session_id);
       expect(childAttention.context.parent_session_id).toBe(mainSession);
+      expect(records.filter(
+        (record) =>
+          record.event === "AttentionRequired" &&
+          record.context.agent_role === "subagent" &&
+          record.context.session_id === childContext.session_id &&
+          record.payload.kind === "permission",
+      )).toHaveLength(1);
       expect(records.some(
         (record) =>
           record.event === "AttentionRequired" &&
