@@ -1654,6 +1654,7 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
         alloc,
         startup.workspace_root,
         ctx.mcp_elicitation_capabilities,
+        null,
     );
     if (ctx.mcp) |mcp| {
         var health_snapshot = try mcp.snapshotHealth(
@@ -4469,7 +4470,12 @@ fn testPresentKeyNoContextStartup(alloc: Allocator, transport: oauth_transport.P
     return state;
 }
 
-fn testNoMcpRuntime(_: Allocator, _: []const u8, _: mcp_elicitation.Capabilities) !?*mcp_runtime.McpRuntime {
+fn testNoMcpRuntime(
+    _: Allocator,
+    _: []const u8,
+    _: mcp_elicitation.Capabilities,
+    _: ?[]const u8,
+) !?*mcp_runtime.McpRuntime {
     return null;
 }
 
@@ -5607,7 +5613,12 @@ const test_startup_cancellation_context_registry = context_contract.Registry{ .d
     .append_transient_fn = testNoTransientContext,
 } };
 
-fn testLoadMcpRuntimeWithCancellation(_: Allocator, _: []const u8, _: mcp_elicitation.Capabilities) !?*mcp_runtime.McpRuntime {
+fn testLoadMcpRuntimeWithCancellation(
+    _: Allocator,
+    _: []const u8,
+    _: mcp_elicitation.Capabilities,
+    _: ?[]const u8,
+) !?*mcp_runtime.McpRuntime {
     test_startup_cancellation_mcp_calls += 1;
     if (test_startup_cancellation_stage == .during_mcp_load) {
         requestTestHeadlessInterrupt();

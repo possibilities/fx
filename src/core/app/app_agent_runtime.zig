@@ -205,6 +205,7 @@ pub fn Runtime(comptime App: type) type {
                 provider_set.Bundle.Capabilities{};
             var ctx: tool_runtime.Context = .{
                 .workspace_root = workspace_root,
+                .profile_home = if (comptime @hasField(App, "profile_home")) app.profile_home else null,
                 .access_scope = if (host_workspace != null)
                     workspace_access.AccessScope.primaryOnly(workspace_root)
                 else
@@ -856,6 +857,7 @@ pub fn Runtime(comptime App: type) type {
 
             app.context_snapshot = app.contextRegistry().gatherDefaultSnapshot(app.alloc, .{
                 .workspace_root = app.workspace_root,
+                .profile_home = if (comptime @hasField(App, "profile_home")) app.profile_home else null,
                 .access_scope = appAccessScope(app),
                 .project_instructions_enabled = if (comptime @hasField(App, "project_instructions_enabled")) app.project_instructions_enabled else true,
                 .targets = targets,

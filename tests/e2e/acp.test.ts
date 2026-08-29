@@ -5933,6 +5933,195 @@ describe("acp: model-independent", () => {
   );
 
   test(
+    "--state-dir rejects missing and non-directory roots before serving",
+    async () => {
+      const root = createIsolatedRoot("fx-acp-state-root-validation-");
+      const filePath = join(root.root, "state-file");
+      writeFileSync(filePath, "not a directory\n");
+      try {
+        for (const path of [join(root.root, "missing"), filePath]) {
+          const result = await runFx(["--state-dir", path, "acp"], {
+            cwd: root.workspace,
+            env: { HOME: root.home },
+            timeoutMs: TIMEOUT,
+          });
+          expect(result.code).not.toBe(0);
+          expect(result.timedOut).toBe(false);
+          expect(result.stdout).toBe("");
+          expect(result.stderr).toContain(
+            "fx: --state-dir must name an existing directory",
+          );
+        }
+      } finally {
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "ACP state root isolates profile data while children retain operator HOME",
+    async () => {
+      const root = createIsolatedRoot("fx-acp-state-isolation-");
+      const stateA = join(root.root, "state-a");
+      const stateB = join(root.root, "state-b");
+      const mcpPidPath = join(root.root, "mcp.pid");
+      const mcpEnvironmentPath = join(root.root, "mcp-environment.json");
+      mkdirSync(join(stateA, ".fx", "skills", "isolated-state-skill"), {
+        recursive: true,
+      });
+      mkdirSync(join(root.home, ".codex", "skills", "ambient-profile-skill"), {
+        recursive: true,
+      });
+      mkdirSync(join(stateA, ".codex", "skills", "selected-profile-skill"), {
+        recursive: true,
+      });
+      mkdirSync(join(stateB, ".fx"), { recursive: true });
+      writeFileSync(
+        join(stateA, ".fx", "settings.json"),
+        JSON.stringify({ model: FAKE_GATEWAY_MODEL }) + "\n",
+      );
+      writeFileSync(
+        join(root.home, ".fx", "settings.json"),
+        JSON.stringify({ model: "ambient/model-must-not-load" }) + "\n",
+      );
+      writeFileSync(join(stateA, ".fx", "api-key"), "selected-state-key\n", {
+        mode: 0o600,
+      });
+      writeFileSync(join(root.home, ".fx", "api-key"), "ambient-key\n", {
+        mode: 0o600,
+      });
+      writeFileSync(
+        join(stateA, ".fx", "memories.json"),
+        JSON.stringify(["selected state memory"]) + "\n",
+      );
+      writeFileSync(
+        join(root.home, ".fx", "memories.json"),
+        JSON.stringify(["ambient memory must not load"]) + "\n",
+      );
+      writeFileSync(join(stateA, ".fx", "AGENTS.md"), "SELECTED_PROFILE_INSTRUCTIONS\n");
+      writeFileSync(join(root.home, ".fx", "AGENTS.md"), "AMBIENT_PROFILE_INSTRUCTIONS\n");
+      writeFileSync(
+        join(stateA, ".fx", "skills", "isolated-state-skill", "SKILL.md"),
+        "---\nname: isolated-state-skill\ndescription: selected state skill\n---\n\nSELECTED_STATE_SKILL_BODY\n",
+      );
+      const ambientSkill = join(root.home, ".fx", "skills", "ambient-state-skill");
+      mkdirSync(ambientSkill, { recursive: true });
+      writeFileSync(
+        join(ambientSkill, "SKILL.md"),
+        "---\nname: ambient-state-skill\ndescription: ambient state skill\n---\n\nAMBIENT_STATE_SKILL_BODY\n",
+      );
+      writeFileSync(
+        join(stateA, ".codex", "skills", "selected-profile-skill", "SKILL.md"),
+        "---\nname: selected-profile-skill\ndescription: selected profile skill\n---\n\nSELECTED_PROFILE_SKILL_BODY\n",
+      );
+      writeFileSync(
+        join(root.home, ".codex", "skills", "ambient-profile-skill", "SKILL.md"),
+        "---\nname: ambient-profile-skill\ndescription: ambient profile skill\n---\n\nAMBIENT_PROFILE_SKILL_BODY\n",
+      );
+      writeAcpSession(stateA, root.workspace, "state-a-session", 30);
+      writeAcpSession(stateB, root.workspace, "state-b-session", 20);
+      writeAcpSession(root.home, root.workspace, "ambient-session", 10);
+
+      const gateway = startFakeGateway([
+        fakeGatewayToolCall("state_memory", "memory", { action: "list" }),
+        fakeGatewayToolCall("state_home", "terminal", {
+          action: "exec",
+          command: "printf '%s' \"$HOME\"",
+          timeout_ms: 5_000,
+        }),
+        finalText("ACP isolated state complete"),
+      ]);
+      try {
+        client = await AcpClient.create({
+          cwd: root.workspace,
+          args: ["--state-dir", stateA, "acp"],
+          env: {
+            HOME: root.home,
+            AI_GATEWAY_API_KEY: "",
+            VERCEL_OIDC_TOKEN: "",
+            FX_DISABLE_KEYCHAIN: "1",
+            FX_GATEWAY_BASE_URL: gateway.baseUrl,
+            FX_GATEWAY_CHAT_URL: gateway.chatUrl,
+            FX_MODEL: undefined,
+            FX_AUTO_UPGRADE: "0",
+          },
+        });
+        await client.request("initialize", { protocolVersion: 1 }, 1);
+        expect(gateway.modelRequests[0]?.headers.get("authorization")).toBe(
+          "Bearer selected-state-key",
+        );
+
+        const listed = await client.request("session/list", {}, 2) as any;
+        expect(listed.result.sessions.map((session: { sessionId: string }) =>
+          session.sessionId
+        )).toEqual(["state-a-session"]);
+        for (const sessionId of ["state-b-session", "ambient-session"]) {
+          for (const method of ["session/load", "session/resume"]) {
+            const rejected = await client.request(
+              method,
+              { sessionId, cwd: root.workspace, mcpServers: [] },
+            ) as any;
+            expect(rejected.error?.message).toBe("Session not found");
+          }
+        }
+
+        const created = await client.request(
+          "session/new",
+          {
+            mcpServers: [acpStdioServer(
+              "state-isolation-mcp",
+              mcpPidPath,
+              "normal",
+              { FX_MCP_ENV_CAPTURE: mcpEnvironmentPath },
+            )],
+          },
+          3,
+        ) as any;
+        expect(created.error).toBeUndefined();
+        await client.readLine();
+        await client.request("session/set_mode", { modeId: "code" }, 4);
+        client.setPermissionOption("allow_once");
+
+        const result = await runPrompt(
+          client,
+          "$selected-profile-skill $isolated-state-skill inspect isolated state.",
+          TIMEOUT,
+        );
+        expect(result.promptResult.result.stopReason).toBe("end_turn");
+        expect(gateway.requests).toHaveLength(3);
+        expect(gateway.requests[0]!.body).toContain("SELECTED_PROFILE_SKILL_BODY");
+        expect(gateway.requests[0]!.body).toContain("isolated-state-skill");
+        expect(gateway.requests[0]!.body).toContain("SELECTED_PROFILE_INSTRUCTIONS");
+        expect(gateway.requests[0]!.body).not.toContain("ambient-state-skill");
+        expect(gateway.requests[0]!.body).not.toContain("ambient-profile-skill");
+        expect(gateway.requests[0]!.body).not.toContain(
+          "AMBIENT_PROFILE_INSTRUCTIONS",
+        );
+        expect(acpToolResultText(gateway.requests[1]!.body, "state_memory"))
+          .toContain("selected state memory");
+        expect(acpToolResultText(gateway.requests[1]!.body, "state_memory"))
+          .not.toContain("ambient memory must not load");
+        expect(acpToolResultText(gateway.requests[2]!.body, "state_home"))
+          .toContain(root.home);
+
+        await waitForPath(mcpEnvironmentPath);
+        const mcpEnvironment = JSON.parse(
+          readFileSync(mcpEnvironmentPath, "utf8"),
+        );
+        expect(mcpEnvironment.home).toBe(root.home);
+        expect(client.stderr).toBe("");
+      } finally {
+        await client?.close();
+        if (existsSync(mcpPidPath)) await expectMcpProcessExited(mcpPidPath);
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
     "session/list without cwd returns all sessions and filters by absolute cwd",
     async () => {
       const root = createIsolatedRoot("fx-acp-workspace-session-list-");

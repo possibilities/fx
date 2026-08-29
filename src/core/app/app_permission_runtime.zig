@@ -1,5 +1,6 @@
 const std = @import("std");
 const app_worker_runtime = @import("app_worker_runtime.zig");
+const app_profile_runtime = @import("app_profile_runtime.zig");
 const config_runtime = @import("../config/config_runtime.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const io_mod = @import("../shared/io.zig");
@@ -183,8 +184,8 @@ pub fn Runtime(comptime App: type) type {
                 return;
             }
 
-            var attempt = config_runtime.attemptUserPreferences(
-                app.alloc,
+            var attempt = app_profile_runtime.attemptUserPreferences(
+                app,
                 .{ .yolo_acknowledged = true },
             );
             defer attempt.deinit(app.alloc);
@@ -237,8 +238,8 @@ pub fn Runtime(comptime App: type) type {
                 return;
             }
 
-            var attempt = config_runtime.attemptUserPreferences(
-                app.alloc,
+            var attempt = app_profile_runtime.attemptUserPreferences(
+                app,
                 .{ .permission_mode = mode },
             );
             defer attempt.deinit(app.alloc);

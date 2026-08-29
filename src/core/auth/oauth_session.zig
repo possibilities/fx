@@ -604,6 +604,30 @@ pub fn load(alloc: Allocator) !?Session {
     return loadFromDir(alloc, &fx_dir, .tolerate_open_failure);
 }
 
+/// Loads only the profile file beneath an explicit home. This intentionally
+/// bypasses the account-global keychain so a selected TUI or ACP state root
+/// cannot discover ambient authorization.
+pub fn loadFromHome(alloc: Allocator, home: []const u8) !?Session {
+    if (comptime host_target.is_wasm) return null;
+    var home_dir = std.Io.Dir.openDirAbsolute(io_mod.getIo(), home, .{ .iterate = true }) catch |err| {
+        debug_trace.logf("auth", "isolated session load failed step=open_home err={s}", .{@errorName(err)});
+        return null;
+    };
+    defer home_dir.close(io_mod.getIo());
+
+    var fx_dir = home_dir.openDir(io_mod.getIo(), profile_paths.root_dir_name, .{
+        .iterate = true,
+        .follow_symlinks = false,
+    }) catch |err| {
+        if (err != error.FileNotFound) {
+            debug_trace.logf("auth", "isolated session load failed step=open_profile err={s}", .{@errorName(err)});
+        }
+        return null;
+    };
+    defer fx_dir.close(io_mod.getIo());
+    return loadFromDir(alloc, &fx_dir, .tolerate_open_failure);
+}
+
 fn loadFromHost(alloc: Allocator, store: js_host_auth.SessionStore) !?Session {
     var stored = (try store.load(alloc)) orelse return null;
     defer stored.deinit(alloc);
@@ -660,6 +684,17 @@ pub fn saveNewSession(alloc: Allocator, session: Session) !void {
     try mutation.save(alloc, session);
 }
 
+pub fn saveNewSessionFromHome(
+    alloc: Allocator,
+    home: []const u8,
+    session: Session,
+) !void {
+    if (comptime host_target.is_wasm) return error.HomeNotSet;
+    var mutation = try beginProfileMutation(home);
+    defer mutation.deinit();
+    try mutation.save(alloc, session);
+}
+
 pub fn beginExistingMutation() !?Mutation {
     if (comptime host_target.is_wasm) {
         return @as(?Mutation, HostMutation.init(js_host_auth.oauth_session_store));
@@ -668,6 +703,22 @@ pub fn beginExistingMutation() !?Mutation {
         return @as(?Mutation, try beginMutation());
     }
     return beginExistingNativeMutation();
+}
+
+/// Opens a file-backed mutation beneath an explicit profile home. Keychain
+/// migration is disabled because it would cross the selected state boundary.
+pub fn beginExistingMutationFromHome(home: []const u8) !?Mutation {
+    if (comptime host_target.is_wasm) return null;
+    var home_dir = io_mod.VerifiedDir{
+        .dir = try std.Io.Dir.openDirAbsolute(io_mod.getIo(), home, .{ .iterate = true }),
+    };
+    defer home_dir.close();
+
+    const fx_dir = openExistingPrivateFxDir(&home_dir) catch |err| switch (err) {
+        error.FileNotFound => return null,
+        else => return err,
+    };
+    return @as(?Mutation, try lockProfileMutation(fx_dir));
 }
 
 fn beginExistingNativeMutation() !?Mutation {
@@ -713,12 +764,33 @@ fn beginMutation() !Mutation {
     return lockMutation(fx_dir);
 }
 
+fn beginProfileMutation(home: []const u8) !Mutation {
+    var home_dir = io_mod.VerifiedDir{
+        .dir = try std.Io.Dir.openDirAbsolute(io_mod.getIo(), home, .{ .iterate = true }),
+    };
+    defer home_dir.close();
+
+    const fx_dir = try io_mod.openOrCreateVerifiedPrivateDir(&home_dir, profile_paths.root_dir_name);
+    return lockProfileMutation(fx_dir);
+}
+
 fn lockMutation(open_fx_dir: io_mod.VerifiedDir) !Mutation {
     var probe = MutationLockProbe{ .fx_dir = open_fx_dir.dir };
     return lockMutationWithOps(open_fx_dir, mutation_lock_deadline_ms, .{
         .ctx = &probe,
         .try_lock = MutationLockProbe.tryLock,
     });
+}
+
+fn lockProfileMutation(open_fx_dir: io_mod.VerifiedDir) !Mutation {
+    var probe = MutationLockProbe{ .fx_dir = open_fx_dir.dir };
+    return lockMutationWithBackend(
+        open_fx_dir,
+        mutation_lock_deadline_ms,
+        .{ .ctx = &probe, .try_lock = MutationLockProbe.tryLock },
+        .profile_file,
+        native_keychain_backend,
+    );
 }
 
 fn lockMutationWithOps(
