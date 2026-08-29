@@ -18,7 +18,8 @@ pub const Snapshot = struct {
     agent_state: AgentState = .idle,
     attention_kind: ?hooks.AttentionKind = null,
     attention_token: ?hooks.AttentionToken = null,
-    resolved_attention_tokens: [3]?hooks.AttentionToken = @splat(null),
+    closed_attention_tokens: [64]?hooks.AttentionToken = @splat(null),
+    closed_attention_next: usize = 0,
 };
 
 pub const Event = enum {
@@ -30,6 +31,7 @@ pub const Event = enum {
     post_turn_end,
     attention_required,
     attention_resolved,
+    attention_closed,
     fx_stopped,
 };
 
@@ -130,6 +132,24 @@ pub const Reducer = struct {
         return .{ .previous = previous, .current = state.* };
     }
 
+    /// Closes one exact attention identity without publishing an external
+    /// resolution. Cancellation and host teardown use this before releasing
+    /// an abandoned approval so a registry snapshot copied earlier cannot
+    /// reopen the child after its terminal lifecycle edge.
+    pub fn closeAttentionToken(
+        self: *Reducer,
+        agent: Agent,
+        attention_kind: hooks.AttentionKind,
+        attention_token: hooks.AttentionToken,
+    ) Update {
+        return self.transitionWithToken(
+            agent,
+            .attention_closed,
+            attention_kind,
+            attention_token,
+        );
+    }
+
     fn snapshotLocked(self: *Reducer, agent: Agent) Snapshot {
         return switch (agent) {
             .main => self.main,
@@ -196,12 +216,8 @@ fn reduceWithToken(
             next.attention_token = null;
         },
         .attention_required => {
-            if (attention_kind) |kind| {
-                if (attention_token) |token| {
-                    if (next.resolved_attention_tokens[attentionKindIndex(kind)]) |resolved| {
-                        if (std.mem.eql(u8, resolved[0..], token[0..])) return previous;
-                    }
-                }
+            if (attention_token) |token| {
+                if (attentionTokenClosed(previous, token)) return previous;
             }
             next.agent_state = .blocked;
             next.attention_kind = attention_kind;
@@ -214,24 +230,46 @@ fn reduceWithToken(
             if (attention_token) |token| {
                 const active = previous.attention_token orelse return previous;
                 if (!std.mem.eql(u8, active[0..], token[0..])) return previous;
-                if (attention_kind) |kind| {
-                    next.resolved_attention_tokens[attentionKindIndex(kind)] = token;
-                }
+                rememberClosedAttentionToken(&next, token);
             }
             next.agent_state = .working;
             next.attention_kind = null;
             next.attention_token = null;
         },
+        .attention_closed => {
+            const kind = attention_kind orelse return previous;
+            const token = attention_token orelse return previous;
+            rememberClosedAttentionToken(&next, token);
+            if (previous.agent_state == .blocked and
+                previous.attention_kind == kind)
+            {
+                if (previous.attention_token) |active| {
+                    if (std.mem.eql(u8, active[0..], token[0..])) {
+                        next.agent_state = .working;
+                        next.attention_kind = null;
+                        next.attention_token = null;
+                    }
+                }
+            }
+        },
     }
     return next;
 }
 
-fn attentionKindIndex(kind: hooks.AttentionKind) usize {
-    return switch (kind) {
-        .permission => 0,
-        .question => 1,
-        .route_recovery => 2,
-    };
+fn attentionTokenClosed(snapshot: Snapshot, token: hooks.AttentionToken) bool {
+    for (snapshot.closed_attention_tokens) |maybe_closed| {
+        const closed = maybe_closed orelse continue;
+        if (std.mem.eql(u8, closed[0..], token[0..])) return true;
+    }
+    return false;
+}
+
+fn rememberClosedAttentionToken(snapshot: *Snapshot, token: hooks.AttentionToken) void {
+    if (attentionTokenClosed(snapshot.*, token)) return;
+    const index: usize = snapshot.closed_attention_next;
+    snapshot.closed_attention_tokens[index] = token;
+    snapshot.closed_attention_next =
+        (index + 1) % snapshot.closed_attention_tokens.len;
 }
 
 test "lifecycle reducer carries attention through resolution and turn end" {
@@ -274,6 +312,18 @@ test "lifecycle reducer carries attention through resolution and turn end" {
     );
     try std.testing.expect(fresh.changed());
     try std.testing.expectEqual(AgentState.blocked, fresh.current.agent_state);
+
+    const copied_before_cancel = [_]u8{0x33} ** 32;
+    _ = reducer.closeAttentionToken(child, .permission, copied_before_cancel);
+    _ = reducer.transition(child, .post_turn_end, null);
+    const delayed_after_cancel = reducer.transitionWithToken(
+        child,
+        .attention_required,
+        .permission,
+        copied_before_cancel,
+    );
+    try std.testing.expect(!delayed_after_cancel.changed());
+    try std.testing.expectEqual(AgentState.idle, delayed_after_cancel.current.agent_state);
 }
 
 test "lifecycle reducer ignores unmatched attention resolution" {

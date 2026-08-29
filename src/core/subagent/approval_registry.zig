@@ -116,6 +116,19 @@ pub fn attentionToken(child_id: []const u8, request_id: []const u8) AttentionTok
     return digest;
 }
 
+pub const AttentionInvalidationObserver = struct {
+    context: ?*anyopaque = null,
+    observe_fn: *const fn (?*anyopaque, []const u8, AttentionToken) void,
+
+    fn observe(
+        self: AttentionInvalidationObserver,
+        child_id: []const u8,
+        attention_token: AttentionToken,
+    ) void {
+        self.observe_fn(self.context, child_id, attention_token);
+    }
+};
+
 pub const PendingChildren = struct {
     storage: [max_pending_child_snapshot][max_pending_child_id_bytes]u8 = undefined,
     lengths: [max_pending_child_snapshot]usize = @splat(0),
@@ -194,6 +207,17 @@ pub const Registry = struct {
     closed: bool = false,
     worker_routes_closed: bool = false,
     pending_revision: u64 = 0,
+    attention_invalidation_observer: ?AttentionInvalidationObserver = null,
+
+    pub fn setAttentionInvalidationObserver(
+        self: *Registry,
+        observer: AttentionInvalidationObserver,
+    ) void {
+        self.mutex.lockUncancelable(io_mod.getIo());
+        defer self.mutex.unlock(io_mod.getIo());
+        std.debug.assert(self.bindings.items.len == 0);
+        self.attention_invalidation_observer = observer;
+    }
 
     pub fn pendingRevision(self: *Registry) u64 {
         self.mutex.lockUncancelable(io_mod.getIo());
@@ -540,6 +564,18 @@ pub const Registry = struct {
         debug_trace.logf("subagent", "relationship approval continuation completed request_id={s} child_id={s} outcome={s}", .{ traceId(request_id), traceId(child_id), @tagName(completion) });
     }
 
+    /// Closes copied lifecycle attention identities without mutating their
+    /// persisted routes or releasing their worker waiters. A committed owner
+    /// cancellation calls this before it emits any live cancellation signal.
+    pub fn closeChildAttention(self: *Registry, child_id: []const u8) void {
+        self.mutex.lockUncancelable(io_mod.getIo());
+        defer self.mutex.unlock(io_mod.getIo());
+        for (self.bindings.items) |binding| {
+            if (!std.mem.eql(u8, binding.child_id, child_id)) continue;
+            self.observeAttentionInvalidatedLocked(binding);
+        }
+    }
+
     /// Retires persisted routes while the registry lock still pins every
     /// stack-owned worker. Failed persistence leaves only a detached, stale
     /// route for a later invalidation retry; every waiter is still denied.
@@ -559,6 +595,7 @@ pub const Registry = struct {
             index -= 1;
             const binding = &self.bindings.items[index];
             if (!std.mem.eql(u8, binding.child_id, child_id)) continue;
+            self.observeAttentionInvalidatedLocked(binding.*);
             var persisted = true;
             self.persistence.invalidate(
                 binding.request_id,
@@ -601,6 +638,7 @@ pub const Registry = struct {
         while (index > 0) {
             index -= 1;
             if (self.bindings.items[index].worker == null) continue;
+            self.observeAttentionInvalidatedLocked(self.bindings.items[index]);
             debug_trace.logf("subagent", "approval route retired request_id={s} child_id={s} reason=owner_shutdown", .{
                 traceId(self.bindings.items[index].request_id),
                 traceId(self.bindings.items[index].child_id),
@@ -614,8 +652,19 @@ pub const Registry = struct {
         self.mutex.lockUncancelable(io_mod.getIo());
         defer self.mutex.unlock(io_mod.getIo());
         self.closed = true;
-        for (self.bindings.items) |*binding| binding.deinit(self.alloc);
+        for (self.bindings.items) |*binding| {
+            self.observeAttentionInvalidatedLocked(binding.*);
+            binding.deinit(self.alloc);
+        }
         self.bindings.deinit(self.alloc);
+    }
+
+    fn observeAttentionInvalidatedLocked(self: *Registry, binding: Binding) void {
+        const observer = self.attention_invalidation_observer orelse return;
+        observer.observe(
+            binding.child_id,
+            attentionToken(binding.child_id, binding.request_id),
+        );
     }
 
     fn persistAndAdd(
@@ -1398,9 +1447,32 @@ test "child invalidation failure detaches and wakes the worker route until retry
             }
         }
     };
+    const RecordingInvalidation = struct {
+        worker: *worker_runtime.WorkerRuntime,
+        count: usize = 0,
+        first_ran_before_waiter_release: bool = false,
+        first_token: AttentionToken = undefined,
+
+        fn observe(
+            raw: ?*anyopaque,
+            _: []const u8,
+            token: AttentionToken,
+        ) void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            if (self.count == 0) {
+                self.first_ran_before_waiter_release =
+                    self.worker.pending_permission_response == null;
+                self.first_token = token;
+            }
+            self.count += 1;
+        }
+    };
 
     const alloc = std.testing.allocator;
     var persisted = FailingPersistence{};
+    var worker = worker_runtime.WorkerRuntime{};
+    defer worker.deinit(alloc);
+    var invalidation = RecordingInvalidation{ .worker = &worker };
     var registry = Registry{
         .alloc = alloc,
         .persistence = .{
@@ -1409,10 +1481,12 @@ test "child invalidation failure detaches and wakes the worker route until retry
             .commit_response_fn = FailingPersistence.commit,
             .invalidate_fn = FailingPersistence.invalidate,
         },
+        .attention_invalidation_observer = .{
+            .context = &invalidation,
+            .observe_fn = RecordingInvalidation.observe,
+        },
     };
     defer registry.deinit();
-    var worker = worker_runtime.WorkerRuntime{};
-    defer worker.deinit(alloc);
     worker.worker_processing = true;
     worker.pending_permission_waiting = true;
     worker.pending_permission_request_shared =
@@ -1430,6 +1504,18 @@ test "child invalidation failure detaches and wakes the worker route until retry
         &worker,
         1,
     );
+    var pending: PendingChildren = .{};
+    registry.snapshotPendingChildren(&pending);
+    try std.testing.expectEqual(@as(usize, 1), pending.len);
+    const copied_token = pending.attentionTokenAt(0);
+    registry.closeChildAttention("child");
+    try std.testing.expectEqual(@as(usize, 1), invalidation.count);
+    try std.testing.expect(invalidation.first_ran_before_waiter_release);
+    try std.testing.expectEqualSlices(
+        u8,
+        copied_token[0..],
+        invalidation.first_token[0..],
+    );
 
     try std.testing.expectError(
         error.CommitFailed,
@@ -1439,6 +1525,7 @@ test "child invalidation failure detaches and wakes the worker route until retry
     try std.testing.expect(registry.bindings.items[0].worker == null);
     try std.testing.expect(registry.bindings.items[0].worker_route_detached);
     try std.testing.expect(worker.pending_permission_response != null);
+    try std.testing.expectEqual(@as(usize, 2), invalidation.count);
     try std.testing.expectEqual(
         types.ToolPermissionDecision.deny,
         worker.pending_permission_response.?.decision,
@@ -1458,6 +1545,7 @@ test "child invalidation failure detaches and wakes the worker route until retry
         try registry.invalidateChild("child", .cancelled, 4),
     );
     try std.testing.expectEqual(@as(usize, 0), registry.bindings.items.len);
+    try std.testing.expectEqual(@as(usize, 3), invalidation.count);
 }
 
 test "capacity rejection publishes no pending approval route" {

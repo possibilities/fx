@@ -807,6 +807,18 @@ const App = struct {
         });
     }
 
+    pub fn invalidateSubagentAttentionToken(
+        self: *App,
+        child_session_id: []const u8,
+        attention_token: hooks.AttentionToken,
+    ) void {
+        _ = self.lifecycle_state.closeAttentionToken(
+            .{ .subagent_session = child_session_id },
+            .permission,
+            attention_token,
+        );
+    }
+
     fn attentionScope(
         self: *App,
         child_session_id: ?[]const u8,

@@ -1598,6 +1598,13 @@ pub const Owner = struct {
         child_id: []const u8,
         timestamp_ms: i64,
     ) ControlError!void {
+        // Durable cancellation is already committed. Close every copied
+        // attention identity before any worker or waiter can publish a late
+        // lifecycle edge from the abandoned approval.
+        if (self.approval_registry) |registry| {
+            registry.closeChildAttention(child_id);
+        }
+
         self.mutex.lockUncancelable(io_mod.getIo());
         for (self.slots.items) |slot| {
             if (std.mem.eql(u8, slot.child_id, child_id)) {
@@ -1766,6 +1773,10 @@ pub const Owner = struct {
     }
 
     pub fn deinit(self: *Owner) void {
+        // Prevent new approval routes and close every copied attention token
+        // before shutdown signals let workers publish terminal lifecycle edges.
+        if (self.approval_registry) |registry| registry.detachWorkerRoutes();
+
         self.mutex.lockUncancelable(io_mod.getIo());
         if (self.retirement_scan_pending and self.retirement_root_id != null) {
             self.retirement_due_ms = reaperNowMs(self);
@@ -1785,7 +1796,6 @@ pub const Owner = struct {
         const reaper_thread = self.reaper_thread;
         self.mutex.unlock(io_mod.getIo());
 
-        if (self.approval_registry) |registry| registry.detachWorkerRoutes();
         self.mutex.lockUncancelable(io_mod.getIo());
         for (self.slots.items) |slot| {
             if (slot.active_worker) |worker| worker.requestShutdown();

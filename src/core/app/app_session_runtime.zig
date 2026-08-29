@@ -40,6 +40,7 @@ const session_resume_view = @import("../session/session_resume_view.zig");
 const session_store = @import("../session/session_store.zig");
 const session_summary_codec = @import("../session/session_summary_codec.zig");
 const subagent_tool_host = @import("../subagent/tool_host.zig");
+const approval_registry = @import("../subagent/approval_registry.zig");
 const subagent_authority = @import("../subagent/authority.zig");
 const subagent_resume_admission = @import("../subagent/resume_admission.zig");
 const tool_set_contract = @import("../tooling/tool_set.zig");
@@ -4451,7 +4452,7 @@ pub fn Runtime(comptime App: type) type {
         ) void {
             disableSubagentHost(app);
             const store = if (app.session_persistence.store) |*value| value else return;
-            app.session_persistence.subagent_host = subagent_tool_host.Runtime.create(
+            const host = subagent_tool_host.Runtime.create(
                 app.alloc,
                 store,
                 loaded.active_id,
@@ -4468,6 +4469,27 @@ pub fn Runtime(comptime App: type) type {
                 );
                 return;
             };
+            if (comptime @hasDecl(App, "invalidateSubagentAttentionToken")) {
+                host.approvals.setAttentionInvalidationObserver(.{
+                    .context = app,
+                    .observe_fn = observeSubagentAttentionInvalidation,
+                });
+            }
+            app.session_persistence.subagent_host = host;
+        }
+
+        fn observeSubagentAttentionInvalidation(
+            raw: ?*anyopaque,
+            child_session_id: []const u8,
+            attention_token: approval_registry.AttentionToken,
+        ) void {
+            const app: *App = @ptrCast(@alignCast(raw.?));
+            if (comptime @hasDecl(App, "invalidateSubagentAttentionToken")) {
+                app.invalidateSubagentAttentionToken(
+                    child_session_id,
+                    attention_token,
+                );
+            }
         }
 
         fn subagentAuthorityResolver(app: *App) subagent_authority.HostResolver {
