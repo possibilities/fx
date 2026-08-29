@@ -265,6 +265,8 @@ describe("cli: help", () => {
       expect(r.stdout).toContain("--context-limit <spec>");
       expect(r.stdout).toContain("Set name=bytes|off; repeatable");
       expect(r.stdout).toContain("--add-dir <path>");
+      expect(r.stdout).toContain("--skills-dir <path>");
+      expect(r.stdout).toContain("--no-default-skills");
       expect(r.stdout).toContain("-c, --continue");
       expect(r.stdout).toContain("-r");
       expect(r.stdout).toContain("Open the saved-session picker");
@@ -4677,6 +4679,30 @@ describe("cli: workspace access", () => {
       );
       expect(duplicate.stderr).not.toContain(
         "DuplicateAdditionalDirectorySuppression",
+      );
+
+      const missingSkillsRoot = await runFx(["--skills-dir"], { env: enabled });
+      expect(missingSkillsRoot.code).toBe(1);
+      expect(missingSkillsRoot.stderr).toContain(
+        "--skills-dir requires a directory path",
+      );
+
+      const duplicateDefaultSkillGate = await runFx(
+        ["--no-default-skills", "--no-default-skills"],
+        { env: enabled },
+      );
+      expect(duplicateDefaultSkillGate.code).toBe(1);
+      expect(duplicateDefaultSkillGate.stderr).toContain(
+        "--no-default-skills may only be specified once",
+      );
+
+      const unsupportedSkillPolicy = await runFx(
+        ["--no-default-skills", "ask", "hello"],
+        { env: enabled },
+      );
+      expect(unsupportedSkillPolicy.code).toBe(1);
+      expect(unsupportedSkillPolicy.stderr).toContain(
+        "--skills-dir and --no-default-skills are only supported for interactive, resume, and ACP launches",
       );
     },
     TIMEOUT,

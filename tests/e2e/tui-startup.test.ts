@@ -11,7 +11,14 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { FX_BIN, HAS_API_KEY } from "../evals/eval-helpers";
-import { hasEmptyComposer, TmuxSession, tmuxAvailable } from "./tmux-helpers";
+import {
+  FAKE_GATEWAY_MODEL,
+  fakeGatewayFinalText,
+  hasEmptyComposer,
+  startFakeGateway,
+  TmuxSession,
+  tmuxAvailable,
+} from "./tmux-helpers";
 
 const SKIP = !tmuxAvailable() || !HAS_API_KEY;
 const SKIP_TMUX = !tmuxAvailable();
@@ -63,6 +70,90 @@ describe.skipIf(SKIP)("tui: startup and exit", () => {
 });
 
 describe.skipIf(SKIP_TMUX)("tui: fresh-session commands", () => {
+  test(
+    "exclusive invocation skill roots reach TUI in flag order without defaults",
+    async () => {
+      const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-tui-exclusive-skill-roots-")));
+      const home = join(root, "home");
+      const workspace = join(root, "workspace");
+      const firstRoot = join(root, "first-skills");
+      const secondRoot = join(root, "second-skills");
+      const stderrPath = join(root, "stderr.log");
+      mkdirSync(join(home, ".fx", "skills", "managed-default"), {
+        recursive: true,
+      });
+      mkdirSync(join(workspace, "skills", "workspace-default"), {
+        recursive: true,
+      });
+      mkdirSync(join(firstRoot, "first-invocation"), { recursive: true });
+      mkdirSync(join(secondRoot, "second-invocation"), { recursive: true });
+      writeFileSync(
+        join(home, ".fx", "skills", "managed-default", "SKILL.md"),
+        "---\nname: managed-default\ndescription: must not load\n---\n",
+      );
+      writeFileSync(
+        join(workspace, "skills", "workspace-default", "SKILL.md"),
+        "---\nname: workspace-default\ndescription: must not load\n---\n",
+      );
+      writeFileSync(
+        join(firstRoot, "first-invocation", "SKILL.md"),
+        "---\nname: first-invocation\ndescription: first selected root\n---\n",
+      );
+      writeFileSync(
+        join(secondRoot, "second-invocation", "SKILL.md"),
+        "---\nname: second-invocation\ndescription: second selected root\n---\n",
+      );
+      writeFileSync(stderrPath, "");
+      const gateway = startFakeGateway([
+        fakeGatewayFinalText("TUI_EXCLUSIVE_SKILL_ROOTS_COMPLETE"),
+      ]);
+
+      try {
+        session = await TmuxSession.create({
+          cmd: `${FX_BIN} --no-default-skills --skills-dir ${firstRoot} --skills-dir=${secondRoot}`,
+          cwd: workspace,
+          env: {
+            HOME: home,
+            AI_GATEWAY_API_KEY: "fake-tui-exclusive-skills-key",
+            VERCEL_OIDC_TOKEN: undefined,
+            FX_GATEWAY_BASE_URL: gateway.baseUrl,
+            FX_GATEWAY_CHAT_URL: gateway.chatUrl,
+            FX_MODEL: FAKE_GATEWAY_MODEL,
+            FX_AUTO_UPGRADE: "0",
+          },
+          stderrPath,
+        });
+
+        await session.waitForComposer(10_000);
+        await session.sendText("List available skills.");
+        await session.waitForText("TUI_EXCLUSIVE_SKILL_ROOTS_COMPLETE", 10_000);
+        expect(gateway.requests).toHaveLength(1);
+        const body = gateway.requests[0]!.body;
+        expect(body).toContain("first-invocation");
+        expect(body).toContain("second-invocation");
+        expect(body.indexOf("first-invocation")).toBeLessThan(
+          body.indexOf("second-invocation"),
+        );
+        expect(body).not.toContain("managed-default");
+        expect(body).not.toContain("workspace-default");
+        expect(readFileSync(stderrPath, "utf8")).toBe("");
+
+        await session.sendText("/quit");
+        expect(await session.waitForSessionEnd(5_000)).toBe(true);
+        await session.kill();
+        session = null;
+      } finally {
+        gateway.stop();
+        if (session) {
+          await session.kill();
+          session = null;
+        }
+        rmSync(root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
   test(
     "statusline hides the workspace identity by default",
     async () => {

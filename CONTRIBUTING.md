@@ -151,6 +151,11 @@ There are two distinct skill categories in `fx`:
 
 `/skills list` should make that distinction visible to the user.
 
+For an interactive TUI or ACP launch, global `--skills-dir <path>` adds an
+explicit skill root and may be repeated. Pair it with `--no-default-skills` to
+discover only those explicit roots, in flag order. This launch policy never
+changes managed skill storage.
+
 `/skills add` and `/skills install` install full skill directories into the profile-owned `~/.fx/skills` managed root, not just `SKILL.md`. Workspace `.fx/skills` and `skills/` remain discoverable project-local instructions, not managed install targets.
 
 The interactive agent can also install skills via the `install_skill` tool when the user asks to install one in conversation, including pasted `npx skills add ...` syntax.

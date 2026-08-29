@@ -117,16 +117,31 @@ pub const LaunchModifiers = struct {
     context_limit_overrides: []config_runtime.context_limits.Override = &.{},
     additional_directories: [][]u8 = &.{},
     saved_directories_suppressed: bool = false,
+    skill_directories: [][]u8 = &.{},
+    no_default_skills: bool = false,
 
     pub fn deinit(self: *LaunchModifiers, alloc: Allocator) void {
         if (self.context_limit_overrides.len > 0) alloc.free(self.context_limit_overrides);
         for (self.additional_directories) |path| alloc.free(path);
         if (self.additional_directories.len > 0) alloc.free(self.additional_directories);
+        for (self.skill_directories) |path| alloc.free(path);
+        if (self.skill_directories.len > 0) alloc.free(self.skill_directories);
         self.* = .{};
     }
 
     pub fn hasWorkspaceModifiers(self: LaunchModifiers) bool {
         return self.additional_directories.len > 0 or self.saved_directories_suppressed;
+    }
+
+    pub fn hasSkillModifiers(self: LaunchModifiers) bool {
+        return self.skill_directories.len > 0 or self.no_default_skills;
+    }
+
+    pub fn skillRootPolicy(self: LaunchModifiers, default_policy: skill_contract.RootPolicy) skill_contract.RootPolicy {
+        var policy = default_policy;
+        policy.invocation_roots = self.skill_directories;
+        policy.exclusive_invocation_roots = self.no_default_skills;
+        return policy;
     }
 };
 
@@ -383,6 +398,12 @@ fn parseGlobalLaunchArgs(
         directories.deinit(alloc);
     }
     var suppress_saved = false;
+    var skill_directories: std.ArrayList([]u8) = .empty;
+    errdefer {
+        for (skill_directories.items) |path| alloc.free(path);
+        skill_directories.deinit(alloc);
+    }
+    var no_default_skills = false;
 
     var index: usize = 0;
     while (index < args.len) {
@@ -404,6 +425,17 @@ fn parseGlobalLaunchArgs(
         } else if (std.mem.eql(u8, arg, "--no-additional-dirs")) {
             if (suppress_saved) return error.DuplicateAdditionalDirectorySuppression;
             suppress_saved = true;
+        } else if (std.mem.eql(u8, arg, "--skills-dir")) {
+            index += 1;
+            if (index >= args.len or args[index].len == 0) return error.MissingSkillsDirectoryValue;
+            try skill_directories.append(alloc, try alloc.dupe(u8, args[index]));
+        } else if (std.mem.startsWith(u8, arg, "--skills-dir=")) {
+            const value = arg["--skills-dir=".len..];
+            if (value.len == 0) return error.MissingSkillsDirectoryValue;
+            try skill_directories.append(alloc, try alloc.dupe(u8, value));
+        } else if (std.mem.eql(u8, arg, "--no-default-skills")) {
+            if (no_default_skills) return error.DuplicateDefaultSkillsSuppression;
+            no_default_skills = true;
         } else {
             break;
         }
@@ -413,12 +445,19 @@ fn parseGlobalLaunchArgs(
     const override_slice = try overrides.toOwnedSlice(alloc);
     errdefer if (override_slice.len > 0) alloc.free(override_slice);
     const directory_slice = try directories.toOwnedSlice(alloc);
+    errdefer {
+        for (directory_slice) |path| alloc.free(path);
+        if (directory_slice.len > 0) alloc.free(directory_slice);
+    }
+    const skill_directory_slice = try skill_directories.toOwnedSlice(alloc);
     return .{
         .remaining = args[index..],
         .modifiers = .{
             .context_limit_overrides = override_slice,
             .additional_directories = directory_slice,
             .saved_directories_suppressed = suppress_saved,
+            .skill_directories = skill_directory_slice,
+            .no_default_skills = no_default_skills,
         },
     };
 }
@@ -435,12 +474,17 @@ pub fn argsAfterGlobalLaunchArgs(args: []const [:0]const u8) []const [:0]const u
     var index: usize = 0;
     while (index < args.len) {
         const arg = args[index];
-        if (std.mem.eql(u8, arg, "--context-limit") or std.mem.eql(u8, arg, "--add-dir")) {
+        if (std.mem.eql(u8, arg, "--context-limit") or
+            std.mem.eql(u8, arg, "--add-dir") or
+            std.mem.eql(u8, arg, "--skills-dir"))
+        {
             index += 1;
             if (index >= args.len) return &.{};
         } else if (!std.mem.startsWith(u8, arg, "--context-limit=") and
             !std.mem.startsWith(u8, arg, "--add-dir=") and
-            !std.mem.eql(u8, arg, "--no-additional-dirs"))
+            !std.mem.startsWith(u8, arg, "--skills-dir=") and
+            !std.mem.eql(u8, arg, "--no-additional-dirs") and
+            !std.mem.eql(u8, arg, "--no-default-skills"))
         {
             return args[index..];
         }
@@ -865,6 +909,12 @@ fn runNonInteractiveWithDeps(
         try writeWorkspaceModifierUsage(deps);
         return .handled_failure;
     }
+    if (global_args.modifiers.hasSkillModifiers() and
+        !commandSupportsSkillModifiers(parsed_command))
+    {
+        try writeSkillModifierUsage(deps);
+        return .handled_failure;
+    }
 
     if (isVersionFlag(effective_args[0])) {
         if (effective_args.len != 1) {
@@ -923,6 +973,7 @@ fn runNonInteractiveWithDeps(
                 .context_limit_overrides = global_args.modifiers.context_limit_overrides,
                 .additional_directories = global_args.modifiers.additional_directories,
                 .saved_directories_suppressed = global_args.modifiers.saved_directories_suppressed,
+                .skill_root_policy = global_args.modifiers.skillRootPolicy(cfg.skill_root_policy),
                 .model_override = acp_opts.model,
                 .log_file = acp_opts.log_file,
             });
@@ -3475,6 +3526,13 @@ fn commandSupportsWorkspaceModifiers(command: Command) bool {
     };
 }
 
+fn commandSupportsSkillModifiers(command: Command) bool {
+    return switch (command) {
+        .interactive, .acp, .resume_session => true,
+        else => false,
+    };
+}
+
 fn writeWorkspaceModifierUsage(deps: RunDeps) !void {
     try writeStderr(
         deps,
@@ -3482,10 +3540,19 @@ fn writeWorkspaceModifierUsage(deps: RunDeps) !void {
     );
 }
 
+fn writeSkillModifierUsage(deps: RunDeps) !void {
+    try writeStderr(
+        deps,
+        "fx: --skills-dir and --no-default-skills are only supported for interactive, resume, and ACP launches\n",
+    );
+}
+
 fn globalLaunchErrorMessage(err: anyerror) ?[]const u8 {
     return switch (err) {
         error.MissingAddDirectoryValue => "--add-dir requires a directory path",
         error.DuplicateAdditionalDirectorySuppression => "--no-additional-dirs may only be specified once",
+        error.MissingSkillsDirectoryValue => "--skills-dir requires a directory path",
+        error.DuplicateDefaultSkillsSuppression => "--no-default-skills may only be specified once",
         else => null,
     };
 }
@@ -4058,6 +4125,35 @@ test "global launch modifiers preserve repeatable context limits before the comm
     try std.testing.expectEqualStrings("hello", parsed.remaining[1]);
 }
 
+test "global skill modifiers retain ordered roots and reject malformed policy" {
+    var parsed = try parseGlobalLaunchArgs(std.testing.allocator, &.{
+        @constCast("--no-default-skills"),
+        @constCast("--skills-dir"),
+        @constCast("/tmp/first-skills"),
+        @constCast("--skills-dir=/tmp/second-skills"),
+        @constCast("ask"),
+    });
+    defer parsed.deinit(std.testing.allocator);
+
+    try std.testing.expect(parsed.modifiers.no_default_skills);
+    try std.testing.expectEqual(@as(usize, 2), parsed.modifiers.skill_directories.len);
+    try std.testing.expectEqualStrings("/tmp/first-skills", parsed.modifiers.skill_directories[0]);
+    try std.testing.expectEqualStrings("/tmp/second-skills", parsed.modifiers.skill_directories[1]);
+    try std.testing.expectEqualStrings("ask", parsed.remaining[0]);
+
+    try std.testing.expectError(
+        error.MissingSkillsDirectoryValue,
+        parseGlobalLaunchArgs(std.testing.allocator, &.{@constCast("--skills-dir")}),
+    );
+    try std.testing.expectError(
+        error.DuplicateDefaultSkillsSuppression,
+        parseGlobalLaunchArgs(std.testing.allocator, &.{
+            @constCast("--no-default-skills"),
+            @constCast("--no-default-skills"),
+        }),
+    );
+}
+
 test "global context limits reject missing values and stop at the command" {
     try std.testing.expectError(
         error.MissingContextLimitValue,
@@ -4176,6 +4272,10 @@ test "ACP command routes parsed options and launch config through the injected r
                 cfg.additional_directories.len == 1 and
                 std.mem.eql(u8, cfg.additional_directories[0], "/tmp/acp-extra") and
                 cfg.saved_directories_suppressed and
+                cfg.skill_root_policy.exclusive_invocation_roots and
+                cfg.skill_root_policy.invocation_roots.len == 2 and
+                std.mem.eql(u8, cfg.skill_root_policy.invocation_roots[0], "/tmp/acp-first-skills") and
+                std.mem.eql(u8, cfg.skill_root_policy.invocation_roots[1], "/tmp/acp-second-skills") and
                 std.mem.eql(u8, cfg.model_override.?, "model-override") and
                 std.mem.eql(u8, cfg.log_file.?, "/tmp/acp.log");
         }
@@ -4193,6 +4293,10 @@ test "ACP command routes parsed options and launch config through the injected r
             @constCast("--add-dir"),
             @constCast("/tmp/acp-extra"),
             @constCast("--no-additional-dirs"),
+            @constCast("--no-default-skills"),
+            @constCast("--skills-dir"),
+            @constCast("/tmp/acp-first-skills"),
+            @constCast("--skills-dir=/tmp/acp-second-skills"),
             @constCast("acp"),
             @constCast("--model"),
             @constCast("model-override"),
