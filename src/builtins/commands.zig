@@ -375,6 +375,10 @@ pub const top_level_flags = [_]TopLevelFlag{
         .description = "Allow only this native tool; repeatable",
     },
     .{
+        .usage = "--no-default-skills",
+        .description = "Use only --skills-dir roots",
+    },
+    .{
         .usage = "-c, --continue",
         .description = "Resume the latest workspace session",
     },

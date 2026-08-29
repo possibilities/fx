@@ -9,6 +9,7 @@ const host = @import("../hosts/host.zig");
 const mode_registry = @import("../modes/mode_registry.zig");
 const prompt_policy = @import("../config/prompt_policy.zig");
 const tool_set_contract = @import("../tooling/tool_set.zig");
+const skill_contract = @import("../skills/skill_contract.zig");
 const context_contract = @import("../workspace/context_contract.zig");
 
 const Allocator = std.mem.Allocator;
@@ -44,6 +45,7 @@ pub const Config = struct {
     additional_directories: []const []const u8 = &.{},
     invocation_skill_roots: []const []const u8 = &.{},
     saved_directories_suppressed: bool = false,
+    skill_root_policy: skill_contract.RootPolicy = .{ .managed_root_source = null },
     allow_acp_mcp: bool = true,
     allow_native_tools: bool = true,
     native_tool_set: ?tool_set_contract.ToolSet = null,
