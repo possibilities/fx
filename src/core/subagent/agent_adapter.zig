@@ -150,14 +150,24 @@ pub fn run(
         admission.provider,
         config.tool_context.credential_source,
     )) {
-        const resolution = credentials.resolveForProvider(
-            turn.alloc,
-            config.tool_context.oauth_transport,
-            config.tool_context.secret_store,
-            .refresh_if_needed,
-            admission.provider,
-            config.tool_context.credential_source,
-        ) catch |err| {
+        const resolution = (if (config.tool_context.profile_home) |home|
+            credentials.resolveForProviderFromHome(
+                turn.alloc,
+                config.tool_context.oauth_transport,
+                .refresh_if_needed,
+                admission.provider,
+                config.tool_context.credential_source,
+                home,
+            )
+        else
+            credentials.resolveForProvider(
+                turn.alloc,
+                config.tool_context.oauth_transport,
+                config.tool_context.secret_store,
+                .refresh_if_needed,
+                admission.provider,
+                config.tool_context.credential_source,
+            )) catch |err| {
             if (err == error.OutOfMemory) return error.OutOfMemory;
             turn.setFailureDiagnostic("model_credential_resolution_failed", @errorName(err)) catch
                 return error.OutOfMemory;
@@ -356,6 +366,16 @@ fn refreshGatewayCredential(
     expected_account_id: ?[]const u8,
 ) !?[]u8 {
     const context: *Context = @ptrCast(@alignCast(raw));
+    if (context.config.tool_context.profile_home) |home| {
+        return auth_runtime.refreshCredentialTokenForAccountFromHome(
+            context.config.tool_context.oauth_transport,
+            alloc,
+            source,
+            mode,
+            expected_account_id,
+            home,
+        );
+    }
     return auth_runtime.refreshCredentialTokenForAccount(
         context.config.tool_context.oauth_transport,
         alloc,

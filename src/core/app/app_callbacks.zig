@@ -381,6 +381,18 @@ pub fn Bindings(comptime App: type) type {
             expected_account_id: ?[]const u8,
         ) !?[]u8 {
             const app: *App = @ptrCast(@alignCast(raw_ctx));
+            if (comptime @hasField(App, "profile_home")) {
+                if (app.profile_home) |home_dir| {
+                    return auth_runtime.refreshCredentialTokenForAccountFromHome(
+                        app.auth.oauthTransport(),
+                        alloc,
+                        source,
+                        mode,
+                        expected_account_id,
+                        home_dir,
+                    );
+                }
+            }
             return auth_runtime.refreshCredentialTokenForAccount(
                 app.auth.oauthTransport(),
                 alloc,

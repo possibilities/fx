@@ -77,6 +77,11 @@ pub const Mutation = struct {
 pub fn load(alloc: Allocator) !?Session {
     if (comptime host_target.is_wasm) return null;
     const home = io_mod.getenv("HOME") orelse return null;
+    return loadFromHome(alloc, home);
+}
+
+pub fn loadFromHome(alloc: Allocator, home: []const u8) !?Session {
+    if (comptime host_target.is_wasm) return null;
     var home_dir = std.Io.Dir.openDirAbsolute(io_mod.getIo(), home, .{ .iterate = true }) catch |err| {
         debug_trace.logf("auth", "ChatGPT session load failed step=open_home err={s}", .{@errorName(err)});
         return null;
@@ -131,7 +136,17 @@ fn loadFromDir(alloc: Allocator, fx_dir: *std.Io.Dir, report_open_failure: bool)
 
 pub fn saveNewSession(alloc: Allocator, session: Session) !void {
     if (comptime host_target.is_wasm) return error.ChatGptOAuthUnavailable;
-    var mutation = try beginMutation();
+    const home = io_mod.getenv("HOME") orelse return error.HomeNotSet;
+    return saveNewSessionFromHome(alloc, home, session);
+}
+
+pub fn saveNewSessionFromHome(
+    alloc: Allocator,
+    home: []const u8,
+    session: Session,
+) !void {
+    if (comptime host_target.is_wasm) return error.ChatGptOAuthUnavailable;
+    var mutation = try beginMutationFromHome(home);
     defer mutation.deinit();
     try mutation.save(alloc, session);
 }
@@ -139,6 +154,11 @@ pub fn saveNewSession(alloc: Allocator, session: Session) !void {
 pub fn beginExistingMutation() !?Mutation {
     if (comptime host_target.is_wasm) return null;
     const home = io_mod.getenv("HOME") orelse return error.HomeNotSet;
+    return beginExistingMutationFromHome(home);
+}
+
+pub fn beginExistingMutationFromHome(home: []const u8) !?Mutation {
+    if (comptime host_target.is_wasm) return null;
     var home_dir = io_mod.VerifiedDir{
         .dir = try std.Io.Dir.openDirAbsolute(io_mod.getIo(), home, .{ .iterate = true }),
     };
@@ -153,6 +173,10 @@ pub fn beginExistingMutation() !?Mutation {
 
 fn beginMutation() !Mutation {
     const home = io_mod.getenv("HOME") orelse return error.HomeNotSet;
+    return beginMutationFromHome(home);
+}
+
+fn beginMutationFromHome(home: []const u8) !Mutation {
     var home_dir = io_mod.VerifiedDir{
         .dir = try std.Io.Dir.openDirAbsolute(io_mod.getIo(), home, .{ .iterate = true }),
     };
