@@ -15,7 +15,26 @@ pub const context_limits = @import("context_limits.zig");
 
 const Allocator = std.mem.Allocator;
 const max_settings_bytes: usize = 64 * 1024;
+pub const max_launch_permission_policy_bytes: usize = max_settings_bytes;
 pub const default_permission_mode: types.PermissionMode = .auto;
+
+pub const LaunchPermissionPolicy = struct {
+    path: []u8,
+    rules: types.PermissionRuleSet,
+
+    pub fn deinit(self: *LaunchPermissionPolicy, alloc: Allocator) void {
+        alloc.free(self.path);
+        self.rules.deinit(alloc);
+        self.* = undefined;
+    }
+};
+
+pub const LoadLaunchPermissionPolicyError = error{
+    OutOfMemory,
+    PermissionPolicyUnavailable,
+    PermissionPolicyTooLarge,
+    InvalidPermissionPolicy,
+};
 
 pub const Paths = struct {
     home_dir: ?[]u8 = null,
@@ -1207,6 +1226,53 @@ fn readOptionalFile(alloc: Allocator, path: []const u8) !?[]u8 {
     const stat = try file.stat(io_mod.getIo());
     if (stat.kind != .file or stat.size > max_settings_bytes) return error.StreamTooLong;
     return try io_mod.readFileToEnd(alloc, &file, max_settings_bytes + 1);
+}
+
+/// Loads one invocation-owned permission policy. The returned path is
+/// canonical and both it and the parsed rules are owned by the caller.
+pub fn loadLaunchPermissionPolicy(
+    alloc: Allocator,
+    path: []const u8,
+) LoadLaunchPermissionPolicyError!LaunchPermissionPolicy {
+    const canonical = io_mod.realpathAlloc(alloc, path) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.PermissionPolicyUnavailable,
+    };
+    errdefer alloc.free(canonical);
+
+    var file = io_mod.openExistingReadOnlyRegularFile(
+        std.Io.Dir.cwd(),
+        canonical,
+        .no_follow,
+    ) catch return error.PermissionPolicyUnavailable;
+    defer file.close(io_mod.getIo());
+
+    const stat = file.stat(io_mod.getIo()) catch return error.PermissionPolicyUnavailable;
+    if (stat.kind != .file) return error.PermissionPolicyUnavailable;
+    if (stat.size > max_launch_permission_policy_bytes) {
+        return error.PermissionPolicyTooLarge;
+    }
+    const bytes = io_mod.readFileToEnd(
+        alloc,
+        &file,
+        max_launch_permission_policy_bytes + 1,
+    ) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.StreamTooLong => return error.PermissionPolicyTooLarge,
+        else => return error.PermissionPolicyUnavailable,
+    };
+    defer alloc.free(bytes);
+
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, bytes, .{}) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.InvalidPermissionPolicy,
+    };
+    defer parsed.deinit();
+    const rules = parsePermissionConfig(alloc, parsed.value) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.InvalidPermissionPolicy,
+    };
+    return .{ .path = canonical, .rules = rules };
 }
 
 fn parseSettingsJson(alloc: Allocator, json_text: []const u8) !Settings {
@@ -2510,6 +2576,83 @@ test "nested permission config preserves JSON object order" {
     try expectPermissionRule(settings.permission_rules.rules[1], "bash", "git *", .allow);
     try expectPermissionRule(settings.permission_rules.rules[2], "bash", "git push *", .deny);
     try expectPermissionRule(settings.permission_rules.rules[3], "edit", "*", .deny);
+}
+
+test "launch permission policy owns a canonical path and parsed rule order" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(io_mod.getIo(), "nested");
+    try writeFixtureFile(
+        tmp.dir,
+        "policy.json",
+        "{\"bash\":{\"git *\":\"allow\",\"git push *\":\"deny\"},\"edit\":\"deny\"}",
+    );
+    const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(root);
+    const raw_path = try std.fs.path.join(alloc, &.{ root, "nested", "..", "policy.json" });
+    defer alloc.free(raw_path);
+    const expected = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "policy.json");
+    defer alloc.free(expected);
+
+    var policy = try loadLaunchPermissionPolicy(alloc, raw_path);
+    defer policy.deinit(alloc);
+
+    try std.testing.expect(policy.path.ptr != raw_path.ptr);
+    try std.testing.expectEqualStrings(expected, policy.path);
+    try std.testing.expectEqual(@as(usize, 3), policy.rules.rules.len);
+    try expectPermissionRule(policy.rules.rules[0], "bash", "git *", .allow);
+    try expectPermissionRule(policy.rules.rules[1], "bash", "git push *", .deny);
+    try expectPermissionRule(policy.rules.rules[2], "edit", "*", .deny);
+}
+
+test "launch permission policy rejects unavailable malformed and oversized files" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(io_mod.getIo(), "directory");
+    try writeFixtureFile(tmp.dir, "malformed.json", "{not json");
+    try writeFixtureFile(tmp.dir, "invalid-rule.json", "{\"bash\":\"sometimes\"}");
+    const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(root);
+    const missing = try std.fs.path.join(alloc, &.{ root, "missing.json" });
+    defer alloc.free(missing);
+    const directory = try std.fs.path.join(alloc, &.{ root, "directory" });
+    defer alloc.free(directory);
+    const malformed = try std.fs.path.join(alloc, &.{ root, "malformed.json" });
+    defer alloc.free(malformed);
+    const invalid_rule = try std.fs.path.join(alloc, &.{ root, "invalid-rule.json" });
+    defer alloc.free(invalid_rule);
+    const oversized = try std.fs.path.join(alloc, &.{ root, "oversized.json" });
+    defer alloc.free(oversized);
+    try writeRepeatedByteAbsolute(
+        oversized,
+        'x',
+        max_launch_permission_policy_bytes + 1,
+    );
+
+    try std.testing.expectError(
+        error.PermissionPolicyUnavailable,
+        loadLaunchPermissionPolicy(alloc, missing),
+    );
+    try std.testing.expectError(
+        error.PermissionPolicyUnavailable,
+        loadLaunchPermissionPolicy(alloc, directory),
+    );
+    try std.testing.expectError(
+        error.InvalidPermissionPolicy,
+        loadLaunchPermissionPolicy(alloc, malformed),
+    );
+    try std.testing.expectError(
+        error.InvalidPermissionPolicy,
+        loadLaunchPermissionPolicy(alloc, invalid_rule),
+    );
+    try std.testing.expectError(
+        error.PermissionPolicyTooLarge,
+        loadLaunchPermissionPolicy(alloc, oversized),
+    );
 }
 
 test "parsePermissionMode accepts only exact case-insensitive labels" {
