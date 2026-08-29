@@ -117,16 +117,22 @@ pub const LaunchModifiers = struct {
     context_limit_overrides: []config_runtime.context_limits.Override = &.{},
     additional_directories: [][]u8 = &.{},
     saved_directories_suppressed: bool = false,
+    permission_policy: ?config_runtime.LaunchPermissionPolicy = null,
 
     pub fn deinit(self: *LaunchModifiers, alloc: Allocator) void {
         if (self.context_limit_overrides.len > 0) alloc.free(self.context_limit_overrides);
         for (self.additional_directories) |path| alloc.free(path);
         if (self.additional_directories.len > 0) alloc.free(self.additional_directories);
+        if (self.permission_policy) |*policy| policy.deinit(alloc);
         self.* = .{};
     }
 
     pub fn hasWorkspaceModifiers(self: LaunchModifiers) bool {
         return self.additional_directories.len > 0 or self.saved_directories_suppressed;
+    }
+
+    pub fn hasPermissionPolicy(self: LaunchModifiers) bool {
+        return self.permission_policy != null;
     }
 };
 
@@ -383,6 +389,8 @@ fn parseGlobalLaunchArgs(
         directories.deinit(alloc);
     }
     var suppress_saved = false;
+    var permission_policy: ?config_runtime.LaunchPermissionPolicy = null;
+    errdefer if (permission_policy) |*policy| policy.deinit(alloc);
 
     var index: usize = 0;
     while (index < args.len) {
@@ -404,6 +412,16 @@ fn parseGlobalLaunchArgs(
         } else if (std.mem.eql(u8, arg, "--no-additional-dirs")) {
             if (suppress_saved) return error.DuplicateAdditionalDirectorySuppression;
             suppress_saved = true;
+        } else if (std.mem.eql(u8, arg, "--permissions-file")) {
+            if (permission_policy != null) return error.DuplicatePermissionsFile;
+            index += 1;
+            if (index >= args.len or args[index].len == 0) return error.MissingPermissionsFileValue;
+            permission_policy = try config_runtime.loadLaunchPermissionPolicy(alloc, args[index]);
+        } else if (std.mem.startsWith(u8, arg, "--permissions-file=")) {
+            if (permission_policy != null) return error.DuplicatePermissionsFile;
+            const value = arg["--permissions-file=".len..];
+            if (value.len == 0) return error.MissingPermissionsFileValue;
+            permission_policy = try config_runtime.loadLaunchPermissionPolicy(alloc, value);
         } else {
             break;
         }
@@ -419,6 +437,7 @@ fn parseGlobalLaunchArgs(
             .context_limit_overrides = override_slice,
             .additional_directories = directory_slice,
             .saved_directories_suppressed = suppress_saved,
+            .permission_policy = permission_policy,
         },
     };
 }
@@ -435,11 +454,15 @@ pub fn argsAfterGlobalLaunchArgs(args: []const [:0]const u8) []const [:0]const u
     var index: usize = 0;
     while (index < args.len) {
         const arg = args[index];
-        if (std.mem.eql(u8, arg, "--context-limit") or std.mem.eql(u8, arg, "--add-dir")) {
+        if (std.mem.eql(u8, arg, "--context-limit") or
+            std.mem.eql(u8, arg, "--add-dir") or
+            std.mem.eql(u8, arg, "--permissions-file"))
+        {
             index += 1;
             if (index >= args.len) return &.{};
         } else if (!std.mem.startsWith(u8, arg, "--context-limit=") and
             !std.mem.startsWith(u8, arg, "--add-dir=") and
+            !std.mem.startsWith(u8, arg, "--permissions-file=") and
             !std.mem.eql(u8, arg, "--no-additional-dirs"))
         {
             return args[index..];
@@ -832,7 +855,7 @@ fn runIfRequestedWithDeps(alloc: Allocator, args: []const [:0]const u8, cfg: Con
         } else {
             try writer.writer.print("fx: invalid global launch option: {s}\n", .{@errorName(err)});
         }
-        try writer.writer.writeAll("usage: fx [--context-limit NAME=BYTES|off] [--add-dir PATH]... [--no-additional-dirs] <command>\n");
+        try writer.writer.writeAll("usage: fx [--context-limit NAME=BYTES|off] [--add-dir PATH]... [--no-additional-dirs] [--permissions-file FILE] <command>\n");
         try writeStderr(deps, writer.written());
         return .handled_failure;
     };
@@ -863,6 +886,12 @@ fn runNonInteractiveWithDeps(
         !commandSupportsWorkspaceModifiers(parsed_command))
     {
         try writeWorkspaceModifierUsage(deps);
+        return .handled_failure;
+    }
+    if (global_args.modifiers.hasPermissionPolicy() and
+        !commandSupportsLaunchPermissionPolicy(parsed_command))
+    {
+        try writeLaunchPermissionPolicyUsage(deps);
         return .handled_failure;
     }
 
@@ -923,6 +952,10 @@ fn runNonInteractiveWithDeps(
                 .context_limit_overrides = global_args.modifiers.context_limit_overrides,
                 .additional_directories = global_args.modifiers.additional_directories,
                 .saved_directories_suppressed = global_args.modifiers.saved_directories_suppressed,
+                .permission_rules_override = if (global_args.modifiers.permission_policy) |policy|
+                    policy.rules
+                else
+                    null,
                 .model_override = acp_opts.model,
                 .log_file = acp_opts.log_file,
             });
@@ -3475,6 +3508,13 @@ fn commandSupportsWorkspaceModifiers(command: Command) bool {
     };
 }
 
+fn commandSupportsLaunchPermissionPolicy(command: Command) bool {
+    return switch (command) {
+        .interactive, .acp, .resume_session => true,
+        else => false,
+    };
+}
+
 fn writeWorkspaceModifierUsage(deps: RunDeps) !void {
     try writeStderr(
         deps,
@@ -3482,10 +3522,22 @@ fn writeWorkspaceModifierUsage(deps: RunDeps) !void {
     );
 }
 
+fn writeLaunchPermissionPolicyUsage(deps: RunDeps) !void {
+    try writeStderr(
+        deps,
+        "fx: --permissions-file is only supported for interactive, resume, and ACP launches\n",
+    );
+}
+
 fn globalLaunchErrorMessage(err: anyerror) ?[]const u8 {
     return switch (err) {
         error.MissingAddDirectoryValue => "--add-dir requires a directory path",
         error.DuplicateAdditionalDirectorySuppression => "--no-additional-dirs may only be specified once",
+        error.MissingPermissionsFileValue => "--permissions-file requires a file path",
+        error.DuplicatePermissionsFile => "--permissions-file may only be specified once",
+        error.PermissionPolicyUnavailable => "--permissions-file must name a readable regular file",
+        error.PermissionPolicyTooLarge => "--permissions-file exceeds the 64 KiB limit",
+        error.InvalidPermissionPolicy => "--permissions-file must contain valid permission-rule JSON",
         else => null,
     };
 }
@@ -4107,6 +4159,51 @@ test "additional directory flags fail closed when malformed" {
     );
 }
 
+test "global launch permission policy owns canonical rules before the command" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    {
+        var file = try tmp.dir.createFile(std.testing.io, "policy.json", .{});
+        defer file.close(std.testing.io);
+        try file.writeStreamingAll(
+            std.testing.io,
+            "{\"bash\":{\"git *\":\"allow\",\"git push *\":\"deny\"}}",
+        );
+    }
+    const policy_path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "policy.json");
+    defer alloc.free(policy_path);
+    const policy_arg = try alloc.dupeZ(u8, policy_path);
+    defer alloc.free(policy_arg);
+
+    var parsed = try parseGlobalLaunchArgs(alloc, &.{
+        @constCast("--permissions-file"),
+        policy_arg,
+        @constCast("acp"),
+    });
+    defer parsed.deinit(alloc);
+
+    const policy = parsed.modifiers.permission_policy.?;
+    try std.testing.expect(policy.path.ptr != policy_arg.ptr);
+    try std.testing.expectEqualStrings(policy_path, policy.path);
+    try std.testing.expectEqual(@as(usize, 2), policy.rules.rules.len);
+    try std.testing.expectEqualStrings("git *", policy.rules.rules[0].pattern);
+    try std.testing.expectEqual(types.PermissionAction.allow, policy.rules.rules[0].action);
+    try std.testing.expectEqualStrings("git push *", policy.rules.rules[1].pattern);
+    try std.testing.expectEqual(types.PermissionAction.deny, policy.rules.rules[1].action);
+    try std.testing.expectEqualStrings("acp", parsed.remaining[0]);
+
+    try std.testing.expectError(
+        error.DuplicatePermissionsFile,
+        parseGlobalLaunchArgs(alloc, &.{
+            @constCast("--permissions-file"),
+            policy_arg,
+            @constCast("--permissions-file"),
+            policy_arg,
+        }),
+    );
+}
+
 test "parse acp args extracts known flags and rejects invalid arguments" {
     const opts = try parseAcpArgs(&.{
         @constCast("--model"),
@@ -4171,8 +4268,16 @@ test "ACP command routes parsed options and launch config through the injected r
                     .bytes => |bytes| bytes == 1234,
                     .off => false,
                 };
+            const permission_matches = if (cfg.permission_rules_override) |rules|
+                rules.rules.len == 1 and
+                    std.mem.eql(u8, rules.rules[0].permission, "edit") and
+                    std.mem.eql(u8, rules.rules[0].pattern, "*") and
+                    rules.rules[0].action == .deny
+            else
+                false;
             self.launch_matches =
                 limit_matches and
+                permission_matches and
                 cfg.additional_directories.len == 1 and
                 std.mem.eql(u8, cfg.additional_directories[0], "/tmp/acp-extra") and
                 cfg.saved_directories_suppressed and
@@ -4181,6 +4286,22 @@ test "ACP command routes parsed options and launch config through the injected r
         }
     };
 
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    {
+        var file = try tmp.dir.createFile(std.testing.io, "policy.json", .{});
+        defer file.close(std.testing.io);
+        try file.writeStreamingAll(std.testing.io, "{\"edit\":\"deny\"}");
+    }
+    const policy_path = try io_mod.dirRealpathAlloc(
+        std.testing.allocator,
+        tmp.dir,
+        "policy.json",
+    );
+    defer std.testing.allocator.free(policy_path);
+    const policy_arg = try std.testing.allocator.dupeZ(u8, policy_path);
+    defer std.testing.allocator.free(policy_arg);
+
     var cfg = testConfig();
     cfg.provider_set.gateway.permission_reviewer = test_builtin_gateway.permission_reviewer.provider;
     var capture = Capture{ .expected = cfg };
@@ -4188,6 +4309,8 @@ test "ACP command routes parsed options and launch config through the injected r
     const result = try runIfRequestedWithDeps(
         std.testing.allocator,
         &.{
+            @constCast("--permissions-file"),
+            policy_arg,
             @constCast("--context-limit"),
             @constCast("project_instructions_total_bytes=1234"),
             @constCast("--add-dir"),
@@ -4790,6 +4913,10 @@ test "global workspace launch option errors use user-facing copy" {
         .{
             .args = &.{ @constCast("--no-additional-dirs"), @constCast("--no-additional-dirs") },
             .expected = "fx: --no-additional-dirs may only be specified once\n",
+        },
+        .{
+            .args = &.{@constCast("--permissions-file")},
+            .expected = "fx: --permissions-file requires a file path\n",
         },
     };
 
