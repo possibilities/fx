@@ -221,6 +221,7 @@ fn runInteractiveWithDeps(comptime App: type, comptime cooperative: bool, alloc:
     const resume_requested = launch.requested_resume != null;
     const allow_native_tools = launch.modifiers.allow_native_tools;
     const selected_native_tools = launch.modifiers.selected_native_tools;
+    const no_default_skills = launch.modifiers.no_default_skills;
     var app = App.init(alloc, launch) catch |err| {
         switch (err) {
             error.NotATerminal => {
@@ -328,7 +329,7 @@ fn runInteractiveWithDeps(comptime App: type, comptime cooperative: bool, alloc:
             selected_native_tools.len * 2;
         try relaunch_argv.ensureTotalCapacity(
             alloc,
-            4 + native_tool_arg_count + relaunch_skill_roots.len * 2,
+            4 + native_tool_arg_count + @intFromBool(no_default_skills) + relaunch_skill_roots.len * 2,
         );
     }
     const resume_handoff_columns: u16 = if (comptime cooperative)
@@ -354,6 +355,9 @@ fn runInteractiveWithDeps(comptime App: type, comptime cooperative: bool, alloc:
                     relaunch_argv.appendAssumeCapacity("--tool");
                     relaunch_argv.appendAssumeCapacity(name);
                 }
+            }
+            if (no_default_skills) {
+                relaunch_argv.appendAssumeCapacity("--no-default-skills");
             }
             for (relaunch_skill_roots) |root| {
                 relaunch_argv.appendAssumeCapacity("--skills-dir");
@@ -1172,6 +1176,50 @@ test "app entry preserves ordered native tool selection across upgrade relaunch"
         capture.stderr.written(),
         "fx --tool terminal:exec --tool read_file --resume session-123",
     ) != null);
+}
+
+test "app entry relaunch preserves exclusive skill roots" {
+    const alloc = std.testing.allocator;
+    const roots = roots: {
+        const owned = try alloc.alloc([]u8, 2);
+        var initialized: usize = 0;
+        errdefer {
+            for (owned[0..initialized]) |root| alloc.free(root);
+            alloc.free(owned);
+        }
+        owned[0] = try alloc.dupe(u8, "/tmp/first-skills");
+        initialized += 1;
+        owned[1] = try alloc.dupe(u8, "/tmp/second-skills");
+        break :roots owned;
+    };
+    var capture = TestCapture.init(.{ .interactive = .{ .modifiers = .{
+        .invocation_skill_roots = roots,
+        .no_default_skills = true,
+    } } });
+    defer capture.deinit();
+    capture.resume_handoff_id = "session-123";
+    capture.upgrade_relaunch_path = "/tmp/fx-upgraded";
+
+    const outcome = try runWithDeps(
+        TestApp,
+        alloc,
+        &.{},
+        testConfig(),
+        capture.deps(),
+    );
+
+    try std.testing.expectEqual(@as(u8, 1), outcome.exit);
+    try std.testing.expectEqual(@as(usize, 1), capture.replace_calls);
+    try std.testing.expectEqual(@as(usize, 9), capture.replace_arg_count);
+    try std.testing.expectEqualStrings("/tmp/fx-upgraded", capture.replaceArg(0));
+    try std.testing.expectEqualStrings("--no-default-skills", capture.replaceArg(1));
+    try std.testing.expectEqualStrings("--skills-dir", capture.replaceArg(2));
+    try std.testing.expectEqualStrings("/tmp/first-skills", capture.replaceArg(3));
+    try std.testing.expectEqualStrings("--skills-dir", capture.replaceArg(4));
+    try std.testing.expectEqualStrings("/tmp/second-skills", capture.replaceArg(5));
+    try std.testing.expectEqualStrings("resume", capture.replaceArg(6));
+    try std.testing.expectEqualStrings("session-123", capture.replaceArg(7));
+    try std.testing.expectEqualStrings("--upgrade-relaunch", capture.replaceArg(8));
 }
 
 test "app entry never relaunches without a validated handoff" {

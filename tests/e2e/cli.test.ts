@@ -267,6 +267,8 @@ describe("cli: help", () => {
       expect(r.stdout).toContain("--context-limit <spec>");
       expect(r.stdout).toContain("Set name=bytes|off; repeatable");
       expect(r.stdout).toContain("--add-dir <path>");
+      expect(r.stdout).toContain("--skills-dir <path>");
+      expect(r.stdout).toContain("--no-default-skills");
       expect(r.stdout).toContain("--no-native-tools");
       expect(r.stdout).toContain("--tool <name>");
       expect(r.stdout).toContain("-c, --continue");
@@ -5017,6 +5019,30 @@ describe("cli: workspace access", () => {
       expect(unsupportedNativeToolSelection.code).toBe(1);
       expect(unsupportedNativeToolSelection.stderr).toContain(
         "--tool is only supported for interactive, resume, and ACP launches",
+      );
+
+      const missingSkillsRoot = await runFx(["--skills-dir"], { env: enabled });
+      expect(missingSkillsRoot.code).toBe(1);
+      expect(missingSkillsRoot.stderr).toContain(
+        "--skills-dir requires a directory path",
+      );
+
+      const duplicateDefaultSkillGate = await runFx(
+        ["--no-default-skills", "--no-default-skills"],
+        { env: enabled },
+      );
+      expect(duplicateDefaultSkillGate.code).toBe(1);
+      expect(duplicateDefaultSkillGate.stderr).toContain(
+        "--no-default-skills may only be specified once",
+      );
+
+      const unsupportedSkillPolicy = await runFx(
+        ["--no-default-skills", "ask", "hello"],
+        { env: enabled },
+      );
+      expect(unsupportedSkillPolicy.code).toBe(1);
+      expect(unsupportedSkillPolicy.stderr).toContain(
+        "--no-default-skills is only supported for interactive, resume, and ACP launches",
       );
     },
     TIMEOUT,

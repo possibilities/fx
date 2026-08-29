@@ -332,7 +332,7 @@ pub fn loadVisibleSkills(
         workspace_root,
         home,
         skills_dir,
-        &.{},
+        root_policy.invocation_roots,
         root_policy,
     );
 }
@@ -368,19 +368,21 @@ pub fn loadVisibleSkillsWithInvocationRoots(
         try appendInvocationRoot(alloc, &roots, root);
     }
 
-    if (workspace_root) |root| {
-        try appendWorkspaceRoots(alloc, &roots, root, home, root_policy.workspace_roots);
-    }
-
-    if (skills_dir.len > 0) {
-        if (root_policy.managed_root_source) |source| {
-            try appendManagedRoot(alloc, &roots, source, skills_dir);
+    if (!root_policy.exclusive_invocation_roots) {
+        if (workspace_root) |root| {
+            try appendWorkspaceRoots(alloc, &roots, root, home, root_policy.workspace_roots);
         }
-    }
 
-    if (home) |home_root| {
-        for (root_policy.global_roots) |spec| {
-            try appendSpecRoot(alloc, &roots, home_root, spec);
+        if (skills_dir.len > 0) {
+            if (root_policy.managed_root_source) |source| {
+                try appendManagedRoot(alloc, &roots, source, skills_dir);
+            }
+        }
+
+        if (home) |home_root| {
+            for (root_policy.global_roots) |spec| {
+                try appendSpecRoot(alloc, &roots, home_root, spec);
+            }
         }
     }
 
@@ -1939,6 +1941,7 @@ test "skill discovery bounds near-emergency valid metadata" {
 }
 
 test "skill group labels distinguish managed workspace and compatibility roots" {
+    try std.testing.expectEqualStrings("Invocation roots", skillGroupLabel(.invocation));
     try std.testing.expectEqualStrings("Managed installs", skillGroupLabel(.global_fx));
     try std.testing.expectEqualStrings("Workspace skills", skillGroupLabel(.workspace_shared));
     try std.testing.expectEqualStrings("Compatibility roots", skillGroupLabel(.workspace_agents));
@@ -2761,6 +2764,7 @@ test "an explicitly supplied managed install root keeps managed identity" {
         "home/.fx/skills/review/SKILL.md",
         "---\nname: review\ndescription: managed review\n---\n\nMANAGED_BODY\n",
     );
+
     const home_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
     defer alloc.free(home_root);
     const managed_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home/.fx/skills");
@@ -2782,6 +2786,52 @@ test "an explicitly supplied managed install root keeps managed identity" {
     try std.testing.expectEqual(SkillSource.global_fx, discovery.skills[0].source);
     try std.testing.expect(isManagedInstallSkill(discovery.skills[0]));
     try std.testing.expect(discovery.skills[0].read_authority == null);
+}
+
+test "exclusive invocation roots omit automatic roots and retain flag order" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try writeTempFile(&tmp, "home/workspace/app/.fx/skills/automatic/SKILL.md", "---\nname: automatic\n---\nbody\n");
+    try writeTempFile(&tmp, "home/.fx/skills/managed/SKILL.md", "---\nname: managed\n---\nbody\n");
+    try writeTempFile(&tmp, "roots/first/one/SKILL.md", "---\nname: one\n---\nbody\n");
+    try writeTempFile(&tmp, "roots/second/two/SKILL.md", "---\nname: two\n---\nbody\n");
+
+    const workspace_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home/workspace/app");
+    defer alloc.free(workspace_root);
+    const home_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
+    defer alloc.free(home_root);
+    const managed_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home/.fx/skills");
+    defer alloc.free(managed_root);
+    const first_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "roots/first");
+    defer alloc.free(first_root);
+    const second_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "roots/second");
+    defer alloc.free(second_root);
+
+    const invocation_roots = [_][]const u8{ second_root, first_root };
+    var discovery = try loadVisibleSkills(alloc, workspace_root, home_root, managed_root, .{
+        .invocation_roots = &invocation_roots,
+        .exclusive_invocation_roots = true,
+        .managed_root_source = .global_fx,
+        .workspace_roots = &.{.{ .source = .workspace_fx, .path = ".fx/skills" }},
+    });
+    defer discovery.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 2), discovery.skills.len);
+    try std.testing.expectEqualStrings("two", discovery.skills[0].name);
+    try std.testing.expectEqualStrings("one", discovery.skills[1].name);
+    try std.testing.expectEqual(SkillSource.invocation, discovery.skills[0].source);
+    try std.testing.expect(findSkillByName(discovery.skills, "automatic") == null);
+    try std.testing.expect(findSkillByName(discovery.skills, "managed") == null);
+
+    var empty_discovery = try loadVisibleSkills(alloc, workspace_root, home_root, managed_root, .{
+        .exclusive_invocation_roots = true,
+        .managed_root_source = .global_fx,
+        .workspace_roots = &.{.{ .source = .workspace_fx, .path = ".fx/skills" }},
+    });
+    defer empty_discovery.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 0), empty_discovery.skills.len);
 }
 
 test "loadVisibleSkills preserves root-distinct duplicate skill names" {
