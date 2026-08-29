@@ -31,6 +31,7 @@ const command_admission = @import("../permissions/command_admission.zig");
 const pathing = @import("../workspace/pathing.zig");
 const execution_router = @import("../execution/router.zig");
 const skill_runtime = @import("../skills/skill_runtime.zig");
+const skill_contract = @import("../skills/skill_contract.zig");
 const subagent_authority = @import("../subagent/authority.zig");
 const subagent_communication_store = @import("../subagent/communication_store.zig");
 const subagent_control_store = @import("../subagent/control_store.zig");
@@ -180,6 +181,7 @@ pub const Context = struct {
     session_allocator: Allocator = std.heap.c_allocator,
     skills_dir: []const u8 = "",
     invocation_skill_roots: []const []const u8 = &.{},
+    skill_root_policy: ?skill_contract.RootPolicy = null,
     context_limits: context_limits.Values = .{},
     context_registry: context_contract.Registry,
     context_enabled: bool = true,
@@ -877,6 +879,7 @@ fn typedDispatchContext(ctx: Context, arena: Allocator) tool_dispatch.DispatchCo
         .change_tracker = ctx.tracker,
         .skills_dir = ctx.skills_dir,
         .invocation_skill_roots = ctx.invocation_skill_roots,
+        .skill_root_policy = ctx.skill_root_policy,
         .context_limits = ctx.context_limits,
         .ignored_list_entries = ctx.ignored_list_entries,
         .max_list_entries = ctx.max_list_entries,
@@ -2211,6 +2214,7 @@ const TestRuntime = struct {
     ignored_list_entries: []const []const u8 = &.{},
     skills_dir: []const u8 = "",
     invocation_skill_roots: []const []const u8 = &.{},
+    skill_root_policy: ?skill_contract.RootPolicy = null,
     tracker: ?*change_tracker.ChangeTracker = null,
     permission_rules: types.PermissionRuleSet = .{},
     permission_grants: []const PermissionGrant = &.{},
@@ -2299,6 +2303,7 @@ const TestRuntime = struct {
             .session_allocator = self.session_allocator,
             .skills_dir = self.skills_dir,
             .invocation_skill_roots = self.invocation_skill_roots,
+            .skill_root_policy = self.skill_root_policy,
             .context_registry = test_context_registry,
             .context_limits = self.context_limits,
             .output_chunk_ctx = undefined,
@@ -7773,6 +7778,59 @@ test "name-only skill call rediscovers a duplicate added after the first read" {
     try std.testing.expectEqual(tool_contracts.ToolExecutionStatus.failure, rediscovered.status);
     try expectContains(rediscovered.model_output, "ambiguous");
     try expectNotContains(rediscovered.model_output, "already loaded");
+}
+
+test "skill tool preserves exclusive invocation roots" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/workspace");
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx/skills/automatic");
+    try tmp.dir.createDirPath(io_mod.getIo(), "invocation/selected");
+    {
+        var file = try tmp.dir.createFile(io_mod.getIo(), "home/.fx/skills/automatic/SKILL.md", .{});
+        defer file.close(io_mod.getIo());
+        try file.writeStreamingAll(io_mod.getIo(), "---\nname: automatic\ndescription: automatic skill\n---\n\nAUTOMATIC BODY\n");
+    }
+    {
+        var file = try tmp.dir.createFile(io_mod.getIo(), "invocation/selected/SKILL.md", .{});
+        defer file.close(io_mod.getIo());
+        try file.writeStreamingAll(io_mod.getIo(), "---\nname: selected\ndescription: selected skill\n---\n\nSELECTED BODY\n");
+    }
+
+    const workspace_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home/workspace");
+    defer alloc.free(workspace_root);
+    const skills_dir = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home/.fx/skills");
+    defer alloc.free(skills_dir);
+    const invocation_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "invocation");
+    defer alloc.free(invocation_root);
+    const invocation_roots = [_][]const u8{invocation_root};
+    try setTestHome(null);
+    defer setTestHome(null) catch {};
+
+    var rt = TestRuntime{
+        .workspace_root = workspace_root,
+        .skills_dir = skills_dir,
+        .skill_root_policy = .{
+            .invocation_roots = &invocation_roots,
+            .exclusive_invocation_roots = true,
+            .managed_root_source = .global_fx,
+        },
+    };
+    defer rt.deinit(alloc);
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const selected = try executeToolCall(rt.context(), arena, .{ .id = "selected", .name = "skill", .arguments_json = "{\"name\":\"selected\"}" });
+    try std.testing.expectEqual(tool_contracts.ToolExecutionStatus.success, selected.status);
+    try expectContains(selected.model_output, "SELECTED BODY");
+
+    const automatic = try executeToolCall(rt.context(), arena, .{ .id = "automatic", .name = "skill", .arguments_json = "{\"name\":\"automatic\"}" });
+    try std.testing.expectEqual(tool_contracts.ToolExecutionStatus.failure, automatic.status);
+    try expectContains(automatic.model_output, "Skill \"automatic\" not found.");
+    try expectNotContains(automatic.model_output, "AUTOMATIC BODY");
 }
 
 test "supplied session grant authorizes skill in a fresh session" {

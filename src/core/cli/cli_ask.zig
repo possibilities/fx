@@ -992,6 +992,7 @@ const AskContext = struct {
             .session_allocator = self.alloc,
             .skills_dir = self.skills_dir,
             .invocation_skill_roots = self.cfg.invocation_skill_roots,
+            .skill_root_policy = self.cfg.skill_root_policy,
             .context_limits = self.context_limits,
             .context_enabled = self.context_enabled,
             .context_registry = self.deps.context_registry,
