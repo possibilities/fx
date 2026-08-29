@@ -129,6 +129,7 @@ pub const LaunchModifiers = struct {
     allow_native_tools: bool = true,
     selected_native_tools: [][]u8 = &.{},
     no_default_skills: bool = false,
+    project_instructions_enabled: bool = true,
 
     pub fn deinit(self: *LaunchModifiers, alloc: Allocator) void {
         if (self.context_limit_overrides.len > 0) alloc.free(self.context_limit_overrides);
@@ -465,6 +466,7 @@ fn parseGlobalLaunchArgs(
         selected_native_tools.deinit(alloc);
     }
     var no_default_skills = false;
+    var project_instructions_enabled = true;
 
     var index: usize = 0;
     while (index < args.len) {
@@ -534,6 +536,9 @@ fn parseGlobalLaunchArgs(
         } else if (std.mem.eql(u8, arg, "--no-default-skills")) {
             if (no_default_skills) return error.DuplicateDefaultSkillsSuppression;
             no_default_skills = true;
+        } else if (std.mem.eql(u8, arg, "--no-project-instructions")) {
+            if (!project_instructions_enabled) return error.DuplicateProjectInstructionSuppression;
+            project_instructions_enabled = false;
         } else {
             break;
         }
@@ -572,6 +577,7 @@ fn parseGlobalLaunchArgs(
             .allow_native_tools = allow_native_tools,
             .selected_native_tools = selected_tool_slice,
             .no_default_skills = no_default_skills,
+            .project_instructions_enabled = project_instructions_enabled,
         },
     };
 }
@@ -603,7 +609,8 @@ pub fn argsAfterGlobalLaunchArgs(args: []const [:0]const u8) []const [:0]const u
             !std.mem.startsWith(u8, arg, "--tool=") and
             !std.mem.eql(u8, arg, "--no-additional-dirs") and
             !std.mem.eql(u8, arg, "--no-native-tools") and
-            !std.mem.eql(u8, arg, "--no-default-skills"))
+            !std.mem.eql(u8, arg, "--no-default-skills") and
+            !std.mem.eql(u8, arg, "--no-project-instructions"))
         {
             return args[index..];
         }
@@ -1126,6 +1133,12 @@ fn runNonInteractiveWithDeps(
         try writeExclusiveSkillPolicyUsage(deps);
         return .handled_failure;
     }
+    if (!global_args.modifiers.project_instructions_enabled and
+        !commandSupportsProjectInstructionModifier(parsed_command))
+    {
+        try writeProjectInstructionModifierUsage(deps);
+        return .handled_failure;
+    }
 
     if (isVersionFlag(effective_args[0])) {
         if (effective_args.len != 1) {
@@ -1197,6 +1210,7 @@ fn runNonInteractiveWithDeps(
                 .allow_acp_mcp = acp_opts.allow_acp_mcp,
                 .allow_native_tools = global_args.modifiers.allow_native_tools,
                 .native_tool_set = selected_tools.tool_set,
+                .project_instructions_enabled = global_args.modifiers.project_instructions_enabled,
             });
             return .handled_success;
         },
@@ -3769,6 +3783,13 @@ fn commandSupportsNativeToolModifier(command: Command) bool {
     };
 }
 
+fn commandSupportsProjectInstructionModifier(command: Command) bool {
+    return switch (command) {
+        .interactive, .acp, .resume_session => true,
+        else => false,
+    };
+}
+
 fn commandSupportsExclusiveSkillPolicy(command: Command) bool {
     return switch (command) {
         .interactive, .acp, .resume_session => true,
@@ -3911,6 +3932,13 @@ fn writeExclusiveSkillPolicyUsage(deps: RunDeps) !void {
     );
 }
 
+fn writeProjectInstructionModifierUsage(deps: RunDeps) !void {
+    try writeStderr(
+        deps,
+        "fx: --no-project-instructions is only supported for interactive, resume, and ACP launches\n",
+    );
+}
+
 fn globalLaunchErrorMessage(err: anyerror) ?[]const u8 {
     return switch (err) {
         error.MissingAddDirectoryValue => "--add-dir requires a directory path",
@@ -3923,6 +3951,7 @@ fn globalLaunchErrorMessage(err: anyerror) ?[]const u8 {
         error.MissingNativeToolSelection => "--tool requires a native tool name",
         error.ConflictingNativeToolSelection => "--tool cannot be combined with --no-native-tools",
         error.DuplicateDefaultSkillsSuppression => "--no-default-skills may only be specified once",
+        error.DuplicateProjectInstructionSuppression => "--no-project-instructions may only be specified once",
         else => null,
     };
 }
@@ -4550,6 +4579,7 @@ test "global launch modifiers own repeatable additional directories and suppress
         @constCast("--add-dir=/tmp/shared-two"),
         @constCast("--no-additional-dirs"),
         @constCast("--no-native-tools"),
+        @constCast("--no-project-instructions"),
         @constCast("ask"),
         @constCast("inspect"),
     });
@@ -4560,6 +4590,7 @@ test "global launch modifiers own repeatable additional directories and suppress
     try std.testing.expectEqualStrings("/tmp/shared-two", parsed.modifiers.additional_directories[1]);
     try std.testing.expect(parsed.modifiers.saved_directories_suppressed);
     try std.testing.expect(!parsed.modifiers.allow_native_tools);
+    try std.testing.expect(!parsed.modifiers.project_instructions_enabled);
     try std.testing.expectEqualStrings("ask", parsed.remaining[0]);
 }
 
@@ -4860,6 +4891,10 @@ test "global native tool selection parsing is allocation safe" {
         checkNativeToolSelectionParseAllocationFailures,
         .{},
     );
+    try std.testing.expectError(
+        error.DuplicateProjectInstructionSuppression,
+        parseGlobalLaunchArgs(std.testing.allocator, &.{ @constCast("--no-project-instructions"), @constCast("--no-project-instructions") }),
+    );
 }
 
 test "parse acp args extracts known flags and rejects invalid arguments" {
@@ -4937,17 +4972,19 @@ test "ACP command routes parsed options and launch config through the injected r
                 limit_matches and
                 cfg.additional_directories.len == 1 and
                 std.mem.eql(u8, cfg.additional_directories[0], "/tmp/acp-extra") and
-                cfg.invocation_skill_roots.len == 1 and
+                cfg.invocation_skill_roots.len == 3 and
                 std.mem.eql(u8, cfg.invocation_skill_roots[0], self.expected_invocation_root) and
                 cfg.saved_directories_suppressed and
                 cfg.skill_root_policy.exclusive_invocation_roots and
-                cfg.skill_root_policy.invocation_roots.len == 2 and
-                std.mem.eql(u8, cfg.skill_root_policy.invocation_roots[0], "/tmp/acp-first-skills") and
-                std.mem.eql(u8, cfg.skill_root_policy.invocation_roots[1], "/tmp/acp-second-skills") and
+                cfg.skill_root_policy.invocation_roots.len == 3 and
+                std.mem.eql(u8, cfg.skill_root_policy.invocation_roots[0], self.expected_invocation_root) and
+                std.mem.eql(u8, cfg.skill_root_policy.invocation_roots[1], "/tmp/acp-first-skills") and
+                std.mem.eql(u8, cfg.skill_root_policy.invocation_roots[2], "/tmp/acp-second-skills") and
                 std.mem.eql(u8, cfg.model_override.?, "model-override") and
                 std.mem.eql(u8, cfg.log_file.?, "/tmp/acp.log") and
                 !cfg.allow_native_tools and
-                !cfg.allow_acp_mcp;
+                !cfg.allow_acp_mcp and
+                !cfg.project_instructions_enabled;
         }
     };
 
@@ -4989,6 +5026,7 @@ test "ACP command routes parsed options and launch config through the injected r
             @constCast("--skills-dir"),
             @constCast("/tmp/acp-first-skills"),
             @constCast("--skills-dir=/tmp/acp-second-skills"),
+            @constCast("--no-project-instructions"),
             @constCast("acp"),
             @constCast("--model"),
             @constCast("model-override"),

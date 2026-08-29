@@ -91,6 +91,9 @@ pub fn Runtime(comptime App: type) type {
             if (comptime @hasField(App, "context_enabled")) {
                 if (!app.context_enabled) return "";
             }
+            if (comptime @hasField(App, "project_instructions_enabled")) {
+                if (!app.project_instructions_enabled) return "";
+            }
             if (app.worker.active_context_snapshot) |snapshot| return snapshot.modelVisibleBytes();
             return app.context_snapshot.modelVisibleBytes();
         }
@@ -850,6 +853,7 @@ pub fn Runtime(comptime App: type) type {
             app.context_snapshot = app.contextRegistry().gatherDefaultSnapshot(app.alloc, .{
                 .workspace_root = app.workspace_root,
                 .access_scope = appAccessScope(app),
+                .project_instructions_enabled = if (comptime @hasField(App, "project_instructions_enabled")) app.project_instructions_enabled else true,
                 .targets = targets,
                 .context_limits = if (comptime @hasField(App, "context_limits")) app.context_limits else .{},
             }) catch |err| {
@@ -1083,6 +1087,7 @@ pub fn Runtime(comptime App: type) type {
                 .custom_tool_guidance = child_projection.custom_guidance,
                 .context_registry = app.contextRegistry(),
                 .context_enabled = if (comptime @hasField(App, "context_enabled")) app.context_enabled else true,
+                .project_instructions_enabled = if (comptime @hasField(App, "project_instructions_enabled")) app.project_instructions_enabled else true,
                 .project_context = modelVisibleProjectContext(app),
                 .lifecycle_view = app.lifecycle_view,
             }, turn, message, admission, cancel);

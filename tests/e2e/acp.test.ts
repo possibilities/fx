@@ -6985,6 +6985,71 @@ describe("acp: model-independent", () => {
   );
 
   test(
+    "--no-project-instructions omits repository prose while retaining runtime context",
+    async () => {
+      const root = createIsolatedRoot("fx-acp-no-project-instructions-");
+      const nested = join(root.workspace, "nested");
+      mkdirSync(nested, { recursive: true });
+      const localPath = join(nested, "resource.txt");
+      writeFileSync(localPath, "ACP_NEUTRAL_RESOURCE_CONTENT\n");
+      const globalRule = "ACP_GLOBAL_RULE_MUST_BE_ABSENT";
+      const rootRule = "ACP_ROOT_RULE_MUST_BE_ABSENT";
+      const nestedRule = "ACP_NESTED_RULE_MUST_BE_ABSENT";
+      writeFileSync(join(root.home, ".fx", "AGENTS.md"), `${globalRule}\n`);
+      writeFileSync(join(root.workspace, "AGENTS.md"), `${rootRule}\n`);
+      writeFileSync(join(nested, "AGENTS.md"), `${nestedRule}\n`);
+      const projectSettings = '{"context":true}\n';
+      const projectSettingsPath = join(root.workspace, ".fx.json");
+      writeFileSync(projectSettingsPath, projectSettings);
+      const gateway = startFakeGateway([
+        finalText("repository-neutral ACP prompt complete"),
+      ]);
+      try {
+        client = await AcpClient.create({
+          args: ["--no-project-instructions", "acp"],
+          cwd: root.workspace,
+          env: fakeGatewayEnv(root, gateway),
+        });
+        await startCodeSession(client);
+        const result = await runPromptBlocks(client, [
+          { type: "text", text: "Inspect the attached local resource." },
+          {
+            type: "resource",
+            resource: {
+              uri: pathToFileURL(localPath).href,
+              mimeType: "text/plain",
+              text: "ACP_NEUTRAL_RESOURCE_CONTENT",
+            },
+          },
+        ], TIMEOUT);
+
+        expect(result.promptResult.result.stopReason).toBe("end_turn");
+        expect(gateway.requests).toHaveLength(1);
+        const request = acpGatewayRequest(gateway.requests[0]!.body);
+        const promptText = acpPromptText(gateway.requests[0]!.body);
+        expect(promptText).not.toContain(globalRule);
+        expect(promptText).not.toContain(rootRule);
+        expect(promptText).not.toContain(nestedRule);
+        expect(promptText).toContain("ACP_NEUTRAL_RESOURCE_CONTENT");
+        expect(promptText).toContain(
+          "Runtime context: this is a noninteractive run without live question UI;",
+        );
+        expect(promptText).toContain(
+          "Permission checks run at tool execution time.",
+        );
+        expect(request.tools.length).toBeGreaterThan(0);
+        expect(readFileSync(projectSettingsPath, "utf8")).toBe(projectSettings);
+        expect(client.stderr).toBe("");
+      } finally {
+        await client?.close();
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
     "session/prompt applies scoped instructions from a local resource target",
     async () => {
       const root = createIsolatedRoot("fx-acp-resource-context-");
