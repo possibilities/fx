@@ -121,6 +121,12 @@ fx builds as a native binary or WebAssembly. Applications embedding fx can provi
 
 The WebAssembly SDK is experimental. See the [WebAssembly SDK](sdk/README.md) and [ACP documentation](https://fx.sh/docs/using-fx/acp).
 
+For a repository-neutral interactive TUI or ACP process, launch Fx with the
+global `--no-project-instructions` option. Fx omits `AGENTS.md`, `CLAUDE.md`,
+and compatible scoped instruction prose for that process while retaining
+runtime context such as the working directory, date, Git state, tool guidance,
+and permission guidance.
+
 ## Extend fx
 
 In the interactive shell, bare `/mcp` opens an inline browser for servers, tools, resources, and prompts without adding anything to the transcript. Resource and prompt content enters the composer only after an explicit Insert action. Direct `/mcp SUBCOMMAND` forms remain available.
