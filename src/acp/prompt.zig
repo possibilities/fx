@@ -320,12 +320,19 @@ const AcpContext = struct {
 };
 
 fn activeToolSet(state: *const server.ServerState) tool_set_contract.ToolSet {
-    return nativeToolSet(state.cfg.allow_native_tools);
+    return nativeToolSet(
+        state.cfg.allow_native_tools,
+        state.cfg.native_tool_set,
+    );
 }
 
-fn nativeToolSet(allow_native_tools: bool) tool_set_contract.ToolSet {
+fn nativeToolSet(
+    allow_native_tools: bool,
+    selected: ?tool_set_contract.ToolSet,
+) tool_set_contract.ToolSet {
     if (comptime host_target.is_wasm) return tool_set_contract.empty;
-    return if (allow_native_tools) builtin_tools.advertisement_set else tool_set_contract.empty;
+    if (!allow_native_tools) return tool_set_contract.empty;
+    return selected orelse builtin_tools.advertisement_set;
 }
 
 const AcpElicitationResponderContext = struct {
@@ -728,9 +735,21 @@ pub fn runSubagentChild(
 }
 
 test "ACP native tool gate keeps the native set empty" {
-    try std.testing.expectEqual(@as(usize, 0), nativeToolSet(false).registry.tools.len);
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        nativeToolSet(false, builtin_tools.advertisement_set).registry.tools.len,
+    );
     if (comptime !host_target.is_wasm) {
-        try std.testing.expect(nativeToolSet(true).registry.tools.len > 0);
+        try std.testing.expect(nativeToolSet(true, null).registry.tools.len > 0);
+        const selected = tool_set_contract.ToolSet{
+            .registry = .{ .tools = builtin_tools.registry.tools[0..1] },
+            .order = builtin_tools.advertisement_set.order[0..1],
+            .read_only_tool_names = &.{},
+        };
+        try std.testing.expectEqual(
+            @as(usize, 1),
+            nativeToolSet(true, selected).registry.tools.len,
+        );
     }
 }
 

@@ -125,6 +125,65 @@ describe.skipIf(SKIP_TMUX)("tui: fresh-session commands", () => {
   );
 
   test(
+    "global native tool selection sends the TUI model only the ordered allowlist",
+    async () => {
+      const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-tui-native-tool-selection-")));
+      const home = join(root, "home");
+      const workspace = join(root, "workspace");
+      const stderrPath = join(root, "stderr.log");
+      mkdirSync(home);
+      mkdirSync(workspace);
+      writeFileSync(stderrPath, "");
+      const gateway = startFakeGateway([
+        fakeGatewayFinalText("TUI_NATIVE_TOOLS_SELECTED"),
+      ]);
+
+      try {
+        session = await TmuxSession.create({
+          cmd: `${FX_BIN} --tool terminal:exec --tool read_file`,
+          cwd: workspace,
+          env: {
+            HOME: home,
+            AI_GATEWAY_API_KEY: "fake-tui-native-tool-selection-key",
+            VERCEL_OIDC_TOKEN: undefined,
+            FX_GATEWAY_BASE_URL: gateway.baseUrl,
+            FX_GATEWAY_CHAT_URL: gateway.chatUrl,
+            FX_MODEL: FAKE_GATEWAY_MODEL,
+            FX_AUTO_UPGRADE: "0",
+          },
+          stderrPath,
+        });
+
+        await session.waitForComposer(10_000);
+        await session.sendText("Answer with the selected native tools.");
+        await session.waitForText("TUI_NATIVE_TOOLS_SELECTED", 10_000);
+        expect(gateway.requests).toHaveLength(1);
+        const request = JSON.parse(gateway.requests[0]!.body) as {
+          tools: Array<{ name: string }>;
+        };
+        expect(request.tools.map((tool) => tool.name)).toEqual([
+          "terminal",
+          "read_file",
+        ]);
+        expect(readFileSync(stderrPath, "utf8")).toBe("");
+
+        await session.sendText("/quit");
+        expect(await session.waitForSessionEnd(5_000)).toBe(true);
+        await session.kill();
+        session = null;
+      } finally {
+        gateway.stop();
+        if (session) {
+          await session.kill();
+          session = null;
+        }
+        rmSync(root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
     "statusline hides the workspace identity by default",
     async () => {
       const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-e2e-statusline-default-")));

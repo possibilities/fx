@@ -22,6 +22,7 @@ const mcp_contract = @import("../mcp/mcp_contract.zig");
 const mcp_command_provider = @import("../mcp/command_provider.zig");
 const mcp_health = @import("../mcp/health.zig");
 const mcp_runtime = @import("../mcp/mcp_runtime.zig");
+const tool_selection = @import("../tooling/tool_selection.zig");
 const tool_set_contract = @import("../tooling/tool_set.zig");
 const update_target = @import("../upgrade/update_target.zig");
 const test_builtin_gateway = if (builtin.is_test)
@@ -64,6 +65,7 @@ pub const Config = struct {
     context_registry: context_contract.Registry,
     mode_registry: mode_registry.Registry,
     tool_set: tool_set_contract.ToolSet,
+    tool_selection_catalog: tool_selection.Catalog = .{},
     inspect_mcp_profile_config: mcp_contract.InspectProfileConfigFn,
     inspect_mcp_local_config: mcp_health.InspectLocalConfigFn =
         mcp_health.inspectLocalConfigUnavailable,
@@ -218,6 +220,7 @@ fn unavailableCliDispatch(_: ?*anyopaque, _: Allocator, _: []const [:0]const u8,
 fn runInteractiveWithDeps(comptime App: type, comptime cooperative: bool, alloc: Allocator, launch: *cli_surface.InteractiveLaunch, deps: RunDeps) !RunOutcome {
     const resume_requested = launch.requested_resume != null;
     const allow_native_tools = launch.modifiers.allow_native_tools;
+    const selected_native_tools = launch.modifiers.selected_native_tools;
     var app = App.init(alloc, launch) catch |err| {
         switch (err) {
             error.NotATerminal => {
@@ -319,7 +322,14 @@ fn runInteractiveWithDeps(comptime App: type, comptime cooperative: bool, alloc:
     var relaunch_argv: std.ArrayList([]const u8) = .empty;
     defer relaunch_argv.deinit(alloc);
     if (relaunch_request != null) {
-        try relaunch_argv.ensureTotalCapacity(alloc, 5 + relaunch_skill_roots.len * 2);
+        const native_tool_arg_count: usize = if (!allow_native_tools)
+            1
+        else
+            selected_native_tools.len * 2;
+        try relaunch_argv.ensureTotalCapacity(
+            alloc,
+            4 + native_tool_arg_count + relaunch_skill_roots.len * 2,
+        );
     }
     const resume_handoff_columns: u16 = if (comptime cooperative)
         0
@@ -339,6 +349,11 @@ fn runInteractiveWithDeps(comptime App: type, comptime cooperative: bool, alloc:
             relaunch_argv.appendAssumeCapacity(request.executablePath());
             if (!allow_native_tools) {
                 relaunch_argv.appendAssumeCapacity("--no-native-tools");
+            } else {
+                for (selected_native_tools) |name| {
+                    relaunch_argv.appendAssumeCapacity("--tool");
+                    relaunch_argv.appendAssumeCapacity(name);
+                }
             }
             for (relaunch_skill_roots) |root| {
                 relaunch_argv.appendAssumeCapacity("--skills-dir");
@@ -353,10 +368,12 @@ fn runInteractiveWithDeps(comptime App: type, comptime cooperative: bool, alloc:
                 .{ .argv = relaunch_argv.items },
             );
             writeUpgradeRelaunchFailure(
+                alloc,
                 deps,
                 replace_err,
                 handoff.session_id,
                 allow_native_tools,
+                selected_native_tools,
             );
         } else {
             writeStderr(
@@ -420,26 +437,52 @@ fn replaceProcessDefault(
 }
 
 fn writeUpgradeRelaunchFailure(
+    alloc: Allocator,
     deps: RunDeps,
     err: std.process.ReplaceError,
     session_id: []const u8,
     allow_native_tools: bool,
+    selected_native_tools: []const []const u8,
 ) void {
-    var buffer: [768]u8 = undefined;
-    const message = if (allow_native_tools)
-        std.fmt.bufPrint(
-            &buffer,
-            "fx: upgrade installed, but relaunch failed: {s}\nContinue session with: fx --resume {s}\n",
-            .{ @errorName(err), session_id },
-        )
-    else
-        std.fmt.bufPrint(
-            &buffer,
-            "fx: upgrade installed, but relaunch failed: {s}\nContinue session with: fx --no-native-tools --resume {s}\n",
-            .{ @errorName(err), session_id },
+    const rendered = formatUpgradeRelaunchFailure(
+        alloc,
+        err,
+        session_id,
+        allow_native_tools,
+        selected_native_tools,
+    ) catch {
+        writeStderr(
+            deps,
+            "fx: upgrade installed, but relaunch failed; run `fx doctor`.\n",
         );
-    const rendered = message catch "fx: upgrade installed, but relaunch failed; run `fx doctor`.\n";
+        return;
+    };
+    defer alloc.free(rendered);
     writeStderr(deps, rendered);
+}
+
+fn formatUpgradeRelaunchFailure(
+    alloc: Allocator,
+    err: std.process.ReplaceError,
+    session_id: []const u8,
+    allow_native_tools: bool,
+    selected_native_tools: []const []const u8,
+) ![]u8 {
+    var writer: std.Io.Writer.Allocating = .init(alloc);
+    errdefer writer.deinit();
+    try writer.writer.print(
+        "fx: upgrade installed, but relaunch failed: {s}\nContinue session with: fx",
+        .{@errorName(err)},
+    );
+    if (!allow_native_tools) {
+        try writer.writer.writeAll(" --no-native-tools");
+    } else {
+        for (selected_native_tools) |name| {
+            try writer.writer.print(" --tool {s}", .{name});
+        }
+    }
+    try writer.writer.print(" --resume {s}\n", .{session_id});
+    return writer.toOwnedSlice();
 }
 
 fn cliSurfaceConfig(cfg: Config) cli_surface.Config {
@@ -471,6 +514,7 @@ fn cliSurfaceConfig(cfg: Config) cli_surface.Config {
         .context_registry = cfg.context_registry,
         .mode_registry = cfg.mode_registry,
         .tool_set = cfg.tool_set,
+        .tool_selection_catalog = cfg.tool_selection_catalog,
         .inspect_mcp_profile_config = cfg.inspect_mcp_profile_config,
         .inspect_mcp_local_config = cfg.inspect_mcp_local_config,
         .load_mcp_runtime = cfg.load_mcp_runtime,
@@ -1089,6 +1133,44 @@ test "app entry preserves native tool suppression across upgrade relaunch" {
         u8,
         capture.stderr.written(),
         "fx --no-native-tools --resume session-123",
+    ) != null);
+}
+
+test "app entry preserves ordered native tool selection across upgrade relaunch" {
+    const alloc = std.testing.allocator;
+    const selected = try alloc.alloc([]u8, 2);
+    selected[0] = try alloc.dupe(u8, "terminal:exec");
+    selected[1] = try alloc.dupe(u8, "read_file");
+    var capture = TestCapture.init(.{ .interactive = .{
+        .modifiers = .{ .selected_native_tools = selected },
+    } });
+    defer capture.deinit();
+    capture.resume_handoff_id = "session-123";
+    capture.upgrade_relaunch_path = "/tmp/fx-upgraded";
+
+    const outcome = try runWithDeps(
+        TestApp,
+        alloc,
+        &.{},
+        testConfig(),
+        capture.deps(),
+    );
+
+    try std.testing.expectEqual(@as(u8, 1), outcome.exit);
+    try std.testing.expectEqual(@as(usize, 1), capture.replace_calls);
+    try std.testing.expectEqual(@as(usize, 8), capture.replace_arg_count);
+    try std.testing.expectEqualStrings("/tmp/fx-upgraded", capture.replaceArg(0));
+    try std.testing.expectEqualStrings("--tool", capture.replaceArg(1));
+    try std.testing.expectEqualStrings("terminal:exec", capture.replaceArg(2));
+    try std.testing.expectEqualStrings("--tool", capture.replaceArg(3));
+    try std.testing.expectEqualStrings("read_file", capture.replaceArg(4));
+    try std.testing.expectEqualStrings("resume", capture.replaceArg(5));
+    try std.testing.expectEqualStrings("session-123", capture.replaceArg(6));
+    try std.testing.expectEqualStrings("--upgrade-relaunch", capture.replaceArg(7));
+    try std.testing.expect(std.mem.find(
+        u8,
+        capture.stderr.written(),
+        "fx --tool terminal:exec --tool read_file --resume session-123",
     ) != null);
 }
 
