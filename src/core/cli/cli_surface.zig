@@ -688,12 +688,25 @@ pub fn systemPromptFilesRequested(args: []const [:0]const u8) bool {
         {
             return true;
         }
-        if (std.mem.eql(u8, arg, "--context-limit") or std.mem.eql(u8, arg, "--add-dir")) {
+        if (std.mem.eql(u8, arg, "--context-limit") or
+            std.mem.eql(u8, arg, "--add-dir") or
+            std.mem.eql(u8, arg, "--skills-dir") or
+            std.mem.eql(u8, arg, "--tool") or
+            std.mem.eql(u8, arg, "--state-dir") or
+            std.mem.eql(u8, arg, "--permissions-file"))
+        {
             index += 1;
             if (index >= args.len) return false;
         } else if (!std.mem.startsWith(u8, arg, "--context-limit=") and
             !std.mem.startsWith(u8, arg, "--add-dir=") and
-            !std.mem.eql(u8, arg, "--no-additional-dirs"))
+            !std.mem.startsWith(u8, arg, "--skills-dir=") and
+            !std.mem.startsWith(u8, arg, "--tool=") and
+            !std.mem.startsWith(u8, arg, "--state-dir=") and
+            !std.mem.startsWith(u8, arg, "--permissions-file=") and
+            !std.mem.eql(u8, arg, "--no-additional-dirs") and
+            !std.mem.eql(u8, arg, "--no-native-tools") and
+            !std.mem.eql(u8, arg, "--no-default-skills") and
+            !std.mem.eql(u8, arg, "--no-project-instructions"))
         {
             return false;
         }
@@ -4822,6 +4835,23 @@ test "workflow launch config preserves ordered invocation skill roots" {
     try std.testing.expectEqual(@as(usize, 2), workflow_cfg.invocation_skill_roots.len);
     try std.testing.expectEqualStrings("/tmp/team-skills", workflow_cfg.invocation_skill_roots[0]);
     try std.testing.expectEqualStrings("/opt/shared-skills", workflow_cfg.invocation_skill_roots[1]);
+}
+
+test "global prompt detection scans across shared TUI and ACP controls" {
+    try std.testing.expect(systemPromptFilesRequested(&.{
+        @constCast("--state-dir"),
+        @constCast("/tmp/fx state"),
+        @constCast("--permissions-file=/tmp/policy.json"),
+        @constCast("--no-project-instructions"),
+        @constCast("--append-system-prompt-file=extra.md"),
+    }));
+    try std.testing.expect(systemPromptFilesRequested(&.{
+        @constCast("--permissions-file"),
+        @constCast("/tmp/policy.json"),
+        @constCast("--state-dir=/tmp/fx-state"),
+        @constCast("--system-prompt-file"),
+        @constCast("base.md"),
+    }));
 }
 
 test "global system prompt file modifiers preserve replacement and append order" {
