@@ -177,6 +177,7 @@ pub const Context = struct {
     session: *SessionRuntime,
     session_allocator: Allocator = std.heap.c_allocator,
     skills_dir: []const u8 = "",
+    invocation_skill_roots: []const []const u8 = &.{},
     context_limits: context_limits.Values = .{},
     context_registry: context_contract.Registry,
     context_enabled: bool = true,
@@ -872,6 +873,7 @@ fn typedDispatchContext(ctx: Context, arena: Allocator) tool_dispatch.DispatchCo
         .access_scope = ctx.access_scope,
         .change_tracker = ctx.tracker,
         .skills_dir = ctx.skills_dir,
+        .invocation_skill_roots = ctx.invocation_skill_roots,
         .context_limits = ctx.context_limits,
         .ignored_list_entries = ctx.ignored_list_entries,
         .max_list_entries = ctx.max_list_entries,
@@ -2205,6 +2207,7 @@ const TestRuntime = struct {
     workspace_root: []const u8 = "/tmp",
     ignored_list_entries: []const []const u8 = &.{},
     skills_dir: []const u8 = "",
+    invocation_skill_roots: []const []const u8 = &.{},
     tracker: ?*change_tracker.ChangeTracker = null,
     permission_rules: types.PermissionRuleSet = .{},
     permission_grants: []const PermissionGrant = &.{},
@@ -2292,6 +2295,7 @@ const TestRuntime = struct {
             .session = &self.session,
             .session_allocator = self.session_allocator,
             .skills_dir = self.skills_dir,
+            .invocation_skill_roots = self.invocation_skill_roots,
             .context_registry = test_context_registry,
             .context_limits = self.context_limits,
             .output_chunk_ctx = undefined,
@@ -7787,6 +7791,50 @@ test "supplied session grant authorizes skill in a fresh session" {
     }, .ask, &grants)).decision;
 
     try std.testing.expectEqual(ToolPermissionDecision.once, decision);
+}
+
+test "skill tool loads an invocation-root skill" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/workspace");
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx/skills");
+    try tmp.dir.createDirPath(io_mod.getIo(), "custom/workflow");
+    {
+        var file = try tmp.dir.createFile(io_mod.getIo(), "custom/workflow/SKILL.md", .{});
+        defer file.close(io_mod.getIo());
+        try file.writeStreamingAll(
+            io_mod.getIo(),
+            "---\nname: workflow\ndescription: invocation workflow\n---\n\nINVOCATION ROOT BODY\n",
+        );
+    }
+
+    const workspace_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home/workspace");
+    defer alloc.free(workspace_root);
+    const skills_dir = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home/.fx/skills");
+    defer alloc.free(skills_dir);
+    const custom_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "custom");
+    defer alloc.free(custom_root);
+    const invocation_skill_roots = [_][]const u8{custom_root};
+    try setTestHome(null);
+    defer setTestHome(null) catch {};
+
+    var rt = TestRuntime{
+        .workspace_root = workspace_root,
+        .skills_dir = skills_dir,
+        .invocation_skill_roots = &invocation_skill_roots,
+    };
+    defer rt.deinit(alloc);
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const result = try executeToolCall(
+        rt.context(),
+        arena_state.allocator(),
+        .{ .id = "1", .name = "skill", .arguments_json = "{\"name\":\"workflow\"}" },
+    );
+    try std.testing.expectEqual(tool_contracts.ToolExecutionStatus.success, result.status);
+    try expectContains(result.model_output, "INVOCATION ROOT BODY");
 }
 
 test "skill tool reports missing skill" {
