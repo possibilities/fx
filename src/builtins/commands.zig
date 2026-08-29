@@ -354,6 +354,10 @@ pub const top_level_flags = [_]TopLevelFlag{
         .description = "Ignore saved additional directories",
     },
     .{
+        .usage = "--state-dir <path>",
+        .description = "Use an isolated Fx profile for TUI or ACP",
+    },
+    .{
         .usage = "-c, --continue",
         .description = "Resume the latest workspace session",
     },

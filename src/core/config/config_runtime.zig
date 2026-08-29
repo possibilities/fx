@@ -844,6 +844,14 @@ pub fn attemptUserPreferences(
     patch: UserSettingsPatch,
 ) CommitAttempt {
     const home = io_mod.getenv("HOME") orelse return .{ .failure = .{ .err = error.HomeNotSet } };
+    return attemptUserPreferencesFromHome(alloc, home, patch);
+}
+
+pub fn attemptUserPreferencesFromHome(
+    alloc: Allocator,
+    home: []const u8,
+    patch: UserSettingsPatch,
+) CommitAttempt {
     var store = settings_store.Store.initFromHome(alloc, home, .writable) catch |err| {
         return .{ .failure = .{ .err = err } };
     };
@@ -892,6 +900,14 @@ pub fn mutateWorkspaceDirectory(
     mutation: WorkspaceDirectoryMutation,
 ) !CommitOutcome {
     const home = io_mod.getenv("HOME") orelse return error.HomeNotSet;
+    return mutateWorkspaceDirectoryFromHome(alloc, home, mutation);
+}
+
+pub fn mutateWorkspaceDirectoryFromHome(
+    alloc: Allocator,
+    home: []const u8,
+    mutation: WorkspaceDirectoryMutation,
+) !CommitOutcome {
     var store = try settings_store.Store.initFromHome(alloc, home, .writable);
     defer store.deinit(alloc);
     return store.applyWorkspaceDirectoryPatch(alloc, mutation);
@@ -902,6 +918,14 @@ pub fn mutatePermission(
     mutation: PermissionMutation,
 ) !CommitOutcome {
     const home = io_mod.getenv("HOME") orelse return error.HomeNotSet;
+    return mutatePermissionFromHome(alloc, home, mutation);
+}
+
+pub fn mutatePermissionFromHome(
+    alloc: Allocator,
+    home: []const u8,
+    mutation: PermissionMutation,
+) !CommitOutcome {
     var store = try settings_store.Store.initFromHome(alloc, home, .writable);
     defer store.deinit(alloc);
     return store.applyPermissionPatch(alloc, mutation);
@@ -916,6 +940,26 @@ pub fn addPermissionRule(
     action: types.PermissionAction,
 ) !CommitOutcome {
     return mutatePermission(alloc, .{
+        .scope = scope,
+        .workspace_root = workspace_root,
+        .patch = .{ .add = .{
+            .category = category,
+            .pattern = pattern,
+            .action = action,
+        } },
+    });
+}
+
+pub fn addPermissionRuleFromHome(
+    alloc: Allocator,
+    home: []const u8,
+    scope: PermissionScope,
+    workspace_root: ?[]const u8,
+    category: []const u8,
+    pattern: []const u8,
+    action: types.PermissionAction,
+) !CommitOutcome {
+    return mutatePermissionFromHome(alloc, home, .{
         .scope = scope,
         .workspace_root = workspace_root,
         .patch = .{ .add = .{
@@ -943,6 +987,24 @@ pub fn removePermissionRule(
     });
 }
 
+pub fn removePermissionRuleFromHome(
+    alloc: Allocator,
+    home: []const u8,
+    scope: PermissionScope,
+    workspace_root: ?[]const u8,
+    category: []const u8,
+    pattern: []const u8,
+) !CommitOutcome {
+    return mutatePermissionFromHome(alloc, home, .{
+        .scope = scope,
+        .workspace_root = workspace_root,
+        .patch = .{ .remove = .{
+            .category = category,
+            .pattern = pattern,
+        } },
+    });
+}
+
 pub fn removeAllowlistRules(
     alloc: Allocator,
     permission_scope: PermissionScope,
@@ -950,6 +1012,20 @@ pub fn removeAllowlistRules(
     reset_scope: AllowlistResetScope,
 ) !CommitOutcome {
     return mutatePermission(alloc, .{
+        .scope = permission_scope,
+        .workspace_root = workspace_root,
+        .patch = .{ .reset = reset_scope },
+    });
+}
+
+pub fn removeAllowlistRulesFromHome(
+    alloc: Allocator,
+    home: []const u8,
+    permission_scope: PermissionScope,
+    workspace_root: ?[]const u8,
+    reset_scope: AllowlistResetScope,
+) !CommitOutcome {
+    return mutatePermissionFromHome(alloc, home, .{
         .scope = permission_scope,
         .workspace_root = workspace_root,
         .patch = .{ .reset = reset_scope },

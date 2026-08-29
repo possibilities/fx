@@ -121,6 +121,13 @@ fx builds as a native binary or WebAssembly. Applications embedding fx can provi
 
 The WebAssembly SDK is experimental. See the [WebAssembly SDK](sdk/README.md) and [ACP documentation](https://fx.sh/docs/using-fx/acp).
 
+Run `fx --state-dir <path>` for an interactive session, or
+`fx --state-dir <path> acp` for ACP, when the agent needs an isolated Fx
+profile. The directory must already exist; Fx keeps its settings,
+authorization, profile instructions, profile-global skills, MCP state,
+memories, usage, prompt history, and sessions beneath `<path>/.fx` while
+terminal tools and MCP processes retain the normal `HOME` environment.
+
 ## Extend fx
 
 In the interactive shell, bare `/mcp` opens an inline browser for servers, tools, resources, and prompts without adding anything to the transcript. Resource and prompt content enters the composer only after an explicit Insert action. Direct `/mcp SUBCOMMAND` forms remain available.

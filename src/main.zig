@@ -514,6 +514,8 @@ const App = struct {
     provider_selection: provider_runtime.Runtime = provider_runtime.Runtime.init(std.heap.c_allocator),
     model_cache: model_cache_runtime.Runtime = model_cache_runtime.Runtime.init(std.heap.c_allocator, builtin_gateway.models_path),
     usage_dashboard: usage_dashboard_runtime.Runtime = usage_dashboard_runtime.Runtime.init(std.heap.c_allocator),
+    /// Explicit Fx profile home; child processes continue to inherit real HOME.
+    profile_home: ?[]const u8 = null,
     workspace_root: []u8 = &.{},
     workspace_identity: statusline_identity.Runtime = .{},
     workspace_host: WorkspaceHostRuntime = .{},
@@ -591,6 +593,7 @@ const App = struct {
         _: Allocator,
         _: []const u8,
         _: @import("core/mcp/elicitation.zig").Capabilities,
+        _: ?[]const u8,
     ) !?*mcp_runtime_mod.McpRuntime {
         return null;
     }
@@ -637,6 +640,9 @@ const App = struct {
                 );
             }
         }
+        app.profile_home = launch.modifiers.state_home;
+        app.mcp.setProfileHome(app.profile_home);
+        app.auth.setProfileHome(app.profile_home);
         app.shell.max_transcript_bytes = max_transcript_bytes;
         if (launch.requested_resume) |target| {
             app.requested_resume = target;
@@ -1883,7 +1889,10 @@ const App = struct {
     }
 
     pub fn reloadSkills(self: *App) !void {
-        const loaded = try app_runtime_setup.loadSkills(std.heap.c_allocator, self.workspace_root, builtin_skills.root_policy);
+        const loaded = if (self.profile_home) |home_dir|
+            try app_runtime_setup.loadSkillsFromHome(std.heap.c_allocator, self.workspace_root, home_dir, builtin_skills.root_policy)
+        else
+            try app_runtime_setup.loadSkills(std.heap.c_allocator, self.workspace_root, builtin_skills.root_policy);
         skill_runtime.traceDiagnostics("interactive_reload", loaded.diagnostics);
         self.skills.replaceLoaded(std.heap.c_allocator, loaded.dir, loaded.skills, loaded.diagnostics);
     }
@@ -4159,6 +4168,7 @@ test {
     _ = @import("core/app/app_bootstrap_runtime.zig");
     _ = @import("core/app/app_callbacks.zig");
     _ = @import("core/app/app_commands.zig");
+    _ = @import("core/app/app_profile_runtime.zig");
     _ = @import("core/app/app_entry_runtime.zig");
     _ = @import("core/app/app_input_runtime.zig");
     _ = @import("core/app/app_lifecycle.zig");
@@ -4237,6 +4247,7 @@ test {
     _ = @import("core/permissions/auto_classifier.zig");
     _ = @import("core/permissions/command_admission.zig");
     _ = @import("core/mcp/mcp_runtime.zig");
+    _ = @import("core/mcp/mcp_auth_store.zig");
     _ = @import("core/mcp/features/common.zig");
     _ = @import("core/mcp/features/resources.zig");
     _ = @import("core/mcp/features/prompts.zig");
@@ -4320,6 +4331,7 @@ test {
     _ = @import("tools/web/html_to_markdown.zig");
     _ = @import("tools/filesystem/read_file.zig");
     _ = @import("tools/session/read_tool_result.zig");
+    _ = @import("tools/memory/memory.zig");
     _ = @import("tools/skills/install_skill.zig");
     _ = @import("tools/skills/skill.zig");
     _ = @import("core/upgrade/upgrade_helpers.zig");
