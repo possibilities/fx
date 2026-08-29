@@ -26,6 +26,21 @@ const TIMEOUT = 30_000;
 
 let session: TmuxSession | null = null;
 
+function nestedText(content: unknown): string {
+  if (typeof content === "string") return content;
+  if (Array.isArray(content)) return content.map(nestedText).join("");
+  if (content && typeof content === "object") {
+    const value = content as Record<string, unknown>;
+    return [nestedText(value.text), nestedText(value.value), nestedText(value.content)].join("");
+  }
+  return "";
+}
+
+function gatewayPromptText(body: string): string {
+  const request = JSON.parse(body) as { prompt: Array<{ content: unknown }> };
+  return request.prompt.map((message) => nestedText(message.content)).join("\n");
+}
+
 afterEach(async () => {
   if (session) { await session.kill(); session = null; }
 });
@@ -249,6 +264,67 @@ describe.skipIf(SKIP_TMUX)("tui: fresh-session commands", () => {
         );
         expect(body).not.toContain("managed-default");
         expect(body).not.toContain("workspace-default");
+        expect(readFileSync(stderrPath, "utf8")).toBe("");
+
+        await session.sendText("/quit");
+        expect(await session.waitForSessionEnd(5_000)).toBe(true);
+        await session.kill();
+        session = null;
+      } finally {
+        gateway.stop();
+        if (session) {
+          await session.kill();
+          session = null;
+        }
+        rmSync(root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "global project instruction suppression keeps TUI runtime context",
+    async () => {
+      const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-tui-no-project-instructions-")));
+      const home = join(root, "home");
+      const workspace = join(root, "workspace");
+      const stderrPath = join(root, "stderr.log");
+      const globalRule = "TUI_GLOBAL_RULE_MUST_BE_ABSENT";
+      const projectRule = "TUI_PROJECT_RULE_MUST_BE_ABSENT";
+      mkdirSync(join(home, ".fx"), { recursive: true });
+      mkdirSync(workspace);
+      writeFileSync(join(home, ".fx", "AGENTS.md"), `${globalRule}\n`);
+      writeFileSync(join(workspace, "AGENTS.md"), `${projectRule}\n`);
+      writeFileSync(stderrPath, "");
+      const gateway = startFakeGateway([
+        fakeGatewayFinalText("TUI_PROJECT_INSTRUCTIONS_DISABLED"),
+      ]);
+
+      try {
+        session = await TmuxSession.create({
+          cmd: `${FX_BIN} --no-project-instructions`,
+          cwd: workspace,
+          env: {
+            HOME: home,
+            AI_GATEWAY_API_KEY: "fake-tui-project-instruction-key",
+            VERCEL_OIDC_TOKEN: undefined,
+            FX_GATEWAY_BASE_URL: gateway.baseUrl,
+            FX_GATEWAY_CHAT_URL: gateway.chatUrl,
+            FX_MODEL: FAKE_GATEWAY_MODEL,
+            FX_AUTO_UPGRADE: "0",
+          },
+          stderrPath,
+        });
+
+        await session.waitForComposer(10_000);
+        await session.sendText("Answer using current runtime facts.");
+        await session.waitForText("TUI_PROJECT_INSTRUCTIONS_DISABLED", 10_000);
+        expect(gateway.requests).toHaveLength(1);
+        const promptText = gatewayPromptText(gateway.requests[0]!.body);
+        expect(promptText).not.toContain(globalRule);
+        expect(promptText).not.toContain(projectRule);
+        expect(promptText).toContain(`workspace_root: ${realpathSync(workspace)}`);
+        expect(promptText).toContain("Runtime context: permission mode is auto.");
         expect(readFileSync(stderrPath, "utf8")).toBe("");
 
         await session.sendText("/quit");

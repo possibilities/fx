@@ -586,6 +586,7 @@ const App = struct {
     allow_native_tools: bool = true,
     native_tool_selection: tool_selection.Resolved =
         tool_selection.Resolved.borrowed(builtin_tools.advertisement_set),
+    project_instructions_enabled: bool = true,
     context_limits: config_runtime.context_limits.Values = .{},
     fast_mode: bool = false,
     auto_upgrade_enabled: bool = true,
@@ -630,6 +631,7 @@ const App = struct {
             else
                 background_process.provider),
             .allow_native_tools = launch.modifiers.allow_native_tools,
+            .project_instructions_enabled = launch.modifiers.project_instructions_enabled,
         };
         auth_runtime.Runtime.initInto(
             &app.auth,
@@ -3613,6 +3615,7 @@ test "full entry config commands also use early threaded io" {
         @as([:0]const u8, "--no-native-tools"),
         @as([:0]const u8, "--no-default-skills"),
         @as([:0]const u8, "--skills-dir=/tmp/acp-skills"),
+        @as([:0]const u8, "--no-project-instructions"),
         @as([:0]const u8, "acp"),
     }));
     try std.testing.expect(needsFullEntryConfig(&.{
