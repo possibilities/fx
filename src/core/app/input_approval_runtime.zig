@@ -405,7 +405,10 @@ pub fn ApprovalRuntime(comptime App: type) type {
             return true;
         }
 
-        pub fn cancelApprovalOperation(app: *App) !void {
+        pub fn cancelApprovalOperation(
+            app: *App,
+            comptime presentation: input_queue_runtime.ReviewPresentation,
+        ) !void {
             if (comptime @hasField(App, "subagents")) {
                 if (comptime @hasDecl(@TypeOf(app.subagents), "mainApprovalBinding")) {
                     if (app.approval_prompt.request) |request| {
@@ -423,7 +426,7 @@ pub fn ApprovalRuntime(comptime App: type) type {
                 debug_trace.logf("input", "cancel approval operation queued={d}", .{app.worker.queuedPromptCount()});
                 interrupt.traceInterruptRequested(app, "input_approval");
             }
-            if (comptime @hasField(App, "queued_prompt_review")) {
+            if (comptime @hasField(App, "queued_prompt_review") and presentation == .open) {
                 _ = queue_rt.pauseAndOpenAfterModalCancel(app);
             }
             app.worker.cancelApprovalTurn();

@@ -102,6 +102,8 @@ pub const PromptAdmission = enum {
     replaced,
 };
 
+pub const ReviewPresentation = enum { hidden, open };
+
 pub fn Runtime(comptime App: type) type {
     return struct {
         pub fn requestCancelAndOpen(app: *App) bool {

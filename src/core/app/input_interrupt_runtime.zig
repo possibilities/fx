@@ -8,7 +8,10 @@ pub fn InterruptRuntime(comptime App: type) type {
     return struct {
         const queue_rt = input_queue_runtime.Runtime(App);
 
-        pub fn cancelActiveOperation(app: *App) !void {
+        pub fn cancelActiveOperation(
+            app: *App,
+            comptime presentation: input_queue_runtime.ReviewPresentation,
+        ) !void {
             if (!app.stream.active) return;
             // Pending approval keeps the stream active until resolution.
             // Avoid duplicate cancellation notices once the worker is cancelled.
@@ -16,8 +19,11 @@ pub fn InterruptRuntime(comptime App: type) type {
             const tool_active = activeToolStatusCount(app) > 0;
             debug_trace.logf("input", "cancel active operation queued={d}", .{app.worker.queuedPromptCount()});
             traceInterruptRequested(app, "input_active_stream");
-            const queue_review_opened = if (comptime @hasField(App, "queued_prompt_review"))
-                queue_rt.requestCancelAndOpen(app)
+            const queue_review_started = if (comptime @hasField(App, "queued_prompt_review"))
+                if (comptime presentation == .open)
+                    queue_rt.requestCancelAndOpen(app)
+                else
+                    app.worker.requestCancelWithQueueReview()
             else blk: {
                 app.worker.requestCancel();
                 break :blk false;
@@ -27,7 +33,7 @@ pub fn InterruptRuntime(comptime App: type) type {
             if (!tool_active) {
                 try app.writeDomainNotice(session_runtime.interrupted_turn_notice, true);
             }
-            if (tool_active and !queue_review_opened) return;
+            if (tool_active and !queue_review_started) return;
             app.stream = .{};
             app.shell.render_requests.request(.footer);
         }
@@ -103,4 +109,69 @@ test "interactive connectivity wait maps try later to recovery pause" {
     app.worker.connectivity_wait_active = false;
     try std.testing.expect(!InterruptRuntime(FakeApp).pauseActiveRecovery(&app));
     try std.testing.expect(!app.worker.pause_requested);
+}
+
+test "hidden interrupt pauses queued work without opening the human editor" {
+    const FakeWorker = struct {
+        cancel_requested: bool = false,
+
+        pub fn isCancelRequested(self: *const @This()) bool {
+            return self.cancel_requested;
+        }
+
+        pub fn queuedPromptCount(_: *const @This()) usize {
+            return 1;
+        }
+
+        pub fn requestCancelWithQueueReview(self: *@This()) bool {
+            self.cancel_requested = true;
+            return true;
+        }
+    };
+    const FakePrompt = struct {
+        pub fn isActive(_: *const @This()) bool {
+            return false;
+        }
+    };
+    const FakeStream = struct {
+        active: bool = false,
+        chunks: usize = 0,
+        last_activity_kind: ?enum { text } = null,
+    };
+    const FakeRenderRequests = struct {
+        requested: bool = false,
+
+        pub fn request(self: *@This(), _: anytype) void {
+            self.requested = true;
+        }
+    };
+    const FakeShell = struct {
+        render_requests: FakeRenderRequests = .{},
+    };
+    const FakePacer = struct {
+        pub fn clear(_: *@This(), _: std.mem.Allocator) void {}
+    };
+    const FakeApp = struct {
+        alloc: std.mem.Allocator = std.testing.allocator,
+        worker: FakeWorker = .{},
+        stream: FakeStream = .{ .active = true },
+        approval_prompt: FakePrompt = .{},
+        question_prompt: FakePrompt = .{},
+        queued_prompt_review: struct { visible: bool = false } = .{},
+        shell: FakeShell = .{},
+        pacer: FakePacer = .{},
+        notice_written: bool = false,
+
+        pub fn writeDomainNotice(self: *@This(), _: anytype, _: bool) !void {
+            self.notice_written = true;
+        }
+    };
+
+    var app = FakeApp{};
+    try InterruptRuntime(FakeApp).cancelActiveOperation(&app, .hidden);
+    try std.testing.expect(app.worker.cancel_requested);
+    try std.testing.expect(!app.queued_prompt_review.visible);
+    try std.testing.expect(!app.stream.active);
+    try std.testing.expect(app.notice_written);
+    try std.testing.expect(app.shell.render_requests.requested);
 }

@@ -51,20 +51,27 @@ pub fn QuestionRuntime(comptime App: type) type {
                     return .consumed;
                 },
                 .cancelled => {
-                    try cancelQuestionPrompt(app);
+                    try cancelQuestionPrompt(app, .open);
                     return .consumed;
                 },
                 .limit_exceeded => return .limit_exceeded,
             }
         }
 
-        pub fn cancelQuestionPrompt(app: *App) !void {
+        pub fn cancelQuestionPrompt(
+            app: *App,
+            comptime presentation: input_queue_runtime.ReviewPresentation,
+        ) !void {
             const route_recovery = isRouteRecoveryPrompt(app);
             const mcp_elicitation = isMcpElicitationPrompt(app);
             interrupt.traceInterruptRequested(app, "input_question");
             if (!route_recovery) {
                 if (comptime @hasField(App, "queued_prompt_review")) {
-                    _ = queue_rt.requestCancelAndOpen(app);
+                    if (comptime presentation == .open) {
+                        _ = queue_rt.requestCancelAndOpen(app);
+                    } else {
+                        _ = app.worker.requestCancelWithQueueReview();
+                    }
                 } else {
                     app.worker.requestCancel();
                 }
