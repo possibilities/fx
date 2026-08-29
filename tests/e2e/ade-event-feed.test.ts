@@ -347,13 +347,13 @@ describe.skipIf(!tmuxAvailable())("ADE event feed", () => {
       const originalTitle = resumePane.includes("ade-native-session-title")
         ? "ade-native-session-title"
         : "ADE_QUESTION_REQUEST";
-      expect(resumePane.indexOf(originalTitle)).toBeLessThan(
-        resumePane.indexOf("ADE_CHILD_PROMPT: run a terminal command"),
-      );
       // The picker can preserve its prior selection while the all-workspaces
-      // page loads. With exactly two rows, Up selects (or stays on) the first,
-      // original main session deterministically.
-      await session.sendKeys("Up");
+      // page loads. With exactly two rows, clamp to the edge containing the
+      // original main session instead of assuming timestamp-tied catalog order.
+      const originalComesFirst =
+        resumePane.indexOf(originalTitle) <
+        resumePane.indexOf("ADE_CHILD_PROMPT: run a terminal command");
+      await session.sendKeys(originalComesFirst ? "Up" : "Down");
       await session.sendKeys("Enter");
       await receiver.waitFor(
         (record) =>
