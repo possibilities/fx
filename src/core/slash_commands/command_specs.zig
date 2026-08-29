@@ -1592,6 +1592,7 @@ test "rendered top-level help is a complete CLI navigation page" {
     try std.testing.expect(std.mem.find(u8, text, "credits|balance") != null);
     try std.testing.expect(std.mem.find(u8, text, "Show the AI Gateway credit balance") != null);
     try std.testing.expect(std.mem.find(u8, text, "Flags:") != null);
+    try std.testing.expect(std.mem.find(u8, text, "--skills-dir <path>") != null);
     try std.testing.expect(std.mem.find(u8, text, "--context-limit <spec>") != null);
     try std.testing.expect(std.mem.find(u8, text, "Set name=bytes|off; repeatable") != null);
     try std.testing.expect(std.mem.find(u8, text, "--add-dir <path>") != null);
@@ -1648,6 +1649,7 @@ test "top-level help renders flags as compact aligned rows" {
     defer std.testing.allocator.free(narrow);
 
     try std.testing.expect(lineContainsBoth(wide, "--record", "Record terminal output"));
+    try std.testing.expect(lineContainsBoth(wide, "--skills-dir <path>", "Load an invocation skill root; repeatable"));
     try std.testing.expect(lineContainsBoth(wide, "--context-limit <spec>", "Set name=bytes|off; repeatable"));
     try std.testing.expect(lineContainsBoth(wide, "--add-dir <path>", "Add a workspace directory; repeatable"));
     try std.testing.expect(lineContainsBoth(wide, "-c, --continue", "Resume the latest workspace session"));

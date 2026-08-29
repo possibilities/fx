@@ -209,6 +209,7 @@ pub const DispatchContext = struct {
     max_read_file_line_len: usize = default_max_read_file_line_len,
     max_tool_result_bytes: usize = tool_result_limits.default_max_tool_result_bytes,
     skills_dir: []const u8 = "",
+    invocation_skill_roots: []const []const u8 = &.{},
     context_limits: context_limits.Values = .{},
     permission_ctx: ?*const PermissionContext = null,
     read_tracker: ?*read_tracker_mod.ReadTracker = null,
