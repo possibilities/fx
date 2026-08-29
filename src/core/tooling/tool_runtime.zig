@@ -547,12 +547,7 @@ fn prepareEditedPathObservation(
             call.arguments_json,
         );
     }
-    return prepareOrdinaryEditedPathObservation(
-        alloc,
-        ctx.workspace_root,
-        spec.executor_kind,
-        call.arguments_json,
-    );
+    return null;
 }
 
 fn prepareAuthorizedFileMutationObservation(
@@ -563,63 +558,6 @@ fn prepareAuthorizedFileMutationObservation(
         .paths = .{ canonical_target_path, undefined },
         .path_count = 1,
         .require_committed_file_handoff = true,
-    };
-}
-
-fn prepareOrdinaryEditedPathObservation(
-    alloc: Allocator,
-    workspace_root: []const u8,
-    executor_kind: tool_dispatch.ExecutorKind,
-    arguments_json: []const u8,
-) ?PreparedEditedPathObservation {
-    const args = tool_args.parseToolArgsObject(alloc, arguments_json) catch return null;
-    return switch (executor_kind) {
-        .delete_file => blk: {
-            const raw_path = tool_args.requiredStringArg(args, "path") catch break :blk null;
-            const path = pathing.resolveWorkspaceOrExternalPath(
-                alloc,
-                workspace_root,
-                raw_path,
-            ) catch break :blk null;
-            break :blk .{
-                .source = .file_mutation,
-                .paths = .{ path, undefined },
-                .path_count = 1,
-            };
-        },
-        .rename_file => blk: {
-            const raw_source = tool_args.requiredStringArg(args, "old_path") catch break :blk null;
-            const raw_destination = tool_args.requiredStringArg(args, "new_path") catch break :blk null;
-            const source = pathing.resolveWorkspaceOrExternalPath(
-                alloc,
-                workspace_root,
-                raw_source,
-            ) catch break :blk null;
-            const destination = pathing.resolveWorkspaceOrExternalCreatePath(
-                alloc,
-                workspace_root,
-                raw_destination,
-            ) catch break :blk null;
-            break :blk .{
-                .source = .file_mutation,
-                .paths = .{ source, destination },
-                .path_count = 2,
-            };
-        },
-        .copy_file => blk: {
-            const raw_destination = tool_args.requiredStringArg(args, "destination") catch break :blk null;
-            const destination = pathing.resolveWorkspaceOrExternalCreatePath(
-                alloc,
-                workspace_root,
-                raw_destination,
-            ) catch break :blk null;
-            break :blk .{
-                .source = .file_mutation,
-                .paths = .{ destination, undefined },
-                .path_count = 1,
-            };
-        },
-        else => null,
     };
 }
 
@@ -863,70 +801,15 @@ fn terminalStartExitedZero(alloc: Allocator, model_output: []const u8) bool {
     return exited == .integer and exited.integer == 0;
 }
 
-test "ADE edited path preparation preserves exact file-operation mutation targets" {
+test "ADE edited path preparation preserves admitted file-mutation targets" {
     const alloc = std.testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(alloc);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    try tmp.dir.createDirPath(std.testing.io, "workspace/source");
-    try tmp.dir.createDirPath(std.testing.io, "workspace/destination");
-    try tmp.dir.writeFile(std.testing.io, .{
-        .sub_path = "workspace/source/delete.txt",
-        .data = "delete",
-    });
-    try tmp.dir.writeFile(std.testing.io, .{
-        .sub_path = "workspace/source/rename.txt",
-        .data = "rename",
-    });
-    try tmp.dir.writeFile(std.testing.io, .{
-        .sub_path = "workspace/source/copy.txt",
-        .data = "copy",
-    });
-
-    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
-    defer alloc.free(workspace);
-    const delete_path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace/source/delete.txt");
-    defer alloc.free(delete_path);
-    const rename_source = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace/source/rename.txt");
-    defer alloc.free(rename_source);
-    const rename_destination = try std.fs.path.join(alloc, &.{ workspace, "destination", "renamed.txt" });
-    defer alloc.free(rename_destination);
-    const copy_destination = try std.fs.path.join(alloc, &.{ workspace, "destination", "copied.txt" });
-    defer alloc.free(copy_destination);
-
-    const delete = prepareOrdinaryEditedPathObservation(
-        arena,
-        workspace,
-        .delete_file,
-        "{\"path\":\"source/delete.txt\"}",
-    ).?;
-    try std.testing.expectEqual(@as(usize, 1), delete.slice().len);
-    try std.testing.expectEqualStrings(delete_path, delete.slice()[0]);
-
-    const rename = prepareOrdinaryEditedPathObservation(
-        arena,
-        workspace,
-        .rename_file,
-        "{\"old_path\":\"source/rename.txt\",\"new_path\":\"destination/renamed.txt\"}",
-    ).?;
-    try std.testing.expectEqual(@as(usize, 2), rename.slice().len);
-    try std.testing.expectEqualStrings(rename_source, rename.slice()[0]);
-    try std.testing.expectEqualStrings(rename_destination, rename.slice()[1]);
-
-    const copy = prepareOrdinaryEditedPathObservation(
-        arena,
-        workspace,
-        .copy_file,
-        "{\"source\":\"source/copy.txt\",\"destination\":\"destination/copied.txt\"}",
-    ).?;
-    try std.testing.expectEqual(@as(usize, 1), copy.slice().len);
-    try std.testing.expectEqualStrings(copy_destination, copy.slice()[0]);
-
-    const write = prepareAuthorizedFileMutationObservation(copy_destination);
+    const canonical_target = try std.fs.path.join(arena, &.{ "workspace", "edited.txt" });
+    const write = prepareAuthorizedFileMutationObservation(canonical_target);
     try std.testing.expectEqual(@as(usize, 1), write.slice().len);
-    try std.testing.expectEqualStrings(copy_destination, write.slice()[0]);
+    try std.testing.expectEqualStrings(canonical_target, write.slice()[0]);
     try std.testing.expect(write.require_committed_file_handoff);
 }
 
