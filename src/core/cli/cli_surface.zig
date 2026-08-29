@@ -5152,6 +5152,8 @@ test "ACP command routes parsed options and launch config through the injected r
     const Capture = struct {
         expected: Config,
         expected_invocation_root: []const u8,
+        expected_first_skill_root: []const u8,
+        expected_second_skill_root: []const u8,
         calls: usize = 0,
         config_matches: bool = false,
         launch_matches: bool = false,
@@ -5212,8 +5214,8 @@ test "ACP command routes parsed options and launch config through the injected r
                 cfg.skill_root_policy.exclusive_invocation_roots and
                 cfg.skill_root_policy.invocation_roots.len == 3 and
                 std.mem.eql(u8, cfg.skill_root_policy.invocation_roots[0], self.expected_invocation_root) and
-                std.mem.eql(u8, cfg.skill_root_policy.invocation_roots[1], "/tmp/acp-first-skills") and
-                std.mem.eql(u8, cfg.skill_root_policy.invocation_roots[2], "/tmp/acp-second-skills") and
+                std.mem.eql(u8, cfg.skill_root_policy.invocation_roots[1], self.expected_first_skill_root) and
+                std.mem.eql(u8, cfg.skill_root_policy.invocation_roots[2], self.expected_second_skill_root) and
                 std.mem.eql(u8, cfg.model_override.?, "model-override") and
                 std.mem.eql(u8, cfg.log_file.?, "/tmp/acp.log") and
                 !cfg.allow_native_tools and
@@ -5226,10 +5228,20 @@ test "ACP command routes parsed options and launch config through the injected r
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "acp-first-skills");
+    try tmp.dir.createDirPath(std.testing.io, "acp-second-skills");
     const invocation_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(invocation_root);
     const invocation_root_z = try alloc.dupeZ(u8, invocation_root);
     defer alloc.free(invocation_root_z);
+    const first_skill_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "acp-first-skills");
+    defer alloc.free(first_skill_root);
+    const first_skill_root_z = try alloc.dupeZ(u8, first_skill_root);
+    defer alloc.free(first_skill_root_z);
+    const second_skill_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "acp-second-skills");
+    defer alloc.free(second_skill_root);
+    const second_skill_root_z = try alloc.dupeZ(u8, second_skill_root);
+    defer alloc.free(second_skill_root_z);
     var prompt_file = try tmp.dir.createFile(std.testing.io, "acp-system-prompt", .{});
     defer prompt_file.close(std.testing.io);
     try prompt_file.writeStreamingAll(std.testing.io, "ACP_FILE_SYSTEM_PROMPT");
@@ -5255,7 +5267,12 @@ test "ACP command routes parsed options and launch config through the injected r
     cfg.provider_set.gateway.permission_reviewer = test_builtin_gateway.permission_reviewer.provider;
     var expected = cfg;
     expected.prompt_policy.system_prompt = "ACP_FILE_SYSTEM_PROMPT";
-    var capture = Capture{ .expected = expected, .expected_invocation_root = invocation_root };
+    var capture = Capture{
+        .expected = expected,
+        .expected_invocation_root = invocation_root,
+        .expected_first_skill_root = first_skill_root,
+        .expected_second_skill_root = second_skill_root,
+    };
     cfg.acp_runner = .{ .context = &capture, .run_fn = Capture.run };
     const result = try runIfRequestedWithDeps(
         alloc,
@@ -5274,8 +5291,9 @@ test "ACP command routes parsed options and launch config through the injected r
             @constCast("--no-native-tools"),
             @constCast("--no-default-skills"),
             @constCast("--skills-dir"),
-            @constCast("/tmp/acp-first-skills"),
-            @constCast("--skills-dir=/tmp/acp-second-skills"),
+            first_skill_root_z,
+            @constCast("--skills-dir"),
+            second_skill_root_z,
             @constCast("--no-project-instructions"),
             @constCast("--state-dir"),
             invocation_root_z,
