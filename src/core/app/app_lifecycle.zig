@@ -15,6 +15,7 @@ const update_target = @import("../upgrade/update_target.zig");
 const notification_sound = @import("../notifications/sound.zig");
 const tool_result_limits = @import("../tooling/tool_result_limits.zig");
 const types = @import("../shared/types.zig");
+const session_naming = @import("../session/session_naming.zig");
 const ui_render = @import("../../ui/render.zig");
 const transcript_presentation = @import("../output/transcript_presentation.zig");
 const shell_runtime = @import("../../ui/shell_runtime.zig");
@@ -148,6 +149,7 @@ pub const StartupState = struct {
     notification_turn_end: bool = false,
     notification_attention_required: bool = false,
     notification_max: bool = false,
+    session_naming_config: session_naming.Config = .{},
     theme_monitor_enabled: bool = false,
 
     pub fn deinit(self: *StartupState, alloc: Allocator) void {
@@ -157,6 +159,7 @@ pub const StartupState = struct {
         if (self.selected_model.len > 0) alloc.free(self.selected_model);
         if (self.configured_model.len > 0) alloc.free(self.configured_model);
         self.permission_rules.deinit(alloc);
+        self.session_naming_config.deinit(alloc);
         if (self.config_diagnostics.len > 0) {
             for (self.config_diagnostics) |*diagnostic| diagnostic.deinit(alloc);
             alloc.free(self.config_diagnostics);
@@ -195,6 +198,12 @@ pub const StartupState = struct {
     pub fn takeCredential(self: *StartupState) ?credentials.Credential {
         const value = self.credential;
         self.credential = null;
+        return value;
+    }
+
+    pub fn takeSessionNamingConfig(self: *StartupState) session_naming.Config {
+        const value = self.session_naming_config;
+        self.session_naming_config = .{};
         return value;
     }
 
@@ -442,6 +451,10 @@ fn loadStartupStateFromOwnedWorkspace(
     state.notification_turn_end = sound_on_override orelse settings.notification_turn_end orelse notification_sound.default_enabled;
     state.notification_attention_required = sound_on_override orelse settings.notification_attention_required orelse notification_sound.default_enabled;
     state.notification_max = max_override orelse settings.notification_max orelse false;
+    state.session_naming_config = try session_naming.resolveConfig(
+        alloc,
+        &settings.session_naming,
+    );
 
     return state;
 }
