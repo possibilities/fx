@@ -677,10 +677,10 @@ pub fn argsAfterGlobalLaunchArgs(args: []const [:0]const u8) []const [:0]const u
     return &.{};
 }
 
-/// Reports whether a system prompt file modifier occurs in the leading global
-/// launch argument segment. Startup uses this before choosing its configuration
-/// so interactive and resume launches compose against the same base prompt the
-/// app will later use.
+/// Reports whether the leading global launch segment may select system prompt
+/// files explicitly or through a state root. Startup uses this before choosing
+/// its configuration so interactive and resume launches compose against the
+/// same base prompt the app will later use.
 pub fn systemPromptFilesRequested(args: []const [:0]const u8) bool {
     var index: usize = 0;
     while (index < args.len) {
@@ -688,7 +688,9 @@ pub fn systemPromptFilesRequested(args: []const [:0]const u8) bool {
         if (std.mem.eql(u8, arg, "--system-prompt-file") or
             std.mem.eql(u8, arg, "--append-system-prompt-file") or
             std.mem.startsWith(u8, arg, "--system-prompt-file=") or
-            std.mem.startsWith(u8, arg, "--append-system-prompt-file="))
+            std.mem.startsWith(u8, arg, "--append-system-prompt-file=") or
+            std.mem.eql(u8, arg, "--state-dir") or
+            std.mem.startsWith(u8, arg, "--state-dir="))
         {
             return true;
         }
@@ -1177,11 +1179,9 @@ fn runIfRequestedWithDeps(alloc: Allocator, args: []const [:0]const u8, cfg: Con
     };
     switch (parsed_launch) {
         .interactive => |*launch| {
-            if (!try prepareSkillDirectories(alloc, &launch.modifiers, deps)) {
-                launch.deinit(alloc);
-                return .handled_failure;
-            }
-            if (!try prepareSystemPromptFiles(alloc, &launch.modifiers, cfg.prompt_policy.system_prompt, deps)) {
+            if (!try prepareSystemPromptFiles(alloc, &launch.modifiers, cfg.prompt_policy.system_prompt, true, deps) or
+                !try prepareInvocationSkillRoots(alloc, &launch.modifiers, deps))
+            {
                 launch.deinit(alloc);
                 return .handled_failure;
             }
@@ -1210,7 +1210,13 @@ fn runIfRequestedWithDeps(alloc: Allocator, args: []const [:0]const u8, cfg: Con
                 launch.deinit(alloc);
                 return .handled_failure;
             }
-            if (!try prepareSystemPromptFiles(alloc, &launch.global_args.modifiers, cfg.prompt_policy.system_prompt, deps)) {
+            if (!try prepareSystemPromptFiles(
+                alloc,
+                &launch.global_args.modifiers,
+                cfg.prompt_policy.system_prompt,
+                commandSupportsStateHome(launch.command),
+                deps,
+            )) {
                 launch.deinit(alloc);
                 return .handled_failure;
             }
@@ -1282,7 +1288,7 @@ fn runNonInteractiveWithDeps(
         try writeExclusiveSkillRootUsage(deps);
         return .handled_failure;
     }
-    if (!try prepareSkillDirectories(alloc, &global_args.modifiers, deps)) {
+    if (!try prepareInvocationSkillRoots(alloc, &global_args.modifiers, deps)) {
         return .handled_failure;
     }
     if (global_args.modifiers.hasNativeToolSelection() and
@@ -3658,7 +3664,7 @@ fn commandSupportsExclusiveSkillRoots(command: Command) bool {
     };
 }
 
-fn prepareSkillDirectories(
+fn prepareInvocationSkillRoots(
     alloc: Allocator,
     modifiers: *LaunchModifiers,
     deps: RunDeps,
@@ -3703,27 +3709,82 @@ fn askHasSystemOverride(args: []const [:0]const u8) bool {
     return false;
 }
 
-fn prepareSystemPromptFiles(alloc: Allocator, modifiers: *LaunchModifiers, base: []const u8, deps: RunDeps) !bool {
-    if (!modifiers.hasPromptFileModifiers()) return true;
-    const result = try modifiers.prompt_files.compose(alloc, base);
+fn prepareSystemPromptFiles(
+    alloc: Allocator,
+    modifiers: *LaunchModifiers,
+    base: []const u8,
+    apply_state_convention: bool,
+    deps: RunDeps,
+) !bool {
+    // State-derived paths belong only to this composition attempt. Keep the
+    // invocation request unchanged so a controlled relaunch serializes its
+    // original CLI paths plus --state-dir and discovers the convention again.
+    var prompt_files = try modifiers.prompt_files.cloneForPreparation(alloc);
+    defer prompt_files.deinit(alloc);
+    if (apply_state_convention) {
+        if (modifiers.state_home) |state_home| {
+            const state_result = prompt_files.applyStateConvention(alloc, state_home) catch |err| {
+                if (err == error.OutOfMemory) return error.OutOfMemory;
+                var message: std.Io.Writer.Allocating = .init(alloc);
+                defer message.deinit();
+                try message.writer.print(
+                    "fx: could not safely inspect state system prompt files under {s}/.fx\n",
+                    .{state_home},
+                );
+                try writeStderr(deps, message.written());
+                return false;
+            };
+            switch (state_result) {
+                .conflicting => {
+                    var message: std.Io.Writer.Allocating = .init(alloc);
+                    defer message.deinit();
+                    try message.writer.print(
+                        "fx: state directory {s} contains both .fx/{s} and .fx/{s}; remove one or use --system-prompt-file to override the state prompt\n",
+                        .{
+                            state_home,
+                            profile_paths.system_prompt_file_name,
+                            profile_paths.system_prompt_append_file_name,
+                        },
+                    );
+                    try writeStderr(deps, message.written());
+                    return false;
+                },
+                .failure => |failure| {
+                    try writeSystemPromptFileFailure(alloc, deps, failure);
+                    return false;
+                },
+                else => {},
+            }
+        }
+    }
+    if (!prompt_files.requested()) return true;
+    const result = try prompt_files.compose(alloc, base);
     switch (result) {
         .prompt => |prompt| {
             modifiers.effective_system_prompt = prompt;
             return true;
         },
         .failure => |failure| {
-            var message: std.Io.Writer.Allocating = .init(alloc);
-            defer message.deinit();
-            try message.writer.print("fx: could not use system prompt file {s}: {s}\n", .{ failure.path, switch (failure.reason) {
-                .unreadable => "file is missing or unreadable",
-                .not_regular_file => "path is not a regular file",
-                .too_large => "custom system prompt files exceed the 256 KiB combined limit",
-                .invalid_text => "content must be valid UTF-8 and contain no NUL bytes",
-            } });
-            try writeStderr(deps, message.written());
+            try writeSystemPromptFileFailure(alloc, deps, failure);
             return false;
         },
     }
+}
+
+fn writeSystemPromptFileFailure(
+    alloc: Allocator,
+    deps: RunDeps,
+    failure: system_prompt_files.Failure,
+) !void {
+    var message: std.Io.Writer.Allocating = .init(alloc);
+    defer message.deinit();
+    try message.writer.print("fx: could not use system prompt file {s}: {s}\n", .{ failure.path, switch (failure.reason) {
+        .unreadable => "file is missing or unreadable",
+        .not_regular_file => "path is not a regular file",
+        .too_large => "custom system prompt files exceed the 256 KiB combined limit",
+        .invalid_text => "content must be valid UTF-8 and contain no NUL bytes",
+    } });
+    try writeStderr(deps, message.written());
 }
 
 fn writePromptFileModifierUsage(deps: RunDeps) !void {
@@ -4578,7 +4639,7 @@ test "invocation skill root canonicalization preserves allocator failure" {
     var failing = std.testing.FailingAllocator.init(alloc, .{ .fail_index = 0 });
     try std.testing.expectError(
         error.OutOfMemory,
-        prepareSkillDirectories(failing.allocator(), &modifiers, .{}),
+        prepareInvocationSkillRoots(failing.allocator(), &modifiers, .{}),
     );
 }
 
@@ -4619,6 +4680,28 @@ test "workflow launch config preserves ordered invocation skill roots" {
     try std.testing.expectEqual(@as(usize, 2), workflow_cfg.skill_root_policy.invocation_roots.len);
     try std.testing.expectEqualStrings("/tmp/team-skills", workflow_cfg.skill_root_policy.invocation_roots[0]);
     try std.testing.expectEqualStrings("/opt/shared-skills", workflow_cfg.skill_root_policy.invocation_roots[1]);
+}
+
+test "global prompt detection scans across shared TUI and ACP controls" {
+    try std.testing.expect(systemPromptFilesRequested(&.{
+        @constCast("--state-dir=/tmp/fx-state"),
+        @constCast("resume"),
+        @constCast("last"),
+    }));
+    try std.testing.expect(systemPromptFilesRequested(&.{
+        @constCast("--state-dir"),
+        @constCast("/tmp/fx state"),
+        @constCast("--permissions-file=/tmp/policy.json"),
+        @constCast("--no-project-instructions"),
+        @constCast("--append-system-prompt-file=extra.md"),
+    }));
+    try std.testing.expect(systemPromptFilesRequested(&.{
+        @constCast("--permissions-file"),
+        @constCast("/tmp/policy.json"),
+        @constCast("--state-dir=/tmp/fx-state"),
+        @constCast("--system-prompt-file"),
+        @constCast("base.md"),
+    }));
 }
 
 test "global system prompt file modifiers preserve replacement and append order" {
@@ -4732,6 +4815,186 @@ test "system prompt files are prepared for interactive and resumed launches" {
         },
         else => return error.TestExpectedInteractiveLaunch,
     }
+}
+
+test "state system prompts compose replacement append conflict and explicit precedence" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "append-state/.fx");
+    try tmp.dir.createDirPath(std.testing.io, "replace-state/.fx");
+    try tmp.dir.createDirPath(std.testing.io, "conflict-state/.fx");
+    try tmp.dir.createDirPath(std.testing.io, "wrong-case-state/.fx");
+    try tmp.dir.createDirPath(std.testing.io, "wrong-profile-case-state/.FX");
+    for ([_]struct { path: []const u8, content: []const u8 }{
+        .{ .path = "append-state/.fx/SYSTEM_APPEND.md", .content = "STATE_APPEND" },
+        .{ .path = "replace-state/.fx/SYSTEM.md", .content = "STATE_REPLACEMENT" },
+        .{ .path = "conflict-state/.fx/SYSTEM.md", .content = "STATE_CONFLICT_REPLACEMENT" },
+        .{ .path = "conflict-state/.fx/SYSTEM_APPEND.md", .content = "STATE_CONFLICT_APPEND" },
+        .{ .path = "wrong-case-state/.fx/system.md", .content = "WRONG_CASE_REPLACEMENT" },
+        .{ .path = "wrong-case-state/.fx/system_append.md", .content = "WRONG_CASE_APPEND" },
+        .{ .path = "wrong-profile-case-state/.FX/SYSTEM.md", .content = "WRONG_PROFILE_CASE_REPLACEMENT" },
+        .{ .path = "cli-append", .content = "CLI_APPEND" },
+        .{ .path = "cli-replacement", .content = "CLI_REPLACEMENT" },
+    }) |fixture| {
+        var file = try tmp.dir.createFile(std.testing.io, fixture.path, .{});
+        defer file.close(std.testing.io);
+        try file.writeStreamingAll(std.testing.io, fixture.content);
+    }
+
+    const append_home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "append-state");
+    defer alloc.free(append_home);
+    const append_home_z = try alloc.dupeZ(u8, append_home);
+    defer alloc.free(append_home_z);
+    const replace_home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "replace-state");
+    defer alloc.free(replace_home);
+    const replace_home_z = try alloc.dupeZ(u8, replace_home);
+    defer alloc.free(replace_home_z);
+    const conflict_home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "conflict-state");
+    defer alloc.free(conflict_home);
+    const conflict_home_z = try alloc.dupeZ(u8, conflict_home);
+    defer alloc.free(conflict_home_z);
+    const wrong_case_home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "wrong-case-state");
+    defer alloc.free(wrong_case_home);
+    const wrong_case_home_z = try alloc.dupeZ(u8, wrong_case_home);
+    defer alloc.free(wrong_case_home_z);
+    const wrong_profile_case_home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "wrong-profile-case-state");
+    defer alloc.free(wrong_profile_case_home);
+    const wrong_profile_case_home_z = try alloc.dupeZ(u8, wrong_profile_case_home);
+    defer alloc.free(wrong_profile_case_home_z);
+    const cli_append = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "cli-append");
+    defer alloc.free(cli_append);
+    const cli_append_z = try alloc.dupeZ(u8, cli_append);
+    defer alloc.free(cli_append_z);
+    const cli_replacement = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "cli-replacement");
+    defer alloc.free(cli_replacement);
+    const cli_replacement_z = try alloc.dupeZ(u8, cli_replacement);
+    defer alloc.free(cli_replacement_z);
+
+    var appended = try runIfRequestedWithDeps(
+        alloc,
+        &.{
+            @constCast("--state-dir"),
+            append_home_z,
+            @constCast("--no-project-instructions"),
+            @constCast("--append-system-prompt-file"),
+            cli_append_z,
+        },
+        testConfig(),
+        .{},
+    );
+    switch (appended) {
+        .interactive => |*launch| {
+            defer launch.deinit(alloc);
+            try std.testing.expectEqualStrings(
+                "system\n\nSTATE_APPEND\n\nCLI_APPEND",
+                launch.modifiers.effective_system_prompt.?,
+            );
+            try std.testing.expectEqual(@as(usize, 1), launch.modifiers.prompt_files.append_paths.len);
+            try std.testing.expectEqualStrings(
+                cli_append,
+                launch.modifiers.prompt_files.append_paths[0],
+            );
+        },
+        else => return error.TestExpectedInteractiveLaunch,
+    }
+
+    var replaced = try runIfRequestedWithDeps(
+        alloc,
+        &.{
+            @constCast("--state-dir"),
+            replace_home_z,
+            @constCast("resume"),
+            @constCast("last"),
+        },
+        testConfig(),
+        .{},
+    );
+    switch (replaced) {
+        .interactive => |*launch| {
+            defer launch.deinit(alloc);
+            try std.testing.expect(launch.requested_resume != null);
+            try std.testing.expectEqualStrings(
+                "STATE_REPLACEMENT",
+                launch.modifiers.effective_system_prompt.?,
+            );
+            try std.testing.expect(launch.modifiers.prompt_files.replacement_path == null);
+            try std.testing.expectEqual(@as(usize, 0), launch.modifiers.prompt_files.append_paths.len);
+        },
+        else => return error.TestExpectedInteractiveLaunch,
+    }
+
+    var explicit = try runIfRequestedWithDeps(
+        alloc,
+        &.{
+            @constCast("--state-dir"),
+            conflict_home_z,
+            @constCast("--system-prompt-file"),
+            cli_replacement_z,
+        },
+        testConfig(),
+        .{},
+    );
+    switch (explicit) {
+        .interactive => |*launch| {
+            defer launch.deinit(alloc);
+            try std.testing.expectEqualStrings(
+                "CLI_REPLACEMENT",
+                launch.modifiers.effective_system_prompt.?,
+            );
+            try std.testing.expectEqualStrings(
+                cli_replacement,
+                launch.modifiers.prompt_files.replacement_path.?,
+            );
+        },
+        else => return error.TestExpectedInteractiveLaunch,
+    }
+
+    var wrong_case = try runIfRequestedWithDeps(
+        alloc,
+        &.{ @constCast("--state-dir"), wrong_case_home_z },
+        testConfig(),
+        .{},
+    );
+    switch (wrong_case) {
+        .interactive => |*launch| {
+            defer launch.deinit(alloc);
+            try std.testing.expect(launch.modifiers.effective_system_prompt == null);
+        },
+        else => return error.TestExpectedInteractiveLaunch,
+    }
+
+    var wrong_profile_case = try runIfRequestedWithDeps(
+        alloc,
+        &.{ @constCast("--state-dir"), wrong_profile_case_home_z },
+        testConfig(),
+        .{},
+    );
+    switch (wrong_profile_case) {
+        .interactive => |*launch| {
+            defer launch.deinit(alloc);
+            try std.testing.expect(launch.modifiers.effective_system_prompt == null);
+        },
+        else => return error.TestExpectedInteractiveLaunch,
+    }
+
+    var capture = CaptureOutput.init(alloc);
+    defer capture.deinit();
+    const conflict = try runIfRequestedWithDeps(
+        alloc,
+        &.{ @constCast("--state-dir"), conflict_home_z },
+        testConfig(),
+        capture.deps(),
+    );
+    try std.testing.expectEqual(RunResult.handled_failure, conflict);
+    try std.testing.expectEqualStrings("", capture.stdout.written());
+    const expected_error = try std.fmt.allocPrint(
+        alloc,
+        "fx: state directory {s} contains both .fx/SYSTEM.md and .fx/SYSTEM_APPEND.md; remove one or use --system-prompt-file to override the state prompt\n",
+        .{conflict_home},
+    );
+    defer alloc.free(expected_error);
+    try std.testing.expectEqualStrings(expected_error, capture.stderr.written());
 }
 
 test "workflow launch config preserves the effective prompt for PR and issue" {
@@ -5523,7 +5786,7 @@ test "runIfRequested help writes top-level help" {
     try std.testing.expect(std.mem.startsWith(u8, capture.stdout.written(), "𝒇x v0.0.0\nFast, native coding agent for the terminal."));
     try std.testing.expect(std.mem.find(u8, capture.stdout.written(), testConfig().version) != null);
     try std.testing.expect(std.mem.find(u8, capture.stdout.written(), "--state-dir <path>") != null);
-    try std.testing.expect(std.mem.find(u8, capture.stdout.written(), "Use an isolated Fx profile for TUI or ACP") != null);
+    try std.testing.expect(std.mem.find(u8, capture.stdout.written(), "Use an isolated Fx profile and prompt for TUI or ACP") != null);
     try std.testing.expectEqualStrings("", capture.stderr.written());
 }
 
