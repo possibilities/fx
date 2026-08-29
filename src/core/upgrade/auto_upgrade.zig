@@ -106,7 +106,7 @@ pub const AutoUpgrade = struct {
                 const ver = self.getLatestVersion(&ver_buf);
                 return std.fmt.bufPrint(buf, "upgrading to {s}...", .{ver}) catch "";
             },
-            .ready => return "update ready: ctrl+g to reload",
+            .ready => return "update ready: ctrl+t to reload",
             .failed => return "upgrade failed",
             else => return "",
         }
@@ -287,12 +287,12 @@ test "statusLabel downloading shows ellipsis" {
     try std.testing.expectEqualStrings("upgrading to 0.3.0...", label);
 }
 
-test "statusLabel ready explains ctrl+g reload" {
+test "statusLabel ready explains ctrl+t reload" {
     var au = AutoUpgrade{};
     au.setState(.ready);
     var buf: [64]u8 = undefined;
     const label = au.statusLabel(&buf);
-    try std.testing.expectEqualStrings("update ready: ctrl+g to reload", label);
+    try std.testing.expectEqualStrings("update ready: ctrl+t to reload", label);
 }
 
 test "setLatestVersion stores normalized version" {
