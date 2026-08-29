@@ -97,6 +97,28 @@ function writeSeededFxAuth(
   chmodSync(authPath, 0o600);
 }
 
+function chatgptAccessToken(accountId: string): string {
+  const payload = Buffer.from(JSON.stringify({
+    "https://api.openai.com/auth": { chatgpt_account_id: accountId },
+  })).toString("base64url");
+  return `header.${payload}.signature`;
+}
+
+function writeSeededChatGptLogin(home: string, accessToken: string, accountId: string): void {
+  const fxDir = join(home, ".fx");
+  mkdirSync(fxDir, { recursive: true, mode: 0o700 });
+  chmodSync(fxDir, 0o700);
+  const authPath = join(fxDir, "chatgpt-auth.json");
+  writeFileSync(authPath, JSON.stringify({
+    version: 1,
+    access_token: accessToken,
+    refresh_token: "chatgpt-refresh",
+    expires_at_ms: Date.now() + 60 * 60 * 1000,
+    account_id: accountId,
+  }) + "\n", { mode: 0o600 });
+  chmodSync(authPath, 0o600);
+}
+
 function startRequestCatcher() {
   const requests: Array<{ method: string; path: string }> = [];
   const server = Bun.serve({
@@ -3199,6 +3221,104 @@ function catalogTraceEvents(trace: string): string[] {
 }
 
 describe("cli: models", () => {
+  test(
+    "fx models --json preserves ordered efforts for the configured Codex catalog",
+    async () => {
+      const root = mkdtempSync(join(tmpdir(), "fx-e2e-codex-models-"));
+      const home = join(root, "home");
+      const workspace = join(root, "workspace");
+      const accountId = "acct_codex_models";
+      const accessToken = chatgptAccessToken(accountId);
+      const requests: Array<{ path: string; authorization: string | null }> = [];
+      const server = Bun.serve({
+        hostname: "127.0.0.1",
+        port: 0,
+        fetch(request) {
+          const url = new URL(request.url);
+          requests.push({
+            path: url.pathname,
+            authorization: request.headers.get("authorization"),
+          });
+          if (url.pathname !== "/models") return new Response("not found", { status: 404 });
+          return Response.json({ models: [
+            {
+              slug: "gpt-5.6-sol",
+              visibility: "list",
+              supported_in_api: true,
+              supported_reasoning_levels: [
+                { effort: "high" },
+                { effort: "future-tier" },
+                { effort: "low" },
+              ],
+              additional_speed_tiers: ["fast"],
+              input_modalities: ["text", "image"],
+              context_window: 272000,
+            },
+            {
+              slug: "gpt-5.4-mini",
+              visibility: "list",
+              supported_in_api: true,
+              supported_reasoning_levels: [{ effort: "low" }],
+              additional_speed_tiers: [],
+              input_modalities: ["text"],
+              context_window: 128000,
+            },
+          ] });
+        },
+      });
+
+      try {
+        mkdirSync(home);
+        mkdirSync(workspace);
+        writeSeededChatGptLogin(home, accessToken, accountId);
+        writeFileSync(
+          join(home, ".fx", "settings.json"),
+          JSON.stringify({ provider: "codex", codex_model: "gpt-5.6-sol" }) + "\n",
+        );
+
+        const result = await runFx(["models", "--json"], {
+          cwd: realpathSync(workspace),
+          env: {
+            ...NO_GATEWAY_AUTH,
+            HOME: realpathSync(home),
+            FX_DISABLE_KEYCHAIN: "1",
+            FX_AUTO_UPGRADE: "0",
+            FX_MODEL: undefined,
+            FX_GATEWAY_BASE_URL: `http://127.0.0.1:${server.port}`,
+            FX_E2E_GATEWAY_MODELS_URL: `http://127.0.0.1:${server.port}/gateway-models`,
+            FX_E2E_OPENAI_CODEX_MODELS_URL: `http://127.0.0.1:${server.port}/models`,
+          },
+          timeoutMs: TIMEOUT,
+        });
+
+        expect(result.code).toBe(0);
+        expect(result.stderr).toBe("");
+        const json = JSON.parse(result.stdout.trim());
+        expect(json.ids).toEqual(["gpt-5.6-sol", "gpt-5.4-mini"]);
+        expect(json.models).toEqual([
+          {
+            id: "gpt-5.6-sol",
+            source: "Codex subscription",
+            reasoning_efforts: ["high", "future-tier", "low"],
+          },
+          {
+            id: "gpt-5.4-mini",
+            source: "Codex subscription",
+            reasoning_efforts: ["low"],
+          },
+        ]);
+        expect(requests).toEqual([{
+          path: "/models",
+          authorization: `Bearer ${accessToken}`,
+        }]);
+      } finally {
+        server.stop(true);
+        rmSync(root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
   for (const scenario of [
     {
       name: "an ordinary public empty catalog",
@@ -3286,6 +3406,11 @@ describe("cli: models", () => {
             more_count: 0,
             private_models_hidden: true,
             ids: ["public/fallback"],
+            models: [{
+              id: "public/fallback",
+              source: "Vercel AI Gateway",
+              reasoning_efforts: [],
+            }],
           });
 
           expect(gateway.modelRequests).toHaveLength(2);
@@ -3574,7 +3699,14 @@ describe("cli: models", () => {
               (!scenario.seedFxLogin || url.searchParams.get("teamId") === "team_123");
             return Response.json({
               data: [
-                { id: "public/sentinel", type: "language", tags: ["tool-use"] },
+                {
+                  id: "public/sentinel",
+                  type: "language",
+                  tags: ["tool-use"],
+                  reasoning_options: [
+                    { type: "effort", values: ["low", "future-tier", "high"] },
+                  ],
+                },
                 ...(seededAuth
                   ? [{ id: "private/blue-hornbill", type: "language", tags: ["tool-use"] }]
                   : []),
@@ -3621,6 +3753,11 @@ describe("cli: models", () => {
           const json = JSON.parse(r.stdout.trim());
           expect(json.kind).toBe("models");
           expect(json.ids).toContain("public/sentinel");
+          expect(json.models).toContainEqual({
+            id: "public/sentinel",
+            source: "Vercel AI Gateway",
+            reasoning_efforts: ["low", "future-tier", "high"],
+          });
           if (scenario.expectPrivate) {
             expect(json.ids).toContain("private/blue-hornbill");
           } else {
