@@ -384,7 +384,7 @@ pub const top_level_flags = [_]TopLevelFlag{
     },
     .{
         .usage = "--state-dir <path>",
-        .description = "Use an isolated Fx profile for TUI or ACP",
+        .description = "Use an isolated Fx profile and prompt for TUI or ACP",
     },
     .{
         .usage = "--permissions-file <path>",

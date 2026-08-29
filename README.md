@@ -171,6 +171,16 @@ authorization, profile instructions, profile-global skills, MCP state,
 memories, usage, prompt history, and sessions beneath `<path>/.fx` while
 terminal tools and MCP processes retain the normal `HOME` environment.
 
+An explicit state directory can also carry one conventional system prompt for
+interactive, resumed, and ACP sessions and their in-process children.
+`<path>/.fx/SYSTEM.md` replaces Fx's built-in prompt, while
+`<path>/.fx/SYSTEM_APPEND.md` appends to it. The names are case-sensitive, and
+a launch fails if both files exist. `--system-prompt-file` bypasses this state
+discovery; repeatable `--append-system-prompt-file` values are added afterward.
+The same regular-file, UTF-8, NUL-free, and combined 256 KiB limits apply.
+`--no-project-instructions` does not suppress the selected state prompt, and Fx
+does not discover these files from the default home without `--state-dir`.
+
 ## Extend fx
 
 Add reusable instructions with [skills](https://fx.sh/docs/capabilities/skills), connect external tools through [MCP](https://fx.sh/docs/capabilities/mcp), or delegate independent work to [subagents](https://fx.sh/docs/capabilities/subagents). Run `fx mcp add NAME COMMAND [ARGS...]` for a local server or `fx mcp add --transport http NAME URL` for Streamable HTTP without opening the interactive shell; the equivalent `/mcp add` forms remain available inside fx. A workspace may also provide Claude-compatible `.mcp.json` with a top-level `mcpServers` object. Pending project servers stay disconnected on every surface until they are approved with `/mcp trust approve <server>` or `fx mcp trust approve <server>`. Interactive fx presents the trust prompt after startup. `fx ask` reports skipped pending servers on stderr, and ACP leaves them unavailable. Repository files cannot persist approval or expose environment-expanded values before approval. `/mcp trust reject <server>` rejects one and `/mcp trust reset` clears the workspace choices. Profile entries win same-name collisions. Profile `~/.fx/mcp.json` accepts `mcpServers` as an alias for `mcp`, while writes always use `mcp` and ambiguous server-like keys produce a visible warning. Project instruction files may link within their scope, and read-only workspace or compatibility skill directories and their primary `SKILL.md` files may link within their owning workspace or home; managed skills, secondary resources, and escaping links remain no-follow. Skills installed via symlinks that resolve outside home or workspace (e.g. Nix store paths) are loaded when their resolved target is inside a directory listed in the `FX_SKILL_SYMLINK_AUTHORITIES` environment variable (colon-separated absolute paths). `fx status` and `fx doctor` report invalid or suspicious trusted MCP profiles without starting their servers.

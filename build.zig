@@ -123,6 +123,7 @@ pub fn build(b: *std.Build) void {
         .filters = &.{
             "ACP restore rejects MCP servers when host capability is disabled",
             "global system prompt file modifiers preserve replacement and append order",
+            "state system prompts compose replacement append conflict and explicit precedence",
             "ACP command routes parsed options and launch config through the injected runner",
             "app entry preserves every launch control across an upgrade relaunch",
             "upgrade relaunch recovery shell-quotes unsafe arguments",

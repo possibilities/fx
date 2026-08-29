@@ -26,6 +26,7 @@ const expected_names = [_][]const u8{
     "core.app.app_input_runtime.test.app_input_runtime ctrl+g invokes external editor without composer mutation",
     "core.app.app_lifecycle.test.loadStartupState lets FX_EFFORT win over the configured effort without rewriting it",
     "core.cli.cli_surface.test.global system prompt file modifiers preserve replacement and append order",
+    "core.cli.cli_surface.test.state system prompts compose replacement append conflict and explicit precedence",
     "core.cli.cli_surface.test.ACP command routes parsed options and launch config through the injected runner",
     "core.app.app_entry_runtime.test.app entry preserves every launch control across an upgrade relaunch",
     "core.app.app_entry_runtime.test.upgrade relaunch recovery shell-quotes unsafe arguments",

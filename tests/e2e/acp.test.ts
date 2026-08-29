@@ -6001,6 +6001,8 @@ describe("acp: model-independent", () => {
       );
       writeFileSync(join(stateA, ".fx", "AGENTS.md"), "SELECTED_PROFILE_INSTRUCTIONS\n");
       writeFileSync(join(root.home, ".fx", "AGENTS.md"), "AMBIENT_PROFILE_INSTRUCTIONS\n");
+      writeFileSync(join(stateA, ".fx", "SYSTEM.md"), "SELECTED_STATE_SYSTEM_REPLACEMENT\n");
+      writeFileSync(join(root.home, ".fx", "SYSTEM.md"), "AMBIENT_STATE_SYSTEM_REPLACEMENT\n");
       writeFileSync(
         join(stateA, ".fx", "skills", "isolated-state-skill", "SKILL.md"),
         "---\nname: isolated-state-skill\ndescription: selected state skill\n---\n\nSELECTED_STATE_SKILL_BODY\n",
@@ -6093,10 +6095,17 @@ describe("acp: model-independent", () => {
         expect(gateway.requests[0]!.body).toContain("SELECTED_PROFILE_SKILL_BODY");
         expect(gateway.requests[0]!.body).toContain("isolated-state-skill");
         expect(gateway.requests[0]!.body).toContain("SELECTED_PROFILE_INSTRUCTIONS");
+        expect(gateway.requests[0]!.body).toContain("SELECTED_STATE_SYSTEM_REPLACEMENT");
+        expect(gateway.requests[0]!.body).not.toContain(
+          "You are fx, a local coding CLI assistant",
+        );
         expect(gateway.requests[0]!.body).not.toContain("ambient-state-skill");
         expect(gateway.requests[0]!.body).not.toContain("ambient-profile-skill");
         expect(gateway.requests[0]!.body).not.toContain(
           "AMBIENT_PROFILE_INSTRUCTIONS",
+        );
+        expect(gateway.requests[0]!.body).not.toContain(
+          "AMBIENT_STATE_SYSTEM_REPLACEMENT",
         );
         expect(acpToolResultText(gateway.requests[1]!.body, "state_memory"))
           .toContain("selected state memory");

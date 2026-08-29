@@ -14,6 +14,8 @@ pub const usage_recovery_dir_name = "usage-recovery";
 pub const backups_dir_name = "backups";
 pub const mcp_credentials_dir_name = "mcp-credentials";
 pub const mcp_credentials_file_name = "credentials.json";
+pub const system_prompt_file_name = "SYSTEM.md";
+pub const system_prompt_append_file_name = "SYSTEM_APPEND.md";
 
 const settings_file_name = "settings.json";
 const mcp_config_file_name = "mcp.json";
@@ -33,6 +35,14 @@ pub fn settingsPath(alloc: Allocator, home: []const u8) ![]u8 {
 
 pub fn mcpConfigPath(alloc: Allocator, home: []const u8) ![]u8 {
     return std.fs.path.join(alloc, &.{ home, root_dir_name, mcp_config_file_name });
+}
+
+pub fn systemPromptPath(alloc: Allocator, home: []const u8) ![]u8 {
+    return std.fs.path.join(alloc, &.{ home, root_dir_name, system_prompt_file_name });
+}
+
+pub fn systemPromptAppendPath(alloc: Allocator, home: []const u8) ![]u8 {
+    return std.fs.path.join(alloc, &.{ home, root_dir_name, system_prompt_append_file_name });
 }
 
 pub fn mcpCredentialsDir(alloc: Allocator, home: []const u8) ![]u8 {
@@ -110,6 +120,17 @@ test "profile path helpers preserve current default locations" {
     const mcp = try mcpConfigPath(alloc, "/tmp/fake-home");
     defer alloc.free(mcp);
     try std.testing.expectEqualStrings("/tmp/fake-home/.fx/mcp.json", mcp);
+
+    const system_prompt = try systemPromptPath(alloc, "/tmp/fake-home");
+    defer alloc.free(system_prompt);
+    try std.testing.expectEqualStrings("/tmp/fake-home/.fx/SYSTEM.md", system_prompt);
+
+    const system_prompt_append = try systemPromptAppendPath(alloc, "/tmp/fake-home");
+    defer alloc.free(system_prompt_append);
+    try std.testing.expectEqualStrings(
+        "/tmp/fake-home/.fx/SYSTEM_APPEND.md",
+        system_prompt_append,
+    );
 
     const mcp_credentials_dir = try mcpCredentialsDir(alloc, "/tmp/fake-home");
     defer alloc.free(mcp_credentials_dir);
