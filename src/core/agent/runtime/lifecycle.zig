@@ -32,8 +32,19 @@ pub const PostTurnEndCheckpoint = struct {
 };
 
 pub const AttentionRequiredCheckpoint = struct {
-    turn_id: u64,
+    turn_id: ?u64,
     kind: hooks.AttentionKind,
+    presented_interactively: bool = false,
+};
+
+pub const AttentionResolvedCheckpoint = struct {
+    turn_id: ?u64,
+    kind: hooks.AttentionKind,
+    presented_interactively: bool = false,
+};
+
+pub const TurnStartedCheckpoint = struct {
+    turn_id: u64,
 };
 
 const PreToolUseCheckpoint = struct {
@@ -204,6 +215,18 @@ pub fn dispatchPostTurnEndCheckpoint(
     });
 }
 
+pub fn dispatchTurnStartedCheckpoint(
+    lifecycle: LifecycleContext,
+    checkpoint: TurnStartedCheckpoint,
+) void {
+    lifecycle.view.runTurnStarted(.{
+        .invocation = .{
+            .scope = lifecycle.scope,
+            .turn_id = checkpoint.turn_id,
+        },
+    });
+}
+
 pub fn dispatchAttentionRequiredCheckpoint(
     lifecycle: LifecycleContext,
     checkpoint: AttentionRequiredCheckpoint,
@@ -214,6 +237,21 @@ pub fn dispatchAttentionRequiredCheckpoint(
             .turn_id = checkpoint.turn_id,
         },
         .kind = checkpoint.kind,
+        .presented_interactively = checkpoint.presented_interactively,
+    });
+}
+
+pub fn dispatchAttentionResolvedCheckpoint(
+    lifecycle: LifecycleContext,
+    checkpoint: AttentionResolvedCheckpoint,
+) void {
+    lifecycle.view.runAttentionResolved(.{
+        .invocation = .{
+            .scope = lifecycle.scope,
+            .turn_id = checkpoint.turn_id,
+        },
+        .kind = checkpoint.kind,
+        .presented_interactively = checkpoint.presented_interactively,
     });
 }
 

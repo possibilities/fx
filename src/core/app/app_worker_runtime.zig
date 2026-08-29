@@ -166,6 +166,62 @@ fn batchSegmentEndsInterrupted(events: []const WorkerEvent) bool {
 
 pub fn Runtime(comptime App: type) type {
     return struct {
+        const QuestionPresentationObserver = struct {
+            app: *App,
+
+            fn interface(self: *@This()) worker_runtime.QuestionPresentationObserver {
+                return .{
+                    .context = self,
+                    .observe_fn = observe,
+                };
+            }
+
+            fn observe(
+                raw: *anyopaque,
+                turn_id: u64,
+                source: worker_runtime.QuestionPromptSource,
+            ) void {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                if (comptime @hasDecl(App, "dispatchAttentionRequired")) {
+                    self.app.dispatchAttentionRequired(
+                        turn_id,
+                        switch (source) {
+                            .agent_question, .mcp_elicitation => .question,
+                            .route_recovery => .route_recovery,
+                        },
+                        null,
+                    );
+                }
+            }
+        };
+
+        fn presentQuestionAttention(
+            app: *App,
+            source: worker_runtime.QuestionPromptSource,
+        ) bool {
+            const Worker = switch (@typeInfo(@TypeOf(app.worker))) {
+                .pointer => |pointer| pointer.child,
+                else => @TypeOf(app.worker),
+            };
+            if (comptime @hasDecl(Worker, "presentPendingQuestionBatchObserved")) {
+                var observation = QuestionPresentationObserver{ .app = app };
+                return app.worker.presentPendingQuestionBatchObserved(
+                    observation.interface(),
+                );
+            }
+            if (comptime @hasDecl(App, "dispatchAttentionRequired")) {
+                app.dispatchAttentionRequired(
+                    app.worker.activeTurnId(),
+                    switch (source) {
+                        .agent_question, .mcp_elicitation => .question,
+                        .route_recovery => .route_recovery,
+                    },
+                    null,
+                );
+            }
+            return true;
+        }
+
         fn cancelledToolStartAdmission(
             presenter: activity_runtime.LifecyclePresenter,
             id: types.ToolLifecycleId,
@@ -472,8 +528,23 @@ pub fn Runtime(comptime App: type) type {
                 app.shell.render_requests.request(.modal);
             }
             if (!was_approval_active and app.approval_prompt.isActive()) {
+                var child_session_id: ?[]const u8 = null;
+                if (child_pending_request) |child_request| {
+                    if (comptime @hasDecl(
+                        @TypeOf(app.subagents),
+                        "mainApprovalBinding",
+                    )) {
+                        if (app.subagents.mainApprovalBinding(child_request.id)) |binding| {
+                            child_session_id = binding.child_id;
+                        }
+                    }
+                }
                 if (comptime @hasDecl(App, "dispatchAttentionRequired")) {
-                    app.dispatchAttentionRequired(snapshot.active_turn_id, .permission);
+                    app.dispatchAttentionRequired(
+                        snapshot.active_turn_id,
+                        .permission,
+                        child_session_id,
+                    );
                 }
             }
 
@@ -802,14 +873,12 @@ pub fn Runtime(comptime App: type) type {
                                 return err;
                             };
                             if (!was_active and app.question_prompt.isActive()) {
-                                app.shell.render_requests.request(.modal);
-                                if (comptime @hasDecl(App, "dispatchAttentionRequired")) {
-                                    app.dispatchAttentionRequired(
-                                        app.worker.activeTurnId(),
-                                        switch (question_snapshot.source) {
-                                            .agent_question, .mcp_elicitation => .question,
-                                            .route_recovery => .route_recovery,
-                                        },
+                                if (presentQuestionAttention(app, question_snapshot.source)) {
+                                    app.shell.render_requests.request(.modal);
+                                } else {
+                                    app.question_prompt.discard(
+                                        app.alloc,
+                                        "worker_cleared_before_presentation",
                                     );
                                 }
                             }
@@ -1139,6 +1208,8 @@ const FakeWorker = struct {
     pending_permission_review: ?*const diff_mod.FileReview = null,
     pending_question: bool = false,
     pending_question_source: worker_runtime.QuestionPromptSource = .agent_question,
+    question_presentation_allowed: bool = true,
+    question_presentation_count: usize = 0,
     active_turn_id: u64 = 1,
     propagated_history_turns: usize = 0,
     propagated_grants: usize = 0,
@@ -1224,6 +1295,20 @@ const FakeWorker = struct {
         return if (self.pending_question) FakeQuestionSnapshot{
             .source = self.pending_question_source,
         } else null;
+    }
+
+    fn presentPendingQuestionBatchObserved(
+        self: *FakeWorker,
+        observer: worker_runtime.QuestionPresentationObserver,
+    ) bool {
+        if (!self.pending_question or !self.question_presentation_allowed) return false;
+        self.question_presentation_count += 1;
+        observer.observe_fn(
+            observer.context,
+            self.active_turn_id,
+            self.pending_question_source,
+        );
+        return true;
     }
 
     fn syncQueuedPromptModel(self: *FakeWorker, alloc: std.mem.Allocator, model: []const u8) !void {
@@ -1510,8 +1595,15 @@ const FakePacer = struct {
 const FakeSubagents = struct {
     view_active: bool = false,
     child_busy: bool = false,
+    pending_approval: ?permission_request.PermissionRequest = null,
+    pending_child_session_id: ?[]const u8 = null,
+    approval_presented: bool = false,
     child_shell: FakeShell = .{},
     child_render_requests: render_request.RenderRequestState = .{},
+
+    const MainApprovalBinding = struct {
+        child_id: []const u8,
+    };
 
     const ChildPresentationView = struct {
         chat: struct {
@@ -1539,6 +1631,21 @@ const FakeSubagents = struct {
 
     fn activeRenderRequests(self: *FakeSubagents) *render_request.RenderRequestState {
         return &self.child_render_requests;
+    }
+
+    fn mainApprovalRequest(self: *const FakeSubagents) ?permission_request.PermissionRequest {
+        return self.pending_approval;
+    }
+
+    fn markMainApprovalPresented(self: *FakeSubagents, presented: bool) void {
+        self.approval_presented = presented;
+    }
+
+    fn mainApprovalBinding(self: *const FakeSubagents, prompt_id: u64) ?MainApprovalBinding {
+        if (!self.approval_presented) return null;
+        const request = self.pending_approval orelse return null;
+        if (request.id != prompt_id) return null;
+        return .{ .child_id = self.pending_child_session_id orelse return null };
     }
 
     fn deinit(self: *FakeSubagents, alloc: std.mem.Allocator) void {
@@ -1594,6 +1701,8 @@ const FakeApp = struct {
     attention_count: usize = 0,
     last_attention_turn_id: u64 = 0,
     last_attention_kind: ?@import("../hooks/hooks.zig").AttentionKind = null,
+    child_attention_count: usize = 0,
+    last_attention_child_session_id: ?[]const u8 = null,
 
     fn init(alloc: std.mem.Allocator) FakeApp {
         return .{ .alloc = alloc };
@@ -1671,10 +1780,15 @@ const FakeApp = struct {
         self: *FakeApp,
         turn_id: u64,
         kind: @import("../hooks/hooks.zig").AttentionKind,
+        child_session_id: ?[]const u8,
     ) void {
         self.attention_count += 1;
         self.last_attention_turn_id = turn_id;
         self.last_attention_kind = kind;
+        if (child_session_id) |session_id| {
+            self.child_attention_count += 1;
+            self.last_attention_child_session_id = session_id;
+        }
     }
 };
 
@@ -2940,6 +3054,36 @@ test "core.app_worker_runtime emits permission attention once when approval open
     try std.testing.expectEqual(@as(usize, 1), app.attention_count);
 }
 
+test "core.app_worker_runtime attributes surfaced child permission attention to the child session" {
+    var app = FakeApp.init(std.testing.allocator);
+    defer app.deinit();
+    app.worker.processing = true;
+    app.worker.active_turn_id = 73;
+    app.subagents.pending_approval = .{
+        .id = 19,
+        .label = "subagent command",
+        .origin = .{ .subagent = "child-name" },
+    };
+    app.subagents.pending_child_session_id = "child-session-19";
+
+    Runtime(FakeApp).syncState(&app, NoopBridge.lifecyclePresenter(&app));
+
+    try std.testing.expectEqual(@as(usize, 1), app.attention_count);
+    try std.testing.expectEqual(@as(usize, 1), app.child_attention_count);
+    try std.testing.expectEqualStrings(
+        "child-session-19",
+        app.last_attention_child_session_id.?,
+    );
+    try std.testing.expectEqual(
+        @as(?@import("../hooks/hooks.zig").AttentionKind, .permission),
+        app.last_attention_kind,
+    );
+
+    Runtime(FakeApp).syncState(&app, NoopBridge.lifecyclePresenter(&app));
+    try std.testing.expectEqual(@as(usize, 1), app.attention_count);
+    try std.testing.expectEqual(@as(usize, 1), app.child_attention_count);
+}
+
 test "core.app_worker_runtime emits question and route recovery attention only for active prompts" {
     const cases = [_]struct {
         source: worker_runtime.QuestionPromptSource,
@@ -2975,6 +3119,22 @@ test "core.app_worker_runtime emits question and route recovery attention only f
     try invalid.worker.pushEvent(std.heap.c_allocator, .question_requested);
     try Runtime(FakeApp).tick(&invalid, noopTaskCompletion, NoopBridge.handlers(&invalid));
     try std.testing.expectEqual(@as(usize, 0), invalid.attention_count);
+}
+
+test "core.app_worker_runtime drops a question resolved before attention presentation" {
+    var app = FakeApp.init(std.testing.allocator);
+    defer app.deinit();
+    app.worker.processing = true;
+    app.worker.pending_question = true;
+    app.worker.question_presentation_allowed = false;
+    try app.worker.pushEvent(std.heap.c_allocator, .question_requested);
+
+    try Runtime(FakeApp).tick(&app, noopTaskCompletion, NoopBridge.handlers(&app));
+
+    try std.testing.expectEqual(@as(usize, 0), app.worker.question_presentation_count);
+    try std.testing.expectEqual(@as(usize, 0), app.attention_count);
+    try std.testing.expect(!app.question_prompt.isActive());
+    try std.testing.expectEqual(@as(usize, 1), app.question_prompt.clear_count);
 }
 
 test "core.app_worker_runtime syncState clears a completed question" {

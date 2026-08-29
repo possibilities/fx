@@ -383,7 +383,7 @@ const App = struct {
         Self,
         builtin_hooks.notifications.provider(Self),
     );
-    const HerdrAppRuntime = builtin_hooks.Runtime(Self);
+    const LifecycleAppRuntime = builtin_hooks.Runtime(Self);
     const RenderAppRuntime = app_render_runtime.Runtime(Self);
     const SessionAppRuntime = app_session_runtime.Runtime(Self);
     const UpgradeAppRuntime = app_upgrade_runtime.Runtime(Self);
@@ -517,6 +517,8 @@ const App = struct {
     lifecycle_runtime: hooks.Runtime = hooks.Runtime.init(std.heap.c_allocator),
     lifecycle_view: hooks.RuntimeView = hooks.RuntimeView.empty(),
     notifications: builtin_hooks.notifications.State = .{},
+    lifecycle_state: builtin_hooks.lifecycle_state.Reducer = .{},
+    ade_events: builtin_hooks.ade_events.Client = .{},
     herdr: builtin_hooks.Client = .{},
 
     session: SessionRuntime = SessionRuntime.initWithProviders(
@@ -678,10 +680,15 @@ const App = struct {
     }
 
     pub fn configureNotifications(self: *App) !void {
-        // Register herdr hooks before NotificationAppRuntime.configure freezes
-        // the lifecycle runtime (its call to freeze() is the sole freeze site).
-        try HerdrAppRuntime.configure(self, SessionAppRuntime.activeSessionId(self));
+        // Register built-in observers before NotificationAppRuntime.configure
+        // freezes the lifecycle runtime (its call to freeze() is the sole
+        // freeze site).
+        try LifecycleAppRuntime.configure(self, SessionAppRuntime.activeSessionId(self));
         try NotificationAppRuntime.configure(self);
+    }
+
+    pub fn reportSessionIdentityChanged(self: *App, session_id: ?[]const u8) void {
+        LifecycleAppRuntime.reportSessionChanged(self, session_id);
     }
 
     pub fn rebindAfterInit(self: *App) void {
@@ -748,8 +755,49 @@ const App = struct {
         self: *App,
         turn_id: u64,
         kind: hooks.AttentionKind,
+        child_session_id: ?[]const u8,
     ) void {
-        NotificationAppRuntime.dispatchAttentionRequired(self, turn_id, kind);
+        agent_runtime.dispatchAttentionRequiredCheckpoint(.{
+            .view = self.lifecycle_view,
+            .scope = self.attentionScope(child_session_id),
+            .outcome_allocator = self.alloc,
+        }, .{
+            .turn_id = if (child_session_id == null) turn_id else null,
+            .kind = kind,
+            .presented_interactively = true,
+        });
+    }
+
+    pub fn dispatchAttentionResolved(
+        self: *App,
+        turn_id: u64,
+        kind: hooks.AttentionKind,
+        child_session_id: ?[]const u8,
+    ) void {
+        agent_runtime.dispatchAttentionResolvedCheckpoint(.{
+            .view = self.lifecycle_view,
+            .scope = self.attentionScope(child_session_id),
+            .outcome_allocator = self.alloc,
+        }, .{
+            .turn_id = if (child_session_id == null) turn_id else null,
+            .kind = kind,
+            .presented_interactively = true,
+        });
+    }
+
+    fn attentionScope(
+        self: *App,
+        child_session_id: ?[]const u8,
+    ) hooks.Scope {
+        return if (child_session_id) |session_id| .{
+            .kind = .subagent,
+            .workspace_root = self.workspace_root,
+            .session_id = session_id,
+        } else .{
+            .kind = .interactive,
+            .workspace_root = self.workspace_root,
+            .session_id = SessionAppRuntime.activeSessionId(self),
+        };
     }
 
     /// Must be called after init() returns so the AutoUpgrade thread
@@ -842,6 +890,8 @@ const App = struct {
         self.web_fetch_runtime.deinit(self.alloc);
         self.web_search_runtime.deinit();
         self.subagents.deinit(self.alloc);
+        LifecycleAppRuntime.prepareStopped(self);
+        self.ade_events.deinit();
         self.queued_prompt_review.deinit(self.alloc);
         self.prompt_history.deinit(self.alloc);
         self.clearPendingImages();
@@ -870,6 +920,7 @@ const App = struct {
         self.context_snapshot.deinit(self.alloc);
         self.file_index.deinit(std.heap.c_allocator);
         self.lifecycle_runtime.deinit();
+        LifecycleAppRuntime.deinit(self);
 
         self.auth.deinit(self.alloc);
         WorkspaceAppRuntime.deinit(self);
@@ -1443,7 +1494,7 @@ const App = struct {
                 review,
             );
 
-        try self.worker.admitPrompt(std.heap.c_allocator, .{
+        try self.worker.admitPromptObserved(std.heap.c_allocator, .{
             .turn_id = if (recovery_checkpoint) |checkpoint| checkpoint.turn_id else turn_id,
             .prompt = prompt_copy,
             .images = images_copy,
@@ -1465,9 +1516,17 @@ const App = struct {
             .recovery_checkpoint = recovery_checkpoint_copy,
             .recovery_source_already_presented = recovery_checkpoint != null,
             .user_prompt_already_presented = user_prompt_already_presented,
-        }, recovery_checkpoint == null and intent == .steer);
-        HerdrAppRuntime.reportWorking(self);
+        }, recovery_checkpoint == null and intent == .steer, .{
+            .ctx = self,
+            .report = reportPromptAdmission,
+        });
+        LifecycleAppRuntime.reportPromptWorking(self);
         return true;
+    }
+
+    fn reportPromptAdmission(raw: *anyopaque) void {
+        const self: *App = @ptrCast(@alignCast(raw));
+        LifecycleAppRuntime.reportPromptQueued(self);
     }
 
     pub fn installInitialMcpRuntime(self: *App, runtime: ?*mcp_runtime_mod.McpRuntime) void {

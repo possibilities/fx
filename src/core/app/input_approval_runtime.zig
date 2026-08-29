@@ -42,6 +42,62 @@ pub fn ApprovalRuntime(comptime App: type) type {
         const interrupt = input_interrupt_runtime.InterruptRuntime(App);
         const queue_rt = input_queue_runtime.Runtime(App);
 
+        const AttentionResolutionObserver = struct {
+            app: *App,
+            child_session_id: ?[]const u8,
+
+            fn interface(self: *@This()) worker_runtime.DecisionObserver {
+                return .{
+                    .context = self,
+                    .observe_fn = observe,
+                };
+            }
+
+            fn observe(raw: *anyopaque, turn_id: u64) void {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                if (comptime @hasDecl(App, "dispatchAttentionResolved")) {
+                    self.app.dispatchAttentionResolved(
+                        turn_id,
+                        .permission,
+                        self.child_session_id,
+                    );
+                }
+            }
+        };
+
+        fn resolveSubagentApproval(
+            app: *App,
+            host: anytype,
+            options: subagent_tool_host.ApprovalResolveOptions,
+            child_session_id: []const u8,
+        ) !approval_registry.ResolveResult {
+            const Host = @TypeOf(host.*);
+            if (comptime @hasDecl(Host, "resolveApprovalObserved") and
+                @hasDecl(App, "dispatchAttentionResolved"))
+            {
+                var observation = AttentionResolutionObserver{
+                    .app = app,
+                    .child_session_id = child_session_id,
+                };
+                return host.resolveApprovalObserved(
+                    options,
+                    observation.interface(),
+                );
+            }
+
+            const result = try host.resolveApproval(options);
+            if (result == .accepted) {
+                if (comptime @hasDecl(App, "dispatchAttentionResolved")) {
+                    app.dispatchAttentionResolved(
+                        app.worker.activeTurnId(),
+                        .permission,
+                        child_session_id,
+                    );
+                }
+            }
+            return result;
+        }
+
         fn requestActiveSurfaceFrame(app: *App) void {
             app_render_runtime.Runtime(App).requestActiveSurfaceFrame(app, .modal);
         }
@@ -254,7 +310,35 @@ pub fn ApprovalRuntime(comptime App: type) type {
             );
             var response_submitted = false;
             errdefer if (!response_submitted) response.deinit();
-            const result = app.worker.submitPermissionResponse(request_id, response);
+            const Worker = switch (@typeInfo(@TypeOf(app.worker))) {
+                .pointer => |pointer| pointer.child,
+                else => @TypeOf(app.worker),
+            };
+            const result = if (comptime @hasDecl(Worker, "submitPermissionResponseObserved") and
+                @hasDecl(App, "dispatchAttentionResolved"))
+            observed: {
+                var observation = AttentionResolutionObserver{
+                    .app = app,
+                    .child_session_id = null,
+                };
+                break :observed app.worker.submitPermissionResponseObserved(
+                    request_id,
+                    response,
+                    observation.interface(),
+                );
+            } else fallback: {
+                const submitted = app.worker.submitPermissionResponse(request_id, response);
+                if (submitted == .accepted) {
+                    if (comptime @hasDecl(App, "dispatchAttentionResolved")) {
+                        app.dispatchAttentionResolved(
+                            app.worker.activeTurnId(),
+                            .permission,
+                            null,
+                        );
+                    }
+                }
+                break :fallback submitted;
+            };
             response_submitted = true;
             switch (result) {
                 .accepted => {
@@ -366,13 +450,19 @@ pub fn ApprovalRuntime(comptime App: type) type {
                 decision,
             );
             defer response.deinit();
-            const resolved = host.resolveApproval(.{
+            const options: subagent_tool_host.ApprovalResolveOptions = .{
                 .request_id = binding.approval_id,
                 .child_id = binding.child_id,
                 .decision = response.decision,
                 .feedback = response.feedback,
                 .timestamp_ms = io_mod.milliTimestamp(),
-            }) catch |err| {
+            };
+            const resolved = resolveSubagentApproval(
+                app,
+                host,
+                options,
+                binding.child_id,
+            ) catch |err| {
                 const stale = err == error.RequestNotFound or
                     err == error.StaleRequest or err == error.WrongChild;
                 debug_trace.logf(

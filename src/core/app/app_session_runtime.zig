@@ -1498,6 +1498,7 @@ pub fn Runtime(comptime App: type) type {
 
         fn installFreshLiveSession(app: *App) !void {
             try beginFreshPersistedSession(app);
+            reportSessionIdentityChanged(app);
             enableSessionStores(app);
             refreshSubagentProjectionAfterSessionInstall(app);
             try finishLiveSessionTransition(app);
@@ -1869,8 +1870,15 @@ pub fn Runtime(comptime App: type) type {
             const active = &app.session_persistence.writable.?;
             try hydrateResumedSession(app, active.state, display.title, notice);
             active.resume_view_stale = true;
+            reportSessionIdentityChanged(app);
             enableSessionStores(app);
             refreshSubagentProjectionAfterSessionInstall(app);
+        }
+
+        fn reportSessionIdentityChanged(app: *App) void {
+            if (comptime @hasDecl(App, "reportSessionIdentityChanged")) {
+                app.reportSessionIdentityChanged(activeSessionId(app));
+            }
         }
 
         fn hydrateResumedSession(
@@ -2315,6 +2323,7 @@ pub fn Runtime(comptime App: type) type {
                 );
                 return;
             };
+            reportSessionIdentityChanged(app);
             enableSessionStores(app);
         }
 
@@ -5114,12 +5123,19 @@ const TestApp = struct {
         authority_mutex: std.Io.Mutex = .init,
     } = .{},
     mcp_tool_names: std.ArrayList([]u8) = .empty,
+    reported_session_identity_count: usize = 0,
+    last_reported_session_id: ?[]const u8 = null,
 
     fn init(alloc: Allocator, workspace_root: []const u8) !TestApp {
         return .{
             .alloc = alloc,
             .workspace_root = try alloc.dupe(u8, workspace_root),
         };
+    }
+
+    fn reportSessionIdentityChanged(self: *TestApp, session_id: ?[]const u8) void {
+        self.reported_session_identity_count += 1;
+        self.last_reported_session_id = session_id;
     }
 
     fn toolAdvertisementSet(_: *const TestApp) tool_set_contract.ToolSet {
@@ -7819,6 +7835,11 @@ test "canceling a startup session picker starts a writable fresh session" {
 
     try std.testing.expect(!app.session_persistence.session_picker.active);
     try std.testing.expect(app.session_persistence.writable != null);
+    try std.testing.expectEqual(@as(usize, 1), app.reported_session_identity_count);
+    try std.testing.expectEqualStrings(
+        app.session_persistence.writable.?.active_id,
+        app.last_reported_session_id.?,
+    );
 }
 
 test "interactive session resume uses the live transition and shared restore path" {
