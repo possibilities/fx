@@ -371,6 +371,10 @@ pub const top_level_flags = [_]TopLevelFlag{
         .description = "Disable native tools for TUI or ACP",
     },
     .{
+        .usage = "--tool <name>",
+        .description = "Allow only this native tool; repeatable",
+    },
+    .{
         .usage = "-c, --continue",
         .description = "Resume the latest workspace session",
     },
