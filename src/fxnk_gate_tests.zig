@@ -11,6 +11,7 @@ test {
     _ = @import("core/app/app_input_runtime.zig");
     _ = @import("core/app/app_lifecycle.zig");
     _ = @import("core/app/app_profile_runtime.zig");
+    _ = @import("core/app/app_runtime_setup.zig");
     _ = @import("core/app/input_approval_runtime.zig");
     _ = @import("core/cli/cli_surface.zig");
     _ = @import("core/config/config_runtime.zig");
@@ -20,6 +21,7 @@ test {
     _ = @import("core/session/session_naming.zig");
     _ = @import("core/skills/skill_runtime.zig");
     _ = @import("core/subagent/tool_host.zig");
+    _ = @import("core/tooling/tool_runtime.zig");
     _ = @import("tools/skills/skill_search.zig");
     _ = @import("napi_session_store.zig");
     _ = @import("ui/transcript/runtime.zig");
