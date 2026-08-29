@@ -376,6 +376,10 @@ fn runInteractiveWithDeps(comptime App: type, comptime cooperative: bool, alloc:
                 try relaunch_argv.append(alloc, "--state-dir");
                 try relaunch_argv.append(alloc, home);
             }
+            if (launch.modifiers.permission_policy) |policy| {
+                try relaunch_argv.append(alloc, "--permissions-file");
+                try relaunch_argv.append(alloc, policy.path);
+            }
             if (!allow_native_tools) {
                 try relaunch_argv.append(alloc, "--no-native-tools");
             } else {
@@ -412,6 +416,7 @@ fn runInteractiveWithDeps(comptime App: type, comptime cooperative: bool, alloc:
                 selected_native_tools,
                 project_instructions_enabled,
                 launch.modifiers.state_home,
+                if (launch.modifiers.permission_policy) |policy| policy.path else null,
             );
         } else {
             writeStderr(
@@ -483,6 +488,7 @@ fn writeUpgradeRelaunchFailure(
     selected_native_tools: []const []const u8,
     project_instructions_enabled: bool,
     state_home: ?[]const u8,
+    permission_file: ?[]const u8,
 ) void {
     const rendered = formatUpgradeRelaunchFailure(
         alloc,
@@ -492,6 +498,7 @@ fn writeUpgradeRelaunchFailure(
         selected_native_tools,
         project_instructions_enabled,
         state_home,
+        permission_file,
     ) catch {
         writeStderr(
             deps,
@@ -511,6 +518,7 @@ fn formatUpgradeRelaunchFailure(
     selected_native_tools: []const []const u8,
     project_instructions_enabled: bool,
     state_home: ?[]const u8,
+    permission_file: ?[]const u8,
 ) ![]u8 {
     var writer: std.Io.Writer.Allocating = .init(alloc);
     errdefer writer.deinit();
@@ -530,6 +538,9 @@ fn formatUpgradeRelaunchFailure(
     }
     if (state_home) |home| {
         try writer.writer.print(" --state-dir {s}", .{home});
+    }
+    if (permission_file) |path| {
+        try writer.writer.print(" --permissions-file {s}", .{path});
     }
     try writer.writer.print(" --resume {s}\n", .{session_id});
     return writer.toOwnedSlice();
@@ -1305,7 +1316,7 @@ test "app entry preserves project instruction suppression across upgrade relaunc
     ) != null);
 }
 
-test "app entry preserves launch controls across upgrade relaunch" {
+test "app entry preserves state, permission policy, and launch modifiers across upgrade relaunch" {
     const alloc = std.testing.allocator;
     const overrides = try alloc.dupe(
         config_runtime.context_limits.Override,
@@ -1317,6 +1328,7 @@ test "app entry preserves launch controls across upgrade relaunch" {
     const directories = try alloc.alloc([]u8, 1);
     directories[0] = try alloc.dupe(u8, "/tmp/fx-extra");
     const state_home = try alloc.dupe(u8, "/tmp/fx-state");
+    const permission_path = try alloc.dupe(u8, "/tmp/fx-policy.json");
     var capture = TestCapture.init(.{ .interactive = .{
         .record_requested = true,
         .modifiers = .{
@@ -1324,6 +1336,10 @@ test "app entry preserves launch controls across upgrade relaunch" {
             .additional_directories = directories,
             .saved_directories_suppressed = true,
             .state_home = state_home,
+            .permission_policy = .{
+                .path = permission_path,
+                .rules = .{},
+            },
         },
     } });
     defer capture.deinit();
@@ -1348,6 +1364,8 @@ test "app entry preserves launch controls across upgrade relaunch" {
         "--no-additional-dirs",
         "--state-dir",
         "/tmp/fx-state",
+        "--permissions-file",
+        "/tmp/fx-policy.json",
         "resume",
         "session-123",
         "--upgrade-relaunch",
@@ -1360,7 +1378,7 @@ test "app entry preserves launch controls across upgrade relaunch" {
     try std.testing.expect(std.mem.find(
         u8,
         capture.stderr.written(),
-        "fx --state-dir /tmp/fx-state resume session-123",
+        "fx --state-dir /tmp/fx-state --permissions-file /tmp/fx-policy.json --resume session-123",
     ) != null);
 }
 

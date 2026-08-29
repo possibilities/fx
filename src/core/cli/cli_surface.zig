@@ -131,6 +131,7 @@ pub const LaunchModifiers = struct {
     no_default_skills: bool = false,
     project_instructions_enabled: bool = true,
     state_home: ?[]u8 = null,
+    permission_policy: ?config_runtime.LaunchPermissionPolicy = null,
 
     pub fn deinit(self: *LaunchModifiers, alloc: Allocator) void {
         if (self.context_limit_overrides.len > 0) alloc.free(self.context_limit_overrides);
@@ -143,6 +144,7 @@ pub const LaunchModifiers = struct {
         for (self.selected_native_tools) |name| alloc.free(name);
         if (self.selected_native_tools.len > 0) alloc.free(self.selected_native_tools);
         if (self.state_home) |path| alloc.free(path);
+        if (self.permission_policy) |*policy| policy.deinit(alloc);
         self.* = .{};
     }
 
@@ -183,6 +185,10 @@ pub const LaunchModifiers = struct {
         policy.invocation_roots = self.invocation_skill_roots;
         policy.exclusive_invocation_roots = self.no_default_skills;
         return policy;
+    }
+
+    pub fn hasPermissionPolicy(self: LaunchModifiers) bool {
+        return self.permission_policy != null;
     }
 };
 
@@ -471,6 +477,8 @@ fn parseGlobalLaunchArgs(
     var project_instructions_enabled = true;
     var state_home: ?[]u8 = null;
     errdefer if (state_home) |path| alloc.free(path);
+    var permission_policy: ?config_runtime.LaunchPermissionPolicy = null;
+    errdefer if (permission_policy) |*policy| policy.deinit(alloc);
 
     var index: usize = 0;
     while (index < args.len) {
@@ -559,6 +567,16 @@ fn parseGlobalLaunchArgs(
                 error.OutOfMemory => return error.OutOfMemory,
                 else => return error.InvalidStateDirectory,
             };
+        } else if (std.mem.eql(u8, arg, "--permissions-file")) {
+            if (permission_policy != null) return error.DuplicatePermissionsFile;
+            index += 1;
+            if (index >= args.len or args[index].len == 0) return error.MissingPermissionsFileValue;
+            permission_policy = try config_runtime.loadLaunchPermissionPolicy(alloc, args[index]);
+        } else if (std.mem.startsWith(u8, arg, "--permissions-file=")) {
+            if (permission_policy != null) return error.DuplicatePermissionsFile;
+            const value = arg["--permissions-file=".len..];
+            if (value.len == 0) return error.MissingPermissionsFileValue;
+            permission_policy = try config_runtime.loadLaunchPermissionPolicy(alloc, value);
         } else {
             break;
         }
@@ -599,6 +617,7 @@ fn parseGlobalLaunchArgs(
             .no_default_skills = no_default_skills,
             .project_instructions_enabled = project_instructions_enabled,
             .state_home = state_home,
+            .permission_policy = permission_policy,
         },
     };
 }
@@ -629,7 +648,8 @@ pub fn argsAfterGlobalLaunchArgs(args: []const [:0]const u8) []const [:0]const u
             std.mem.eql(u8, arg, "--skills-dir") or std.mem.eql(u8, arg, "--system-prompt-file") or
             std.mem.eql(u8, arg, "--append-system-prompt-file") or
             std.mem.eql(u8, arg, "--tool") or
-            std.mem.eql(u8, arg, "--state-dir"))
+            std.mem.eql(u8, arg, "--state-dir") or
+            std.mem.eql(u8, arg, "--permissions-file"))
         {
             index += 1;
             if (index >= args.len) return &.{};
@@ -643,7 +663,8 @@ pub fn argsAfterGlobalLaunchArgs(args: []const [:0]const u8) []const [:0]const u
             !std.mem.eql(u8, arg, "--no-native-tools") and
             !std.mem.eql(u8, arg, "--no-default-skills") and
             !std.mem.eql(u8, arg, "--no-project-instructions") and
-            !std.mem.startsWith(u8, arg, "--state-dir="))
+            !std.mem.startsWith(u8, arg, "--state-dir=") and
+            !std.mem.startsWith(u8, arg, "--permissions-file="))
         {
             return args[index..];
         }
@@ -1064,7 +1085,7 @@ fn runIfRequestedWithDeps(alloc: Allocator, args: []const [:0]const u8, cfg: Con
         } else {
             try writer.writer.print("fx: invalid global launch option: {s}\n", .{@errorName(err)});
         }
-        try writer.writer.writeAll("usage: fx [--skills-dir PATH]... [--system-prompt-file PATH] [--append-system-prompt-file PATH]... [--context-limit NAME=BYTES|off] [--add-dir PATH]... [--no-additional-dirs] [--state-dir DIR] <command>\n");
+        try writer.writer.writeAll("usage: fx [--skills-dir PATH]... [--system-prompt-file PATH] [--append-system-prompt-file PATH]... [--context-limit NAME=BYTES|off] [--add-dir PATH]... [--no-additional-dirs] [--state-dir DIR] [--permissions-file FILE] <command>\n");
         try writeStderr(deps, writer.written());
         return .handled_failure;
     };
@@ -1178,6 +1199,12 @@ fn runNonInteractiveWithDeps(
         try writeStateHomeUsage(deps);
         return .handled_failure;
     }
+    if (global_args.modifiers.hasPermissionPolicy() and
+        !commandSupportsLaunchPermissionPolicy(parsed_command))
+    {
+        try writeLaunchPermissionPolicyUsage(deps);
+        return .handled_failure;
+    }
 
     if (isVersionFlag(effective_args[0])) {
         if (effective_args.len != 1) {
@@ -1244,6 +1271,10 @@ fn runNonInteractiveWithDeps(
                 .invocation_skill_roots = global_args.modifiers.invocation_skill_roots,
                 .saved_directories_suppressed = global_args.modifiers.saved_directories_suppressed,
                 .skill_root_policy = global_args.modifiers.skillRootPolicy(cfg.skill_root_policy),
+                .permission_rules_override = if (global_args.modifiers.permission_policy) |policy|
+                    policy.rules
+                else
+                    null,
                 .model_override = acp_opts.model,
                 .log_file = acp_opts.log_file,
                 .allow_acp_mcp = acp_opts.allow_acp_mcp,
@@ -3824,6 +3855,13 @@ fn commandSupportsNativeToolModifier(command: Command) bool {
     };
 }
 
+fn commandSupportsLaunchPermissionPolicy(command: Command) bool {
+    return switch (command) {
+        .interactive, .acp, .resume_session => true,
+        else => false,
+    };
+}
+
 fn commandSupportsStateHome(command: Command) bool {
     return switch (command) {
         .interactive, .acp, .resume_session => true,
@@ -3927,7 +3965,6 @@ fn writePromptFileModifierUsage(deps: RunDeps) !void {
 fn writeAskSystemPromptConflict(deps: RunDeps) !void {
     try writeStderr(deps, "fx ask: --system cannot be combined with --system-prompt-file or --append-system-prompt-file\n");
 }
-
 fn writeWorkspaceModifierUsage(deps: RunDeps) !void {
     try writeStderr(
         deps,
@@ -3995,6 +4032,13 @@ fn writeStateHomeUsage(deps: RunDeps) !void {
     );
 }
 
+fn writeLaunchPermissionPolicyUsage(deps: RunDeps) !void {
+    try writeStderr(
+        deps,
+        "fx: --permissions-file is only supported for interactive, resume, and ACP launches\n",
+    );
+}
+
 fn globalLaunchErrorMessage(err: anyerror) ?[]const u8 {
     return switch (err) {
         error.MissingAddDirectoryValue => "--add-dir requires a directory path",
@@ -4011,6 +4055,11 @@ fn globalLaunchErrorMessage(err: anyerror) ?[]const u8 {
         error.MissingStateDirectoryValue => "--state-dir requires a directory path",
         error.DuplicateStateDirectory => "--state-dir may only be specified once",
         error.InvalidStateDirectory => "--state-dir must name an existing directory",
+        error.MissingPermissionsFileValue => "--permissions-file requires a file path",
+        error.DuplicatePermissionsFile => "--permissions-file may only be specified once",
+        error.PermissionPolicyUnavailable => "--permissions-file must name a readable regular file",
+        error.PermissionPolicyTooLarge => "--permissions-file exceeds the 64 KiB limit",
+        error.InvalidPermissionPolicy => "--permissions-file must contain valid permission-rule JSON",
         else => null,
     };
 }
@@ -4974,6 +5023,52 @@ test "global native tool selection parsing is allocation safe" {
         .{},
     );
 }
+
+test "global launch permission policy owns canonical rules before the command" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    {
+        var file = try tmp.dir.createFile(std.testing.io, "policy.json", .{});
+        defer file.close(std.testing.io);
+        try file.writeStreamingAll(
+            std.testing.io,
+            "{\"bash\":{\"git *\":\"allow\",\"git push *\":\"deny\"}}",
+        );
+    }
+    const policy_path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "policy.json");
+    defer alloc.free(policy_path);
+    const policy_arg = try alloc.dupeZ(u8, policy_path);
+    defer alloc.free(policy_arg);
+
+    var parsed = try parseGlobalLaunchArgs(alloc, &.{
+        @constCast("--permissions-file"),
+        policy_arg,
+        @constCast("acp"),
+    });
+    defer parsed.deinit(alloc);
+
+    const policy = parsed.modifiers.permission_policy.?;
+    try std.testing.expect(policy.path.ptr != policy_arg.ptr);
+    try std.testing.expectEqualStrings(policy_path, policy.path);
+    try std.testing.expectEqual(@as(usize, 2), policy.rules.rules.len);
+    try std.testing.expectEqualStrings("git *", policy.rules.rules[0].pattern);
+    try std.testing.expectEqual(types.PermissionAction.allow, policy.rules.rules[0].action);
+    try std.testing.expectEqualStrings("git push *", policy.rules.rules[1].pattern);
+    try std.testing.expectEqual(types.PermissionAction.deny, policy.rules.rules[1].action);
+    try std.testing.expectEqualStrings("acp", parsed.remaining[0]);
+
+    try std.testing.expectError(
+        error.DuplicatePermissionsFile,
+        parseGlobalLaunchArgs(alloc, &.{
+            @constCast("--permissions-file"),
+            policy_arg,
+            @constCast("--permissions-file"),
+            policy_arg,
+        }),
+    );
+}
+
 test "parse acp args extracts known flags and rejects invalid arguments" {
     const opts = try parseAcpArgs(&.{
         @constCast("--model"),
@@ -5070,8 +5165,16 @@ test "ACP command routes parsed options and launch config through the injected r
                     .bytes => |bytes| bytes == 1234,
                     .off => false,
                 };
+            const permission_matches = if (cfg.permission_rules_override) |rules|
+                rules.rules.len == 1 and
+                    std.mem.eql(u8, rules.rules[0].permission, "edit") and
+                    std.mem.eql(u8, rules.rules[0].pattern, "*") and
+                    rules.rules[0].action == .deny
+            else
+                false;
             self.launch_matches =
                 limit_matches and
+                permission_matches and
                 cfg.additional_directories.len == 1 and
                 std.mem.eql(u8, cfg.additional_directories[0], "/tmp/acp-extra") and
                 cfg.invocation_skill_roots.len == 3 and
@@ -5096,6 +5199,11 @@ test "ACP command routes parsed options and launch config through the injected r
     defer tmp.cleanup();
     try tmp.dir.createDirPath(std.testing.io, "acp-first-skills");
     try tmp.dir.createDirPath(std.testing.io, "acp-second-skills");
+    {
+        var file = try tmp.dir.createFile(std.testing.io, "policy.json", .{});
+        defer file.close(std.testing.io);
+        try file.writeStreamingAll(std.testing.io, "{\"edit\":\"deny\"}");
+    }
     const invocation_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(invocation_root);
     const invocation_root_z = try alloc.dupeZ(u8, invocation_root);
@@ -5115,6 +5223,14 @@ test "ACP command routes parsed options and launch config through the injected r
     defer alloc.free(prompt_path);
     const prompt_path_z = try alloc.dupeZ(u8, prompt_path);
     defer alloc.free(prompt_path_z);
+    const policy_path = try io_mod.dirRealpathAlloc(
+        alloc,
+        tmp.dir,
+        "policy.json",
+    );
+    defer alloc.free(policy_path);
+    const policy_arg = try alloc.dupeZ(u8, policy_path);
+    defer alloc.free(policy_arg);
 
     var cfg = testConfig();
     cfg.provider_set.gateway.permission_reviewer = test_builtin_gateway.permission_reviewer.provider;
@@ -5134,6 +5250,8 @@ test "ACP command routes parsed options and launch config through the injected r
             invocation_root_z,
             @constCast("--system-prompt-file"),
             prompt_path_z,
+            @constCast("--permissions-file"),
+            policy_arg,
             @constCast("--context-limit"),
             @constCast("project_instructions_total_bytes=1234"),
             @constCast("--add-dir"),
@@ -5788,6 +5906,10 @@ test "global workspace launch option errors use user-facing copy" {
         .{
             .args = &.{ @constCast("--no-additional-dirs"), @constCast("--no-additional-dirs") },
             .expected = "fx: --no-additional-dirs may only be specified once\n",
+        },
+        .{
+            .args = &.{@constCast("--permissions-file")},
+            .expected = "fx: --permissions-file requires a file path\n",
         },
     };
 
