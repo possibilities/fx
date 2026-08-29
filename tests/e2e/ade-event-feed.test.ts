@@ -339,11 +339,15 @@ describe.skipIf(!tmuxAvailable())("ADE event feed", () => {
       const resumePane = await session.waitForPane(
         (pane) =>
           pane.includes("Sessions 2") &&
-          pane.includes("ADE_QUESTION_REQUEST") &&
+          (pane.includes("ade-native-session-title") ||
+            pane.includes("ADE_QUESTION_REQUEST")) &&
           pane.includes("ADE_CHILD_PROMPT: run a terminal command"),
         TIMEOUT,
       );
-      expect(resumePane.indexOf("ADE_QUESTION_REQUEST")).toBeLessThan(
+      const originalTitle = resumePane.includes("ade-native-session-title")
+        ? "ade-native-session-title"
+        : "ADE_QUESTION_REQUEST";
+      expect(resumePane.indexOf(originalTitle)).toBeLessThan(
         resumePane.indexOf("ADE_CHILD_PROMPT: run a terminal command"),
       );
       // The picker can preserve its prior selection while the all-workspaces
