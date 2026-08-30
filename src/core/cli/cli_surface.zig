@@ -117,17 +117,30 @@ pub const ResumeTarget = union(enum) {
 pub const LaunchModifiers = struct {
     context_limit_overrides: []config_runtime.context_limits.Override = &.{},
     additional_directories: [][]u8 = &.{},
+    invocation_skill_roots: [][]u8 = &.{},
     saved_directories_suppressed: bool = false,
 
     pub fn deinit(self: *LaunchModifiers, alloc: Allocator) void {
         if (self.context_limit_overrides.len > 0) alloc.free(self.context_limit_overrides);
         for (self.additional_directories) |path| alloc.free(path);
         if (self.additional_directories.len > 0) alloc.free(self.additional_directories);
+        for (self.invocation_skill_roots) |path| alloc.free(path);
+        if (self.invocation_skill_roots.len > 0) alloc.free(self.invocation_skill_roots);
         self.* = .{};
     }
 
     pub fn hasWorkspaceModifiers(self: LaunchModifiers) bool {
         return self.additional_directories.len > 0 or self.saved_directories_suppressed;
+    }
+
+    pub fn hasInvocationSkillRoots(self: LaunchModifiers) bool {
+        return self.invocation_skill_roots.len > 0;
+    }
+
+    pub fn takeInvocationSkillRoots(self: *LaunchModifiers) [][]u8 {
+        const roots = self.invocation_skill_roots;
+        self.invocation_skill_roots = &.{};
+        return roots;
     }
 };
 
@@ -374,6 +387,14 @@ const GlobalLaunchArgs = struct {
     }
 };
 
+/// Duplicates a global path argument and transfers its ownership to `paths`.
+/// If growing the list fails, this helper remains responsible for the duplicate.
+fn dupeAndAppendPath(alloc: Allocator, paths: *std.ArrayList([]u8), value: []const u8) !void {
+    const path = try alloc.dupe(u8, value);
+    errdefer alloc.free(path);
+    try paths.append(alloc, path);
+}
+
 fn parseGlobalLaunchArgs(
     alloc: Allocator,
     args: []const [:0]const u8,
@@ -384,6 +405,11 @@ fn parseGlobalLaunchArgs(
     errdefer {
         for (directories.items) |path| alloc.free(path);
         directories.deinit(alloc);
+    }
+    var skill_roots: std.ArrayList([]u8) = .empty;
+    errdefer {
+        for (skill_roots.items) |path| alloc.free(path);
+        skill_roots.deinit(alloc);
     }
     var suppress_saved = false;
 
@@ -399,11 +425,19 @@ fn parseGlobalLaunchArgs(
         } else if (std.mem.eql(u8, arg, "--add-dir")) {
             index += 1;
             if (index >= args.len or args[index].len == 0) return error.MissingAddDirectoryValue;
-            try directories.append(alloc, try alloc.dupe(u8, args[index]));
+            try dupeAndAppendPath(alloc, &directories, args[index]);
         } else if (std.mem.startsWith(u8, arg, "--add-dir=")) {
             const value = arg["--add-dir=".len..];
             if (value.len == 0) return error.MissingAddDirectoryValue;
-            try directories.append(alloc, try alloc.dupe(u8, value));
+            try dupeAndAppendPath(alloc, &directories, value);
+        } else if (std.mem.eql(u8, arg, "--skills-dir")) {
+            index += 1;
+            if (index >= args.len or args[index].len == 0) return error.MissingSkillsDirectoryValue;
+            try dupeAndAppendPath(alloc, &skill_roots, args[index]);
+        } else if (std.mem.startsWith(u8, arg, "--skills-dir=")) {
+            const value = arg["--skills-dir=".len..];
+            if (value.len == 0) return error.MissingSkillsDirectoryValue;
+            try dupeAndAppendPath(alloc, &skill_roots, value);
         } else if (std.mem.eql(u8, arg, "--no-additional-dirs")) {
             if (suppress_saved) return error.DuplicateAdditionalDirectorySuppression;
             suppress_saved = true;
@@ -416,11 +450,17 @@ fn parseGlobalLaunchArgs(
     const override_slice = try overrides.toOwnedSlice(alloc);
     errdefer if (override_slice.len > 0) alloc.free(override_slice);
     const directory_slice = try directories.toOwnedSlice(alloc);
+    errdefer {
+        for (directory_slice) |path| alloc.free(path);
+        if (directory_slice.len > 0) alloc.free(directory_slice);
+    }
+    const skill_root_slice = try skill_roots.toOwnedSlice(alloc);
     return .{
         .remaining = args[index..],
         .modifiers = .{
             .context_limit_overrides = override_slice,
             .additional_directories = directory_slice,
+            .invocation_skill_roots = skill_root_slice,
             .saved_directories_suppressed = suppress_saved,
         },
     };
@@ -438,11 +478,14 @@ pub fn argsAfterGlobalLaunchArgs(args: []const [:0]const u8) []const [:0]const u
     var index: usize = 0;
     while (index < args.len) {
         const arg = args[index];
-        if (std.mem.eql(u8, arg, "--context-limit") or std.mem.eql(u8, arg, "--add-dir")) {
+        if (std.mem.eql(u8, arg, "--context-limit") or std.mem.eql(u8, arg, "--add-dir") or
+            std.mem.eql(u8, arg, "--skills-dir"))
+        {
             index += 1;
             if (index >= args.len) return &.{};
         } else if (!std.mem.startsWith(u8, arg, "--context-limit=") and
             !std.mem.startsWith(u8, arg, "--add-dir=") and
+            !std.mem.startsWith(u8, arg, "--skills-dir=") and
             !std.mem.eql(u8, arg, "--no-additional-dirs"))
         {
             return args[index..];
@@ -835,12 +878,17 @@ fn runIfRequestedWithDeps(alloc: Allocator, args: []const [:0]const u8, cfg: Con
         } else {
             try writer.writer.print("fx: invalid global launch option: {s}\n", .{@errorName(err)});
         }
-        try writer.writer.writeAll("usage: fx [--context-limit NAME=BYTES|off] [--add-dir PATH]... [--no-additional-dirs] <command>\n");
+        try writer.writer.writeAll("usage: fx [--skills-dir PATH]... [--context-limit NAME=BYTES|off] [--add-dir PATH]... [--no-additional-dirs] <command>\n");
         try writeStderr(deps, writer.written());
         return .handled_failure;
     };
     switch (parsed_launch) {
-        .interactive => |launch| {
+        .interactive => |value| {
+            var launch = value;
+            if (!try prepareInvocationSkillRoots(alloc, &launch.modifiers, deps)) {
+                launch.deinit(alloc);
+                return .handled_failure;
+            }
             try writeMcpProfileWarningIfPresent(alloc, cfg, deps);
             return .{ .interactive = launch };
         },
@@ -866,6 +914,15 @@ fn runNonInteractiveWithDeps(
         !commandSupportsWorkspaceModifiers(parsed_command))
     {
         try writeWorkspaceModifierUsage(deps);
+        return .handled_failure;
+    }
+    if (global_args.modifiers.hasInvocationSkillRoots() and
+        !commandSupportsInvocationSkillRoots(parsed_command))
+    {
+        try writeInvocationSkillRootUsage(deps);
+        return .handled_failure;
+    }
+    if (!try prepareInvocationSkillRoots(alloc, &global_args.modifiers, deps)) {
         return .handled_failure;
     }
 
@@ -940,6 +997,7 @@ fn runNonInteractiveWithDeps(
                 .mode_registry = cfg.mode_registry,
                 .context_limit_overrides = global_args.modifiers.context_limit_overrides,
                 .additional_directories = global_args.modifiers.additional_directories,
+                .invocation_skill_roots = global_args.modifiers.invocation_skill_roots,
                 .saved_directories_suppressed = global_args.modifiers.saved_directories_suppressed,
                 .model_override = acp_opts.model,
                 .effort_override = acp_opts.effort,
@@ -3484,6 +3542,7 @@ fn workflowConfigWithLaunchModifiers(
     var result = workflowConfig(cfg);
     result.context_limit_overrides = modifiers.context_limit_overrides;
     result.additional_directories = modifiers.additional_directories;
+    result.invocation_skill_roots = modifiers.invocation_skill_roots;
     result.saved_directories_suppressed = modifiers.saved_directories_suppressed;
     return result;
 }
@@ -3495,6 +3554,50 @@ fn commandSupportsWorkspaceModifiers(command: Command) bool {
     };
 }
 
+fn commandSupportsInvocationSkillRoots(command: Command) bool {
+    return switch (command) {
+        .interactive, .ask, .acp, .pr, .issue, .resume_session => true,
+        else => false,
+    };
+}
+
+fn prepareInvocationSkillRoots(
+    alloc: Allocator,
+    modifiers: *LaunchModifiers,
+    deps: RunDeps,
+) !bool {
+    for (modifiers.invocation_skill_roots, 0..) |path, index| {
+        const canonical_path = io_mod.realpathAlloc(alloc, path) catch |err| {
+            if (err == error.OutOfMemory) return error.OutOfMemory;
+            const message = try std.fmt.allocPrint(
+                alloc,
+                "fx: could not use skills directory {s}: directory is missing or unreadable\n",
+                .{path},
+            );
+            defer alloc.free(message);
+            try writeStderr(deps, message);
+            return false;
+        };
+        var dir = io_mod.openDirAbsoluteNoFollow(canonical_path, .{}) catch |err| {
+            defer alloc.free(canonical_path);
+            if (err == error.OutOfMemory) return error.OutOfMemory;
+            const message = try std.fmt.allocPrint(
+                alloc,
+                "fx: could not use skills directory {s}: path is not a readable directory\n",
+                .{path},
+            );
+            defer alloc.free(message);
+            try writeStderr(deps, message);
+            return false;
+        };
+        dir.close(io_mod.getIo());
+
+        alloc.free(path);
+        modifiers.invocation_skill_roots[index] = canonical_path;
+    }
+    return true;
+}
+
 fn writeWorkspaceModifierUsage(deps: RunDeps) !void {
     try writeStderr(
         deps,
@@ -3502,9 +3605,17 @@ fn writeWorkspaceModifierUsage(deps: RunDeps) !void {
     );
 }
 
+fn writeInvocationSkillRootUsage(deps: RunDeps) !void {
+    try writeStderr(
+        deps,
+        "fx: --skills-dir is only supported for interactive, resume, ask, ACP, PR, and issue launches\n",
+    );
+}
+
 fn globalLaunchErrorMessage(err: anyerror) ?[]const u8 {
     return switch (err) {
         error.MissingAddDirectoryValue => "--add-dir requires a directory path",
+        error.MissingSkillsDirectoryValue => "--skills-dir requires a directory path",
         error.DuplicateAdditionalDirectorySuppression => "--no-additional-dirs may only be specified once",
         else => null,
     };
@@ -4135,6 +4246,86 @@ test "additional directory flags fail closed when malformed" {
     );
 }
 
+test "global launch modifiers own ordered invocation skill roots" {
+    var parsed = try parseGlobalLaunchArgs(std.testing.allocator, &.{
+        @constCast("--skills-dir"),
+        @constCast("./team skills"),
+        @constCast("--skills-dir=/opt/shared-skills"),
+        @constCast("ask"),
+        @constCast("inspect"),
+    });
+    defer parsed.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 2), parsed.modifiers.invocation_skill_roots.len);
+    try std.testing.expectEqualStrings("./team skills", parsed.modifiers.invocation_skill_roots[0]);
+    try std.testing.expectEqualStrings("/opt/shared-skills", parsed.modifiers.invocation_skill_roots[1]);
+    try std.testing.expectEqualStrings("ask", parsed.remaining[0]);
+}
+
+test "invocation skill root flags fail closed when malformed" {
+    try std.testing.expectError(
+        error.MissingSkillsDirectoryValue,
+        parseGlobalLaunchArgs(std.testing.allocator, &.{@constCast("--skills-dir")}),
+    );
+    try std.testing.expectError(
+        error.MissingSkillsDirectoryValue,
+        parseGlobalLaunchArgs(std.testing.allocator, &.{@constCast("--skills-dir=")}),
+    );
+}
+
+test "invocation skill root canonicalization preserves allocator failure" {
+    const alloc = std.testing.allocator;
+    const roots = try alloc.alloc([]u8, 1);
+    roots[0] = try alloc.dupe(u8, "/tmp");
+    var modifiers = LaunchModifiers{ .invocation_skill_roots = roots };
+    defer modifiers.deinit(alloc);
+
+    var failing = std.testing.FailingAllocator.init(alloc, .{ .fail_index = 0 });
+    try std.testing.expectError(
+        error.OutOfMemory,
+        prepareInvocationSkillRoots(failing.allocator(), &modifiers, .{}),
+    );
+}
+
+test "invocation skill root command support is limited to launch surfaces" {
+    for ([_]Command{
+        .interactive,
+        .{ .ask = &.{} },
+        .{ .acp = &.{} },
+        .{ .pr = &.{} },
+        .{ .issue = &.{} },
+    }) |command| {
+        try std.testing.expect(commandSupportsInvocationSkillRoots(command));
+    }
+    try std.testing.expect(commandSupportsInvocationSkillRoots(.{ .resume_session = .{
+        .args = &.{},
+        .top_level_alias = false,
+    } }));
+    for ([_]Command{
+        .help,
+        .{ .models = &.{} },
+        .{ .status = &.{} },
+        .{ .doctor = &.{} },
+        .{ .upgrade = &.{} },
+    }) |command| {
+        try std.testing.expect(!commandSupportsInvocationSkillRoots(command));
+    }
+}
+
+test "workflow launch config preserves ordered invocation skill roots" {
+    var roots = [_][]u8{
+        @constCast("/tmp/team-skills"),
+        @constCast("/opt/shared-skills"),
+    };
+    const workflow_cfg = workflowConfigWithLaunchModifiers(testConfig(), .{
+        .invocation_skill_roots = &roots,
+    });
+
+    try std.testing.expectEqual(@as(usize, 2), workflow_cfg.invocation_skill_roots.len);
+    try std.testing.expectEqualStrings("/tmp/team-skills", workflow_cfg.invocation_skill_roots[0]);
+    try std.testing.expectEqualStrings("/opt/shared-skills", workflow_cfg.invocation_skill_roots[1]);
+}
+
 test "parse acp args extracts known flags and rejects invalid arguments" {
     const opts = try parseAcpArgs(&.{
         @constCast("--model"),
@@ -4162,6 +4353,7 @@ test "parse acp args extracts known flags and rejects invalid arguments" {
 test "ACP command routes parsed options and launch config through the injected runner" {
     const Capture = struct {
         expected: Config,
+        expected_invocation_root: []const u8,
         calls: usize = 0,
         config_matches: bool = false,
         launch_matches: bool = false,
@@ -4208,6 +4400,8 @@ test "ACP command routes parsed options and launch config through the injected r
                 limit_matches and
                 cfg.additional_directories.len == 1 and
                 std.mem.eql(u8, cfg.additional_directories[0], "/tmp/acp-extra") and
+                cfg.invocation_skill_roots.len == 1 and
+                std.mem.eql(u8, cfg.invocation_skill_roots[0], self.expected_invocation_root) and
                 cfg.saved_directories_suppressed and
                 std.mem.eql(u8, cfg.model_override.?, "model-override") and
                 cfg.effort_override.?.eql(types.ReasoningEffort.literal("high")) and
@@ -4215,13 +4409,22 @@ test "ACP command routes parsed options and launch config through the injected r
         }
     };
 
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const invocation_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, ".");
+    defer std.testing.allocator.free(invocation_root);
+    const invocation_root_z = try std.testing.allocator.dupeZ(u8, invocation_root);
+    defer std.testing.allocator.free(invocation_root_z);
+
     var cfg = testConfig();
     cfg.provider_set.gateway.permission_reviewer = test_builtin_gateway.permission_reviewer.provider;
-    var capture = Capture{ .expected = cfg };
+    var capture = Capture{ .expected = cfg, .expected_invocation_root = invocation_root };
     cfg.acp_runner = .{ .context = &capture, .run_fn = Capture.run };
     const result = try runIfRequestedWithDeps(
         std.testing.allocator,
         &.{
+            @constCast("--skills-dir"),
+            invocation_root_z,
             @constCast("--context-limit"),
             @constCast("project_instructions_total_bytes=1234"),
             @constCast("--add-dir"),

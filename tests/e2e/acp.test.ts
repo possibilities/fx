@@ -6589,6 +6589,53 @@ describe("acp: model-independent", () => {
   );
 
   test(
+    "ACP loads an invocation skill root from --skills-dir",
+    async () => {
+      const root = createIsolatedRoot("fx-acp-invocation-skill-");
+      const invocationRoot = join(root.root, "invocation-skills");
+      const skillDirectory = join(invocationRoot, "acp-invocation");
+      const skillBody = "ACP_INVOCATION_SKILL_BODY";
+      mkdirSync(skillDirectory, { recursive: true });
+      writeFileSync(
+        join(skillDirectory, "SKILL.md"),
+        `---\nname: acp-invocation\ndescription: invocation ACP fixture\n---\n\n${skillBody}\n`,
+      );
+      const gateway = startFakeGateway([
+        finalText("ACP invocation skill complete"),
+      ]);
+      try {
+        client = await AcpClient.create({
+          cwd: root.workspace,
+          args: ["--skills-dir", invocationRoot, "acp"],
+          env: fakeGatewayEnv(root, gateway),
+        });
+        await startCodeSession(client);
+        const result = await runPrompt(
+          client,
+          "$acp-invocation apply the selected skill.",
+          TIMEOUT,
+        );
+
+        expect(result.promptResult.error).toBeUndefined();
+        expect(result.promptResult.result.stopReason).toBe("end_turn");
+        expect(gateway.requests).toHaveLength(1);
+        const promptText = acpPromptText(gateway.requests[0]!.body);
+        expect(promptText).toContain("invocation ACP fixture");
+        expect(promptText).toContain(
+          '<skill_content name="acp-invocation" resource="SKILL.md"',
+        );
+        expect(promptText).toContain(skillBody);
+        expect(client.stderr).toBe("");
+      } finally {
+        await client?.close();
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
     "ACP rejects an explicitly invoked skill deleted after session startup",
     async () => {
       const root = createIsolatedRoot("fx-acp-stale-explicit-skill-");

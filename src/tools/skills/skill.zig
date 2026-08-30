@@ -94,6 +94,7 @@ pub fn call(ctx: tool_dispatch.DispatchContext, erased: tool_dispatch.ToolInput)
         ctx.allocator,
         ctx.workspace_root,
         ctx.skills_dir,
+        ctx.invocation_skill_roots,
         input.name,
         input.location,
         input.resource,
@@ -142,6 +143,7 @@ pub fn executeForSession(
         arena,
         workspace_root,
         skills_dir,
+        &.{},
         name,
         location,
         resource,
@@ -155,6 +157,7 @@ fn loadByIdentity(
     alloc: Allocator,
     workspace_root: []const u8,
     skills_dir: []const u8,
+    invocation_skill_roots: []const []const u8,
     name: []const u8,
     location: ?[]const u8,
     resource: ?[]const u8,
@@ -162,7 +165,12 @@ fn loadByIdentity(
     limits: context_limits.Values,
     max_tool_result_bytes: ?usize,
 ) !skill_invocation.ExecuteResult {
-    var discovery = try builtin_skills.loadVisibleSkillsForTool(alloc, workspace_root, skills_dir);
+    var discovery = try builtin_skills.loadVisibleSkillsForTool(
+        alloc,
+        workspace_root,
+        skills_dir,
+        invocation_skill_roots,
+    );
     defer discovery.deinit(alloc);
     skill_runtime.traceDiagnostics("skill_tool", discovery.diagnostics);
     return skill_invocation.loadByIdentity(
@@ -176,7 +184,6 @@ fn loadByIdentity(
         max_tool_result_bytes,
     );
 }
-
 pub fn readsOnly(_: tool_dispatch.ToolInput) bool {
     return false;
 }

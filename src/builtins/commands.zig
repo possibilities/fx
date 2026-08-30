@@ -343,6 +343,10 @@ pub const top_level_flags = [_]TopLevelFlag{
         .description = "Record terminal output",
     },
     .{
+        .usage = "--skills-dir <path>",
+        .description = "Load an invocation skill root; repeatable",
+    },
+    .{
         .usage = "--context-limit <spec>",
         .description = "Set name=bytes|off; repeatable",
     },

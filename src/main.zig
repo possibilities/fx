@@ -576,6 +576,7 @@ const App = struct {
     change_tracker: change_tracker_mod.ChangeTracker = .{},
     mcp: app_mcp_runtime.State = .{},
     skills: skill_runtime.Runtime = .{},
+    invocation_skill_roots: [][]u8 = &.{},
     context_snapshot: context_contract.GatheredContextSnapshot = .{},
     file_index: file_index_mod.FileIndex = .{},
     context_enabled: bool = true,
@@ -663,9 +664,11 @@ const App = struct {
             .{
                 .load_mcp_runtime = if (comptime host_target.is_wasm) loadNoMcpRuntime else builtin_mcp.loadRuntime,
                 .skill_root_policy = if (comptime host_target.is_wasm) wasm_skill_root_policy else builtin_skills.root_policy,
+                .invocation_skill_roots = launch.modifiers.invocation_skill_roots,
                 .terminal_title = app.terminalTitle(),
             },
         );
+        app.invocation_skill_roots = launch.modifiers.takeInvocationSkillRoots();
         errdefer app.deinit();
         try WorkspaceAppRuntime.applyLaunch(
             &app,
@@ -900,6 +903,8 @@ const App = struct {
         self.diff_entries.deinit(std.heap.c_allocator);
         self.mcp.deinit(self.alloc);
         self.skills.deinit(std.heap.c_allocator);
+        for (self.invocation_skill_roots) |path| self.alloc.free(path);
+        if (self.invocation_skill_roots.len > 0) self.alloc.free(self.invocation_skill_roots);
         self.context_snapshot.deinit(self.alloc);
         self.file_index.deinit(std.heap.c_allocator);
         self.lifecycle_runtime.deinit();
@@ -1911,7 +1916,12 @@ const App = struct {
     }
 
     pub fn reloadSkills(self: *App) !void {
-        const loaded = try app_runtime_setup.loadSkills(std.heap.c_allocator, self.workspace_root, builtin_skills.root_policy);
+        const loaded = try app_runtime_setup.loadSkills(
+            std.heap.c_allocator,
+            self.workspace_root,
+            self.invocation_skill_roots,
+            builtin_skills.root_policy,
+        );
         skill_runtime.traceDiagnostics("interactive_reload", loaded.diagnostics);
         self.skills.replaceLoaded(std.heap.c_allocator, loaded.dir, loaded.skills, loaded.diagnostics);
     }
@@ -3158,6 +3168,9 @@ pub fn runWasmTerminal(init: std.process.Init) !void {
         },
     };
     defer launch.deinit(alloc);
+    if (launch.modifiers.hasInvocationSkillRoots()) {
+        return error.WasmTerminalInvocationSkillRootsUnsupported;
+    }
     const outcome = try app_entry_runtime.runInteractiveCooperative(App, alloc, &launch);
     switch (outcome) {
         .returned => {},
