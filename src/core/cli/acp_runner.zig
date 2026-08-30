@@ -56,6 +56,7 @@ pub const Config = struct {
     allow_acp_mcp: bool = true,
     allow_native_tools: bool = true,
     native_tool_set: ?tool_set_contract.ToolSet = null,
+    project_instructions_enabled: bool = true,
 };
 
 pub const RunFn = *const fn (?*anyopaque, Allocator, Config) anyerror!void;

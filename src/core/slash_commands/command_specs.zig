@@ -1603,6 +1603,7 @@ test "rendered top-level help is a complete CLI navigation page" {
     try std.testing.expect(std.mem.find(u8, text, "--tool <name>") != null);
     try std.testing.expect(std.mem.find(u8, text, "--skills-dir <path>") != null);
     try std.testing.expect(std.mem.find(u8, text, "--no-default-skills") != null);
+    try std.testing.expect(std.mem.find(u8, text, "--no-project-instructions") != null);
     try std.testing.expect(std.mem.find(u8, text, "-c, --continue") != null);
     try std.testing.expect(std.mem.find(u8, text, "-r") != null);
     try std.testing.expect(std.mem.find(u8, text, "-c, -r, --continue") == null);
@@ -1664,6 +1665,7 @@ test "top-level help renders flags as compact aligned rows" {
     try std.testing.expect(lineContainsBoth(wide, "--no-native-tools", "Disable native tools for TUI or ACP"));
     try std.testing.expect(lineContainsBoth(wide, "--tool <name>", "Allow only this native tool; repeatable"));
     try std.testing.expect(lineContainsBoth(wide, "--no-default-skills", "Use only --skills-dir roots"));
+    try std.testing.expect(lineContainsBoth(wide, "--no-project-instructions", "Ignore repository instructions for TUI or ACP"));
     try std.testing.expect(lineContainsBoth(wide, "-c, --continue", "Resume the latest workspace session"));
     try std.testing.expect(lineContainsBoth(wide, "-r", "Open the saved-session picker"));
     try std.testing.expect(lineContainsBoth(wide, "--resume [last|<id>]", "Resume the latest workspace session or an exact ID"));
@@ -1723,6 +1725,7 @@ test "ACP help documents ACP-specific accepted options" {
     try std.testing.expect(std.mem.find(u8, text, "--log-file <path>") != null);
     try std.testing.expect(std.mem.find(u8, text, "--no-native-tools") == null);
     try std.testing.expect(std.mem.find(u8, text, "--no-acp-mcp") != null);
+    try std.testing.expect(std.mem.find(u8, text, "--no-project-instructions") == null);
 }
 
 test "hidden top-level commands do not reserve help usage width" {

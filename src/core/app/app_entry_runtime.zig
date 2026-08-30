@@ -222,6 +222,7 @@ fn runInteractiveWithDeps(comptime App: type, comptime cooperative: bool, alloc:
     const allow_native_tools = launch.modifiers.allow_native_tools;
     const selected_native_tools = launch.modifiers.selected_native_tools;
     const no_default_skills = launch.modifiers.no_default_skills;
+    const project_instructions_enabled = launch.modifiers.project_instructions_enabled;
     var app = App.init(alloc, launch) catch |err| {
         switch (err) {
             error.NotATerminal => {
@@ -328,7 +329,7 @@ fn runInteractiveWithDeps(comptime App: type, comptime cooperative: bool, alloc:
             selected_native_tools.len * 2;
         try relaunch_argv.ensureTotalCapacity(
             alloc,
-            4 + native_tool_arg_count + @intFromBool(no_default_skills) + relaunch_skill_roots.len * 2,
+            4 + native_tool_arg_count + @intFromBool(no_default_skills) + relaunch_skill_roots.len * 2 + @intFromBool(!project_instructions_enabled),
         );
     }
     const resume_handoff_columns: u16 = if (comptime cooperative)
@@ -362,6 +363,9 @@ fn runInteractiveWithDeps(comptime App: type, comptime cooperative: bool, alloc:
                 relaunch_argv.appendAssumeCapacity("--skills-dir");
                 relaunch_argv.appendAssumeCapacity(root);
             }
+            if (!project_instructions_enabled) {
+                relaunch_argv.appendAssumeCapacity("--no-project-instructions");
+            }
             relaunch_argv.appendAssumeCapacity("resume");
             relaunch_argv.appendAssumeCapacity(handoff.session_id);
             relaunch_argv.appendAssumeCapacity(cli_surface.upgrade_relaunch_arg);
@@ -377,6 +381,7 @@ fn runInteractiveWithDeps(comptime App: type, comptime cooperative: bool, alloc:
                 handoff.session_id,
                 allow_native_tools,
                 selected_native_tools,
+                project_instructions_enabled,
             );
         } else {
             writeStderr(
@@ -446,6 +451,7 @@ fn writeUpgradeRelaunchFailure(
     session_id: []const u8,
     allow_native_tools: bool,
     selected_native_tools: []const []const u8,
+    project_instructions_enabled: bool,
 ) void {
     const rendered = formatUpgradeRelaunchFailure(
         alloc,
@@ -453,6 +459,7 @@ fn writeUpgradeRelaunchFailure(
         session_id,
         allow_native_tools,
         selected_native_tools,
+        project_instructions_enabled,
     ) catch {
         writeStderr(
             deps,
@@ -470,6 +477,7 @@ fn formatUpgradeRelaunchFailure(
     session_id: []const u8,
     allow_native_tools: bool,
     selected_native_tools: []const []const u8,
+    project_instructions_enabled: bool,
 ) ![]u8 {
     var writer: std.Io.Writer.Allocating = .init(alloc);
     errdefer writer.deinit();
@@ -483,6 +491,9 @@ fn formatUpgradeRelaunchFailure(
         for (selected_native_tools) |name| {
             try writer.writer.print(" --tool {s}", .{name});
         }
+    }
+    if (!project_instructions_enabled) {
+        try writer.writer.writeAll(" --no-project-instructions");
     }
     try writer.writer.print(" --resume {s}\n", .{session_id});
     return writer.toOwnedSlice();
@@ -1227,6 +1238,38 @@ test "app entry relaunch preserves exclusive skill roots" {
     try std.testing.expectEqualStrings("resume", capture.replaceArg(6));
     try std.testing.expectEqualStrings("session-123", capture.replaceArg(7));
     try std.testing.expectEqualStrings("--upgrade-relaunch", capture.replaceArg(8));
+}
+
+test "app entry preserves project instruction suppression across upgrade relaunch" {
+    const alloc = std.testing.allocator;
+    var capture = TestCapture.init(.{ .interactive = .{
+        .modifiers = .{ .project_instructions_enabled = false },
+    } });
+    defer capture.deinit();
+    capture.resume_handoff_id = "session-123";
+    capture.upgrade_relaunch_path = "/tmp/fx-upgraded";
+
+    const outcome = try runWithDeps(
+        TestApp,
+        alloc,
+        &.{},
+        testConfig(),
+        capture.deps(),
+    );
+
+    try std.testing.expectEqual(@as(u8, 1), outcome.exit);
+    try std.testing.expectEqual(@as(usize, 1), capture.replace_calls);
+    try std.testing.expectEqual(@as(usize, 5), capture.replace_arg_count);
+    try std.testing.expectEqualStrings("/tmp/fx-upgraded", capture.replaceArg(0));
+    try std.testing.expectEqualStrings("--no-project-instructions", capture.replaceArg(1));
+    try std.testing.expectEqualStrings("resume", capture.replaceArg(2));
+    try std.testing.expectEqualStrings("session-123", capture.replaceArg(3));
+    try std.testing.expectEqualStrings("--upgrade-relaunch", capture.replaceArg(4));
+    try std.testing.expect(std.mem.find(
+        u8,
+        capture.stderr.written(),
+        "fx --no-project-instructions --resume session-123",
+    ) != null);
 }
 
 test "app entry never relaunches without a validated handoff" {
