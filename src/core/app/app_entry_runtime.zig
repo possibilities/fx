@@ -1410,6 +1410,7 @@ test "app entry preserves every launch control across an upgrade relaunch" {
     const prompt_appends = try alloc.alloc([]u8, 2);
     prompt_appends[0] = try alloc.dupe(u8, "/tmp/first-extra.md");
     prompt_appends[1] = try alloc.dupe(u8, "/tmp/second extra.md");
+    const effective_system_prompt = try alloc.dupe(u8, "COMPOSED_LAUNCH_SYSTEM_PROMPT");
     const selected_tools = try alloc.alloc([]u8, 2);
     selected_tools[0] = try alloc.dupe(u8, "terminal:exec");
     selected_tools[1] = try alloc.dupe(u8, "read_file");
@@ -1428,6 +1429,7 @@ test "app entry preserves every launch control across an upgrade relaunch" {
                 .replacement_path = prompt_replacement,
                 .append_paths = prompt_appends,
             },
+            .effective_system_prompt = effective_system_prompt,
             .selected_native_tools = selected_tools,
             .invocation_skill_roots = skill_roots,
             .no_default_skills = true,

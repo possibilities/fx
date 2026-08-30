@@ -198,6 +198,16 @@ authorization, profile instructions, profile-global skills, MCP state,
 memories, usage, prompt history, and sessions beneath `<path>/.fx` while
 terminal tools and MCP processes retain the normal `HOME` environment.
 
+An explicit state directory can also carry one conventional system prompt for
+interactive, resumed, and ACP sessions and their in-process children.
+`<path>/.fx/SYSTEM.md` replaces Fx's built-in prompt, while
+`<path>/.fx/SYSTEM_APPEND.md` appends to it. The names are case-sensitive, and
+a launch fails if both files exist. `--system-prompt-file` bypasses this state
+discovery; repeatable `--append-system-prompt-file` values are added afterward.
+The same regular-file, UTF-8, NUL-free, and combined 256 KiB limits apply.
+`--no-project-instructions` does not suppress the selected state prompt, and Fx
+does not discover these files from the default home without `--state-dir`.
+
 ## Extend fx
 
 In the interactive shell, bare `/mcp` opens an inline browser for servers, tools, resources, and prompts without adding anything to the transcript. Resource and prompt content enters the composer only after an explicit Insert action. Direct `/mcp SUBCOMMAND` forms remain available.
