@@ -177,7 +177,7 @@ pub const LaunchModifiers = struct {
         return self.selected_native_tools.len > 0;
     }
 
-    pub fn hasSkillModifiers(self: LaunchModifiers) bool {
+    pub fn hasExclusiveSkillPolicy(self: LaunchModifiers) bool {
         return self.no_default_skills;
     }
 
@@ -1198,10 +1198,10 @@ fn runNonInteractiveWithDeps(
         try writeNativeToolSelectionUsage(deps);
         return .handled_failure;
     }
-    if (global_args.modifiers.hasSkillModifiers() and
-        !commandSupportsSkillModifiers(parsed_command))
+    if (global_args.modifiers.hasExclusiveSkillPolicy() and
+        !commandSupportsExclusiveSkillPolicy(parsed_command))
     {
-        try writeSkillModifierUsage(deps);
+        try writeExclusiveSkillPolicyUsage(deps);
         return .handled_failure;
     }
     if (!global_args.modifiers.project_instructions_enabled and
@@ -3910,7 +3910,7 @@ fn commandSupportsProjectInstructionModifier(command: Command) bool {
     };
 }
 
-fn commandSupportsSkillModifiers(command: Command) bool {
+fn commandSupportsExclusiveSkillPolicy(command: Command) bool {
     return switch (command) {
         .interactive, .acp, .resume_session => true,
         else => false,
@@ -3999,7 +3999,6 @@ fn writePromptFileModifierUsage(deps: RunDeps) !void {
 fn writeAskSystemPromptConflict(deps: RunDeps) !void {
     try writeStderr(deps, "fx ask: --system cannot be combined with --system-prompt-file or --append-system-prompt-file\n");
 }
-
 fn writeWorkspaceModifierUsage(deps: RunDeps) !void {
     try writeStderr(
         deps,
@@ -4046,7 +4045,7 @@ fn writeNativeToolSelectionIssue(
     try writeStderr(deps, writer.written());
 }
 
-fn writeSkillModifierUsage(deps: RunDeps) !void {
+fn writeExclusiveSkillPolicyUsage(deps: RunDeps) !void {
     try writeStderr(
         deps,
         "fx: --no-default-skills is only supported for interactive, resume, and ACP launches\n",
@@ -4867,6 +4866,23 @@ test "workflow launch config preserves ordered invocation skill roots" {
     try std.testing.expectEqualStrings("/opt/shared-skills", workflow_cfg.invocation_skill_roots[1]);
 }
 
+test "global prompt detection scans across shared TUI and ACP controls" {
+    try std.testing.expect(systemPromptFilesRequested(&.{
+        @constCast("--state-dir"),
+        @constCast("/tmp/fx state"),
+        @constCast("--permissions-file=/tmp/policy.json"),
+        @constCast("--no-project-instructions"),
+        @constCast("--append-system-prompt-file=extra.md"),
+    }));
+    try std.testing.expect(systemPromptFilesRequested(&.{
+        @constCast("--permissions-file"),
+        @constCast("/tmp/policy.json"),
+        @constCast("--state-dir=/tmp/fx-state"),
+        @constCast("--system-prompt-file"),
+        @constCast("base.md"),
+    }));
+}
+
 test "global system prompt file modifiers preserve replacement and append order" {
     var parsed = try parseGlobalLaunchArgs(std.testing.allocator, &.{
         @constCast("--append-system-prompt-file"),
@@ -4898,39 +4914,6 @@ test "global system prompt file modifiers reject missing and duplicate replaceme
         parseGlobalLaunchArgs(std.testing.allocator, &.{
             @constCast("--system-prompt-file=one"),
             @constCast("--system-prompt-file=two"),
-        }),
-    );
-}
-
-test "global native tool selections preserve order and fail closed when malformed" {
-    var parsed = try parseGlobalLaunchArgs(std.testing.allocator, &.{
-        @constCast("--tool"),
-        @constCast("terminal:exec"),
-        @constCast("--tool=read_file"),
-        @constCast("acp"),
-    });
-    defer parsed.deinit(std.testing.allocator);
-
-    try std.testing.expect(parsed.modifiers.allow_native_tools);
-    try std.testing.expectEqual(@as(usize, 2), parsed.modifiers.selected_native_tools.len);
-    try std.testing.expectEqualStrings("terminal:exec", parsed.modifiers.selected_native_tools[0]);
-    try std.testing.expectEqualStrings("read_file", parsed.modifiers.selected_native_tools[1]);
-    try std.testing.expectEqualStrings("acp", parsed.remaining[0]);
-
-    try std.testing.expectError(
-        error.MissingNativeToolSelection,
-        parseGlobalLaunchArgs(std.testing.allocator, &.{@constCast("--tool")}),
-    );
-    try std.testing.expectError(
-        error.MissingNativeToolSelection,
-        parseGlobalLaunchArgs(std.testing.allocator, &.{@constCast("--tool=")}),
-    );
-    try std.testing.expectError(
-        error.ConflictingNativeToolSelection,
-        parseGlobalLaunchArgs(std.testing.allocator, &.{
-            @constCast("--tool"),
-            @constCast("read_file"),
-            @constCast("--no-native-tools"),
         }),
     );
 }
@@ -5046,6 +5029,39 @@ test "ask system prompt conflict is fatal before file access" {
     try std.testing.expectEqualStrings(
         "fx ask: --system cannot be combined with --system-prompt-file or --append-system-prompt-file\n",
         capture.stderr.written(),
+    );
+}
+
+test "global native tool selections preserve order and fail closed when malformed" {
+    var parsed = try parseGlobalLaunchArgs(std.testing.allocator, &.{
+        @constCast("--tool"),
+        @constCast("terminal:exec"),
+        @constCast("--tool=read_file"),
+        @constCast("acp"),
+    });
+    defer parsed.deinit(std.testing.allocator);
+
+    try std.testing.expect(parsed.modifiers.allow_native_tools);
+    try std.testing.expectEqual(@as(usize, 2), parsed.modifiers.selected_native_tools.len);
+    try std.testing.expectEqualStrings("terminal:exec", parsed.modifiers.selected_native_tools[0]);
+    try std.testing.expectEqualStrings("read_file", parsed.modifiers.selected_native_tools[1]);
+    try std.testing.expectEqualStrings("acp", parsed.remaining[0]);
+
+    try std.testing.expectError(
+        error.MissingNativeToolSelection,
+        parseGlobalLaunchArgs(std.testing.allocator, &.{@constCast("--tool")}),
+    );
+    try std.testing.expectError(
+        error.MissingNativeToolSelection,
+        parseGlobalLaunchArgs(std.testing.allocator, &.{@constCast("--tool=")}),
+    );
+    try std.testing.expectError(
+        error.ConflictingNativeToolSelection,
+        parseGlobalLaunchArgs(std.testing.allocator, &.{
+            @constCast("--tool"),
+            @constCast("read_file"),
+            @constCast("--no-native-tools"),
+        }),
     );
 }
 
@@ -5169,6 +5185,8 @@ test "ACP command routes parsed options and launch config through the injected r
     const Capture = struct {
         expected: Config,
         expected_invocation_root: []const u8,
+        expected_first_skill_root: []const u8,
+        expected_second_skill_root: []const u8,
         calls: usize = 0,
         config_matches: bool = false,
         launch_matches: bool = false,
@@ -5223,12 +5241,14 @@ test "ACP command routes parsed options and launch config through the injected r
                 permission_matches and
                 cfg.additional_directories.len == 1 and
                 std.mem.eql(u8, cfg.additional_directories[0], "/tmp/acp-extra") and
-                cfg.invocation_skill_roots.len == 1 and
+                cfg.invocation_skill_roots.len == 3 and
                 std.mem.eql(u8, cfg.invocation_skill_roots[0], self.expected_invocation_root) and
                 cfg.saved_directories_suppressed and
                 cfg.skill_root_policy.exclusive_invocation_roots and
-                cfg.skill_root_policy.invocation_roots.len == 1 and
+                cfg.skill_root_policy.invocation_roots.len == 3 and
                 std.mem.eql(u8, cfg.skill_root_policy.invocation_roots[0], self.expected_invocation_root) and
+                std.mem.eql(u8, cfg.skill_root_policy.invocation_roots[1], self.expected_first_skill_root) and
+                std.mem.eql(u8, cfg.skill_root_policy.invocation_roots[2], self.expected_second_skill_root) and
                 std.mem.eql(u8, cfg.model_override.?, "model-override") and
                 cfg.effort_override.?.eql(types.ReasoningEffort.literal("high")) and
                 std.mem.eql(u8, cfg.log_file.?, "/tmp/acp.log") and
@@ -5243,10 +5263,20 @@ test "ACP command routes parsed options and launch config through the injected r
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "acp-first-skills");
+    try tmp.dir.createDirPath(std.testing.io, "acp-second-skills");
     const invocation_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(invocation_root);
     const invocation_root_z = try alloc.dupeZ(u8, invocation_root);
     defer alloc.free(invocation_root_z);
+    const first_skill_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "acp-first-skills");
+    defer alloc.free(first_skill_root);
+    const first_skill_root_z = try alloc.dupeZ(u8, first_skill_root);
+    defer alloc.free(first_skill_root_z);
+    const second_skill_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "acp-second-skills");
+    defer alloc.free(second_skill_root);
+    const second_skill_root_z = try alloc.dupeZ(u8, second_skill_root);
+    defer alloc.free(second_skill_root_z);
     var prompt_file = try tmp.dir.createFile(std.testing.io, "acp-system-prompt", .{});
     defer prompt_file.close(std.testing.io);
     try prompt_file.writeStreamingAll(std.testing.io, "ACP_FILE_SYSTEM_PROMPT");
@@ -5260,19 +5290,24 @@ test "ACP command routes parsed options and launch config through the injected r
         try file.writeStreamingAll(std.testing.io, "{\"edit\":\"deny\"}");
     }
     const policy_path = try io_mod.dirRealpathAlloc(
-        std.testing.allocator,
+        alloc,
         tmp.dir,
         "policy.json",
     );
-    defer std.testing.allocator.free(policy_path);
-    const policy_arg = try std.testing.allocator.dupeZ(u8, policy_path);
-    defer std.testing.allocator.free(policy_arg);
+    defer alloc.free(policy_path);
+    const policy_arg = try alloc.dupeZ(u8, policy_path);
+    defer alloc.free(policy_arg);
 
     var cfg = testConfig();
     cfg.provider_set.gateway.permission_reviewer = test_builtin_gateway.permission_reviewer.provider;
     var expected = cfg;
     expected.prompt_policy.system_prompt = "ACP_FILE_SYSTEM_PROMPT";
-    var capture = Capture{ .expected = expected, .expected_invocation_root = invocation_root };
+    var capture = Capture{
+        .expected = expected,
+        .expected_invocation_root = invocation_root,
+        .expected_first_skill_root = first_skill_root,
+        .expected_second_skill_root = second_skill_root,
+    };
     cfg.acp_runner = .{ .context = &capture, .run_fn = Capture.run };
     const result = try runIfRequestedWithDeps(
         alloc,
@@ -5290,6 +5325,10 @@ test "ACP command routes parsed options and launch config through the injected r
             @constCast("--no-additional-dirs"),
             @constCast("--no-native-tools"),
             @constCast("--no-default-skills"),
+            @constCast("--skills-dir"),
+            first_skill_root_z,
+            @constCast("--skills-dir"),
+            second_skill_root_z,
             @constCast("--no-project-instructions"),
             @constCast("--state-dir"),
             invocation_root_z,

@@ -220,10 +220,6 @@ fn unavailableCliDispatch(_: ?*anyopaque, _: Allocator, _: []const [:0]const u8,
 
 fn runInteractiveWithDeps(comptime App: type, comptime cooperative: bool, alloc: Allocator, launch: *cli_surface.InteractiveLaunch, deps: RunDeps) !RunOutcome {
     const resume_requested = launch.requested_resume != null;
-    const allow_native_tools = launch.modifiers.allow_native_tools;
-    const selected_native_tools = launch.modifiers.selected_native_tools;
-    const no_default_skills = launch.modifiers.no_default_skills;
-    const project_instructions_enabled = launch.modifiers.project_instructions_enabled;
     var app = App.init(alloc, launch) catch |err| {
         switch (err) {
             error.NotATerminal => {
@@ -321,13 +317,6 @@ fn runInteractiveWithDeps(comptime App: type, comptime cooperative: bool, alloc:
         relaunch_request != null,
     );
     defer freeInvocationSkillRoots(alloc, relaunch_skill_roots);
-    var relaunch_argv: std.ArrayList([]const u8) = .empty;
-    defer relaunch_argv.deinit(alloc);
-    var owned_relaunch_argv: std.ArrayList([]u8) = .empty;
-    defer {
-        for (owned_relaunch_argv.items) |arg| alloc.free(arg);
-        owned_relaunch_argv.deinit(alloc);
-    }
     const resume_handoff_columns: u16 = if (comptime cooperative)
         0
     else if (comptime @hasDecl(App, "resumeHandoffColumns"))
@@ -343,79 +332,28 @@ fn runInteractiveWithDeps(comptime App: type, comptime cooperative: bool, alloc:
         if (handoff_value) |value| {
             var handoff = value;
             defer handoff.deinit(alloc);
-            try relaunch_argv.append(alloc, request.executablePath());
-            for (launch.modifiers.context_limit_overrides) |override| {
-                try relaunch_argv.append(alloc, "--context-limit");
-                const rendered = switch (override.value) {
-                    .bytes => |bytes| try std.fmt.allocPrint(
-                        alloc,
-                        "{s}={d}",
-                        .{ @tagName(override.name), bytes },
-                    ),
-                    .off => try std.fmt.allocPrint(
-                        alloc,
-                        "{s}=off",
-                        .{@tagName(override.name)},
-                    ),
-                };
-                owned_relaunch_argv.append(alloc, rendered) catch |err| {
-                    alloc.free(rendered);
-                    return err;
-                };
-                try relaunch_argv.append(alloc, rendered);
-            }
-            for (launch.modifiers.additional_directories) |path| {
-                try relaunch_argv.append(alloc, "--add-dir");
-                try relaunch_argv.append(alloc, path);
-            }
-            if (launch.modifiers.saved_directories_suppressed) {
-                try relaunch_argv.append(alloc, "--no-additional-dirs");
-            }
-            if (launch.modifiers.state_home) |home| {
-                try relaunch_argv.append(alloc, "--state-dir");
-                try relaunch_argv.append(alloc, home);
-            }
-            if (launch.modifiers.permission_policy) |policy| {
-                try relaunch_argv.append(alloc, "--permissions-file");
-                try relaunch_argv.append(alloc, policy.path);
-            }
-            if (!allow_native_tools) {
-                try relaunch_argv.append(alloc, "--no-native-tools");
-            } else {
-                for (selected_native_tools) |name| {
-                    try relaunch_argv.append(alloc, "--tool");
-                    try relaunch_argv.append(alloc, name);
-                }
-            }
-            if (no_default_skills) {
-                try relaunch_argv.append(alloc, "--no-default-skills");
-            }
-            for (relaunch_skill_roots) |root| {
-                try relaunch_argv.append(alloc, "--skills-dir");
-                try relaunch_argv.append(alloc, root);
-            }
-            if (!project_instructions_enabled) {
-                try relaunch_argv.append(alloc, "--no-project-instructions");
-            }
-            try relaunch_argv.append(alloc, "resume");
-            try relaunch_argv.append(alloc, handoff.session_id);
-            try relaunch_argv.append(alloc, cli_surface.upgrade_relaunch_arg);
-            if (launch.record_requested) try relaunch_argv.append(alloc, "--record");
+            var relaunch_args = try UpgradeRelaunchArguments.init(
+                alloc,
+                launch,
+                handoff.session_id,
+                relaunch_skill_roots,
+            );
+            defer relaunch_args.deinit(alloc);
+            var process_argv = try relaunch_args.processArgv(
+                alloc,
+                request.executablePath(),
+            );
+            defer process_argv.deinit(alloc);
             const replace_err = deps.replace_process(
                 deps.replace_ctx,
                 io_mod.getIo(),
-                .{ .argv = relaunch_argv.items },
+                .{ .argv = process_argv.items },
             );
             writeUpgradeRelaunchFailure(
                 alloc,
                 deps,
                 replace_err,
-                handoff.session_id,
-                allow_native_tools,
-                selected_native_tools,
-                project_instructions_enabled,
-                launch.modifiers.state_home,
-                if (launch.modifiers.permission_policy) |policy| policy.path else null,
+                relaunch_args.args.items,
             );
         } else {
             writeStderr(
@@ -441,6 +379,131 @@ fn runInteractiveWithDeps(comptime App: type, comptime cooperative: bool, alloc:
     }
     return .returned;
 }
+
+const UpgradeRelaunchArguments = struct {
+    args: std.ArrayList([]const u8) = .empty,
+    owned_args: std.ArrayList([]u8) = .empty,
+
+    fn init(
+        alloc: Allocator,
+        launch: *const cli_surface.InteractiveLaunch,
+        session_id: []const u8,
+        invocation_skill_roots: []const []const u8,
+    ) !UpgradeRelaunchArguments {
+        var result = UpgradeRelaunchArguments{};
+        errdefer result.deinit(alloc);
+
+        for (launch.modifiers.context_limit_overrides) |override| {
+            try result.append(alloc, "--context-limit");
+            const rendered = switch (override.value) {
+                .bytes => |bytes| try std.fmt.allocPrint(
+                    alloc,
+                    "{s}={d}",
+                    .{ @tagName(override.name), bytes },
+                ),
+                .off => try std.fmt.allocPrint(
+                    alloc,
+                    "{s}=off",
+                    .{@tagName(override.name)},
+                ),
+            };
+            try result.appendOwned(alloc, rendered);
+        }
+        for (launch.modifiers.additional_directories) |path| {
+            try result.appendPair(alloc, "--add-dir", path);
+        }
+        if (launch.modifiers.saved_directories_suppressed) {
+            try result.append(alloc, "--no-additional-dirs");
+        }
+        if (launch.modifiers.prompt_files.replacement_path) |path| {
+            try result.appendPair(alloc, "--system-prompt-file", path);
+        }
+        for (launch.modifiers.prompt_files.append_paths) |path| {
+            try result.appendPair(alloc, "--append-system-prompt-file", path);
+        }
+        if (launch.modifiers.state_home) |home| {
+            try result.appendPair(alloc, "--state-dir", home);
+        }
+        if (launch.modifiers.permission_policy) |policy| {
+            try result.appendPair(alloc, "--permissions-file", policy.path);
+        }
+        if (!launch.modifiers.allow_native_tools) {
+            try result.append(alloc, "--no-native-tools");
+        } else {
+            for (launch.modifiers.selected_native_tools) |name| {
+                try result.appendPair(alloc, "--tool", name);
+            }
+        }
+        if (launch.modifiers.no_default_skills) {
+            try result.append(alloc, "--no-default-skills");
+        }
+        for (invocation_skill_roots) |root| {
+            try result.appendPair(alloc, "--skills-dir", root);
+        }
+        if (!launch.modifiers.project_instructions_enabled) {
+            try result.append(alloc, "--no-project-instructions");
+        }
+        try result.appendPair(alloc, "resume", session_id);
+        if (launch.record_requested) try result.append(alloc, "--record");
+        return result;
+    }
+
+    fn deinit(self: *UpgradeRelaunchArguments, alloc: Allocator) void {
+        for (self.owned_args.items) |arg| alloc.free(arg);
+        self.owned_args.deinit(alloc);
+        self.args.deinit(alloc);
+        self.* = .{};
+    }
+
+    fn append(self: *UpgradeRelaunchArguments, alloc: Allocator, arg: []const u8) !void {
+        try self.args.append(alloc, arg);
+    }
+
+    fn appendPair(
+        self: *UpgradeRelaunchArguments,
+        alloc: Allocator,
+        name: []const u8,
+        value: []const u8,
+    ) !void {
+        try self.append(alloc, name);
+        errdefer _ = self.args.pop();
+        try self.append(alloc, value);
+    }
+
+    fn appendOwned(
+        self: *UpgradeRelaunchArguments,
+        alloc: Allocator,
+        arg: []u8,
+    ) !void {
+        self.owned_args.append(alloc, arg) catch |err| {
+            alloc.free(arg);
+            return err;
+        };
+        self.args.append(alloc, arg) catch |err| {
+            _ = self.owned_args.pop();
+            alloc.free(arg);
+            return err;
+        };
+    }
+
+    fn processArgv(
+        self: UpgradeRelaunchArguments,
+        alloc: Allocator,
+        executable_path: []const u8,
+    ) !std.ArrayList([]const u8) {
+        var argv: std.ArrayList([]const u8) = .empty;
+        errdefer argv.deinit(alloc);
+        try argv.append(alloc, executable_path);
+
+        const has_record = self.args.items.len > 0 and
+            std.mem.eql(u8, self.args.items[self.args.items.len - 1], "--record");
+        const public_end = self.args.items.len - @intFromBool(has_record);
+        try argv.appendSlice(alloc, self.args.items[0..public_end]);
+        try argv.append(alloc, cli_surface.upgrade_relaunch_arg);
+        if (has_record) try argv.append(alloc, "--record");
+        return argv;
+    }
+};
 
 fn cloneInvocationSkillRootsForRelaunch(
     comptime App: type,
@@ -482,22 +545,12 @@ fn writeUpgradeRelaunchFailure(
     alloc: Allocator,
     deps: RunDeps,
     err: std.process.ReplaceError,
-    session_id: []const u8,
-    allow_native_tools: bool,
-    selected_native_tools: []const []const u8,
-    project_instructions_enabled: bool,
-    state_home: ?[]const u8,
-    permission_file: ?[]const u8,
+    relaunch_args: []const []const u8,
 ) void {
     const rendered = formatUpgradeRelaunchFailure(
         alloc,
         err,
-        session_id,
-        allow_native_tools,
-        selected_native_tools,
-        project_instructions_enabled,
-        state_home,
-        permission_file,
+        relaunch_args,
     ) catch {
         writeStderr(
             deps,
@@ -512,12 +565,7 @@ fn writeUpgradeRelaunchFailure(
 fn formatUpgradeRelaunchFailure(
     alloc: Allocator,
     err: std.process.ReplaceError,
-    session_id: []const u8,
-    allow_native_tools: bool,
-    selected_native_tools: []const []const u8,
-    project_instructions_enabled: bool,
-    state_home: ?[]const u8,
-    permission_file: ?[]const u8,
+    relaunch_args: []const []const u8,
 ) ![]u8 {
     var writer: std.Io.Writer.Allocating = .init(alloc);
     errdefer writer.deinit();
@@ -525,24 +573,35 @@ fn formatUpgradeRelaunchFailure(
         "fx: upgrade installed, but relaunch failed: {s}\nContinue session with: fx",
         .{@errorName(err)},
     );
-    if (!allow_native_tools) {
-        try writer.writer.writeAll(" --no-native-tools");
-    } else {
-        for (selected_native_tools) |name| {
-            try writer.writer.print(" --tool {s}", .{name});
+    for (relaunch_args) |arg| {
+        try writer.writer.writeByte(' ');
+        try writeShellArgument(&writer.writer, arg);
+    }
+    try writer.writer.writeByte('\n');
+    return writer.toOwnedSlice();
+}
+
+fn writeShellArgument(writer: *std.Io.Writer, arg: []const u8) !void {
+    var safe = arg.len > 0;
+    for (arg) |byte| {
+        if (std.ascii.isAlphanumeric(byte) or switch (byte) {
+            '_', '-', '.', '/', ':', '=', '+', ',', '@', '%' => true,
+            else => false,
+        }) continue;
+        safe = false;
+        break;
+    }
+    if (safe) return writer.writeAll(arg);
+
+    try writer.writeByte('\'');
+    for (arg) |byte| {
+        if (byte == '\'') {
+            try writer.writeAll("'\"'\"'");
+        } else {
+            try writer.writeByte(byte);
         }
     }
-    if (!project_instructions_enabled) {
-        try writer.writer.writeAll(" --no-project-instructions");
-    }
-    if (state_home) |home| {
-        try writer.writer.print(" --state-dir {s}", .{home});
-    }
-    if (permission_file) |path| {
-        try writer.writer.print(" --permissions-file {s}", .{path});
-    }
-    try writer.writer.print(" --resume {s}\n", .{session_id});
-    return writer.toOwnedSlice();
+    try writer.writeByte('\'');
 }
 
 fn cliSurfaceConfig(cfg: Config) cli_surface.Config {
@@ -765,8 +824,8 @@ const TestCapture = struct {
     replace_error: std.process.ReplaceError = error.InvalidExe,
     replace_calls: usize = 0,
     replace_arg_count: usize = 0,
-    replace_arg_bufs: [16][128]u8 = undefined,
-    replace_arg_lens: [16]usize = [_]usize{0} ** 16,
+    replace_arg_bufs: [32][256]u8 = undefined,
+    replace_arg_lens: [32]usize = [_]usize{0} ** 32,
     fail_unexpected_format: bool = false,
 
     fn init(run_result: cli_surface.RunResult) TestCapture {
@@ -958,6 +1017,14 @@ const TestApp = struct {
     }
 };
 
+test "upgrade relaunch recovery shell-quotes unsafe arguments" {
+    var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+
+    try writeShellArgument(&out.writer, "team's skills");
+    try std.testing.expectEqualStrings("'team'\"'\"'s skills'", out.written());
+}
+
 test "app entry returns after handled CLI success without initializing app" {
     const alloc = std.testing.allocator;
     var capture = TestCapture.init(.handled_success);
@@ -1116,7 +1183,7 @@ test "app entry relaunches only after teardown with the validated handoff" {
     try std.testing.expect(std.mem.find(
         u8,
         capture.stderr.written(),
-        "fx --resume session-123",
+        "fx resume session-123",
     ) != null);
     try expectEvents(&.{
         "init:none",
@@ -1175,6 +1242,11 @@ test "app entry preserves invocation skill roots across an upgrade relaunch" {
     try std.testing.expectEqualStrings("resume", capture.replaceArg(5));
     try std.testing.expectEqualStrings("session-123", capture.replaceArg(6));
     try std.testing.expectEqualStrings("--upgrade-relaunch", capture.replaceArg(7));
+    try std.testing.expect(std.mem.find(
+        u8,
+        capture.stderr.written(),
+        "fx --skills-dir '/tmp/team skills' --skills-dir /opt/shared-skills resume session-123",
+    ) != null);
 }
 
 test "app entry preserves native tool suppression across upgrade relaunch" {
@@ -1205,7 +1277,7 @@ test "app entry preserves native tool suppression across upgrade relaunch" {
     try std.testing.expect(std.mem.find(
         u8,
         capture.stderr.written(),
-        "fx --no-native-tools --resume session-123",
+        "fx --no-native-tools resume session-123",
     ) != null);
 }
 
@@ -1243,7 +1315,7 @@ test "app entry preserves ordered native tool selection across upgrade relaunch"
     try std.testing.expect(std.mem.find(
         u8,
         capture.stderr.written(),
-        "fx --tool terminal:exec --tool read_file --resume session-123",
+        "fx --tool terminal:exec --tool read_file resume session-123",
     ) != null);
 }
 
@@ -1319,11 +1391,11 @@ test "app entry preserves project instruction suppression across upgrade relaunc
     try std.testing.expect(std.mem.find(
         u8,
         capture.stderr.written(),
-        "fx --no-project-instructions --resume session-123",
+        "fx --no-project-instructions resume session-123",
     ) != null);
 }
 
-test "app entry preserves state, permission policy, and launch modifiers across upgrade relaunch" {
+test "app entry preserves every launch control across an upgrade relaunch" {
     const alloc = std.testing.allocator;
     const overrides = try alloc.dupe(
         config_runtime.context_limits.Override,
@@ -1333,7 +1405,17 @@ test "app entry preserves state, permission policy, and launch modifiers across 
         }},
     );
     const directories = try alloc.alloc([]u8, 1);
-    directories[0] = try alloc.dupe(u8, "/tmp/fx-extra");
+    directories[0] = try alloc.dupe(u8, "/tmp/fx extra");
+    const prompt_replacement = try alloc.dupe(u8, "/tmp/base prompt.md");
+    const prompt_appends = try alloc.alloc([]u8, 2);
+    prompt_appends[0] = try alloc.dupe(u8, "/tmp/first-extra.md");
+    prompt_appends[1] = try alloc.dupe(u8, "/tmp/second extra.md");
+    const selected_tools = try alloc.alloc([]u8, 2);
+    selected_tools[0] = try alloc.dupe(u8, "terminal:exec");
+    selected_tools[1] = try alloc.dupe(u8, "read_file");
+    const skill_roots = try alloc.alloc([]u8, 2);
+    skill_roots[0] = try alloc.dupe(u8, "/tmp/team skills");
+    skill_roots[1] = try alloc.dupe(u8, "/opt/shared-skills");
     const state_home = try alloc.dupe(u8, "/tmp/fx-state");
     const permission_path = try alloc.dupe(u8, "/tmp/fx-policy.json");
     var capture = TestCapture.init(.{ .interactive = .{
@@ -1342,6 +1424,14 @@ test "app entry preserves state, permission policy, and launch modifiers across 
             .context_limit_overrides = overrides,
             .additional_directories = directories,
             .saved_directories_suppressed = true,
+            .prompt_files = .{
+                .replacement_path = prompt_replacement,
+                .append_paths = prompt_appends,
+            },
+            .selected_native_tools = selected_tools,
+            .invocation_skill_roots = skill_roots,
+            .no_default_skills = true,
+            .project_instructions_enabled = false,
             .state_home = state_home,
             .permission_policy = .{
                 .path = permission_path,
@@ -1367,12 +1457,28 @@ test "app entry preserves state, permission policy, and launch modifiers across 
         "--context-limit",
         "skill_chunk_bytes=4096",
         "--add-dir",
-        "/tmp/fx-extra",
+        "/tmp/fx extra",
         "--no-additional-dirs",
+        "--system-prompt-file",
+        "/tmp/base prompt.md",
+        "--append-system-prompt-file",
+        "/tmp/first-extra.md",
+        "--append-system-prompt-file",
+        "/tmp/second extra.md",
         "--state-dir",
         "/tmp/fx-state",
         "--permissions-file",
         "/tmp/fx-policy.json",
+        "--tool",
+        "terminal:exec",
+        "--tool",
+        "read_file",
+        "--no-default-skills",
+        "--skills-dir",
+        "/tmp/team skills",
+        "--skills-dir",
+        "/opt/shared-skills",
+        "--no-project-instructions",
         "resume",
         "session-123",
         "--upgrade-relaunch",
@@ -1382,11 +1488,19 @@ test "app entry preserves state, permission policy, and launch modifiers across 
     for (expected, 0..) |arg, index| {
         try std.testing.expectEqualStrings(arg, capture.replaceArg(index));
     }
-    try std.testing.expect(std.mem.find(
-        u8,
+    try std.testing.expectEqualStrings(
+        "fx: upgrade installed, but relaunch failed: InvalidExe\n" ++
+            "Continue session with: fx --context-limit skill_chunk_bytes=4096" ++
+            " --add-dir '/tmp/fx extra' --no-additional-dirs" ++
+            " --system-prompt-file '/tmp/base prompt.md'" ++
+            " --append-system-prompt-file /tmp/first-extra.md" ++
+            " --append-system-prompt-file '/tmp/second extra.md'" ++
+            " --state-dir /tmp/fx-state --permissions-file /tmp/fx-policy.json" ++
+            " --tool terminal:exec --tool read_file --no-default-skills" ++
+            " --skills-dir '/tmp/team skills' --skills-dir /opt/shared-skills" ++
+            " --no-project-instructions resume session-123 --record\n",
         capture.stderr.written(),
-        "fx --state-dir /tmp/fx-state --permissions-file /tmp/fx-policy.json --resume session-123",
-    ) != null);
+    );
 }
 
 test "app entry never relaunches without a validated handoff" {
