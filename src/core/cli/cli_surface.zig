@@ -129,6 +129,7 @@ pub const LaunchModifiers = struct {
     effective_system_prompt: ?[]u8 = null,
     allow_native_tools: bool = true,
     selected_native_tools: [][]u8 = &.{},
+    no_default_skills: bool = false,
 
     pub fn deinit(self: *LaunchModifiers, alloc: Allocator) void {
         if (self.context_limit_overrides.len > 0) alloc.free(self.context_limit_overrides);
@@ -169,6 +170,17 @@ pub const LaunchModifiers = struct {
 
     pub fn hasNativeToolSelection(self: LaunchModifiers) bool {
         return self.selected_native_tools.len > 0;
+    }
+
+    pub fn hasSkillModifiers(self: LaunchModifiers) bool {
+        return self.no_default_skills;
+    }
+
+    pub fn skillRootPolicy(self: LaunchModifiers, default_policy: skill_contract.RootPolicy) skill_contract.RootPolicy {
+        var policy = default_policy;
+        policy.invocation_roots = self.invocation_skill_roots;
+        policy.exclusive_invocation_roots = self.no_default_skills;
+        return policy;
     }
 };
 
@@ -455,6 +467,7 @@ fn parseGlobalLaunchArgs(
         for (selected_native_tools.items) |name| alloc.free(name);
         selected_native_tools.deinit(alloc);
     }
+    var no_default_skills = false;
 
     var index: usize = 0;
     while (index < args.len) {
@@ -521,6 +534,9 @@ fn parseGlobalLaunchArgs(
                 alloc.free(name);
                 return err;
             };
+        } else if (std.mem.eql(u8, arg, "--no-default-skills")) {
+            if (no_default_skills) return error.DuplicateDefaultSkillsSuppression;
+            no_default_skills = true;
         } else {
             break;
         }
@@ -562,6 +578,7 @@ fn parseGlobalLaunchArgs(
             },
             .allow_native_tools = allow_native_tools,
             .selected_native_tools = selected_tool_slice,
+            .no_default_skills = no_default_skills,
         },
     };
 }
@@ -592,7 +609,8 @@ pub fn argsAfterGlobalLaunchArgs(args: []const [:0]const u8) []const [:0]const u
             !std.mem.startsWith(u8, arg, "--append-system-prompt-file=") and
             !std.mem.startsWith(u8, arg, "--tool=") and
             !std.mem.eql(u8, arg, "--no-additional-dirs") and
-            !std.mem.eql(u8, arg, "--no-native-tools"))
+            !std.mem.eql(u8, arg, "--no-native-tools") and
+            !std.mem.eql(u8, arg, "--no-default-skills"))
         {
             return args[index..];
         }
@@ -626,7 +644,8 @@ pub fn systemPromptFilesRequested(args: []const [:0]const u8) bool {
             !std.mem.startsWith(u8, arg, "--skills-dir=") and
             !std.mem.startsWith(u8, arg, "--tool=") and
             !std.mem.eql(u8, arg, "--no-additional-dirs") and
-            !std.mem.eql(u8, arg, "--no-native-tools"))
+            !std.mem.eql(u8, arg, "--no-native-tools") and
+            !std.mem.eql(u8, arg, "--no-default-skills"))
         {
             return false;
         }
@@ -1114,6 +1133,12 @@ fn runNonInteractiveWithDeps(
         try writeNativeToolSelectionUsage(deps);
         return .handled_failure;
     }
+    if (global_args.modifiers.hasSkillModifiers() and
+        !commandSupportsSkillModifiers(parsed_command))
+    {
+        try writeSkillModifierUsage(deps);
+        return .handled_failure;
+    }
 
     if (isVersionFlag(effective_args[0])) {
         if (effective_args.len != 1) {
@@ -1194,6 +1219,7 @@ fn runNonInteractiveWithDeps(
                 .additional_directories = global_args.modifiers.additional_directories,
                 .invocation_skill_roots = global_args.modifiers.invocation_skill_roots,
                 .saved_directories_suppressed = global_args.modifiers.saved_directories_suppressed,
+                .skill_root_policy = global_args.modifiers.skillRootPolicy(cfg.skill_root_policy),
                 .model_override = acp_opts.model,
                 .effort_override = acp_opts.effort,
                 .log_file = acp_opts.log_file,
@@ -3773,6 +3799,13 @@ fn commandSupportsNativeToolModifier(command: Command) bool {
     };
 }
 
+fn commandSupportsSkillModifiers(command: Command) bool {
+    return switch (command) {
+        .interactive, .acp, .resume_session => true,
+        else => false,
+    };
+}
+
 fn commandSupportsPromptFileModifiers(command: Command) bool {
     return switch (command) {
         .interactive, .ask, .acp, .pr, .issue, .resume_session => true,
@@ -3902,6 +3935,13 @@ fn writeNativeToolSelectionIssue(
     try writeStderr(deps, writer.written());
 }
 
+fn writeSkillModifierUsage(deps: RunDeps) !void {
+    try writeStderr(
+        deps,
+        "fx: --no-default-skills is only supported for interactive, resume, and ACP launches\n",
+    );
+}
+
 fn globalLaunchErrorMessage(err: anyerror) ?[]const u8 {
     return switch (err) {
         error.MissingAddDirectoryValue => "--add-dir requires a directory path",
@@ -3913,6 +3953,7 @@ fn globalLaunchErrorMessage(err: anyerror) ?[]const u8 {
         error.DuplicateNativeToolSuppression => "--no-native-tools may only be specified once",
         error.MissingNativeToolSelection => "--tool requires a native tool name",
         error.ConflictingNativeToolSelection => "--tool cannot be combined with --no-native-tools",
+        error.DuplicateDefaultSkillsSuppression => "--no-default-skills may only be specified once",
         else => null,
     };
 }
@@ -4496,6 +4537,35 @@ test "global launch modifiers preserve repeatable context limits before the comm
     try std.testing.expectEqualStrings("hello", parsed.remaining[1]);
 }
 
+test "global skill modifiers retain ordered roots and reject malformed policy" {
+    var parsed = try parseGlobalLaunchArgs(std.testing.allocator, &.{
+        @constCast("--no-default-skills"),
+        @constCast("--skills-dir"),
+        @constCast("/tmp/first-skills"),
+        @constCast("--skills-dir=/tmp/second-skills"),
+        @constCast("ask"),
+    });
+    defer parsed.deinit(std.testing.allocator);
+
+    try std.testing.expect(parsed.modifiers.no_default_skills);
+    try std.testing.expectEqual(@as(usize, 2), parsed.modifiers.skill_directories.len);
+    try std.testing.expectEqualStrings("/tmp/first-skills", parsed.modifiers.skill_directories[0]);
+    try std.testing.expectEqualStrings("/tmp/second-skills", parsed.modifiers.skill_directories[1]);
+    try std.testing.expectEqualStrings("ask", parsed.remaining[0]);
+
+    try std.testing.expectError(
+        error.MissingSkillsDirectoryValue,
+        parseGlobalLaunchArgs(std.testing.allocator, &.{@constCast("--skills-dir")}),
+    );
+    try std.testing.expectError(
+        error.DuplicateDefaultSkillsSuppression,
+        parseGlobalLaunchArgs(std.testing.allocator, &.{
+            @constCast("--no-default-skills"),
+            @constCast("--no-default-skills"),
+        }),
+    );
+}
+
 test "global context limits reject missing values and stop at the command" {
     try std.testing.expectError(
         error.MissingContextLimitValue,
@@ -4914,6 +4984,9 @@ test "ACP command routes parsed options and launch config through the injected r
                 cfg.invocation_skill_roots.len == 1 and
                 std.mem.eql(u8, cfg.invocation_skill_roots[0], self.expected_invocation_root) and
                 cfg.saved_directories_suppressed and
+                cfg.skill_root_policy.exclusive_invocation_roots and
+                cfg.skill_root_policy.invocation_roots.len == 1 and
+                std.mem.eql(u8, cfg.skill_root_policy.invocation_roots[0], self.expected_invocation_root) and
                 std.mem.eql(u8, cfg.model_override.?, "model-override") and
                 cfg.effort_override.?.eql(types.ReasoningEffort.literal("high")) and
                 std.mem.eql(u8, cfg.log_file.?, "/tmp/acp.log") and
@@ -4956,6 +5029,7 @@ test "ACP command routes parsed options and launch config through the injected r
             @constCast("/tmp/acp-extra"),
             @constCast("--no-additional-dirs"),
             @constCast("--no-native-tools"),
+            @constCast("--no-default-skills"),
             @constCast("acp"),
             @constCast("--model"),
             @constCast("model-override"),
