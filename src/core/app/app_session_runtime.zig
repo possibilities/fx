@@ -2969,6 +2969,27 @@ pub fn Runtime(comptime App: type) type {
             return if (app.session_title.items.len == 0) null else app.session_title.items;
         }
 
+        /// Returns the cached title only when the active session's sidecar is
+        /// readable and names the same value. Resume can derive a cosmetic
+        /// title from legacy history when display metadata is missing; raw
+        /// metadata observers must not mistake that fallback for a committed
+        /// native name.
+        pub fn durableCachedSessionTitle(app: *App) ?[]const u8 {
+            if (comptime !@hasField(App, "session_persistence")) return null;
+            const title = cachedSessionTitle(app) orelse return null;
+            const loaded = if (app.session_persistence.writable) |*value|
+                value
+            else
+                return null;
+            var display = session_display_metadata.readSidecarOrFallback(
+                app.alloc,
+                &loaded.log.dir,
+            ) catch return null;
+            defer display.deinit(app.alloc);
+            if (!display.present or !std.mem.eql(u8, display.title, title)) return null;
+            return title;
+        }
+
         /// Derives and caches the title on the first turn of a fresh session.
         /// Derivation freezes at the first usable prompt, so this is a no-op
         /// once a title is cached.
@@ -2984,6 +3005,12 @@ pub fn Runtime(comptime App: type) type {
             };
             defer display.deinit(app.alloc);
             if (!display.present) return;
+            if (comptime @hasField(App, "session_persistence")) {
+                if (app.session_persistence.writable != null) {
+                    try persistActiveSessionTitle(app, display.title);
+                    return;
+                }
+            }
             try setCachedSessionTitle(app, display.title);
         }
 
@@ -3014,40 +3041,61 @@ pub fn Runtime(comptime App: type) type {
             const title = try validateSessionTitle(raw);
             if (comptime !@hasField(App, "session_persistence")) return error.NoActiveSession;
             if (app.session_persistence.writable == null) return error.NoActiveSession;
+            if (comptime @hasDecl(App, "cancelPendingSessionName")) {
+                app.cancelPendingSessionName();
+            }
+            try persistActiveSessionTitle(app, title);
+        }
+
+        pub fn applyGeneratedSessionTitle(app: *App, raw: []const u8) !void {
+            const title = try validateSessionTitle(raw);
+            if (comptime !@hasField(App, "session_persistence")) return error.NoActiveSession;
+            if (app.session_persistence.writable == null) return error.NoActiveSession;
+            try persistActiveSessionTitle(app, title);
+        }
+
+        /// Installs one native title through the same sidecar and index path
+        /// for generated, derived, and manually supplied names. Publication
+        /// to observers happens only after the durable sidecar replacement.
+        fn persistActiveSessionTitle(app: *App, title: []const u8) !void {
+            {
+                app.session_persistence.write_mutex.lockUncancelable(io_mod.getIo());
+                defer app.session_persistence.write_mutex.unlock(io_mod.getIo());
+
+                const loaded = &app.session_persistence.writable.?;
+                var display = session_display_metadata.readSidecarOrFallback(
+                    app.alloc,
+                    &loaded.log.dir,
+                ) catch |err| switch (err) {
+                    error.OutOfMemory => return error.OutOfMemory,
+                    else => try session_display_metadata.missingFallback(app.alloc),
+                };
+                defer display.deinit(app.alloc);
+
+                const owned_title = try app.alloc.dupe(u8, title);
+                app.alloc.free(display.title);
+                display.title = owned_title;
+                display.present = true;
+                if (display.origin_workspace_root == null) {
+                    display.origin_workspace_root = try app.alloc.dupe(u8, loaded.state.origin_workspace_root);
+                }
+                try session_display_metadata.writeSidecar(app.alloc, &loaded.log.dir, display);
+
+                if (app.session_persistence.store) |*store| {
+                    store.updateIndexedTitle(app.alloc, loaded.active_id, title) catch |err| switch (err) {
+                        error.OutOfMemory => return error.OutOfMemory,
+                        else => debug_trace.logf(
+                            "session",
+                            "event=session_title_index_update_failed id={s} err={s}",
+                            .{ loaded.active_id, @errorName(err) },
+                        ),
+                    };
+                }
+            }
 
             try setCachedSessionTitle(app, title);
-
-            app.session_persistence.write_mutex.lockUncancelable(io_mod.getIo());
-            defer app.session_persistence.write_mutex.unlock(io_mod.getIo());
-
-            const loaded = &app.session_persistence.writable.?;
-            var display = session_display_metadata.readSidecarOrFallback(
-                app.alloc,
-                &loaded.log.dir,
-            ) catch |err| switch (err) {
-                error.OutOfMemory => return error.OutOfMemory,
-                else => try session_display_metadata.missingFallback(app.alloc),
-            };
-            defer display.deinit(app.alloc);
-
-            const owned_title = try app.alloc.dupe(u8, title);
-            app.alloc.free(display.title);
-            display.title = owned_title;
-            display.present = true;
-            if (display.origin_workspace_root == null) {
-                display.origin_workspace_root = try app.alloc.dupe(u8, loaded.state.origin_workspace_root);
-            }
-            try session_display_metadata.writeSidecar(app.alloc, &loaded.log.dir, display);
-
-            if (app.session_persistence.store) |*store| {
-                store.updateIndexedTitle(app.alloc, loaded.active_id, title) catch |err| switch (err) {
-                    error.OutOfMemory => return error.OutOfMemory,
-                    else => debug_trace.logf(
-                        "session",
-                        "event=rename_index_update_failed id={s} err={s}",
-                        .{ loaded.active_id, @errorName(err) },
-                    ),
-                };
+            if (comptime @hasDecl(App, "reportSessionMetadataChanged")) {
+                app.reportSessionMetadataChanged(title);
             }
         }
 
@@ -5258,6 +5306,11 @@ const TestApp = struct {
     mcp_tool_names: std.ArrayList([]u8) = .empty,
     reported_session_identity_count: usize = 0,
     last_reported_session_id: ?[]const u8 = null,
+    cancelled_session_name_count: usize = 0,
+    reported_session_metadata_count: usize = 0,
+    reported_session_metadata_after_sidecar: bool = false,
+    reported_session_metadata_title: [session_display_metadata.max_title_bytes]u8 = undefined,
+    reported_session_metadata_title_len: usize = 0,
 
     fn init(alloc: Allocator, workspace_root: []const u8) !TestApp {
         return .{
@@ -5269,6 +5322,34 @@ const TestApp = struct {
     fn reportSessionIdentityChanged(self: *TestApp, session_id: ?[]const u8) void {
         self.reported_session_identity_count += 1;
         self.last_reported_session_id = session_id;
+    }
+
+    fn cancelPendingSessionName(self: *TestApp) void {
+        self.cancelled_session_name_count += 1;
+    }
+
+    fn reportSessionMetadataChanged(self: *TestApp, title: []const u8) void {
+        self.reported_session_metadata_count += 1;
+        self.reported_session_metadata_title_len = @min(
+            title.len,
+            self.reported_session_metadata_title.len,
+        );
+        @memcpy(
+            self.reported_session_metadata_title[0..self.reported_session_metadata_title_len],
+            title[0..self.reported_session_metadata_title_len],
+        );
+        const loaded = if (self.session_persistence.writable) |*value| value else return;
+        var display = session_display_metadata.readSidecarOrFallback(
+            self.alloc,
+            &loaded.log.dir,
+        ) catch return;
+        defer display.deinit(self.alloc);
+        self.reported_session_metadata_after_sidecar = display.present and
+            std.mem.eql(u8, display.title, title);
+    }
+
+    fn reportedSessionMetadataTitle(self: *const TestApp) []const u8 {
+        return self.reported_session_metadata_title[0..self.reported_session_metadata_title_len];
     }
 
     fn toolAdvertisementSet(_: *const TestApp) tool_set_contract.ToolSet {
@@ -9980,6 +10061,36 @@ test "renameActiveSession requires an active session" {
     );
 }
 
+fn expectActiveTitleDurable(app: *TestApp, expected: []const u8) !void {
+    const alloc = std.testing.allocator;
+    const loaded = &app.session_persistence.writable.?;
+    var display = try session_display_metadata.readSidecarOrFallback(alloc, &loaded.log.dir);
+    defer display.deinit(alloc);
+    try std.testing.expect(display.present);
+    try std.testing.expectEqualStrings(expected, display.title);
+
+    const store = app.session_persistence.store.?;
+    var page = try store.listResumablePage(alloc, null, null);
+    page.deinit(alloc);
+    const index_path = try std.fs.path.join(alloc, &.{ store.sessions_dir, "index.json" });
+    defer alloc.free(index_path);
+    var index_file = try std.Io.Dir.openFileAbsolute(io_mod.getIo(), index_path, .{});
+    defer index_file.close(io_mod.getIo());
+    const bytes = try io_mod.readFileToEnd(alloc, &index_file, 2 * 1024 * 1024);
+    defer alloc.free(bytes);
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, bytes, .{});
+    defer parsed.deinit();
+    const summaries = parsed.value.object.get("sessions").?.array.items;
+    for (summaries) |summary| {
+        const object = summary.object;
+        if (!std.mem.eql(u8, object.get("id").?.string, loaded.active_id)) continue;
+        try std.testing.expect(object.get("display_metadata_present").?.bool);
+        try std.testing.expectEqualStrings(expected, object.get("title").?.string);
+        return;
+    }
+    return error.TestExpectedIndexedSession;
+}
+
 test "renameActiveSession persists the title to the sidecar and session index" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -10003,6 +10114,14 @@ test "renameActiveSession persists the title to the sidecar and session index" {
 
     try Runtime(TestApp).renameActiveSession(&app, "  deploy pipeline fix  ");
 
+    try std.testing.expectEqual(@as(usize, 1), app.cancelled_session_name_count);
+    try std.testing.expectEqual(@as(usize, 1), app.reported_session_metadata_count);
+    try std.testing.expect(app.reported_session_metadata_after_sidecar);
+    try std.testing.expectEqualStrings(
+        "deploy pipeline fix",
+        app.reportedSessionMetadataTitle(),
+    );
+
     // Cached for the footer without re-reading the sidecar.
     try std.testing.expectEqualStrings(
         "deploy pipeline fix",
@@ -10018,6 +10137,152 @@ test "renameActiveSession persists the title to the sidecar and session index" {
     defer display.deinit(alloc);
     try std.testing.expect(display.present);
     try std.testing.expectEqualStrings("deploy pipeline fix", display.title);
+}
+
+test "fallback generated and manual titles share one durable metadata path" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const paths = try testPaths(alloc, &tmp);
+    defer {
+        alloc.free(paths.home);
+        alloc.free(paths.workspace);
+    }
+    const home = try TestHome.install(alloc, paths.home);
+    defer home.deinit();
+
+    var app = try TestApp.init(alloc, paths.workspace);
+    defer app.deinit();
+    try configureTestPreferences(&app);
+    try Runtime(TestApp).initializePersistence(&app, true);
+    try Runtime(TestApp).beginFreshPersistedSession(&app);
+    Runtime(TestApp).enableSessionStores(&app);
+
+    const turn = try session_runtime.makeAssistantTurn(
+        alloc,
+        "fallback title from the admitted first user prompt",
+        "answer",
+    );
+    defer session_runtime.freeHistoryTurn(alloc, turn);
+    try Runtime(TestApp).appendHistoryTurn(&app, turn);
+    try expectActiveTitleDurable(&app, "fallback title from the admitted first user prompt");
+    try std.testing.expect(app.reported_session_metadata_after_sidecar);
+    try std.testing.expectEqualStrings(
+        "fallback title from the admitted first user prompt",
+        app.reportedSessionMetadataTitle(),
+    );
+
+    app.reported_session_metadata_after_sidecar = false;
+    try Runtime(TestApp).applyGeneratedSessionTitle(&app, "Generated native title");
+    try expectActiveTitleDurable(&app, "Generated native title");
+    try std.testing.expect(app.reported_session_metadata_after_sidecar);
+    try std.testing.expectEqualStrings("Generated native title", app.reportedSessionMetadataTitle());
+    try std.testing.expectEqual(@as(usize, 0), app.cancelled_session_name_count);
+
+    app.reported_session_metadata_after_sidecar = false;
+    try Runtime(TestApp).renameActiveSession(&app, "Manual native title");
+    try expectActiveTitleDurable(&app, "Manual native title");
+    try std.testing.expect(app.reported_session_metadata_after_sidecar);
+    try std.testing.expectEqualStrings("Manual native title", app.reportedSessionMetadataTitle());
+    try std.testing.expectEqual(@as(usize, 1), app.cancelled_session_name_count);
+    try std.testing.expectEqual(@as(usize, 3), app.reported_session_metadata_count);
+}
+
+test "generated title committed before first history remains authoritative in the index" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const paths = try testPaths(alloc, &tmp);
+    defer {
+        alloc.free(paths.home);
+        alloc.free(paths.workspace);
+    }
+    const home = try TestHome.install(alloc, paths.home);
+    defer home.deinit();
+
+    var app = try TestApp.init(alloc, paths.workspace);
+    defer app.deinit();
+    try configureTestPreferences(&app);
+    try Runtime(TestApp).initializePersistence(&app, true);
+    try Runtime(TestApp).beginFreshPersistedSession(&app);
+    Runtime(TestApp).enableSessionStores(&app);
+
+    const seed_turn = try session_runtime.makeAssistantTurn(
+        alloc,
+        "seed the existing native session index",
+        "answer",
+    );
+    defer session_runtime.freeHistoryTurn(alloc, seed_turn);
+    try Runtime(TestApp).appendHistoryTurn(&app, seed_turn);
+    try expectActiveTitleDurable(&app, "seed the existing native session index");
+
+    try Runtime(TestApp).beginFreshPersistedSession(&app);
+    Runtime(TestApp).enableSessionStores(&app);
+    try Runtime(TestApp).applyGeneratedSessionTitle(&app, "Fast generated title");
+    const turn = try session_runtime.makeAssistantTurn(
+        alloc,
+        "a much longer fallback title that must never replace generation",
+        "answer",
+    );
+    defer session_runtime.freeHistoryTurn(alloc, turn);
+    try Runtime(TestApp).appendHistoryTurn(&app, turn);
+
+    try expectActiveTitleDurable(&app, "Fast generated title");
+    try std.testing.expectEqualStrings(
+        "Fast generated title",
+        Runtime(TestApp).cachedSessionTitle(&app).?,
+    );
+}
+
+test "derived legacy resume title is not exposed as durable native metadata" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const paths = try testPaths(alloc, &tmp);
+    defer {
+        alloc.free(paths.home);
+        alloc.free(paths.workspace);
+    }
+    const home = try TestHome.install(alloc, paths.home);
+    defer home.deinit();
+
+    var app = try TestApp.init(alloc, paths.workspace);
+    defer app.deinit();
+    try configureTestPreferences(&app);
+    try Runtime(TestApp).initializePersistence(&app, true);
+
+    const history = [_]types.HistoryTurn{.{ .assistant = .{
+        .user = .{ .text = @constCast("legacy resume title from saved history") },
+        .assistant = @constCast("saved response"),
+    } }};
+    const store = app.session_persistence.store.?;
+    try writeSessionFixture(alloc, store, "legacy-display-gap", &history, 0);
+    {
+        var fixture = try store.resumeForWrite(alloc, "legacy-display-gap");
+        defer fixture.deinit(alloc);
+        try fixture.log.dir.dir.deleteFile(
+            io_mod.getIo(),
+            session_display_metadata.sidecar_file,
+        );
+    }
+
+    app.requested_resume = .{ .id = try alloc.dupe(u8, "legacy-display-gap") };
+    try Runtime(TestApp).resumeRequestedSession(&app);
+
+    try std.testing.expectEqualStrings(
+        "legacy resume title from saved history",
+        Runtime(TestApp).cachedSessionTitle(&app).?,
+    );
+    try std.testing.expect(Runtime(TestApp).durableCachedSessionTitle(&app) == null);
+
+    try Runtime(TestApp).applyGeneratedSessionTitle(&app, "Committed native title");
+    try std.testing.expectEqualStrings(
+        "Committed native title",
+        Runtime(TestApp).durableCachedSessionTitle(&app).?,
+    );
 }
 
 const ReconciliationOriginUsage = struct {

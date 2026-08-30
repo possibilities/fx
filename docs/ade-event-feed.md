@@ -131,6 +131,26 @@ Either identity can be `null`. The new identity is also present in `context`.
 Idle `/new` and `/resume` transitions therefore publish without waiting for a
 prompt.
 
+### `SessionMetadataChanged`
+
+Emitted after Fx durably installs native metadata for the active main session:
+
+```json
+{ "title": "Prompt submit session naming" }
+```
+
+The title is the same value used by `/rename`, `display.json`, the resume
+index, the status line, and the terminal tab. A fresh session can first publish
+a prompt-derived fallback and then replace it with a generated title. Resuming
+or switching sessions publishes that session's existing title after the
+corresponding `SessionChanged` record. Repeated identical titles are suppressed
+within one active session.
+
+This is a raw metadata fact rather than a lifecycle transition. Receivers may
+use it immediately for their own presentation, but Fx remains the persistence
+authority. After a sequence gap, a receiver that needs the current value can
+read `~/.fx/sessions/<session_id>/display.json`.
+
 ### `PromptQueued`
 
 Emitted for a main-agent prompt after queue admission and before the worker is
@@ -260,6 +280,7 @@ how Fx derives it:
 | --- | --- |
 | `FxStarted` | Bind the instance's main session and seed its lifecycle state as idle |
 | `SessionChanged` | Replace the instance's main session identity |
+| `SessionMetadataChanged` | Replace the instance's displayed native session title |
 | `PromptQueued` | Mark the main agent working as soon as Fx accepts its prompt |
 | `TurnStarted` | Confirm execution for the identified main agent or mark a subagent working |
 | `AttentionRequired` | Mark that agent blocked and retain `kind` |
@@ -272,10 +293,11 @@ Fx deliberately does not duplicate those presentation facts in the feed.
 
 ## Sensitive payloads
 
-The socket receives workspace paths, tool names, complete tool arguments, and
-assistant text. Those values can contain secrets. The launching ADE is
-responsible for protecting the socket, authenticating its local clients, and
-applying any persistence, redaction, or forwarding policy.
+The socket receives workspace paths, native session titles, tool names,
+complete tool arguments, and assistant text. Titles can summarize sensitive
+prompt text, and the other values can contain secrets directly. The launching
+ADE is responsible for protecting the socket, authenticating its local
+clients, and applying any persistence, redaction, or forwarding policy.
 
 The ADE feed and the Herdr integration are independent projections of the same
 lifecycle observations. Setting `FX_ADE_*` does not enable, disable, filter, or

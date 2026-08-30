@@ -95,6 +95,12 @@ pub fn Runtime(comptime App: type) type {
             }
         }
 
+        pub fn reportSessionMetadataChanged(app: *App, title: []const u8) void {
+            app.lifecycle_state.lockProjection();
+            defer app.lifecycle_state.unlockProjection();
+            app.ade_events.reportSessionMetadataChanged(title);
+        }
+
         pub fn prepareStopped(app: *App) void {
             app.lifecycle_state.lockProjection();
             defer app.lifecycle_state.unlockProjection();
@@ -264,6 +270,7 @@ const RecordingClient = struct {
 const RecordingAdeClient = struct {
     const Event = enum {
         fx_started,
+        session_metadata_changed,
         prompt_queued,
         turn_started,
         pre_tool_use,
@@ -297,6 +304,10 @@ const RecordingAdeClient = struct {
 
     fn reportSessionChanged(self: *RecordingAdeClient, session_id: ?[]const u8) void {
         self.reported_session = session_id;
+    }
+
+    fn reportSessionMetadataChanged(self: *RecordingAdeClient, _: []const u8) void {
+        if (self.enabled) self.record(.session_metadata_changed, .main);
     }
 
     fn reportPromptQueued(self: *RecordingAdeClient) void {
