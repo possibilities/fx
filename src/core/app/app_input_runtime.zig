@@ -1786,7 +1786,7 @@ pub fn Runtime(comptime App: type) type {
             debug_trace.logf("input", "ctrl_c_exit_hint_armed", .{});
 
             if (app.stream.active) {
-                try interrupt_rt.cancelActiveOperation(app);
+                try interrupt_rt.cancelActiveOperation(app, .open);
                 app.shell.render_requests.request(.footer);
                 return;
             }
@@ -3077,7 +3077,7 @@ pub fn Runtime(comptime App: type) type {
                     _ = disarmEscapeClear(app);
                     if (approvalOwnsCurrentSurface(app)) {
                         if (was_cancel_pending) {
-                            try approval_rt.cancelApprovalOperation(app);
+                            try approval_rt.cancelApprovalOperation(app, .open);
                         }
                         return;
                     }
@@ -3109,11 +3109,11 @@ pub fn Runtime(comptime App: type) type {
                         app.shell.render_requests.request(.footer);
                         return;
                     }
-                    try question_rt.cancelQuestionPrompt(app);
+                    try question_rt.cancelQuestionPrompt(app, .open);
                     return;
                 }
                 if (app.approval_prompt.isActive()) {
-                    try approval_rt.cancelApprovalOperation(app);
+                    try approval_rt.cancelApprovalOperation(app, .open);
                     _ = disarmEscapeClear(app);
                     return;
                 }
@@ -3134,7 +3134,7 @@ pub fn Runtime(comptime App: type) type {
                     }
                 }
                 if (!interrupt_rt.pauseActiveRecovery(app)) {
-                    try interrupt_rt.cancelActiveOperation(app);
+                    try interrupt_rt.cancelActiveOperation(app, .open);
                 }
                 _ = disarmEscapeClear(app);
                 return;
@@ -11008,7 +11008,7 @@ test "approval cancellation uses one worker-owned terminal transition" {
         .{ .label = "terminal.exec npm test" },
     ));
 
-    try Runtime(FakeApprovalCancelApp).cancelApprovalOperation(&app);
+    try Runtime(FakeApprovalCancelApp).cancelApprovalOperation(&app, .open);
 
     try std.testing.expect(app.worker.cancel_requested);
     try std.testing.expectEqual(@as(usize, 1), app.worker.order_len);
@@ -11716,7 +11716,7 @@ test "route recovery question cancel stays local" {
     };
     try app.question_prompt.syncFrom(alloc, &entries);
 
-    try input_question_runtime.QuestionRuntime(RoutingFakeApp).cancelQuestionPrompt(&app);
+    try input_question_runtime.QuestionRuntime(RoutingFakeApp).cancelQuestionPrompt(&app, .open);
 
     try std.testing.expect(app.worker.question_cancelled);
     try std.testing.expectEqual(@as(usize, 1), app.worker.observed_question_submission_count);

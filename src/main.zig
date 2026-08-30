@@ -36,6 +36,7 @@ const app_render_runtime = @import("core/app/app_render_runtime.zig");
 const app_session_runtime = @import("core/app/app_session_runtime.zig");
 const app_upgrade_runtime = @import("core/app/app_upgrade_runtime.zig");
 const app_worker_runtime = @import("core/app/app_worker_runtime.zig");
+const app_work_control_runtime = @import("core/app/app_work_control_runtime.zig");
 const app_workspace_runtime = @import("core/app/app_workspace_runtime.zig");
 const app_callbacks = @import("core/app/app_callbacks.zig");
 const app_commands = @import("core/app/app_commands.zig");
@@ -89,6 +90,7 @@ const github_publish = @import("core/github/github_publish.zig");
 const subagent_domain = @import("core/subagent/domain.zig");
 const subagent_execution = @import("core/subagent/execution.zig");
 const types = @import("core/shared/types.zig");
+const work_control = @import("core/control/work_control.zig");
 const image_attachments = @import("core/images/image_attachments.zig");
 const permissions = @import("core/permissions/permissions.zig");
 const command_runner = @import("core/execution/command_runner.zig");
@@ -408,6 +410,7 @@ const App = struct {
     const SessionAppRuntime = app_session_runtime.Runtime(Self);
     const UpgradeAppRuntime = app_upgrade_runtime.Runtime(Self);
     const WorkerAppRuntime = app_worker_runtime.Runtime(Self);
+    const WorkControlAppRuntime = app_work_control_runtime.Runtime(Self);
     const WorkspaceAppRuntime = app_workspace_runtime.Runtime(Self);
 
     pub fn contextRegistry(_: *const Self) context_contract.Registry {
@@ -572,6 +575,7 @@ const App = struct {
 
     worker_thread: ?std.Thread = null,
     worker: WorkerRuntime = .{},
+    work_control: work_control.Endpoint = .{},
     background: BackgroundRuntime = .{},
     terminal_client: terminal_client_runtime.Runtime = .{},
     terminal_direct: terminal_direct_runtime.Runtime = .{},
@@ -676,6 +680,9 @@ const App = struct {
         app.invocation_skill_roots = launch.modifiers.takeInvocationSkillRoots();
         errdefer app.deinit();
         app.system_prompt_override = launch.modifiers.takeEffectiveSystemPrompt();
+        if (comptime !host_target.is_wasm) {
+            try app.work_control.configureFromEnvironment();
+        }
         try WorkspaceAppRuntime.applyLaunch(
             &app,
             launch.modifiers.additional_directories,
@@ -882,6 +889,13 @@ const App = struct {
         }
     }
 
+    /// Starts only after init() returns so the listener retains the final App
+    /// address through its pending main-loop handoff.
+    pub fn startWorkControl(self: *App) !void {
+        if (comptime host_target.is_wasm) return;
+        try self.work_control.start();
+    }
+
     pub fn applyReadyUpgradeShortcut(self: *App) !void {
         try UpgradeAppRuntime.applyReadyUpgrade(self);
     }
@@ -931,6 +945,7 @@ const App = struct {
     fn deinitImpl(self: *App, capture_resume_handoff: bool) ?app_session_runtime.ResumeHandoff {
         // Client.deinit releases the herdr pane (clear agent + label) when enabled.
         self.herdr.deinit();
+        if (comptime !host_target.is_wasm) self.work_control.deinit();
         self.stopStream();
 
         self.worker.requestShutdown();
@@ -1222,7 +1237,7 @@ const App = struct {
         );
     }
 
-    const PromptSubmitIntent = enum { queue, steer };
+    pub const PromptSubmitIntent = enum { queue, steer };
 
     fn enqueuePromptWithOptionalReview(
         self: *App,
@@ -1467,6 +1482,40 @@ const App = struct {
         );
     }
 
+    /// Applies host-supplied semantic work through the same snapshot and
+    /// worker admission path as interactive submission, with deliberately
+    /// empty image and skill state rather than borrowing the composer.
+    pub fn admitWorkControlPrompt(
+        self: *App,
+        prompt: []const u8,
+        intent: PromptSubmitIntent,
+    ) !worker_runtime.PromptAdmissionResult {
+        const no_images: []const types.ImageAttachment = &.{};
+        const context_targets = if (self.context_enabled)
+            try context_contract.applicableTargetsForImages(self.alloc, no_images)
+        else
+            &.{};
+        defer if (context_targets.len > 0) self.alloc.free(context_targets);
+
+        try AgentAppRuntime.refreshProjectContext(self, context_targets);
+        self.session.setConversationLanguageFromUserMessage(prompt);
+        const admission = try self.snapshotAndAdmitPrompt(
+            prompt,
+            &.{},
+            null,
+            null,
+            no_images,
+            0,
+            false,
+            intent,
+        );
+        WorkerAppRuntime.syncState(
+            self,
+            app_callbacks.Bindings(App).worker_tool_lifecycle_presenter(self),
+        );
+        return admission;
+    }
+
     pub fn continuePausedRecovery(self: *App) !bool {
         return SessionAppRuntime.continuePausedRecovery(self);
     }
@@ -1503,6 +1552,30 @@ const App = struct {
         user_prompt_already_presented: bool,
         intent: PromptSubmitIntent,
     ) !bool {
+        _ = try self.snapshotAndAdmitPrompt(
+            prompt,
+            skill_tokens,
+            review_draft,
+            recovery_checkpoint,
+            prompt_images,
+            turn_id,
+            user_prompt_already_presented,
+            intent,
+        );
+        return true;
+    }
+
+    fn snapshotAndAdmitPrompt(
+        self: *App,
+        prompt: []const u8,
+        skill_tokens: []const registered_entities.SkillTokenSpan,
+        review_draft: ?worker_runtime.QueueReviewDraft,
+        recovery_checkpoint: ?*const session_codec.RecoveryCheckpoint,
+        prompt_images: ?[]const types.ImageAttachment,
+        turn_id: u64,
+        user_prompt_already_presented: bool,
+        intent: PromptSubmitIntent,
+    ) !worker_runtime.PromptAdmissionResult {
         try self.reloadSkills();
 
         const source_images = if (recovery_checkpoint) |checkpoint|
@@ -1589,7 +1662,7 @@ const App = struct {
                 review,
             );
 
-        try self.worker.admitPromptObserved(std.heap.c_allocator, .{
+        const admission = try self.worker.admitPromptObserved(std.heap.c_allocator, .{
             .turn_id = if (recovery_checkpoint) |checkpoint| checkpoint.turn_id else turn_id,
             .prompt = prompt_copy,
             .images = images_copy,
@@ -1616,7 +1689,7 @@ const App = struct {
             .report = reportPromptAdmission,
         });
         LifecycleAppRuntime.reportPromptWorking(self);
-        return true;
+        return admission;
     }
 
     fn reportPromptAdmission(raw: *anyopaque) void {
@@ -2950,6 +3023,7 @@ const App = struct {
 
     pub fn loopCollectFacts(ctx: *anyopaque) !void {
         const self: *App = @ptrCast(@alignCast(ctx));
+        if (comptime !host_target.is_wasm) try WorkControlAppRuntime.collect(self);
         if (!try WorkerAppRuntime.authorizeInteractiveAdmission(self)) return;
         InputSubmitRuntime.collectPendingSubmissionFacts(self);
 

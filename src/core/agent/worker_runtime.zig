@@ -261,6 +261,44 @@ pub const QueueReviewReason = enum {
 
 pub const PromptDraftKind = enum { queued, steering };
 
+pub const PromptAdmissionDisposition = enum { queued, steering };
+
+pub const PromptAdmissionResult = struct {
+    turn_id: u64,
+    disposition: PromptAdmissionDisposition,
+};
+
+pub const WorkSnapshotLimits = struct {
+    max_entries: usize,
+    max_text_bytes: usize,
+};
+
+pub const WorkQueueEntry = struct {
+    turn_id: u64,
+    kind: PromptDraftKind,
+    text: []u8,
+    has_images: bool,
+    has_skill_bindings: bool,
+    has_review_draft: bool,
+};
+
+pub const WorkSnapshot = struct {
+    active_turn_id: ?u64,
+    queue_paused: bool,
+    entries: []WorkQueueEntry,
+
+    pub fn deinit(self: WorkSnapshot, alloc: std.mem.Allocator) void {
+        for (self.entries) |entry| alloc.free(entry.text);
+        if (self.entries.len > 0) alloc.free(self.entries);
+    }
+};
+
+pub const QueuedPromptTextUpdate = enum {
+    updated,
+    not_found,
+    carries_non_text_state,
+};
+
 pub const QueuedPromptDraft = struct {
     turn_id: u64,
     kind: PromptDraftKind = .queued,
@@ -832,7 +870,7 @@ pub const WorkerRuntime = struct {
     };
 
     pub fn enqueuePrompt(self: *WorkerRuntime, alloc: std.mem.Allocator, prompt: QueuedPrompt) !void {
-        try self.admitPromptObserved(alloc, prompt, false, null);
+        _ = try self.admitPromptObserved(alloc, prompt, false, null);
     }
 
     pub fn enqueuePromptObserved(
@@ -841,7 +879,7 @@ pub const WorkerRuntime = struct {
         prompt: QueuedPrompt,
         observer: ?PromptAdmissionObserver,
     ) !void {
-        try self.admitPromptObserved(alloc, prompt, false, observer);
+        _ = try self.admitPromptObserved(alloc, prompt, false, observer);
     }
 
     /// Transfers `prompt` to the active turn when steering is requested and the
@@ -852,16 +890,18 @@ pub const WorkerRuntime = struct {
         prompt: QueuedPrompt,
         steer_if_active: bool,
     ) !void {
-        try self.admitPromptObserved(alloc, prompt, steer_if_active, null);
+        _ = try self.admitPromptObserved(alloc, prompt, steer_if_active, null);
     }
 
+    /// Admits one prompt through the native FIFO and reports the stable turn
+    /// identity and the disposition selected while holding the worker lock.
     pub fn admitPromptObserved(
         self: *WorkerRuntime,
         alloc: std.mem.Allocator,
         prompt: QueuedPrompt,
         steer_if_active: bool,
         observer: ?PromptAdmissionObserver,
-    ) !void {
+    ) !PromptAdmissionResult {
         var queued = prompt;
         if (queued.turn_id == 0) queued.turn_id = debug_trace.nextTurnId();
 
@@ -889,10 +929,15 @@ pub const WorkerRuntime = struct {
         {
             queued.steer_target_turn_id = self.active_turn_id;
         }
+        const result: PromptAdmissionResult = .{
+            .turn_id = queued.turn_id,
+            .disposition = if (queued.steer_target_turn_id != null) .steering else .queued,
+        };
         try self.enqueuePromptLocked(alloc, queued);
         self.worker_mutex.unlock(io_mod.getIo());
         locked = false;
         if (observer) |admitted| admitted.report(admitted.ctx);
+        return result;
     }
 
     fn enqueuePromptLocked(self: *WorkerRuntime, alloc: std.mem.Allocator, queued: QueuedPrompt) !void {
@@ -1064,6 +1109,111 @@ pub const WorkerRuntime = struct {
             };
         }
         return drafts;
+    }
+
+    /// Returns one atomic, allocator-owned view of active and queued work.
+    /// Bounds are checked while holding the same lock that owns admission so a
+    /// controller never receives a partial queue.
+    pub fn snapshotWork(
+        self: *WorkerRuntime,
+        alloc: std.mem.Allocator,
+        limits: WorkSnapshotLimits,
+    ) !WorkSnapshot {
+        self.worker_mutex.lockUncancelable(io_mod.getIo());
+        defer self.worker_mutex.unlock(io_mod.getIo());
+
+        if (self.queued_prompts.items.len > limits.max_entries) {
+            return error.WorkSnapshotEntryLimitExceeded;
+        }
+        var text_bytes: usize = 0;
+        for (self.queued_prompts.items) |queued| {
+            const text = if (queued.review_draft) |review| review.input else queued.prompt;
+            text_bytes = std.math.add(usize, text_bytes, text.len) catch
+                return error.WorkSnapshotTextLimitExceeded;
+            if (text_bytes > limits.max_text_bytes) {
+                return error.WorkSnapshotTextLimitExceeded;
+            }
+        }
+
+        if (self.queued_prompts.items.len == 0) return .{
+            .active_turn_id = if (self.worker_processing and self.active_turn_id != 0)
+                self.active_turn_id
+            else
+                null,
+            .queue_paused = self.queue_admission != null,
+            .entries = &.{},
+        };
+
+        const entries = try alloc.alloc(WorkQueueEntry, self.queued_prompts.items.len);
+        var filled: usize = 0;
+        errdefer {
+            for (entries[0..filled]) |entry| alloc.free(entry.text);
+            alloc.free(entries);
+        }
+        while (filled < self.queued_prompts.items.len) : (filled += 1) {
+            const queued = self.queued_prompts.items[filled];
+            const text = if (queued.review_draft) |review| review.input else queued.prompt;
+            entries[filled] = .{
+                .turn_id = queued.turn_id,
+                .kind = if (queued.steer_target_turn_id != null) .steering else .queued,
+                .text = try alloc.dupe(u8, text),
+                .has_images = queued.images.len > 0,
+                .has_skill_bindings = queued.skill_bindings.len > 0 or queued.skill_display_spans.len > 0,
+                .has_review_draft = queued.review_draft != null,
+            };
+        }
+        return .{
+            .active_turn_id = if (self.worker_processing and self.active_turn_id != 0)
+                self.active_turn_id
+            else
+                null,
+            .queue_paused = self.queue_admission != null,
+            .entries = entries,
+        };
+    }
+
+    /// Replaces only plain-text queued work. The allocation occurs before the
+    /// lock; identity and compatibility are then checked and swapped atomically.
+    pub fn updateQueuedPromptText(
+        self: *WorkerRuntime,
+        alloc: std.mem.Allocator,
+        turn_id: u64,
+        text: []const u8,
+    ) !QueuedPromptTextUpdate {
+        const replacement = try alloc.dupe(u8, text);
+        var old: ?[]u8 = null;
+
+        self.worker_mutex.lockUncancelable(io_mod.getIo());
+        for (self.queued_prompts.items) |*queued| {
+            if (queued.turn_id != turn_id) continue;
+            if (queued.images.len > 0 or
+                queued.skill_bindings.len > 0 or
+                queued.skill_display_spans.len > 0 or
+                queued.review_draft != null)
+            {
+                self.worker_mutex.unlock(io_mod.getIo());
+                alloc.free(replacement);
+                return .carries_non_text_state;
+            }
+            old = queued.prompt;
+            queued.prompt = replacement;
+            debug_trace.eventf(
+                "worker",
+                "work_control_queue_updated",
+                .{ .turn_id = turn_id },
+                "prompt_bytes={d}",
+                .{replacement.len},
+            );
+            break;
+        }
+        self.worker_mutex.unlock(io_mod.getIo());
+
+        if (old) |owned| {
+            alloc.free(owned);
+            return .updated;
+        }
+        alloc.free(replacement);
+        return .not_found;
     }
 
     pub fn replaceQueuedPromptDrafts(
@@ -3343,6 +3493,89 @@ test "active prompt admission drains steering in FIFO order" {
     try std.testing.expectEqual(@as(usize, 2), runtime.worker_events.items.len);
     try std.testing.expectEqualStrings("first", runtime.worker_events.items[0].append_user_feedback);
     try std.testing.expectEqualStrings("second", runtime.worker_events.items[1].append_user_feedback);
+}
+
+test "work control snapshot and text update preserve native admission order" {
+    const alloc = std.testing.allocator;
+    var runtime = WorkerRuntime{};
+    defer runtime.deinit(alloc);
+    runtime.worker_processing = true;
+    runtime.active_turn_id = 41;
+
+    const steering = try runtime.admitPromptObserved(
+        alloc,
+        try makePrompt(alloc, "steer now", "model"),
+        true,
+        null,
+    );
+    const queued = try runtime.admitPromptObserved(
+        alloc,
+        try makePrompt(alloc, "then queue", "model"),
+        false,
+        null,
+    );
+    try std.testing.expectEqual(PromptAdmissionDisposition.steering, steering.disposition);
+    try std.testing.expectEqual(PromptAdmissionDisposition.queued, queued.disposition);
+    try std.testing.expect(runtime.beginQueueReview(.manual));
+
+    var snapshot = try runtime.snapshotWork(alloc, .{
+        .max_entries = 2,
+        .max_text_bytes = 64,
+    });
+    defer snapshot.deinit(alloc);
+    try std.testing.expectEqual(@as(?u64, 41), snapshot.active_turn_id);
+    try std.testing.expect(snapshot.queue_paused);
+    try std.testing.expectEqual(@as(usize, 2), snapshot.entries.len);
+    try std.testing.expectEqual(steering.turn_id, snapshot.entries[0].turn_id);
+    try std.testing.expectEqual(PromptDraftKind.steering, snapshot.entries[0].kind);
+    try std.testing.expectEqualStrings("steer now", snapshot.entries[0].text);
+    try std.testing.expectEqual(queued.turn_id, snapshot.entries[1].turn_id);
+
+    try std.testing.expectEqual(
+        QueuedPromptTextUpdate.updated,
+        try runtime.updateQueuedPromptText(alloc, queued.turn_id, "updated queue"),
+    );
+    var updated = try runtime.snapshotWork(alloc, .{
+        .max_entries = 2,
+        .max_text_bytes = 64,
+    });
+    defer updated.deinit(alloc);
+    try std.testing.expectEqualStrings("updated queue", updated.entries[1].text);
+    try std.testing.expectEqual(PromptDraftKind.queued, updated.entries[1].kind);
+}
+
+test "work control snapshot and update enforce semantic bounds" {
+    const alloc = std.testing.allocator;
+    var runtime = WorkerRuntime{};
+    defer runtime.deinit(alloc);
+
+    var reviewed = try makePrompt(alloc, "execution text", "model");
+    reviewed.review_draft = .{ .input = try alloc.dupe(u8, "human draft") };
+    const admitted = try runtime.admitPromptObserved(alloc, reviewed, false, null);
+    try std.testing.expectError(
+        error.WorkSnapshotEntryLimitExceeded,
+        runtime.snapshotWork(alloc, .{ .max_entries = 0, .max_text_bytes = 64 }),
+    );
+    try std.testing.expectError(
+        error.WorkSnapshotTextLimitExceeded,
+        runtime.snapshotWork(alloc, .{ .max_entries = 1, .max_text_bytes = 5 }),
+    );
+    try std.testing.expectEqual(
+        QueuedPromptTextUpdate.carries_non_text_state,
+        try runtime.updateQueuedPromptText(alloc, admitted.turn_id, "replacement"),
+    );
+    try std.testing.expectEqual(
+        QueuedPromptTextUpdate.not_found,
+        try runtime.updateQueuedPromptText(alloc, admitted.turn_id + 1, "replacement"),
+    );
+
+    var snapshot = try runtime.snapshotWork(alloc, .{
+        .max_entries = 1,
+        .max_text_bytes = 64,
+    });
+    defer snapshot.deinit(alloc);
+    try std.testing.expectEqualStrings("human draft", snapshot.entries[0].text);
+    try std.testing.expect(snapshot.entries[0].has_review_draft);
 }
 
 test "queue review atomically blocks steering consumption and edits by prompt identity" {
