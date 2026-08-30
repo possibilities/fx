@@ -1205,6 +1205,26 @@ export class TmuxSession {
     );
   }
 
+  /**
+   * Wait for one process to leave the process table.
+   *
+   * A file fx writes is complete once fx itself is gone, which is not the same
+   * moment tmux tears the session down: the pane shell and the server can
+   * outlive the program under test. Assertions that read a tape or a stderr
+   * file should wait on the process that wrote it rather than on the
+   * multiplexer around it.
+   */
+  async waitForProcessExit(pid: number, timeoutMs = 10_000): Promise<boolean> {
+    const start = Date.now();
+    while (Date.now() - start < timeoutMs) {
+      if (!processAlive(pid)) return true;
+      await sleep(25);
+    }
+    throw new Error(
+      `Timed out waiting for process ${pid} in ${this.name} to exit after ${timeoutMs}ms.`,
+    );
+  }
+
   async waitForSessionEnd(timeoutMs = 10_000): Promise<boolean> {
     const start = Date.now();
     while (Date.now() - start < timeoutMs) {
@@ -1278,6 +1298,17 @@ function shellQuote(value: string): string {
 
 function sleep(ms: number): Promise<void> {
   return new Promise((r) => setTimeout(r, ms));
+}
+
+function processAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    // EPERM means the process exists and is owned by someone else, which still
+    // counts as alive. Only ESRCH proves it is gone.
+    return (error as { code?: string }).code === "EPERM";
+  }
 }
 
 export function tmuxAvailable(): boolean {
