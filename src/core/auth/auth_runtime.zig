@@ -974,7 +974,7 @@ pub const Runtime = struct {
         secret_store: host.SecretStore,
     ) void {
         comptime {
-            if (std.meta.fields(Self).len != 24) {
+            if (std.meta.fields(Self).len != 25) {
                 @compileError("update Runtime.initInto for the changed field set");
             }
         }
@@ -982,6 +982,7 @@ pub const Runtime = struct {
         storage.api_key_validator = validator;
         storage.oauth_transport = transport;
         storage.secret_store = secret_store;
+        storage.profile_home = null;
         storage.selected_credential = null;
         storage.credential_refresh_failure_source = null;
         storage.source_inventory = .empty;
@@ -1992,6 +1993,7 @@ test "auth in-place initialization preserves empty runtime state" {
 
     try std.testing.expect(runtime.selected_credential == null);
     try std.testing.expect(runtime.credential_refresh_failure_source == null);
+    try std.testing.expect(runtime.profile_home == null);
     try std.testing.expect(runtime.source_inventory.count() == 0);
     try std.testing.expect(runtime.stored_key_status == .not_attempted);
     try std.testing.expect(!runtime.picker_active);
