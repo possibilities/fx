@@ -41,6 +41,7 @@ const usage_report = @import("../session/usage_report.zig");
 const skill_runtime = @import("../skills/skill_runtime.zig");
 const file_index = @import("../workspace/file_index.zig");
 const command_specs = @import("../slash_commands/command_specs.zig");
+const hooks = @import("../hooks/hooks.zig");
 const types = @import("../shared/types.zig");
 const subagent_input = @import("../subagent/input_action.zig");
 const worker_runtime = @import("../agent/worker_runtime.zig");
@@ -3620,6 +3621,8 @@ const RoutingWorker = struct {
     submitted_question_answers: [2][64]u8 = undefined,
     submitted_question_answer_lens: [2]usize = .{ 0, 0 },
     submitted_question_count: usize = 0,
+    question_pending: bool = true,
+    observed_question_submission_count: usize = 0,
     cancel_requested: bool = false,
     question_source: worker_runtime.QuestionPromptSource = .agent_question,
     admission_snapshot: worker_runtime.InteractiveAdmissionSnapshot = .open,
@@ -3707,6 +3710,20 @@ const RoutingWorker = struct {
                 @memcpy(self.submitted_question_answer[0..len], answer[0..len]);
             }
         }
+    }
+
+    pub fn submitQuestionBatchAnswerObserved(
+        self: *RoutingWorker,
+        alloc: std.mem.Allocator,
+        answers: ?[]const []const u8,
+        observer: ?worker_runtime.DecisionObserver,
+    ) !worker_runtime.QuestionSubmissionResult {
+        if (!self.question_pending) return .no_pending;
+        self.question_pending = false;
+        self.observed_question_submission_count += 1;
+        if (observer) |value| value.observe_fn(value.context, 1);
+        try self.submitQuestionBatchAnswer(alloc, answers);
+        return .accepted;
     }
 
     pub fn pendingQuestionBatchSource(self: *RoutingWorker) worker_runtime.QuestionPromptSource {
@@ -3903,6 +3920,9 @@ const RoutingFakeApp = struct {
     external_editor_count: usize = 0,
     suspend_count: usize = 0,
     workspace_access: app_workspace_runtime.Access = .{},
+    attention_resolved_count: usize = 0,
+    attention_resolved_turn_id: ?u64 = null,
+    attention_resolved_kind: ?hooks.AttentionKind = null,
 
     pub fn slashRegistry(_: *const RoutingFakeApp) command_specs.SlashRegistry {
         return routing_test_slash_registry;
@@ -3957,6 +3977,18 @@ const RoutingFakeApp = struct {
 
     pub fn workspaceAccess(self: *RoutingFakeApp) *app_workspace_runtime.Access {
         return &self.workspace_access;
+    }
+
+    pub fn dispatchAttentionResolved(
+        self: *RoutingFakeApp,
+        turn_id: u64,
+        kind: hooks.AttentionKind,
+        child_session_id: ?[]const u8,
+    ) void {
+        std.debug.assert(child_session_id == null);
+        self.attention_resolved_count += 1;
+        self.attention_resolved_turn_id = turn_id;
+        self.attention_resolved_kind = kind;
     }
 
     pub fn flushBeforeBlockingExternalWork(_: *RoutingFakeApp) !void {}
@@ -11687,11 +11719,87 @@ test "route recovery question cancel stays local" {
     try input_question_runtime.QuestionRuntime(RoutingFakeApp).cancelQuestionPrompt(&app);
 
     try std.testing.expect(app.worker.question_cancelled);
+    try std.testing.expectEqual(@as(usize, 1), app.worker.observed_question_submission_count);
+    try std.testing.expectEqual(@as(usize, 1), app.attention_resolved_count);
+    try std.testing.expectEqual(@as(?u64, 1), app.attention_resolved_turn_id);
+    try std.testing.expectEqual(@as(?hooks.AttentionKind, .route_recovery), app.attention_resolved_kind);
     try std.testing.expect(!app.worker.cancel_requested_when_question_cancelled);
     try std.testing.expect(!app.worker.cancel_requested);
     try std.testing.expect(!app.question_prompt.isActive());
     try std.testing.expect(!app.stream.active);
     try std.testing.expectEqual(@as(usize, 0), countOccurrences(app.transcript.items, "Route failed. What should fx do?"));
+}
+
+test "agent and MCP question cancellation resolve accepted question attention" {
+    const alloc = std.testing.allocator;
+    const sources = [_]worker_runtime.QuestionPromptSource{
+        .agent_question,
+        .mcp_elicitation,
+    };
+
+    for (sources) |source| {
+        var app = try RoutingFakeApp.init(alloc);
+        defer app.deinit();
+        app.worker.question_source = source;
+        app.stream.active = true;
+
+        const opts = [_]types.QuestionOption{
+            .{ .label = "Stop", .description = null },
+        };
+        const entries = [_]types.QuestionBatchEntry{
+            .{ .question = "Cancel this question?", .options = &opts },
+        };
+        try app.question_prompt.syncFrom(alloc, &entries);
+
+        try input_question_runtime.QuestionRuntime(RoutingFakeApp).cancelQuestionPrompt(&app);
+
+        try std.testing.expect(app.worker.question_cancelled);
+        try std.testing.expect(app.worker.cancel_requested_when_question_cancelled);
+        try std.testing.expect(app.worker.cancel_requested);
+        try std.testing.expectEqual(@as(usize, 1), app.worker.observed_question_submission_count);
+        try std.testing.expectEqual(@as(usize, 1), app.attention_resolved_count);
+        try std.testing.expectEqual(@as(?u64, 1), app.attention_resolved_turn_id);
+        try std.testing.expectEqual(@as(?hooks.AttentionKind, .question), app.attention_resolved_kind);
+        try std.testing.expect(!app.question_prompt.isActive());
+        try std.testing.expect(!app.stream.active);
+    }
+}
+
+test "late question cancellations do not resolve attention" {
+    const alloc = std.testing.allocator;
+    const sources = [_]worker_runtime.QuestionPromptSource{
+        .agent_question,
+        .mcp_elicitation,
+        .route_recovery,
+    };
+
+    for (sources) |source| {
+        var app = try RoutingFakeApp.init(alloc);
+        defer app.deinit();
+        app.worker.question_source = source;
+        app.worker.question_pending = false;
+
+        const opts = [_]types.QuestionOption{
+            .{ .label = "Continue", .description = null },
+        };
+        const entries = [_]types.QuestionBatchEntry{
+            .{ .question = "This question is already stale.", .options = &opts },
+        };
+        try app.question_prompt.syncFrom(alloc, &entries);
+
+        try input_question_runtime.QuestionRuntime(RoutingFakeApp).cancelQuestionPrompt(&app);
+
+        try std.testing.expect(!app.worker.question_cancelled);
+        try std.testing.expectEqual(@as(usize, 0), app.worker.observed_question_submission_count);
+        try std.testing.expectEqual(@as(usize, 0), app.attention_resolved_count);
+        try std.testing.expect(app.attention_resolved_turn_id == null);
+        try std.testing.expect(app.attention_resolved_kind == null);
+        try std.testing.expectEqual(
+            source != .route_recovery,
+            app.worker.cancel_requested,
+        );
+        try std.testing.expect(!app.question_prompt.isActive());
+    }
 }
 
 test "app_input_runtime submits multi-question answers in entry order" {

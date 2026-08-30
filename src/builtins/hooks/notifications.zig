@@ -244,10 +244,10 @@ fn Runtime(comptime App: type) type {
             input: hooks.AttentionRequiredInput,
         ) hooks.HandlerError!void {
             const app: *App = @ptrCast(@alignCast(raw));
-            if (!app.notifications.enabledForScope(
-                .attention_required,
-                input.invocation.scope.kind,
-            )) return;
+            const visible_in_interactive_tui = input.invocation.scope.kind == .interactive or
+                input.presented_interactively;
+            if (!visible_in_interactive_tui or
+                !app.notifications.enabled(.attention_required)) return;
             enqueue(app, .{ .kind = .attention_required });
         }
 
