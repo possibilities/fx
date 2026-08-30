@@ -1098,7 +1098,7 @@ pub const Persistence = struct {
     /// in a static release-binary template.
     pub fn initInto(storage: *Persistence) void {
         comptime {
-            if (std.meta.fields(Persistence).len != 19) {
+            if (std.meta.fields(Persistence).len != 20) {
                 @compileError("update Persistence.initInto for the changed field set");
             }
         }
@@ -1112,6 +1112,7 @@ pub const Persistence = struct {
         storage.js_host_store = .{};
         storage.js_host_session = null;
         storage.process_model_override = null;
+        storage.process_effort_override = null;
         storage.session_picker = .{};
         storage.session_picker_load = .{};
         storage.session_picker_current_cache = .{};
@@ -1161,6 +1162,7 @@ test "persistence in-place initialization preserves empty ownership" {
     try std.testing.expect(persistence.store == null);
     try std.testing.expect(persistence.writable == null);
     try std.testing.expect(persistence.subagent_host == null);
+    try std.testing.expect(persistence.process_effort_override == null);
     try std.testing.expect(!persistence.session_picker.active);
     try std.testing.expect(persistence.session_picker_load.task == null);
     try std.testing.expect(!persistence.session_picker_current_cache.ready);
