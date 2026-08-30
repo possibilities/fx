@@ -15,6 +15,7 @@ test {
     _ = @import("core/app/input_approval_runtime.zig");
     _ = @import("core/cli/cli_surface.zig");
     _ = @import("core/config/config_runtime.zig");
+    _ = @import("core/control/work_control.zig");
     _ = @import("core/hosts/native_external_editor.zig");
     _ = @import("core/notifications/sound.zig");
     _ = @import("core/output/output_contracts.zig");

@@ -15,7 +15,8 @@ Requirements:
 - Node.js 20 or later
 - Chrome or Edge 137 or later for browser WebAssembly
 - JSPI when using the WebAssembly backend
-- A Vercel AI Gateway credential or a host-provided authenticated `fetch`
+- A Vercel AI Gateway credential, or a Codex subscription session with the
+  native Node backend
 
 The package includes:
 
@@ -40,6 +41,8 @@ Public exports:
 - `supportsJspi()` detects WebAssembly JSPI support.
 - `xtermAdapter()` connects fx to an xterm.js terminal.
 - `encodeXtermKeyEvent()` translates browser keyboard events into terminal input.
+- `fxProfileSession()` explicitly opts a native Node agent into the fx profile's
+  Codex session.
 
 ## Headless agent
 
@@ -75,6 +78,70 @@ console.log("Stopped:", await turn.stopReason);
 await session.close();
 await agent.close();
 ```
+
+### Provider authorization
+
+`auth` accepts one authorization or an ordered list. The first entry selects
+the initial provider, and a session may switch only to another provider named
+in that list:
+
+```js
+import { createFxAgent, fxProfileSession } from "libfx/node";
+
+const agent = await createFxAgent({
+  backend: "native",
+  auth: [
+    { provider: "codex", session: fxProfileSession() },
+    { provider: "gateway", apiKey: process.env.AI_GATEWAY_API_KEY },
+  ],
+});
+
+const session = await agent.createSession();
+await session.setConfig({ provider: "gateway" });
+```
+
+`env.AI_GATEWAY_API_KEY` remains shorthand for Gateway authorization. An
+explicit Gateway entry and the environment value may both be present only
+when they are identical.
+
+Codex is native-only. It never reads the fx profile implicitly. Use
+`fxProfileSession()` to opt into `~/.fx/chatgpt-auth.json`, or provide a host
+store for an application-owned OAuth session:
+
+```js
+const codexSessionStore = {
+  async load({ signal }) {
+    const snapshot = await secrets.read("codex", { signal });
+    return snapshot && {
+      bytes: snapshot.bytes,
+      revision: snapshot.revision,
+    };
+  },
+  async commit(bytes, expectedRevision, { signal }) {
+    return secrets.compareAndSwap("codex", {
+      bytes,
+      expectedRevision,
+      signal,
+    }); // { revision }
+  },
+};
+
+const agent = await createFxAgent({
+  backend: "native",
+  auth: { provider: "codex", session: codexSessionStore },
+});
+```
+
+Session bytes are opaque and may contain access and refresh tokens. `load()`
+returns `null` or `{ bytes: Uint8Array, revision: string }`; `commit()` returns
+`{ revision: string }`. A compare-and-swap conflict must throw an error whose
+`code` is `FX_CODEX_SESSION_REVISION_CONFLICT`. Operations receive an
+`AbortSignal`, time out after 30 seconds, and must not log or retain the bytes.
+If a store ignores cancellation, libfx reports the failure promptly, keeps an
+operation-owned credential copy only until that promise settles, and closes
+the timed-out native runtime so no later request can wedge behind it. Once an
+agent has selected a Codex account, a replacement snapshot for a different
+account is rejected before refresh or write-back.
 
 A prompt may be a string or an array of text and resource blocks:
 
@@ -147,9 +214,7 @@ if (!supportsJspi()) {
 }
 
 const agent = await createFxAgent({
-  env: {
-    AI_GATEWAY_API_KEY: "<short-lived credential>",
-  },
+  auth: { provider: "gateway", apiKey: "<short-lived credential>" },
 });
 
 const session = await agent.createSession();
@@ -166,6 +231,9 @@ the installed package. Pass `wasm` explicitly to provide a URL, `Response`,
 
 Do not embed a long-lived API key in public browser code. Use a short-lived
 credential or an authenticated server-side proxy.
+
+Browser and direct WebAssembly agents support Gateway authorization only and
+reject Codex authorization before instantiating WebAssembly.
 
 ## Interactive terminal
 
@@ -292,9 +360,13 @@ Hosts may provide adapters for runtime state and external effects:
 `nativeAddon` and `env.FX_GATEWAY_CHAT_URL` are trusted host configuration. Do
 not populate them from request, tenant, or other untrusted input.
 
-The native backend sends production credentials only to the canonical Vercel
-AI Gateway endpoint. Custom Gateway endpoints are limited to explicit loopback
-HTTP URLs for local development.
+The native backend sends Gateway credentials only through the host `fetch`
+boundary to the canonical Vercel AI Gateway endpoint. Custom Gateway endpoints
+are limited to explicit loopback HTTP URLs for local development. With explicit
+Codex authorization, the native provider sends the supplied ChatGPT OAuth
+credential to OpenAI's canonical ChatGPT Codex and OAuth endpoints. The host
+application is trusted with any Codex session it supplies or elects to read
+through `fxProfileSession()`.
 
 The WebAssembly runtime intentionally does not provide:
 
