@@ -30,6 +30,8 @@ const expected_names = [_][]const u8{
     "core.agent.runtime.gateway_step.test.provider-local exact usage reaches session accounting",
     "core.app.app_input_runtime.test.app_input_runtime ctrl+t invokes upgrade shortcut without composer mutation",
     "core.app.app_input_runtime.test.app_input_runtime ctrl+g invokes external editor without composer mutation",
+    "core.app.app_session_runtime.test.persistence in-place initialization preserves empty ownership",
+    "core.auth.auth_runtime.test.auth in-place initialization preserves empty runtime state",
     "core.app.app_lifecycle.test.loadStartupState lets FX_EFFORT win over the configured effort without rewriting it",
     "core.cli.cli_surface.test.global system prompt file modifiers preserve replacement and append order",
     "core.cli.cli_surface.test.state system prompts compose replacement append conflict and explicit precedence",

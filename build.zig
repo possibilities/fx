@@ -170,6 +170,8 @@ pub fn build(b: *std.Build) void {
             "detached waiter owns sound state beyond player teardown",
             "app_input_runtime ctrl+t invokes upgrade shortcut without composer mutation",
             "app_input_runtime ctrl+g invokes external editor without composer mutation",
+            "persistence in-place initialization preserves empty ownership",
+            "auth in-place initialization preserves empty runtime state",
             "pending resume projection accepts candidate row below base content through recovery",
             "provider-local exact usage reaches session accounting",
         },
