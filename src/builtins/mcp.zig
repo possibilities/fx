@@ -537,10 +537,11 @@ pub fn loadRuntime(
     alloc: Allocator,
     workspace_root: []const u8,
     elicitation_capabilities: elicitation.Capabilities,
+    profile_home: ?[]const u8,
 ) !?*mcp_runtime.McpRuntime {
     var profile: std.ArrayList(McpServerConfig) = .empty;
     defer freeConfigs(alloc, &profile);
-    if (io_mod.getenv("HOME")) |home| {
+    if (profile_home orelse io_mod.getenv("HOME")) |home| {
         const config_path = try configPathFromHome(alloc, home);
         defer alloc.free(config_path);
         profile = try loadConfigFromPath(alloc, config_path);
@@ -549,7 +550,7 @@ pub fn loadRuntime(
     var choice_load = config_runtime.loadProjectMcpChoices(alloc, workspace_root) catch |err| {
         if (err == error.OutOfMemory) return error.OutOfMemory;
         debug_trace.logf("mcp", "workspace MCP choices unavailable err={s}", .{@errorName(err)});
-        return runtimeFromConfigs(alloc, &profile, elicitation_capabilities);
+        return runtimeFromConfigs(alloc, &profile, elicitation_capabilities, profile_home);
     };
     defer choice_load.deinit(alloc);
     for (choice_load.diagnostics.items) |diagnostic| {
@@ -578,7 +579,7 @@ pub fn loadRuntime(
 
     var configs = try project_config.mergeNative(alloc, &profile, &workspace.configs);
     defer freeConfigs(alloc, &configs);
-    var runtime = try runtimeFromConfigs(alloc, &configs, elicitation_capabilities);
+    var runtime = try runtimeFromConfigs(alloc, &configs, elicitation_capabilities, profile_home);
     if (runtime == null and workspace.diagnostics.items.len > 0) {
         runtime = try alloc.create(mcp_runtime.McpRuntime);
         runtime.?.* = mcp_runtime.McpRuntime.initWithElicitation(
@@ -787,6 +788,7 @@ fn runtimeFromConfigs(
     alloc: Allocator,
     configs: *std.ArrayList(McpServerConfig),
     elicitation_capabilities: elicitation.Capabilities,
+    profile_home: ?[]const u8,
 ) !?*mcp_runtime.McpRuntime {
     if (configs.items.len == 0) return null;
 
@@ -794,6 +796,7 @@ fn runtimeFromConfigs(
     errdefer alloc.destroy(runtime);
     runtime.* = mcp_runtime.McpRuntime.initWithElicitation(alloc, elicitation_capabilities);
     errdefer runtime.deinit();
+    try runtime.setProfileHome(profile_home);
     while (configs.items.len > 0) {
         var config = configs.orderedRemove(0);
         runtime.addServer(config) catch |err| {
@@ -1303,7 +1306,7 @@ test "built-in MCP runtime returns null when HOME is missing" {
     const home = try TestHome.install(alloc, null);
     defer home.deinit();
 
-    try std.testing.expect(try loadRuntime(alloc, "/", .{}) == null);
+    try std.testing.expect(try loadRuntime(alloc, "/", .{}, null) == null);
 }
 
 test "MCP config diagnostic treats nonblocking profile states as clear" {
@@ -1362,7 +1365,7 @@ test "MCP config diagnostic preserves the startup parser error" {
         .clear, .warning => return error.TestUnexpectedResult,
         .failed => |err| try std.testing.expectEqual(error.McpConfigInvalidJson, err),
     }
-    try std.testing.expectError(error.McpConfigInvalidJson, loadRuntime(alloc, "/", .{}));
+    try std.testing.expectError(error.McpConfigInvalidJson, loadRuntime(alloc, "/", .{}, null));
 }
 
 test "MCP config diagnostic propagates allocation failure" {
@@ -1447,7 +1450,7 @@ test "workspace MCP missing environment variable is actionable and secret free" 
     const environment = try TestHome.install(alloc, home_path);
     defer environment.deinit();
 
-    const runtime = try loadRuntime(alloc, workspace_root, .{}) orelse
+    const runtime = try loadRuntime(alloc, workspace_root, .{}, null) orelse
         return error.TestUnexpectedResult;
     defer {
         runtime.deinit();
@@ -1477,7 +1480,7 @@ test "built-in MCP runtime loads disabled configured servers without spawning" {
     const home = try TestHome.install(alloc, home_path);
     defer home.deinit();
 
-    const runtime = try loadRuntime(alloc, "/", .{}) orelse return error.TestUnexpectedResult;
+    const runtime = try loadRuntime(alloc, "/", .{}, null) orelse return error.TestUnexpectedResult;
     defer {
         runtime.deinit();
         alloc.destroy(runtime);
@@ -1487,6 +1490,37 @@ test "built-in MCP runtime loads disabled configured servers without spawning" {
     try std.testing.expectEqual(@as(usize, 1), runtime.servers.items.len);
     try std.testing.expectEqual(mcp_runtime.ServerState.disabled, runtime.servers.items[0].state);
     try std.testing.expectEqualStrings("noop", runtime.servers.items[0].config.name);
+}
+
+test "built-in MCP runtime loads config from the selected profile home" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try writeTempFile(&tmp, "ambient/.fx/mcp.json",
+        \\{"mcp":{"ambient":{"type":"local","command":["false"],"enabled":false}}}
+    );
+    try writeTempFile(&tmp, "selected/.fx/mcp.json",
+        \\{"mcp":{"selected":{"type":"local","command":["false"],"enabled":false}}}
+    );
+    const ambient_home = try tmpDirPath(alloc, tmp.dir, "ambient");
+    defer alloc.free(ambient_home);
+    const selected_home = try tmpDirPath(alloc, tmp.dir, "selected");
+    defer alloc.free(selected_home);
+
+    const home = try TestHome.install(alloc, ambient_home);
+    defer home.deinit();
+
+    const runtime = try loadRuntime(alloc, "/", .{}, selected_home) orelse
+        return error.TestUnexpectedResult;
+    defer {
+        runtime.deinit();
+        alloc.destroy(runtime);
+    }
+
+    try std.testing.expectEqualStrings(selected_home, runtime.profile_home.?);
+    try std.testing.expectEqual(@as(usize, 1), runtime.servers.items.len);
+    try std.testing.expectEqualStrings("selected", runtime.servers.items[0].config.name);
 }
 
 test "built-in MCP runtime loading leaves enabled servers disconnected" {
@@ -1503,7 +1537,7 @@ test "built-in MCP runtime loading leaves enabled servers disconnected" {
     const home = try TestHome.install(alloc, home_path);
     defer home.deinit();
 
-    const runtime = try loadRuntime(alloc, "/", .{}) orelse return error.TestUnexpectedResult;
+    const runtime = try loadRuntime(alloc, "/", .{}, null) orelse return error.TestUnexpectedResult;
     defer {
         runtime.deinit();
         alloc.destroy(runtime);
@@ -1526,7 +1560,7 @@ test "built-in MCP runtime config transfer cleans its unvisited suffix on append
     );
     try std.testing.expectError(
         error.OutOfMemory,
-        runtimeFromConfigs(failing.allocator(), &configs, .{}),
+        runtimeFromConfigs(failing.allocator(), &configs, .{}, null),
     );
     try std.testing.expectEqual(@as(usize, 1), configs.items.len);
     try std.testing.expectEqualStrings("second", configs.items[0].name);
@@ -1574,7 +1608,7 @@ test "built-in MCP runtime reserves active registry names" {
     const home = try TestHome.install(alloc, home_path);
     defer home.deinit();
 
-    const runtime = try loadRuntime(alloc, "/", .{}) orelse return error.TestUnexpectedResult;
+    const runtime = try loadRuntime(alloc, "/", .{}, null) orelse return error.TestUnexpectedResult;
     defer {
         runtime.deinit();
         alloc.destroy(runtime);

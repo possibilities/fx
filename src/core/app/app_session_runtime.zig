@@ -14,6 +14,7 @@ const host_target = @import("../hosts/target.zig");
 const diff = @import("../output/diff.zig");
 const diagnostics = @import("../workspace/diagnostics.zig");
 const app_lifecycle = @import("app_lifecycle.zig");
+const app_profile_runtime = @import("app_profile_runtime.zig");
 const provider_runtime = @import("provider_runtime.zig");
 const input_completion_runtime = @import("input_completion_runtime.zig");
 const input_queue_runtime = @import("input_queue_runtime.zig");
@@ -1374,10 +1375,13 @@ pub fn Runtime(comptime App: type) type {
             required: bool,
         ) !void {
             if (comptime !runtime_profile.allows(App, .durable_sessions)) return;
-            var store = session_store.Store.init(
-                app.alloc,
-                app.workspace_root,
-            ) catch |err| {
+            var store = (if (comptime @hasField(App, "profile_home"))
+                if (app.profile_home) |home_dir|
+                    session_store.Store.initFromHome(app.alloc, home_dir, app.workspace_root)
+                else
+                    session_store.Store.init(app.alloc, app.workspace_root)
+            else
+                session_store.Store.init(app.alloc, app.workspace_root)) catch |err| {
                 if (required) return err;
                 return;
             };
@@ -2797,8 +2801,8 @@ pub fn Runtime(comptime App: type) type {
                 result.session_error = err;
             };
 
-            var settings_attempt = config_runtime.attemptUserPreferences(
-                app.alloc,
+            var settings_attempt = app_profile_runtime.attemptUserPreferences(
+                app,
                 patch.userSettingsPatch(),
             );
             switch (settings_attempt) {

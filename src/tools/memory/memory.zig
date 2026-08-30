@@ -75,7 +75,7 @@ pub fn validate(ctx: tool_dispatch.DispatchContext, erased: tool_dispatch.ToolIn
 
 pub fn call(ctx: tool_dispatch.DispatchContext, erased: tool_dispatch.ToolInput) tool_dispatch.DispatchError!tool_dispatch.ToolResult {
     const input = erased.as(Input);
-    const output = runMemory(ctx.allocator, input.action, input.fact) catch |err| switch (err) {
+    const output = runMemoryAtHome(ctx.allocator, ctx.profile_home orelse io_mod.getenv("HOME"), input.action, input.fact) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         error.MemoryStoreMalformed => return .{ .failure = try ctx.allocator.dupe(
             u8,
@@ -106,9 +106,13 @@ pub fn execute(arena: Allocator, args_json: []const u8) ![]u8 {
 }
 
 fn runMemory(alloc: Allocator, action: []const u8, fact: ?[]const u8) ![]u8 {
+    return runMemoryAtHome(alloc, io_mod.getenv("HOME"), action, fact);
+}
+
+fn runMemoryAtHome(alloc: Allocator, maybe_home: ?[]const u8, action: []const u8, fact: ?[]const u8) ![]u8 {
     if (!isSupportedAction(action)) return error.UnsupportedMemoryAction;
 
-    const home = io_mod.getenv("HOME") orelse return std.fmt.allocPrint(alloc, "memory unavailable: HOME not set", .{});
+    const home = maybe_home orelse return std.fmt.allocPrint(alloc, "memory unavailable: HOME not set", .{});
     const memories_path = try profile_paths.memoriesPath(alloc, home);
     defer alloc.free(memories_path);
 
@@ -288,6 +292,28 @@ fn setTestHome(home: ?[]const u8) !void {
     map.* = std.process.Environ.Map.init(std.heap.c_allocator);
     if (home) |value| try map.put("HOME", value);
     io_mod.setEnvironMap(map);
+}
+
+test "selected profile state keeps memories in its root" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "state-a");
+    try tmp.dir.createDirPath(std.testing.io, "state-b");
+    const home_a = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "state-a");
+    defer alloc.free(home_a);
+    const home_b = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "state-b");
+    defer alloc.free(home_b);
+
+    const saved = try runMemoryAtHome(alloc, home_a, "save", "isolated fact");
+    defer alloc.free(saved);
+    try std.testing.expectEqualStrings("remembered", saved);
+    const selected = try runMemoryAtHome(alloc, home_a, "list", null);
+    defer alloc.free(selected);
+    try std.testing.expectEqualStrings("- isolated fact\n", selected);
+    const other = try runMemoryAtHome(alloc, home_b, "list", null);
+    defer alloc.free(other);
+    try std.testing.expectEqualStrings("No saved memories", other);
 }
 
 test "memory owner rejects invalid JSON and action shape" {

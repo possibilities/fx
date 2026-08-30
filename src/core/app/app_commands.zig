@@ -1,6 +1,7 @@
 const std = @import("std");
 const runtime_profile = @import("../hosts/runtime_profile.zig");
 const app_permission_runtime = @import("app_permission_runtime.zig");
+const app_profile_runtime = @import("app_profile_runtime.zig");
 const app_session_runtime = @import("app_session_runtime.zig");
 const io_mod = @import("../shared/io.zig");
 const auth_runtime = @import("../auth/auth_runtime.zig");
@@ -166,7 +167,7 @@ fn persistUserPreferences(
     patch: config_runtime.UserSettingsPatch,
     runtime_changed: bool,
 ) !void {
-    var attempt = config_runtime.attemptUserPreferences(app.alloc, patch);
+    var attempt = app_profile_runtime.attemptUserPreferences(app, patch);
     defer attempt.deinit(app.alloc);
     switch (attempt) {
         .failure => |failure| try session_commands.reportUserSettingsFailure(
@@ -264,13 +265,23 @@ fn handleWorkspaceCommand(app: anytype, rest: []const u8) !void {
     defer app.worker.releaseTurnStartHold();
 
     var failure_phase: workspace_commands.FailurePhase = .stage;
-    var result = workspace_commands.execute(
-        app.alloc,
-        app.workspace_root,
-        app.workspaceAccess(),
-        action,
-        &failure_phase,
-    ) catch |err| {
+    var result = (if (app_profile_runtime.explicitHome(app)) |profile_home|
+        workspace_commands.executeFromHome(
+            app.alloc,
+            profile_home,
+            app.workspace_root,
+            app.workspaceAccess(),
+            action,
+            &failure_phase,
+        )
+    else
+        workspace_commands.execute(
+            app.alloc,
+            app.workspace_root,
+            app.workspaceAccess(),
+            action,
+            &failure_phase,
+        )) catch |err| {
         const reason = output_contracts.workspaceErrorMessage(err) orelse "workspace update failed";
         const prefix: []const u8 = switch (failure_phase) {
             .stage => "Workspace update rejected",
@@ -1215,7 +1226,7 @@ pub fn Handlers(comptime App: type) type {
             if (scope == .session) {
                 return app.session.usage.reportSnapshot(app.alloc);
             }
-            const home = io_mod.getenv("HOME") orelse return error.HomeNotSet;
+            const home = app_profile_runtime.home(app) orelse return error.HomeNotSet;
             const availability = try app.session.ensureProfileUsageReadable(
                 app.alloc,
                 home,
@@ -1316,7 +1327,7 @@ pub fn Handlers(comptime App: type) type {
                 return;
             }
             const result = try app.mcpCommandProvider().handle(app.alloc, rest, .{
-                .home = io_mod.getenv("HOME"),
+                .home = app_profile_runtime.home(app),
                 .list_ctx = @ptrCast(app),
                 .summarize_servers = summarizeMcpServers,
                 .list_servers_and_tools = listMcpServersAndTools,
@@ -1912,7 +1923,7 @@ pub fn Handlers(comptime App: type) type {
         fn commandHandleSettings(ctx: *anyopaque, rest: []const u8) !void {
             const app: *App = @ptrCast(@alignCast(ctx));
             if (std.mem.trim(u8, rest, " \t").len == 0) {
-                var settings = config_runtime.loadMergedSettings(app.alloc, app.workspace_root) catch {
+                var settings = app_profile_runtime.loadMergedSettings(app) catch {
                     try session_commands.Commands(App).handleSettings(app, rest);
                     return;
                 };
@@ -3432,7 +3443,7 @@ fn handleNotificationsCommand(app: anytype, rest: []const u8) !void {
         .notification_attention_required = sound_on,
         .notification_max = max,
     };
-    var attempt = config_runtime.attemptUserPreferences(app.alloc, patch);
+    var attempt = app_profile_runtime.attemptUserPreferences(app, patch);
     defer attempt.deinit(app.alloc);
     switch (attempt) {
         .failure => |failure| try session_commands.reportUserSettingsFailure(
@@ -3519,7 +3530,7 @@ fn persistUserPreferencesSilently(
     patch: config_runtime.UserSettingsPatch,
     runtime_changed: bool,
 ) !void {
-    var attempt = config_runtime.attemptUserPreferences(app.alloc, patch);
+    var attempt = app_profile_runtime.attemptUserPreferences(app, patch);
     defer attempt.deinit(app.alloc);
     switch (attempt) {
         .failure => |failure| try session_commands.reportUserSettingsFailure(
@@ -3600,7 +3611,7 @@ pub fn applySettingsCatalogChange(app: anytype, change: settings_catalog.Change)
                 app,
                 if (enabled) "startup-scrollback on" else "startup-scrollback off",
             );
-            var settings = config_runtime.loadMergedSettings(app.alloc, app.workspace_root) catch return;
+            var settings = app_profile_runtime.loadMergedSettings(app) catch return;
             defer settings.deinit(app.alloc);
             app.input_runtime.settings_menu.startup_scrollback = settings.startup_scrollback orelse true;
         },

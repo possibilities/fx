@@ -327,9 +327,10 @@ pub fn loadVisibleSkills(
     skills_dir: []const u8,
     root_policy: skill_contract.RootPolicy,
 ) !SkillDiscovery {
-    return loadVisibleSkillsWithInvocationRoots(
+    return loadVisibleSkillsWithHomes(
         alloc,
         workspace_root,
+        home,
         home,
         skills_dir,
         root_policy.invocation_roots,
@@ -341,6 +342,26 @@ pub fn loadVisibleSkillsWithInvocationRoots(
     alloc: Allocator,
     workspace_root: ?[]const u8,
     home: ?[]const u8,
+    skills_dir: []const u8,
+    invocation_skill_roots: []const []const u8,
+    root_policy: skill_contract.RootPolicy,
+) !SkillDiscovery {
+    return loadVisibleSkillsWithHomes(
+        alloc,
+        workspace_root,
+        home,
+        home,
+        skills_dir,
+        invocation_skill_roots,
+        root_policy,
+    );
+}
+
+pub fn loadVisibleSkillsWithHomes(
+    alloc: Allocator,
+    workspace_root: ?[]const u8,
+    workspace_home: ?[]const u8,
+    profile_home: ?[]const u8,
     skills_dir: []const u8,
     invocation_skill_roots: []const []const u8,
     root_policy: skill_contract.RootPolicy,
@@ -370,7 +391,7 @@ pub fn loadVisibleSkillsWithInvocationRoots(
 
     if (!root_policy.exclusive_invocation_roots) {
         if (workspace_root) |root| {
-            try appendWorkspaceRoots(alloc, &roots, root, home, root_policy.workspace_roots);
+            try appendWorkspaceRoots(alloc, &roots, root, workspace_home, root_policy.workspace_roots);
         }
 
         if (skills_dir.len > 0) {
@@ -379,7 +400,7 @@ pub fn loadVisibleSkillsWithInvocationRoots(
             }
         }
 
-        if (home) |home_root| {
+        if (profile_home) |home_root| {
             for (root_policy.global_roots) |spec| {
                 try appendSpecRoot(alloc, &roots, home_root, spec);
             }
@@ -418,6 +439,10 @@ fn appendWorkspaceRoots(
     home: ?[]const u8,
     root_specs: []const skill_contract.RootSpec,
 ) !void {
+    const scan_ancestors = if (home) |home_root|
+        pathing.pathInside(home_root, workspace_root)
+    else
+        false;
     var current: ?[]const u8 = workspace_root;
     while (current) |dir| : (current = std.fs.path.dirname(dir)) {
         if (home) |home_root| {
@@ -427,6 +452,7 @@ fn appendWorkspaceRoots(
         for (root_specs) |spec| {
             try appendSpecRoot(alloc, roots, dir, spec);
         }
+        if (!scan_ancestors) break;
     }
 }
 

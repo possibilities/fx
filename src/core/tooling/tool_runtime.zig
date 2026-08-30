@@ -149,6 +149,8 @@ pub const EditedPathObserver = struct {
 
 pub const Context = struct {
     workspace_root: []const u8,
+    /// Fx-owned profile paths use this root without changing subprocess HOME.
+    profile_home: ?[]const u8 = null,
     access_scope: ?workspace_access.AccessScope = null,
     ignored_list_entries: []const []const u8,
     max_list_entries: usize,
@@ -1446,6 +1448,7 @@ fn typedDispatchContext(ctx: Context, arena: Allocator) tool_dispatch.DispatchCo
         .allocator = arena,
         .permission_mode = ctx.permission_mode,
         .workspace_root = ctx.workspace_root,
+        .profile_home = ctx.profile_home,
         .access_scope = ctx.access_scope,
         .change_tracker = ctx.tracker,
         .skills_dir = ctx.skills_dir,

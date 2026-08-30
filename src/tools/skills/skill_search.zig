@@ -79,6 +79,7 @@ pub fn search(
         ctx.skills_dir,
         ctx.invocation_skill_roots,
         ctx.skill_root_policy orelse builtin_skills.root_policy,
+        ctx.profile_home,
     );
     defer discovery.deinit(ctx.allocator);
     skill_runtime.traceDiagnostics("skill_search", discovery.diagnostics);
