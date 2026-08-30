@@ -42,6 +42,10 @@ const test_builtin_gateway = if (builtin.is_test)
     @import("../../builtins/gateway.zig")
 else
     struct {};
+const test_builtin_tools = if (builtin.is_test)
+    @import("../../builtins/tools.zig")
+else
+    struct {};
 const context_contract = @import("../workspace/context_contract.zig");
 const mode_registry = @import("../modes/mode_registry.zig");
 const mcp_contract = @import("../mcp/mcp_contract.zig");
@@ -52,6 +56,7 @@ const mcp_runtime = @import("../mcp/mcp_runtime.zig");
 const text_utils = @import("../shared/text_utils.zig");
 const profile_paths = @import("../shared/profile_paths.zig");
 const tool_set_contract = @import("../tooling/tool_set.zig");
+const tool_selection = @import("../tooling/tool_selection.zig");
 const workspace_access = @import("../workspace/workspace_access.zig");
 const workspace_commands = @import("../workspace/workspace_commands.zig");
 const usage_cli_runtime = @import("usage_cli_runtime.zig");
@@ -123,6 +128,7 @@ pub const LaunchModifiers = struct {
     prompt_files: system_prompt_files.Request = .{},
     effective_system_prompt: ?[]u8 = null,
     allow_native_tools: bool = true,
+    selected_native_tools: [][]u8 = &.{},
 
     pub fn deinit(self: *LaunchModifiers, alloc: Allocator) void {
         if (self.context_limit_overrides.len > 0) alloc.free(self.context_limit_overrides);
@@ -132,6 +138,8 @@ pub const LaunchModifiers = struct {
         if (self.invocation_skill_roots.len > 0) alloc.free(self.invocation_skill_roots);
         self.prompt_files.deinit(alloc);
         if (self.effective_system_prompt) |prompt| alloc.free(prompt);
+        for (self.selected_native_tools) |name| alloc.free(name);
+        if (self.selected_native_tools.len > 0) alloc.free(self.selected_native_tools);
         self.* = .{};
     }
 
@@ -157,6 +165,10 @@ pub const LaunchModifiers = struct {
         const prompt = self.effective_system_prompt;
         self.effective_system_prompt = null;
         return prompt;
+    }
+
+    pub fn hasNativeToolSelection(self: LaunchModifiers) bool {
+        return self.selected_native_tools.len > 0;
     }
 };
 
@@ -231,6 +243,7 @@ pub const Config = struct {
     context_registry: context_contract.Registry,
     mode_registry: mode_registry.Registry,
     tool_set: tool_set_contract.ToolSet,
+    tool_selection_catalog: tool_selection.Catalog = .{},
     inspect_mcp_profile_config: mcp_contract.InspectProfileConfigFn,
     inspect_mcp_local_config: mcp_health.InspectLocalConfigFn =
         mcp_health.inspectLocalConfigUnavailable,
@@ -437,6 +450,11 @@ fn parseGlobalLaunchArgs(
         append_paths.deinit(alloc);
     }
     var allow_native_tools = true;
+    var selected_native_tools: std.ArrayList([]u8) = .empty;
+    errdefer {
+        for (selected_native_tools.items) |name| alloc.free(name);
+        selected_native_tools.deinit(alloc);
+    }
 
     var index: usize = 0;
     while (index < args.len) {
@@ -487,10 +505,30 @@ fn parseGlobalLaunchArgs(
         } else if (std.mem.eql(u8, arg, "--no-native-tools")) {
             if (!allow_native_tools) return error.DuplicateNativeToolSuppression;
             allow_native_tools = false;
+        } else if (std.mem.eql(u8, arg, "--tool")) {
+            index += 1;
+            if (index >= args.len or args[index].len == 0) return error.MissingNativeToolSelection;
+            const name = try alloc.dupe(u8, args[index]);
+            selected_native_tools.append(alloc, name) catch |err| {
+                alloc.free(name);
+                return err;
+            };
+        } else if (std.mem.startsWith(u8, arg, "--tool=")) {
+            const value = arg["--tool=".len..];
+            if (value.len == 0) return error.MissingNativeToolSelection;
+            const name = try alloc.dupe(u8, value);
+            selected_native_tools.append(alloc, name) catch |err| {
+                alloc.free(name);
+                return err;
+            };
         } else {
             break;
         }
         index += 1;
+    }
+
+    if (!allow_native_tools and selected_native_tools.items.len > 0) {
+        return error.ConflictingNativeToolSelection;
     }
 
     const override_slice = try overrides.toOwnedSlice(alloc);
@@ -506,6 +544,11 @@ fn parseGlobalLaunchArgs(
         if (skill_root_slice.len > 0) alloc.free(skill_root_slice);
     }
     const append_slice = try append_paths.toOwnedSlice(alloc);
+    errdefer {
+        for (append_slice) |path| alloc.free(path);
+        if (append_slice.len > 0) alloc.free(append_slice);
+    }
+    const selected_tool_slice = try selected_native_tools.toOwnedSlice(alloc);
     return .{
         .remaining = args[index..],
         .modifiers = .{
@@ -518,6 +561,7 @@ fn parseGlobalLaunchArgs(
                 .append_paths = append_slice,
             },
             .allow_native_tools = allow_native_tools,
+            .selected_native_tools = selected_tool_slice,
         },
     };
 }
@@ -536,7 +580,8 @@ pub fn argsAfterGlobalLaunchArgs(args: []const [:0]const u8) []const [:0]const u
         const arg = args[index];
         if (std.mem.eql(u8, arg, "--context-limit") or std.mem.eql(u8, arg, "--add-dir") or
             std.mem.eql(u8, arg, "--skills-dir") or std.mem.eql(u8, arg, "--system-prompt-file") or
-            std.mem.eql(u8, arg, "--append-system-prompt-file"))
+            std.mem.eql(u8, arg, "--append-system-prompt-file") or
+            std.mem.eql(u8, arg, "--tool"))
         {
             index += 1;
             if (index >= args.len) return &.{};
@@ -545,6 +590,7 @@ pub fn argsAfterGlobalLaunchArgs(args: []const [:0]const u8) []const [:0]const u
             !std.mem.startsWith(u8, arg, "--skills-dir=") and
             !std.mem.startsWith(u8, arg, "--system-prompt-file=") and
             !std.mem.startsWith(u8, arg, "--append-system-prompt-file=") and
+            !std.mem.startsWith(u8, arg, "--tool=") and
             !std.mem.eql(u8, arg, "--no-additional-dirs") and
             !std.mem.eql(u8, arg, "--no-native-tools"))
         {
@@ -571,13 +617,14 @@ pub fn systemPromptFilesRequested(args: []const [:0]const u8) bool {
             return true;
         }
         if (std.mem.eql(u8, arg, "--context-limit") or std.mem.eql(u8, arg, "--add-dir") or
-            std.mem.eql(u8, arg, "--skills-dir"))
+            std.mem.eql(u8, arg, "--skills-dir") or std.mem.eql(u8, arg, "--tool"))
         {
             index += 1;
             if (index >= args.len) return false;
         } else if (!std.mem.startsWith(u8, arg, "--context-limit=") and
             !std.mem.startsWith(u8, arg, "--add-dir=") and
             !std.mem.startsWith(u8, arg, "--skills-dir=") and
+            !std.mem.startsWith(u8, arg, "--tool=") and
             !std.mem.eql(u8, arg, "--no-additional-dirs") and
             !std.mem.eql(u8, arg, "--no-native-tools"))
         {
@@ -971,7 +1018,7 @@ fn runIfRequestedWithDeps(alloc: Allocator, args: []const [:0]const u8, cfg: Con
         } else {
             try writer.writer.print("fx: invalid global launch option: {s}\n", .{@errorName(err)});
         }
-        try writer.writer.writeAll("usage: fx [--skills-dir PATH]... [--system-prompt-file PATH] [--append-system-prompt-file PATH]... [--context-limit NAME=BYTES|off] [--add-dir PATH]... [--no-additional-dirs] [--no-native-tools] <command>\n");
+        try writer.writer.writeAll("usage: fx [--skills-dir PATH]... [--system-prompt-file PATH] [--append-system-prompt-file PATH]... [--context-limit NAME=BYTES|off] [--add-dir PATH]... [--no-additional-dirs] [--no-native-tools | --tool NAME]... <command>\n");
         try writeStderr(deps, writer.written());
         return .handled_failure;
     };
@@ -982,6 +1029,11 @@ fn runIfRequestedWithDeps(alloc: Allocator, args: []const [:0]const u8, cfg: Con
                 return .handled_failure;
             }
             if (!try prepareSystemPromptFiles(alloc, &launch.modifiers, cfg.prompt_policy.system_prompt, deps)) {
+                launch.deinit(alloc);
+                return .handled_failure;
+            }
+            if (tool_selection.validate(cfg.tool_selection_catalog, launch.modifiers.selected_native_tools)) |issue| {
+                try writeNativeToolSelectionIssue(alloc, deps, issue);
                 launch.deinit(alloc);
                 return .handled_failure;
             }
@@ -1016,6 +1068,10 @@ fn runIfRequestedWithDeps(alloc: Allocator, args: []const [:0]const u8, cfg: Con
         .noninteractive => |value| {
             var noninteractive = value;
             defer noninteractive.deinit(alloc);
+            if (tool_selection.validate(cfg.tool_selection_catalog, noninteractive.global_args.modifiers.selected_native_tools)) |issue| {
+                try writeNativeToolSelectionIssue(alloc, deps, issue);
+                return .handled_failure;
+            }
             return runNonInteractiveWithDeps(alloc, &noninteractive, cfg, deps);
         },
     }
@@ -1050,6 +1106,12 @@ fn runNonInteractiveWithDeps(
         !commandSupportsNativeToolModifier(parsed_command))
     {
         try writeNativeToolModifierUsage(deps);
+        return .handled_failure;
+    }
+    if (global_args.modifiers.hasNativeToolSelection() and
+        !commandSupportsNativeToolModifier(parsed_command))
+    {
+        try writeNativeToolSelectionUsage(deps);
         return .handled_failure;
     }
 
@@ -1101,6 +1163,12 @@ fn runNonInteractiveWithDeps(
                 try writeStderr(deps, "usage: fx acp [--model <id>] [--effort <name>] [--log-file <path>] [--no-acp-mcp]\n");
                 return .handled_failure;
             };
+            var selected_tools = try tool_selection.resolve(
+                alloc,
+                cfg.tool_selection_catalog,
+                global_args.modifiers.selected_native_tools,
+            );
+            defer selected_tools.deinit(alloc);
             try cfg.acp_runner.run(alloc, .{
                 .default_model = cfg.default_model,
                 .default_agent_step_limit = cfg.default_agent_step_limit,
@@ -1131,6 +1199,7 @@ fn runNonInteractiveWithDeps(
                 .log_file = acp_opts.log_file,
                 .allow_acp_mcp = acp_opts.allow_acp_mcp,
                 .allow_native_tools = global_args.modifiers.allow_native_tools,
+                .native_tool_set = selected_tools.tool_set,
             });
             return .handled_success;
         },
@@ -3808,6 +3877,31 @@ fn writeNativeToolModifierUsage(deps: RunDeps) !void {
     );
 }
 
+fn writeNativeToolSelectionUsage(deps: RunDeps) !void {
+    try writeStderr(
+        deps,
+        "fx: --tool is only supported for interactive, resume, and ACP launches\n",
+    );
+}
+
+fn writeNativeToolSelectionIssue(
+    alloc: Allocator,
+    deps: RunDeps,
+    issue: tool_selection.Issue,
+) !void {
+    var writer: std.Io.Writer.Allocating = .init(alloc);
+    defer writer.deinit();
+    switch (issue) {
+        .unknown => |name| try writer.writer.print("fx: unknown native tool selection: {s}\n", .{name}),
+        .duplicate => |name| try writer.writer.print("fx: native tool may only be selected once: {s}\n", .{name}),
+        .conflict => |conflict| try writer.writer.print(
+            "fx: conflicting native tool selections: {s} and {s}\n",
+            .{ conflict.first, conflict.second },
+        ),
+    }
+    try writeStderr(deps, writer.written());
+}
+
 fn globalLaunchErrorMessage(err: anyerror) ?[]const u8 {
     return switch (err) {
         error.MissingAddDirectoryValue => "--add-dir requires a directory path",
@@ -3817,6 +3911,8 @@ fn globalLaunchErrorMessage(err: anyerror) ?[]const u8 {
         error.DuplicateSystemPromptFile => "--system-prompt-file may only be specified once",
         error.MissingAppendSystemPromptFileValue => "--append-system-prompt-file requires a file path",
         error.DuplicateNativeToolSuppression => "--no-native-tools may only be specified once",
+        error.MissingNativeToolSelection => "--tool requires a native tool name",
+        error.ConflictingNativeToolSelection => "--tool cannot be combined with --no-native-tools",
         else => null,
     };
 }
@@ -4570,6 +4666,39 @@ test "global system prompt file modifiers reject missing and duplicate replaceme
     );
 }
 
+test "global native tool selections preserve order and fail closed when malformed" {
+    var parsed = try parseGlobalLaunchArgs(std.testing.allocator, &.{
+        @constCast("--tool"),
+        @constCast("terminal:exec"),
+        @constCast("--tool=read_file"),
+        @constCast("acp"),
+    });
+    defer parsed.deinit(std.testing.allocator);
+
+    try std.testing.expect(parsed.modifiers.allow_native_tools);
+    try std.testing.expectEqual(@as(usize, 2), parsed.modifiers.selected_native_tools.len);
+    try std.testing.expectEqualStrings("terminal:exec", parsed.modifiers.selected_native_tools[0]);
+    try std.testing.expectEqualStrings("read_file", parsed.modifiers.selected_native_tools[1]);
+    try std.testing.expectEqualStrings("acp", parsed.remaining[0]);
+
+    try std.testing.expectError(
+        error.MissingNativeToolSelection,
+        parseGlobalLaunchArgs(std.testing.allocator, &.{@constCast("--tool")}),
+    );
+    try std.testing.expectError(
+        error.MissingNativeToolSelection,
+        parseGlobalLaunchArgs(std.testing.allocator, &.{@constCast("--tool=")}),
+    );
+    try std.testing.expectError(
+        error.ConflictingNativeToolSelection,
+        parseGlobalLaunchArgs(std.testing.allocator, &.{
+            @constCast("--tool"),
+            @constCast("read_file"),
+            @constCast("--no-native-tools"),
+        }),
+    );
+}
+
 test "global launch parsing releases every owned value across allocation failures" {
     const backing = std.testing.allocator;
     const args = [_][:0]const u8{
@@ -4681,6 +4810,24 @@ test "ask system prompt conflict is fatal before file access" {
     try std.testing.expectEqualStrings(
         "fx ask: --system cannot be combined with --system-prompt-file or --append-system-prompt-file\n",
         capture.stderr.written(),
+    );
+}
+
+fn checkNativeToolSelectionParseAllocationFailures(alloc: Allocator) !void {
+    var parsed = try parseGlobalLaunchArgs(alloc, &.{
+        @constCast("--tool"),
+        @constCast("terminal:exec"),
+        @constCast("--tool=read_file"),
+        @constCast("acp"),
+    });
+    parsed.deinit(alloc);
+}
+
+test "global native tool selection parsing is allocation safe" {
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        checkNativeToolSelectionParseAllocationFailures,
+        .{},
     );
 }
 
@@ -4841,6 +4988,46 @@ test "ACP runner errors preserve their identity" {
         error.TestAcpRunnerFailed,
         runIfRequested(std.testing.allocator, &.{@constCast("acp")}, cfg),
     );
+}
+
+test "ACP command resolves selected native tools in invocation order" {
+    const Capture = struct {
+        calls: usize = 0,
+        selected_matches: bool = false,
+
+        fn run(raw: ?*anyopaque, _: Allocator, cfg: acp_runner.Config) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.calls += 1;
+            const selected = cfg.native_tool_set orelse return;
+            self.selected_matches =
+                selected.order.len == 2 and
+                std.mem.eql(u8, selected.order[0], "terminal") and
+                std.mem.eql(u8, selected.order[1], "read_file") and
+                std.mem.eql(
+                    u8,
+                    selected.registry.lookup("terminal").?.description,
+                    test_builtin_tools.terminalExecOnlySpec().description,
+                );
+        }
+    };
+
+    var capture = Capture{};
+    var cfg = testConfig();
+    cfg.acp_runner = .{ .context = &capture, .run_fn = Capture.run };
+    const result = try runIfRequested(
+        std.testing.allocator,
+        &.{
+            @constCast("--tool"),
+            @constCast("terminal:exec"),
+            @constCast("--tool=read_file"),
+            @constCast("acp"),
+        },
+        cfg,
+    );
+
+    try std.testing.expectEqual(RunResult.handled_success, result);
+    try std.testing.expectEqual(@as(usize, 1), capture.calls);
+    try std.testing.expect(capture.selected_matches);
 }
 
 test "parse local surface args accepts only json" {
@@ -6489,6 +6676,12 @@ fn unexpectedAcpRunForTest(_: ?*anyopaque, _: Allocator, _: acp_runner.Config) a
 }
 
 fn testConfig() Config {
+    const selection_aliases = struct {
+        const values = [_]tool_selection.Alias{.{
+            .token = "terminal:exec",
+            .tool = test_builtin_tools.terminalExecOnlySpec(),
+        }};
+    }.values;
     return .{
         .version = "0.0.0",
         .command_catalog = testCommandCatalog(),
@@ -6516,10 +6709,10 @@ fn testConfig() Config {
         .inspect_mcp_profile_config = clearMcpConfigInspectionForTest,
         .load_mcp_runtime = noMcpRuntimeForTest,
         .acp_runner = .{ .run_fn = unexpectedAcpRunForTest },
-        .tool_set = .{
-            .registry = .{ .tools = &.{} },
-            .order = &.{},
-            .read_only_tool_names = &.{},
+        .tool_set = test_builtin_tools.advertisement_set,
+        .tool_selection_catalog = .{
+            .default_set = test_builtin_tools.advertisement_set,
+            .aliases = &selection_aliases,
         },
     };
 }

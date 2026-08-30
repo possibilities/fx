@@ -166,8 +166,10 @@ fx builds as a native binary or WebAssembly. Applications embedding fx can provi
 | `createFxTerminal()` | Embed the interactive terminal with `fx-term.wasm`. |
 
 Interactive TUI and ACP launches can disable Fx-native tools with the global
-`--no-native-tools` option. ACP can independently reject client-supplied MCP
-servers with `fx acp --no-acp-mcp`.
+`--no-native-tools` option, or select an ordered allowlist with repeatable
+`--tool <name>`. The `terminal:exec` selection exposes only one-shot terminal
+commands, without interactive terminal-session actions. ACP can independently
+reject client-supplied MCP servers with `fx acp --no-acp-mcp`.
 
 The WebAssembly SDK is experimental. See the [WebAssembly SDK](sdk/README.md) and [ACP documentation](https://fx.sh/docs/using-fx/acp).
 

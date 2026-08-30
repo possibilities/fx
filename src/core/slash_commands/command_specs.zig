@@ -1600,6 +1600,7 @@ test "rendered top-level help is a complete CLI navigation page" {
     try std.testing.expect(std.mem.find(u8, text, "Set name=bytes|off; repeatable") != null);
     try std.testing.expect(std.mem.find(u8, text, "--add-dir <path>") != null);
     try std.testing.expect(std.mem.find(u8, text, "--no-native-tools") != null);
+    try std.testing.expect(std.mem.find(u8, text, "--tool <name>") != null);
     try std.testing.expect(std.mem.find(u8, text, "-c, --continue") != null);
     try std.testing.expect(std.mem.find(u8, text, "-r") != null);
     try std.testing.expect(std.mem.find(u8, text, "-c, -r, --continue") == null);
@@ -1659,6 +1660,7 @@ test "top-level help renders flags as compact aligned rows" {
     try std.testing.expect(lineContainsBoth(wide, "--context-limit <spec>", "Set name=bytes|off; repeatable"));
     try std.testing.expect(lineContainsBoth(wide, "--add-dir <path>", "Add a workspace directory; repeatable"));
     try std.testing.expect(lineContainsBoth(wide, "--no-native-tools", "Disable native tools for TUI or ACP"));
+    try std.testing.expect(lineContainsBoth(wide, "--tool <name>", "Allow only this native tool; repeatable"));
     try std.testing.expect(lineContainsBoth(wide, "-c, --continue", "Resume the latest workspace session"));
     try std.testing.expect(lineContainsBoth(wide, "-r", "Open the saved-session picker"));
     try std.testing.expect(lineContainsBoth(wide, "--resume [last|<id>]", "Resume the latest workspace session or an exact ID"));
