@@ -217,6 +217,7 @@ fn unavailableCliDispatch(_: ?*anyopaque, _: Allocator, _: []const [:0]const u8,
 
 fn runInteractiveWithDeps(comptime App: type, comptime cooperative: bool, alloc: Allocator, launch: *cli_surface.InteractiveLaunch, deps: RunDeps) !RunOutcome {
     const resume_requested = launch.requested_resume != null;
+    const allow_native_tools = launch.modifiers.allow_native_tools;
     var app = App.init(alloc, launch) catch |err| {
         switch (err) {
             error.NotATerminal => {
@@ -317,7 +318,7 @@ fn runInteractiveWithDeps(comptime App: type, comptime cooperative: bool, alloc:
     var relaunch_argv: std.ArrayList([]const u8) = .empty;
     defer relaunch_argv.deinit(alloc);
     if (relaunch_request != null) {
-        try relaunch_argv.ensureTotalCapacity(alloc, 4 + relaunch_skill_roots.len * 2);
+        try relaunch_argv.ensureTotalCapacity(alloc, 5 + relaunch_skill_roots.len * 2);
     }
     const resume_handoff_columns: u16 = if (comptime cooperative)
         0
@@ -335,6 +336,9 @@ fn runInteractiveWithDeps(comptime App: type, comptime cooperative: bool, alloc:
             var handoff = value;
             defer handoff.deinit(alloc);
             relaunch_argv.appendAssumeCapacity(request.executablePath());
+            if (!allow_native_tools) {
+                relaunch_argv.appendAssumeCapacity("--no-native-tools");
+            }
             for (relaunch_skill_roots) |root| {
                 relaunch_argv.appendAssumeCapacity("--skills-dir");
                 relaunch_argv.appendAssumeCapacity(root);
@@ -347,7 +351,12 @@ fn runInteractiveWithDeps(comptime App: type, comptime cooperative: bool, alloc:
                 io_mod.getIo(),
                 .{ .argv = relaunch_argv.items },
             );
-            writeUpgradeRelaunchFailure(deps, replace_err, handoff.session_id);
+            writeUpgradeRelaunchFailure(
+                deps,
+                replace_err,
+                handoff.session_id,
+                allow_native_tools,
+            );
         } else {
             writeStderr(
                 deps,
@@ -413,14 +422,23 @@ fn writeUpgradeRelaunchFailure(
     deps: RunDeps,
     err: std.process.ReplaceError,
     session_id: []const u8,
+    allow_native_tools: bool,
 ) void {
     var buffer: [768]u8 = undefined;
-    const message = std.fmt.bufPrint(
-        &buffer,
-        "fx: upgrade installed, but relaunch failed: {s}\nContinue session with: fx --resume {s}\n",
-        .{ @errorName(err), session_id },
-    ) catch "fx: upgrade installed, but relaunch failed; run `fx doctor`.\n";
-    writeStderr(deps, message);
+    const message = if (allow_native_tools)
+        std.fmt.bufPrint(
+            &buffer,
+            "fx: upgrade installed, but relaunch failed: {s}\nContinue session with: fx --resume {s}\n",
+            .{ @errorName(err), session_id },
+        )
+    else
+        std.fmt.bufPrint(
+            &buffer,
+            "fx: upgrade installed, but relaunch failed: {s}\nContinue session with: fx --no-native-tools --resume {s}\n",
+            .{ @errorName(err), session_id },
+        );
+    const rendered = message catch "fx: upgrade installed, but relaunch failed; run `fx doctor`.\n";
+    writeStderr(deps, rendered);
 }
 
 fn cliSurfaceConfig(cfg: Config) cli_surface.Config {
@@ -637,8 +655,8 @@ const TestCapture = struct {
     replace_error: std.process.ReplaceError = error.InvalidExe,
     replace_calls: usize = 0,
     replace_arg_count: usize = 0,
-    replace_arg_bufs: [8][128]u8 = undefined,
-    replace_arg_lens: [8]usize = .{ 0, 0, 0, 0, 0, 0, 0, 0 },
+    replace_arg_bufs: [16][128]u8 = undefined,
+    replace_arg_lens: [16]usize = [_]usize{0} ** 16,
     fail_unexpected_format: bool = false,
 
     fn init(run_result: cli_surface.RunResult) TestCapture {
@@ -1047,6 +1065,38 @@ test "app entry preserves invocation skill roots across an upgrade relaunch" {
     try std.testing.expectEqualStrings("resume", capture.replaceArg(5));
     try std.testing.expectEqualStrings("session-123", capture.replaceArg(6));
     try std.testing.expectEqualStrings("--upgrade-relaunch", capture.replaceArg(7));
+}
+
+test "app entry preserves native tool suppression across upgrade relaunch" {
+    const alloc = std.testing.allocator;
+    var capture = TestCapture.init(.{ .interactive = .{
+        .modifiers = .{ .allow_native_tools = false },
+    } });
+    defer capture.deinit();
+    capture.resume_handoff_id = "session-123";
+    capture.upgrade_relaunch_path = "/tmp/fx-upgraded";
+
+    const outcome = try runWithDeps(
+        TestApp,
+        alloc,
+        &.{},
+        testConfig(),
+        capture.deps(),
+    );
+
+    try std.testing.expectEqual(@as(u8, 1), outcome.exit);
+    try std.testing.expectEqual(@as(usize, 1), capture.replace_calls);
+    try std.testing.expectEqual(@as(usize, 5), capture.replace_arg_count);
+    try std.testing.expectEqualStrings("/tmp/fx-upgraded", capture.replaceArg(0));
+    try std.testing.expectEqualStrings("--no-native-tools", capture.replaceArg(1));
+    try std.testing.expectEqualStrings("resume", capture.replaceArg(2));
+    try std.testing.expectEqualStrings("session-123", capture.replaceArg(3));
+    try std.testing.expectEqualStrings("--upgrade-relaunch", capture.replaceArg(4));
+    try std.testing.expect(std.mem.find(
+        u8,
+        capture.stderr.written(),
+        "fx --no-native-tools --resume session-123",
+    ) != null);
 }
 
 test "app entry never relaunches without a validated handoff" {

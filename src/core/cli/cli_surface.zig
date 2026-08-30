@@ -122,6 +122,7 @@ pub const LaunchModifiers = struct {
     saved_directories_suppressed: bool = false,
     prompt_files: system_prompt_files.Request = .{},
     effective_system_prompt: ?[]u8 = null,
+    allow_native_tools: bool = true,
 
     pub fn deinit(self: *LaunchModifiers, alloc: Allocator) void {
         if (self.context_limit_overrides.len > 0) alloc.free(self.context_limit_overrides);
@@ -345,6 +346,7 @@ const AcpOptions = struct {
     model: ?[]const u8 = null,
     effort: ?types.ReasoningEffort = null,
     log_file: ?[]const u8 = null,
+    allow_acp_mcp: bool = true,
 };
 
 const WorkflowOptions = struct {
@@ -434,6 +436,7 @@ fn parseGlobalLaunchArgs(
         for (append_paths.items) |path| alloc.free(path);
         append_paths.deinit(alloc);
     }
+    var allow_native_tools = true;
 
     var index: usize = 0;
     while (index < args.len) {
@@ -481,6 +484,9 @@ fn parseGlobalLaunchArgs(
             const value = arg["--append-system-prompt-file=".len..];
             if (value.len == 0) return error.MissingAppendSystemPromptFileValue;
             try dupeAndAppendPath(alloc, &append_paths, value);
+        } else if (std.mem.eql(u8, arg, "--no-native-tools")) {
+            if (!allow_native_tools) return error.DuplicateNativeToolSuppression;
+            allow_native_tools = false;
         } else {
             break;
         }
@@ -511,6 +517,7 @@ fn parseGlobalLaunchArgs(
                 .replacement_path = replacement_path,
                 .append_paths = append_slice,
             },
+            .allow_native_tools = allow_native_tools,
         },
     };
 }
@@ -538,7 +545,8 @@ pub fn argsAfterGlobalLaunchArgs(args: []const [:0]const u8) []const [:0]const u
             !std.mem.startsWith(u8, arg, "--skills-dir=") and
             !std.mem.startsWith(u8, arg, "--system-prompt-file=") and
             !std.mem.startsWith(u8, arg, "--append-system-prompt-file=") and
-            !std.mem.eql(u8, arg, "--no-additional-dirs"))
+            !std.mem.eql(u8, arg, "--no-additional-dirs") and
+            !std.mem.eql(u8, arg, "--no-native-tools"))
         {
             return args[index..];
         }
@@ -562,12 +570,16 @@ pub fn systemPromptFilesRequested(args: []const [:0]const u8) bool {
         {
             return true;
         }
-        if (std.mem.eql(u8, arg, "--context-limit") or std.mem.eql(u8, arg, "--add-dir")) {
+        if (std.mem.eql(u8, arg, "--context-limit") or std.mem.eql(u8, arg, "--add-dir") or
+            std.mem.eql(u8, arg, "--skills-dir"))
+        {
             index += 1;
             if (index >= args.len) return false;
         } else if (!std.mem.startsWith(u8, arg, "--context-limit=") and
             !std.mem.startsWith(u8, arg, "--add-dir=") and
-            !std.mem.eql(u8, arg, "--no-additional-dirs"))
+            !std.mem.startsWith(u8, arg, "--skills-dir=") and
+            !std.mem.eql(u8, arg, "--no-additional-dirs") and
+            !std.mem.eql(u8, arg, "--no-native-tools"))
         {
             return false;
         }
@@ -959,7 +971,7 @@ fn runIfRequestedWithDeps(alloc: Allocator, args: []const [:0]const u8, cfg: Con
         } else {
             try writer.writer.print("fx: invalid global launch option: {s}\n", .{@errorName(err)});
         }
-        try writer.writer.writeAll("usage: fx [--skills-dir PATH]... [--system-prompt-file PATH] [--append-system-prompt-file PATH]... [--context-limit NAME=BYTES|off] [--add-dir PATH]... [--no-additional-dirs] <command>\n");
+        try writer.writer.writeAll("usage: fx [--skills-dir PATH]... [--system-prompt-file PATH] [--append-system-prompt-file PATH]... [--context-limit NAME=BYTES|off] [--add-dir PATH]... [--no-additional-dirs] [--no-native-tools] <command>\n");
         try writeStderr(deps, writer.written());
         return .handled_failure;
     };
@@ -1034,6 +1046,12 @@ fn runNonInteractiveWithDeps(
     if (!try prepareInvocationSkillRoots(alloc, &global_args.modifiers, deps)) {
         return .handled_failure;
     }
+    if (!global_args.modifiers.allow_native_tools and
+        !commandSupportsNativeToolModifier(parsed_command))
+    {
+        try writeNativeToolModifierUsage(deps);
+        return .handled_failure;
+    }
 
     if (isVersionFlag(effective_args[0])) {
         if (effective_args.len != 1) {
@@ -1080,7 +1098,7 @@ fn runNonInteractiveWithDeps(
         },
         .acp => |rest| {
             const acp_opts = parseAcpArgs(rest) catch {
-                try writeStderr(deps, "usage: fx acp [--model <id>] [--effort <name>] [--log-file <path>]\n");
+                try writeStderr(deps, "usage: fx acp [--model <id>] [--effort <name>] [--log-file <path>] [--no-acp-mcp]\n");
                 return .handled_failure;
             };
             try cfg.acp_runner.run(alloc, .{
@@ -1111,6 +1129,8 @@ fn runNonInteractiveWithDeps(
                 .model_override = acp_opts.model,
                 .effort_override = acp_opts.effort,
                 .log_file = acp_opts.log_file,
+                .allow_acp_mcp = acp_opts.allow_acp_mcp,
+                .allow_native_tools = global_args.modifiers.allow_native_tools,
             });
             return .handled_success;
         },
@@ -3677,6 +3697,13 @@ fn commandSupportsInvocationSkillRoots(command: Command) bool {
     };
 }
 
+fn commandSupportsNativeToolModifier(command: Command) bool {
+    return switch (command) {
+        .interactive, .acp, .resume_session => true,
+        else => false,
+    };
+}
+
 fn commandSupportsPromptFileModifiers(command: Command) bool {
     return switch (command) {
         .interactive, .ask, .acp, .pr, .issue, .resume_session => true,
@@ -3774,6 +3801,13 @@ fn writeInvocationSkillRootUsage(deps: RunDeps) !void {
     );
 }
 
+fn writeNativeToolModifierUsage(deps: RunDeps) !void {
+    try writeStderr(
+        deps,
+        "fx: --no-native-tools is only supported for interactive, resume, and ACP launches\n",
+    );
+}
+
 fn globalLaunchErrorMessage(err: anyerror) ?[]const u8 {
     return switch (err) {
         error.MissingAddDirectoryValue => "--add-dir requires a directory path",
@@ -3782,6 +3816,7 @@ fn globalLaunchErrorMessage(err: anyerror) ?[]const u8 {
         error.MissingSystemPromptFileValue => "--system-prompt-file requires a file path",
         error.DuplicateSystemPromptFile => "--system-prompt-file may only be specified once",
         error.MissingAppendSystemPromptFileValue => "--append-system-prompt-file requires a file path",
+        error.DuplicateNativeToolSuppression => "--no-native-tools may only be specified once",
         else => null,
     };
 }
@@ -3802,6 +3837,9 @@ fn parseAcpArgs(args: []const [:0]const u8) !AcpOptions {
             if (opts.log_file != null or i + 1 >= args.len) return error.InvalidAcpArgs;
             i += 1;
             opts.log_file = args[i];
+        } else if (std.mem.eql(u8, args[i], "--no-acp-mcp")) {
+            if (!opts.allow_acp_mcp) return error.InvalidAcpArgs;
+            opts.allow_acp_mcp = false;
         } else {
             return error.InvalidAcpArgs;
         }
@@ -4384,6 +4422,7 @@ test "global launch modifiers own repeatable additional directories and suppress
         @constCast("--context-limit=skill_chunk_bytes=2048"),
         @constCast("--add-dir=/tmp/shared-two"),
         @constCast("--no-additional-dirs"),
+        @constCast("--no-native-tools"),
         @constCast("ask"),
         @constCast("inspect"),
     });
@@ -4393,6 +4432,7 @@ test "global launch modifiers own repeatable additional directories and suppress
     try std.testing.expectEqualStrings("/tmp/shared one", parsed.modifiers.additional_directories[0]);
     try std.testing.expectEqualStrings("/tmp/shared-two", parsed.modifiers.additional_directories[1]);
     try std.testing.expect(parsed.modifiers.saved_directories_suppressed);
+    try std.testing.expect(!parsed.modifiers.allow_native_tools);
     try std.testing.expectEqualStrings("ask", parsed.remaining[0]);
 }
 
@@ -4408,6 +4448,10 @@ test "additional directory flags fail closed when malformed" {
     try std.testing.expectError(
         error.DuplicateAdditionalDirectorySuppression,
         parseGlobalLaunchArgs(std.testing.allocator, &.{ @constCast("--no-additional-dirs"), @constCast("--no-additional-dirs") }),
+    );
+    try std.testing.expectError(
+        error.DuplicateNativeToolSuppression,
+        parseGlobalLaunchArgs(std.testing.allocator, &.{ @constCast("--no-native-tools"), @constCast("--no-native-tools") }),
     );
 }
 
@@ -4648,10 +4692,12 @@ test "parse acp args extracts known flags and rejects invalid arguments" {
         @constCast("high"),
         @constCast("--log-file"),
         @constCast("/tmp/fx.log"),
+        @constCast("--no-acp-mcp"),
     });
     try std.testing.expectEqualStrings("openai/gpt-4o", opts.model.?);
     try std.testing.expect(opts.effort.?.eql(types.ReasoningEffort.literal("high")));
     try std.testing.expectEqualStrings("/tmp/fx.log", opts.log_file.?);
+    try std.testing.expect(!opts.allow_acp_mcp);
 
     try std.testing.expectError(error.InvalidAcpArgs, parseAcpArgs(&.{@constCast("--unknown")}));
     try std.testing.expectError(error.InvalidAcpArgs, parseAcpArgs(&.{@constCast("--model")}));
@@ -4661,6 +4707,10 @@ test "parse acp args extracts known flags and rejects invalid arguments" {
     try std.testing.expectError(
         error.InvalidAcpArgs,
         parseAcpArgs(&.{ @constCast("--model"), @constCast("first"), @constCast("--model"), @constCast("second") }),
+    );
+    try std.testing.expectError(
+        error.InvalidAcpArgs,
+        parseAcpArgs(&.{ @constCast("--no-acp-mcp"), @constCast("--no-acp-mcp") }),
     );
 }
 
@@ -4719,7 +4769,9 @@ test "ACP command routes parsed options and launch config through the injected r
                 cfg.saved_directories_suppressed and
                 std.mem.eql(u8, cfg.model_override.?, "model-override") and
                 cfg.effort_override.?.eql(types.ReasoningEffort.literal("high")) and
-                std.mem.eql(u8, cfg.log_file.?, "/tmp/acp.log");
+                std.mem.eql(u8, cfg.log_file.?, "/tmp/acp.log") and
+                !cfg.allow_native_tools and
+                !cfg.allow_acp_mcp;
         }
     };
 
@@ -4756,6 +4808,7 @@ test "ACP command routes parsed options and launch config through the injected r
             @constCast("--add-dir"),
             @constCast("/tmp/acp-extra"),
             @constCast("--no-additional-dirs"),
+            @constCast("--no-native-tools"),
             @constCast("acp"),
             @constCast("--model"),
             @constCast("model-override"),
@@ -4763,6 +4816,7 @@ test "ACP command routes parsed options and launch config through the injected r
             @constCast("high"),
             @constCast("--log-file"),
             @constCast("/tmp/acp.log"),
+            @constCast("--no-acp-mcp"),
         },
         cfg,
         .{},

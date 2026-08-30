@@ -165,6 +165,10 @@ fx builds as a native binary or WebAssembly. Applications embedding fx can provi
 | `createFxAgent()` | Embed the agent core in a JavaScript host with `fx-core.wasm`. |
 | `createFxTerminal()` | Embed the interactive terminal with `fx-term.wasm`. |
 
+Interactive TUI and ACP launches can disable Fx-native tools with the global
+`--no-native-tools` option. ACP can independently reject client-supplied MCP
+servers with `fx acp --no-acp-mcp`.
+
 The WebAssembly SDK is experimental. See the [WebAssembly SDK](sdk/README.md) and [ACP documentation](https://fx.sh/docs/using-fx/acp).
 
 ## Extend fx

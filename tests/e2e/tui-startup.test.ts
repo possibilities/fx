@@ -12,6 +12,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { FX_BIN, HAS_API_KEY } from "../evals/eval-helpers";
 import {
+  FAKE_GATEWAY_MODEL,
   fakeGatewayFinalText,
   hasEmptyComposer,
   startFakeGateway,
@@ -69,6 +70,60 @@ describe.skipIf(SKIP)("tui: startup and exit", () => {
 });
 
 describe.skipIf(SKIP_TMUX)("tui: fresh-session commands", () => {
+  test(
+    "global native tool suppression sends the TUI model an empty native catalog",
+    async () => {
+      const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-tui-no-native-tools-")));
+      const home = join(root, "home");
+      const workspace = join(root, "workspace");
+      const stderrPath = join(root, "stderr.log");
+      mkdirSync(home);
+      mkdirSync(workspace);
+      writeFileSync(stderrPath, "");
+      const gateway = startFakeGateway([
+        fakeGatewayFinalText("TUI_NATIVE_TOOLS_DISABLED"),
+      ]);
+
+      try {
+        session = await TmuxSession.create({
+          cmd: `${FX_BIN} --no-native-tools`,
+          cwd: workspace,
+          env: {
+            HOME: home,
+            AI_GATEWAY_API_KEY: "fake-tui-native-tool-gate-key",
+            VERCEL_OIDC_TOKEN: undefined,
+            FX_GATEWAY_BASE_URL: gateway.baseUrl,
+            FX_GATEWAY_CHAT_URL: gateway.chatUrl,
+            FX_MODEL: FAKE_GATEWAY_MODEL,
+            FX_AUTO_UPGRADE: "0",
+          },
+          stderrPath,
+        });
+
+        await session.waitForComposer(10_000);
+        await session.sendText("Answer without native tools.");
+        await session.waitForText("TUI_NATIVE_TOOLS_DISABLED", 10_000);
+        expect(gateway.requests).toHaveLength(1);
+        expect((JSON.parse(gateway.requests[0]!.body) as { tools?: unknown[] }).tools)
+          .toEqual([]);
+        expect(readFileSync(stderrPath, "utf8")).toBe("");
+
+        await session.sendText("/quit");
+        expect(await session.waitForSessionEnd(5_000)).toBe(true);
+        await session.kill();
+        session = null;
+      } finally {
+        gateway.stop();
+        if (session) {
+          await session.kill();
+          session = null;
+        }
+        rmSync(root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
   test(
     "statusline hides the workspace identity by default",
     async () => {
