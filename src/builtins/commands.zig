@@ -388,6 +388,10 @@ pub const top_level_flags = [_]TopLevelFlag{
         .description = "Use an isolated Fx profile for TUI or ACP",
     },
     .{
+        .usage = "--permissions-file <path>",
+        .description = "Replace configured rules for TUI or ACP",
+    },
+    .{
         .usage = "-c, --continue",
         .description = "Resume the latest workspace session",
     },

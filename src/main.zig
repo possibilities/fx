@@ -552,6 +552,8 @@ const App = struct {
     workspace_host: WorkspaceHostRuntime = .{},
     workspace: app_workspace_runtime.State = .{},
     permission_engine: PermissionEngine = .{},
+    /// Prevent ambient allowlist reloads from replacing invocation policy.
+    launch_permission_policy_active: bool = false,
     permission_state: app_permission_runtime.State = .{},
     agent_step_limit: usize = default_max_agent_steps,
     web_fetch_runtime: web_fetch_runtime.Runtime = web_fetch_runtime.Runtime.init(.{}),
@@ -722,6 +724,13 @@ const App = struct {
             native_tool_selection_catalog,
             launch.modifiers.selected_native_tools,
         );
+        if (launch.modifiers.permission_policy) |policy| {
+            app.permission_engine.replaceRules(
+                app.alloc,
+                try types.dupePermissionRuleSet(app.alloc, policy.rules),
+            );
+            app.launch_permission_policy_active = true;
+        }
         try WorkspaceAppRuntime.applyLaunch(
             &app,
             launch.modifiers.additional_directories,

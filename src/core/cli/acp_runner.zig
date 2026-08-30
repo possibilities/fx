@@ -53,6 +53,8 @@ pub const Config = struct {
     invocation_skill_roots: []const []const u8 = &.{},
     saved_directories_suppressed: bool = false,
     skill_root_policy: skill_contract.RootPolicy = .{ .managed_root_source = null },
+    /// Borrowed invocation policy; the server duplicates it during initialize.
+    permission_rules_override: ?types.PermissionRuleSet = null,
     allow_acp_mcp: bool = true,
     allow_native_tools: bool = true,
     native_tool_set: ?tool_set_contract.ToolSet = null,
