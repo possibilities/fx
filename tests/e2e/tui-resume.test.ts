@@ -27,6 +27,7 @@ import {
   isEmptyComposerLine,
   isVolatileTokenStatusRow,
   paneExitMatches,
+  startDynamicFakeGateway,
   startFakeGateway,
   TmuxSession,
   tmuxAvailable,
@@ -884,6 +885,205 @@ test.skipIf(!tmuxAvailable())(
     }
   },
   TIMEOUT * 2,
+);
+
+test.skipIf(!tmuxAvailable())(
+  "launch name survives exact resume composition and never leaks through new",
+  async () => {
+    const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-launch-name-resume-")));
+    const ambientHome = join(root, "ambient-home");
+    const selectedStateRoot = join(root, "selected-state-root");
+    const isolatedStateRoot = join(root, "isolated-state-root");
+    const initialWorkspace = join(root, "initial-workspace");
+    const reboundWorkspace = join(root, "rebound-workspace");
+    const initialStderrPath = join(root, "initial-stderr.log");
+    const resumedStderrPath = join(root, "resumed-stderr.log");
+    const isolatedStderrPath = join(root, "isolated-stderr.log");
+    for (const path of [
+      ambientHome,
+      selectedStateRoot,
+      isolatedStateRoot,
+      initialWorkspace,
+      reboundWorkspace,
+    ]) {
+      mkdirSync(path);
+    }
+    mkdirSync(join(selectedStateRoot, ".fx"));
+    mkdirSync(join(isolatedStateRoot, ".fx"));
+    writeFileSync(
+      join(selectedStateRoot, ".fx", "settings.json"),
+      JSON.stringify({
+        sandbox: "none",
+        permission_mode: "auto",
+        permission: {},
+        session_naming: {
+          gateway: { model: FAKE_GATEWAY_MODEL, effort: "low" },
+          timeout_ms: 10_000,
+        },
+      }),
+    );
+    for (const path of [initialStderrPath, resumedStderrPath, isolatedStderrPath]) {
+      writeFileSync(path, "");
+    }
+
+    const reboundRoot = realpathSync(reboundWorkspace);
+    let namingRequests = 0;
+    const gateway = startDynamicFakeGateway((body) => {
+      if (body.includes("Generate a short session title")) {
+        namingRequests += 1;
+        return fakeGatewayFinalText("Automatic new conversation title");
+      }
+      if (body.includes('"toolCallId":"launch_name_rebind_pwd"')) {
+        return fakeGatewayFinalText(
+          body.includes(reboundRoot)
+            ? "LAUNCH_NAME_REBOUND_OK"
+            : "LAUNCH_NAME_REBOUND_BAD",
+        );
+      }
+      if (body.includes("LAUNCH_NAME_RESUME_PROMPT")) {
+        return fakeGatewayToolCall("launch_name_rebind_pwd", "terminal", {
+          action: "exec",
+          command: "pwd",
+          timeout_ms: 600_000,
+        });
+      }
+      if (body.includes("LAUNCH_NAME_NEW_PROMPT")) {
+        return fakeGatewayFinalText("LAUNCH_NAME_NEW_DONE");
+      }
+      if (body.includes("LAUNCH_NAME_INITIAL_PROMPT")) {
+        return fakeGatewayFinalText("LAUNCH_NAME_INITIAL_DONE");
+      }
+      return new Response("unexpected launch-name request", { status: 500 });
+    });
+
+    let active: TmuxSession | null = null;
+    try {
+      active = await TmuxSession.create({
+        cmd: `${FX_BIN} --state-dir '${selectedStateRoot}' --name 'Initial launch title'`,
+        cwd: realpathSync(initialWorkspace),
+        env: gatewayEnv(ambientHome, gateway),
+        stderrPath: initialStderrPath,
+        width: 100,
+        height: 30,
+      });
+      await active.waitForComposer(TIMEOUT);
+      const originalId = sessionIdFromHome(selectedStateRoot);
+      await active.sendText("LAUNCH_NAME_INITIAL_PROMPT");
+      await active.waitForText("LAUNCH_NAME_INITIAL_DONE", TIMEOUT);
+      await active.waitForComposer(TIMEOUT);
+      expect(namingRequests).toBe(0);
+
+      const originalDisplayPath = join(
+        selectedStateRoot,
+        ".fx",
+        "sessions",
+        originalId,
+        "display.json",
+      );
+      expect((JSON.parse(readFileSync(originalDisplayPath, "utf8")) as { title: string }).title)
+        .toBe("Initial launch title");
+
+      await active.sendText("/new");
+      await active.waitForComposer(TIMEOUT);
+      await waitForCondition(
+        () => readdirSync(join(selectedStateRoot, ".fx", "sessions"), { withFileTypes: true })
+          .filter((entry) => entry.name !== "latest" && entry.isDirectory()).length === 2,
+        "fresh session after /new",
+      );
+      const newId = readdirSync(join(selectedStateRoot, ".fx", "sessions"), {
+        withFileTypes: true,
+      }).filter((entry) => entry.name !== "latest" && entry.isDirectory())
+        .map((entry) => entry.name)
+        .find((id) => id !== originalId)!;
+
+      await active.sendText("LAUNCH_NAME_NEW_PROMPT");
+      await active.waitForText("LAUNCH_NAME_NEW_DONE", TIMEOUT);
+      await active.waitForComposer(TIMEOUT);
+      await waitForCondition(() => {
+        const displayPath = join(
+          selectedStateRoot,
+          ".fx",
+          "sessions",
+          newId,
+          "display.json",
+        );
+        if (!existsSync(displayPath)) return false;
+        const display = JSON.parse(readFileSync(displayPath, "utf8")) as { title?: unknown };
+        return display.title === "automatic-new-conversation-title";
+      }, "automatic name on the fresh /new conversation");
+      expect(namingRequests).toBe(1);
+
+      await active.sendText("/quit");
+      expect(await active.waitForSessionEnd(TIMEOUT)).toBe(true);
+      await active.kill();
+      active = null;
+
+      active = await TmuxSession.create({
+        cmd: `${FX_BIN} --state-dir '${selectedStateRoot}' --name 'Resumed launch title' resume ${originalId}`,
+        cwd: reboundRoot,
+        env: gatewayEnv(ambientHome, gateway),
+        stderrPath: resumedStderrPath,
+        width: 100,
+        height: 30,
+      });
+      await waitForScrollback(active, "LAUNCH_NAME_INITIAL_DONE", TIMEOUT);
+      await active.waitForComposer(TIMEOUT);
+      await active.sendText("LAUNCH_NAME_RESUME_PROMPT");
+      const resumed = await waitForScrollback(active, "LAUNCH_NAME_REBOUND_OK", TIMEOUT);
+      expect(resumed).not.toContain("LAUNCH_NAME_NEW_DONE");
+      expect(resumed).not.toContain("LAUNCH_NAME_REBOUND_BAD");
+      await active.waitForComposer(TIMEOUT);
+      expect(namingRequests).toBe(1);
+
+      const resumedState = JSON.parse(readFileSync(
+        join(selectedStateRoot, ".fx", "sessions", originalId, "session.json"),
+        "utf8",
+      )) as { workspace_root?: unknown };
+      expect(resumedState.workspace_root).toBe(reboundRoot);
+      expect((JSON.parse(readFileSync(originalDisplayPath, "utf8")) as { title: string }).title)
+        .toBe("Resumed launch title");
+      const index = JSON.parse(readFileSync(
+        join(selectedStateRoot, ".fx", "sessions", "index.json"),
+        "utf8",
+      )) as { sessions?: Array<{ id?: unknown; title?: unknown }> };
+      expect(index.sessions?.find((entry) => entry.id === originalId)?.title)
+        .toBe("Resumed launch title");
+
+      await active.sendText("/quit");
+      expect(await active.waitForSessionEnd(TIMEOUT)).toBe(true);
+      await active.kill();
+      active = null;
+
+      active = await TmuxSession.create({
+        cmd: `${FX_BIN} --state-dir '${isolatedStateRoot}' --name 'Wrong state root' resume ${originalId}`,
+        cwd: reboundRoot,
+        env: gatewayEnv(ambientHome, gateway),
+        stderrPath: isolatedStderrPath,
+        remainOnExit: true,
+        width: 100,
+        height: 30,
+      });
+      await waitForCondition(
+        () => active?.paneStatus().dead === true,
+        "isolated state-root resume to exit",
+      );
+      expect(paneExitMatches(active.paneStatus(), 1)).toBe(true);
+      expect(readFileSync(isolatedStderrPath, "utf8"))
+        .toContain("fx: saved session not found");
+      expect(existsSync(join(isolatedStateRoot, ".fx", "sessions", originalId))).toBe(false);
+      expect(existsSync(join(ambientHome, ".fx", "sessions", originalId))).toBe(false);
+      await active.kill();
+      active = null;
+
+      expect(readFileSync(initialStderrPath, "utf8")).toBe("");
+      expect(readFileSync(resumedStderrPath, "utf8")).toBe("");
+    } finally {
+      if (active) await active.kill();
+      gateway.stop();
+      rmSync(root, { recursive: true, force: true });
+    }
+  },
+  TIMEOUT * 3,
 );
 
 function expectAltExitToPreserveNormalViewport(tapePath: string): void {
@@ -4929,9 +5129,9 @@ test.skipIf(!tmuxAvailable())(
 );
 
 test.skipIf(!tmuxAvailable())(
-  "upgrade ctrl-g reloads the background-installed binary and resumes",
+  "upgrade ctrl-t reloads the background-installed binary and resumes",
   async () => {
-    const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-tui-upgrade-ctrl-g-")));
+    const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-tui-upgrade-ctrl-t-")));
     const home = join(root, "home");
     const freshHome = join(root, "fresh-home");
     const workspace = join(root, "workspace");
@@ -4951,8 +5151,8 @@ test.skipIf(!tmuxAvailable())(
     let active: TmuxSession | null = null;
     let fresh: TmuxSession | null = null;
     const gateway = startFakeGateway([
-      fakeGatewayFinalText("UPGRADE_CTRL_G_INITIAL_DONE"),
-      fakeGatewayFinalText("UPGRADE_CTRL_G_FOLLOWUP_DONE"),
+      fakeGatewayFinalText("UPGRADE_CTRL_T_INITIAL_DONE"),
+      fakeGatewayFinalText("UPGRADE_CTRL_T_FOLLOWUP_DONE"),
     ]);
     const release = startUpgradeServer(root, argvLogPath);
 
@@ -4973,12 +5173,12 @@ test.skipIf(!tmuxAvailable())(
       });
       await active.waitForComposer(TIMEOUT);
       await active.sendText("Save a turn before upgrade handoff.");
-      await active.waitForText("UPGRADE_CTRL_G_INITIAL_DONE", TIMEOUT);
+      await active.waitForText("UPGRADE_CTRL_T_INITIAL_DONE", TIMEOUT);
       await active.waitForComposer(TIMEOUT);
       const sessionId = sessionIdFromHome(home);
 
       await active.waitForText(
-        "update ready: ctrl+g to reload",
+        "update ready: ctrl+t to reload",
         UPGRADE_TIMEOUT,
       );
       expect(readFileSync(installedFx, "utf8")).toContain(argvLogPath);
@@ -4995,19 +5195,19 @@ test.skipIf(!tmuxAvailable())(
       expect(readFileSync(argvLogPath, "utf8").trim().split("\n")).toEqual([
         installedFx,
       ]);
-      expect(await fresh.capturePane()).not.toContain("update ready: ctrl+g to reload");
+      expect(await fresh.capturePane()).not.toContain("update ready: ctrl+t to reload");
       await fresh.sendText("/quit");
       expect(await fresh.waitForSessionEnd()).toBe(true);
       await fresh.kill();
       fresh = null;
 
       const version = (await runFx(["--version"])).stdout.trim();
-      await active.sendHexBytes(["07"]);
+      await active.sendHexBytes(["14"]);
 
       const updatedNotice = `● fx has been updated to v${version}`;
       await active.waitForText(updatedNotice, TIMEOUT);
-      const resumed = await waitForScrollback(active, "UPGRADE_CTRL_G_INITIAL_DONE");
-      expect(resumed).toContain("UPGRADE_CTRL_G_INITIAL_DONE");
+      const resumed = await waitForScrollback(active, "UPGRADE_CTRL_T_INITIAL_DONE");
+      expect(resumed).toContain("UPGRADE_CTRL_T_INITIAL_DONE");
       expect(resumed).toContain(updatedNotice);
       expect(resumed).not.toContain("● Session resumed:");
       expect(resumed).not.toContain("● Session: resumed:");
@@ -5019,7 +5219,7 @@ test.skipIf(!tmuxAvailable())(
       ]);
 
       await active.sendText("Continue after upgrade handoff.");
-      await active.waitForText("UPGRADE_CTRL_G_FOLLOWUP_DONE", TIMEOUT);
+      await active.waitForText("UPGRADE_CTRL_T_FOLLOWUP_DONE", TIMEOUT);
       const stderr = readFileSync(stderrPath, "utf8");
       expect(stderr).not.toContain("relaunch failed");
       expect(stderr).not.toContain("AnsiBandOverflow");
@@ -5046,7 +5246,7 @@ test.skipIf(!tmuxAvailable())(
 );
 
 test.skipIf(!tmuxAvailable())(
-  "upgrade ctrl-g repairs an exact corrupt boundary and resumes",
+  "upgrade ctrl-t repairs an exact corrupt boundary and resumes",
   async () => {
     const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-tui-upgrade-corrupt-")));
     const home = join(root, "home");
@@ -5090,7 +5290,7 @@ test.skipIf(!tmuxAvailable())(
       await waitForCommittedSessionMarker(home, "UPGRADE_CORRUPT_INITIAL_DONE");
       const sessionId = sessionIdFromHome(home);
       await active.waitForText(
-        "update ready: ctrl+g to reload",
+        "update ready: ctrl+t to reload",
         UPGRADE_TIMEOUT,
       );
 
@@ -5100,7 +5300,7 @@ test.skipIf(!tmuxAvailable())(
       )!;
       writeFileSync(join(sessionDir, watermarkName), "{}\n", { mode: 0o600 });
       const version = (await runFx(["--version"])).stdout.trim();
-      await active.sendHexBytes(["07"]);
+      await active.sendHexBytes(["14"]);
 
       await active.waitForText(`● fx has been updated to v${version}`, TIMEOUT);
       const resumed = await waitForScrollback(

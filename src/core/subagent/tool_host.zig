@@ -2,6 +2,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const approval_persistence = @import("approval_persistence.zig");
 const approval_registry = @import("approval_registry.zig");
+const worker_runtime = @import("../agent/worker_runtime.zig");
 const authority = @import("authority.zig");
 const auto_classifier_context = @import("../permissions/auto_classifier_context.zig");
 const communication = @import("communication.zig");
@@ -912,12 +913,21 @@ pub const Runtime = struct {
         self: *Runtime,
         options: ApprovalResolveOptions,
     ) approval_registry.Error!approval_registry.ResolveResult {
-        const resolved = self.approvals.resolve(
+        return self.resolveApprovalObserved(options, null);
+    }
+
+    pub fn resolveApprovalObserved(
+        self: *Runtime,
+        options: ApprovalResolveOptions,
+        observer: ?worker_runtime.DecisionObserver,
+    ) approval_registry.Error!approval_registry.ResolveResult {
+        const observed = self.approvals.resolveObserved(
             options.request_id,
             options.child_id,
             options.decision,
             options.feedback,
             options.timestamp_ms,
+            observer,
         ) catch |err| {
             if (self.relationshipApprovalIsTerminal(
                 options.child_id,
@@ -928,18 +938,40 @@ pub const Runtime = struct {
             }
             return err;
         };
-        switch (resolved) {
+        switch (observed.result) {
             .accepted => {
                 if (options.decision == .deny) {
                     self.completeOperationIdentity(options.request_id) catch
                         return error.CommitFailed;
                 }
+                if (!observed.observer_ran) {
+                    if (observer) |value| value.observe_fn(value.context, 0);
+                }
                 return .accepted;
             },
             .rejected => return .rejected,
-            .relationship_ready => return self.continueApprovedRelationship(
-                options,
-            ),
+            .relationship_ready => {
+                // Publish the resolution before the continuation runs. The
+                // decision is already accepted and committed by this point;
+                // what remains is applying the relationship, and that reaches
+                // `manager.execute`, which can start the child. A child
+                // released first sends `Stop` or `PostTurnEnd` that overtakes
+                // its own `AttentionResolved`: the reducer then sees a
+                // previous state that is no longer blocked, drops the
+                // resolution as unmatched, and leaves the consumer holding an
+                // agent it still believes is waiting on a human.
+                //
+                // A failed continuation needs no explicit undo. A retryable
+                // failure leaves the binding pending, so the next sync raises
+                // that child's attention again; a terminal failure removes
+                // the binding, and the child genuinely is no longer waiting.
+                // The continuation returns `.accepted` or an error, never
+                // `.rejected`, so nothing else reaches here.
+                if (!observed.observer_ran) {
+                    if (observer) |value| value.observe_fn(value.context, 0);
+                }
+                return self.continueApprovedRelationship(options);
+            },
         }
     }
 
@@ -2397,6 +2429,7 @@ fn captureAdmission(
         return error.AdmissionFailed;
     defer snapshot.deinit(alloc);
     return domain.captureAdmission(alloc, .{
+        .root_id = self.root_id,
         .parent_id = request.parent_id,
         .source_id = request.source_id,
         .model = request.preferences.model,
@@ -7391,4 +7424,130 @@ test "child beyond the first tree page can message its direct parent only" {
     var after = try unrelated_store.load(alloc);
     defer after.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 0), after.queue.len);
+}
+
+test "relationship approval publishes its resolution before the child is released" {
+    const alloc = std.testing.allocator;
+    const root_id = "01J00000000000000000000000";
+    var env = try TestEnvironment.init(alloc);
+    defer env.deinit(alloc);
+    try env.createSession(alloc, root_id);
+    var test_authority = TestAuthority{ .root_id = root_id };
+    const host = try Runtime.create(
+        alloc,
+        &env.store,
+        root_id,
+        test_authority.resolver(),
+        .{},
+    );
+    defer host.deinit();
+
+    var parent_command = try domain.validateCommand(alloc, .{ .create = .{
+        .name = "ordering-parent",
+        .mode = .persistent,
+    } });
+    defer parent_command.deinit(alloc);
+    const parent_result = try host.execute(
+        alloc,
+        &parent_command,
+        testOptions(root_id, "create-ordering-parent"),
+    );
+    defer alloc.free(parent_result);
+    const parent_id = try resultChildIdAlloc(alloc, parent_result);
+    defer alloc.free(parent_id);
+
+    var child_command = try domain.validateCommand(alloc, .{ .create = .{
+        .name = "ordering-child",
+        .mode = .persistent,
+    } });
+    defer child_command.deinit(alloc);
+    const child_result = try host.execute(
+        alloc,
+        &child_command,
+        testOptions(root_id, "create-ordering-child"),
+    );
+    defer alloc.free(child_result);
+    const child_id = try resultChildIdAlloc(alloc, child_result);
+    defer alloc.free(child_id);
+
+    var reparent = try domain.validateCommand(alloc, .{ .relationship = .{
+        .action = .reparent,
+        .id = child_id,
+        .parent_id = parent_id,
+    } });
+    defer reparent.deinit(alloc);
+    var reparent_options = testOptions(root_id, "reparent-ordering-child");
+    reparent_options.identity_epoch = try host.issueOperationIdentity(
+        alloc,
+        reparent_options.invocation_id,
+        .model,
+    );
+    const intent = try host.execute(alloc, &reparent, reparent_options);
+    defer alloc.free(intent);
+    try std.testing.expect(std.mem.find(u8, intent, "awaiting_approval") != null);
+    const operation_id = try resultOperationIdAlloc(alloc, intent);
+    defer alloc.free(operation_id);
+    try std.testing.expect(try host.operationIdentityOutstanding(alloc, operation_id));
+
+    // The observer stands in for the lifecycle projection that publishes
+    // `AttentionResolved`. It probes the one piece of state the continuation
+    // itself retires, so its answer says which of the two ran first.
+    const Observation = struct {
+        host: *Runtime,
+        alloc: std.mem.Allocator,
+        operation_id: []const u8,
+        runs: usize = 0,
+        identity_outstanding_when_observed: bool = false,
+
+        fn interface(self: *@This()) worker_runtime.DecisionObserver {
+            return .{ .context = self, .observe_fn = observe };
+        }
+
+        fn observe(raw: *anyopaque, _: u64) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.runs += 1;
+            self.identity_outstanding_when_observed = self.host.operationIdentityOutstanding(
+                self.alloc,
+                self.operation_id,
+            ) catch false;
+        }
+    };
+    var observation = Observation{
+        .host = host,
+        .alloc = alloc,
+        .operation_id = operation_id,
+    };
+
+    try std.testing.expectEqual(
+        approval_registry.ResolveResult.accepted,
+        try host.resolveApprovalObserved(.{
+            .request_id = operation_id,
+            .child_id = child_id,
+            .decision = .once,
+            .timestamp_ms = 11,
+        }, observation.interface()),
+    );
+
+    // Exactly one resolution, published while the relationship was still
+    // pending. Running it after the continuation let a `Stop` or
+    // `PostTurnEnd` from the released child overtake the resolution, and the
+    // reducer then dropped it as unmatched.
+    try std.testing.expectEqual(@as(usize, 1), observation.runs);
+    try std.testing.expect(observation.identity_outstanding_when_observed);
+
+    // The continuation still applied: the edge moved and the identity retired.
+    try std.testing.expect(!try host.operationIdentityOutstanding(alloc, operation_id));
+    var capability = try env.store.openSubagentControlCapabilityReadOnly(
+        alloc,
+        child_id,
+        .{},
+    );
+    defer capability.deinit();
+    const store = control_store.Store{
+        .capability = &capability,
+        .expected_child_id = child_id,
+    };
+    var record = try store.load(alloc);
+    defer record.deinit(alloc);
+    try std.testing.expectEqualStrings(parent_id, record.parent_id.?);
 }

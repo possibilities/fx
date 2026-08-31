@@ -261,6 +261,108 @@ pub const QueueReviewReason = enum {
 
 pub const PromptDraftKind = enum { queued, steering };
 
+pub const PromptAdmissionDisposition = enum { queued, steering };
+
+pub const PromptAdmissionResult = struct {
+    turn_id: u64,
+    disposition: PromptAdmissionDisposition,
+};
+
+pub const DurableInitialAdmissionIdentity = struct {
+    result: PromptAdmissionResult,
+    steer_target_turn_id: ?u64 = null,
+};
+
+pub const DurableInitialAdmissionPhase = enum {
+    decision_only,
+    visible,
+    consumed,
+};
+
+/// One process-local bridge to the durable authority for the first semantic
+/// Work-control admission. The callback runs while `worker_mutex` is held,
+/// after queue capacity is reserved and before the prompt is observable.
+pub const DurableInitialAdmissionHook = struct {
+    context: *anyopaque,
+    matches_initial_fn: *const fn (
+        context: *anyopaque,
+        prompt: []const u8,
+    ) bool,
+    decide_fn: *const fn (
+        context: *anyopaque,
+        prompt: []const u8,
+        proposed: DurableInitialAdmissionIdentity,
+    ) anyerror!DurableInitialAdmissionDecision,
+    transition_fn: *const fn (
+        context: *anyopaque,
+        identity: DurableInitialAdmissionIdentity,
+        phase: DurableInitialAdmissionPhase,
+    ) anyerror!void,
+
+    pub fn decide(
+        self: DurableInitialAdmissionHook,
+        prompt: []const u8,
+        proposed: DurableInitialAdmissionIdentity,
+    ) !DurableInitialAdmissionDecision {
+        return self.decide_fn(self.context, prompt, proposed);
+    }
+
+    pub fn transition(
+        self: DurableInitialAdmissionHook,
+        identity: DurableInitialAdmissionIdentity,
+        phase: DurableInitialAdmissionPhase,
+    ) !void {
+        try self.transition_fn(self.context, identity, phase);
+    }
+
+    pub fn matchesInitial(
+        self: DurableInitialAdmissionHook,
+        prompt: []const u8,
+    ) bool {
+        return self.matches_initial_fn(self.context, prompt);
+    }
+};
+
+pub const DurableInitialAdmissionDecision = union(enum) {
+    cancelled_before_start,
+    admitted: struct {
+        identity: DurableInitialAdmissionIdentity,
+        phase: DurableInitialAdmissionPhase = .decision_only,
+        replayed: bool,
+    },
+};
+
+pub const WorkSnapshotLimits = struct {
+    max_entries: usize,
+    max_text_bytes: usize,
+};
+
+pub const WorkQueueEntry = struct {
+    turn_id: u64,
+    kind: PromptDraftKind,
+    text: []u8,
+    has_images: bool,
+    has_skill_bindings: bool,
+    has_review_draft: bool,
+};
+
+pub const WorkSnapshot = struct {
+    active_turn_id: ?u64,
+    queue_paused: bool,
+    entries: []WorkQueueEntry,
+
+    pub fn deinit(self: WorkSnapshot, alloc: std.mem.Allocator) void {
+        for (self.entries) |entry| alloc.free(entry.text);
+        if (self.entries.len > 0) alloc.free(self.entries);
+    }
+};
+
+pub const QueuedPromptTextUpdate = enum {
+    updated,
+    not_found,
+    carries_non_text_state,
+};
+
 pub const QueuedPromptDraft = struct {
     turn_id: u64,
     kind: PromptDraftKind = .queued,
@@ -467,6 +569,23 @@ pub const PermissionSubmissionResult = enum {
     no_pending,
 };
 
+pub const QuestionSubmissionResult = enum {
+    accepted,
+    no_pending,
+};
+
+/// Runs after a human decision has been reserved under `worker_mutex`, but
+/// before the waiting worker is released. The callback never runs with the
+/// worker mutex held, so lifecycle projections may perform synchronous I/O.
+pub const DecisionObserver = struct {
+    context: *anyopaque,
+    observe_fn: *const fn (*anyopaque, u64) void,
+
+    fn observe(self: DecisionObserver, turn_id: u64) void {
+        self.observe_fn(self.context, turn_id);
+    }
+};
+
 const OwnedQuestionOption = struct {
     label: []u8,
     description: ?[]u8 = null,
@@ -481,6 +600,23 @@ pub const QuestionPromptSource = enum {
     agent_question,
     route_recovery,
     mcp_elicitation,
+};
+
+/// Runs after a pending question has been reserved for presentation under
+/// `worker_mutex`, but before cancellation can resolve it. The callback never
+/// runs with the worker mutex held, so lifecycle projections may perform
+/// synchronous I/O.
+pub const QuestionPresentationObserver = struct {
+    context: *anyopaque,
+    observe_fn: *const fn (*anyopaque, u64, QuestionPromptSource) void,
+
+    fn observe(
+        self: QuestionPresentationObserver,
+        turn_id: u64,
+        source: QuestionPromptSource,
+    ) void {
+        self.observe_fn(self.context, turn_id, source);
+    }
 };
 
 const OwnedQuestionBatch = struct {
@@ -565,22 +701,27 @@ pub const WorkerRuntime = struct {
     turn_start_held: bool = false,
     next_permission_request_id: u64 = 1,
     pending_permission_response: ?permission_request.OwnedPermissionResponse = null,
+    pending_permission_response_reserved: bool = false,
     pending_permission_request_shared: ?permission_request.OwnedPermissionRequest = null,
     pending_permission_review: ?*const diff_mod.FileReview = null,
     pending_permission_waiting: bool = false,
     pending_question_shared: ?OwnedQuestionBatch = null,
     pending_question_response: QuestionResponse = .pending,
+    pending_question_response_reserved: bool = false,
     agent_turn_settings: AgentTurnSettings = .{},
     active_agent_turn_settings: ?AgentTurnSettings = null,
     active_context_snapshot: ?*const context_contract.GatheredContextSnapshot = null,
     active_prompt_snapshot_ownership: ?*ActivePromptSnapshotOwnership = null,
     preserve_prompt_snapshot_turn_id: ?u64 = null,
+    durable_initial_admission_hook: ?DurableInitialAdmissionHook = null,
+    durable_initial_admission: ?DurableInitialAdmissionIdentity = null,
 
     pub fn deinit(self: *WorkerRuntime, alloc: std.mem.Allocator) void {
         if (self.pending_permission_response) |response| {
             self.discardPermissionResponse(response, "deinit");
         }
         self.pending_permission_response = null;
+        self.pending_permission_response_reserved = false;
         if (self.pending_permission_request_shared) |*request| request.deinit(alloc);
         self.pending_permission_request_shared = null;
         self.pending_permission_review = null;
@@ -588,6 +729,7 @@ pub const WorkerRuntime = struct {
         self.pending_question_shared = null;
         freeQuestionResponse(alloc, self.pending_question_response);
         self.pending_question_response = .pending;
+        self.pending_question_response_reserved = false;
 
         for (self.queued_prompts.items) |prompt| discardQueuedPrompt(alloc, prompt, &.{});
         self.queued_prompts.deinit(alloc);
@@ -788,8 +930,34 @@ pub const WorkerRuntime = struct {
         return self.takeEventBatch().events;
     }
 
+    pub const PromptAdmissionObserver = struct {
+        ctx: *anyopaque,
+        report: *const fn (ctx: *anyopaque) void,
+    };
+
     pub fn enqueuePrompt(self: *WorkerRuntime, alloc: std.mem.Allocator, prompt: QueuedPrompt) !void {
-        try self.admitPrompt(alloc, prompt, false);
+        _ = try self.admitPromptObserved(alloc, prompt, false, null);
+    }
+
+    pub fn enqueuePromptObserved(
+        self: *WorkerRuntime,
+        alloc: std.mem.Allocator,
+        prompt: QueuedPrompt,
+        observer: ?PromptAdmissionObserver,
+    ) !void {
+        _ = try self.admitPromptObserved(alloc, prompt, false, observer);
+    }
+
+    /// Installs the process-stable adapter used only by schema-1 Work-control
+    /// queue/steer admission. Call before starting the Work-control listener.
+    pub fn setDurableInitialAdmissionHook(
+        self: *WorkerRuntime,
+        hook: DurableInitialAdmissionHook,
+    ) void {
+        self.worker_mutex.lockUncancelable(io_mod.getIo());
+        defer self.worker_mutex.unlock(io_mod.getIo());
+        std.debug.assert(self.durable_initial_admission_hook == null);
+        self.durable_initial_admission_hook = hook;
     }
 
     /// Transfers `prompt` to the active turn when steering is requested and the
@@ -800,11 +968,75 @@ pub const WorkerRuntime = struct {
         prompt: QueuedPrompt,
         steer_if_active: bool,
     ) !void {
+        _ = try self.admitPromptObserved(alloc, prompt, steer_if_active, null);
+    }
+
+    /// Admits one prompt through the native FIFO and reports the stable turn
+    /// identity and the disposition selected while holding the worker lock.
+    pub fn admitPromptObserved(
+        self: *WorkerRuntime,
+        alloc: std.mem.Allocator,
+        prompt: QueuedPrompt,
+        steer_if_active: bool,
+        observer: ?PromptAdmissionObserver,
+    ) !PromptAdmissionResult {
+        return self.admitPromptObservedInternal(
+            alloc,
+            prompt,
+            steer_if_active,
+            false,
+            observer,
+        );
+    }
+
+    /// Routes the first authenticated Work-control queue/steer request through
+    /// the configured durable decision hook. Ordinary interactive and recovery
+    /// admissions never consult this boundary.
+    pub fn admitWorkControlPromptObserved(
+        self: *WorkerRuntime,
+        alloc: std.mem.Allocator,
+        prompt: QueuedPrompt,
+        steer_if_active: bool,
+    ) !PromptAdmissionResult {
+        return self.admitPromptObservedInternal(
+            alloc,
+            prompt,
+            steer_if_active,
+            true,
+            null,
+        );
+    }
+
+    pub fn admitWorkControlPromptObservedWithObserver(
+        self: *WorkerRuntime,
+        alloc: std.mem.Allocator,
+        prompt: QueuedPrompt,
+        steer_if_active: bool,
+        observer: PromptAdmissionObserver,
+    ) !PromptAdmissionResult {
+        return self.admitPromptObservedInternal(
+            alloc,
+            prompt,
+            steer_if_active,
+            true,
+            observer,
+        );
+    }
+
+    fn admitPromptObservedInternal(
+        self: *WorkerRuntime,
+        alloc: std.mem.Allocator,
+        prompt: QueuedPrompt,
+        steer_if_active: bool,
+        use_durable_initial_admission: bool,
+        observer: ?PromptAdmissionObserver,
+    ) !PromptAdmissionResult {
         var queued = prompt;
         if (queued.turn_id == 0) queued.turn_id = debug_trace.nextTurnId();
 
         self.worker_mutex.lockUncancelable(io_mod.getIo());
-        defer self.worker_mutex.unlock(io_mod.getIo());
+        var locked = true;
+        defer if (locked) self.worker_mutex.unlock(io_mod.getIo());
         if (self.finalization_failure != null) return error.TurnFinalizationDeliveryFailed;
         if (self.worker_stop_requested) return error.WorkerStopped;
         if (queued.recovery_checkpoint != null and
@@ -826,11 +1058,105 @@ pub const WorkerRuntime = struct {
         {
             queued.steer_target_turn_id = self.active_turn_id;
         }
+        const result: PromptAdmissionResult = .{
+            .turn_id = queued.turn_id,
+            .disposition = if (queued.steer_target_turn_id != null) .steering else .queued,
+        };
+        if (use_durable_initial_admission) {
+            if (self.durable_initial_admission_hook) |hook| {
+                // Once the correlated work has durable delivery authority,
+                // unrelated later
+                // Work-control requests resume the ordinary path. Exact
+                // initial-work retries must always revisit the durable
+                // decision, including after the first response was lost.
+                if (self.durable_initial_admission != null and
+                    !hook.matchesInitial(queued.prompt))
+                {
+                    try self.enqueuePromptLocked(alloc, queued);
+                    self.worker_mutex.unlock(io_mod.getIo());
+                    locked = false;
+                    if (observer) |admitted| admitted.report(admitted.ctx);
+                    return result;
+                }
+                // No allocation or fallible queue mutation may occur after the
+                // durable decision and before the prompt becomes observable.
+                try self.queued_prompts.ensureUnusedCapacity(alloc, 1);
+                const durable = try hook.decide(queued.prompt, .{
+                    .result = result,
+                    .steer_target_turn_id = queued.steer_target_turn_id,
+                });
+                switch (durable) {
+                    .cancelled_before_start => return error.InitialAdmissionCancelled,
+                    .admitted => |admission| {
+                        const identity = admission.identity;
+                        if (identity.result.turn_id == 0 or
+                            (identity.result.disposition == .queued and identity.steer_target_turn_id != null) or
+                            (identity.result.disposition == .steering and (identity.steer_target_turn_id orelse 0) == 0))
+                        {
+                            return error.InvalidDurableAdmissionDecision;
+                        }
+                        if (admission.phase == .consumed) {
+                            freeQueuedPrompt(alloc, queued);
+                            self.durable_initial_admission = identity;
+                            return identity.result;
+                        }
+                        if (self.containsTurnLocked(identity.result.turn_id)) {
+                            const recovered_phase: DurableInitialAdmissionPhase =
+                                if (self.worker_processing and self.active_turn_id == identity.result.turn_id)
+                                    .consumed
+                                else
+                                    .visible;
+                            try hook.transition(identity, recovered_phase);
+                            freeQueuedPrompt(alloc, queued);
+                            self.durable_initial_admission = identity;
+                            return identity.result;
+                        }
+
+                        queued.turn_id = identity.result.turn_id;
+                        switch (identity.result.disposition) {
+                            .queued => queued.steer_target_turn_id = null,
+                            .steering => {
+                                const target = identity.steer_target_turn_id.?;
+                                if (!self.worker_processing or self.active_turn_id != target) {
+                                    // Recovery may demote guidance whose exact
+                                    // target is gone, but it must never steer a
+                                    // different active Turn or lose the work.
+                                    if (!admission.replayed) return error.InvalidDurableAdmissionDecision;
+                                    queued.steer_target_turn_id = null;
+                                } else {
+                                    queued.steer_target_turn_id = target;
+                                }
+                            },
+                        }
+                        try hook.transition(identity, .visible);
+                        self.enqueuePromptAssumeCapacityLocked(queued);
+                        self.durable_initial_admission = identity;
+                        self.worker_mutex.unlock(io_mod.getIo());
+                        locked = false;
+                        if (observer) |admitted| admitted.report(admitted.ctx);
+                        return identity.result;
+                    },
+                }
+            }
+        }
         try self.enqueuePromptLocked(alloc, queued);
+        self.worker_mutex.unlock(io_mod.getIo());
+        locked = false;
+        if (observer) |admitted| admitted.report(admitted.ctx);
+        return result;
     }
 
     fn enqueuePromptLocked(self: *WorkerRuntime, alloc: std.mem.Allocator, queued: QueuedPrompt) !void {
         try self.queued_prompts.append(alloc, queued);
+        self.finishPromptEnqueueLocked(queued);
+    }
+
+    fn enqueuePromptAssumeCapacityLocked(self: *WorkerRuntime, queued: QueuedPrompt) void {
+        self.queued_prompts.appendAssumeCapacity(queued);
+        self.finishPromptEnqueueLocked(queued);
+    }
+
+    fn finishPromptEnqueueLocked(self: *WorkerRuntime, queued: QueuedPrompt) void {
         self.queued_prompt_count += 1;
         debug_trace.logf(
             "worker",
@@ -845,6 +1171,25 @@ pub const WorkerRuntime = struct {
             .{ queued.prompt.len, self.queued_prompt_count, if (queued.agent_settings.fast_mode) "true" else "false", queued.agent_settings.effort.label() },
         );
         self.worker_cond.broadcast(io_mod.getIo());
+    }
+
+    fn containsTurnLocked(self: *const WorkerRuntime, turn_id: u64) bool {
+        if (self.worker_processing and self.active_turn_id == turn_id) return true;
+        for (self.queued_prompts.items) |queued| {
+            if (queued.turn_id == turn_id) return true;
+        }
+        return false;
+    }
+
+    fn markDurableInitialAdmissionConsumedLocked(
+        self: *WorkerRuntime,
+        prompt: QueuedPrompt,
+    ) !void {
+        const identity = self.durable_initial_admission orelse return;
+        if (prompt.turn_id != identity.result.turn_id) return;
+        const hook = self.durable_initial_admission_hook orelse
+            return error.InvalidDurableAdmissionDecision;
+        try hook.transition(identity, .consumed);
     }
 
     /// Returns allocator-owned steering text for `turn_id`, removing only those
@@ -887,6 +1232,10 @@ pub const WorkerRuntime = struct {
             event_count += 1;
         }
         try self.worker_events.ensureUnusedCapacity(alloc, events.len);
+        for (self.queued_prompts.items) |prompt| {
+            if (prompt.steer_target_turn_id != turn_id) continue;
+            try self.markDurableInitialAdmissionConsumedLocked(prompt);
+        }
         for (events) |event| self.worker_events.appendAssumeCapacity(event);
         alloc.free(events);
 
@@ -998,6 +1347,111 @@ pub const WorkerRuntime = struct {
             };
         }
         return drafts;
+    }
+
+    /// Returns one atomic, allocator-owned view of active and queued work.
+    /// Bounds are checked while holding the same lock that owns admission so a
+    /// controller never receives a partial queue.
+    pub fn snapshotWork(
+        self: *WorkerRuntime,
+        alloc: std.mem.Allocator,
+        limits: WorkSnapshotLimits,
+    ) !WorkSnapshot {
+        self.worker_mutex.lockUncancelable(io_mod.getIo());
+        defer self.worker_mutex.unlock(io_mod.getIo());
+
+        if (self.queued_prompts.items.len > limits.max_entries) {
+            return error.WorkSnapshotEntryLimitExceeded;
+        }
+        var text_bytes: usize = 0;
+        for (self.queued_prompts.items) |queued| {
+            const text = if (queued.review_draft) |review| review.input else queued.prompt;
+            text_bytes = std.math.add(usize, text_bytes, text.len) catch
+                return error.WorkSnapshotTextLimitExceeded;
+            if (text_bytes > limits.max_text_bytes) {
+                return error.WorkSnapshotTextLimitExceeded;
+            }
+        }
+
+        if (self.queued_prompts.items.len == 0) return .{
+            .active_turn_id = if (self.worker_processing and self.active_turn_id != 0)
+                self.active_turn_id
+            else
+                null,
+            .queue_paused = self.queue_admission != null,
+            .entries = &.{},
+        };
+
+        const entries = try alloc.alloc(WorkQueueEntry, self.queued_prompts.items.len);
+        var filled: usize = 0;
+        errdefer {
+            for (entries[0..filled]) |entry| alloc.free(entry.text);
+            alloc.free(entries);
+        }
+        while (filled < self.queued_prompts.items.len) : (filled += 1) {
+            const queued = self.queued_prompts.items[filled];
+            const text = if (queued.review_draft) |review| review.input else queued.prompt;
+            entries[filled] = .{
+                .turn_id = queued.turn_id,
+                .kind = if (queued.steer_target_turn_id != null) .steering else .queued,
+                .text = try alloc.dupe(u8, text),
+                .has_images = queued.images.len > 0,
+                .has_skill_bindings = queued.skill_bindings.len > 0 or queued.skill_display_spans.len > 0,
+                .has_review_draft = queued.review_draft != null,
+            };
+        }
+        return .{
+            .active_turn_id = if (self.worker_processing and self.active_turn_id != 0)
+                self.active_turn_id
+            else
+                null,
+            .queue_paused = self.queue_admission != null,
+            .entries = entries,
+        };
+    }
+
+    /// Replaces only plain-text queued work. The allocation occurs before the
+    /// lock; identity and compatibility are then checked and swapped atomically.
+    pub fn updateQueuedPromptText(
+        self: *WorkerRuntime,
+        alloc: std.mem.Allocator,
+        turn_id: u64,
+        text: []const u8,
+    ) !QueuedPromptTextUpdate {
+        const replacement = try alloc.dupe(u8, text);
+        var old: ?[]u8 = null;
+
+        self.worker_mutex.lockUncancelable(io_mod.getIo());
+        for (self.queued_prompts.items) |*queued| {
+            if (queued.turn_id != turn_id) continue;
+            if (queued.images.len > 0 or
+                queued.skill_bindings.len > 0 or
+                queued.skill_display_spans.len > 0 or
+                queued.review_draft != null)
+            {
+                self.worker_mutex.unlock(io_mod.getIo());
+                alloc.free(replacement);
+                return .carries_non_text_state;
+            }
+            old = queued.prompt;
+            queued.prompt = replacement;
+            debug_trace.eventf(
+                "worker",
+                "work_control_queue_updated",
+                .{ .turn_id = turn_id },
+                "prompt_bytes={d}",
+                .{replacement.len},
+            );
+            break;
+        }
+        self.worker_mutex.unlock(io_mod.getIo());
+
+        if (old) |owned| {
+            alloc.free(owned);
+            return .updated;
+        }
+        alloc.free(replacement);
+        return .not_found;
     }
 
     pub fn replaceQueuedPromptDrafts(
@@ -1156,28 +1610,40 @@ pub const WorkerRuntime = struct {
         if (self.worker_stop_requested or self.queued_prompts.items.len == 0) return null;
 
         const queued = self.queued_prompts.items[0];
+        var begin_event: ?WorkerEvent = null;
+        errdefer if (begin_event) |event| freeWorkerEvent(alloc, event);
         if (queued.recovery_checkpoint == null and queued.user_prompt_already_presented) {
-            try self.worker_events.append(alloc, .{
-                .begin_presented_prompt = queued.turn_id,
-            });
+            begin_event = .{ .begin_presented_prompt = queued.turn_id };
         } else if (queued.recovery_checkpoint == null) {
             const begin_prompt = try types.dupeUserTurn(alloc, .{ .text = queued.prompt, .images = queued.images });
-            errdefer types.freeUserTurn(alloc, begin_prompt);
+            var begin_prompt_owned = true;
+            errdefer if (begin_prompt_owned) types.freeUserTurn(alloc, begin_prompt);
             if (queued.skill_bindings.len > 0 or queued.skill_display_spans.len > 0) {
                 const skill_bindings = try dupeSkillBindings(alloc, queued.skill_bindings);
-                errdefer freeSkillBindings(alloc, skill_bindings);
+                var skill_bindings_owned = true;
+                errdefer if (skill_bindings_owned) freeSkillBindings(alloc, skill_bindings);
                 const skill_display_spans = try dupeSkillDisplaySpans(alloc, queued.skill_display_spans);
-                errdefer freeSkillDisplaySpans(alloc, skill_display_spans);
-                try self.worker_events.append(alloc, .{
-                    .begin_prompt_with_skill_bindings = .{
-                        .prompt = begin_prompt,
-                        .skill_bindings = skill_bindings,
-                        .skill_display_spans = skill_display_spans,
-                    },
-                });
+                var skill_display_spans_owned = true;
+                errdefer if (skill_display_spans_owned) freeSkillDisplaySpans(alloc, skill_display_spans);
+                begin_event = .{ .begin_prompt_with_skill_bindings = .{
+                    .prompt = begin_prompt,
+                    .skill_bindings = skill_bindings,
+                    .skill_display_spans = skill_display_spans,
+                } };
+                begin_prompt_owned = false;
+                skill_bindings_owned = false;
+                skill_display_spans_owned = false;
             } else {
-                try self.worker_events.append(alloc, .{ .begin_prompt = begin_prompt });
+                begin_event = .{ .begin_prompt = begin_prompt };
+                begin_prompt_owned = false;
             }
+        }
+
+        if (begin_event != null) try self.worker_events.ensureUnusedCapacity(alloc, 1);
+        try self.markDurableInitialAdmissionConsumedLocked(queued);
+        if (begin_event) |event| {
+            self.worker_events.appendAssumeCapacity(event);
+            begin_event = null;
         }
 
         var job = self.queued_prompts.orderedRemove(0);
@@ -1648,6 +2114,7 @@ pub const WorkerRuntime = struct {
             self.discardPermissionResponse(response, "request_replaced");
         }
         self.pending_permission_response = null;
+        self.pending_permission_response_reserved = false;
         self.pending_permission_waiting = true;
 
         if (observer) |value| {
@@ -1664,14 +2131,17 @@ pub const WorkerRuntime = struct {
             };
         }
 
-        while (self.pending_permission_response == null and !self.worker_stop_requested) {
-            self.worker_cond.wait(io_mod.getIo(), &self.worker_mutex) catch break;
+        while (self.pending_permission_response == null and
+            (!self.worker_stop_requested or self.pending_permission_response_reserved))
+        {
+            self.worker_cond.waitUncancelable(io_mod.getIo(), &self.worker_mutex);
         }
 
         const response = self.pending_permission_response orelse
             permission_request.OwnedPermissionResponse.init(alloc, .deny, null);
         self.pending_permission_waiting = false;
         self.pending_permission_response = null;
+        self.pending_permission_response_reserved = false;
         if (self.pending_permission_request_shared) |*old| {
             old.deinit(alloc);
             self.pending_permission_request_shared = null;
@@ -1685,15 +2155,25 @@ pub const WorkerRuntime = struct {
         expected_request_id: u64,
         response: permission_request.OwnedPermissionResponse,
     ) PermissionSubmissionResult {
-        self.worker_mutex.lockUncancelable(io_mod.getIo());
-        defer self.worker_mutex.unlock(io_mod.getIo());
+        return self.submitPermissionResponseObserved(
+            expected_request_id,
+            response,
+            null,
+        );
+    }
 
-        if (self.permissionSubmissionBlockedLocked(expected_request_id)) |blocked| {
-            self.discardPermissionResponse(response, @tagName(blocked));
-            return blocked;
-        }
-        std.debug.assert(self.resolvePendingPermissionLocked(response));
-        return .accepted;
+    pub fn submitPermissionResponseObserved(
+        self: *WorkerRuntime,
+        expected_request_id: u64,
+        response: permission_request.OwnedPermissionResponse,
+        observer: ?DecisionObserver,
+    ) PermissionSubmissionResult {
+        return self.submitPermissionResponseAfterCommitObserved(
+            expected_request_id,
+            response,
+            null,
+            observer,
+        ) catch unreachable;
     }
 
     pub const PermissionCommitError = error{
@@ -1716,18 +2196,51 @@ pub const WorkerRuntime = struct {
         response: permission_request.OwnedPermissionResponse,
         commit: ?PermissionCommit,
     ) PermissionCommitError!PermissionSubmissionResult {
-        self.worker_mutex.lockUncancelable(io_mod.getIo());
-        defer self.worker_mutex.unlock(io_mod.getIo());
+        return self.submitPermissionResponseAfterCommitObserved(
+            expected_request_id,
+            response,
+            commit,
+            null,
+        );
+    }
 
+    /// Reserves a valid response and its active turn identity, runs the
+    /// lifecycle observer without `worker_mutex`, then publishes the response
+    /// and wakes the waiter. An unrelated broadcast or stop request cannot let
+    /// the waiter resume while the observer is in flight.
+    pub fn submitPermissionResponseAfterCommitObserved(
+        self: *WorkerRuntime,
+        expected_request_id: u64,
+        response: permission_request.OwnedPermissionResponse,
+        commit: ?PermissionCommit,
+        observer: ?DecisionObserver,
+    ) PermissionCommitError!PermissionSubmissionResult {
+        self.worker_mutex.lockUncancelable(io_mod.getIo());
         if (self.permissionSubmissionBlockedLocked(expected_request_id)) |blocked| {
+            self.worker_mutex.unlock(io_mod.getIo());
             self.discardPermissionResponse(response, @tagName(blocked));
             return blocked;
         }
         if (commit) |effect| effect.commit_fn(effect.context) catch |err| {
+            self.worker_mutex.unlock(io_mod.getIo());
             self.discardPermissionResponse(response, "commit_failed");
             return err;
         };
-        std.debug.assert(self.resolvePendingPermissionLocked(response));
+        self.pending_permission_response_reserved = true;
+        const turn_id = self.active_turn_id;
+        self.worker_mutex.unlock(io_mod.getIo());
+
+        if (observer) |value| value.observe(turn_id);
+
+        self.worker_mutex.lockUncancelable(io_mod.getIo());
+        std.debug.assert(self.pending_permission_response_reserved);
+        std.debug.assert(self.pending_permission_waiting);
+        std.debug.assert(self.pending_permission_request_shared != null);
+        std.debug.assert(self.pending_permission_response == null);
+        self.pending_permission_response_reserved = false;
+        self.pending_permission_response = response;
+        self.worker_cond.broadcast(io_mod.getIo());
+        self.worker_mutex.unlock(io_mod.getIo());
         return .accepted;
     }
 
@@ -1736,7 +2249,8 @@ pub const WorkerRuntime = struct {
         expected_request_id: u64,
     ) ?PermissionSubmissionResult {
         if (!self.permissionRequestAwaitedLocked() or
-            self.pending_permission_response != null)
+            self.pending_permission_response != null or
+            self.pending_permission_response_reserved)
         {
             return .no_pending;
         }
@@ -1770,7 +2284,8 @@ pub const WorkerRuntime = struct {
         self: *const WorkerRuntime,
     ) bool {
         return self.permissionRequestAwaitedLocked() and
-            self.pending_permission_response == null;
+            self.pending_permission_response == null and
+            !self.pending_permission_response_reserved;
     }
 
     fn resolvePendingPermissionLocked(
@@ -1831,16 +2346,20 @@ pub const WorkerRuntime = struct {
         self.pending_question_shared = owned;
         freeQuestionResponse(alloc, self.pending_question_response);
         self.pending_question_response = .pending;
+        self.pending_question_response_reserved = false;
         self.worker_events.append(alloc, .question_requested) catch |err| {
             self.pending_question_shared = null;
             self.pending_question_response = .pending;
+            self.pending_question_response_reserved = false;
             return err;
         };
         owns_pending_question = false;
         self.worker_cond.broadcast(io_mod.getIo());
 
-        while (self.pending_question_response == .pending and !self.worker_stop_requested) {
-            self.worker_cond.wait(io_mod.getIo(), &self.worker_mutex) catch break;
+        while (self.pending_question_response == .pending and
+            (!self.worker_stop_requested or self.pending_question_response_reserved))
+        {
+            self.worker_cond.waitUncancelable(io_mod.getIo(), &self.worker_mutex);
         }
 
         if (self.pending_question_shared) |pending| {
@@ -1850,6 +2369,7 @@ pub const WorkerRuntime = struct {
 
         const response = self.pending_question_response;
         self.pending_question_response = .pending;
+        self.pending_question_response_reserved = false;
         return switch (response) {
             .answered => |labels| labels,
             .cancelled, .pending => null,
@@ -1857,6 +2377,17 @@ pub const WorkerRuntime = struct {
     }
 
     pub fn submitQuestionBatchAnswer(self: *WorkerRuntime, alloc: std.mem.Allocator, answers: ?[]const []const u8) !void {
+        _ = try self.submitQuestionBatchAnswerObserved(alloc, answers, null);
+    }
+
+    /// Reserves one accepted answer, observes its lifecycle transition without
+    /// `worker_mutex`, and only then releases the waiting worker.
+    pub fn submitQuestionBatchAnswerObserved(
+        self: *WorkerRuntime,
+        alloc: std.mem.Allocator,
+        answers: ?[]const []const u8,
+        observer: ?DecisionObserver,
+    ) !QuestionSubmissionResult {
         var new_response: QuestionResponse = .cancelled;
         if (answers) |labels| {
             const dup = try alloc.alloc([]u8, labels.len);
@@ -1870,30 +2401,97 @@ pub const WorkerRuntime = struct {
             new_response = .{ .answered = dup };
         }
 
-        self.worker_mutex.lockUncancelable(io_mod.getIo());
-        defer self.worker_mutex.unlock(io_mod.getIo());
-        if (self.pending_question_shared == null or self.pending_question_response != .pending) {
-            freeQuestionResponse(alloc, new_response);
-            debug_trace.logf("worker", "ignored late question response pending=false", .{});
-            return;
-        }
-        freeQuestionResponse(alloc, self.pending_question_response);
-        self.pending_question_response = new_response;
-        self.worker_cond.broadcast(io_mod.getIo());
+        return self.submitQuestionResponseObserved(alloc, new_response, observer);
     }
 
-    pub fn cancelPendingQuestionBatch(self: *WorkerRuntime) bool {
+    /// Reserves an accepted cancellation, observes its lifecycle transition,
+    /// and only then releases the waiting worker. Unlike answer submission,
+    /// cancellation owns no response allocation and cannot fail.
+    pub fn cancelPendingQuestionBatchObserved(
+        self: *WorkerRuntime,
+        observer: ?DecisionObserver,
+    ) QuestionSubmissionResult {
+        return self.submitQuestionResponseObserved(
+            std.heap.c_allocator,
+            .cancelled,
+            observer,
+        );
+    }
+
+    fn submitQuestionResponseObserved(
+        self: *WorkerRuntime,
+        alloc: std.mem.Allocator,
+        new_response: QuestionResponse,
+        observer: ?DecisionObserver,
+    ) QuestionSubmissionResult {
         self.worker_mutex.lockUncancelable(io_mod.getIo());
-        defer self.worker_mutex.unlock(io_mod.getIo());
-        if (self.pending_question_shared == null or self.pending_question_response != .pending) return false;
-        self.pending_question_response = .cancelled;
+        if (self.pending_question_shared == null or
+            self.pending_question_response != .pending or
+            self.pending_question_response_reserved or
+            self.worker_stop_requested)
+        {
+            self.worker_mutex.unlock(io_mod.getIo());
+            freeQuestionResponse(alloc, new_response);
+            debug_trace.logf("worker", "ignored late question response pending=false", .{});
+            return .no_pending;
+        }
+        self.pending_question_response_reserved = true;
+        const turn_id = self.active_turn_id;
+        self.worker_mutex.unlock(io_mod.getIo());
+
+        if (observer) |value| value.observe(turn_id);
+
+        self.worker_mutex.lockUncancelable(io_mod.getIo());
+        std.debug.assert(self.pending_question_response_reserved);
+        std.debug.assert(self.pending_question_shared != null);
+        std.debug.assert(self.pending_question_response == .pending);
+        self.pending_question_response_reserved = false;
+        self.pending_question_response = new_response;
         self.worker_cond.broadcast(io_mod.getIo());
+        self.worker_mutex.unlock(io_mod.getIo());
+        return .accepted;
+    }
+
+    /// Reserves the still-pending question while its interactive presentation
+    /// is observed. Accepted answers and cancellations cannot overtake the
+    /// observation; a stop that arrives during it is woken again on release.
+    pub fn presentPendingQuestionBatchObserved(
+        self: *WorkerRuntime,
+        observer: QuestionPresentationObserver,
+    ) bool {
+        self.worker_mutex.lockUncancelable(io_mod.getIo());
+        const pending = self.pending_question_shared orelse {
+            self.worker_mutex.unlock(io_mod.getIo());
+            return false;
+        };
+        if (self.worker_stop_requested or
+            self.pending_question_response != .pending or
+            self.pending_question_response_reserved)
+        {
+            self.worker_mutex.unlock(io_mod.getIo());
+            return false;
+        }
+        self.pending_question_response_reserved = true;
+        const turn_id = self.active_turn_id;
+        const source = pending.source;
+        self.worker_mutex.unlock(io_mod.getIo());
+
+        observer.observe(turn_id, source);
+
+        self.worker_mutex.lockUncancelable(io_mod.getIo());
+        std.debug.assert(self.pending_question_response_reserved);
+        std.debug.assert(self.pending_question_shared != null);
+        std.debug.assert(self.pending_question_response == .pending);
+        self.pending_question_response_reserved = false;
+        self.worker_cond.broadcast(io_mod.getIo());
+        self.worker_mutex.unlock(io_mod.getIo());
         return true;
     }
 
     pub fn snapshotPendingQuestionBatch(self: *WorkerRuntime, alloc: std.mem.Allocator) !?PendingQuestionBatchSnapshot {
         self.worker_mutex.lockUncancelable(io_mod.getIo());
         defer self.worker_mutex.unlock(io_mod.getIo());
+        if (self.pending_question_response != .pending) return null;
         const pending = self.pending_question_shared orelse return null;
         return try dupePendingBatchSnapshot(alloc, pending);
     }
@@ -3147,6 +3745,412 @@ test "active prompt admission drains steering in FIFO order" {
     try std.testing.expectEqualStrings("second", runtime.worker_events.items[1].append_user_feedback);
 }
 
+const DurableAdmissionProbe = struct {
+    calls: usize = 0,
+    transition_calls: usize = 0,
+    decision: DurableInitialAdmissionDecision,
+    expected_prompt: []const u8,
+    phase: DurableInitialAdmissionPhase = .decision_only,
+    fail_transition_once: ?DurableInitialAdmissionPhase = null,
+
+    fn decide(
+        raw: *anyopaque,
+        prompt: []const u8,
+        _: DurableInitialAdmissionIdentity,
+    ) !DurableInitialAdmissionDecision {
+        const self: *DurableAdmissionProbe = @ptrCast(@alignCast(raw));
+        self.calls += 1;
+        try std.testing.expectEqualStrings(self.expected_prompt, prompt);
+        var decision = self.decision;
+        if (decision == .admitted) decision.admitted.phase = self.phase;
+        return decision;
+    }
+
+    fn transition(
+        raw: *anyopaque,
+        identity: DurableInitialAdmissionIdentity,
+        phase: DurableInitialAdmissionPhase,
+    ) !void {
+        const self: *DurableAdmissionProbe = @ptrCast(@alignCast(raw));
+        self.transition_calls += 1;
+        const expected = self.decision.admitted.identity;
+        try std.testing.expectEqual(expected.result.turn_id, identity.result.turn_id);
+        try std.testing.expectEqual(expected.result.disposition, identity.result.disposition);
+        try std.testing.expectEqual(expected.steer_target_turn_id, identity.steer_target_turn_id);
+        if (self.fail_transition_once == phase) {
+            self.fail_transition_once = null;
+            return error.InjectedAdmissionTransitionFailure;
+        }
+        if (@intFromEnum(phase) < @intFromEnum(self.phase)) {
+            return error.InvalidDurableAdmissionDecision;
+        }
+        self.phase = phase;
+    }
+
+    fn matchesInitial(raw: *anyopaque, prompt: []const u8) bool {
+        const self: *DurableAdmissionProbe = @ptrCast(@alignCast(raw));
+        return std.mem.eql(u8, self.expected_prompt, prompt);
+    }
+
+    fn hook(self: *DurableAdmissionProbe) DurableInitialAdmissionHook {
+        return .{
+            .context = self,
+            .matches_initial_fn = matchesInitial,
+            .decide_fn = decide,
+            .transition_fn = transition,
+        };
+    }
+};
+
+test "durable initial Work-control admission reserves capacity before decision and publishes exact Turn" {
+    const alloc = std.testing.allocator;
+    var runtime = WorkerRuntime{};
+    defer runtime.deinit(alloc);
+    var probe = DurableAdmissionProbe{
+        .decision = .{ .admitted = .{
+            .identity = .{ .result = .{ .turn_id = 991, .disposition = .queued } },
+            .replayed = false,
+        } },
+        .expected_prompt = "durable initial work",
+    };
+    runtime.setDurableInitialAdmissionHook(probe.hook());
+
+    const prompt = try makePrompt(alloc, probe.expected_prompt, "model");
+    var failing = std.testing.FailingAllocator.init(alloc, .{ .fail_index = 0 });
+    try std.testing.expectError(
+        error.OutOfMemory,
+        runtime.admitWorkControlPromptObserved(failing.allocator(), prompt, false),
+    );
+    try std.testing.expectEqual(@as(usize, 0), probe.calls);
+    freeQueuedPrompt(alloc, prompt);
+
+    probe.fail_transition_once = .visible;
+    const decision_only_prompt = try makePrompt(alloc, probe.expected_prompt, "model");
+    try std.testing.expectError(
+        error.InjectedAdmissionTransitionFailure,
+        runtime.admitWorkControlPromptObserved(alloc, decision_only_prompt, false),
+    );
+    freeQueuedPrompt(alloc, decision_only_prompt);
+    try std.testing.expectEqual(DurableInitialAdmissionPhase.decision_only, probe.phase);
+    try std.testing.expectEqual(@as(usize, 0), runtime.queued_prompts.items.len);
+
+    const admitted = try runtime.admitWorkControlPromptObserved(
+        alloc,
+        try makePrompt(alloc, probe.expected_prompt, "model"),
+        false,
+    );
+    try std.testing.expectEqual(@as(u64, 991), admitted.turn_id);
+    try std.testing.expectEqual(PromptAdmissionDisposition.queued, admitted.disposition);
+    try std.testing.expectEqual(@as(usize, 1), runtime.queued_prompts.items.len);
+    try std.testing.expectEqual(@as(u64, 991), runtime.queued_prompts.items[0].turn_id);
+    try std.testing.expectEqual(DurableInitialAdmissionPhase.visible, probe.phase);
+    try std.testing.expectEqual(@as(usize, 2), probe.calls);
+}
+
+test "durable initial Work-control cancellation is permanent and exact admitted retries never enqueue twice" {
+    const alloc = std.testing.allocator;
+    {
+        var runtime = WorkerRuntime{};
+        defer runtime.deinit(alloc);
+        var cancelled = DurableAdmissionProbe{
+            .decision = .cancelled_before_start,
+            .expected_prompt = "cancelled work",
+        };
+        runtime.setDurableInitialAdmissionHook(cancelled.hook());
+        const prompt = try makePrompt(alloc, cancelled.expected_prompt, "model");
+        defer freeQueuedPrompt(alloc, prompt);
+        try std.testing.expectError(
+            error.InitialAdmissionCancelled,
+            runtime.admitWorkControlPromptObserved(alloc, prompt, false),
+        );
+        const retry = try makePrompt(alloc, cancelled.expected_prompt, "model");
+        defer freeQueuedPrompt(alloc, retry);
+        try std.testing.expectError(
+            error.InitialAdmissionCancelled,
+            runtime.admitWorkControlPromptObserved(alloc, retry, false),
+        );
+        try std.testing.expectEqual(@as(usize, 0), runtime.queued_prompts.items.len);
+        try std.testing.expectEqual(@as(usize, 2), cancelled.calls);
+    }
+
+    {
+        var runtime = WorkerRuntime{};
+        defer runtime.deinit(alloc);
+        var admitted = DurableAdmissionProbe{
+            .decision = .{ .admitted = .{
+                .identity = .{ .result = .{ .turn_id = 992, .disposition = .queued } },
+                .replayed = true,
+            } },
+            .expected_prompt = "replayed work",
+        };
+        runtime.setDurableInitialAdmissionHook(admitted.hook());
+        const first = try runtime.admitWorkControlPromptObserved(
+            alloc,
+            try makePrompt(alloc, admitted.expected_prompt, "model"),
+            false,
+        );
+        const replay = try runtime.admitWorkControlPromptObserved(
+            alloc,
+            try makePrompt(alloc, admitted.expected_prompt, "model"),
+            false,
+        );
+        try std.testing.expectEqual(first.turn_id, replay.turn_id);
+        try std.testing.expectEqual(first.disposition, replay.disposition);
+        try std.testing.expectEqual(@as(usize, 1), runtime.queued_prompts.items.len);
+        const consumed = (try runtime.tryTakeNextPrompt(alloc)).?;
+        freeQueuedPrompt(alloc, consumed);
+        try std.testing.expectEqual(DurableInitialAdmissionPhase.consumed, admitted.phase);
+        const later = try runtime.admitWorkControlPromptObserved(
+            alloc,
+            try makePrompt(alloc, "later ordinary work", "model"),
+            false,
+        );
+        try std.testing.expectEqual(@as(u64, 992), first.turn_id);
+        try std.testing.expect(later.turn_id != first.turn_id);
+        try std.testing.expectEqual(@as(usize, 1), runtime.queued_prompts.items.len);
+        try std.testing.expectEqual(@as(usize, 2), admitted.calls);
+
+        var restarted = WorkerRuntime{};
+        defer restarted.deinit(alloc);
+        restarted.setDurableInitialAdmissionHook(admitted.hook());
+        const consumed_replay = try restarted.admitWorkControlPromptObserved(
+            alloc,
+            try makePrompt(alloc, admitted.expected_prompt, "model"),
+            false,
+        );
+        try std.testing.expectEqual(first.turn_id, consumed_replay.turn_id);
+        try std.testing.expectEqual(@as(usize, 0), restarted.queued_prompts.items.len);
+        try std.testing.expectEqual(@as(usize, 3), admitted.calls);
+    }
+}
+
+test "durable initial Work-control recovery reuses an already-present Turn" {
+    const alloc = std.testing.allocator;
+    var runtime = WorkerRuntime{};
+    defer runtime.deinit(alloc);
+    runtime.worker_processing = true;
+    runtime.active_turn_id = 993;
+    var replay = DurableAdmissionProbe{
+        .decision = .{ .admitted = .{
+            .identity = .{ .result = .{ .turn_id = 993, .disposition = .queued } },
+            .replayed = true,
+        } },
+        .expected_prompt = "recovered initial work",
+    };
+    runtime.setDurableInitialAdmissionHook(replay.hook());
+
+    const recovered = try runtime.admitWorkControlPromptObserved(
+        alloc,
+        try makePrompt(alloc, replay.expected_prompt, "model"),
+        false,
+    );
+    try std.testing.expectEqual(@as(u64, 993), recovered.turn_id);
+    try std.testing.expectEqual(@as(usize, 0), runtime.queued_prompts.items.len);
+    try std.testing.expectEqual(@as(usize, 1), replay.calls);
+    try std.testing.expectEqual(DurableInitialAdmissionPhase.consumed, replay.phase);
+
+    _ = try runtime.admitWorkControlPromptObserved(
+        alloc,
+        try makePrompt(alloc, "later ordinary work", "model"),
+        false,
+    );
+    try std.testing.expectEqual(@as(usize, 1), runtime.queued_prompts.items.len);
+    try std.testing.expectEqual(@as(usize, 1), replay.calls);
+
+    var steering = DurableAdmissionProbe{
+        .decision = .{ .admitted = .{
+            .identity = .{
+                .result = .{ .turn_id = 994, .disposition = .steering },
+                .steer_target_turn_id = 41,
+            },
+            .replayed = false,
+        } },
+        .expected_prompt = "recovered steering work",
+        .fail_transition_once = .visible,
+    };
+    {
+        var first_process = WorkerRuntime{};
+        defer first_process.deinit(alloc);
+        first_process.worker_processing = true;
+        first_process.active_turn_id = 41;
+        first_process.setDurableInitialAdmissionHook(steering.hook());
+        const decision_only = try makePrompt(alloc, steering.expected_prompt, "model");
+        try std.testing.expectError(
+            error.InjectedAdmissionTransitionFailure,
+            first_process.admitWorkControlPromptObserved(alloc, decision_only, true),
+        );
+        freeQueuedPrompt(alloc, decision_only);
+        try std.testing.expectEqual(DurableInitialAdmissionPhase.decision_only, steering.phase);
+        const visible = try first_process.admitWorkControlPromptObserved(
+            alloc,
+            try makePrompt(alloc, steering.expected_prompt, "model"),
+            true,
+        );
+        try std.testing.expectEqual(PromptAdmissionDisposition.steering, visible.disposition);
+        try std.testing.expectEqual(@as(?u64, 41), first_process.queued_prompts.items[0].steer_target_turn_id);
+        try std.testing.expectEqual(DurableInitialAdmissionPhase.visible, steering.phase);
+    }
+
+    steering.decision.admitted.replayed = true;
+    {
+        var recovered_process = WorkerRuntime{};
+        defer recovered_process.deinit(alloc);
+        recovered_process.worker_processing = true;
+        recovered_process.active_turn_id = 42;
+        recovered_process.setDurableInitialAdmissionHook(steering.hook());
+        const recovered_steering = try recovered_process.admitWorkControlPromptObserved(
+            alloc,
+            try makePrompt(alloc, steering.expected_prompt, "model"),
+            true,
+        );
+        try std.testing.expectEqual(PromptAdmissionDisposition.steering, recovered_steering.disposition);
+        try std.testing.expectEqual(@as(usize, 1), recovered_process.queued_prompts.items.len);
+        try std.testing.expect(recovered_process.queued_prompts.items[0].steer_target_turn_id == null);
+        const demoted = (try recovered_process.tryTakeNextPrompt(alloc)).?;
+        freeQueuedPrompt(alloc, demoted);
+        try std.testing.expectEqual(DurableInitialAdmissionPhase.consumed, steering.phase);
+    }
+
+    var final_process = WorkerRuntime{};
+    defer final_process.deinit(alloc);
+    final_process.worker_processing = true;
+    final_process.active_turn_id = 43;
+    final_process.setDurableInitialAdmissionHook(steering.hook());
+    const consumed_replay = try final_process.admitWorkControlPromptObserved(
+        alloc,
+        try makePrompt(alloc, steering.expected_prompt, "model"),
+        true,
+    );
+    try std.testing.expectEqual(@as(u64, 994), consumed_replay.turn_id);
+    try std.testing.expectEqual(@as(usize, 0), final_process.queued_prompts.items.len);
+
+    var consumed_steering = DurableAdmissionProbe{
+        .decision = .{ .admitted = .{
+            .identity = .{
+                .result = .{ .turn_id = 995, .disposition = .steering },
+                .steer_target_turn_id = 51,
+            },
+            .replayed = false,
+        } },
+        .expected_prompt = "consumed steering work",
+    };
+    {
+        var steering_process = WorkerRuntime{};
+        defer steering_process.deinit(alloc);
+        steering_process.worker_processing = true;
+        steering_process.active_turn_id = 51;
+        steering_process.setDurableInitialAdmissionHook(consumed_steering.hook());
+        _ = try steering_process.admitWorkControlPromptObserved(
+            alloc,
+            try makePrompt(alloc, consumed_steering.expected_prompt, "model"),
+            true,
+        );
+        const guidance = try steering_process.takeSteering(alloc, 51);
+        defer {
+            for (guidance) |message| alloc.free(message);
+            alloc.free(guidance);
+        }
+        try std.testing.expectEqual(@as(usize, 1), guidance.len);
+        try std.testing.expectEqualStrings(consumed_steering.expected_prompt, guidance[0]);
+        try std.testing.expectEqual(DurableInitialAdmissionPhase.consumed, consumed_steering.phase);
+    }
+    consumed_steering.decision.admitted.replayed = true;
+    var steering_after_loss = WorkerRuntime{};
+    defer steering_after_loss.deinit(alloc);
+    steering_after_loss.worker_processing = true;
+    steering_after_loss.active_turn_id = 52;
+    steering_after_loss.setDurableInitialAdmissionHook(consumed_steering.hook());
+    _ = try steering_after_loss.admitWorkControlPromptObserved(
+        alloc,
+        try makePrompt(alloc, consumed_steering.expected_prompt, "model"),
+        true,
+    );
+    try std.testing.expectEqual(@as(usize, 0), steering_after_loss.queued_prompts.items.len);
+}
+
+test "work control snapshot and text update preserve native admission order" {
+    const alloc = std.testing.allocator;
+    var runtime = WorkerRuntime{};
+    defer runtime.deinit(alloc);
+    runtime.worker_processing = true;
+    runtime.active_turn_id = 41;
+
+    const steering = try runtime.admitPromptObserved(
+        alloc,
+        try makePrompt(alloc, "steer now", "model"),
+        true,
+        null,
+    );
+    const queued = try runtime.admitPromptObserved(
+        alloc,
+        try makePrompt(alloc, "then queue", "model"),
+        false,
+        null,
+    );
+    try std.testing.expectEqual(PromptAdmissionDisposition.steering, steering.disposition);
+    try std.testing.expectEqual(PromptAdmissionDisposition.queued, queued.disposition);
+    try std.testing.expect(runtime.beginQueueReview(.manual));
+
+    var snapshot = try runtime.snapshotWork(alloc, .{
+        .max_entries = 2,
+        .max_text_bytes = 64,
+    });
+    defer snapshot.deinit(alloc);
+    try std.testing.expectEqual(@as(?u64, 41), snapshot.active_turn_id);
+    try std.testing.expect(snapshot.queue_paused);
+    try std.testing.expectEqual(@as(usize, 2), snapshot.entries.len);
+    try std.testing.expectEqual(steering.turn_id, snapshot.entries[0].turn_id);
+    try std.testing.expectEqual(PromptDraftKind.steering, snapshot.entries[0].kind);
+    try std.testing.expectEqualStrings("steer now", snapshot.entries[0].text);
+    try std.testing.expectEqual(queued.turn_id, snapshot.entries[1].turn_id);
+
+    try std.testing.expectEqual(
+        QueuedPromptTextUpdate.updated,
+        try runtime.updateQueuedPromptText(alloc, queued.turn_id, "updated queue"),
+    );
+    var updated = try runtime.snapshotWork(alloc, .{
+        .max_entries = 2,
+        .max_text_bytes = 64,
+    });
+    defer updated.deinit(alloc);
+    try std.testing.expectEqualStrings("updated queue", updated.entries[1].text);
+    try std.testing.expectEqual(PromptDraftKind.queued, updated.entries[1].kind);
+}
+
+test "work control snapshot and update enforce semantic bounds" {
+    const alloc = std.testing.allocator;
+    var runtime = WorkerRuntime{};
+    defer runtime.deinit(alloc);
+
+    var reviewed = try makePrompt(alloc, "execution text", "model");
+    reviewed.review_draft = .{ .input = try alloc.dupe(u8, "human draft") };
+    const admitted = try runtime.admitPromptObserved(alloc, reviewed, false, null);
+    try std.testing.expectError(
+        error.WorkSnapshotEntryLimitExceeded,
+        runtime.snapshotWork(alloc, .{ .max_entries = 0, .max_text_bytes = 64 }),
+    );
+    try std.testing.expectError(
+        error.WorkSnapshotTextLimitExceeded,
+        runtime.snapshotWork(alloc, .{ .max_entries = 1, .max_text_bytes = 5 }),
+    );
+    try std.testing.expectEqual(
+        QueuedPromptTextUpdate.carries_non_text_state,
+        try runtime.updateQueuedPromptText(alloc, admitted.turn_id, "replacement"),
+    );
+    try std.testing.expectEqual(
+        QueuedPromptTextUpdate.not_found,
+        try runtime.updateQueuedPromptText(alloc, admitted.turn_id + 1, "replacement"),
+    );
+
+    var snapshot = try runtime.snapshotWork(alloc, .{
+        .max_entries = 1,
+        .max_text_bytes = 64,
+    });
+    defer snapshot.deinit(alloc);
+    try std.testing.expectEqualStrings("human draft", snapshot.entries[0].text);
+    try std.testing.expect(snapshot.entries[0].has_review_draft);
+}
+
 test "queue review atomically blocks steering consumption and edits by prompt identity" {
     const alloc = std.testing.allocator;
     var runtime = WorkerRuntime{};
@@ -3334,6 +4338,45 @@ test "state snapshot allocation failures preserve pending event ownership" {
         checkStateSnapshotFailurePreservesPendingEvents,
         .{},
     );
+}
+
+test "prompt admission observer runs exactly once only after queue admission" {
+    const AdmissionCapture = struct {
+        calls: usize = 0,
+
+        fn report(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+        }
+    };
+
+    const alloc = std.testing.allocator;
+    var runtime = WorkerRuntime{};
+    defer runtime.deinit(alloc);
+    var capture = AdmissionCapture{};
+    try runtime.enqueuePromptObserved(
+        alloc,
+        try makePrompt(alloc, "accepted", "model"),
+        .{ .ctx = &capture, .report = AdmissionCapture.report },
+    );
+    try std.testing.expectEqual(@as(usize, 1), capture.calls);
+    try std.testing.expectEqual(@as(usize, 1), runtime.queued_prompt_count);
+
+    runtime.latchFinalizationFailure(.{
+        .turn_id = 40,
+        .outcome = .failed,
+    });
+    const rejected = try makePrompt(alloc, "rejected", "model");
+    try std.testing.expectError(
+        error.TurnFinalizationDeliveryFailed,
+        runtime.enqueuePromptObserved(
+            alloc,
+            rejected,
+            .{ .ctx = &capture, .report = AdmissionCapture.report },
+        ),
+    );
+    freeQueuedPrompt(alloc, rejected);
+    try std.testing.expectEqual(@as(usize, 1), capture.calls);
 }
 
 test "finalization failure latches fixed metadata and closes interactive admission" {
@@ -5154,6 +6197,76 @@ const PermissionThreadState = struct {
     err: ?anyerror = null,
 };
 
+const BlockingDecisionObserver = struct {
+    entered: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    release: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    turn_id: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+
+    fn interface(self: *BlockingDecisionObserver) DecisionObserver {
+        return .{
+            .context = self,
+            .observe_fn = observe,
+        };
+    }
+
+    fn observe(raw: *anyopaque, turn_id: u64) void {
+        const self: *BlockingDecisionObserver = @ptrCast(@alignCast(raw));
+        self.turn_id.store(turn_id, .seq_cst);
+        self.entered.store(true, .seq_cst);
+        while (!self.release.load(.seq_cst)) {
+            std.Thread.yield() catch std.atomic.spinLoopHint();
+        }
+    }
+};
+
+const CountingDecisionObserver = struct {
+    count: usize = 0,
+    turn_id: u64 = 0,
+
+    fn interface(self: *CountingDecisionObserver) DecisionObserver {
+        return .{
+            .context = self,
+            .observe_fn = observe,
+        };
+    }
+
+    fn observe(raw: *anyopaque, turn_id: u64) void {
+        const self: *CountingDecisionObserver = @ptrCast(@alignCast(raw));
+        self.count += 1;
+        self.turn_id = turn_id;
+    }
+};
+
+const BlockingQuestionPresentationObserver = struct {
+    entered: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    release: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    turn_id: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    source: QuestionPromptSource = .agent_question,
+
+    fn interface(
+        self: *BlockingQuestionPresentationObserver,
+    ) QuestionPresentationObserver {
+        return .{
+            .context = self,
+            .observe_fn = observe,
+        };
+    }
+
+    fn observe(
+        raw: *anyopaque,
+        turn_id: u64,
+        source: QuestionPromptSource,
+    ) void {
+        const self: *BlockingQuestionPresentationObserver = @ptrCast(@alignCast(raw));
+        self.turn_id.store(turn_id, .seq_cst);
+        self.source = source;
+        self.entered.store(true, .seq_cst);
+        while (!self.release.load(.seq_cst)) {
+            std.Thread.yield() catch std.atomic.spinLoopHint();
+        }
+    }
+};
+
 fn runPermissionRequest(state: *PermissionThreadState, runtime: *WorkerRuntime, label: []const u8) void {
     var response = runtime.requestPermissionBlocking(
         std.testing.allocator,
@@ -5257,6 +6370,133 @@ test "permission blocking handles submit and stop" {
     var shutdown_snapshot = try shutdown_runtime.snapshotState(alloc);
     defer shutdown_snapshot.deinit(alloc);
     try std.testing.expect(shutdown_snapshot.pending_permission_request == null);
+}
+
+test "observed permission response projects before waiter release and keeps assigned turn" {
+    const alloc = std.testing.allocator;
+    var runtime = WorkerRuntime{};
+    defer runtime.deinit(alloc);
+    runtime.worker_processing = true;
+    runtime.active_turn_id = 73;
+
+    const Waiter = struct {
+        runtime: *WorkerRuntime,
+        completed: *std.atomic.Value(bool),
+        decision: ?types.ToolPermissionDecision = null,
+        err: ?anyerror = null,
+
+        fn run(self: *@This()) void {
+            var response = self.runtime.requestPermissionBlocking(
+                std.testing.allocator,
+                .{ .label = "finish immediately" },
+            ) catch |err| {
+                self.err = err;
+                self.completed.store(true, .seq_cst);
+                return;
+            };
+            defer response.deinit();
+            self.decision = response.decision;
+            self.runtime.finishProcessing();
+            self.completed.store(true, .seq_cst);
+        }
+    };
+    const Submitter = struct {
+        runtime: *WorkerRuntime,
+        request_id: u64,
+        observer: *BlockingDecisionObserver,
+        result: ?PermissionSubmissionResult = null,
+
+        fn run(self: *@This()) void {
+            self.result = self.runtime.submitPermissionResponseObserved(
+                self.request_id,
+                permission_request.OwnedPermissionResponse.init(
+                    std.testing.allocator,
+                    .once,
+                    null,
+                ),
+                self.observer.interface(),
+            );
+        }
+    };
+
+    var completed = std.atomic.Value(bool).init(false);
+    var waiter = Waiter{
+        .runtime = &runtime,
+        .completed = &completed,
+    };
+    const waiter_thread = try std.Thread.spawn(.{}, Waiter.run, .{&waiter});
+    const request_id = try waitForPermissionLabel(&runtime, "finish immediately");
+
+    var observer = BlockingDecisionObserver{};
+    var submitter = Submitter{
+        .runtime = &runtime,
+        .request_id = request_id,
+        .observer = &observer,
+    };
+    const submitter_thread = try std.Thread.spawn(.{}, Submitter.run, .{&submitter});
+    while (!observer.entered.load(.seq_cst)) {
+        std.Thread.yield() catch std.atomic.spinLoopHint();
+    }
+
+    runtime.requestStop();
+    io_mod.sleep(5 * std.time.ns_per_ms);
+    try std.testing.expect(!completed.load(.seq_cst));
+    try std.testing.expectEqual(@as(u64, 73), runtime.activeTurnId());
+    try std.testing.expectEqual(@as(u64, 73), observer.turn_id.load(.seq_cst));
+
+    observer.release.store(true, .seq_cst);
+    submitter_thread.join();
+    waiter_thread.join();
+
+    try std.testing.expectEqual(PermissionSubmissionResult.accepted, submitter.result.?);
+    try std.testing.expect(waiter.err == null);
+    try std.testing.expectEqual(types.ToolPermissionDecision.once, waiter.decision.?);
+    try std.testing.expect(completed.load(.seq_cst));
+    try std.testing.expectEqual(@as(u64, 0), runtime.activeTurnId());
+}
+
+test "stale and duplicate permission responses do not run decision observer" {
+    const alloc = std.testing.allocator;
+    var runtime = WorkerRuntime{};
+    defer runtime.deinit(alloc);
+    runtime.worker_processing = true;
+    runtime.active_turn_id = 79;
+    runtime.pending_permission_waiting = true;
+    runtime.pending_permission_request_shared =
+        try permission_request.OwnedPermissionRequest.dupe(
+            alloc,
+            .{ .id = 31, .label = "current" },
+        );
+
+    var observer = CountingDecisionObserver{};
+    try std.testing.expectEqual(
+        PermissionSubmissionResult.stale,
+        runtime.submitPermissionResponseObserved(
+            30,
+            permission_request.OwnedPermissionResponse.init(alloc, .once, null),
+            observer.interface(),
+        ),
+    );
+    try std.testing.expectEqual(@as(usize, 0), observer.count);
+    try std.testing.expectEqual(
+        PermissionSubmissionResult.accepted,
+        runtime.submitPermissionResponseObserved(
+            31,
+            permission_request.OwnedPermissionResponse.init(alloc, .deny, null),
+            observer.interface(),
+        ),
+    );
+    try std.testing.expectEqual(@as(usize, 1), observer.count);
+    try std.testing.expectEqual(@as(u64, 79), observer.turn_id);
+    try std.testing.expectEqual(
+        PermissionSubmissionResult.no_pending,
+        runtime.submitPermissionResponseObserved(
+            31,
+            permission_request.OwnedPermissionResponse.init(alloc, .always, null),
+            observer.interface(),
+        ),
+    );
+    try std.testing.expectEqual(@as(usize, 1), observer.count);
 }
 
 test "permission response accepts feedback ownership" {
@@ -5563,6 +6803,382 @@ test "question batch snapshot answer and cancellation" {
     try std.testing.expect(cancel_state.err == null);
     try std.testing.expect(cancel_state.answers == null);
     try std.testing.expect(try cancel_runtime.snapshotPendingQuestionBatch(alloc) == null);
+}
+
+test "observed question response projects before waiter release" {
+    const alloc = std.testing.allocator;
+    const options = [_]types.QuestionOption{
+        .{ .label = "Continue", .description = null },
+    };
+    const entries = [_]types.QuestionBatchEntry{.{
+        .question = "Finish immediately?",
+        .options = &options,
+    }};
+
+    var runtime = WorkerRuntime{};
+    defer runtime.deinit(alloc);
+    runtime.worker_processing = true;
+    runtime.active_turn_id = 83;
+
+    const Waiter = struct {
+        runtime: *WorkerRuntime,
+        entries: []const types.QuestionBatchEntry,
+        completed: *std.atomic.Value(bool),
+        answers: ?[][]u8 = null,
+        err: ?anyerror = null,
+
+        fn run(self: *@This()) void {
+            self.answers = self.runtime.requestQuestionBatchAnswerBlocking(
+                std.testing.allocator,
+                self.entries,
+            ) catch |err| {
+                self.err = err;
+                self.completed.store(true, .seq_cst);
+                return;
+            };
+            self.runtime.finishProcessing();
+            self.completed.store(true, .seq_cst);
+        }
+    };
+    const Submitter = struct {
+        runtime: *WorkerRuntime,
+        observer: *BlockingDecisionObserver,
+        result: ?QuestionSubmissionResult = null,
+        err: ?anyerror = null,
+
+        fn run(self: *@This()) void {
+            self.result = self.runtime.submitQuestionBatchAnswerObserved(
+                std.testing.allocator,
+                &.{"Continue"},
+                self.observer.interface(),
+            ) catch |err| {
+                self.err = err;
+                return;
+            };
+        }
+    };
+
+    var completed = std.atomic.Value(bool).init(false);
+    var waiter = Waiter{
+        .runtime = &runtime,
+        .entries = &entries,
+        .completed = &completed,
+    };
+    const waiter_thread = try std.Thread.spawn(.{}, Waiter.run, .{&waiter});
+    var snapshot = try waitForQuestionSnapshot(&runtime);
+    snapshot.deinit(alloc);
+
+    var observer = BlockingDecisionObserver{};
+    var submitter = Submitter{
+        .runtime = &runtime,
+        .observer = &observer,
+    };
+    const submitter_thread = try std.Thread.spawn(.{}, Submitter.run, .{&submitter});
+    while (!observer.entered.load(.seq_cst)) {
+        std.Thread.yield() catch std.atomic.spinLoopHint();
+    }
+
+    runtime.requestStop();
+    io_mod.sleep(5 * std.time.ns_per_ms);
+    try std.testing.expect(!completed.load(.seq_cst));
+    try std.testing.expectEqual(@as(u64, 83), runtime.activeTurnId());
+    try std.testing.expectEqual(@as(u64, 83), observer.turn_id.load(.seq_cst));
+
+    observer.release.store(true, .seq_cst);
+    submitter_thread.join();
+    waiter_thread.join();
+    defer freeAnswers(alloc, waiter.answers);
+
+    try std.testing.expect(submitter.err == null);
+    try std.testing.expectEqual(QuestionSubmissionResult.accepted, submitter.result.?);
+    try std.testing.expect(waiter.err == null);
+    try std.testing.expectEqualStrings("Continue", waiter.answers.?[0]);
+    try std.testing.expect(completed.load(.seq_cst));
+    try std.testing.expectEqual(@as(u64, 0), runtime.activeTurnId());
+}
+
+test "question presentation projects before cancellation can resolve" {
+    const alloc = std.testing.allocator;
+    const options = [_]types.QuestionOption{
+        .{ .label = "Continue", .description = null },
+    };
+    const entries = [_]types.QuestionBatchEntry{.{
+        .question = "Wait for presentation?",
+        .options = &options,
+    }};
+
+    var runtime = WorkerRuntime{};
+    defer runtime.deinit(alloc);
+    runtime.worker_processing = true;
+    runtime.active_turn_id = 84;
+
+    var state = QuestionThreadState{};
+    const waiter_thread = try std.Thread.spawn(
+        .{},
+        runQuestionRequest,
+        .{ &state, &runtime, &entries },
+    );
+    var snapshot = try waitForQuestionSnapshot(&runtime);
+    snapshot.deinit(alloc);
+
+    const Presenter = struct {
+        runtime: *WorkerRuntime,
+        observer: *BlockingQuestionPresentationObserver,
+        presented: bool = false,
+
+        fn run(self: *@This()) void {
+            self.presented = self.runtime.presentPendingQuestionBatchObserved(
+                self.observer.interface(),
+            );
+        }
+    };
+    var presentation_observer = BlockingQuestionPresentationObserver{};
+    var presenter = Presenter{
+        .runtime = &runtime,
+        .observer = &presentation_observer,
+    };
+    const presenter_thread = try std.Thread.spawn(.{}, Presenter.run, .{&presenter});
+    while (!presentation_observer.entered.load(.seq_cst)) {
+        std.Thread.yield() catch std.atomic.spinLoopHint();
+    }
+
+    var resolution_observer = CountingDecisionObserver{};
+    try std.testing.expectEqual(
+        QuestionSubmissionResult.no_pending,
+        runtime.cancelPendingQuestionBatchObserved(
+            resolution_observer.interface(),
+        ),
+    );
+    try std.testing.expectEqual(@as(usize, 0), resolution_observer.count);
+    try std.testing.expectEqual(@as(u64, 84), runtime.activeTurnId());
+    try std.testing.expectEqual(
+        @as(u64, 84),
+        presentation_observer.turn_id.load(.seq_cst),
+    );
+    try std.testing.expectEqual(
+        QuestionPromptSource.agent_question,
+        presentation_observer.source,
+    );
+
+    presentation_observer.release.store(true, .seq_cst);
+    presenter_thread.join();
+    try std.testing.expect(presenter.presented);
+
+    try std.testing.expectEqual(
+        QuestionSubmissionResult.accepted,
+        runtime.cancelPendingQuestionBatchObserved(
+            resolution_observer.interface(),
+        ),
+    );
+    waiter_thread.join();
+
+    try std.testing.expect(state.err == null);
+    try std.testing.expect(state.answers == null);
+    try std.testing.expectEqual(@as(usize, 1), resolution_observer.count);
+    try std.testing.expectEqual(@as(u64, 84), resolution_observer.turn_id);
+}
+
+test "question shutdown waits for presentation without accepting resolution" {
+    const alloc = std.testing.allocator;
+    const options = [_]types.QuestionOption{
+        .{ .label = "Continue", .description = null },
+    };
+    const entries = [_]types.QuestionBatchEntry{.{
+        .question = "Shut down after presentation?",
+        .options = &options,
+    }};
+
+    var runtime = WorkerRuntime{};
+    defer runtime.deinit(alloc);
+    runtime.worker_processing = true;
+    runtime.active_turn_id = 85;
+
+    const Waiter = struct {
+        runtime: *WorkerRuntime,
+        entries: []const types.QuestionBatchEntry,
+        completed: *std.atomic.Value(bool),
+        answers: ?[][]u8 = null,
+        err: ?anyerror = null,
+
+        fn run(self: *@This()) void {
+            self.answers = self.runtime.requestQuestionBatchAnswerBlocking(
+                std.testing.allocator,
+                self.entries,
+            ) catch |err| {
+                self.err = err;
+                self.completed.store(true, .seq_cst);
+                return;
+            };
+            self.completed.store(true, .seq_cst);
+        }
+    };
+    var completed = std.atomic.Value(bool).init(false);
+    var waiter = Waiter{
+        .runtime = &runtime,
+        .entries = &entries,
+        .completed = &completed,
+    };
+    const waiter_thread = try std.Thread.spawn(.{}, Waiter.run, .{&waiter});
+    var snapshot = try waitForQuestionSnapshot(&runtime);
+    snapshot.deinit(alloc);
+
+    const Presenter = struct {
+        runtime: *WorkerRuntime,
+        observer: *BlockingQuestionPresentationObserver,
+        presented: bool = false,
+
+        fn run(self: *@This()) void {
+            self.presented = self.runtime.presentPendingQuestionBatchObserved(
+                self.observer.interface(),
+            );
+        }
+    };
+    var presentation_observer = BlockingQuestionPresentationObserver{};
+    var presenter = Presenter{
+        .runtime = &runtime,
+        .observer = &presentation_observer,
+    };
+    const presenter_thread = try std.Thread.spawn(.{}, Presenter.run, .{&presenter});
+    while (!presentation_observer.entered.load(.seq_cst)) {
+        std.Thread.yield() catch std.atomic.spinLoopHint();
+    }
+
+    runtime.requestStop();
+    io_mod.sleep(5 * std.time.ns_per_ms);
+    try std.testing.expect(!completed.load(.seq_cst));
+
+    presentation_observer.release.store(true, .seq_cst);
+    presenter_thread.join();
+    waiter_thread.join();
+    try std.testing.expect(presenter.presented);
+    try std.testing.expect(waiter.err == null);
+    try std.testing.expect(waiter.answers == null);
+
+    var resolution_observer = CountingDecisionObserver{};
+    try std.testing.expectEqual(
+        QuestionSubmissionResult.no_pending,
+        runtime.cancelPendingQuestionBatchObserved(
+            resolution_observer.interface(),
+        ),
+    );
+    try std.testing.expectEqual(@as(usize, 0), resolution_observer.count);
+}
+
+test "observed question cancellation projects before waiter release" {
+    const alloc = std.testing.allocator;
+    const options = [_]types.QuestionOption{
+        .{ .label = "Continue", .description = null },
+    };
+    const entries = [_]types.QuestionBatchEntry{.{
+        .question = "Cancel this question?",
+        .options = &options,
+    }};
+
+    var runtime = WorkerRuntime{};
+    defer runtime.deinit(alloc);
+    runtime.worker_processing = true;
+    runtime.active_turn_id = 84;
+
+    const Waiter = struct {
+        runtime: *WorkerRuntime,
+        entries: []const types.QuestionBatchEntry,
+        completed: *std.atomic.Value(bool),
+        answers: ?[][]u8 = null,
+        err: ?anyerror = null,
+
+        fn run(self: *@This()) void {
+            self.answers = self.runtime.requestQuestionBatchAnswerBlocking(
+                std.testing.allocator,
+                self.entries,
+            ) catch |err| {
+                self.err = err;
+                self.completed.store(true, .seq_cst);
+                return;
+            };
+            self.runtime.finishProcessing();
+            self.completed.store(true, .seq_cst);
+        }
+    };
+    const Submitter = struct {
+        runtime: *WorkerRuntime,
+        observer: *BlockingDecisionObserver,
+        result: ?QuestionSubmissionResult = null,
+        err: ?anyerror = null,
+
+        fn run(self: *@This()) void {
+            self.result = self.runtime.submitQuestionBatchAnswerObserved(
+                std.testing.allocator,
+                null,
+                self.observer.interface(),
+            ) catch |err| {
+                self.err = err;
+                return;
+            };
+        }
+    };
+
+    var completed = std.atomic.Value(bool).init(false);
+    var waiter = Waiter{
+        .runtime = &runtime,
+        .entries = &entries,
+        .completed = &completed,
+    };
+    const waiter_thread = try std.Thread.spawn(.{}, Waiter.run, .{&waiter});
+    var snapshot = try waitForQuestionSnapshot(&runtime);
+    snapshot.deinit(alloc);
+
+    var observer = BlockingDecisionObserver{};
+    var submitter = Submitter{
+        .runtime = &runtime,
+        .observer = &observer,
+    };
+    const submitter_thread = try std.Thread.spawn(.{}, Submitter.run, .{&submitter});
+    while (!observer.entered.load(.seq_cst)) {
+        std.Thread.yield() catch std.atomic.spinLoopHint();
+    }
+
+    runtime.requestStop();
+    io_mod.sleep(5 * std.time.ns_per_ms);
+    try std.testing.expect(!completed.load(.seq_cst));
+    try std.testing.expectEqual(@as(u64, 84), runtime.activeTurnId());
+    try std.testing.expectEqual(@as(u64, 84), observer.turn_id.load(.seq_cst));
+
+    observer.release.store(true, .seq_cst);
+    submitter_thread.join();
+    waiter_thread.join();
+
+    try std.testing.expect(submitter.err == null);
+    try std.testing.expectEqual(QuestionSubmissionResult.accepted, submitter.result.?);
+    try std.testing.expect(waiter.err == null);
+    try std.testing.expect(waiter.answers == null);
+    try std.testing.expect(completed.load(.seq_cst));
+    try std.testing.expectEqual(@as(u64, 0), runtime.activeTurnId());
+}
+
+test "late question response does not run decision observer" {
+    const alloc = std.testing.allocator;
+    var runtime = WorkerRuntime{};
+    defer runtime.deinit(alloc);
+    var observer = CountingDecisionObserver{};
+
+    try std.testing.expectEqual(
+        QuestionSubmissionResult.no_pending,
+        try runtime.submitQuestionBatchAnswerObserved(
+            alloc,
+            &.{"late"},
+            observer.interface(),
+        ),
+    );
+    try std.testing.expectEqual(@as(usize, 0), observer.count);
+    try std.testing.expectEqual(
+        QuestionSubmissionResult.no_pending,
+        try runtime.submitQuestionBatchAnswerObserved(
+            alloc,
+            null,
+            observer.interface(),
+        ),
+    );
+    try std.testing.expectEqual(@as(usize, 0), observer.count);
 }
 
 test "question batch source distinguishes route recovery from agent questions" {

@@ -845,8 +845,37 @@ const terminal_exec_only = blk: {
             .additional_properties = false,
         },
     };
+    spec.decode = decodeTerminalExecOnly;
     break :blk spec;
 };
+
+fn decodeTerminalExecOnly(
+    ctx: tool_dispatch.DispatchContext,
+    args_json: []const u8,
+) tool_dispatch.DispatchError!tool_dispatch.DecodeResult {
+    var arena_state = std.heap.ArenaAllocator.init(ctx.allocator);
+    defer arena_state.deinit();
+    const raw = std.json.parseFromSliceLeaky(
+        std.json.Value,
+        arena_state.allocator(),
+        args_json,
+        .{ .allocate = .alloc_always },
+    ) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return terminal_impl.decode(ctx, args_json),
+    };
+    if (raw == .object) {
+        if (raw.object.get("action")) |action| {
+            if (action == .string and !std.mem.eql(u8, action.string, "exec")) {
+                return .{ .failure = try ctx.allocator.dupe(
+                    u8,
+                    "terminal:exec selection permits only one-shot exec actions",
+                ) };
+            }
+        }
+    }
+    return terminal_impl.decode(ctx, args_json);
+}
 
 pub fn terminalExecOnlySpec() ToolSpec {
     return terminal_exec_only;
@@ -1475,6 +1504,53 @@ test "terminal exec-only schema reuses exec structure with focused descriptions"
     try std.testing.expectEqual(@as(?u64, terminal_impl.exec_timeout_min_ms), timeout.bounds.?.minimum);
     try std.testing.expectEqual(@as(?u64, terminal_impl.exec_timeout_max_ms), timeout.bounds.?.maximum);
     try std.testing.expect(timeout.nullable == null);
+}
+
+test "terminal exec-only dispatch rejects durable actions before permission" {
+    const spec = terminalExecOnlySpec();
+    const ctx = tool_dispatch.DispatchContext{
+        .allocator = std.testing.allocator,
+        .workspace_root = "/tmp",
+    };
+    const decoded = try spec.decode(
+        ctx,
+        "{\"action\":\"start\",\"command\":\"sleep 10\",\"profile\":\"clean\"}",
+    );
+    switch (decoded) {
+        .failure => |message| {
+            defer std.testing.allocator.free(message);
+            try std.testing.expectEqualStrings(
+                "terminal:exec selection permits only one-shot exec actions",
+                message,
+            );
+        },
+        .input => |input| {
+            input.deinit(std.testing.allocator);
+            return error.TestExpectedDispatchFailure;
+        },
+    }
+}
+
+fn checkTerminalExecOnlyRejectionAllocationFailures(alloc: Allocator) !void {
+    const decoded = try terminalExecOnlySpec().decode(.{
+        .allocator = alloc,
+        .workspace_root = "/tmp",
+    }, "{\"action\":\"start\",\"command\":\"sleep 10\",\"profile\":\"clean\"}");
+    switch (decoded) {
+        .failure => |message| alloc.free(message),
+        .input => |input| {
+            input.deinit(alloc);
+            return error.TestExpectedDispatchFailure;
+        },
+    }
+}
+
+test "terminal exec-only dispatch remains fail closed under allocation failure" {
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        checkTerminalExecOnlyRejectionAllocationFailures,
+        .{},
+    );
 }
 
 test "terminal gateway advertisement projects a provider-compatible object schema" {

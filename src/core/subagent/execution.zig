@@ -1598,6 +1598,13 @@ pub const Owner = struct {
         child_id: []const u8,
         timestamp_ms: i64,
     ) ControlError!void {
+        // Durable cancellation is already committed. Close every copied
+        // attention identity before any worker or waiter can publish a late
+        // lifecycle edge from the abandoned approval.
+        if (self.approval_registry) |registry| {
+            registry.closeChildAttention(child_id);
+        }
+
         self.mutex.lockUncancelable(io_mod.getIo());
         for (self.slots.items) |slot| {
             if (std.mem.eql(u8, slot.child_id, child_id)) {
@@ -1766,6 +1773,10 @@ pub const Owner = struct {
     }
 
     pub fn deinit(self: *Owner) void {
+        // Prevent new approval routes and close every copied attention token
+        // before shutdown signals let workers publish terminal lifecycle edges.
+        if (self.approval_registry) |registry| registry.detachWorkerRoutes();
+
         self.mutex.lockUncancelable(io_mod.getIo());
         if (self.retirement_scan_pending and self.retirement_root_id != null) {
             self.retirement_due_ms = reaperNowMs(self);
@@ -1785,7 +1796,6 @@ pub const Owner = struct {
         const reaper_thread = self.reaper_thread;
         self.mutex.unlock(io_mod.getIo());
 
-        if (self.approval_registry) |registry| registry.detachWorkerRoutes();
         self.mutex.lockUncancelable(io_mod.getIo());
         for (self.slots.items) |slot| {
             if (slot.active_worker) |worker| worker.requestShutdown();
@@ -3909,6 +3919,7 @@ test "admission snapshot is isolated owned and preserves configured permission m
         .target_path = @constCast("/tmp/a"),
     }};
     var snapshot = try domain.captureAdmission(alloc, .{
+        .root_id = "root",
         .parent_id = "parent",
         .source_id = "source",
         .model = "test/model",
@@ -3920,6 +3931,8 @@ test "admission snapshot is isolated owned and preserves configured permission m
         .integration_names = &.{"mcp:test"},
     });
     defer snapshot.deinit(alloc);
+    try std.testing.expectEqualStrings("root", snapshot.root_id);
+    try std.testing.expectEqualStrings("parent", snapshot.parent_id);
     try std.testing.expectEqual(types.PermissionMode.ask, snapshot.permission_mode);
     try std.testing.expectEqualStrings("test/model", snapshot.model);
     try std.testing.expectEqualStrings("write_file", snapshot.tool_names[1]);
@@ -4257,6 +4270,7 @@ const FakeExecution = struct {
             .target_path = @constCast(if (current == 0) "/tmp/old.txt" else "/tmp/new.txt"),
         }};
         return domain.captureAdmission(alloc, .{
+            .root_id = "root",
             .parent_id = request.parent_id,
             .source_id = request.source_id,
             .model = request.preferences.model,
@@ -4377,6 +4391,7 @@ const ApprovalBlockingExecution = struct {
         request: CaptureRequest,
     ) ServiceError!domain.AdmissionSnapshot {
         return domain.captureAdmission(alloc, .{
+            .root_id = "root",
             .parent_id = request.parent_id,
             .source_id = request.source_id,
             .model = request.preferences.model,
@@ -6884,6 +6899,7 @@ const ToolEffectExecution = struct {
         request: CaptureRequest,
     ) ServiceError!domain.AdmissionSnapshot {
         return domain.captureAdmission(alloc, .{
+            .root_id = "root",
             .parent_id = request.parent_id,
             .source_id = request.source_id,
             .model = request.preferences.model,
@@ -7393,6 +7409,7 @@ const ProcessBoundaryExecution = struct {
         request: CaptureRequest,
     ) ServiceError!domain.AdmissionSnapshot {
         return domain.captureAdmission(alloc, .{
+            .root_id = "root",
             .parent_id = request.parent_id,
             .source_id = request.source_id,
             .model = request.preferences.model,
@@ -8136,6 +8153,7 @@ const GatewayExecution = struct {
             .target_path = @constCast("/tmp/workspace/file.txt"),
         }};
         return domain.captureAdmission(alloc, .{
+            .root_id = "root",
             .parent_id = request.parent_id,
             .source_id = request.source_id,
             .model = request.preferences.model,
@@ -8579,6 +8597,7 @@ test "completed one off reconciles one stable final result message" {
 
 fn checkAdmissionAllocationFailures(alloc: Allocator) !void {
     var snapshot = try domain.captureAdmission(alloc, .{
+        .root_id = "root",
         .parent_id = "parent",
         .source_id = "source",
         .model = "model",

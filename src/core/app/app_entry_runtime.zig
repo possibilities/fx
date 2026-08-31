@@ -13,6 +13,7 @@ const provider_set = @import("../gateway/provider_set.zig");
 const host = @import("../hosts/host.zig");
 const host_target = @import("../hosts/target.zig");
 const io_mod = @import("../shared/io.zig");
+const config_runtime = @import("../config/config_runtime.zig");
 const prompt_policy = @import("../config/prompt_policy.zig");
 const skill_contract = @import("../skills/skill_contract.zig");
 const command_specs = @import("../slash_commands/command_specs.zig");
@@ -22,6 +23,7 @@ const mcp_contract = @import("../mcp/mcp_contract.zig");
 const mcp_command_provider = @import("../mcp/command_provider.zig");
 const mcp_health = @import("../mcp/health.zig");
 const mcp_runtime = @import("../mcp/mcp_runtime.zig");
+const tool_selection = @import("../tooling/tool_selection.zig");
 const tool_set_contract = @import("../tooling/tool_set.zig");
 const update_target = @import("../upgrade/update_target.zig");
 const test_builtin_gateway = if (builtin.is_test)
@@ -64,6 +66,7 @@ pub const Config = struct {
     context_registry: context_contract.Registry,
     mode_registry: mode_registry.Registry,
     tool_set: tool_set_contract.ToolSet,
+    tool_selection_catalog: tool_selection.Catalog = .{},
     inspect_mcp_profile_config: mcp_contract.InspectProfileConfigFn,
     inspect_mcp_local_config: mcp_health.InspectLocalConfigFn =
         mcp_health.inspectLocalConfigUnavailable,
@@ -263,10 +266,6 @@ fn runInteractiveWithDeps(comptime App: type, comptime cooperative: bool, alloc:
             },
         }
     };
-    if (comptime !cooperative) {
-        if (@hasDecl(App, "startMcpDiscovery")) app.startMcpDiscovery();
-        if (@hasDecl(App, "rebindAfterInit")) app.rebindAfterInit();
-    }
     var app_needs_deinit = true;
     defer if (app_needs_deinit) app.deinit();
     if (comptime !cooperative and @hasField(App, "session") and
@@ -275,11 +274,14 @@ fn runInteractiveWithDeps(comptime App: type, comptime cooperative: bool, alloc:
         app.session.attachProfileUsagePublisher(app.alloc);
     }
     if (comptime !cooperative) {
-        if (resume_requested) app.startResumedSessionReconciliation();
         if (@hasDecl(App, "configureNotifications")) try app.configureNotifications();
+        if (@hasDecl(App, "rebindAfterInit")) app.rebindAfterInit();
+        if (resume_requested) app.startResumedSessionReconciliation();
+        if (@hasDecl(App, "startMcpDiscovery")) app.startMcpDiscovery();
         if (@hasDecl(App, "playStartupSound")) app.playStartupSound();
         if (@hasDecl(App, "startAutoUpgrade")) app.startAutoUpgrade();
         if (@hasDecl(App, "startFileIndex")) app.startFileIndex();
+        if (@hasDecl(App, "startWorkControl")) try app.startWorkControl();
         startWorkerThread(App, &app, deps) catch |err| {
             app.releaseTerminal();
             reportUnexpectedInteractiveError(deps, err);
@@ -300,6 +302,20 @@ fn runInteractiveWithDeps(comptime App: type, comptime cooperative: bool, alloc:
         app.takeUpgradeRelaunchRequest()
     else
         null;
+    const relaunch_skill_roots = try cloneInvocationSkillRootsForRelaunch(
+        App,
+        alloc,
+        &app,
+        relaunch_request != null,
+    );
+    defer freeInvocationSkillRoots(alloc, relaunch_skill_roots);
+    const relaunch_session_name = try clonePendingLaunchSessionNameForRelaunch(
+        App,
+        alloc,
+        &app,
+        relaunch_request != null,
+    );
+    defer if (relaunch_session_name) |name| alloc.free(name);
     const resume_handoff_columns: u16 = if (comptime cooperative)
         0
     else if (comptime @hasDecl(App, "resumeHandoffColumns"))
@@ -315,18 +331,30 @@ fn runInteractiveWithDeps(comptime App: type, comptime cooperative: bool, alloc:
         if (handoff_value) |value| {
             var handoff = value;
             defer handoff.deinit(alloc);
-            var argv = [_][]const u8{
-                request.executablePath(),
-                "resume",
+            var relaunch_args = try UpgradeRelaunchArguments.init(
+                alloc,
+                launch,
                 handoff.session_id,
-                cli_surface.upgrade_relaunch_arg,
-            };
+                relaunch_skill_roots,
+                relaunch_session_name,
+            );
+            defer relaunch_args.deinit(alloc);
+            var process_argv = try relaunch_args.processArgv(
+                alloc,
+                request.executablePath(),
+            );
+            defer process_argv.deinit(alloc);
             const replace_err = deps.replace_process(
                 deps.replace_ctx,
                 io_mod.getIo(),
-                .{ .argv = &argv },
+                .{ .argv = process_argv.items },
             );
-            writeUpgradeRelaunchFailure(deps, replace_err, handoff.session_id);
+            writeUpgradeRelaunchFailure(
+                alloc,
+                deps,
+                replace_err,
+                relaunch_args.args.items,
+            );
         } else {
             writeStderr(
                 deps,
@@ -352,6 +380,170 @@ fn runInteractiveWithDeps(comptime App: type, comptime cooperative: bool, alloc:
     return .returned;
 }
 
+const UpgradeRelaunchArguments = struct {
+    args: std.ArrayList([]const u8) = .empty,
+    owned_args: std.ArrayList([]u8) = .empty,
+
+    fn init(
+        alloc: Allocator,
+        launch: *const cli_surface.InteractiveLaunch,
+        session_id: []const u8,
+        invocation_skill_roots: []const []const u8,
+        pending_session_name: ?[]const u8,
+    ) !UpgradeRelaunchArguments {
+        var result = UpgradeRelaunchArguments{};
+        errdefer result.deinit(alloc);
+
+        for (launch.modifiers.context_limit_overrides) |override| {
+            try result.append(alloc, "--context-limit");
+            const rendered = switch (override.value) {
+                .bytes => |bytes| try std.fmt.allocPrint(
+                    alloc,
+                    "{s}={d}",
+                    .{ @tagName(override.name), bytes },
+                ),
+                .off => try std.fmt.allocPrint(
+                    alloc,
+                    "{s}=off",
+                    .{@tagName(override.name)},
+                ),
+            };
+            try result.appendOwned(alloc, rendered);
+        }
+        for (launch.modifiers.additional_directories) |path| {
+            try result.appendPair(alloc, "--add-dir", path);
+        }
+        if (launch.modifiers.saved_directories_suppressed) {
+            try result.append(alloc, "--no-additional-dirs");
+        }
+        if (launch.modifiers.prompt_files.replacement_path) |path| {
+            try result.appendPair(alloc, "--system-prompt-file", path);
+        }
+        for (launch.modifiers.prompt_files.append_paths) |path| {
+            try result.appendPair(alloc, "--append-system-prompt-file", path);
+        }
+        if (launch.modifiers.state_home) |home| {
+            try result.appendPair(alloc, "--state-dir", home);
+        }
+        if (launch.modifiers.permission_policy) |policy| {
+            try result.appendPair(alloc, "--permissions-file", policy.path);
+        }
+        if (!launch.modifiers.allow_native_tools) {
+            try result.append(alloc, "--no-native-tools");
+        } else {
+            for (launch.modifiers.selected_native_tools) |name| {
+                try result.appendPair(alloc, "--tool", name);
+            }
+        }
+        if (launch.modifiers.no_default_skills) {
+            try result.append(alloc, "--no-default-skills");
+        }
+        for (invocation_skill_roots) |root| {
+            try result.appendPair(alloc, "--skills-dir", root);
+        }
+        if (!launch.modifiers.project_instructions_enabled) {
+            try result.append(alloc, "--no-project-instructions");
+        }
+        if (pending_session_name) |name| {
+            try result.appendPair(alloc, "--name", name);
+        }
+        try result.appendPair(alloc, "resume", session_id);
+        return result;
+    }
+
+    fn deinit(self: *UpgradeRelaunchArguments, alloc: Allocator) void {
+        for (self.owned_args.items) |arg| alloc.free(arg);
+        self.owned_args.deinit(alloc);
+        self.args.deinit(alloc);
+        self.* = .{};
+    }
+
+    fn append(self: *UpgradeRelaunchArguments, alloc: Allocator, arg: []const u8) !void {
+        try self.args.append(alloc, arg);
+    }
+
+    fn appendPair(
+        self: *UpgradeRelaunchArguments,
+        alloc: Allocator,
+        name: []const u8,
+        value: []const u8,
+    ) !void {
+        try self.append(alloc, name);
+        errdefer _ = self.args.pop();
+        try self.append(alloc, value);
+    }
+
+    fn appendOwned(
+        self: *UpgradeRelaunchArguments,
+        alloc: Allocator,
+        arg: []u8,
+    ) !void {
+        self.owned_args.append(alloc, arg) catch |err| {
+            alloc.free(arg);
+            return err;
+        };
+        self.args.append(alloc, arg) catch |err| {
+            _ = self.owned_args.pop();
+            alloc.free(arg);
+            return err;
+        };
+    }
+
+    fn processArgv(
+        self: UpgradeRelaunchArguments,
+        alloc: Allocator,
+        executable_path: []const u8,
+    ) !std.ArrayList([]const u8) {
+        var argv: std.ArrayList([]const u8) = .empty;
+        errdefer argv.deinit(alloc);
+        try argv.append(alloc, executable_path);
+        try argv.appendSlice(alloc, self.args.items);
+        try argv.append(alloc, cli_surface.upgrade_relaunch_arg);
+        return argv;
+    }
+};
+
+fn cloneInvocationSkillRootsForRelaunch(
+    comptime App: type,
+    alloc: Allocator,
+    app: *const App,
+    enabled: bool,
+) ![][]u8 {
+    if (!enabled) return &.{};
+    if (comptime !@hasField(App, "invocation_skill_roots")) return &.{};
+    if (app.invocation_skill_roots.len == 0) return &.{};
+
+    const roots = try alloc.alloc([]u8, app.invocation_skill_roots.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (roots[0..initialized]) |root| alloc.free(root);
+        alloc.free(roots);
+    }
+    for (app.invocation_skill_roots, 0..) |root, index| {
+        roots[index] = try alloc.dupe(u8, root);
+        initialized += 1;
+    }
+    return roots;
+}
+
+fn freeInvocationSkillRoots(alloc: Allocator, roots: [][]u8) void {
+    for (roots) |root| alloc.free(root);
+    if (roots.len > 0) alloc.free(roots);
+}
+
+fn clonePendingLaunchSessionNameForRelaunch(
+    comptime App: type,
+    alloc: Allocator,
+    app: *const App,
+    enabled: bool,
+) !?[]u8 {
+    if (!enabled) return null;
+    if (comptime !@hasDecl(App, "clonePendingLaunchSessionNameForRelaunch")) {
+        return null;
+    }
+    return app.clonePendingLaunchSessionNameForRelaunch(alloc);
+}
+
 fn replaceProcessDefault(
     _: ?*anyopaque,
     zio: std.Io,
@@ -361,17 +553,66 @@ fn replaceProcessDefault(
 }
 
 fn writeUpgradeRelaunchFailure(
+    alloc: Allocator,
     deps: RunDeps,
     err: std.process.ReplaceError,
-    session_id: []const u8,
+    relaunch_args: []const []const u8,
 ) void {
-    var buffer: [768]u8 = undefined;
-    const message = std.fmt.bufPrint(
-        &buffer,
-        "fx: upgrade installed, but relaunch failed: {s}\nContinue session with: fx --resume {s}\n",
-        .{ @errorName(err), session_id },
-    ) catch "fx: upgrade installed, but relaunch failed; run `fx doctor`.\n";
-    writeStderr(deps, message);
+    const rendered = formatUpgradeRelaunchFailure(
+        alloc,
+        err,
+        relaunch_args,
+    ) catch {
+        writeStderr(
+            deps,
+            "fx: upgrade installed, but relaunch failed; run `fx doctor`.\n",
+        );
+        return;
+    };
+    defer alloc.free(rendered);
+    writeStderr(deps, rendered);
+}
+
+fn formatUpgradeRelaunchFailure(
+    alloc: Allocator,
+    err: std.process.ReplaceError,
+    relaunch_args: []const []const u8,
+) ![]u8 {
+    var writer: std.Io.Writer.Allocating = .init(alloc);
+    errdefer writer.deinit();
+    try writer.writer.print(
+        "fx: upgrade installed, but relaunch failed: {s}\nContinue session with: fx",
+        .{@errorName(err)},
+    );
+    for (relaunch_args) |arg| {
+        try writer.writer.writeByte(' ');
+        try writeShellArgument(&writer.writer, arg);
+    }
+    try writer.writer.writeByte('\n');
+    return writer.toOwnedSlice();
+}
+
+fn writeShellArgument(writer: *std.Io.Writer, arg: []const u8) !void {
+    var safe = arg.len > 0;
+    for (arg) |byte| {
+        if (std.ascii.isAlphanumeric(byte) or switch (byte) {
+            '_', '-', '.', '/', ':', '=', '+', ',', '@', '%' => true,
+            else => false,
+        }) continue;
+        safe = false;
+        break;
+    }
+    if (safe) return writer.writeAll(arg);
+
+    try writer.writeByte('\'');
+    for (arg) |byte| {
+        if (byte == '\'') {
+            try writer.writeAll("'\"'\"'");
+        } else {
+            try writer.writeByte(byte);
+        }
+    }
+    try writer.writeByte('\'');
 }
 
 fn cliSurfaceConfig(cfg: Config) cli_surface.Config {
@@ -403,6 +644,7 @@ fn cliSurfaceConfig(cfg: Config) cli_surface.Config {
         .context_registry = cfg.context_registry,
         .mode_registry = cfg.mode_registry,
         .tool_set = cfg.tool_set,
+        .tool_selection_catalog = cfg.tool_selection_catalog,
         .inspect_mcp_profile_config = cfg.inspect_mcp_profile_config,
         .inspect_mcp_local_config = cfg.inspect_mcp_local_config,
         .load_mcp_runtime = cfg.load_mcp_runtime,
@@ -483,7 +725,12 @@ const test_entry_context_registry = context_contract.Registry{ .default_provider
     .append_transient_fn = appendNoopTransientContextForTest,
 } };
 
-fn noMcpRuntimeForTest(_: Allocator, _: []const u8, _: @import("../mcp/elicitation.zig").Capabilities) !?*mcp_runtime.McpRuntime {
+fn noMcpRuntimeForTest(
+    _: Allocator,
+    _: []const u8,
+    _: @import("../mcp/elicitation.zig").Capabilities,
+    _: ?[]const u8,
+) !?*mcp_runtime.McpRuntime {
     return null;
 }
 
@@ -574,6 +821,7 @@ const TestCapture = struct {
     stdout: std.Io.Writer.Allocating,
     bench_value: ?[]const u8 = null,
     init_error: ?anyerror = null,
+    configure_error: ?anyerror = null,
     worker_error: ?anyerror = null,
     run_error: ?anyerror = null,
     stderr_error: ?anyerror = null,
@@ -587,8 +835,8 @@ const TestCapture = struct {
     replace_error: std.process.ReplaceError = error.InvalidExe,
     replace_calls: usize = 0,
     replace_arg_count: usize = 0,
-    replace_arg_bufs: [4][128]u8 = undefined,
-    replace_arg_lens: [4]usize = .{ 0, 0, 0, 0 },
+    replace_arg_bufs: [32][256]u8 = undefined,
+    replace_arg_lens: [32]usize = [_]usize{0} ** 32,
     fail_unexpected_format: bool = false,
 
     fn init(run_result: cli_surface.RunResult) TestCapture {
@@ -693,13 +941,19 @@ fn startWorkerThreadForTest(ctx: ?*anyopaque, _: *anyopaque) !void {
 
 const TestApp = struct {
     requested_resume: ?cli_surface.ResumeTarget = null,
+    invocation_skill_roots: [][]u8 = &.{},
+    pending_launch_session_name: ?[]u8 = null,
     terminal_released: bool = false,
 
     fn init(_: Allocator, launch: *cli_surface.InteractiveLaunch) !TestApp {
         appendInitEvent(launch);
         if (active_capture.?.init_error) |err| return err;
 
-        var app = TestApp{};
+        var app = TestApp{
+            .invocation_skill_roots = launch.modifiers.takeInvocationSkillRoots(),
+            .pending_launch_session_name = launch.modifiers.session_name,
+        };
+        launch.modifiers.session_name = null;
         if (launch.requested_resume) |target| {
             app.requested_resume = target;
             launch.requested_resume = null;
@@ -710,6 +964,8 @@ const TestApp = struct {
     fn deinit(self: *TestApp) void {
         self.releaseTerminal();
         if (self.requested_resume) |*target| target.deinit(std.testing.allocator);
+        freeInvocationSkillRoots(std.testing.allocator, self.invocation_skill_roots);
+        if (self.pending_launch_session_name) |name| std.testing.allocator.free(name);
         appendTestEvent("deinit");
         self.* = undefined;
     }
@@ -735,6 +991,14 @@ const TestApp = struct {
         return request;
     }
 
+    fn clonePendingLaunchSessionNameForRelaunch(
+        self: *const TestApp,
+        alloc: Allocator,
+    ) Allocator.Error!?[]u8 {
+        const name = self.pending_launch_session_name orelse return null;
+        return try alloc.dupe(u8, name);
+    }
+
     fn releaseTerminal(self: *TestApp) void {
         if (self.terminal_released) return;
         self.terminal_released = true;
@@ -757,6 +1021,11 @@ const TestApp = struct {
         appendTestEvent("mcp-discovery");
     }
 
+    fn configureNotifications(_: *TestApp) !void {
+        appendTestEvent("configure-notifications");
+        if (active_capture.?.configure_error) |err| return err;
+    }
+
     fn rebindAfterInit(_: *TestApp) void {
         appendTestEvent("rebind-after-init");
     }
@@ -770,6 +1039,14 @@ const TestApp = struct {
         if (active_capture.?.run_error) |err| return err;
     }
 };
+
+test "upgrade relaunch recovery shell-quotes unsafe arguments" {
+    var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+
+    try writeShellArgument(&out.writer, "team's skills");
+    try std.testing.expectEqualStrings("'team'\"'\"'s skills'", out.written());
+}
 
 test "app entry returns after handled CLI success without initializing app" {
     const alloc = std.testing.allocator;
@@ -863,7 +1140,7 @@ test "app entry runs interactive startup callbacks in active order" {
 
     try std.testing.expectEqual(RunOutcome.returned, outcome);
     try std.testing.expectEqual(@as(usize, 0), capture.stdout_calls);
-    try expectEvents(&.{ "init:none", "mcp-discovery", "rebind-after-init", "auto-upgrade", "file-index", "worker-thread", "model-cache", "run", "terminal-release", "deinit" });
+    try expectEvents(&.{ "init:none", "configure-notifications", "rebind-after-init", "mcp-discovery", "auto-upgrade", "file-index", "worker-thread", "model-cache", "run", "terminal-release", "deinit" });
 }
 
 test "app entry writes exact resume handoff after interactive teardown" {
@@ -884,8 +1161,9 @@ test "app entry writes exact resume handoff after interactive teardown" {
     try std.testing.expectEqualStrings("", capture.stderr.written());
     try expectEvents(&.{
         "init:none",
-        "mcp-discovery",
+        "configure-notifications",
         "rebind-after-init",
+        "mcp-discovery",
         "auto-upgrade",
         "file-index",
         "worker-thread",
@@ -928,12 +1206,13 @@ test "app entry relaunches only after teardown with the validated handoff" {
     try std.testing.expect(std.mem.find(
         u8,
         capture.stderr.written(),
-        "fx --resume session-123",
+        "fx resume session-123",
     ) != null);
     try expectEvents(&.{
         "init:none",
-        "mcp-discovery",
+        "configure-notifications",
         "rebind-after-init",
+        "mcp-discovery",
         "auto-upgrade",
         "file-index",
         "worker-thread",
@@ -943,6 +1222,313 @@ test "app entry relaunches only after teardown with the validated handoff" {
         "deinit",
         "stderr-attempt",
     });
+}
+
+test "app entry preserves invocation skill roots across an upgrade relaunch" {
+    const alloc = std.testing.allocator;
+    const roots = roots: {
+        const owned = try alloc.alloc([]u8, 2);
+        var initialized: usize = 0;
+        errdefer {
+            for (owned[0..initialized]) |root| alloc.free(root);
+            alloc.free(owned);
+        }
+        owned[0] = try alloc.dupe(u8, "/tmp/team skills");
+        initialized += 1;
+        owned[1] = try alloc.dupe(u8, "/opt/shared-skills");
+        break :roots owned;
+    };
+
+    var capture = TestCapture.init(.{ .interactive = .{
+        .modifiers = .{ .invocation_skill_roots = roots },
+    } });
+    defer capture.deinit();
+    capture.resume_handoff_id = "session-123";
+    capture.upgrade_relaunch_path = "/tmp/fx-upgraded";
+
+    const outcome = try runWithDeps(
+        TestApp,
+        alloc,
+        &.{},
+        testConfig(),
+        capture.deps(),
+    );
+
+    try std.testing.expectEqual(@as(u8, 1), outcome.exit);
+    try std.testing.expectEqual(@as(usize, 1), capture.replace_calls);
+    try std.testing.expectEqual(@as(usize, 8), capture.replace_arg_count);
+    try std.testing.expectEqualStrings("/tmp/fx-upgraded", capture.replaceArg(0));
+    try std.testing.expectEqualStrings("--skills-dir", capture.replaceArg(1));
+    try std.testing.expectEqualStrings("/tmp/team skills", capture.replaceArg(2));
+    try std.testing.expectEqualStrings("--skills-dir", capture.replaceArg(3));
+    try std.testing.expectEqualStrings("/opt/shared-skills", capture.replaceArg(4));
+    try std.testing.expectEqualStrings("resume", capture.replaceArg(5));
+    try std.testing.expectEqualStrings("session-123", capture.replaceArg(6));
+    try std.testing.expectEqualStrings("--upgrade-relaunch", capture.replaceArg(7));
+    try std.testing.expect(std.mem.find(
+        u8,
+        capture.stderr.written(),
+        "fx --skills-dir '/tmp/team skills' --skills-dir /opt/shared-skills resume session-123",
+    ) != null);
+}
+
+test "app entry preserves native tool suppression across upgrade relaunch" {
+    const alloc = std.testing.allocator;
+    var capture = TestCapture.init(.{ .interactive = .{
+        .modifiers = .{ .allow_native_tools = false },
+    } });
+    defer capture.deinit();
+    capture.resume_handoff_id = "session-123";
+    capture.upgrade_relaunch_path = "/tmp/fx-upgraded";
+
+    const outcome = try runWithDeps(
+        TestApp,
+        alloc,
+        &.{},
+        testConfig(),
+        capture.deps(),
+    );
+
+    try std.testing.expectEqual(@as(u8, 1), outcome.exit);
+    try std.testing.expectEqual(@as(usize, 1), capture.replace_calls);
+    try std.testing.expectEqual(@as(usize, 5), capture.replace_arg_count);
+    try std.testing.expectEqualStrings("/tmp/fx-upgraded", capture.replaceArg(0));
+    try std.testing.expectEqualStrings("--no-native-tools", capture.replaceArg(1));
+    try std.testing.expectEqualStrings("resume", capture.replaceArg(2));
+    try std.testing.expectEqualStrings("session-123", capture.replaceArg(3));
+    try std.testing.expectEqualStrings("--upgrade-relaunch", capture.replaceArg(4));
+    try std.testing.expect(std.mem.find(
+        u8,
+        capture.stderr.written(),
+        "fx --no-native-tools resume session-123",
+    ) != null);
+}
+
+test "app entry preserves ordered native tool selection across upgrade relaunch" {
+    const alloc = std.testing.allocator;
+    const selected = try alloc.alloc([]u8, 2);
+    selected[0] = try alloc.dupe(u8, "terminal:exec");
+    selected[1] = try alloc.dupe(u8, "read_file");
+    var capture = TestCapture.init(.{ .interactive = .{
+        .modifiers = .{ .selected_native_tools = selected },
+    } });
+    defer capture.deinit();
+    capture.resume_handoff_id = "session-123";
+    capture.upgrade_relaunch_path = "/tmp/fx-upgraded";
+
+    const outcome = try runWithDeps(
+        TestApp,
+        alloc,
+        &.{},
+        testConfig(),
+        capture.deps(),
+    );
+
+    try std.testing.expectEqual(@as(u8, 1), outcome.exit);
+    try std.testing.expectEqual(@as(usize, 1), capture.replace_calls);
+    try std.testing.expectEqual(@as(usize, 8), capture.replace_arg_count);
+    try std.testing.expectEqualStrings("/tmp/fx-upgraded", capture.replaceArg(0));
+    try std.testing.expectEqualStrings("--tool", capture.replaceArg(1));
+    try std.testing.expectEqualStrings("terminal:exec", capture.replaceArg(2));
+    try std.testing.expectEqualStrings("--tool", capture.replaceArg(3));
+    try std.testing.expectEqualStrings("read_file", capture.replaceArg(4));
+    try std.testing.expectEqualStrings("resume", capture.replaceArg(5));
+    try std.testing.expectEqualStrings("session-123", capture.replaceArg(6));
+    try std.testing.expectEqualStrings("--upgrade-relaunch", capture.replaceArg(7));
+    try std.testing.expect(std.mem.find(
+        u8,
+        capture.stderr.written(),
+        "fx --tool terminal:exec --tool read_file resume session-123",
+    ) != null);
+}
+
+test "app entry relaunch preserves exclusive skill roots" {
+    const alloc = std.testing.allocator;
+    const roots = roots: {
+        const owned = try alloc.alloc([]u8, 2);
+        var initialized: usize = 0;
+        errdefer {
+            for (owned[0..initialized]) |root| alloc.free(root);
+            alloc.free(owned);
+        }
+        owned[0] = try alloc.dupe(u8, "/tmp/first-skills");
+        initialized += 1;
+        owned[1] = try alloc.dupe(u8, "/tmp/second-skills");
+        break :roots owned;
+    };
+    var capture = TestCapture.init(.{ .interactive = .{ .modifiers = .{
+        .invocation_skill_roots = roots,
+        .no_default_skills = true,
+    } } });
+    defer capture.deinit();
+    capture.resume_handoff_id = "session-123";
+    capture.upgrade_relaunch_path = "/tmp/fx-upgraded";
+
+    const outcome = try runWithDeps(
+        TestApp,
+        alloc,
+        &.{},
+        testConfig(),
+        capture.deps(),
+    );
+
+    try std.testing.expectEqual(@as(u8, 1), outcome.exit);
+    try std.testing.expectEqual(@as(usize, 1), capture.replace_calls);
+    try std.testing.expectEqual(@as(usize, 9), capture.replace_arg_count);
+    try std.testing.expectEqualStrings("/tmp/fx-upgraded", capture.replaceArg(0));
+    try std.testing.expectEqualStrings("--no-default-skills", capture.replaceArg(1));
+    try std.testing.expectEqualStrings("--skills-dir", capture.replaceArg(2));
+    try std.testing.expectEqualStrings("/tmp/first-skills", capture.replaceArg(3));
+    try std.testing.expectEqualStrings("--skills-dir", capture.replaceArg(4));
+    try std.testing.expectEqualStrings("/tmp/second-skills", capture.replaceArg(5));
+    try std.testing.expectEqualStrings("resume", capture.replaceArg(6));
+    try std.testing.expectEqualStrings("session-123", capture.replaceArg(7));
+    try std.testing.expectEqualStrings("--upgrade-relaunch", capture.replaceArg(8));
+}
+
+test "app entry preserves project instruction suppression across upgrade relaunch" {
+    const alloc = std.testing.allocator;
+    var capture = TestCapture.init(.{ .interactive = .{
+        .modifiers = .{ .project_instructions_enabled = false },
+    } });
+    defer capture.deinit();
+    capture.resume_handoff_id = "session-123";
+    capture.upgrade_relaunch_path = "/tmp/fx-upgraded";
+
+    const outcome = try runWithDeps(
+        TestApp,
+        alloc,
+        &.{},
+        testConfig(),
+        capture.deps(),
+    );
+
+    try std.testing.expectEqual(@as(u8, 1), outcome.exit);
+    try std.testing.expectEqual(@as(usize, 1), capture.replace_calls);
+    try std.testing.expectEqual(@as(usize, 5), capture.replace_arg_count);
+    try std.testing.expectEqualStrings("/tmp/fx-upgraded", capture.replaceArg(0));
+    try std.testing.expectEqualStrings("--no-project-instructions", capture.replaceArg(1));
+    try std.testing.expectEqualStrings("resume", capture.replaceArg(2));
+    try std.testing.expectEqualStrings("session-123", capture.replaceArg(3));
+    try std.testing.expectEqualStrings("--upgrade-relaunch", capture.replaceArg(4));
+    try std.testing.expect(std.mem.find(
+        u8,
+        capture.stderr.written(),
+        "fx --no-project-instructions resume session-123",
+    ) != null);
+}
+
+test "app entry preserves every launch control across an upgrade relaunch" {
+    const alloc = std.testing.allocator;
+    const overrides = try alloc.dupe(
+        config_runtime.context_limits.Override,
+        &.{.{
+            .name = .skill_chunk_bytes,
+            .value = .{ .bytes = 4096 },
+        }},
+    );
+    const directories = try alloc.alloc([]u8, 1);
+    directories[0] = try alloc.dupe(u8, "/tmp/fx extra");
+    const prompt_replacement = try alloc.dupe(u8, "/tmp/base prompt.md");
+    const prompt_appends = try alloc.alloc([]u8, 2);
+    prompt_appends[0] = try alloc.dupe(u8, "/tmp/first-extra.md");
+    prompt_appends[1] = try alloc.dupe(u8, "/tmp/second extra.md");
+    const effective_system_prompt = try alloc.dupe(u8, "COMPOSED_LAUNCH_SYSTEM_PROMPT");
+    const selected_tools = try alloc.alloc([]u8, 2);
+    selected_tools[0] = try alloc.dupe(u8, "terminal:exec");
+    selected_tools[1] = try alloc.dupe(u8, "read_file");
+    const skill_roots = try alloc.alloc([]u8, 2);
+    skill_roots[0] = try alloc.dupe(u8, "/tmp/team skills");
+    skill_roots[1] = try alloc.dupe(u8, "/opt/shared-skills");
+    const state_home = try alloc.dupe(u8, "/tmp/fx-state");
+    const permission_path = try alloc.dupe(u8, "/tmp/fx-policy.json");
+    const session_name = try alloc.dupe(u8, "Pending launch title");
+    var capture = TestCapture.init(.{ .interactive = .{
+        .modifiers = .{
+            .context_limit_overrides = overrides,
+            .additional_directories = directories,
+            .saved_directories_suppressed = true,
+            .prompt_files = .{
+                .replacement_path = prompt_replacement,
+                .append_paths = prompt_appends,
+            },
+            .effective_system_prompt = effective_system_prompt,
+            .selected_native_tools = selected_tools,
+            .invocation_skill_roots = skill_roots,
+            .no_default_skills = true,
+            .project_instructions_enabled = false,
+            .state_home = state_home,
+            .permission_policy = .{
+                .path = permission_path,
+                .rules = .{},
+            },
+            .session_name = session_name,
+        },
+    } });
+    defer capture.deinit();
+    capture.resume_handoff_id = "session-123";
+    capture.upgrade_relaunch_path = "/tmp/fx-upgraded";
+
+    const outcome = try runWithDeps(
+        TestApp,
+        alloc,
+        &.{},
+        testConfig(),
+        capture.deps(),
+    );
+
+    try std.testing.expectEqual(@as(u8, 1), outcome.exit);
+    const expected = [_][]const u8{
+        "/tmp/fx-upgraded",
+        "--context-limit",
+        "skill_chunk_bytes=4096",
+        "--add-dir",
+        "/tmp/fx extra",
+        "--no-additional-dirs",
+        "--system-prompt-file",
+        "/tmp/base prompt.md",
+        "--append-system-prompt-file",
+        "/tmp/first-extra.md",
+        "--append-system-prompt-file",
+        "/tmp/second extra.md",
+        "--state-dir",
+        "/tmp/fx-state",
+        "--permissions-file",
+        "/tmp/fx-policy.json",
+        "--tool",
+        "terminal:exec",
+        "--tool",
+        "read_file",
+        "--no-default-skills",
+        "--skills-dir",
+        "/tmp/team skills",
+        "--skills-dir",
+        "/opt/shared-skills",
+        "--no-project-instructions",
+        "--name",
+        "Pending launch title",
+        "resume",
+        "session-123",
+        "--upgrade-relaunch",
+    };
+    try std.testing.expectEqual(expected.len, capture.replace_arg_count);
+    for (expected, 0..) |arg, index| {
+        try std.testing.expectEqualStrings(arg, capture.replaceArg(index));
+    }
+    try std.testing.expectEqualStrings(
+        "fx: upgrade installed, but relaunch failed: InvalidExe\n" ++
+            "Continue session with: fx --context-limit skill_chunk_bytes=4096" ++
+            " --add-dir '/tmp/fx extra' --no-additional-dirs" ++
+            " --system-prompt-file '/tmp/base prompt.md'" ++
+            " --append-system-prompt-file /tmp/first-extra.md" ++
+            " --append-system-prompt-file '/tmp/second extra.md'" ++
+            " --state-dir /tmp/fx-state --permissions-file /tmp/fx-policy.json" ++
+            " --tool terminal:exec --tool read_file --no-default-skills" ++
+            " --skills-dir '/tmp/team skills' --skills-dir /opt/shared-skills" ++
+            " --no-project-instructions --name 'Pending launch title'" ++
+            " resume session-123\n",
+        capture.stderr.written(),
+    );
 }
 
 test "app entry never relaunches without a validated handoff" {
@@ -1011,7 +1597,26 @@ test "app entry releases terminal before reporting worker start errors" {
     try std.testing.expectError(error.TestWorkerStartFailed, runWithDeps(TestApp, alloc, &.{}, testConfig(), capture.deps()));
     try std.testing.expectEqualStrings("fx: TestWorkerStartFailed\n", capture.stderr.written());
     try std.testing.expectEqual(@as(usize, 1), capture.stderr_calls);
-    try expectEvents(&.{ "init:none", "mcp-discovery", "rebind-after-init", "auto-upgrade", "file-index", "worker-thread", "terminal-release", "stderr-attempt", "deinit" });
+    try expectEvents(&.{ "init:none", "configure-notifications", "rebind-after-init", "mcp-discovery", "auto-upgrade", "file-index", "worker-thread", "terminal-release", "stderr-attempt", "deinit" });
+}
+
+test "app entry arms cleanup and configures lifecycle before recovered-child rebind" {
+    const alloc = std.testing.allocator;
+    var capture = TestCapture.init(.{ .interactive = .{} });
+    defer capture.deinit();
+    capture.configure_error = error.TestLifecycleConfigureFailed;
+    capture.record_stderr_event = true;
+
+    try std.testing.expectError(
+        error.TestLifecycleConfigureFailed,
+        runWithDeps(TestApp, alloc, &.{}, testConfig(), capture.deps()),
+    );
+    try expectEvents(&.{
+        "init:none",
+        "configure-notifications",
+        "terminal-release",
+        "deinit",
+    });
 }
 
 test "app entry releases terminal before reporting initial context failures exactly" {
@@ -1042,8 +1647,9 @@ test "app entry releases terminal before reporting initial context failures exac
         try std.testing.expectEqual(@as(usize, 1), capture.stderr_calls);
         try expectEvents(&.{
             "init:none",
-            "mcp-discovery",
+            "configure-notifications",
             "rebind-after-init",
+            "mcp-discovery",
             "auto-upgrade",
             "file-index",
             "worker-thread",
@@ -1067,7 +1673,7 @@ test "app entry reports run errors before deinit and outer cleanup" {
     try std.testing.expectEqualStrings("fx: TestRunFailed\n", capture.stderr.written());
     try std.testing.expectEqual(@as(usize, 1), capture.stderr_calls);
     try std.testing.expectEqual(@as(usize, 0), capture.stdout_calls);
-    try expectEvents(&.{ "init:none", "mcp-discovery", "rebind-after-init", "auto-upgrade", "file-index", "worker-thread", "model-cache", "run", "terminal-release", "stderr-attempt", "deinit", "outer-defer" });
+    try expectEvents(&.{ "init:none", "configure-notifications", "rebind-after-init", "mcp-discovery", "auto-upgrade", "file-index", "worker-thread", "model-cache", "run", "terminal-release", "stderr-attempt", "deinit", "outer-defer" });
 }
 
 test "app entry treats terminal input closure as abnormal cleanup without stderr" {
@@ -1092,8 +1698,9 @@ test "app entry treats terminal input closure as abnormal cleanup without stderr
     try std.testing.expectEqual(@as(usize, 0), capture.stdout_calls);
     try expectEvents(&.{
         "init:none",
-        "mcp-discovery",
+        "configure-notifications",
         "rebind-after-init",
+        "mcp-discovery",
         "auto-upgrade",
         "file-index",
         "worker-thread",
@@ -1114,7 +1721,7 @@ test "app entry preserves run errors when fatal formatting fails" {
     try std.testing.expectError(error.TestRunFailed, runWithDeps(TestApp, alloc, &.{}, testConfig(), capture.deps()));
     try std.testing.expectEqualStrings("", capture.stderr.written());
     try std.testing.expectEqual(@as(usize, 0), capture.stderr_calls);
-    try expectEvents(&.{ "init:none", "mcp-discovery", "rebind-after-init", "auto-upgrade", "file-index", "worker-thread", "model-cache", "run", "terminal-release", "deinit" });
+    try expectEvents(&.{ "init:none", "configure-notifications", "rebind-after-init", "mcp-discovery", "auto-upgrade", "file-index", "worker-thread", "model-cache", "run", "terminal-release", "deinit" });
 }
 
 test "app entry preserves run errors when fatal writer fails" {
@@ -1128,7 +1735,7 @@ test "app entry preserves run errors when fatal writer fails" {
     try std.testing.expectError(error.TestRunFailed, runWithDeps(TestApp, alloc, &.{}, testConfig(), capture.deps()));
     try std.testing.expectEqualStrings("", capture.stderr.written());
     try std.testing.expectEqual(@as(usize, 1), capture.stderr_calls);
-    try expectEvents(&.{ "init:none", "mcp-discovery", "rebind-after-init", "auto-upgrade", "file-index", "worker-thread", "model-cache", "run", "terminal-release", "stderr-attempt", "deinit" });
+    try expectEvents(&.{ "init:none", "configure-notifications", "rebind-after-init", "mcp-discovery", "auto-upgrade", "file-index", "worker-thread", "model-cache", "run", "terminal-release", "stderr-attempt", "deinit" });
 }
 
 test "app entry passes requested resume into app init" {
@@ -1139,7 +1746,7 @@ test "app entry passes requested resume into app init" {
     const outcome = try runWithDeps(TestApp, alloc, &.{ @constCast("resume"), @constCast("session-123") }, testConfig(), capture.deps());
 
     try std.testing.expectEqual(RunOutcome.returned, outcome);
-    try expectEvents(&.{ "init:session-123", "mcp-discovery", "rebind-after-init", "resume-reconciliation", "auto-upgrade", "file-index", "worker-thread", "model-cache", "run", "terminal-release", "deinit" });
+    try expectEvents(&.{ "init:session-123", "configure-notifications", "rebind-after-init", "resume-reconciliation", "mcp-discovery", "auto-upgrade", "file-index", "worker-thread", "model-cache", "run", "terminal-release", "deinit" });
 }
 
 test "app entry maps noninteractive terminal startup to exit one" {

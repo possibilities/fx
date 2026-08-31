@@ -14,6 +14,7 @@ const provider_catalog = @import("../auth/provider_catalog.zig");
 const auth_transition = @import("../auth/auth_transition.zig");
 const model_provider = @import("../config/model_provider.zig");
 const model_catalog = @import("../gateway/model_catalog.zig");
+const app_profile_runtime = @import("app_profile_runtime.zig");
 const provider_runtime = @import("provider_runtime.zig");
 const types = @import("../shared/types.zig");
 
@@ -153,7 +154,10 @@ pub fn Runtime(comptime App: type) type {
                 .available_sources = provider_inventory,
             });
             if (logout_provider == .grok) {
-                const outcome = grok_oauth.logout(app.alloc, app.auth.oauthTransport()) catch {
+                const outcome = (if (app_profile_runtime.explicitHome(app)) |profile_home|
+                    grok_oauth.logoutFromHome(app.alloc, app.auth.oauthTransport(), profile_home)
+                else
+                    grok_oauth.logout(app.alloc, app.auth.oauthTransport())) catch {
                     try writeAuthNotice(app, .{
                         .topic = "auth",
                         .tone = .@"error",
@@ -181,7 +185,10 @@ pub fn Runtime(comptime App: type) type {
                 return;
             }
             if (logout_provider == .codex) {
-                const outcome = chatgpt_oauth.logout() catch {
+                const outcome = (if (app_profile_runtime.explicitHome(app)) |profile_home|
+                    chatgpt_oauth.logoutFromHome(profile_home)
+                else
+                    chatgpt_oauth.logout()) catch {
                     try writeAuthNotice(app, .{
                         .topic = "auth",
                         .tone = .@"error",
@@ -201,7 +208,10 @@ pub fn Runtime(comptime App: type) type {
                 });
                 return;
             }
-            const result = login_flow.logout(app.alloc, app.auth.oauthTransport()) catch |err| switch (err) {
+            const result = (if (app_profile_runtime.explicitHome(app)) |profile_home|
+                login_flow.logoutFromHome(app.alloc, app.auth.oauthTransport(), profile_home)
+            else
+                login_flow.logout(app.alloc, app.auth.oauthTransport())) catch |err| switch (err) {
                 error.SessionDeleteFailed => {
                     try writeAuthNotice(app, .{
                         .topic = "auth",
@@ -550,8 +560,8 @@ pub fn Runtime(comptime App: type) type {
         }
 
         fn forgetCredentialSource(app: *App) void {
-            var attempt = config_runtime.attemptUserPreferences(
-                app.alloc,
+            var attempt = app_profile_runtime.attemptUserPreferences(
+                app,
                 .{ .clear_credential_source = true },
             );
             defer attempt.deinit(app.alloc);
@@ -602,8 +612,8 @@ pub fn Runtime(comptime App: type) type {
                 return;
             }
 
-            var attempt = config_runtime.attemptUserPreferences(
-                app.alloc,
+            var attempt = app_profile_runtime.attemptUserPreferences(
+                app,
                 .{ .credential_source = source },
             );
             defer attempt.deinit(app.alloc);
@@ -771,14 +781,24 @@ pub fn Runtime(comptime App: type) type {
             }
             try app.flushBeforeBlockingExternalWork();
 
-            const resolution = credentials.resolveForProvider(
-                app.alloc,
-                app.auth.oauthTransport(),
-                app.auth.secretStore(),
-                .refresh_if_needed,
-                target,
-                null,
-            ) catch |err| {
+            const resolution = (if (app_profile_runtime.explicitHome(app)) |profile_home|
+                credentials.resolveForProviderFromHome(
+                    app.alloc,
+                    app.auth.oauthTransport(),
+                    .refresh_if_needed,
+                    target,
+                    null,
+                    profile_home,
+                )
+            else
+                credentials.resolveForProvider(
+                    app.alloc,
+                    app.auth.oauthTransport(),
+                    app.auth.secretStore(),
+                    .refresh_if_needed,
+                    target,
+                    null,
+                )) catch |err| {
                 debug_trace.logf("provider", "credential preparation failed provider={t} err={s}", .{ target, @errorName(err) });
                 try app.writeDomainNotice(.{
                     .topic = "provider",
@@ -877,7 +897,7 @@ pub fn Runtime(comptime App: type) type {
                 return;
             }
 
-            var settings = config_runtime.loadMergedSettings(app.alloc, app.workspace_root) catch |err| {
+            var settings = app_profile_runtime.loadMergedSettings(app) catch |err| {
                 debug_trace.logf("provider", "settings load failed err={s}", .{@errorName(err)});
                 try app.writeDomainNotice(.{
                     .topic = "provider",
@@ -952,7 +972,7 @@ pub fn Runtime(comptime App: type) type {
                     try app.writeDomainNotice(.{ .topic = "provider", .tone = .neutral, .body = body }, true);
                 }
             } else {
-                var persistence = config_runtime.attemptUserPreferences(app.alloc, .{
+                var persistence = app_profile_runtime.attemptUserPreferences(app, .{
                     .provider = target,
                     .model_preference = .{
                         .provider = target,
@@ -979,7 +999,10 @@ pub fn Runtime(comptime App: type) type {
             if (!app.auth.pickerView().fx_login_session_available) return;
             try app.flushBeforeBlockingExternalWork();
 
-            var selection = login_flow.loadTeamSelection(app.alloc, app.auth.oauthTransport()) catch |err| {
+            var selection = (if (app_profile_runtime.explicitHome(app)) |profile_home|
+                login_flow.loadTeamSelectionFromHome(app.alloc, app.auth.oauthTransport(), profile_home)
+            else
+                login_flow.loadTeamSelection(app.alloc, app.auth.oauthTransport())) catch |err| {
                 debug_trace.logf("auth", "team picker load failed err={s}", .{@errorName(err)});
                 try app.writeDomainNotice(.{
                     .topic = "auth",
@@ -1008,7 +1031,10 @@ pub fn Runtime(comptime App: type) type {
             );
             defer app.alloc.free(body);
 
-            var selected_team = selection.select(app.alloc, index) catch |err| {
+            var selected_team = (if (app_profile_runtime.explicitHome(app)) |profile_home|
+                selection.selectFromHome(app.alloc, index, profile_home)
+            else
+                selection.select(app.alloc, index)) catch |err| {
                 debug_trace.logf("auth", "team change failed err={s}", .{@errorName(err)});
                 app.auth.closePicker(app.alloc);
                 try app.writeDomainNotice(.{
@@ -1435,6 +1461,15 @@ const TestTeamSelection = struct {
         if (index >= self.teams.items.len) return error.InvalidTeamSelection;
         self.select_count += 1;
         return .{};
+    }
+
+    fn selectFromHome(
+        self: *TestTeamSelection,
+        alloc: std.mem.Allocator,
+        index: usize,
+        _: []const u8,
+    ) error{ InvalidTeamSelection, SessionChanged, NoSession }!TestSelectedTeam {
+        return self.select(alloc, index);
     }
 };
 

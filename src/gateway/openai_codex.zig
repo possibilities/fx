@@ -242,11 +242,19 @@ pub fn streamPrepared(
     defer http_request.deinit();
     var cancel_watch_done = std.atomic.Value(bool).init(false);
     const cancel_watcher = if (http_request.connection) |connection|
-        try gateway_client.spawnHttpCancelWatcher(
-            &cancel_watch_done,
-            request.cancel_flag,
-            connection.stream_writer.stream,
-        )
+        if (request.deadline) |deadline|
+            try gateway_client.spawnHttpCancelWatcherBounded(
+                &cancel_watch_done,
+                request.cancel_flag,
+                deadline,
+                connection.stream_writer.stream,
+            )
+        else
+            try gateway_client.spawnHttpCancelWatcher(
+                &cancel_watch_done,
+                request.cancel_flag,
+                connection.stream_writer.stream,
+            )
     else
         null;
     defer {

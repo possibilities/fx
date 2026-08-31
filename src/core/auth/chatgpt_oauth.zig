@@ -57,6 +57,7 @@ const BrowserLoginContext = struct {
     redirect_uri: []u8,
     code_verifier: []u8,
     state: []u8,
+    profile_home: ?[]const u8 = null,
 
     fn deinit(self: *BrowserLoginContext, alloc: Allocator) void {
         self.listener.deinit(io_mod.getIo());
@@ -77,7 +78,25 @@ pub fn startSignIn(
     alloc: Allocator,
     transport: oauth_transport.Provider,
 ) !bool {
-    const browser = try prepareBrowserSignIn(alloc);
+    return startSignInFromOptionalHome(runtime, alloc, transport, null);
+}
+
+pub fn startSignInFromHome(
+    runtime: *login_flow.SignInRuntime,
+    alloc: Allocator,
+    transport: oauth_transport.Provider,
+    home: []const u8,
+) !bool {
+    return startSignInFromOptionalHome(runtime, alloc, transport, home);
+}
+
+fn startSignInFromOptionalHome(
+    runtime: *login_flow.SignInRuntime,
+    alloc: Allocator,
+    transport: oauth_transport.Provider,
+    profile_home: ?[]const u8,
+) !bool {
+    const browser = try prepareBrowserSignIn(alloc, profile_home);
     return runtime.startPrepared(
         alloc,
         browser.prepared,
@@ -95,7 +114,10 @@ pub fn startSignIn(
     );
 }
 
-fn prepareBrowserSignIn(alloc: Allocator) !PreparedBrowserLogin {
+fn prepareBrowserSignIn(
+    alloc: Allocator,
+    profile_home: ?[]const u8,
+) !PreparedBrowserLogin {
     const configured_issuer = try configuredEndpoint(alloc, e2e_issuer_url_env, issuer_url);
     defer alloc.free(configured_issuer);
     const configured_token_endpoint = try configuredEndpoint(alloc, e2e_token_url_env, token_url);
@@ -133,6 +155,7 @@ fn prepareBrowserSignIn(alloc: Allocator) !PreparedBrowserLogin {
         .redirect_uri = redirect_uri,
         .code_verifier = code_verifier,
         .state = state,
+        .profile_home = profile_home,
     };
     listener_owned = false;
 
@@ -335,12 +358,17 @@ fn completeSignIn(
     return completion;
 }
 
-fn saveSignIn(_: ?*anyopaque, alloc: Allocator, completion: login_flow.SignInCompletion) !void {
+fn saveSignIn(raw: ?*anyopaque, alloc: Allocator, completion: login_flow.SignInCompletion) !void {
+    const context: *BrowserLoginContext = @ptrCast(@alignCast(raw.?));
     const session = switch (completion) {
         .chatgpt => |session| session,
         .vercel, .grok => return error.InvalidSignInCompletion,
     };
-    try chatgpt_session.saveNewSession(alloc, session);
+    if (context.profile_home) |home| {
+        try chatgpt_session.saveNewSessionFromHome(alloc, home, session);
+    } else {
+        try chatgpt_session.saveNewSession(alloc, session);
+    }
 }
 
 pub fn runLogin(
@@ -382,6 +410,12 @@ pub fn logout() !chatgpt_session.DeleteOutcome {
     return mutation.delete();
 }
 
+pub fn logoutFromHome(home: []const u8) !chatgpt_session.DeleteOutcome {
+    var mutation = (try chatgpt_session.beginExistingMutationFromHome(home)) orelse return .missing;
+    defer mutation.deinit();
+    return mutation.delete();
+}
+
 pub fn sourceExists(alloc: Allocator) !bool {
     var session = (try chatgpt_session.load(alloc)) orelse return false;
     defer session.deinit(alloc);
@@ -393,13 +427,65 @@ pub fn loadAccess(
     transport: oauth_transport.Provider,
     mode: RefreshMode,
 ) !?Access {
+    return loadAccessFromStore(alloc, transport, mode, chatgpt_session.default_store);
+}
+
+pub fn loadAccessFromStore(
+    alloc: Allocator,
+    transport: oauth_transport.Provider,
+    mode: RefreshMode,
+    store: chatgpt_session.Store,
+) !?Access {
+    return loadAccessForAccountFromStore(alloc, transport, mode, null, store);
+}
+
+pub fn loadAccessForAccountFromStore(
+    alloc: Allocator,
+    transport: oauth_transport.Provider,
+    mode: RefreshMode,
+    expected_account_id: ?[]const u8,
+    store: chatgpt_session.Store,
+) !?Access {
     if (mode == .stored) {
-        var session = (try chatgpt_session.load(alloc)) orelse return null;
+        var session = (try chatgpt_session.loadFromStore(alloc, store)) orelse return null;
+        defer session.deinit(alloc);
+        try validateExpectedAccount(session, expected_account_id);
+        return takeAccess(&session);
+    }
+
+    var mutation = (try chatgpt_session.beginExistingMutationForStore(store)) orelse return null;
+    defer mutation.deinit();
+    var session = (try mutation.load(alloc)) orelse return null;
+    defer session.deinit(alloc);
+    // Account pinning is an authorization boundary. Validate the loaded
+    // credential before a forced or expiry-driven refresh can send its token
+    // or commit a rotated replacement.
+    try validateExpectedAccount(session, expected_account_id);
+
+    if (mode == .force or session.expired(io_mod.milliTimestamp())) {
+        try refreshSession(alloc, transport, &mutation, &session);
+    }
+    return takeAccess(&session);
+}
+
+fn validateExpectedAccount(session: chatgpt_session.Session, expected_account_id: ?[]const u8) !void {
+    const expected = expected_account_id orelse return;
+    if (!std.mem.eql(u8, expected, session.account_id)) return error.ChatGptAccountChanged;
+}
+
+pub fn loadAccessFromHome(
+    alloc: Allocator,
+    transport: oauth_transport.Provider,
+    mode: RefreshMode,
+    home: []const u8,
+) !?Access {
+    if (mode == .stored) {
+        var session = (try chatgpt_session.loadFromHome(alloc, home)) orelse return null;
         defer session.deinit(alloc);
         return takeAccess(&session);
     }
 
-    var mutation = (try chatgpt_session.beginExistingMutation()) orelse return null;
+    var mutation = (try chatgpt_session.beginExistingMutationFromHome(home)) orelse return null;
     defer mutation.deinit();
     var session = (try mutation.load(alloc)) orelse return null;
     defer session.deinit(alloc);
@@ -428,22 +514,27 @@ fn refreshSession(
     mutation: *chatgpt_session.Mutation,
     session: *chatgpt_session.Session,
 ) !void {
-    var body: std.Io.Writer.Allocating = .init(alloc);
-    defer body.deinit();
+    const body_capacity = try refreshBodyCapacity(session.refresh_token.len);
+    var body = try std.Io.Writer.Allocating.initCapacity(alloc, body_capacity);
+    defer {
+        std.crypto.secureZero(u8, @volatileCast(body.writer.buffer));
+        body.deinit();
+    }
     try body.writer.writeAll("{\"client_id\":");
     try std.json.Stringify.value(client_id, .{}, &body.writer);
     try body.writer.writeAll(",\"grant_type\":\"refresh_token\",\"refresh_token\":");
     try std.json.Stringify.value(session.refresh_token, .{}, &body.writer);
     try body.writer.writeByte('}');
+    std.debug.assert(body.writer.buffer.len == body_capacity);
     var token = try requestRefreshToken(alloc, transport, body.written());
     defer token.deinit(alloc);
 
-    const account_id = try extractAccountId(alloc, token.access_token);
-    errdefer alloc.free(account_id);
+    var account_id = try extractAccountId(alloc, token.access_token);
+    errdefer if (account_id.len > 0) alloc.free(account_id);
     if (!std.mem.eql(u8, account_id, session.account_id)) {
         return error.ChatGptAccountChanged;
     }
-    const refresh_token = if (token.refresh_token) |rotated| rotated else try alloc.dupe(u8, session.refresh_token);
+    var refresh_token = if (token.refresh_token) |rotated| rotated else try alloc.dupe(u8, session.refresh_token);
     if (token.refresh_token != null) token.refresh_token = null;
     errdefer secret.zeroAndFree(alloc, refresh_token);
     const expires_at_ms = if (token.expires_in) |expires_in| blk: {
@@ -459,6 +550,8 @@ fn refreshSession(
         .account_id = account_id,
     };
     token.access_token = &.{};
+    account_id = &.{};
+    refresh_token = &.{};
     errdefer replacement.deinit(alloc);
     try mutation.save(alloc, replacement);
 
@@ -467,6 +560,20 @@ fn refreshSession(
     replacement.access_token = &.{};
     replacement.refresh_token = &.{};
     replacement.account_id = &.{};
+}
+
+fn refreshBodyCapacity(refresh_token_len: usize) Allocator.Error!usize {
+    const prefix = "{\"client_id\":";
+    const middle = ",\"grant_type\":\"refresh_token\",\"refresh_token\":";
+    const string_quotes: usize = 2;
+    const client_bytes = std.math.mul(usize, client_id.len, 6) catch return error.OutOfMemory;
+    const refresh_bytes = std.math.mul(usize, refresh_token_len, 6) catch return error.OutOfMemory;
+    var capacity = std.math.add(usize, prefix.len, client_bytes) catch return error.OutOfMemory;
+    capacity = std.math.add(usize, capacity, string_quotes) catch return error.OutOfMemory;
+    capacity = std.math.add(usize, capacity, middle.len) catch return error.OutOfMemory;
+    capacity = std.math.add(usize, capacity, refresh_bytes) catch return error.OutOfMemory;
+    capacity = std.math.add(usize, capacity, string_quotes + 1) catch return error.OutOfMemory;
+    return capacity;
 }
 
 const RefreshTokenResponse = struct {

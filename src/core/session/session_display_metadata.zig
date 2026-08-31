@@ -14,6 +14,30 @@ const max_preview_bytes: usize = 240;
 pub const fallback_title = "Untitled session";
 pub const image_title = "Image session";
 
+pub const TitleValidationError = error{
+    EmptyTitle,
+    TitleTooLong,
+    InvalidTitle,
+};
+
+/// Validates a native session display title and returns the normalized slice,
+/// which borrows from `raw`. This is the one validation authority shared by
+/// launch naming and `/rename`.
+pub fn validateTitle(raw: []const u8) TitleValidationError![]const u8 {
+    const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+    if (trimmed.len == 0) return error.EmptyTitle;
+    if (trimmed.len > max_title_bytes) return error.TitleTooLong;
+    if (!std.unicode.utf8ValidateSlice(trimmed)) return error.InvalidTitle;
+
+    // Preserve the established `/rename` contract exactly: valid UTF-8 with
+    // no ASCII control bytes. Continuation bytes are already covered by the
+    // UTF-8 validation above and are not interpreted as standalone controls.
+    for (trimmed) |byte| {
+        if (byte < 0x20 or byte == 0x7f) return error.InvalidTitle;
+    }
+    return trimmed;
+}
+
 pub const DisplayMetadata = struct {
     present: bool = false,
     title: []u8,
@@ -385,6 +409,26 @@ test "display metadata sidecar round trips and invalid sidecar falls back" {
     try std.testing.expect(!fallback.present);
     try std.testing.expectEqualStrings("Untitled session", fallback.title);
     try std.testing.expect(fallback.preview == null);
+}
+
+test "session display metadata validates explicit titles at the shared native boundary" {
+    try std.testing.expectEqualStrings("hello world", try validateTitle("  hello world \n"));
+    try std.testing.expectEqualStrings("héllo ✓", try validateTitle("héllo ✓"));
+    try std.testing.expectError(error.EmptyTitle, validateTitle("   "));
+    try std.testing.expectError(error.InvalidTitle, validateTitle("bad\ttitle"));
+    try std.testing.expectError(error.InvalidTitle, validateTitle("bad\x07title"));
+    try std.testing.expectError(error.InvalidTitle, validateTitle("bad\x7ftitle"));
+    try std.testing.expectError(error.InvalidTitle, validateTitle("bad\xfftitle"));
+
+    const exact_bound = "x" ** max_title_bytes;
+    try std.testing.expectEqualStrings(exact_bound, try validateTitle(exact_bound));
+    const over_bound = "x" ** (max_title_bytes + 1);
+    try std.testing.expectError(error.TitleTooLong, validateTitle(over_bound));
+
+    const exact_utf8_bound = "é" ** (max_title_bytes / 2);
+    try std.testing.expectEqual(max_title_bytes, (try validateTitle(exact_utf8_bound)).len);
+    const over_utf8_bound = "é" ** (max_title_bytes / 2 + 1);
+    try std.testing.expectError(error.TitleTooLong, validateTitle(over_utf8_bound));
 }
 
 fn makeAssistantTurn(text: []const u8) session.HistoryTurn {

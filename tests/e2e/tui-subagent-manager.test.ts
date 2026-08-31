@@ -26,9 +26,30 @@ import {
   TmuxSession,
   tmuxAvailable,
 } from "./tmux-helpers";
-import { readTapeFrames, stdoutFrames } from "./render-lab/tape";
+import {
+  liveStdoutFrames,
+  readLiveTapeFrames,
+  readTapeFrames,
+  stdoutFrames,
+  type TapeFrame,
+} from "./render-lab/tape";
 
 const TIMEOUT = 30_000;
+
+/**
+ * Ctrl-X reaches fx in one of two encodings, and which one depends on the
+ * terminal rather than on anything the test does. A terminal that has not
+ * negotiated the CSI-u keyboard protocol sends the C0 control byte 0x18; one
+ * that has sends `ESC [ 120 ; 5 u`, the disambiguated form for x with the
+ * control modifier. Matching only the C0 byte makes a recorded handoff look
+ * like a missing one wherever the richer protocol is active.
+ */
+const CTRL_X_CSI_U = "\x1b[120;5u";
+
+function isCtrlXInput(frame: TapeFrame): boolean {
+  return frame.kind === 2 &&
+    (frame.payload.includes(0x18) || frame.payload.includes(CTRL_X_CSI_U));
+}
 
 async function pasteVisibleText(
   session: TmuxSession,
@@ -619,7 +640,9 @@ describe.skipIf(!tmuxAvailable())("tui: Agents & processes", () => {
         expect(control.configuration.permission_mode).toBe("auto");
         const settledChildGrid = await active.capturePaneGrid();
 
-        const parentStreamingFrameStart = stdoutFrames(tapePath).length;
+        const fxPid = active.processPid();
+        const parentStreamingFrameStart = (await liveStdoutFrames(tapePath))
+          .length;
         releaseParent(fakeGatewayToolCall("isolated_parent_read", "read_file", {
           path: childToolPath,
         }));
@@ -640,18 +663,8 @@ describe.skipIf(!tmuxAvailable())("tui: Agents & processes", () => {
           await Bun.sleep(15);
         }
         await Bun.sleep(500);
-        const parentStreamingFrames = stdoutFrames(tapePath).slice(
-          parentStreamingFrameStart,
-        );
-        expect(
-          parentStreamingFrames.filter((frame) => frame.payload.length >= 1_024),
-        ).toHaveLength(0);
-        expect(
-          parentStreamingFrames.reduce(
-            (total, frame) => total + frame.payload.length,
-            0,
-          ),
-        ).toBeLessThan(8_192);
+        const parentStreamingFrameEnd = (await liveStdoutFrames(tapePath))
+          .length;
         expect(await active.capturePaneGrid()).toEqual(settledChildGrid);
         expect(await active.capturePane()).not.toContain("PARENT_BACKGROUND_20");
 
@@ -661,38 +674,46 @@ describe.skipIf(!tmuxAvailable())("tui: Agents & processes", () => {
 
         await active.sendKeys("Escape");
         await active.waitForText("Agents & processes", TIMEOUT);
-        const handoffFrameStart = readTapeFrames(tapePath).at(-1)?.index ?? 0;
+        const handoffFrameStart =
+          (await readLiveTapeFrames(tapePath)).at(-1)?.index ?? 0;
         await active.sendKeys("C-x");
         const restored = await active.waitForText("PARENT_BACKGROUND_DONE", TIMEOUT);
         expect(restored).not.toContain("Agents & processes");
         expect(restored).not.toContain("ISOLATED_CHILD_COMPLETE");
-        let handoffFrames = readTapeFrames(tapePath);
-        let inputIndex = -1;
-        let leaveIndex = -1;
-        const handoffStartedAt = Date.now();
-        while (Date.now() - handoffStartedAt < TIMEOUT) {
-          try {
-            handoffFrames = readTapeFrames(tapePath);
-          } catch {
-            await Bun.sleep(25);
-            continue;
-          }
-          inputIndex = handoffFrames.findIndex((frame) =>
-            frame.index > handoffFrameStart &&
-            frame.kind === 2 &&
-            frame.payload.includes(0x18)
-          );
-          leaveIndex = handoffFrames.findIndex((frame, index) =>
-            index > inputIndex &&
-            frame.kind === 1 &&
-            frame.payload.includes("\x1b[?1049l")
-          );
-          if (inputIndex >= 0 && leaveIndex > inputIndex) break;
-          await Bun.sleep(25);
-        }
+
+        // Every tape assertion below runs against a settled recording. fx
+        // buffers frames, so reading while it is still running races the
+        // writer and reports a frame that has merely not landed yet as a
+        // missing one. Quitting first makes the tape complete, which turns
+        // these into exact assertions instead of timed ones.
+        await active.sendText("/quit");
+        await active.waitForProcessExit(fxPid, TIMEOUT);
+
+        const settledFrames = readTapeFrames(tapePath);
+        const parentStreamingFrames = settledFrames
+          .filter((frame) => frame.kind === 1)
+          .slice(parentStreamingFrameStart, parentStreamingFrameEnd);
+        expect(
+          parentStreamingFrames.filter((frame) => frame.payload.length >= 1_024),
+        ).toHaveLength(0);
+        expect(
+          parentStreamingFrames.reduce(
+            (total, frame) => total + frame.payload.length,
+            0,
+          ),
+        ).toBeLessThan(8_192);
+
+        const inputIndex = settledFrames.findIndex((frame) =>
+          frame.index > handoffFrameStart && isCtrlXInput(frame)
+        );
         expect(inputIndex).toBeGreaterThanOrEqual(0);
+        const leaveIndex = settledFrames.findIndex((frame, index) =>
+          index > inputIndex &&
+          frame.kind === 1 &&
+          frame.payload.includes("\x1b[?1049l")
+        );
         expect(leaveIndex).toBeGreaterThan(inputIndex);
-        const handoffDelayMs = handoffFrames
+        const handoffDelayMs = settledFrames
           .slice(inputIndex + 1, leaveIndex + 1)
           .reduce((total, frame) => total + frame.deltaMs, 0);
         expect(handoffDelayMs).toBeLessThanOrEqual(16);
