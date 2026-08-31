@@ -2290,7 +2290,11 @@ pub const State = struct {
         pending: ?*PendingReload,
     ) !ReloadOutcome {
         if (cancel_requested.load(.acquire)) return error.Cancelled;
-        const next_authority = preview_workspace_authority(alloc, workspace_root) catch |err| {
+        const next_authority = preview_workspace_authority(
+            alloc,
+            workspace_root,
+            self.profile_home,
+        ) catch |err| {
             const detached = try self.detachForReducingReload(cancel_requested, pending);
             if (detached) |runtime| {
                 destroyRuntime(alloc, runtime);
@@ -2705,6 +2709,7 @@ const TestReloadMode = enum {
 
 var test_reload_mode: TestReloadMode = .empty;
 var test_reload_profile_home: ?[]const u8 = null;
+var test_reload_preview_profile_home: ?[]const u8 = null;
 
 fn loadTestReloadRuntime(
     alloc: Allocator,
@@ -2763,7 +2768,12 @@ fn loadTestReloadRuntime(
     return runtime;
 }
 
-fn previewTestWorkspaceAuthority(alloc: Allocator, _: []const u8) ![][]u8 {
+fn previewTestWorkspaceAuthority(
+    alloc: Allocator,
+    _: []const u8,
+    profile_home: ?[]const u8,
+) ![][]u8 {
+    test_reload_preview_profile_home = profile_home;
     return alloc.alloc([]u8, 0);
 }
 
@@ -2778,6 +2788,7 @@ test "MCP reload retains the selected profile home" {
     state.setProfileHome("/selected-state");
     test_reload_mode = .empty;
     test_reload_profile_home = null;
+    test_reload_preview_profile_home = null;
 
     var outcome = try state.reload(
         alloc,
@@ -2793,6 +2804,10 @@ test "MCP reload retains the selected profile home" {
     try std.testing.expectEqualStrings(
         "/selected-state",
         test_reload_profile_home.?,
+    );
+    try std.testing.expectEqualStrings(
+        "/selected-state",
+        test_reload_preview_profile_home.?,
     );
 }
 
