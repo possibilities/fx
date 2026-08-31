@@ -131,6 +131,7 @@ pub fn build(b: *std.Build) void {
             "ACP child authority preserves native-tool suppression and allowlisting",
             "loadSkills discovers ordered invocation roots when HOME is missing",
             "TUI profile helpers read and mutate only the selected state root",
+            "unapproved workspace logout deletes only selected profile credentials",
             "state-isolated usage dashboard refresh never reads ambient home",
             "launch permission policy owns a canonical path and parsed rule order",
             "loadStartupState lets FX_EFFORT win over the configured effort without rewriting it",
