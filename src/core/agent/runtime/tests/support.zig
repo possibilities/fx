@@ -638,6 +638,7 @@ pub const FakeAgentRuntimeDeps = struct {
     last_route_recovery_finish_reason: ?types.ProviderFinishReason = null,
     last_route_recovery_unsafe_reason: ?types.RouteRecoveryUnsafeReason = null,
     default_model_capabilities: model_capabilities.Capabilities = .{
+        .image_input_support = .non_native,
         .prompt_caching = true,
         .context_window = 1_000_000,
     },

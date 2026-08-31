@@ -505,6 +505,65 @@ pub const EffectiveToolProjection = struct {
     }
 };
 
+pub const TurnToolProjection = struct {
+    advertised_names: []const []const u8,
+    advertised_functions: []const model_tool_schema.FunctionSchema,
+};
+
+pub fn projectForTurn(
+    arena: Allocator,
+    advertised_names: []const []const u8,
+    advertised_functions: []const model_tool_schema.FunctionSchema,
+    current_turn_messages: []const types.ChatMessage,
+) Allocator.Error!TurnToolProjection {
+    if (!latestToolGroupHasTerminalCapabilityNoMatch(current_turn_messages)) {
+        return .{
+            .advertised_names = advertised_names,
+            .advertised_functions = advertised_functions,
+        };
+    }
+
+    const names = try arena.alloc([]const u8, advertised_names.len);
+    errdefer arena.free(names);
+    var name_count: usize = 0;
+    for (advertised_names) |name| {
+        if (std.mem.eql(u8, name, "capability_search")) continue;
+        names[name_count] = name;
+        name_count += 1;
+    }
+    const functions = try arena.alloc(
+        model_tool_schema.FunctionSchema,
+        advertised_functions.len,
+    );
+    var function_count: usize = 0;
+    for (advertised_functions) |function| {
+        if (std.mem.eql(u8, function.name, "capability_search")) continue;
+        functions[function_count] = function;
+        function_count += 1;
+    }
+    return .{
+        .advertised_names = names[0..name_count],
+        .advertised_functions = functions[0..function_count],
+    };
+}
+
+fn latestToolGroupHasTerminalCapabilityNoMatch(
+    messages: []const types.ChatMessage,
+) bool {
+    var index = messages.len;
+    while (index > 0 and messages[index - 1].role == .tool) {
+        index -= 1;
+        const message = messages[index];
+        const tool_name = message.tool_name orelse continue;
+        if (!std.mem.eql(u8, tool_name, "capability_search")) continue;
+        const content = message.content orelse continue;
+        if (std.mem.find(u8, content, "\"state\":\"no_match\"") != null) {
+            return true;
+        }
+    }
+    return false;
+}
+
 pub fn containsName(names: []const []const u8, expected: []const u8) bool {
     for (names) |name| if (std.mem.eql(u8, name, expected)) return true;
     return false;
@@ -561,6 +620,50 @@ const test_tool_set = tool_set_contract.ToolSet{
     .order = test_order[0..],
     .read_only_tool_names = test_read_only_names[0..],
 };
+
+test "terminal capability no-match suppresses only the next tool group" {
+    const names = [_][]const u8{ "capability_search", "read_file" };
+    const functions = [_]model_tool_schema.FunctionSchema{
+        test_capability_search.model_schema,
+        test_read_file.model_schema,
+    };
+    const terminal_messages = [_]types.ChatMessage{
+        .{ .role = .assistant },
+        .{
+            .role = .tool,
+            .tool_name = "capability_search",
+            .content = "{\"state\":\"no_match\"}",
+        },
+    };
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const suppressed = try projectForTurn(
+        arena_state.allocator(),
+        &names,
+        &functions,
+        &terminal_messages,
+    );
+    try std.testing.expectEqual(@as(usize, 1), suppressed.advertised_names.len);
+    try std.testing.expectEqualStrings("read_file", suppressed.advertised_names[0]);
+    try std.testing.expectEqual(@as(usize, 1), suppressed.advertised_functions.len);
+    try std.testing.expectEqualStrings(
+        "read_file",
+        suppressed.advertised_functions[0].name,
+    );
+
+    const later_messages = terminal_messages ++ [_]types.ChatMessage{
+        .{ .role = .assistant },
+        .{ .role = .tool, .tool_name = "read_file", .content = "local evidence" },
+    };
+    const restored = try projectForTurn(
+        arena_state.allocator(),
+        &names,
+        &functions,
+        &later_messages,
+    );
+    try std.testing.expectEqual(@as(usize, 2), restored.advertised_names.len);
+    try std.testing.expect(containsName(restored.advertised_names, "capability_search"));
+}
 
 fn testToolSetForRegistry(tools: []const tool_dispatch.Tool) tool_set_contract.ToolSet {
     return .{

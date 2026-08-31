@@ -6993,7 +6993,13 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
           },
         ]),
         fakeGatewayFinalText(finalText),
-      ]);
+      ], {
+        models: [{
+          id: MODEL,
+          type: "language",
+          tags: ["vision", "file-input", "tool-use"],
+        }],
+      });
       gateway = providerGateway;
 
       session = await TmuxSession.create({
@@ -7029,12 +7035,11 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
 
       const initialRequest = parseGatewayRequest(providerGateway.requests[0]!.body);
       const continuingRequest = parseGatewayRequest(providerGateway.requests[1]!.body);
-      expect(serializedToolNames(initialRequest)).toEqual(
-        AUTO_PERPLEXITY_SERIALIZED_TOOL_NAMES,
+      const expectedToolNames = AUTO_PERPLEXITY_SERIALIZED_TOOL_NAMES.filter(
+        (name) => name !== "vision",
       );
-      expect(serializedToolNames(continuingRequest)).toEqual(
-        AUTO_PERPLEXITY_SERIALIZED_TOOL_NAMES,
-      );
+      expect(serializedToolNames(initialRequest)).toEqual(expectedToolNames);
+      expect(serializedToolNames(continuingRequest)).toEqual(expectedToolNames);
       expect(toolShapesWithoutDescriptions(continuingRequest)).toEqual(
         toolShapesWithoutDescriptions(initialRequest),
       );

@@ -4155,6 +4155,7 @@ test "permission review reaches serial and parallel tools after native history p
     const capability_overrides = [_]test_support.ModelCapabilityOverride{.{
         .model = "openai/gpt-5.6-sol",
         .capabilities = .{
+            .image_input_support = .native,
             .supports_tool_use = true,
             .supports_vision = true,
             .supports_file_input = true,

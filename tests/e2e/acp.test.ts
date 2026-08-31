@@ -2285,6 +2285,12 @@ describe("acp: model-independent", () => {
       const root = createIsolatedRoot("fx-acp-mcp-http-");
       const httpFixture = startModernMcpHttpFixture("json");
       const gateway = startFakeGateway([
+        fakeGatewayToolCall("search_http", "capability_search", {
+          kind: "mcp",
+          server: "fixture",
+          query: "echo",
+          limit: 5,
+        }),
         fakeGatewayToolCall("select_http", "mcp_select_tool", {
           name: MCP_TOOL_NAME,
         }),
@@ -2313,12 +2319,14 @@ describe("acp: model-independent", () => {
         expect(created.error).toBeUndefined();
         await client.readLine();
         await client.request("session/set_mode", { modeId: "code" }, 3);
-        await runMcpToolPrompt(
-          client,
-          gateway,
-          "call_http",
-          `${MODERN_HTTP_TOOL_RESULT}:acp`,
-        );
+        const requestStart = gateway.requests.length;
+        const prompt = await runPrompt(client, "Find and call the supplied MCP echo tool.", TIMEOUT);
+        expect(prompt.promptResult.result.stopReason).toBe("end_turn");
+        expect(gateway.requests).toHaveLength(requestStart + 4);
+        expect(acpToolResultText(gateway.requests[requestStart + 1]!.body, "search_http"))
+          .toContain(MCP_TOOL_NAME);
+        expect(acpToolResultText(gateway.requests[requestStart + 3]!.body, "call_http"))
+          .toContain(MODERN_HTTP_TOOL_RESULT + ":acp");
 
         const initialPrompt = acpGatewayRequest(gateway.requests[0]!.body).prompt
           .map((message) => acpContentText(message.content))
@@ -7046,6 +7054,65 @@ describe("acp: model-independent", () => {
           '<skill_content name="acp-invocation" resource="SKILL.md"',
         );
         expect(promptText).toContain(skillBody);
+        expect(client.stderr).toBe("");
+      } finally {
+        await client?.close();
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "ACP ranks a natural skill match before bounded catalog omission",
+    async () => {
+      const root = createIsolatedRoot("fx-acp-routed-skill-");
+      const distractorDescription =
+        "Synthetic unrelated metadata repeated to consume the bounded catalog while remaining harmless. ".repeat(4);
+      for (const name of ["aaa-one", "aaa-two", "aaa-three"]) {
+        const directory = join(root.workspace, "skills", name);
+        mkdirSync(directory, { recursive: true });
+        writeFileSync(
+          join(directory, "SKILL.md"),
+          `---\nname: ${name}\ndescription: ${distractorDescription}\n---\n\nDISTRACTOR_BODY\n`,
+        );
+      }
+      const targetDirectory = join(
+        root.workspace,
+        "skills",
+        "system-design-method",
+      );
+      mkdirSync(targetDirectory, { recursive: true });
+      writeFileSync(
+        join(targetDirectory, "SKILL.md"),
+        "---\nname: system-design-method\ndescription: Use when designing a system architecture with bounded retries and recovery\n---\n\nTARGET_BODY\n",
+      );
+      const gateway = startFakeGateway([finalText("ACP routed skill complete")]);
+      try {
+        client = await AcpClient.create({
+          cwd: root.workspace,
+          args: ["--context-limit", "skill_catalog_bytes=1024", "acp"],
+          env: fakeGatewayEnv(root, gateway),
+        });
+        await startCodeSession(client);
+        const result = await runPrompt(
+          client,
+          "Design a system architecture with bounded retries and recovery.",
+          TIMEOUT,
+        );
+
+        expect(result.promptResult.error).toBeUndefined();
+        expect(result.promptResult.result.stopReason).toBe("end_turn");
+        expect(gateway.requests).toHaveLength(1);
+        const available = acpTaggedBlock(
+          gateway.requests[0]!.body,
+          "available_skills",
+        );
+        expect(available).toContain("<name>system-design-method</name>");
+        expect(available).toContain("Use when designing a system architecture");
+        expect(available).not.toContain("<name>aaa-three</name>");
+        expect(JSON.stringify(result.messages)).toContain("skill catalog omitted");
         expect(client.stderr).toBe("");
       } finally {
         await client?.close();

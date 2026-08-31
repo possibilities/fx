@@ -2326,6 +2326,7 @@ test "processQueuedPrompt keeps native image parts for vision route model" {
     const capability_overrides = [_]ModelCapabilityOverride{.{
         .model = "google/gemini-2.5-flash",
         .capabilities = .{
+            .image_input_support = .native,
             .supports_vision = true,
             .supports_file_input = true,
         },
@@ -2364,7 +2365,7 @@ test "processQueuedPrompt never uses the vision fallback for Codex" {
     var images = [_]types.ImageAttachment{image};
     const capability_overrides = [_]ModelCapabilityOverride{.{
         .model = "gpt-5.6-sol",
-        .capabilities = .{},
+        .capabilities = .{ .image_input_support = .non_native },
     }};
     var gateway = FakeGateway.init(alloc, &.{});
     defer gateway.deinit();
@@ -2416,6 +2417,7 @@ test "processQueuedPrompt routes images natively only when vision and file input
         const capability_overrides = [_]ModelCapabilityOverride{.{
             .model = model,
             .capabilities = .{
+                .image_input_support = if (entry.expect_native) .native else .non_native,
                 .supports_vision = entry.supports_vision,
                 .supports_file_input = entry.supports_file_input,
             },
@@ -2461,7 +2463,7 @@ test "processQueuedPrompt routes images natively only when vision and file input
             try std.testing.expectEqual(@as(usize, 1), gateway.request_bodies.items.len);
             try expectBodyContains(&gateway, 0, "\"type\":\"file\"");
             try expectBodyContains(&gateway, 0, "iVBORw0KGgpmaXh0dXJlIGltYWdlIGJ5dGVz");
-            try expectBodyContains(&gateway, 0, "\"name\":\"vision\"");
+            try expectBodyNotContains(&gateway, 0, "\"name\":\"vision\"");
             try std.testing.expectEqualStrings("Native route answer", hooks.finish_assistant_text.?);
         } else {
             try std.testing.expectEqual(@as(usize, 3), gateway.request_bodies.items.len);
@@ -2482,7 +2484,7 @@ test "processQueuedPrompt routes images natively only when vision and file input
     }
 }
 
-test "processQueuedPrompt rejects native-route attachment ID Vision calls before permission or execution" {
+test "processQueuedPrompt rejects unadvertised native-route Vision calls before permission or execution" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -2507,6 +2509,7 @@ test "processQueuedPrompt rejects native-route attachment ID Vision calls before
     const capability_overrides = [_]ModelCapabilityOverride{.{
         .model = "native/test-vision",
         .capabilities = .{
+            .image_input_support = .native,
             .supports_vision = true,
             .supports_file_input = true,
         },
@@ -2532,7 +2535,7 @@ test "processQueuedPrompt rejects native-route attachment ID Vision calls before
     try std.testing.expectEqualStrings("native/test-vision", gateway.request_models.items[0]);
     try std.testing.expectEqualStrings("native/test-vision", gateway.request_models.items[1]);
     try expectBodyContains(&gateway, 0, "\"type\":\"file\"");
-    try expectBodyContains(&gateway, 0, "\"name\":\"vision\"");
+    try expectBodyNotContains(&gateway, 0, "\"name\":\"vision\"");
     try expectBodyNotContains(&gateway, 1, image_path);
     try std.testing.expectEqual(@as(usize, 0), hooks.permission_names.items.len);
     try std.testing.expectEqual(@as(usize, 0), hooks.executed_names.items.len);

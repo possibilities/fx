@@ -61,6 +61,7 @@ const tool_result_limits = @import("tool_result_limits.zig");
 const file_mutation_execution = @import("file_mutation_execution.zig");
 const tool_mcp_registry = @import("tool_mcp_registry.zig");
 const tool_mcp_runtime = @import("tool_mcp_runtime.zig");
+const capability_retrieval = @import("capability_retrieval.zig");
 const tool_mcp_feature_dispatch = @import("tool_mcp_feature_dispatch.zig");
 const tool_presentation = @import("tool_presentation.zig");
 const terminal_impl = @import("../../tools/terminal/terminal.zig");
@@ -7672,8 +7673,8 @@ const McpFixture = struct {
         return error.McpFixtureFailure;
     }
 
-    fn search(_: *anyopaque, arena: Allocator, query: *const tool_mcp_runtime.PreparedQuery, _: usize, _: types.PermissionRuleSet, _: context_limits.Values) anyerror!tool_mcp_runtime.SearchResult {
-        return .{ .model_output = try std.fmt.allocPrint(arena, "{{\"query\":\"{s}\",\"tools\":[{{\"name\":\"mcp_fs_read\",\"server\":\"fs\",\"description\":\"Read\",\"input_schema\":{{\"type\":\"object\"}},\"tags\":[\"fs\",\"read\"]}}],\"count\":1}}", .{query.raw}) };
+    fn search(_: *anyopaque, arena: Allocator, request: capability_retrieval.Request, _: types.PermissionRuleSet, _: context_limits.Values) anyerror!tool_mcp_runtime.SearchResult {
+        return .{ .model_output = try std.fmt.allocPrint(arena, "{{\"query\":\"{s}\",\"tools\":[{{\"name\":\"mcp_fs_read\",\"server\":\"fs\",\"description\":\"Read\",\"input_schema\":{{\"type\":\"object\"}},\"tags\":[\"fs\",\"read\"]}}],\"count\":1}}", .{request.query.raw}) };
     }
 
     fn schema(_: *anyopaque, arena: Allocator, name: []const u8, _: types.PermissionRuleSet, _: context_limits.Values, _: tool_mcp_runtime.Access) anyerror!?tool_mcp_runtime.ToolSchemaResult {
@@ -7681,10 +7682,10 @@ const McpFixture = struct {
         return .{ .selected = .{ .model_output = try arena.dupe(u8, "{\"type\":\"function\",\"name\":\"mcp_fs_read\",\"description\":\"Read <context_limit action='literal' />\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"context_limit_rejection\":{\"type\":\"string\"}}}}") } };
     }
 
-    fn searchRecordingRules(raw_ctx: *anyopaque, arena: Allocator, query: *const tool_mcp_runtime.PreparedQuery, _: usize, permission_rules: types.PermissionRuleSet, limits: context_limits.Values, _: tool_mcp_runtime.Access) anyerror!tool_mcp_runtime.SearchResult {
+    fn searchRecordingRules(raw_ctx: *anyopaque, arena: Allocator, request: capability_retrieval.Request, permission_rules: types.PermissionRuleSet, limits: context_limits.Values, _: tool_mcp_runtime.Access) anyerror!tool_mcp_runtime.SearchResult {
         const ctx: *PermissionContext = @ptrCast(@alignCast(raw_ctx));
         ctx.search_rule_count = permission_rules.rules.len;
-        return search(raw_ctx, arena, query, 0, permission_rules, limits);
+        return search(raw_ctx, arena, request, permission_rules, limits);
     }
 
     fn schemaRecordingRules(raw_ctx: *anyopaque, arena: Allocator, name: []const u8, permission_rules: types.PermissionRuleSet, limits: context_limits.Values, access: tool_mcp_runtime.Access) anyerror!?tool_mcp_runtime.ToolSchemaResult {

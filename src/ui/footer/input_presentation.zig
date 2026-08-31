@@ -243,17 +243,21 @@ pub fn cappedInputRows(total_rows: usize, content_bottom: u16, input_visible: bo
     };
 }
 
-fn slashCompletionPickerActive(ctx: RenderContext, modal_active: bool, show_model_query: bool, show_file_query: bool) bool {
-    if (ctx.input.picker.isInlinePickerDismissed(.slash) or modal_active or show_model_query or show_file_query) return false;
-    if (ctx.input.picker.inlinePickerTriggerKind(&ctx.input.edit_state) != .slash) return false;
+pub fn slashCompletionPickerPrefix(ctx: RenderContext, modal_active: bool, show_model_query: bool, show_file_query: bool) ?[]const u8 {
+    if (ctx.input.picker.isInlinePickerDismissed(.slash) or modal_active or show_model_query or show_file_query) return null;
+    if (ctx.input.picker.inlinePickerTriggerKind(&ctx.input.edit_state) != .slash) return null;
     // Mid-turn model-shaped input owns the footer slot even while the model list is hidden.
-    if (ctx.stream.active and ctx.input.picker.isModelShapedInput(&ctx.input.edit_state)) return false;
-    return slashInputPrefix(ctx.slash_registry, ctx.input.edit_state.input.items).len > 0;
+    if (ctx.stream.active and ctx.input.picker.isModelShapedInput(&ctx.input.edit_state)) return null;
+    const prefix = slashInputPrefix(ctx.slash_registry, ctx.input.edit_state.input.items);
+    return if (prefix.len > 0) prefix else null;
+}
+
+fn slashCompletionPickerActive(ctx: RenderContext, modal_active: bool, show_model_query: bool, show_file_query: bool) bool {
+    return slashCompletionPickerPrefix(ctx, modal_active, show_model_query, show_file_query) != null;
 }
 
 pub fn slashCompletionPickerCount(ctx: RenderContext, modal_active: bool, show_model_query: bool, show_file_query: bool) usize {
-    if (!slashCompletionPickerActive(ctx, modal_active, show_model_query, show_file_query)) return 0;
-    const prefix = slashInputPrefix(ctx.slash_registry, ctx.input.edit_state.input.items);
+    const prefix = slashCompletionPickerPrefix(ctx, modal_active, show_model_query, show_file_query) orelse return 0;
     return picker_presentation.mixedSlashCompletionCount(ctx.slash_registry, prefix, ctx.skills_menu.items);
 }
 
@@ -272,6 +276,28 @@ pub fn measureRawInputGeometry(
     modal_active: bool,
     show_model_query: bool,
     show_file_query: bool,
+) RawInputGeometry {
+    return measureRawInputGeometryPrepared(
+        ctx,
+        terminal_cols,
+        content_bottom,
+        input_visible,
+        modal_active,
+        show_model_query,
+        show_file_query,
+        null,
+    );
+}
+
+pub fn measureRawInputGeometryPrepared(
+    ctx: RenderContext,
+    terminal_cols: u16,
+    content_bottom: u16,
+    input_visible: bool,
+    modal_active: bool,
+    show_model_query: bool,
+    show_file_query: bool,
+    prepared_slash_completion_count: ?usize,
 ) RawInputGeometry {
     const display_input: []const u8 = if (ctx.queued_editor_active) "" else ctx.input.edit_state.input.items;
     const display_cursor: usize = if (ctx.queued_editor_active) 0 else ctx.input.edit_state.cursor;
@@ -302,7 +328,8 @@ pub fn measureRawInputGeometry(
     const window = visual_layout.visibleWindow(summary.cursor.row_index, summary.total_rows, capped.row_limit);
     const show_slash_query = slashCompletionPickerActive(ctx, modal_active, show_model_query, show_file_query);
     const slash_completion_count = if (show_slash_query)
-        slashCompletionPickerCount(ctx, modal_active, show_model_query, show_file_query)
+        prepared_slash_completion_count orelse
+            slashCompletionPickerCount(ctx, modal_active, show_model_query, show_file_query)
     else
         0;
     const picker_start_col = if (show_model_query or show_file_query or show_slash_query)

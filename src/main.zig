@@ -2123,8 +2123,8 @@ const App = struct {
         return self.mcp.callTool(arena, name, arguments_json, max_tool_result_bytes, options);
     }
 
-    pub fn searchMcpTools(self: *App, arena: Allocator, query: *const tool_mcp_runtime.PreparedQuery, limit: usize, permission_rules: types.PermissionRuleSet, access: tool_mcp_runtime.Access) !tool_mcp_runtime.SearchResult {
-        return self.mcp.searchTools(arena, query, limit, permission_rules, self.context_limits, access);
+    pub fn searchMcpTools(self: *App, arena: Allocator, request: tool_mcp_runtime.SearchRequest, permission_rules: types.PermissionRuleSet, access: tool_mcp_runtime.Access) !tool_mcp_runtime.SearchResult {
+        return self.mcp.searchTools(arena, request, permission_rules, self.context_limits, access);
     }
 
     pub fn mcpToolSchemaJson(self: *App, arena: Allocator, name: []const u8, permission_rules: types.PermissionRuleSet, access: tool_mcp_runtime.Access) !?tool_mcp_runtime.ToolSchemaResult {

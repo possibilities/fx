@@ -98,6 +98,7 @@ pub const FooterPlannerInput = struct {
     picker_failed: bool = false,
     slash_completion_count: usize = 0,
     slash_menu_layout: ?picker_presentation.SlashMenuLayout = null,
+    prepared_slash_menu: ?*const picker_presentation.PreparedSlashMenu = null,
     picker_start_col: u16 = 1,
     transcript_state: ?FooterTranscriptState = null,
 };
@@ -932,7 +933,10 @@ pub fn composeFooterFrame(
             }
         } else if (input.picker_kind == .slash) {
             const slash_prefix = input_presentation.slashInputPrefix(ctx.slash_registry, ctx.input.edit_state.input.items);
-            const count = picker_presentation.mixedSlashCompletionCount(ctx.slash_registry, slash_prefix, ctx.skills_menu.items);
+            const count = if (input.prepared_slash_menu) |prepared|
+                prepared.resultCount()
+            else
+                picker_presentation.mixedSlashCompletionCount(ctx.slash_registry, slash_prefix, ctx.skills_menu.items);
             if (count > 0) {
                 if (input.slash_menu_layout) |layout| {
                     var row = rows.picker_start;
@@ -946,26 +950,44 @@ pub fn composeFooterFrame(
                         row += 1;
                     }
 
-                    const column_widths = picker_presentation.mixedSlashMenuColumnWidths(
-                        ctx.slash_registry,
-                        slash_prefix,
-                        ctx.skills_menu.items,
-                        layout.window,
-                        ctx.input.slash_menu_categories,
-                    );
-                    var match_idx = layout.window.start;
-                    while (match_idx < layout.window.end) : (match_idx += 1) {
-                        var slash_row = try picker_presentation.composeSlashMenuOptionRow(
-                            alloc,
+                    const column_widths = if (input.prepared_slash_menu) |prepared|
+                        picker_presentation.preparedSlashMenuColumnWidths(
+                            prepared,
+                            layout.window,
+                            ctx.input.slash_menu_categories,
+                        )
+                    else
+                        picker_presentation.mixedSlashMenuColumnWidths(
                             ctx.slash_registry,
                             slash_prefix,
                             ctx.skills_menu.items,
-                            match_idx,
-                            match_idx == layout.selected,
-                            column_widths,
-                            shell.layout.cols,
+                            layout.window,
                             ctx.input.slash_menu_categories,
                         );
+                    var match_idx = layout.window.start;
+                    while (match_idx < layout.window.end) : (match_idx += 1) {
+                        var slash_row = if (input.prepared_slash_menu) |prepared|
+                            try picker_presentation.composePreparedSlashMenuOptionRow(
+                                alloc,
+                                prepared,
+                                match_idx,
+                                match_idx == layout.selected,
+                                column_widths,
+                                shell.layout.cols,
+                                ctx.input.slash_menu_categories,
+                            )
+                        else
+                            try picker_presentation.composeSlashMenuOptionRow(
+                                alloc,
+                                ctx.slash_registry,
+                                slash_prefix,
+                                ctx.skills_menu.items,
+                                match_idx,
+                                match_idx == layout.selected,
+                                column_widths,
+                                shell.layout.cols,
+                                ctx.input.slash_menu_categories,
+                            );
                         try pushFooterBandRow(alloc, &frame, plan, row, &slash_row);
                         row += 1;
                     }
