@@ -1408,11 +1408,7 @@ pub fn Handlers(comptime App: type) type {
                     .reject, .reset => true,
                     .approve, .approve_all => false,
                 };
-                var attempt = config_runtime.attemptProjectMcpMutation(
-                    app.alloc,
-                    app.workspace_root,
-                    action,
-                );
+                var attempt = app_profile_runtime.attemptProjectMcpMutation(app, action);
                 defer attempt.deinit(app.alloc);
                 var warning = false;
                 var owned_notice: ?[]u8 = null;
