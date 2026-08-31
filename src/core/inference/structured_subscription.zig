@@ -398,6 +398,18 @@ pub fn infer(
         );
     }
 
+    if (completion.content_capture_overflowed) {
+        return terminalize(
+            alloc,
+            &entry,
+            request_digest,
+            .schema_failed,
+            null,
+            .{ .stage = "response_schema", .code = "structured_output_size_invalid" },
+            provenance,
+        );
+    }
+
     const content = completion.content orelse return terminalize(
         alloc,
         &entry,
@@ -852,6 +864,8 @@ const TestRuntime = struct {
     cancel_flag: ?*std.atomic.Value(bool) = null,
     request_shape_valid: bool = false,
     response_id: []const u8 = "resp_test",
+    response_content: []const u8 = "{\"choice\":\"yes\"}",
+    content_capture_overflowed: bool = false,
 
     fn deinit(self: *TestRuntime, alloc: Allocator) void {
         self.sequence.deinit(alloc);
@@ -925,7 +939,8 @@ const TestRuntime = struct {
         return switch (self.mode) {
             .success, .cancel_after_admission => .{ .completed = .{
                 .completion = .{
-                    .content = "{\"choice\":\"yes\"}",
+                    .content = self.response_content,
+                    .content_capture_overflowed = self.content_capture_overflowed,
                     .generation_id = self.response_id,
                     .finish_reason = .stop,
                 },
@@ -1202,6 +1217,61 @@ test "structured subscription inference bounds provider identifiers and terminal
     var schema = try std.json.parseFromSlice(std.json.Value, alloc, test_schema_text, .{});
     defer schema.deinit();
     var cancelled = std.atomic.Value(bool).init(false);
+
+    const output_prefix = "{\"choice\":\"";
+    const output_suffix = "\"}";
+    const exact_output = try alloc.alloc(u8, max_provider_output_bytes);
+    defer alloc.free(exact_output);
+    @memcpy(exact_output[0..output_prefix.len], output_prefix);
+    @memset(
+        exact_output[output_prefix.len .. exact_output.len - output_suffix.len],
+        'x',
+    );
+    @memcpy(exact_output[exact_output.len - output_suffix.len ..], output_suffix);
+
+    const exact_output_root = try testStateRoot(alloc, tmp, "exact-output-state");
+    defer alloc.free(exact_output_root);
+    var exact_output_runtime: TestRuntime = .{ .response_content = exact_output };
+    defer exact_output_runtime.deinit(alloc);
+    const exact_output_frame = try infer(alloc, exact_output_root, .{
+        .model = "gpt-test",
+        .effort = "high",
+        .prompt = "Return a choice.",
+        .schema = schema.value,
+        .caller_key = "exact-output-key",
+        .cancel_flag = &cancelled,
+    }, exact_output_runtime.dependencies());
+    defer alloc.free(exact_output_frame);
+    const exact_output_status = try terminalStatus(alloc, exact_output_frame);
+    defer alloc.free(exact_output_status);
+    try std.testing.expectEqualStrings("succeeded", exact_output_status);
+
+    const overflow_root = try testStateRoot(alloc, tmp, "overflow-output-state");
+    defer alloc.free(overflow_root);
+    var overflow_runtime: TestRuntime = .{
+        .response_content = exact_output,
+        .content_capture_overflowed = true,
+    };
+    defer overflow_runtime.deinit(alloc);
+    const overflow_frame = try infer(alloc, overflow_root, .{
+        .model = "gpt-test",
+        .effort = "high",
+        .prompt = "Return a choice.",
+        .schema = schema.value,
+        .caller_key = "overflow-output-key",
+        .cancel_flag = &cancelled,
+    }, overflow_runtime.dependencies());
+    defer alloc.free(overflow_frame);
+    var parsed_overflow = try std.json.parseFromSlice(std.json.Value, alloc, overflow_frame, .{});
+    defer parsed_overflow.deinit();
+    try std.testing.expectEqualStrings(
+        "schema_failed",
+        parsed_overflow.value.object.get("status").?.string,
+    );
+    try std.testing.expectEqualStrings(
+        "structured_output_size_invalid",
+        parsed_overflow.value.object.get("failure").?.object.get("code").?.string,
+    );
 
     const response_id = try alloc.alloc(u8, max_provider_response_id_bytes + 1);
     defer alloc.free(response_id);

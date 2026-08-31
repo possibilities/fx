@@ -114,6 +114,7 @@ pub const ChildContext = struct {
             .context = self,
             .matches_initial_fn = matchesInitialWork,
             .decide_fn = decideForWorker,
+            .transition_fn = transitionForWorker,
         };
     }
 
@@ -203,13 +204,13 @@ pub const ChildContext = struct {
     fn decideForWorker(
         raw: *anyopaque,
         prompt: []const u8,
-        proposed: worker_runtime.PromptAdmissionResult,
+        proposed: worker_runtime.DurableInitialAdmissionIdentity,
     ) !worker_runtime.DurableInitialAdmissionDecision {
         const self: *ChildContext = @ptrCast(@alignCast(raw));
         if (!matchesInitialWork(raw, prompt)) {
             return error.InitialWorkDigestMismatch;
         }
-        const disposition: protocol.Disposition = switch (proposed.disposition) {
+        const disposition: protocol.Disposition = switch (proposed.result.disposition) {
             .queued => .queued,
             .steering => .steering,
         };
@@ -217,8 +218,9 @@ pub const ChildContext = struct {
             self.admission_key,
             self.launch_digest,
             self.launch_id,
-            proposed.turn_id,
+            proposed.result.turn_id,
             disposition,
+            proposed.steer_target_turn_id,
         ) catch |err| switch (err) {
             error.AdmissionCancelled => return .cancelled_before_start,
             else => return err,
@@ -228,16 +230,55 @@ pub const ChildContext = struct {
         return switch (stored) {
             .cancelled_before_start => .cancelled_before_start,
             .admitted => |admitted| .{ .admitted = .{
-                .result = .{
-                    .turn_id = admitted.turn_id,
-                    .disposition = switch (admitted.disposition) {
-                        .queued => .queued,
-                        .steering => .steering,
+                .identity = .{
+                    .result = .{
+                        .turn_id = admitted.turn_id,
+                        .disposition = switch (admitted.disposition) {
+                            .queued => .queued,
+                            .steering => .steering,
+                        },
                     },
+                    .steer_target_turn_id = mutation.delivery.?.steer_target_turn_id,
+                },
+                .phase = switch (mutation.delivery.?.phase) {
+                    .decision_only => .decision_only,
+                    .visible => .visible,
+                    .consumed => .consumed,
                 },
                 .replayed = !mutation.newly_decided,
             } },
         };
+    }
+
+    fn transitionForWorker(
+        raw: *anyopaque,
+        identity: worker_runtime.DurableInitialAdmissionIdentity,
+        phase: worker_runtime.DurableInitialAdmissionPhase,
+    ) !void {
+        const self: *ChildContext = @ptrCast(@alignCast(raw));
+        const authority: ledger_mod.AdmissionAuthority = .{
+            .turn_id = identity.result.turn_id,
+            .disposition = switch (identity.result.disposition) {
+                .queued => .queued,
+                .steering => .steering,
+            },
+            .steer_target_turn_id = identity.steer_target_turn_id,
+        };
+        switch (phase) {
+            .decision_only => return error.InvalidDurableAdmissionDecision,
+            .visible => try self.ledger.markAdmissionVisible(
+                self.admission_key,
+                self.launch_digest,
+                self.launch_id,
+                authority,
+            ),
+            .consumed => try self.ledger.markAdmissionConsumed(
+                self.admission_key,
+                self.launch_digest,
+                self.launch_id,
+                authority,
+            ),
+        }
     }
 
     fn matchesInitialWork(raw: *anyopaque, prompt: []const u8) bool {
@@ -500,13 +541,27 @@ test "launch child runtime durably decides the first Work-control prompt and rep
     try std.testing.expectEqual(first.disposition, lost_response_retry.disposition);
     try std.testing.expectEqual(@as(usize, 1), worker.queued_prompts.items.len);
 
+    const consumed = (try worker.tryTakeNextPrompt(alloc)).?;
+    worker_runtime.freeQueuedPrompt(alloc, consumed);
+
     const later = try worker.admitWorkControlPromptObserved(
         alloc,
         try testPrompt(alloc, "later ordinary work"),
         false,
     );
     try std.testing.expect(later.turn_id != replay.turn_id);
-    try std.testing.expectEqual(@as(usize, 2), worker.queued_prompts.items.len);
+    try std.testing.expectEqual(@as(usize, 1), worker.queued_prompts.items.len);
+
+    var after_process_loss = worker_runtime.WorkerRuntime{};
+    defer after_process_loss.deinit(alloc);
+    after_process_loss.setDurableInitialAdmissionHook(context.workerHook());
+    const consumed_replay = try after_process_loss.admitWorkControlPromptObserved(
+        alloc,
+        try testPrompt(alloc, prompt_text),
+        false,
+    );
+    try std.testing.expectEqual(first.turn_id, consumed_replay.turn_id);
+    try std.testing.expectEqual(@as(usize, 0), after_process_loss.queued_prompts.items.len);
 
     var loaded = (try context.ledger.load(request.admission_key)).?;
     defer loaded.deinit();

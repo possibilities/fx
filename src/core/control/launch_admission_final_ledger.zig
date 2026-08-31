@@ -12,6 +12,11 @@ pub const record_schema_version: u16 = 1;
 pub const max_record_bytes: usize = 64 * 1024;
 pub const lock_deadline_ms: u64 = 5_000;
 
+const admission_authority_suffix = "admission";
+const admission_visible_suffix = "admission-visible";
+const admission_consumed_suffix = "admission-consumed";
+const admission_authority_bytes_len: usize = 17;
+
 pub const Error = error{
     AdmissionConflict,
     AdmissionCancelled,
@@ -83,6 +88,28 @@ pub const Record = struct {
     }
 };
 
+/// Internal, monotonic delivery authority for the one admitted initial prompt.
+/// The public admission decision remains the frozen schema-1 value; this state
+/// only closes the process crash windows around making that decision visible.
+pub const AdmissionDeliveryPhase = enum {
+    decision_only,
+    visible,
+    consumed,
+};
+
+pub const AdmissionAuthority = struct {
+    turn_id: u64,
+    disposition: protocol.Disposition,
+    steer_target_turn_id: ?u64,
+};
+
+pub const AdmissionDelivery = struct {
+    turn_id: u64,
+    disposition: protocol.Disposition,
+    steer_target_turn_id: ?u64,
+    phase: AdmissionDeliveryPhase,
+};
+
 const ResumeWire = struct {
     conversation_id: ?[]const u8 = null,
     mode: []const u8,
@@ -148,6 +175,7 @@ pub const Loaded = struct {
 pub const AdmissionMutation = struct {
     loaded: Loaded,
     newly_decided: bool,
+    delivery: ?AdmissionDelivery = null,
 
     pub fn deinit(self: *AdmissionMutation) void {
         self.loaded.deinit();
@@ -287,8 +315,34 @@ pub const Ledger = struct {
         var loaded = (try self.loadUnlocked(request.admission_key)) orelse return error.LaunchNotFound;
         defer loaded.deinit();
         try requireCorrelation(loaded.record, request.admission_key, request.launch_digest, request.launch_id);
-        if (loaded.record.decision != null) {
-            return .{ .loaded = (try self.loadUnlocked(request.admission_key)).?, .newly_decided = false };
+        if (loaded.record.decision) |existing| {
+            const delivery = switch (existing.decision) {
+                .cancelled_before_start => null,
+                .admitted => blk: {
+                    const authority = (try self.loadAdmissionAuthorityUnlocked(request.admission_key)) orelse
+                        return error.DurableRecordInvalid;
+                    try requireAdmissionAuthority(loaded.record, authority);
+                    break :blk try self.admissionDeliveryUnlocked(request.admission_key, authority);
+                },
+            };
+            return .{
+                .loaded = (try self.loadUnlocked(request.admission_key)).?,
+                .newly_decided = false,
+                .delivery = delivery,
+            };
+        }
+
+        // The admission authority is the decision linearization point. If the
+        // process died after persisting it but before publishing the frozen
+        // decision record, cancellation must recover that exact admission.
+        if (try self.loadAdmissionAuthorityUnlocked(request.admission_key)) |authority| {
+            try self.persistAdmittedDecisionUnlocked(&loaded.record, authority);
+            const delivery = try self.admissionDeliveryUnlocked(request.admission_key, authority);
+            return .{
+                .loaded = (try self.loadUnlocked(request.admission_key)).?,
+                .newly_decided = false,
+                .delivery = delivery,
+            };
         }
 
         var receipt_id_buffer: [48]u8 = undefined;
@@ -314,8 +368,13 @@ pub const Ledger = struct {
         launch_id: []const u8,
         turn_id: u64,
         disposition: protocol.Disposition,
+        steer_target_turn_id: ?u64,
     ) !AdmissionMutation {
-        if (turn_id == 0) return error.InvalidMessage;
+        try validateAdmissionAuthority(.{
+            .turn_id = turn_id,
+            .disposition = disposition,
+            .steer_target_turn_id = steer_target_turn_id,
+        });
         try protocol.validateCorrelation(admission_key, launch_digest, launch_id);
         var lock = try self.acquireLock();
         defer lock.release();
@@ -325,24 +384,67 @@ pub const Ledger = struct {
         if (loaded.record.decision) |existing| {
             switch (existing.decision) {
                 .cancelled_before_start => return error.AdmissionCancelled,
-                .admitted => return .{ .loaded = (try self.loadUnlocked(admission_key)).?, .newly_decided = false },
+                .admitted => {
+                    const authority = (try self.loadAdmissionAuthorityUnlocked(admission_key)) orelse
+                        return error.DurableRecordInvalid;
+                    try requireAdmissionAuthority(loaded.record, authority);
+                    return .{
+                        .loaded = (try self.loadUnlocked(admission_key)).?,
+                        .newly_decided = false,
+                        .delivery = try self.admissionDeliveryUnlocked(admission_key, authority),
+                    };
+                },
             }
         }
 
-        var receipt_id_buffer: [48]u8 = undefined;
-        const receipt_id = try deterministicReceiptId(&receipt_id_buffer, "admission-receipt", launch_digest);
-        var digest_storage: [64]u8 = [_]u8{'0'} ** 64;
-        loaded.record.decision = .{
-            .admission_key = loaded.record.admission_key,
-            .decision = .{ .admitted = .{ .disposition = disposition, .turn_id = turn_id } },
-            .launch_digest = loaded.record.launch_digest,
-            .launch_id = loaded.record.launch_id,
-            .receipt_digest = &digest_storage,
-            .receipt_id = receipt_id,
+        const proposed = AdmissionAuthority{
+            .turn_id = turn_id,
+            .disposition = disposition,
+            .steer_target_turn_id = steer_target_turn_id,
         };
-        digest_storage = try protocol.computeReceiptDigest(self.alloc, .{ .admission_decision = loaded.record.decision.? });
-        try self.persistUnlocked(loaded.record);
-        return .{ .loaded = (try self.loadUnlocked(admission_key)).?, .newly_decided = true };
+        const stored_authority = try self.loadAdmissionAuthorityUnlocked(admission_key);
+        const authority = stored_authority orelse authority: {
+            try self.persistAdmissionMarkerUnlocked(admission_key, admission_authority_suffix, proposed);
+            break :authority proposed;
+        };
+        try self.persistAdmittedDecisionUnlocked(&loaded.record, authority);
+        return .{
+            .loaded = (try self.loadUnlocked(admission_key)).?,
+            .newly_decided = stored_authority == null,
+            .delivery = try self.admissionDeliveryUnlocked(admission_key, authority),
+        };
+    }
+
+    pub fn markAdmissionVisible(
+        self: *Ledger,
+        admission_key: []const u8,
+        launch_digest: []const u8,
+        launch_id: []const u8,
+        authority: AdmissionAuthority,
+    ) !void {
+        try self.transitionAdmission(
+            admission_key,
+            launch_digest,
+            launch_id,
+            authority,
+            .visible,
+        );
+    }
+
+    pub fn markAdmissionConsumed(
+        self: *Ledger,
+        admission_key: []const u8,
+        launch_digest: []const u8,
+        launch_id: []const u8,
+        authority: AdmissionAuthority,
+    ) !void {
+        try self.transitionAdmission(
+            admission_key,
+            launch_digest,
+            launch_id,
+            authority,
+            .consumed,
+        );
     }
 
     pub fn updateActiveConversation(
@@ -438,6 +540,189 @@ pub const Ledger = struct {
         loaded.record.final_acknowledgement_id = acknowledgement.acknowledgement_id;
         try self.persistUnlocked(loaded.record);
         return (try self.loadUnlocked(acknowledgement.admission_key)).?;
+    }
+
+    fn persistAdmittedDecisionUnlocked(
+        self: *Ledger,
+        record: *Record,
+        authority: AdmissionAuthority,
+    ) !void {
+        try validateAdmissionAuthority(authority);
+        var receipt_id_buffer: [48]u8 = undefined;
+        const receipt_id = try deterministicReceiptId(
+            &receipt_id_buffer,
+            "admission-receipt",
+            record.launch_digest,
+        );
+        var digest_storage: [64]u8 = [_]u8{'0'} ** 64;
+        record.decision = .{
+            .admission_key = record.admission_key,
+            .decision = .{ .admitted = .{
+                .disposition = authority.disposition,
+                .turn_id = authority.turn_id,
+            } },
+            .launch_digest = record.launch_digest,
+            .launch_id = record.launch_id,
+            .receipt_digest = &digest_storage,
+            .receipt_id = receipt_id,
+        };
+        digest_storage = try protocol.computeReceiptDigest(
+            self.alloc,
+            .{ .admission_decision = record.decision.? },
+        );
+        try self.persistUnlocked(record.*);
+    }
+
+    fn transitionAdmission(
+        self: *Ledger,
+        admission_key: []const u8,
+        launch_digest: []const u8,
+        launch_id: []const u8,
+        authority: AdmissionAuthority,
+        target: AdmissionDeliveryPhase,
+    ) !void {
+        if (target == .decision_only) return error.InvalidMessage;
+        try validateAdmissionAuthority(authority);
+        try protocol.validateCorrelation(admission_key, launch_digest, launch_id);
+        var lock = try self.acquireLock();
+        defer lock.release();
+        var loaded = (try self.loadUnlocked(admission_key)) orelse return error.LaunchNotFound;
+        defer loaded.deinit();
+        try requireCorrelation(loaded.record, admission_key, launch_digest, launch_id);
+        const stored = (try self.loadAdmissionAuthorityUnlocked(admission_key)) orelse
+            return error.DurableRecordInvalid;
+        if (!admissionAuthorityEqual(stored, authority)) return error.CorrelationMismatch;
+        try requireAdmissionAuthority(loaded.record, stored);
+
+        const current = try self.admissionDeliveryUnlocked(admission_key, stored);
+        switch (target) {
+            .decision_only => unreachable,
+            .visible => if (current.phase == .decision_only) {
+                try self.persistAdmissionMarkerUnlocked(
+                    admission_key,
+                    admission_visible_suffix,
+                    stored,
+                );
+            },
+            .consumed => {
+                if (current.phase == .decision_only) {
+                    try self.persistAdmissionMarkerUnlocked(
+                        admission_key,
+                        admission_visible_suffix,
+                        stored,
+                    );
+                }
+                if (current.phase != .consumed) {
+                    try self.persistAdmissionMarkerUnlocked(
+                        admission_key,
+                        admission_consumed_suffix,
+                        stored,
+                    );
+                }
+            },
+        }
+    }
+
+    fn admissionDeliveryUnlocked(
+        self: *Ledger,
+        admission_key: []const u8,
+        authority: AdmissionAuthority,
+    ) !AdmissionDelivery {
+        const visible = try self.loadAdmissionMarkerUnlocked(
+            admission_key,
+            admission_visible_suffix,
+        );
+        if (visible) |stored| {
+            if (!admissionAuthorityEqual(stored, authority)) return error.DurableRecordInvalid;
+        }
+        const consumed = try self.loadAdmissionMarkerUnlocked(
+            admission_key,
+            admission_consumed_suffix,
+        );
+        if (consumed) |stored| {
+            if (visible == null or !admissionAuthorityEqual(stored, authority)) {
+                return error.DurableRecordInvalid;
+            }
+        }
+        return .{
+            .turn_id = authority.turn_id,
+            .disposition = authority.disposition,
+            .steer_target_turn_id = authority.steer_target_turn_id,
+            .phase = if (consumed != null)
+                .consumed
+            else if (visible != null)
+                .visible
+            else
+                .decision_only,
+        };
+    }
+
+    fn loadAdmissionAuthorityUnlocked(
+        self: *Ledger,
+        admission_key: []const u8,
+    ) !?AdmissionAuthority {
+        return self.loadAdmissionMarkerUnlocked(admission_key, admission_authority_suffix);
+    }
+
+    fn loadAdmissionMarkerUnlocked(
+        self: *Ledger,
+        admission_key: []const u8,
+        suffix: []const u8,
+    ) !?AdmissionAuthority {
+        const name = try admissionMarkerFileName(self.alloc, admission_key, suffix);
+        defer self.alloc.free(name);
+        var file = self.records_dir.dir.openFile(io_mod.getIo(), name, .{
+            .mode = .read_only,
+            .allow_directory = false,
+            .follow_symlinks = false,
+            .resolve_beneath = true,
+        }) catch |err| switch (err) {
+            error.FileNotFound => return null,
+            error.SymLinkLoop, error.IsDir, error.NotDir => return error.LaunchStateUnsafe,
+            else => return err,
+        };
+        defer file.close(io_mod.getIo());
+        const stat = try file.stat(io_mod.getIo());
+        if (stat.kind != .file or stat.nlink != 1 or
+            stat.permissions.toMode() & 0o777 != 0o600 or
+            stat.size != admission_authority_bytes_len)
+        {
+            return error.DurableRecordInvalid;
+        }
+        const bytes = io_mod.readFileToEnd(
+            self.alloc,
+            &file,
+            admission_authority_bytes_len + 1,
+        ) catch |err| switch (err) {
+            error.StreamTooLong => return error.DurableRecordInvalid,
+            else => return err,
+        };
+        defer self.alloc.free(bytes);
+        if (bytes.len != admission_authority_bytes_len) return error.DurableRecordInvalid;
+        return decodeAdmissionAuthority(bytes) catch return error.DurableRecordInvalid;
+    }
+
+    fn persistAdmissionMarkerUnlocked(
+        self: *Ledger,
+        admission_key: []const u8,
+        suffix: []const u8,
+        authority: AdmissionAuthority,
+    ) !void {
+        try validateAdmissionAuthority(authority);
+        if (try self.loadAdmissionMarkerUnlocked(admission_key, suffix)) |existing| {
+            if (!admissionAuthorityEqual(existing, authority)) return error.DurableRecordInvalid;
+            return;
+        }
+        const name = try admissionMarkerFileName(self.alloc, admission_key, suffix);
+        defer self.alloc.free(name);
+        const bytes = encodeAdmissionAuthority(authority);
+        try io_mod.durableReplaceVerifiedWithOps(
+            self.alloc,
+            &self.records_dir,
+            name,
+            &bytes,
+            self.options.durable_ops,
+        );
     }
 
     fn acquireLock(self: *Ledger) !io_mod.TimedAdvisoryLock {
@@ -715,6 +1000,58 @@ fn recordFileName(alloc: Allocator, admission_key: []const u8) ![]u8 {
     return std.fmt.allocPrint(alloc, "{s}.json", .{digest});
 }
 
+fn admissionMarkerFileName(
+    alloc: Allocator,
+    admission_key: []const u8,
+    suffix: []const u8,
+) ![]u8 {
+    try protocol.validateSafeToken(admission_key);
+    const digest = protocol.sha256Hex(admission_key);
+    return std.fmt.allocPrint(alloc, "{s}.{s}", .{ digest, suffix });
+}
+
+fn validateAdmissionAuthority(authority: AdmissionAuthority) !void {
+    if (authority.turn_id == 0) return error.InvalidMessage;
+    switch (authority.disposition) {
+        .queued => if (authority.steer_target_turn_id != null) return error.InvalidMessage,
+        .steering => if ((authority.steer_target_turn_id orelse 0) == 0) return error.InvalidMessage,
+    }
+}
+
+fn admissionAuthorityEqual(left: AdmissionAuthority, right: AdmissionAuthority) bool {
+    return left.turn_id == right.turn_id and
+        left.disposition == right.disposition and
+        left.steer_target_turn_id == right.steer_target_turn_id;
+}
+
+fn encodeAdmissionAuthority(authority: AdmissionAuthority) [admission_authority_bytes_len]u8 {
+    var bytes: [admission_authority_bytes_len]u8 = undefined;
+    bytes[0] = switch (authority.disposition) {
+        .queued => 0,
+        .steering => 1,
+    };
+    std.mem.writeInt(u64, bytes[1..9], authority.turn_id, .big);
+    std.mem.writeInt(u64, bytes[9..17], authority.steer_target_turn_id orelse 0, .big);
+    return bytes;
+}
+
+fn decodeAdmissionAuthority(bytes: []const u8) !AdmissionAuthority {
+    if (bytes.len != admission_authority_bytes_len) return error.DurableRecordInvalid;
+    const disposition: protocol.Disposition = switch (bytes[0]) {
+        0 => .queued,
+        1 => .steering,
+        else => return error.DurableRecordInvalid,
+    };
+    const target = std.mem.readInt(u64, bytes[9..17], .big);
+    const authority: AdmissionAuthority = .{
+        .turn_id = std.mem.readInt(u64, bytes[1..9], .big),
+        .disposition = disposition,
+        .steer_target_turn_id = if (target == 0) null else target,
+    };
+    try validateAdmissionAuthority(authority);
+    return authority;
+}
+
 fn deterministicReceiptId(buffer: *[48]u8, prefix: []const u8, launch_digest: []const u8) ![]const u8 {
     try protocol.validateDigest(launch_digest);
     return std.fmt.bufPrint(buffer, "{s}-{s}", .{ prefix, launch_digest[0..24] });
@@ -724,6 +1061,17 @@ fn requireCorrelation(record: Record, admission_key: []const u8, launch_digest: 
     if (!std.mem.eql(u8, record.admission_key, admission_key)) return error.CorrelationMismatch;
     if (!std.mem.eql(u8, record.launch_digest, launch_digest)) return error.AdmissionConflict;
     if (!std.mem.eql(u8, record.launch_id, launch_id)) return error.CorrelationMismatch;
+}
+
+fn requireAdmissionAuthority(record: Record, authority: AdmissionAuthority) !void {
+    const decision = record.decision orelse return error.DurableRecordInvalid;
+    const admitted = switch (decision.decision) {
+        .cancelled_before_start => return error.DurableRecordInvalid,
+        .admitted => |value| value,
+    };
+    if (admitted.turn_id != authority.turn_id or admitted.disposition != authority.disposition) {
+        return error.DurableRecordInvalid;
+    }
 }
 
 fn outcomesEqual(left: protocol.Outcome, right: protocol.Outcome) bool {
@@ -762,6 +1110,8 @@ fn tempRoot(alloc: Allocator, tmp: *std.testing.TmpDir) ![]u8 {
 const DurableBoundary = enum {
     launch,
     admission,
+    admission_visible,
+    admission_consumed,
     cancellation,
     active_conversation,
     final_receipt,
@@ -832,6 +1182,25 @@ fn exerciseDurableBoundaryRecovery(
         defer setup.deinit();
         var accepted = try setup.acceptLaunch(request, "fresh-conversation-a");
         accepted.deinit();
+        if (boundary == .admission_visible or boundary == .admission_consumed) {
+            var admitted = try setup.admit(
+                request.admission_key,
+                request.launch_digest,
+                request.launch_id,
+                41,
+                .queued,
+                null,
+            );
+            admitted.deinit();
+            if (boundary == .admission_consumed) {
+                try setup.markAdmissionVisible(
+                    request.admission_key,
+                    request.launch_digest,
+                    request.launch_id,
+                    .{ .turn_id = 41, .disposition = .queued, .steer_target_turn_id = null },
+                );
+            }
+        }
         if (boundary == .final_acknowledgement) {
             var final = try setup.recordFinal(
                 request.admission_key,
@@ -860,6 +1229,25 @@ fn exerciseDurableBoundaryRecovery(
                 request.launch_id,
                 41,
                 .queued,
+                null,
+            ),
+        ),
+        .admission_visible => try expectInjectedDurabilityFailure(
+            failure,
+            faulting.markAdmissionVisible(
+                request.admission_key,
+                request.launch_digest,
+                request.launch_id,
+                .{ .turn_id = 41, .disposition = .queued, .steer_target_turn_id = null },
+            ),
+        ),
+        .admission_consumed => try expectInjectedDurabilityFailure(
+            failure,
+            faulting.markAdmissionConsumed(
+                request.admission_key,
+                request.launch_digest,
+                request.launch_id,
+                .{ .turn_id = 41, .disposition = .queued, .steer_target_turn_id = null },
             ),
         ),
         .cancellation => try expectInjectedDurabilityFailure(
@@ -931,6 +1319,7 @@ fn exerciseDurableBoundaryRecovery(
                 request.launch_id,
                 41,
                 .queued,
+                null,
             );
             defer mutation.deinit();
             try std.testing.expectEqual(
@@ -941,6 +1330,42 @@ fn exerciseDurableBoundaryRecovery(
                 @as(u64, 41),
                 mutation.loaded.record.decision.?.decision.admitted.turn_id,
             );
+        },
+        .admission_visible => {
+            const authority: AdmissionAuthority = .{
+                .turn_id = 41,
+                .disposition = .queued,
+                .steer_target_turn_id = null,
+            };
+            try recovered.markAdmissionVisible(
+                request.admission_key,
+                request.launch_digest,
+                request.launch_id,
+                authority,
+            );
+            const delivery = try recovered.admissionDeliveryUnlocked(
+                request.admission_key,
+                authority,
+            );
+            try std.testing.expectEqual(AdmissionDeliveryPhase.visible, delivery.phase);
+        },
+        .admission_consumed => {
+            const authority: AdmissionAuthority = .{
+                .turn_id = 41,
+                .disposition = .queued,
+                .steer_target_turn_id = null,
+            };
+            try recovered.markAdmissionConsumed(
+                request.admission_key,
+                request.launch_digest,
+                request.launch_id,
+                authority,
+            );
+            const delivery = try recovered.admissionDeliveryUnlocked(
+                request.admission_key,
+                authority,
+            );
+            try std.testing.expectEqual(AdmissionDeliveryPhase.consumed, delivery.phase);
         },
         .cancellation => {
             var mutation = try recovered.cancel(.{
@@ -1076,7 +1501,7 @@ test "launch ledger cancellation wins before admission and remains permanent" {
     try std.testing.expect(cancelled.loaded.record.decision.?.decision == .cancelled_before_start);
     try std.testing.expectError(
         error.AdmissionCancelled,
-        ledger.admit(request.admission_key, request.launch_digest, request.launch_id, 41, .queued),
+        ledger.admit(request.admission_key, request.launch_digest, request.launch_id, 41, .queued, null),
     );
 
     var reopened = try Ledger.open(alloc, root, .{});
@@ -1104,10 +1529,41 @@ test "launch ledger admission wins before cancellation and replays the original 
     const request = try sampleLaunchRequest(root, &digest);
     var accepted = try ledger.acceptLaunch(request, "fresh-conversation-a");
     accepted.deinit();
-    var admitted = try ledger.admit(request.admission_key, request.launch_digest, request.launch_id, 41, .steering);
+    var admitted = try ledger.admit(request.admission_key, request.launch_digest, request.launch_id, 41, .steering, 7);
     defer admitted.deinit();
     try std.testing.expect(admitted.newly_decided);
     try std.testing.expectEqual(@as(u64, 41), admitted.loaded.record.decision.?.decision.admitted.turn_id);
+    try std.testing.expectEqual(@as(?u64, 7), admitted.delivery.?.steer_target_turn_id);
+    try std.testing.expectEqual(AdmissionDeliveryPhase.decision_only, admitted.delivery.?.phase);
+
+    const authority: AdmissionAuthority = .{
+        .turn_id = 41,
+        .disposition = .steering,
+        .steer_target_turn_id = 7,
+    };
+    try ledger.markAdmissionVisible(
+        request.admission_key,
+        request.launch_digest,
+        request.launch_id,
+        authority,
+    );
+    var visible_replay = try ledger.admit(
+        request.admission_key,
+        request.launch_digest,
+        request.launch_id,
+        99,
+        .steering,
+        8,
+    );
+    defer visible_replay.deinit();
+    try std.testing.expectEqual(@as(?u64, 7), visible_replay.delivery.?.steer_target_turn_id);
+    try std.testing.expectEqual(AdmissionDeliveryPhase.visible, visible_replay.delivery.?.phase);
+    try ledger.markAdmissionConsumed(
+        request.admission_key,
+        request.launch_digest,
+        request.launch_id,
+        authority,
+    );
 
     var cancelled = try ledger.cancel(.{
         .admission_key = request.admission_key,
@@ -1119,6 +1575,50 @@ test "launch ledger admission wins before cancellation and replays the original 
     try std.testing.expect(!cancelled.newly_decided);
     try std.testing.expectEqual(@as(u64, 41), cancelled.loaded.record.decision.?.decision.admitted.turn_id);
     try std.testing.expectEqual(protocol.Disposition.steering, cancelled.loaded.record.decision.?.decision.admitted.disposition);
+    try std.testing.expectEqual(AdmissionDeliveryPhase.consumed, cancelled.delivery.?.phase);
+
+    var intent_tmp = std.testing.tmpDir(.{});
+    defer intent_tmp.cleanup();
+    const intent_root = try tempRoot(alloc, &intent_tmp);
+    defer alloc.free(intent_root);
+    var intent_digest: [64]u8 = undefined;
+    const intent_request = try sampleLaunchRequest(intent_root, &intent_digest);
+    var intent_ledger = try Ledger.open(alloc, intent_root, .{});
+    defer intent_ledger.deinit();
+    var intent_launch = try intent_ledger.acceptLaunch(intent_request, "fresh-conversation-a");
+    intent_launch.deinit();
+    const intent_authority: AdmissionAuthority = .{
+        .turn_id = 52,
+        .disposition = .steering,
+        .steer_target_turn_id = 19,
+    };
+    {
+        var lock = try intent_ledger.acquireLock();
+        defer lock.release();
+        try intent_ledger.persistAdmissionMarkerUnlocked(
+            intent_request.admission_key,
+            admission_authority_suffix,
+            intent_authority,
+        );
+    }
+    var recovered_by_cancel = try intent_ledger.cancel(.{
+        .admission_key = intent_request.admission_key,
+        .launch_digest = intent_request.launch_digest,
+        .launch_id = intent_request.launch_id,
+        .request_id = "cancel-after-admission-intent",
+    });
+    defer recovered_by_cancel.deinit();
+    try std.testing.expect(
+        recovered_by_cancel.loaded.record.decision.?.decision == .admitted,
+    );
+    try std.testing.expectEqual(
+        @as(u64, 52),
+        recovered_by_cancel.loaded.record.decision.?.decision.admitted.turn_id,
+    );
+    try std.testing.expectEqual(
+        @as(?u64, 19),
+        recovered_by_cancel.delivery.?.steer_target_turn_id,
+    );
 }
 
 test "launch ledger rejects conflicting digest and recovers a lost response" {
@@ -1134,19 +1634,19 @@ test "launch ledger rejects conflicting digest and recovers a lost response" {
         defer ledger.deinit();
         var accepted = try ledger.acceptLaunch(request, "fresh-conversation-a");
         accepted.deinit();
-        var admitted = try ledger.admit(request.admission_key, request.launch_digest, request.launch_id, 77, .queued);
+        var admitted = try ledger.admit(request.admission_key, request.launch_digest, request.launch_id, 77, .queued, null);
         admitted.deinit();
     }
     var recovered = try Ledger.open(alloc, root, .{});
     defer recovered.deinit();
-    var replay = try recovered.admit(request.admission_key, request.launch_digest, request.launch_id, 999, .steering);
+    var replay = try recovered.admit(request.admission_key, request.launch_digest, request.launch_id, 999, .steering, 13);
     defer replay.deinit();
     try std.testing.expect(!replay.newly_decided);
     try std.testing.expectEqual(@as(u64, 77), replay.loaded.record.decision.?.decision.admitted.turn_id);
     var conflict = [_]u8{'f'} ** 64;
     try std.testing.expectError(
         error.AdmissionConflict,
-        recovered.admit(request.admission_key, &conflict, request.launch_id, 88, .queued),
+        recovered.admit(request.admission_key, &conflict, request.launch_id, 88, .queued, null),
     );
 }
 

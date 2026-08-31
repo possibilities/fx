@@ -268,6 +268,17 @@ pub const PromptAdmissionResult = struct {
     disposition: PromptAdmissionDisposition,
 };
 
+pub const DurableInitialAdmissionIdentity = struct {
+    result: PromptAdmissionResult,
+    steer_target_turn_id: ?u64 = null,
+};
+
+pub const DurableInitialAdmissionPhase = enum {
+    decision_only,
+    visible,
+    consumed,
+};
+
 /// One process-local bridge to the durable authority for the first semantic
 /// Work-control admission. The callback runs while `worker_mutex` is held,
 /// after queue capacity is reserved and before the prompt is observable.
@@ -280,15 +291,28 @@ pub const DurableInitialAdmissionHook = struct {
     decide_fn: *const fn (
         context: *anyopaque,
         prompt: []const u8,
-        proposed: PromptAdmissionResult,
+        proposed: DurableInitialAdmissionIdentity,
     ) anyerror!DurableInitialAdmissionDecision,
+    transition_fn: *const fn (
+        context: *anyopaque,
+        identity: DurableInitialAdmissionIdentity,
+        phase: DurableInitialAdmissionPhase,
+    ) anyerror!void,
 
     pub fn decide(
         self: DurableInitialAdmissionHook,
         prompt: []const u8,
-        proposed: PromptAdmissionResult,
+        proposed: DurableInitialAdmissionIdentity,
     ) !DurableInitialAdmissionDecision {
         return self.decide_fn(self.context, prompt, proposed);
+    }
+
+    pub fn transition(
+        self: DurableInitialAdmissionHook,
+        identity: DurableInitialAdmissionIdentity,
+        phase: DurableInitialAdmissionPhase,
+    ) !void {
+        try self.transition_fn(self.context, identity, phase);
     }
 
     pub fn matchesInitial(
@@ -302,7 +326,8 @@ pub const DurableInitialAdmissionHook = struct {
 pub const DurableInitialAdmissionDecision = union(enum) {
     cancelled_before_start,
     admitted: struct {
-        result: PromptAdmissionResult,
+        identity: DurableInitialAdmissionIdentity,
+        phase: DurableInitialAdmissionPhase = .decision_only,
         replayed: bool,
     },
 };
@@ -689,7 +714,7 @@ pub const WorkerRuntime = struct {
     active_prompt_snapshot_ownership: ?*ActivePromptSnapshotOwnership = null,
     preserve_prompt_snapshot_turn_id: ?u64 = null,
     durable_initial_admission_hook: ?DurableInitialAdmissionHook = null,
-    durable_initial_admission_enqueued: bool = false,
+    durable_initial_admission: ?DurableInitialAdmissionIdentity = null,
 
     pub fn deinit(self: *WorkerRuntime, alloc: std.mem.Allocator) void {
         if (self.pending_permission_response) |response| {
@@ -1039,11 +1064,12 @@ pub const WorkerRuntime = struct {
         };
         if (use_durable_initial_admission) {
             if (self.durable_initial_admission_hook) |hook| {
-                // Once the correlated work is visible, unrelated later
+                // Once the correlated work has durable delivery authority,
+                // unrelated later
                 // Work-control requests resume the ordinary path. Exact
                 // initial-work retries must always revisit the durable
                 // decision, including after the first response was lost.
-                if (self.durable_initial_admission_enqueued and
+                if (self.durable_initial_admission != null and
                     !hook.matchesInitial(queued.prompt))
                 {
                     try self.enqueuePromptLocked(alloc, queued);
@@ -1055,42 +1081,60 @@ pub const WorkerRuntime = struct {
                 // No allocation or fallible queue mutation may occur after the
                 // durable decision and before the prompt becomes observable.
                 try self.queued_prompts.ensureUnusedCapacity(alloc, 1);
-                const durable = try hook.decide(queued.prompt, result);
+                const durable = try hook.decide(queued.prompt, .{
+                    .result = result,
+                    .steer_target_turn_id = queued.steer_target_turn_id,
+                });
                 switch (durable) {
                     .cancelled_before_start => return error.InitialAdmissionCancelled,
                     .admitted => |admission| {
-                        if (admission.result.turn_id == 0) return error.InvalidDurableAdmissionDecision;
-                        if (self.durable_initial_admission_enqueued or
-                            self.containsTurnLocked(admission.result.turn_id))
+                        const identity = admission.identity;
+                        if (identity.result.turn_id == 0 or
+                            (identity.result.disposition == .queued and identity.steer_target_turn_id != null) or
+                            (identity.result.disposition == .steering and (identity.steer_target_turn_id orelse 0) == 0))
                         {
+                            return error.InvalidDurableAdmissionDecision;
+                        }
+                        if (admission.phase == .consumed) {
                             freeQueuedPrompt(alloc, queued);
-                            self.durable_initial_admission_enqueued = true;
-                            return admission.result;
+                            self.durable_initial_admission = identity;
+                            return identity.result;
+                        }
+                        if (self.containsTurnLocked(identity.result.turn_id)) {
+                            const recovered_phase: DurableInitialAdmissionPhase =
+                                if (self.worker_processing and self.active_turn_id == identity.result.turn_id)
+                                    .consumed
+                                else
+                                    .visible;
+                            try hook.transition(identity, recovered_phase);
+                            freeQueuedPrompt(alloc, queued);
+                            self.durable_initial_admission = identity;
+                            return identity.result;
                         }
 
-                        queued.turn_id = admission.result.turn_id;
-                        switch (admission.result.disposition) {
+                        queued.turn_id = identity.result.turn_id;
+                        switch (identity.result.disposition) {
                             .queued => queued.steer_target_turn_id = null,
                             .steering => {
-                                if (!self.worker_processing or self.active_turn_id == 0) {
-                                    // A replayed steering decision belongs to
-                                    // the already-admitted active Turn. Never
-                                    // manufacture a second prompt path after
-                                    // recovery if that target is no longer live.
+                                const target = identity.steer_target_turn_id.?;
+                                if (!self.worker_processing or self.active_turn_id != target) {
+                                    // Recovery may demote guidance whose exact
+                                    // target is gone, but it must never steer a
+                                    // different active Turn or lose the work.
                                     if (!admission.replayed) return error.InvalidDurableAdmissionDecision;
-                                    freeQueuedPrompt(alloc, queued);
-                                    self.durable_initial_admission_enqueued = true;
-                                    return admission.result;
+                                    queued.steer_target_turn_id = null;
+                                } else {
+                                    queued.steer_target_turn_id = target;
                                 }
-                                queued.steer_target_turn_id = self.active_turn_id;
                             },
                         }
+                        try hook.transition(identity, .visible);
                         self.enqueuePromptAssumeCapacityLocked(queued);
-                        self.durable_initial_admission_enqueued = true;
+                        self.durable_initial_admission = identity;
                         self.worker_mutex.unlock(io_mod.getIo());
                         locked = false;
                         if (observer) |admitted| admitted.report(admitted.ctx);
-                        return admission.result;
+                        return identity.result;
                     },
                 }
             }
@@ -1137,6 +1181,17 @@ pub const WorkerRuntime = struct {
         return false;
     }
 
+    fn markDurableInitialAdmissionConsumedLocked(
+        self: *WorkerRuntime,
+        prompt: QueuedPrompt,
+    ) !void {
+        const identity = self.durable_initial_admission orelse return;
+        if (prompt.turn_id != identity.result.turn_id) return;
+        const hook = self.durable_initial_admission_hook orelse
+            return error.InvalidDurableAdmissionDecision;
+        try hook.transition(identity, .consumed);
+    }
+
     /// Returns allocator-owned steering text for `turn_id`, removing only those
     /// entries from the shared admission-ordered queue.
     pub fn takeSteering(self: *WorkerRuntime, alloc: std.mem.Allocator, turn_id: u64) ![][]u8 {
@@ -1177,6 +1232,10 @@ pub const WorkerRuntime = struct {
             event_count += 1;
         }
         try self.worker_events.ensureUnusedCapacity(alloc, events.len);
+        for (self.queued_prompts.items) |prompt| {
+            if (prompt.steer_target_turn_id != turn_id) continue;
+            try self.markDurableInitialAdmissionConsumedLocked(prompt);
+        }
         for (events) |event| self.worker_events.appendAssumeCapacity(event);
         alloc.free(events);
 
@@ -1551,28 +1610,40 @@ pub const WorkerRuntime = struct {
         if (self.worker_stop_requested or self.queued_prompts.items.len == 0) return null;
 
         const queued = self.queued_prompts.items[0];
+        var begin_event: ?WorkerEvent = null;
+        errdefer if (begin_event) |event| freeWorkerEvent(alloc, event);
         if (queued.recovery_checkpoint == null and queued.user_prompt_already_presented) {
-            try self.worker_events.append(alloc, .{
-                .begin_presented_prompt = queued.turn_id,
-            });
+            begin_event = .{ .begin_presented_prompt = queued.turn_id };
         } else if (queued.recovery_checkpoint == null) {
             const begin_prompt = try types.dupeUserTurn(alloc, .{ .text = queued.prompt, .images = queued.images });
-            errdefer types.freeUserTurn(alloc, begin_prompt);
+            var begin_prompt_owned = true;
+            errdefer if (begin_prompt_owned) types.freeUserTurn(alloc, begin_prompt);
             if (queued.skill_bindings.len > 0 or queued.skill_display_spans.len > 0) {
                 const skill_bindings = try dupeSkillBindings(alloc, queued.skill_bindings);
-                errdefer freeSkillBindings(alloc, skill_bindings);
+                var skill_bindings_owned = true;
+                errdefer if (skill_bindings_owned) freeSkillBindings(alloc, skill_bindings);
                 const skill_display_spans = try dupeSkillDisplaySpans(alloc, queued.skill_display_spans);
-                errdefer freeSkillDisplaySpans(alloc, skill_display_spans);
-                try self.worker_events.append(alloc, .{
-                    .begin_prompt_with_skill_bindings = .{
-                        .prompt = begin_prompt,
-                        .skill_bindings = skill_bindings,
-                        .skill_display_spans = skill_display_spans,
-                    },
-                });
+                var skill_display_spans_owned = true;
+                errdefer if (skill_display_spans_owned) freeSkillDisplaySpans(alloc, skill_display_spans);
+                begin_event = .{ .begin_prompt_with_skill_bindings = .{
+                    .prompt = begin_prompt,
+                    .skill_bindings = skill_bindings,
+                    .skill_display_spans = skill_display_spans,
+                } };
+                begin_prompt_owned = false;
+                skill_bindings_owned = false;
+                skill_display_spans_owned = false;
             } else {
-                try self.worker_events.append(alloc, .{ .begin_prompt = begin_prompt });
+                begin_event = .{ .begin_prompt = begin_prompt };
+                begin_prompt_owned = false;
             }
+        }
+
+        if (begin_event != null) try self.worker_events.ensureUnusedCapacity(alloc, 1);
+        try self.markDurableInitialAdmissionConsumedLocked(queued);
+        if (begin_event) |event| {
+            self.worker_events.appendAssumeCapacity(event);
+            begin_event = null;
         }
 
         var job = self.queued_prompts.orderedRemove(0);
@@ -3676,18 +3747,44 @@ test "active prompt admission drains steering in FIFO order" {
 
 const DurableAdmissionProbe = struct {
     calls: usize = 0,
+    transition_calls: usize = 0,
     decision: DurableInitialAdmissionDecision,
     expected_prompt: []const u8,
+    phase: DurableInitialAdmissionPhase = .decision_only,
+    fail_transition_once: ?DurableInitialAdmissionPhase = null,
 
     fn decide(
         raw: *anyopaque,
         prompt: []const u8,
-        _: PromptAdmissionResult,
+        _: DurableInitialAdmissionIdentity,
     ) !DurableInitialAdmissionDecision {
         const self: *DurableAdmissionProbe = @ptrCast(@alignCast(raw));
         self.calls += 1;
         try std.testing.expectEqualStrings(self.expected_prompt, prompt);
-        return self.decision;
+        var decision = self.decision;
+        if (decision == .admitted) decision.admitted.phase = self.phase;
+        return decision;
+    }
+
+    fn transition(
+        raw: *anyopaque,
+        identity: DurableInitialAdmissionIdentity,
+        phase: DurableInitialAdmissionPhase,
+    ) !void {
+        const self: *DurableAdmissionProbe = @ptrCast(@alignCast(raw));
+        self.transition_calls += 1;
+        const expected = self.decision.admitted.identity;
+        try std.testing.expectEqual(expected.result.turn_id, identity.result.turn_id);
+        try std.testing.expectEqual(expected.result.disposition, identity.result.disposition);
+        try std.testing.expectEqual(expected.steer_target_turn_id, identity.steer_target_turn_id);
+        if (self.fail_transition_once == phase) {
+            self.fail_transition_once = null;
+            return error.InjectedAdmissionTransitionFailure;
+        }
+        if (@intFromEnum(phase) < @intFromEnum(self.phase)) {
+            return error.InvalidDurableAdmissionDecision;
+        }
+        self.phase = phase;
     }
 
     fn matchesInitial(raw: *anyopaque, prompt: []const u8) bool {
@@ -3700,6 +3797,7 @@ const DurableAdmissionProbe = struct {
             .context = self,
             .matches_initial_fn = matchesInitial,
             .decide_fn = decide,
+            .transition_fn = transition,
         };
     }
 };
@@ -3710,7 +3808,7 @@ test "durable initial Work-control admission reserves capacity before decision a
     defer runtime.deinit(alloc);
     var probe = DurableAdmissionProbe{
         .decision = .{ .admitted = .{
-            .result = .{ .turn_id = 991, .disposition = .queued },
+            .identity = .{ .result = .{ .turn_id = 991, .disposition = .queued } },
             .replayed = false,
         } },
         .expected_prompt = "durable initial work",
@@ -3726,6 +3824,16 @@ test "durable initial Work-control admission reserves capacity before decision a
     try std.testing.expectEqual(@as(usize, 0), probe.calls);
     freeQueuedPrompt(alloc, prompt);
 
+    probe.fail_transition_once = .visible;
+    const decision_only_prompt = try makePrompt(alloc, probe.expected_prompt, "model");
+    try std.testing.expectError(
+        error.InjectedAdmissionTransitionFailure,
+        runtime.admitWorkControlPromptObserved(alloc, decision_only_prompt, false),
+    );
+    freeQueuedPrompt(alloc, decision_only_prompt);
+    try std.testing.expectEqual(DurableInitialAdmissionPhase.decision_only, probe.phase);
+    try std.testing.expectEqual(@as(usize, 0), runtime.queued_prompts.items.len);
+
     const admitted = try runtime.admitWorkControlPromptObserved(
         alloc,
         try makePrompt(alloc, probe.expected_prompt, "model"),
@@ -3735,7 +3843,8 @@ test "durable initial Work-control admission reserves capacity before decision a
     try std.testing.expectEqual(PromptAdmissionDisposition.queued, admitted.disposition);
     try std.testing.expectEqual(@as(usize, 1), runtime.queued_prompts.items.len);
     try std.testing.expectEqual(@as(u64, 991), runtime.queued_prompts.items[0].turn_id);
-    try std.testing.expectEqual(@as(usize, 1), probe.calls);
+    try std.testing.expectEqual(DurableInitialAdmissionPhase.visible, probe.phase);
+    try std.testing.expectEqual(@as(usize, 2), probe.calls);
 }
 
 test "durable initial Work-control cancellation is permanent and exact admitted retries never enqueue twice" {
@@ -3769,7 +3878,7 @@ test "durable initial Work-control cancellation is permanent and exact admitted 
         defer runtime.deinit(alloc);
         var admitted = DurableAdmissionProbe{
             .decision = .{ .admitted = .{
-                .result = .{ .turn_id = 992, .disposition = .queued },
+                .identity = .{ .result = .{ .turn_id = 992, .disposition = .queued } },
                 .replayed = true,
             } },
             .expected_prompt = "replayed work",
@@ -3788,6 +3897,9 @@ test "durable initial Work-control cancellation is permanent and exact admitted 
         try std.testing.expectEqual(first.turn_id, replay.turn_id);
         try std.testing.expectEqual(first.disposition, replay.disposition);
         try std.testing.expectEqual(@as(usize, 1), runtime.queued_prompts.items.len);
+        const consumed = (try runtime.tryTakeNextPrompt(alloc)).?;
+        freeQueuedPrompt(alloc, consumed);
+        try std.testing.expectEqual(DurableInitialAdmissionPhase.consumed, admitted.phase);
         const later = try runtime.admitWorkControlPromptObserved(
             alloc,
             try makePrompt(alloc, "later ordinary work", "model"),
@@ -3795,8 +3907,20 @@ test "durable initial Work-control cancellation is permanent and exact admitted 
         );
         try std.testing.expectEqual(@as(u64, 992), first.turn_id);
         try std.testing.expect(later.turn_id != first.turn_id);
-        try std.testing.expectEqual(@as(usize, 2), runtime.queued_prompts.items.len);
+        try std.testing.expectEqual(@as(usize, 1), runtime.queued_prompts.items.len);
         try std.testing.expectEqual(@as(usize, 2), admitted.calls);
+
+        var restarted = WorkerRuntime{};
+        defer restarted.deinit(alloc);
+        restarted.setDurableInitialAdmissionHook(admitted.hook());
+        const consumed_replay = try restarted.admitWorkControlPromptObserved(
+            alloc,
+            try makePrompt(alloc, admitted.expected_prompt, "model"),
+            false,
+        );
+        try std.testing.expectEqual(first.turn_id, consumed_replay.turn_id);
+        try std.testing.expectEqual(@as(usize, 0), restarted.queued_prompts.items.len);
+        try std.testing.expectEqual(@as(usize, 3), admitted.calls);
     }
 }
 
@@ -3808,7 +3932,7 @@ test "durable initial Work-control recovery reuses an already-present Turn" {
     runtime.active_turn_id = 993;
     var replay = DurableAdmissionProbe{
         .decision = .{ .admitted = .{
-            .result = .{ .turn_id = 993, .disposition = .queued },
+            .identity = .{ .result = .{ .turn_id = 993, .disposition = .queued } },
             .replayed = true,
         } },
         .expected_prompt = "recovered initial work",
@@ -3823,6 +3947,7 @@ test "durable initial Work-control recovery reuses an already-present Turn" {
     try std.testing.expectEqual(@as(u64, 993), recovered.turn_id);
     try std.testing.expectEqual(@as(usize, 0), runtime.queued_prompts.items.len);
     try std.testing.expectEqual(@as(usize, 1), replay.calls);
+    try std.testing.expectEqual(DurableInitialAdmissionPhase.consumed, replay.phase);
 
     _ = try runtime.admitWorkControlPromptObserved(
         alloc,
@@ -3831,6 +3956,116 @@ test "durable initial Work-control recovery reuses an already-present Turn" {
     );
     try std.testing.expectEqual(@as(usize, 1), runtime.queued_prompts.items.len);
     try std.testing.expectEqual(@as(usize, 1), replay.calls);
+
+    var steering = DurableAdmissionProbe{
+        .decision = .{ .admitted = .{
+            .identity = .{
+                .result = .{ .turn_id = 994, .disposition = .steering },
+                .steer_target_turn_id = 41,
+            },
+            .replayed = false,
+        } },
+        .expected_prompt = "recovered steering work",
+        .fail_transition_once = .visible,
+    };
+    {
+        var first_process = WorkerRuntime{};
+        defer first_process.deinit(alloc);
+        first_process.worker_processing = true;
+        first_process.active_turn_id = 41;
+        first_process.setDurableInitialAdmissionHook(steering.hook());
+        const decision_only = try makePrompt(alloc, steering.expected_prompt, "model");
+        try std.testing.expectError(
+            error.InjectedAdmissionTransitionFailure,
+            first_process.admitWorkControlPromptObserved(alloc, decision_only, true),
+        );
+        freeQueuedPrompt(alloc, decision_only);
+        try std.testing.expectEqual(DurableInitialAdmissionPhase.decision_only, steering.phase);
+        const visible = try first_process.admitWorkControlPromptObserved(
+            alloc,
+            try makePrompt(alloc, steering.expected_prompt, "model"),
+            true,
+        );
+        try std.testing.expectEqual(PromptAdmissionDisposition.steering, visible.disposition);
+        try std.testing.expectEqual(@as(?u64, 41), first_process.queued_prompts.items[0].steer_target_turn_id);
+        try std.testing.expectEqual(DurableInitialAdmissionPhase.visible, steering.phase);
+    }
+
+    steering.decision.admitted.replayed = true;
+    {
+        var recovered_process = WorkerRuntime{};
+        defer recovered_process.deinit(alloc);
+        recovered_process.worker_processing = true;
+        recovered_process.active_turn_id = 42;
+        recovered_process.setDurableInitialAdmissionHook(steering.hook());
+        const recovered_steering = try recovered_process.admitWorkControlPromptObserved(
+            alloc,
+            try makePrompt(alloc, steering.expected_prompt, "model"),
+            true,
+        );
+        try std.testing.expectEqual(PromptAdmissionDisposition.steering, recovered_steering.disposition);
+        try std.testing.expectEqual(@as(usize, 1), recovered_process.queued_prompts.items.len);
+        try std.testing.expect(recovered_process.queued_prompts.items[0].steer_target_turn_id == null);
+        const demoted = (try recovered_process.tryTakeNextPrompt(alloc)).?;
+        freeQueuedPrompt(alloc, demoted);
+        try std.testing.expectEqual(DurableInitialAdmissionPhase.consumed, steering.phase);
+    }
+
+    var final_process = WorkerRuntime{};
+    defer final_process.deinit(alloc);
+    final_process.worker_processing = true;
+    final_process.active_turn_id = 43;
+    final_process.setDurableInitialAdmissionHook(steering.hook());
+    const consumed_replay = try final_process.admitWorkControlPromptObserved(
+        alloc,
+        try makePrompt(alloc, steering.expected_prompt, "model"),
+        true,
+    );
+    try std.testing.expectEqual(@as(u64, 994), consumed_replay.turn_id);
+    try std.testing.expectEqual(@as(usize, 0), final_process.queued_prompts.items.len);
+
+    var consumed_steering = DurableAdmissionProbe{
+        .decision = .{ .admitted = .{
+            .identity = .{
+                .result = .{ .turn_id = 995, .disposition = .steering },
+                .steer_target_turn_id = 51,
+            },
+            .replayed = false,
+        } },
+        .expected_prompt = "consumed steering work",
+    };
+    {
+        var steering_process = WorkerRuntime{};
+        defer steering_process.deinit(alloc);
+        steering_process.worker_processing = true;
+        steering_process.active_turn_id = 51;
+        steering_process.setDurableInitialAdmissionHook(consumed_steering.hook());
+        _ = try steering_process.admitWorkControlPromptObserved(
+            alloc,
+            try makePrompt(alloc, consumed_steering.expected_prompt, "model"),
+            true,
+        );
+        const guidance = try steering_process.takeSteering(alloc, 51);
+        defer {
+            for (guidance) |message| alloc.free(message);
+            alloc.free(guidance);
+        }
+        try std.testing.expectEqual(@as(usize, 1), guidance.len);
+        try std.testing.expectEqualStrings(consumed_steering.expected_prompt, guidance[0]);
+        try std.testing.expectEqual(DurableInitialAdmissionPhase.consumed, consumed_steering.phase);
+    }
+    consumed_steering.decision.admitted.replayed = true;
+    var steering_after_loss = WorkerRuntime{};
+    defer steering_after_loss.deinit(alloc);
+    steering_after_loss.worker_processing = true;
+    steering_after_loss.active_turn_id = 52;
+    steering_after_loss.setDurableInitialAdmissionHook(consumed_steering.hook());
+    _ = try steering_after_loss.admitWorkControlPromptObserved(
+        alloc,
+        try makePrompt(alloc, consumed_steering.expected_prompt, "model"),
+        true,
+    );
+    try std.testing.expectEqual(@as(usize, 0), steering_after_loss.queued_prompts.items.len);
 }
 
 test "work control snapshot and text update preserve native admission order" {

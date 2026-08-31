@@ -211,6 +211,7 @@ const ToolAccumulator = struct {
 
 pub const Reducer = struct {
     content: std.ArrayList(u8) = .empty,
+    content_capture_overflowed: bool = false,
     provider_state: std.Io.Writer.Allocating,
     provider_state_count: usize = 0,
     tools: std.ArrayList(ToolAccumulator) = .empty,
@@ -286,7 +287,13 @@ pub const Reducer = struct {
             if (std.mem.eql(u8, event_type, "response.refusal.delta")) self.saw_refusal = true;
             self.saw_content_delta = true;
             callbacks.on_content(callbacks.context, delta);
-            try appendCaptured(alloc, &self.content, delta, content_capture_limit);
+            try appendCaptured(
+                alloc,
+                &self.content,
+                delta,
+                content_capture_limit,
+                &self.content_capture_overflowed,
+            );
         } else if (std.mem.eql(u8, event_type, "response.reasoning_summary_text.delta") or
             std.mem.eql(u8, event_type, "response.reasoning_text.delta"))
         {
@@ -360,7 +367,13 @@ pub const Reducer = struct {
                             break :refusal refusal;
                         };
                         callbacks.on_content(callbacks.context, text);
-                        try appendCaptured(alloc, &self.content, text, content_capture_limit);
+                        try appendCaptured(
+                            alloc,
+                            &self.content,
+                            text,
+                            content_capture_limit,
+                            &self.content_capture_overflowed,
+                        );
                     }
                 };
             }
@@ -448,6 +461,7 @@ pub const Reducer = struct {
         self.generation_id = null;
         return .{
             .content = owned_content,
+            .content_capture_overflowed = self.content_capture_overflowed,
             .tool_calls = owned_tools,
             .generation_id = generation_id,
             .provider_state_json = owned_provider_state,
@@ -518,11 +532,13 @@ fn appendCaptured(
     content: *std.ArrayList(u8),
     delta: []const u8,
     limit: ?usize,
+    overflowed: *bool,
 ) !void {
     const remaining = if (limit) |maximum|
         maximum -| @min(maximum, content.items.len)
     else
         delta.len;
+    if (delta.len > remaining) overflowed.* = true;
     try content.appendSlice(alloc, delta[0..@min(delta.len, remaining)]);
 }
 
@@ -807,6 +823,69 @@ test "Responses reducer classifies refusal content as content filter" {
     defer result.deinit(alloc);
     try std.testing.expectEqual(types.ProviderFinishReason.content_filter, completion.finish_reason.?);
     try std.testing.expectEqualStrings("refused", completion.content.?);
+    try std.testing.expect(!completion.content_capture_overflowed);
+
+    const capture_limit: usize = 960 * 1024;
+    const split = capture_limit / 2;
+    const captured_bytes = try alloc.alloc(u8, capture_limit + 1);
+    defer alloc.free(captured_bytes);
+    @memset(captured_bytes, 'x');
+
+    var exact = Reducer.init(alloc);
+    defer exact.deinit(alloc);
+    try appendCaptured(
+        alloc,
+        &exact.content,
+        captured_bytes[0..split],
+        capture_limit,
+        &exact.content_capture_overflowed,
+    );
+    try appendCaptured(
+        alloc,
+        &exact.content,
+        captured_bytes[split..capture_limit],
+        capture_limit,
+        &exact.content_capture_overflowed,
+    );
+    exact.terminal_seen = true;
+    var exact_result = stream_provider.Result{ .completed = .{
+        .completion = try exact.finish(alloc, &cancelled, limits),
+        .ownership = .owned,
+    } };
+    defer exact_result.deinit(alloc);
+    try std.testing.expectEqual(
+        capture_limit,
+        exact_result.completed.completion.content.?.len,
+    );
+    try std.testing.expect(!exact_result.completed.completion.content_capture_overflowed);
+
+    var overflow = Reducer.init(alloc);
+    defer overflow.deinit(alloc);
+    try appendCaptured(
+        alloc,
+        &overflow.content,
+        captured_bytes[0..split],
+        capture_limit,
+        &overflow.content_capture_overflowed,
+    );
+    try appendCaptured(
+        alloc,
+        &overflow.content,
+        captured_bytes[split .. capture_limit + 1],
+        capture_limit,
+        &overflow.content_capture_overflowed,
+    );
+    overflow.terminal_seen = true;
+    var overflow_result = stream_provider.Result{ .completed = .{
+        .completion = try overflow.finish(alloc, &cancelled, limits),
+        .ownership = .owned,
+    } };
+    defer overflow_result.deinit(alloc);
+    try std.testing.expectEqual(
+        capture_limit,
+        overflow_result.completed.completion.content.?.len,
+    );
+    try std.testing.expect(overflow_result.completed.completion.content_capture_overflowed);
 }
 
 test "Responses reducer preserves a terminal provider outcome after late cancellation" {
