@@ -5313,6 +5313,25 @@ test "global native tool selections preserve order and fail closed when malforme
     );
 }
 
+test "interactive unknown native tool selection renders missing_native_tool before launch teardown" {
+    var capture = CaptureOutput.init(std.testing.allocator);
+    defer capture.deinit();
+
+    const result = try runIfRequestedWithDeps(
+        std.testing.allocator,
+        &.{ @constCast("--tool"), @constCast("missing_native_tool") },
+        testConfig(),
+        capture.deps(),
+    );
+
+    try std.testing.expectEqual(RunResult.handled_failure, result);
+    try std.testing.expectEqualStrings("", capture.stdout.written());
+    try std.testing.expectEqualStrings(
+        "fx: unknown native tool selection: missing_native_tool\n",
+        capture.stderr.written(),
+    );
+}
+
 fn checkNativeToolSelectionParseAllocationFailures(alloc: Allocator) !void {
     var parsed = try parseGlobalLaunchArgs(alloc, &.{
         @constCast("--tool"),
