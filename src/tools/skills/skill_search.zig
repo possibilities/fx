@@ -357,11 +357,15 @@ test "skill search includes invocation-only roots" {
     defer alloc.free(invocation_root);
     const invocation_skill_roots = [_][]const u8{invocation_root};
     const query = try lexical_relevance.prepare("invocation-only-search");
-    const output = try search(.{
+    const output = try searchRequest(.{
         .allocator = alloc,
         .workspace_root = workspace_root,
         .invocation_skill_roots = &invocation_skill_roots,
-    }, &query, 4096);
+    }, .{
+        .query = &query,
+        .kind = .skill,
+        .limit = legacy_result_limit,
+    }, 4096);
     defer alloc.free(output);
 
     try std.testing.expect(std.mem.find(u8, output, "\"name\":\"invocation-only-search\"") != null);

@@ -45,6 +45,38 @@ pub const PreparedLaunch = struct {
         };
     }
 
+    /// Reopens one already-accepted launch without creating it. This is the
+    /// production recovery path for an external process owner: the opaque
+    /// correlation tuple selects Fx's existing ledger and nothing else.
+    pub fn openExisting(
+        alloc: Allocator,
+        state_root: []const u8,
+        admission_key: []const u8,
+        launch_digest: []const u8,
+        launch_id: []const u8,
+    ) !PreparedLaunch {
+        try protocol.validateCorrelation(admission_key, launch_digest, launch_id);
+        var ledger = try ledger_mod.Ledger.open(alloc, state_root, .{});
+        errdefer ledger.deinit();
+        const accepted = (try ledger.load(admission_key)) orelse return error.LaunchNotFound;
+        errdefer {
+            var owned = accepted;
+            owned.deinit();
+        }
+        if (!std.mem.eql(u8, accepted.record.launch_digest, launch_digest) or
+            !std.mem.eql(u8, accepted.record.launch_id, launch_id) or
+            !std.mem.eql(u8, accepted.record.state_root, state_root))
+        {
+            return error.CorrelationMismatch;
+        }
+        return .{
+            .alloc = alloc,
+            .ledger = ledger,
+            .accepted = accepted,
+            .replayed = true,
+        };
+    }
+
     pub fn deinit(self: *PreparedLaunch) void {
         self.accepted.deinit();
         self.ledger.deinit();
@@ -75,6 +107,78 @@ pub const PreparedLaunch = struct {
         acknowledgement: protocol.FinalReceiptAcknowledgement,
     ) !ledger_mod.Loaded {
         return self.ledger.acknowledgeFinal(acknowledgement);
+    }
+
+    /// Records only an outcome already proved by the external process owner.
+    /// This method never spawns, signals, waits for, or otherwise owns a child.
+    pub fn recordExternalFinal(
+        self: *PreparedLaunch,
+        outcome: protocol.Outcome,
+        observed_at: []const u8,
+    ) !ledger_mod.Loaded {
+        return self.ledger.recordFinal(
+            self.accepted.record.admission_key,
+            self.accepted.record.launch_digest,
+            self.accepted.record.launch_id,
+            outcome,
+            observed_at,
+        );
+    }
+
+    /// Builds the exact argument and correlation-environment delta for a
+    /// caller that remains the sole process and PTY owner. The caller's
+    /// private transaction decides whether an initial effect is still absent
+    /// or definitive prior-process end proof permits recovery; Fx validates
+    /// the durable launch state and never performs the process effect here.
+    pub fn buildExternalInvocation(
+        self: *PreparedLaunch,
+        remaining_global_args: []const []const u8,
+        remaining_launch_controls_digest: []const u8,
+        mode: SpawnMode,
+    ) !ExternalInvocation {
+        try protocol.validateDigest(remaining_launch_controls_digest);
+        try validateExternalGlobalArgs(remaining_global_args);
+        const computed = try computeLaunchControlsDigest(self.alloc, remaining_global_args);
+        var current = try self.retained();
+        defer current.deinit();
+        if (!std.mem.eql(u8, current.record.remaining_launch_controls_digest, remaining_launch_controls_digest) or
+            !std.mem.eql(u8, &computed, remaining_launch_controls_digest))
+        {
+            return error.RemainingLaunchControlsMismatch;
+        }
+        if (current.record.final_receipt != null) return error.LaunchAlreadyFinal;
+        if (current.record.decision) |decision| switch (decision.decision) {
+            .cancelled_before_start => return error.LaunchCancelledBeforeStart,
+            .admitted => {},
+        };
+
+        var full = try self.buildFxInvocation("fx", remaining_global_args, mode);
+        defer full.deinit();
+        var arena = std.heap.ArenaAllocator.init(self.alloc);
+        errdefer arena.deinit();
+        const scratch = arena.allocator();
+        const arguments = try scratch.alloc([]const u8, full.argv.len - 1);
+        for (full.argv[1..], 0..) |arg, index| arguments[index] = try scratch.dupe(u8, arg);
+        const cwd = try scratch.dupe(u8, full.cwd);
+        const state_root = try scratch.dupe(u8, full.environment.get(child_runtime.state_root_env).?);
+        const admission_key = try scratch.dupe(u8, full.environment.get(child_runtime.admission_key_env).?);
+        const launch_digest = try scratch.dupe(u8, full.environment.get(child_runtime.launch_digest_env).?);
+        const launch_id = try scratch.dupe(u8, full.environment.get(child_runtime.launch_id_env).?);
+        const conversation_id = try scratch.dupe(u8, full.environment.get(child_runtime.conversation_id_env).?);
+        const model = if (full.environment.get("FX_MODEL")) |value| try scratch.dupe(u8, value) else null;
+        const effort = if (full.environment.get("FX_EFFORT")) |value| try scratch.dupe(u8, value) else null;
+        return .{
+            .arena = arena,
+            .arguments = arguments,
+            .cwd = cwd,
+            .state_root = state_root,
+            .admission_key = admission_key,
+            .launch_digest = launch_digest,
+            .launch_id = launch_id,
+            .conversation_id = conversation_id,
+            .model = model,
+            .effort = effort,
+        };
     }
 
     /// Constructs an ordinary Fx invocation. This is not a new command or
@@ -148,6 +252,14 @@ pub const PreparedLaunch = struct {
             current.record,
             resume_id orelse current.record.initial_conversation_id,
         );
+        if (current.record.model) |model|
+            try environment.put("FX_MODEL", model)
+        else
+            _ = environment.orderedRemove("FX_MODEL");
+        if (current.record.effort) |effort|
+            try environment.put("FX_EFFORT", effort)
+        else
+            _ = environment.orderedRemove("FX_EFFORT");
         const cwd = try scratch.dupe(u8, current.record.directory);
         return .{
             .arena = arena,
@@ -157,6 +269,134 @@ pub const PreparedLaunch = struct {
         };
     }
 };
+
+fn validateExternalGlobalArgs(args: []const []const u8) !void {
+    for (args) |arg| {
+        if (arg.len == 0 or arg.len > 1024 or !std.unicode.utf8ValidateSlice(arg)) {
+            return error.InvalidLaunchControlArgument;
+        }
+        for (arg) |byte| if (byte <= 0x1f or byte == 0x7f) {
+            return error.InvalidLaunchControlArgument;
+        };
+    }
+
+    var index: usize = 0;
+    while (index < args.len) : (index += 1) {
+        const arg = args[index];
+        if (isProviderOwnedArgument(arg)) return error.ProviderOwnedLaunchControl;
+        if (isResumeSelection(arg)) return error.ProviderOwnedLaunchControl;
+        if (isFlagGlobalOption(arg)) continue;
+        if (isValueGlobalOption(arg)) {
+            index += 1;
+            if (index >= args.len or std.mem.startsWith(u8, args[index], "-")) {
+                return error.InvalidLaunchControlArgument;
+            }
+            continue;
+        }
+        if (std.mem.findScalar(u8, arg, '=')) |equals| {
+            if (equals > 2 and isValueGlobalOption(arg[0..equals]) and equals + 1 < arg.len) {
+                continue;
+            }
+        }
+        return error.InvalidLaunchControlArgument;
+    }
+}
+
+fn isFlagGlobalOption(arg: []const u8) bool {
+    return stringIn(arg, &.{
+        "--record",
+        "--no-additional-dirs",
+        "--no-native-tools",
+        "--no-default-skills",
+        "--no-project-instructions",
+    });
+}
+
+fn isValueGlobalOption(arg: []const u8) bool {
+    return stringIn(arg, &.{
+        "--system-prompt-file",
+        "--append-system-prompt-file",
+        "--skills-dir",
+        "--context-limit",
+        "--add-dir",
+        "--tool",
+        "--permissions-file",
+    });
+}
+
+fn isProviderOwnedArgument(arg: []const u8) bool {
+    for ([_][]const u8{
+        "--state-dir",
+        "--name",
+        "--model",
+        "--effort",
+        "--resume",
+        "--resume-id",
+    }) |option| {
+        if (std.mem.eql(u8, arg, option) or
+            (std.mem.startsWith(u8, arg, option) and arg.len > option.len and arg[option.len] == '='))
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
+fn isResumeSelection(arg: []const u8) bool {
+    return stringIn(arg, &.{ "--", "--resume-last", "--continue", "-c", "-r", "resume" }) or
+        std.mem.startsWith(u8, arg, "--resume-");
+}
+
+fn stringIn(value: []const u8, values: []const []const u8) bool {
+    for (values) |candidate| if (std.mem.eql(u8, value, candidate)) return true;
+    return false;
+}
+
+pub const ExternalInvocation = struct {
+    arena: std.heap.ArenaAllocator,
+    arguments: []const []const u8,
+    cwd: []const u8,
+    state_root: []const u8,
+    admission_key: []const u8,
+    launch_digest: []const u8,
+    launch_id: []const u8,
+    conversation_id: []const u8,
+    model: ?[]const u8,
+    effort: ?[]const u8,
+
+    pub fn deinit(self: *ExternalInvocation) void {
+        self.arena.deinit();
+        self.* = undefined;
+    }
+};
+
+/// Canonical digest for the private provider's ordered global argument list.
+/// It is deliberately separate from the frozen public launch wire.
+pub fn computeLaunchControlsDigest(
+    alloc: Allocator,
+    args: []const []const u8,
+) ![64]u8 {
+    const canonical = try encodeLaunchControls(alloc, args);
+    defer alloc.free(canonical);
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(canonical, &digest, .{});
+    return std.fmt.bytesToHex(digest, .lower);
+}
+
+pub fn encodeLaunchControls(alloc: Allocator, args: []const []const u8) ![]u8 {
+    if (args.len > 128) return error.InvalidLaunchControlArgument;
+    try validateExternalGlobalArgs(args);
+    var canonical: std.Io.Writer.Allocating = .init(alloc);
+    errdefer canonical.deinit();
+    try canonical.writer.writeAll("{\"remaining_global_args\":[");
+    for (args, 0..) |arg, index| {
+        if (index != 0) try canonical.writer.writeByte(',');
+        try std.json.Stringify.value(arg, .{}, &canonical.writer);
+    }
+    try canonical.writer.writeAll("]}");
+    if (canonical.written().len > 128 * 1024) return error.InvalidLaunchControlArgument;
+    return canonical.toOwnedSlice();
+}
 
 /// Uses Fx's existing read-only session authority rather than directory
 /// presence. A prepared schema-v3 orphan is not a durable Conversation, while

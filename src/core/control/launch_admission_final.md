@@ -6,6 +6,10 @@ schema version 1. The contract does not define a socket, command, or standard
 input service; an owning adapter chooses the transport and passes ordinary
 Work-control queue or steer requests to Fx.
 
+The independently versioned private production adapter is documented in
+`launch_provider.md`. It carries canonical schema-version-1 messages as opaque
+payloads and does not add a transport to this frozen public contract.
+
 ## Encoding
 
 Each message is canonical UTF-8 JSON behind a four-byte big-endian payload

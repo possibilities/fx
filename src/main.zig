@@ -94,6 +94,7 @@ const subagent_execution = @import("core/subagent/execution.zig");
 const types = @import("core/shared/types.zig");
 const work_control = @import("core/control/work_control.zig");
 const launch_admission_final_runtime = @import("core/control/launch_admission_final_runtime.zig");
+const launch_provider = @import("core/control/launch_provider.zig");
 const image_attachments = @import("core/images/image_attachments.zig");
 const permissions = @import("core/permissions/permissions.zig");
 const command_runner = @import("core/execution/command_runner.zig");
@@ -3548,6 +3549,28 @@ fn mainC(c_argc: c_int, c_argv: [*][*:0]c_char, c_envp: [*:null]?[*:0]c_char) !v
     const raw_args = rawArgs(c_argc, c_argv);
     const raw_env: RawEnviron = @ptrCast(c_envp);
 
+    if (launch_provider.isProviderModeRaw(raw_args)) {
+        io_mod.setRawEnviron(raw_env);
+        const process_args = argsFromRaw(raw_args);
+        var threaded = std.Io.Threaded.init(processAllocator(), .{
+            .argv0 = .init(process_args),
+            .environ = .{ .block = environBlockFromRaw(raw_env) },
+        });
+        defer threaded.deinit();
+        io_mod.setIo(threaded.io());
+        launch_provider.runOne(processAllocator()) catch |err| {
+            var buffer: [160]u8 = undefined;
+            const message = std.fmt.bufPrint(
+                &buffer,
+                "fx launch provider: {s}\n",
+                .{@errorName(err)},
+            ) catch "fx launch provider: failed\n";
+            try writeStderrFast(message);
+            return err;
+        };
+        return;
+    }
+
     if (comptime terminal_host.isSupported()) {
         if (terminal_tmux_session.isCaptureModeRaw(raw_args)) {
             io_mod.setRawEnviron(raw_env);
@@ -4658,6 +4681,7 @@ test {
     _ = @import("core/inference/structured_receipt_ledger.zig");
     _ = @import("core/inference/structured_subscription.zig");
     _ = @import("core/inference/structured_subscription_cli.zig");
+    _ = @import("core/control/launch_provider.zig");
     _ = @import("core/workspace/change_tracker.zig");
     _ = @import("core/shared/collections.zig");
     _ = @import("core/slash_commands/command_router.zig");

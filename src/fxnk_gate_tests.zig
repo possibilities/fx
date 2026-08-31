@@ -36,5 +36,6 @@ test {
     _ = @import("core/control/launch_admission_final_ledger.zig");
     _ = @import("core/control/launch_admission_final_runtime.zig");
     _ = @import("core/control/launch_admission_final_launcher.zig");
+    _ = @import("core/control/launch_provider.zig");
     _ = @import("structured_inference_test_root.zig");
 }
