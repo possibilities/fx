@@ -47,6 +47,7 @@ const expected_names = [_][]const u8{
     "acp.server.test.ACP child authority preserves native-tool suppression and allowlisting",
     "core.app.app_runtime_setup.test.loadSkills discovers ordered invocation roots when HOME is missing",
     "core.app.app_profile_runtime.test.TUI profile helpers read and mutate only the selected state root",
+    "core.mcp.mcp_runtime.test.unapproved workspace logout deletes only selected profile credentials",
     "core.app.app_commands.test.state-isolated usage dashboard refresh never reads ambient home",
     "core.config.config_runtime.test.launch permission policy owns a canonical path and parsed rule order",
     "core.hosts.native_external_editor.test.external editor returns valid text and treats nonzero exit as cancellation",
