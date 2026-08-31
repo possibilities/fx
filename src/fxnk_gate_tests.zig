@@ -29,4 +29,12 @@ test {
     _ = @import("tools/skills/skill_search.zig");
     _ = @import("napi_session_store.zig");
     _ = @import("ui/transcript/runtime.zig");
+    _ = @import("core/app/app_session_naming_runtime.zig");
+    _ = @import("core/session/session_display_metadata.zig");
+    _ = @import("core/slash_commands/command_specs.zig");
+    _ = @import("core/control/launch_admission_final.zig");
+    _ = @import("core/control/launch_admission_final_ledger.zig");
+    _ = @import("core/control/launch_admission_final_runtime.zig");
+    _ = @import("core/control/launch_admission_final_launcher.zig");
+    _ = @import("structured_inference_test_root.zig");
 }
