@@ -1596,6 +1596,8 @@ test "rendered top-level help is a complete CLI navigation page" {
     try std.testing.expect(std.mem.find(u8, text, "Show the AI Gateway credit balance") != null);
     try std.testing.expect(std.mem.find(u8, text, "Flags:") != null);
     try std.testing.expect(std.mem.find(u8, text, "--skills-dir <path>") != null);
+    try std.testing.expect(std.mem.find(u8, text, "--name <title>") != null);
+    try std.testing.expect(std.mem.find(u8, text, "Name a launched or resumed conversation") != null);
     try std.testing.expect(std.mem.find(u8, text, "--context-limit <spec>") != null);
     try std.testing.expect(std.mem.find(u8, text, "Set name=bytes|off; repeatable") != null);
     try std.testing.expect(std.mem.find(u8, text, "--add-dir <path>") != null);
@@ -1660,6 +1662,7 @@ test "top-level help renders flags as compact aligned rows" {
     try std.testing.expect(lineContainsBoth(wide, "--system-prompt-file <path>", "Replace launch system prompt"));
     try std.testing.expect(lineContainsBoth(wide, "--append-system-prompt-file <path>", "Append UTF-8 system prompt"));
     try std.testing.expect(lineContainsBoth(wide, "--skills-dir <path>", "Load an invocation skill root; repeatable"));
+    try std.testing.expect(lineContainsBoth(wide, "--name <title>", "Name a launched or resumed conversation"));
     try std.testing.expect(lineContainsBoth(wide, "--context-limit <spec>", "Set name=bytes|off; repeatable"));
     try std.testing.expect(lineContainsBoth(wide, "--add-dir <path>", "Add a workspace directory; repeatable"));
     try std.testing.expect(lineContainsBoth(wide, "--no-native-tools", "Disable native tools for TUI or ACP"));

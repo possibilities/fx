@@ -1489,6 +1489,9 @@ pub fn Runtime(comptime App: type) type {
         }
 
         pub fn newSession(app: *App) !void {
+            if (comptime @hasDecl(App, "discardPendingLaunchSessionName")) {
+                app.discardPendingLaunchSessionName();
+            }
             try resetSessionWithBackgroundPolicy(app, .carry_forward);
         }
 
@@ -1929,6 +1932,9 @@ pub fn Runtime(comptime App: type) type {
             active.resume_view_stale = true;
             reportSessionIdentityChanged(app);
             enableSessionStores(app);
+            if (comptime @hasDecl(App, "applyPendingLaunchSessionName")) {
+                try app.applyPendingLaunchSessionName();
+            }
             refreshSubagentProjectionAfterSessionInstall(app);
         }
 
@@ -2382,6 +2388,39 @@ pub fn Runtime(comptime App: type) type {
             };
             reportSessionIdentityChanged(app);
             enableSessionStores(app);
+            if (comptime @hasDecl(App, "applyPendingLaunchSessionName")) {
+                app.applyPendingLaunchSessionName() catch |err| {
+                    debug_trace.logf(
+                        "session_naming",
+                        "launch title after picker cancel unavailable err={s}",
+                        .{@errorName(err)},
+                    );
+                    const notice = std.fmt.allocPrint(
+                        app.alloc,
+                        "unable to persist launch name: {s}; the explicit name remains pending",
+                        .{@errorName(err)},
+                    ) catch |notice_err| {
+                        debug_trace.logf(
+                            "session_naming",
+                            "launch title persistence notice unavailable err={s}",
+                            .{@errorName(notice_err)},
+                        );
+                        return;
+                    };
+                    defer app.alloc.free(notice);
+                    app.writeDomainNotice(.{
+                        .topic = "session",
+                        .tone = .@"error",
+                        .body = notice,
+                    }, true) catch |notice_err| {
+                        debug_trace.logf(
+                            "session_naming",
+                            "launch title persistence notice unavailable err={s}",
+                            .{@errorName(notice_err)},
+                        );
+                    };
+                };
+            }
         }
 
         fn invalidateSessionPickerCaches(app: *App) void {
@@ -3020,24 +3059,14 @@ pub fn Runtime(comptime App: type) type {
             try setCachedSessionTitle(app, display.title);
         }
 
-        pub const RenameError = error{
-            EmptyTitle,
-            TitleTooLong,
-            InvalidTitle,
+        pub const RenameError = session_display_metadata.TitleValidationError || error{
             NoActiveSession,
         };
 
         /// Validates a user-supplied session title. Returns the trimmed slice,
         /// which borrows from `raw`.
         pub fn validateSessionTitle(raw: []const u8) RenameError![]const u8 {
-            const trimmed = std.mem.trim(u8, raw, " \t\r\n");
-            if (trimmed.len == 0) return error.EmptyTitle;
-            if (trimmed.len > session_display_metadata.max_title_bytes) return error.TitleTooLong;
-            if (!std.unicode.utf8ValidateSlice(trimmed)) return error.InvalidTitle;
-            for (trimmed) |byte| {
-                if (byte < 0x20 or byte == 0x7f) return error.InvalidTitle;
-            }
-            return trimmed;
+            return session_display_metadata.validateTitle(raw);
         }
 
         /// Renames the active session: caches the title for the footer and
@@ -5259,6 +5288,7 @@ const TestApp = struct {
     pending_images: std.ArrayList(types.ImageAttachment) = .empty,
     next_image_id: usize = 1,
     requested_resume: ?TestResumeTarget = null,
+    pending_launch_session_name: ?[]u8 = null,
     terminal: shell_runtime.TerminalState = .{},
     stream: types.StreamState = .{},
     background: FakeBackground = .{},
@@ -5292,6 +5322,7 @@ const TestApp = struct {
     assistant_thematic_rule_count: usize = 0,
     assistant_presentation_events: std.ArrayList(AssistantPresentationEvent) = .empty,
     fail_system_notice: bool = false,
+    fail_pending_launch_name_apply: bool = false,
     fail_assistant_table_append: bool = false,
     fail_assistant_code_block_append: bool = false,
     writable_seen_during_notice_failure: bool = false,
@@ -5332,6 +5363,21 @@ const TestApp = struct {
 
     fn cancelPendingSessionName(self: *TestApp) void {
         self.cancelled_session_name_count += 1;
+    }
+
+    fn applyPendingLaunchSessionName(self: *TestApp) !void {
+        const name = self.pending_launch_session_name orelse return;
+        if (self.fail_pending_launch_name_apply) {
+            return error.TestLaunchNamePersistenceFailure;
+        }
+        try Runtime(TestApp).renameActiveSession(self, name);
+        self.alloc.free(name);
+        self.pending_launch_session_name = null;
+    }
+
+    fn discardPendingLaunchSessionName(self: *TestApp) void {
+        if (self.pending_launch_session_name) |name| self.alloc.free(name);
+        self.pending_launch_session_name = null;
     }
 
     fn reportSessionMetadataChanged(self: *TestApp, title: []const u8) void {
@@ -5432,6 +5478,7 @@ const TestApp = struct {
         self.assistant_presentation_events.deinit(self.alloc);
         Runtime(TestApp).deinitPersistence(self);
         if (self.requested_resume) |*target| target.deinit(self.alloc);
+        self.discardPendingLaunchSessionName();
         self.session.deinit(self.alloc);
         self.background.deinit();
         self.worker.deinit(std.heap.c_allocator);
@@ -8082,6 +8129,72 @@ test "canceling a startup session picker starts a writable fresh session" {
     );
 }
 
+test "startup picker cancellation retains launch name until persistence and a fresh session cannot inherit it" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const paths = try testPaths(alloc, &tmp);
+    defer {
+        alloc.free(paths.home);
+        alloc.free(paths.workspace);
+    }
+
+    const home = try TestHome.install(alloc, paths.home);
+    defer home.deinit();
+
+    var app = try TestApp.init(alloc, paths.workspace);
+    defer app.deinit();
+    try configureTestPreferences(&app);
+    try Runtime(TestApp).initializePersistence(&app, true);
+    try Runtime(TestApp).openSessionPicker(&app);
+    app.pending_launch_session_name = try alloc.dupe(
+        u8,
+        "Fresh name after picker cancellation",
+    );
+    app.fail_pending_launch_name_apply = true;
+
+    Runtime(TestApp).cancelSessionPickerToComposer(&app);
+
+    try std.testing.expect(!app.session_persistence.session_picker.active);
+    try std.testing.expect(app.session_persistence.writable != null);
+    try std.testing.expectEqualStrings(
+        "Fresh name after picker cancellation",
+        app.pending_launch_session_name.?,
+    );
+    try std.testing.expect(Runtime(TestApp).cachedSessionTitle(&app) == null);
+    try std.testing.expectEqual(@as(usize, 1), app.notices.items.len);
+    try std.testing.expect(std.mem.find(
+        u8,
+        app.notices.items[0],
+        "the explicit name remains pending",
+    ) != null);
+
+    app.fail_pending_launch_name_apply = false;
+    try app.applyPendingLaunchSessionName();
+    try std.testing.expect(app.pending_launch_session_name == null);
+    try std.testing.expectEqualStrings(
+        "Fresh name after picker cancellation",
+        Runtime(TestApp).cachedSessionTitle(&app).?,
+    );
+    var display = try session_display_metadata.readSidecarOrFallback(
+        alloc,
+        &app.session_persistence.writable.?.log.dir,
+    );
+    defer display.deinit(alloc);
+    try std.testing.expect(display.present);
+    try std.testing.expectEqualStrings(
+        "Fresh name after picker cancellation",
+        display.title,
+    );
+    try std.testing.expectEqual(@as(usize, 1), app.reported_session_metadata_count);
+
+    try Runtime(TestApp).beginFreshPersistedSession(&app);
+    Runtime(TestApp).enableSessionStores(&app);
+    try std.testing.expect(app.pending_launch_session_name == null);
+    try std.testing.expect(Runtime(TestApp).durableCachedSessionTitle(&app) == null);
+}
+
 test "interactive session resume uses the live transition and shared restore path" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -8115,6 +8228,10 @@ test "interactive session resume uses the live transition and shared restore pat
     try Runtime(TestApp).openSessionPicker(&app);
     try std.testing.expect(app.session_persistence.session_picker.isLoading());
     try waitForSessionPickerLoad(&app);
+    app.pending_launch_session_name = try alloc.dupe(
+        u8,
+        "Picker-selected launch title",
+    );
 
     try std.testing.expect(try Runtime(TestApp).resumeSelectedSession(&app));
     try std.testing.expectEqual(@as(usize, 1), app.live_resume_prepare_count);
@@ -8129,6 +8246,9 @@ test "interactive session resume uses the live transition and shared restore pat
     try std.testing.expectEqual(@as(usize, 1), app.notices.items.len);
     try std.testing.expectEqualStrings("● Session resumed: saved prompt", app.notices.items[0]);
     try std.testing.expect(!app.session_persistence.session_picker.active);
+    try std.testing.expect(app.pending_launch_session_name == null);
+    try expectActiveTitleDurable(&app, "Picker-selected launch title");
+    try std.testing.expectEqual(@as(usize, 1), app.cancelled_session_name_count);
 
     const host = app.session_persistence.subagent_host.?;
     const recovery_deadline = io_mod.milliTimestamp() + 5_000;
@@ -10143,6 +10263,85 @@ test "renameActiveSession persists the title to the sidecar and session index" {
     defer display.deinit(alloc);
     try std.testing.expect(display.present);
     try std.testing.expectEqualStrings("deploy pipeline fix", display.title);
+}
+
+test "launch name applies to the exact resumed target after new and does not leak" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const paths = try testPaths(alloc, &tmp);
+    defer {
+        alloc.free(paths.home);
+        alloc.free(paths.workspace);
+    }
+    try tmp.dir.createDirPath(io_mod.getIo(), "rebound-workspace");
+    const rebound_workspace = try io_mod.dirRealpathAlloc(
+        alloc,
+        tmp.dir,
+        "rebound-workspace",
+    );
+    defer alloc.free(rebound_workspace);
+
+    const home = try TestHome.install(alloc, paths.home);
+    defer home.deinit();
+
+    var app = try TestApp.init(alloc, paths.workspace);
+    defer app.deinit();
+    try configureTestPreferences(&app);
+    try Runtime(TestApp).initializePersistence(&app, true);
+    try Runtime(TestApp).beginFreshPersistedSession(&app);
+    Runtime(TestApp).enableSessionStores(&app);
+
+    const original_id = try alloc.dupe(
+        u8,
+        app.session_persistence.writable.?.active_id,
+    );
+    defer alloc.free(original_id);
+    const original_turn = try session_runtime.makeAssistantTurn(
+        alloc,
+        "persist the exact session before new",
+        "saved",
+    );
+    defer session_runtime.freeHistoryTurn(alloc, original_turn);
+    try Runtime(TestApp).appendHistoryTurn(&app, original_turn);
+
+    // `/new` installs another writable session before launch resumes the
+    // original ID, so resolving `last` would select the wrong conversation.
+    try Runtime(TestApp).beginFreshPersistedSession(&app);
+    Runtime(TestApp).enableSessionStores(&app);
+    try std.testing.expect(!std.mem.eql(
+        u8,
+        original_id,
+        app.session_persistence.writable.?.active_id,
+    ));
+
+    alloc.free(app.workspace_root);
+    app.workspace_root = try alloc.dupe(u8, rebound_workspace);
+    app.cancelled_session_name_count = 0;
+    app.reported_session_metadata_count = 0;
+    app.reported_session_metadata_after_sidecar = false;
+    app.pending_launch_session_name = try alloc.dupe(
+        u8,
+        "Exact resumed launch title",
+    );
+    app.requested_resume = .{ .id = try alloc.dupe(u8, original_id) };
+
+    try Runtime(TestApp).resumeRequestedSession(&app);
+
+    const resumed = &app.session_persistence.writable.?;
+    try std.testing.expectEqualStrings(original_id, resumed.active_id);
+    try std.testing.expectEqualStrings(rebound_workspace, resumed.state.workspace_root);
+    try std.testing.expect(app.pending_launch_session_name == null);
+    try expectActiveTitleDurable(&app, "Exact resumed launch title");
+    try std.testing.expectEqual(@as(usize, 1), app.cancelled_session_name_count);
+    try std.testing.expectEqual(@as(usize, 1), app.reported_session_metadata_count);
+
+    // The consumed launch value cannot name the next fresh session.
+    try Runtime(TestApp).beginFreshPersistedSession(&app);
+    Runtime(TestApp).enableSessionStores(&app);
+    try std.testing.expect(app.pending_launch_session_name == null);
+    try std.testing.expect(Runtime(TestApp).durableCachedSessionTitle(&app) == null);
 }
 
 test "fallback generated and manual titles share one durable metadata path" {

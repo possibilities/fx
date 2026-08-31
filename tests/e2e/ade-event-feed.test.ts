@@ -168,6 +168,100 @@ async function waitForJsonFile(
 
 describe.skipIf(!tmuxAvailable())("ADE event feed", () => {
   test(
+    "explicit launch name publishes fresh native metadata without automatic generation",
+    async () => {
+      const tempRoot = existsSync("/private/tmp") ? "/private/tmp" : tmpdir();
+      root = realpathSync(mkdtempSync(join(tempRoot, "fx-ade-launch-name-e2e-")));
+      const home = join(root, "home");
+      const workspace = join(root, "workspace");
+      const socketPath = join(root, "ade.sock");
+      const stderrPath = join(root, "stderr.log");
+      mkdirSync(join(home, ".fx"), { recursive: true });
+      mkdirSync(workspace);
+      writeFileSync(
+        join(home, ".fx", "settings.json"),
+        JSON.stringify({
+          sandbox: "none",
+          permission_mode: "auto",
+          permission: {},
+          session_naming: {
+            gateway: { model: FAKE_GATEWAY_MODEL, effort: "low" },
+            timeout_ms: 10_000,
+          },
+        }),
+      );
+      writeFileSync(stderrPath, "");
+
+      receiver = new AdeReceiver(socketPath);
+      receiver.start();
+
+      let namingRequests = 0;
+      gateway = startDynamicFakeGateway((body) => {
+        if (body.includes("Generate a short session title")) {
+          namingRequests += 1;
+          return fakeGatewayFinalText("must-not-replace-explicit-name");
+        }
+        return fakeGatewayFinalText("ADE_EXPLICIT_NAME_DONE");
+      });
+
+      session = await TmuxSession.create({
+        cmd: `${FX_BIN} --name 'ADE explicit native title'`,
+        cwd: realpathSync(workspace),
+        env: {
+          HOME: realpathSync(home),
+          AI_GATEWAY_API_KEY: "ade-launch-name-key",
+          VERCEL_OIDC_TOKEN: undefined,
+          FX_GATEWAY_BASE_URL: gateway.baseUrl,
+          FX_GATEWAY_CHAT_URL: gateway.chatUrl,
+          FX_MODEL: FAKE_GATEWAY_MODEL,
+          FX_AUTO_UPGRADE: "0",
+          FX_ADE_SOCKET_PATH: socketPath,
+          FX_ADE_INSTANCE_ID: INSTANCE_ID,
+          NO_COLOR: "1",
+        },
+        width: 100,
+        height: 28,
+        stderrPath,
+      });
+      await session.waitForComposer(TIMEOUT);
+
+      const metadata = await receiver.waitFor(
+        (record) =>
+          record.event === "SessionMetadataChanged" &&
+          record.context.agent_role === "main" &&
+          record.payload.title === "ADE explicit native title",
+      );
+      const sessionId = metadata.context.session_id;
+      expect(sessionId).not.toBeNull();
+
+      await session.sendText("Exercise the explicitly named conversation.");
+      await session.waitForText("ADE_EXPLICIT_NAME_DONE", TIMEOUT);
+      await session.waitForComposer(TIMEOUT);
+
+      const display = JSON.parse(readFileSync(
+        join(home, ".fx", "sessions", sessionId!, "display.json"),
+        "utf8",
+      )) as { title?: unknown };
+      expect(display.title).toBe("ADE explicit native title");
+
+      const index = JSON.parse(readFileSync(
+        join(home, ".fx", "sessions", "index.json"),
+        "utf8",
+      )) as { sessions?: Array<{ id?: unknown; title?: unknown }> };
+      expect(index.sessions?.find((entry) => entry.id === sessionId)?.title)
+        .toBe("ADE explicit native title");
+      expect(namingRequests).toBe(0);
+      expect(gateway.requests).toHaveLength(1);
+
+      await session.sendText("/quit");
+      expect(await session.waitForSessionEnd(TIMEOUT)).toBe(true);
+      expect(receiver.errors).toEqual([]);
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+    },
+    TIMEOUT * 2,
+  );
+
+  test(
     "publishes ordered main, attention, subagent, and shutdown lifecycle records",
     async () => {
       const tempRoot = existsSync("/private/tmp") ? "/private/tmp" : tmpdir();

@@ -356,6 +356,10 @@ pub const top_level_flags = [_]TopLevelFlag{
         .description = "Load an invocation skill root; repeatable",
     },
     .{
+        .usage = "--name <title>",
+        .description = "Name a launched or resumed conversation",
+    },
+    .{
         .usage = "--context-limit <spec>",
         .description = "Set name=bytes|off; repeatable",
     },

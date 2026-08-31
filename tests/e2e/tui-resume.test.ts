@@ -27,6 +27,7 @@ import {
   isEmptyComposerLine,
   isVolatileTokenStatusRow,
   paneExitMatches,
+  startDynamicFakeGateway,
   startFakeGateway,
   TmuxSession,
   tmuxAvailable,
@@ -884,6 +885,197 @@ test.skipIf(!tmuxAvailable())(
     }
   },
   TIMEOUT * 2,
+);
+
+test.skipIf(!tmuxAvailable())(
+  "launch name survives exact resume composition and never leaks through new",
+  async () => {
+    const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-launch-name-resume-")));
+    const selectedHome = join(root, "selected-home");
+    const isolatedHome = join(root, "isolated-home");
+    const initialWorkspace = join(root, "initial-workspace");
+    const reboundWorkspace = join(root, "rebound-workspace");
+    const initialStderrPath = join(root, "initial-stderr.log");
+    const resumedStderrPath = join(root, "resumed-stderr.log");
+    const isolatedStderrPath = join(root, "isolated-stderr.log");
+    for (const path of [selectedHome, isolatedHome, initialWorkspace, reboundWorkspace]) {
+      mkdirSync(path);
+    }
+    mkdirSync(join(selectedHome, ".fx"));
+    mkdirSync(join(isolatedHome, ".fx"));
+    writeFileSync(
+      join(selectedHome, ".fx", "settings.json"),
+      JSON.stringify({
+        sandbox: "none",
+        permission_mode: "auto",
+        permission: {},
+        session_naming: {
+          gateway: { model: FAKE_GATEWAY_MODEL, effort: "low" },
+          timeout_ms: 10_000,
+        },
+      }),
+    );
+    for (const path of [initialStderrPath, resumedStderrPath, isolatedStderrPath]) {
+      writeFileSync(path, "");
+    }
+
+    const reboundRoot = realpathSync(reboundWorkspace);
+    let namingRequests = 0;
+    const gateway = startDynamicFakeGateway((body) => {
+      if (body.includes("Generate a short session title")) {
+        namingRequests += 1;
+        return fakeGatewayFinalText("Automatic new conversation title");
+      }
+      if (body.includes('"toolCallId":"launch_name_rebind_pwd"')) {
+        return fakeGatewayFinalText(
+          body.includes(reboundRoot)
+            ? "LAUNCH_NAME_REBOUND_OK"
+            : "LAUNCH_NAME_REBOUND_BAD",
+        );
+      }
+      if (body.includes("LAUNCH_NAME_RESUME_PROMPT")) {
+        return fakeGatewayToolCall("launch_name_rebind_pwd", "terminal", {
+          action: "exec",
+          command: "pwd",
+          timeout_ms: 600_000,
+        });
+      }
+      if (body.includes("LAUNCH_NAME_NEW_PROMPT")) {
+        return fakeGatewayFinalText("LAUNCH_NAME_NEW_DONE");
+      }
+      if (body.includes("LAUNCH_NAME_INITIAL_PROMPT")) {
+        return fakeGatewayFinalText("LAUNCH_NAME_INITIAL_DONE");
+      }
+      return new Response("unexpected launch-name request", { status: 500 });
+    });
+
+    let active: TmuxSession | null = null;
+    try {
+      active = await TmuxSession.create({
+        cmd: `${FX_BIN} --name 'Initial launch title'`,
+        cwd: realpathSync(initialWorkspace),
+        env: gatewayEnv(selectedHome, gateway),
+        stderrPath: initialStderrPath,
+        width: 100,
+        height: 30,
+      });
+      await active.waitForComposer(TIMEOUT);
+      const originalId = sessionIdFromHome(selectedHome);
+      await active.sendText("LAUNCH_NAME_INITIAL_PROMPT");
+      await active.waitForText("LAUNCH_NAME_INITIAL_DONE", TIMEOUT);
+      await active.waitForComposer(TIMEOUT);
+      expect(namingRequests).toBe(0);
+
+      const originalDisplayPath = join(
+        selectedHome,
+        ".fx",
+        "sessions",
+        originalId,
+        "display.json",
+      );
+      expect((JSON.parse(readFileSync(originalDisplayPath, "utf8")) as { title: string }).title)
+        .toBe("Initial launch title");
+
+      await active.sendText("/new");
+      await active.waitForComposer(TIMEOUT);
+      await waitForCondition(
+        () => readdirSync(join(selectedHome, ".fx", "sessions"), { withFileTypes: true })
+          .filter((entry) => entry.name !== "latest" && entry.isDirectory()).length === 2,
+        "fresh session after /new",
+      );
+      const newId = readdirSync(join(selectedHome, ".fx", "sessions"), {
+        withFileTypes: true,
+      }).filter((entry) => entry.name !== "latest" && entry.isDirectory())
+        .map((entry) => entry.name)
+        .find((id) => id !== originalId)!;
+
+      await active.sendText("LAUNCH_NAME_NEW_PROMPT");
+      await active.waitForText("LAUNCH_NAME_NEW_DONE", TIMEOUT);
+      await active.waitForComposer(TIMEOUT);
+      await waitForCondition(() => {
+        const displayPath = join(
+          selectedHome,
+          ".fx",
+          "sessions",
+          newId,
+          "display.json",
+        );
+        if (!existsSync(displayPath)) return false;
+        const display = JSON.parse(readFileSync(displayPath, "utf8")) as { title?: unknown };
+        return display.title === "automatic-new-conversation-title";
+      }, "automatic name on the fresh /new conversation");
+      expect(namingRequests).toBe(1);
+
+      await active.sendText("/quit");
+      expect(await active.waitForSessionEnd(TIMEOUT)).toBe(true);
+      await active.kill();
+      active = null;
+
+      active = await TmuxSession.create({
+        cmd: `${FX_BIN} --name 'Resumed launch title' resume ${originalId}`,
+        cwd: reboundRoot,
+        env: gatewayEnv(selectedHome, gateway),
+        stderrPath: resumedStderrPath,
+        width: 100,
+        height: 30,
+      });
+      await waitForScrollback(active, "LAUNCH_NAME_INITIAL_DONE", TIMEOUT);
+      await active.waitForComposer(TIMEOUT);
+      await active.sendText("LAUNCH_NAME_RESUME_PROMPT");
+      const resumed = await waitForScrollback(active, "LAUNCH_NAME_REBOUND_OK", TIMEOUT);
+      expect(resumed).not.toContain("LAUNCH_NAME_NEW_DONE");
+      expect(resumed).not.toContain("LAUNCH_NAME_REBOUND_BAD");
+      await active.waitForComposer(TIMEOUT);
+      expect(namingRequests).toBe(1);
+
+      const resumedState = JSON.parse(readFileSync(
+        join(selectedHome, ".fx", "sessions", originalId, "session.json"),
+        "utf8",
+      )) as { workspace_root?: unknown };
+      expect(resumedState.workspace_root).toBe(reboundRoot);
+      expect((JSON.parse(readFileSync(originalDisplayPath, "utf8")) as { title: string }).title)
+        .toBe("Resumed launch title");
+      const index = JSON.parse(readFileSync(
+        join(selectedHome, ".fx", "sessions", "index.json"),
+        "utf8",
+      )) as { sessions?: Array<{ id?: unknown; title?: unknown }> };
+      expect(index.sessions?.find((entry) => entry.id === originalId)?.title)
+        .toBe("Resumed launch title");
+
+      await active.sendText("/quit");
+      expect(await active.waitForSessionEnd(TIMEOUT)).toBe(true);
+      await active.kill();
+      active = null;
+
+      active = await TmuxSession.create({
+        cmd: `${FX_BIN} --name 'Wrong state root' resume ${originalId}`,
+        cwd: reboundRoot,
+        env: gatewayEnv(isolatedHome, gateway),
+        stderrPath: isolatedStderrPath,
+        remainOnExit: true,
+        width: 100,
+        height: 30,
+      });
+      await waitForCondition(
+        () => active?.paneStatus().dead === true,
+        "isolated state-root resume to exit",
+      );
+      expect(paneExitMatches(active.paneStatus(), 1)).toBe(true);
+      expect(readFileSync(isolatedStderrPath, "utf8"))
+        .toContain("fx: saved session not found");
+      expect(existsSync(join(isolatedHome, ".fx", "sessions", originalId))).toBe(false);
+      await active.kill();
+      active = null;
+
+      expect(readFileSync(initialStderrPath, "utf8")).toBe("");
+      expect(readFileSync(resumedStderrPath, "utf8")).toBe("");
+    } finally {
+      if (active) await active.kill();
+      gateway.stop();
+      rmSync(root, { recursive: true, force: true });
+    }
+  },
+  TIMEOUT * 3,
 );
 
 function expectAltExitToPreserveNormalViewport(tapePath: string): void {

@@ -33,6 +33,7 @@ const secret = @import("../auth/secret.zig");
 const output_contracts = @import("../output/output_contracts.zig");
 const prompt_policy = @import("../config/prompt_policy.zig");
 const system_prompt_files = @import("../config/system_prompt_files.zig");
+const session_display_metadata = @import("../session/session_display_metadata.zig");
 const session_store = @import("../session/session_store.zig");
 const usage_report = @import("../session/usage_report.zig");
 const skill_contract = @import("../skills/skill_contract.zig");
@@ -133,6 +134,7 @@ pub const LaunchModifiers = struct {
     project_instructions_enabled: bool = true,
     state_home: ?[]u8 = null,
     permission_policy: ?config_runtime.LaunchPermissionPolicy = null,
+    session_name: ?[]u8 = null,
 
     pub fn deinit(self: *LaunchModifiers, alloc: Allocator) void {
         if (self.context_limit_overrides.len > 0) alloc.free(self.context_limit_overrides);
@@ -146,6 +148,7 @@ pub const LaunchModifiers = struct {
         if (self.selected_native_tools.len > 0) alloc.free(self.selected_native_tools);
         if (self.state_home) |path| alloc.free(path);
         if (self.permission_policy) |*policy| policy.deinit(alloc);
+        if (self.session_name) |name| alloc.free(name);
         self.* = .{};
     }
 
@@ -190,6 +193,10 @@ pub const LaunchModifiers = struct {
 
     pub fn hasPermissionPolicy(self: LaunchModifiers) bool {
         return self.permission_policy != null;
+    }
+
+    pub fn hasSessionName(self: LaunchModifiers) bool {
+        return self.session_name != null;
     }
 };
 
@@ -482,6 +489,8 @@ fn parseGlobalLaunchArgs(
     errdefer if (state_home) |path| alloc.free(path);
     var permission_policy: ?config_runtime.LaunchPermissionPolicy = null;
     errdefer if (permission_policy) |*policy| policy.deinit(alloc);
+    var session_name: ?[]u8 = null;
+    errdefer if (session_name) |name| alloc.free(name);
 
     var index: usize = 0;
     while (index < args.len) {
@@ -580,6 +589,16 @@ fn parseGlobalLaunchArgs(
             const value = arg["--permissions-file=".len..];
             if (value.len == 0) return error.MissingPermissionsFileValue;
             permission_policy = try config_runtime.loadLaunchPermissionPolicy(alloc, value);
+        } else if (std.mem.eql(u8, arg, "--name")) {
+            if (session_name != null) return error.DuplicateSessionName;
+            index += 1;
+            if (index >= args.len) return error.MissingSessionNameValue;
+            const name = try session_display_metadata.validateTitle(args[index]);
+            session_name = try alloc.dupe(u8, name);
+        } else if (std.mem.startsWith(u8, arg, "--name=")) {
+            if (session_name != null) return error.DuplicateSessionName;
+            const name = try session_display_metadata.validateTitle(arg["--name=".len..]);
+            session_name = try alloc.dupe(u8, name);
         } else {
             break;
         }
@@ -625,6 +644,7 @@ fn parseGlobalLaunchArgs(
             .project_instructions_enabled = project_instructions_enabled,
             .state_home = state_home,
             .permission_policy = permission_policy,
+            .session_name = session_name,
         },
     };
 }
@@ -656,7 +676,8 @@ pub fn argsAfterGlobalLaunchArgs(args: []const [:0]const u8) []const [:0]const u
             std.mem.eql(u8, arg, "--append-system-prompt-file") or
             std.mem.eql(u8, arg, "--tool") or
             std.mem.eql(u8, arg, "--state-dir") or
-            std.mem.eql(u8, arg, "--permissions-file"))
+            std.mem.eql(u8, arg, "--permissions-file") or
+            std.mem.eql(u8, arg, "--name"))
         {
             index += 1;
             if (index >= args.len) return &.{};
@@ -671,7 +692,8 @@ pub fn argsAfterGlobalLaunchArgs(args: []const [:0]const u8) []const [:0]const u
             !std.mem.eql(u8, arg, "--no-default-skills") and
             !std.mem.eql(u8, arg, "--no-project-instructions") and
             !std.mem.startsWith(u8, arg, "--state-dir=") and
-            !std.mem.startsWith(u8, arg, "--permissions-file="))
+            !std.mem.startsWith(u8, arg, "--permissions-file=") and
+            !std.mem.startsWith(u8, arg, "--name="))
         {
             return args[index..];
         }
@@ -1104,7 +1126,7 @@ fn runIfRequestedWithDeps(alloc: Allocator, args: []const [:0]const u8, cfg: Con
         } else {
             try writer.writer.print("fx: invalid global launch option: {s}\n", .{@errorName(err)});
         }
-        try writer.writer.writeAll("usage: fx [--skills-dir PATH]... [--no-default-skills] [--no-project-instructions] [--system-prompt-file PATH] [--append-system-prompt-file PATH]... [--context-limit NAME=BYTES|off] [--add-dir PATH]... [--no-additional-dirs] [--state-dir DIR] [--permissions-file FILE] [--no-native-tools | --tool NAME]... <command>\n");
+        try writer.writer.writeAll("usage: fx [--name TITLE] [--skills-dir PATH]... [--no-default-skills] [--no-project-instructions] [--system-prompt-file PATH] [--append-system-prompt-file PATH]... [--context-limit NAME=BYTES|off] [--add-dir PATH]... [--no-additional-dirs] [--state-dir DIR] [--permissions-file FILE] [--no-native-tools | --tool NAME]... <command>\n");
         try writeStderr(deps, writer.written());
         return .handled_failure;
     };
@@ -1228,6 +1250,12 @@ fn runNonInteractiveWithDeps(
         !commandSupportsLaunchPermissionPolicy(parsed_command))
     {
         try writeLaunchPermissionPolicyUsage(deps);
+        return .handled_failure;
+    }
+    if (global_args.modifiers.hasSessionName() and
+        !commandSupportsSessionName(parsed_command))
+    {
+        try writeSessionNameModifierUsage(deps);
         return .handled_failure;
     }
 
@@ -3890,6 +3918,13 @@ fn commandSupportsInvocationSkillRoots(command: Command) bool {
     };
 }
 
+fn commandSupportsSessionName(command: Command) bool {
+    return switch (command) {
+        .interactive, .resume_session => true,
+        else => false,
+    };
+}
+
 fn commandSupportsNativeToolModifier(command: Command) bool {
     return switch (command) {
         .interactive, .acp, .resume_session => true,
@@ -4136,6 +4171,13 @@ fn writeLaunchPermissionPolicyUsage(deps: RunDeps) !void {
     );
 }
 
+fn writeSessionNameModifierUsage(deps: RunDeps) !void {
+    try writeStderr(
+        deps,
+        "fx: --name is only supported for interactive and resume launches\n",
+    );
+}
+
 fn globalLaunchErrorMessage(err: anyerror) ?[]const u8 {
     return switch (err) {
         error.MissingAddDirectoryValue => "--add-dir requires a directory path",
@@ -4157,6 +4199,11 @@ fn globalLaunchErrorMessage(err: anyerror) ?[]const u8 {
         error.PermissionPolicyUnavailable => "--permissions-file must name a readable regular file",
         error.PermissionPolicyTooLarge => "--permissions-file exceeds the 64 KiB limit",
         error.InvalidPermissionPolicy => "--permissions-file must contain valid permission-rule JSON",
+        error.MissingSessionNameValue => "--name requires a session name",
+        error.DuplicateSessionName => "--name may only be specified once",
+        error.EmptyTitle => "--name requires a nonblank session name",
+        error.TitleTooLong => "--name must be at most 240 UTF-8 bytes",
+        error.InvalidTitle => "--name must be valid UTF-8 without ASCII control bytes",
         else => null,
     };
 }
@@ -5392,6 +5439,128 @@ test "global launch permission policy owns canonical rules before the command" {
             @constCast("--permissions-file"),
             policy_arg,
         }),
+    );
+}
+
+test "global launch name parsing owns one normalized optional title" {
+    const alloc = std.testing.allocator;
+    var parsed = try parseGlobalLaunchArgs(alloc, &.{
+        @constCast("--name"),
+        @constCast("  Release notes ✓  "),
+        @constCast("resume"),
+        @constCast("session-123"),
+    });
+    defer parsed.deinit(alloc);
+
+    try std.testing.expectEqualStrings("Release notes ✓", parsed.modifiers.session_name.?);
+    try std.testing.expectEqualStrings("resume", parsed.remaining[0]);
+    try std.testing.expectEqualStrings("session-123", parsed.remaining[1]);
+    try std.testing.expectEqualStrings(
+        "resume",
+        commandAfterGlobalLaunchArgs(&.{
+            @constCast("--name=Release notes ✓"),
+            @constCast("resume"),
+            @constCast("session-123"),
+        }).?,
+    );
+
+    const launch_result = try parseInteractiveLaunch(
+        alloc,
+        &.{
+            @constCast("--name=Renamed exact session"),
+            @constCast("resume"),
+            @constCast("session-123"),
+        },
+        testCommandCatalog(),
+    );
+    switch (launch_result) {
+        .interactive => |value| {
+            var launch = value;
+            defer launch.deinit(alloc);
+            try std.testing.expectEqualStrings(
+                "Renamed exact session",
+                launch.modifiers.session_name.?,
+            );
+            switch (launch.requested_resume.?) {
+                .id => |id| try std.testing.expectEqualStrings("session-123", id),
+                .pick, .last => return error.TestExpectedExactResumeId,
+            }
+        },
+        .noninteractive => |value| {
+            var noninteractive = value;
+            defer noninteractive.deinit(alloc);
+            return error.TestExpectedInteractiveLaunch;
+        },
+    }
+
+    var omitted = try parseGlobalLaunchArgs(alloc, &.{@constCast("resume")});
+    defer omitted.deinit(alloc);
+    try std.testing.expect(omitted.modifiers.session_name == null);
+}
+
+test "global launch name parsing rejects duplicate missing and invalid values" {
+    const alloc = std.testing.allocator;
+    try std.testing.expectError(
+        error.MissingSessionNameValue,
+        parseGlobalLaunchArgs(alloc, &.{@constCast("--name")}),
+    );
+    try std.testing.expectError(
+        error.DuplicateSessionName,
+        parseGlobalLaunchArgs(alloc, &.{
+            @constCast("--name=first"),
+            @constCast("--name"),
+            @constCast("second"),
+        }),
+    );
+    try std.testing.expectError(
+        error.EmptyTitle,
+        parseGlobalLaunchArgs(alloc, &.{@constCast("--name=   ")}),
+    );
+    try std.testing.expectError(
+        error.InvalidTitle,
+        parseGlobalLaunchArgs(alloc, &.{@constCast("--name=bad\x1btitle")}),
+    );
+    try std.testing.expectError(
+        error.InvalidTitle,
+        parseGlobalLaunchArgs(alloc, &.{@constCast("--name=bad\x7ftitle")}),
+    );
+    try std.testing.expectError(
+        error.InvalidTitle,
+        parseGlobalLaunchArgs(alloc, &.{@constCast("--name=bad\xfftitle")}),
+    );
+
+    const exact_bound = "x" ** session_display_metadata.max_title_bytes;
+    var exact = try parseGlobalLaunchArgs(alloc, &.{@constCast("--name=" ++ exact_bound)});
+    defer exact.deinit(alloc);
+    try std.testing.expectEqual(session_display_metadata.max_title_bytes, exact.modifiers.session_name.?.len);
+
+    const over_bound = "x" ** (session_display_metadata.max_title_bytes + 1);
+    try std.testing.expectError(
+        error.TitleTooLong,
+        parseGlobalLaunchArgs(alloc, &.{@constCast("--name=" ++ over_bound)}),
+    );
+}
+
+test "launch name is restricted to interactive and resume commands" {
+    var capture = CaptureOutput.init(std.testing.allocator);
+    defer capture.deinit();
+
+    const result = try runIfRequestedWithDeps(
+        std.testing.allocator,
+        &.{
+            @constCast("--name"),
+            @constCast("not for ask"),
+            @constCast("ask"),
+            @constCast("hello"),
+        },
+        testConfig(),
+        capture.deps(),
+    );
+    try std.testing.expectEqual(RunResult.handled_failure, result);
+    try std.testing.expectEqualStrings("", capture.stdout.written());
+    try std.testing.expectEqualStrings(
+        "fx: --name is only supported for interactive and resume launches\n",
+        capture.stderr.written(),
     );
 }
 

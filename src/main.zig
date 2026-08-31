@@ -577,6 +577,7 @@ const App = struct {
     ),
     session_persistence: app_session_runtime.Persistence = .{},
     session_naming: session_naming_runtime.Runtime = .{},
+    pending_launch_session_name: app_session_naming_runtime.PendingLaunchName = .{},
     prompt_history: PromptHistoryRuntime = .{},
     requested_resume: ?cli_surface.ResumeTarget = null,
     system_prompt_override: ?[]u8 = null,
@@ -694,6 +695,11 @@ const App = struct {
         app.mcp.setProfileHome(app.profile_home);
         app.auth.setProfileHome(app.profile_home);
         app.shell.max_transcript_bytes = max_transcript_bytes;
+        SessionNamingAppRuntime.adoptPendingLaunchName(
+            &app,
+            &launch.modifiers.session_name,
+        );
+        errdefer SessionNamingAppRuntime.discardPendingLaunchName(&app);
         if (launch.requested_resume) |target| {
             app.requested_resume = target;
             launch.requested_resume = null;
@@ -748,6 +754,11 @@ const App = struct {
                     try SessionAppRuntime.resumeRequestedSession(&app);
                 }
                 SessionAppRuntime.syncTerminalTitle(&app);
+            }
+        }
+        if (comptime host_profile.durable_sessions) {
+            if (app.session_persistence.writable != null) {
+                try SessionNamingAppRuntime.applyPendingLaunchName(&app);
             }
         }
         if (comptime host_profile.durable_sessions) {
@@ -806,6 +817,24 @@ const App = struct {
 
     pub fn cancelPendingSessionName(self: *App) void {
         SessionNamingAppRuntime.invalidate(self);
+    }
+
+    pub fn applyPendingLaunchSessionName(self: *App) !void {
+        try SessionNamingAppRuntime.applyPendingLaunchName(self);
+    }
+
+    pub fn discardPendingLaunchSessionName(self: *App) void {
+        SessionNamingAppRuntime.discardPendingLaunchName(self);
+    }
+
+    pub fn clonePendingLaunchSessionNameForRelaunch(
+        self: *const App,
+        alloc: Allocator,
+    ) Allocator.Error!?[]u8 {
+        return SessionNamingAppRuntime.clonePendingLaunchNameForRelaunch(
+            self,
+            alloc,
+        );
     }
 
     pub fn rebindAfterInit(self: *App) void {
@@ -1028,6 +1057,7 @@ const App = struct {
         self.releaseTerminal();
         if (self.worker_thread) |thread| thread.join();
         SessionNamingAppRuntime.deinit(self);
+        SessionNamingAppRuntime.discardPendingLaunchName(self);
         self.notifications.deinit();
         self.terminal_takeover.deinit(self.alloc);
         const direct_deinit_disposition = if (capture_resume_handoff)
@@ -1736,7 +1766,7 @@ const App = struct {
                 review,
             );
 
-        var naming_admission = SessionNamingAppRuntime.prepareAdmission(self, prompt);
+        var naming_admission = try SessionNamingAppRuntime.prepareAdmission(self, prompt);
         defer if (naming_admission) |*prepared| prepared.deinit();
         var admission_context = PromptAdmissionContext{
             .app = self,
