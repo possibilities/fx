@@ -89,6 +89,7 @@ const subagent_domain = @import("core/subagent/domain.zig");
 const subagent_execution = @import("core/subagent/execution.zig");
 const types = @import("core/shared/types.zig");
 const work_control = @import("core/control/work_control.zig");
+const launch_admission_final_runtime = @import("core/control/launch_admission_final_runtime.zig");
 const image_attachments = @import("core/images/image_attachments.zig");
 const permissions = @import("core/permissions/permissions.zig");
 const command_runner = @import("core/execution/command_runner.zig");
@@ -506,6 +507,10 @@ const App = struct {
         return ui_render.terminalTitleFor(&self.shell.stdout_file);
     }
 
+    pub fn requiresDurableLaunchSession(self: *const Self) bool {
+        return self.launch_admission_context != null;
+    }
+
     alloc: Allocator,
     terminal: TerminalState = .{},
 
@@ -561,6 +566,7 @@ const App = struct {
     worker_thread: ?std.Thread = null,
     worker: WorkerRuntime = .{},
     work_control: work_control.Endpoint = .{},
+    launch_admission_context: ?launch_admission_final_runtime.ChildContext = null,
     background: BackgroundRuntime = .{},
     terminal_client: terminal_client_runtime.Runtime = .{},
     terminal_direct: terminal_direct_runtime.Runtime = .{},
@@ -625,6 +631,30 @@ const App = struct {
         );
         usage_dashboard_runtime.Runtime.initInto(&app.usage_dashboard, std.heap.c_allocator);
         app_session_runtime.Persistence.initInto(&app.session_persistence);
+        if (comptime !host_target.is_wasm) {
+            app.launch_admission_context = try launch_admission_final_runtime.ChildContext.fromEnvironment(alloc);
+            if (app.launch_admission_context) |*context| {
+                const requested_exact_id: ?[]const u8 = if (launch.requested_resume) |target|
+                    switch (target) {
+                        .id => |id| id,
+                        .pick, .last => null,
+                    }
+                else
+                    null;
+                context.validateInteractiveResume(
+                    launch.requested_resume != null,
+                    requested_exact_id,
+                ) catch |err| {
+                    context.deinit();
+                    app.launch_admission_context = null;
+                    return err;
+                };
+            }
+        }
+        errdefer if (app.launch_admission_context) |*context| {
+            context.deinit();
+            app.launch_admission_context = null;
+        };
         if (comptime host_profile.js_host_workspace) {
             app.workspace_host = js_host_workspace.Runtime.init(alloc) catch |err| blk: {
                 if (err != error.WorkspaceUnavailable) {
@@ -663,6 +693,11 @@ const App = struct {
         errdefer app.deinit();
         if (comptime !host_target.is_wasm) {
             try app.work_control.configureFromEnvironment();
+            if (app.launch_admission_context != null and
+                !app.work_control.configured())
+            {
+                return error.LaunchAdmissionRequiresWorkControl;
+            }
         }
         try WorkspaceAppRuntime.applyLaunch(
             &app,
@@ -716,6 +751,9 @@ const App = struct {
 
     pub fn rebindAfterInit(self: *App) void {
         SessionAppRuntime.rebindSubagentHost(self);
+        if (self.launch_admission_context) |*context| {
+            self.worker.setDurableInitialAdmissionHook(context.workerHook());
+        }
     }
 
     pub fn setNotificationPreferences(
@@ -877,6 +915,8 @@ const App = struct {
         };
         self.background.deinit(std.heap.c_allocator);
         self.worker.deinit(std.heap.c_allocator);
+        if (self.launch_admission_context) |*context| context.deinit();
+        self.launch_admission_context = null;
         self.web_fetch_runtime.deinit(self.alloc);
         self.web_search_runtime.deinit();
         self.subagents.deinit(self.alloc);
@@ -1385,6 +1425,7 @@ const App = struct {
             0,
             false,
             intent,
+            true,
         );
         WorkerAppRuntime.syncState(
             self,
@@ -1438,6 +1479,7 @@ const App = struct {
             turn_id,
             user_prompt_already_presented,
             intent,
+            false,
         );
         return true;
     }
@@ -1452,6 +1494,7 @@ const App = struct {
         turn_id: u64,
         user_prompt_already_presented: bool,
         intent: PromptSubmitIntent,
+        durable_work_control_admission: bool,
     ) !worker_runtime.PromptAdmissionResult {
         try self.reloadSkills();
 
@@ -1539,7 +1582,7 @@ const App = struct {
                 review,
             );
 
-        const admission = try self.worker.admitPromptObserved(std.heap.c_allocator, .{
+        const queued_prompt = worker_runtime.QueuedPrompt{
             .turn_id = if (recovery_checkpoint) |checkpoint| checkpoint.turn_id else turn_id,
             .prompt = prompt_copy,
             .images = images_copy,
@@ -1561,7 +1604,19 @@ const App = struct {
             .recovery_checkpoint = recovery_checkpoint_copy,
             .recovery_source_already_presented = recovery_checkpoint != null,
             .user_prompt_already_presented = user_prompt_already_presented,
-        }, recovery_checkpoint == null and intent == .steer);
+        };
+        const admission = if (durable_work_control_admission)
+            try self.worker.admitWorkControlPromptObserved(
+                std.heap.c_allocator,
+                queued_prompt,
+                recovery_checkpoint == null and intent == .steer,
+            )
+        else
+            try self.worker.admitPromptObserved(
+                std.heap.c_allocator,
+                queued_prompt,
+                recovery_checkpoint == null and intent == .steer,
+            );
         HerdrAppRuntime.reportWorking(self);
         return admission;
     }
@@ -4213,6 +4268,7 @@ test "semantic code block preserves indentation on wrapped continuation rows" {
 }
 
 test {
+    _ = @import("core/control/launch_admission_final_launcher.zig");
     _ = @import("napi_fetch_state.zig");
     _ = @import("core/config/model_provider.zig");
     _ = provider_runtime;
