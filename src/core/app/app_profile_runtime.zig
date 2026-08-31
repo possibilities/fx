@@ -1,5 +1,7 @@
 const std = @import("std");
+const builtin_mcp = @import("../../builtins/mcp.zig");
 const config_runtime = @import("../config/config_runtime.zig");
+const mcp_command_provider = @import("../mcp/command_provider.zig");
 const io_mod = @import("../shared/io.zig");
 const types = @import("../shared/types.zig");
 
@@ -11,6 +13,45 @@ pub fn explicitHome(app: anytype) ?[]const u8 {
 
 pub fn home(app: anytype) ?[]const u8 {
     return explicitHome(app) orelse io_mod.getenv("HOME");
+}
+
+pub fn addMcpProfileServer(
+    app: anytype,
+    intent: mcp_command_provider.AddIntent,
+) !mcp_command_provider.ProfileAddResult {
+    if (explicitHome(app)) |profile_home| {
+        return builtin_mcp.addProfileServerFromHome(app.alloc, profile_home, intent);
+    }
+    return builtin_mcp.addProfileServer(app.alloc, intent);
+}
+
+pub fn removeMcpProfileServer(
+    app: anytype,
+    name: []const u8,
+) !mcp_command_provider.ProfileRemoveResult {
+    if (explicitHome(app)) |profile_home| {
+        return builtin_mcp.removeProfileServerFromHome(app.alloc, profile_home, name);
+    }
+    return builtin_mcp.removeProfileServer(app.alloc, name);
+}
+
+pub fn attemptProjectMcpMutation(
+    app: anytype,
+    action: @import("../mcp/project_config.zig").ProjectMcpAction,
+) config_runtime.CommitAttempt {
+    if (explicitHome(app)) |profile_home| {
+        return config_runtime.attemptProjectMcpMutationFromHome(
+            app.alloc,
+            profile_home,
+            app.workspace_root,
+            action,
+        );
+    }
+    return config_runtime.attemptProjectMcpMutation(
+        app.alloc,
+        app.workspace_root,
+        action,
+    );
 }
 
 pub fn attemptUserPreferences(
@@ -202,4 +243,59 @@ test "TUI profile helpers read and mutate only the selected state root" {
     );
     defer other_after_rule.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 0), other_after_rule.permission_rules.rules.len);
+
+    const state_b_mcp = try builtin_mcp.configPathFromHome(alloc, state_b);
+    defer alloc.free(state_b_mcp);
+    {
+        var file = try std.Io.Dir.createFileAbsolute(std.testing.io, state_b_mcp, .{});
+        defer file.close(std.testing.io);
+        try file.writeStreamingAll(std.testing.io, "{\"mcp\":{}}\n");
+    }
+    var added = try addMcpProfileServer(
+        &app,
+        try mcp_command_provider.parseAddIntent(&.{ "selected", "node", "server.mjs" }),
+    );
+    defer added.deinit(alloc);
+    const state_a_mcp = try builtin_mcp.configPathFromHome(alloc, state_a);
+    defer alloc.free(state_a_mcp);
+    try std.testing.expectEqualStrings(state_a_mcp, added.profile_path);
+
+    var removed = try removeMcpProfileServer(&app, "selected");
+    defer removed.deinit(alloc);
+    try std.testing.expect(removed.removed);
+    try std.testing.expectEqualStrings(state_a_mcp, removed.profile_path);
+
+    var untouched_file = try std.Io.Dir.openFileAbsolute(std.testing.io, state_b_mcp, .{});
+    defer untouched_file.close(std.testing.io);
+    const untouched = try io_mod.readFileToEnd(alloc, &untouched_file, 1024);
+    defer alloc.free(untouched);
+    try std.testing.expectEqualStrings("{\"mcp\":{}}\n", untouched);
+
+    var project_attempt = attemptProjectMcpMutation(
+        &app,
+        .{ .reject = "selected-project" },
+    );
+    defer project_attempt.deinit(alloc);
+    switch (project_attempt) {
+        .outcome => {},
+        .failure => |failure| return failure.err,
+    }
+    var selected_choices = try config_runtime.loadProjectMcpChoicesFromHome(
+        alloc,
+        state_a,
+        workspace,
+    );
+    defer selected_choices.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), selected_choices.choices.rejected.len);
+    try std.testing.expectEqualStrings(
+        "selected-project",
+        selected_choices.choices.rejected[0],
+    );
+    var other_choices = try config_runtime.loadProjectMcpChoicesFromHome(
+        alloc,
+        state_b,
+        workspace,
+    );
+    defer other_choices.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 0), other_choices.choices.rejected.len);
 }

@@ -104,6 +104,7 @@ pub const LoadRuntimeFn = *const fn (
 pub const PreviewNativeWorkspaceAuthorityFn = *const fn (
     Allocator,
     []const u8,
+    ?[]const u8,
 ) anyerror![][]u8;
 
 const ConnectionControl = struct {
@@ -5733,11 +5734,7 @@ pub const McpRuntime = struct {
         if (server.config.source == .workspace and
             server.config.workspace_admission != .approved)
         {
-            const deleted = try mcp_auth_store.delete(
-                self.alloc,
-                server.config.name,
-                try server.config.remoteUrl(),
-            );
+            const deleted = try deleteCredentialsForServer(self.alloc, server);
             return .{
                 .removed = deleted.removed > 0,
                 .repaired_entries = deleted.repaired_entries,
@@ -19321,6 +19318,101 @@ test "runtime rejects source and workspace admission mismatches before installat
     };
     try std.testing.expectError(error.McpConfigAdmissionMismatch, runtime.addServer(synthetic));
     synthetic.deinit(alloc);
+}
+
+fn profileLogoutTestCredentials(
+    alloc: Allocator,
+    endpoint: []const u8,
+    access_token: []const u8,
+) !mcp_auth.Credentials {
+    const owned_endpoint = try alloc.dupe(u8, endpoint);
+    errdefer alloc.free(owned_endpoint);
+    const resource = try alloc.dupe(u8, endpoint);
+    errdefer alloc.free(resource);
+    const issuer = try alloc.dupe(u8, "https://issuer.example");
+    errdefer alloc.free(issuer);
+    const client_id = try alloc.dupe(u8, "client");
+    errdefer alloc.free(client_id);
+    const owned_access_token = try alloc.dupe(u8, access_token);
+    errdefer alloc.free(owned_access_token);
+    const scope = try alloc.dupe(u8, "tools.read");
+    errdefer alloc.free(scope);
+    const token_type = try alloc.dupe(u8, "Bearer");
+    errdefer alloc.free(token_type);
+    const auth_method = try alloc.dupe(u8, "none");
+    errdefer alloc.free(auth_method);
+    const authorization_endpoint = try alloc.dupe(
+        u8,
+        "https://issuer.example/authorize",
+    );
+    errdefer alloc.free(authorization_endpoint);
+    return .{
+        .endpoint = owned_endpoint,
+        .resource = resource,
+        .issuer = issuer,
+        .client_id = client_id,
+        .access_token = owned_access_token,
+        .scope = scope,
+        .token_type = token_type,
+        .token_endpoint_auth_method = auth_method,
+        .expires_at_ms = 123_456,
+        .authorization_endpoint = authorization_endpoint,
+        .token_endpoint = try alloc.dupe(u8, "https://issuer.example/token"),
+    };
+}
+
+test "unapproved workspace logout deletes only selected profile credentials" {
+    const alloc = std.testing.allocator;
+    const endpoint = "https://mcp.example/service";
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "selected");
+    try tmp.dir.createDirPath(std.testing.io, "other");
+    const selected_home = try tmp.dir.realPathFileAlloc(std.testing.io, "selected", alloc);
+    defer alloc.free(selected_home);
+    const other_home = try tmp.dir.realPathFileAlloc(std.testing.io, "other", alloc);
+    defer alloc.free(other_home);
+
+    var selected = try profileLogoutTestCredentials(alloc, endpoint, "selected-secret");
+    defer selected.deinit(alloc);
+    var other = try profileLogoutTestCredentials(alloc, endpoint, "other-secret");
+    defer other.deinit(alloc);
+    _ = try mcp_auth_store.saveFromHome(alloc, "pending", selected, selected_home);
+    _ = try mcp_auth_store.saveFromHome(alloc, "pending", other, other_home);
+
+    var runtime = McpRuntime.init(alloc);
+    defer runtime.deinit();
+    try runtime.setProfileHome(selected_home);
+    try runtime.addServer(.{
+        .name = try alloc.dupe(u8, "pending"),
+        .source = .workspace,
+        .scope = .workspace,
+        .transport = .http,
+        .url = try alloc.dupe(u8, endpoint),
+        .workspace_admission = .pending,
+    });
+
+    const result = try runtime.logoutServer("pending");
+    try std.testing.expect(result.local_only);
+    try std.testing.expect(result.removed);
+    try std.testing.expect((try mcp_auth_store.loadFromHome(
+        alloc,
+        "pending",
+        endpoint,
+        null,
+        null,
+        selected_home,
+    )) == null);
+    var other_remaining = (try mcp_auth_store.loadFromHome(
+        alloc,
+        "pending",
+        endpoint,
+        null,
+        null,
+        other_home,
+    )).?;
+    defer other_remaining.deinit(alloc);
+    try std.testing.expectEqualStrings("other-secret", other_remaining.access_token);
 }
 
 test "interactive authentication requires approved workspace admission" {
