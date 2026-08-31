@@ -148,11 +148,12 @@ pub const PreparedLaunch = struct {
             current.record,
             resume_id orelse current.record.initial_conversation_id,
         );
+        const cwd = try scratch.dupe(u8, current.record.directory);
         return .{
             .arena = arena,
             .environment = environment,
             .argv = argv,
-            .cwd = try scratch.dupe(u8, current.record.directory),
+            .cwd = cwd,
         };
     }
 };
