@@ -11672,7 +11672,7 @@ test "agent and MCP question cancellation resolve accepted question attention" {
         };
         try app.question_prompt.syncFrom(alloc, &entries);
 
-        try input_question_runtime.QuestionRuntime(RoutingFakeApp).cancelQuestionPrompt(&app);
+        try input_question_runtime.QuestionRuntime(RoutingFakeApp).cancelQuestionPrompt(&app, .open);
 
         try std.testing.expect(app.worker.question_cancelled);
         try std.testing.expect(app.worker.cancel_requested_when_question_cancelled);
@@ -11708,7 +11708,7 @@ test "late question cancellations do not resolve attention" {
         };
         try app.question_prompt.syncFrom(alloc, &entries);
 
-        try input_question_runtime.QuestionRuntime(RoutingFakeApp).cancelQuestionPrompt(&app);
+        try input_question_runtime.QuestionRuntime(RoutingFakeApp).cancelQuestionPrompt(&app, .open);
 
         try std.testing.expect(!app.worker.question_cancelled);
         try std.testing.expectEqual(@as(usize, 0), app.worker.observed_question_submission_count);
