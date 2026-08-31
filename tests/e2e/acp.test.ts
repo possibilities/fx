@@ -6027,14 +6027,6 @@ describe("acp: model-independent", () => {
       writeFileSync(join(root.home, ".fx", "api-key"), "ambient-key\n", {
         mode: 0o600,
       });
-      writeFileSync(
-        join(stateA, ".fx", "memories.json"),
-        JSON.stringify(["selected state memory"]) + "\n",
-      );
-      writeFileSync(
-        join(root.home, ".fx", "memories.json"),
-        JSON.stringify(["ambient memory must not load"]) + "\n",
-      );
       writeFileSync(join(stateA, ".fx", "AGENTS.md"), "SELECTED_PROFILE_INSTRUCTIONS\n");
       writeFileSync(join(root.home, ".fx", "AGENTS.md"), "AMBIENT_PROFILE_INSTRUCTIONS\n");
       writeFileSync(join(stateA, ".fx", "SYSTEM.md"), "SELECTED_STATE_SYSTEM_REPLACEMENT\n");
@@ -6062,7 +6054,9 @@ describe("acp: model-independent", () => {
       writeAcpSession(root.home, root.workspace, "ambient-session", 10);
 
       const gateway = startFakeGateway([
-        fakeGatewayToolCall("state_memory", "memory", { action: "list" }),
+        fakeGatewayToolCall("state_skill", "skill", {
+          name: "isolated-state-skill",
+        }),
         fakeGatewayToolCall("state_home", "terminal", {
           action: "exec",
           command: "printf '%s' \"$HOME\"",
@@ -6143,10 +6137,10 @@ describe("acp: model-independent", () => {
         expect(gateway.requests[0]!.body).not.toContain(
           "AMBIENT_STATE_SYSTEM_REPLACEMENT",
         );
-        expect(acpToolResultText(gateway.requests[1]!.body, "state_memory"))
-          .toContain("selected state memory");
-        expect(acpToolResultText(gateway.requests[1]!.body, "state_memory"))
-          .not.toContain("ambient memory must not load");
+        expect(acpToolResultText(gateway.requests[1]!.body, "state_skill"))
+          .toContain("SELECTED_STATE_SKILL_BODY");
+        expect(acpToolResultText(gateway.requests[1]!.body, "state_skill"))
+          .not.toContain("AMBIENT_STATE_SKILL_BODY");
         expect(acpToolResultText(gateway.requests[2]!.body, "state_home"))
           .toContain(root.home);
 

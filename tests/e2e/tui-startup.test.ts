@@ -856,14 +856,6 @@ describe.skipIf(SKIP_TMUX)("tui: selected state root", () => {
       writeFileSync(join(home, ".fx", "api-key"), "ambient-key\n", {
         mode: 0o600,
       });
-      writeFileSync(
-        join(stateHome, ".fx", "memories.json"),
-        JSON.stringify(["selected state memory"]) + "\n",
-      );
-      writeFileSync(
-        join(home, ".fx", "memories.json"),
-        JSON.stringify(["ambient memory must not load"]) + "\n",
-      );
       writeFileSync(join(stateHome, ".fx", "AGENTS.md"), "SELECTED_PROFILE_INSTRUCTIONS\n");
       writeFileSync(join(home, ".fx", "AGENTS.md"), "AMBIENT_PROFILE_INSTRUCTIONS\n");
       writeFileSync(
@@ -924,7 +916,9 @@ describe.skipIf(SKIP_TMUX)("tui: selected state root", () => {
       );
 
       const gateway = startFakeGateway([
-        fakeGatewayToolCall("state_memory", "memory", { action: "list" }),
+        fakeGatewayToolCall("state_skill", "skill", {
+          name: "isolated-state-skill",
+        }),
         fakeGatewayToolCall("state_home", "terminal", {
           action: "exec",
           command: "printf '%s' \"$HOME\"",
@@ -979,10 +973,8 @@ describe.skipIf(SKIP_TMUX)("tui: selected state root", () => {
         expect(gateway.requests[0]!.body).not.toContain("ambient-profile-skill");
         expect(gateway.requests[0]!.body).not.toContain("AMBIENT_PROFILE_INSTRUCTIONS");
         expect(gateway.requests[0]!.body).not.toContain("AMBIENT_STATE_SYSTEM_APPEND");
-        expect(gateway.requests[1]!.body).toContain("selected state memory");
-        expect(gateway.requests[1]!.body).not.toContain(
-          "ambient memory must not load",
-        );
+        expect(gateway.requests[1]!.body).toContain("SELECTED_STATE_SKILL_BODY");
+        expect(gateway.requests[1]!.body).not.toContain("AMBIENT_STATE_SKILL_BODY");
         expect(gateway.requests[2]!.body).toContain(home);
         const mcpEnvironment = JSON.parse(
           readFileSync(mcpEnvironmentPath, "utf8"),
