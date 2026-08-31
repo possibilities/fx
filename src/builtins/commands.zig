@@ -292,6 +292,16 @@ pub const top_level_specs = [_]TopLevelSpec{
             "Additional directories are stored for the current primary workspace.",
         },
     },
+    .{
+        .kind = .structured_inference,
+        .token = "structured-inference",
+        .usage = "structured-inference [--state-root <absolute-path>]",
+        .summary = "Run one internal structured Codex subscription request",
+        .options = &.{
+            .{ .flag = "--state-root <absolute-path>", .description = "Override the private receipt-ledger root" },
+        },
+        .hidden_from_top_level_help = true,
+    },
 };
 
 pub const top_level_help_default_width = command_specs.top_level_help_default_width;
