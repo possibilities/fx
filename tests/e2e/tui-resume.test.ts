@@ -891,20 +891,27 @@ test.skipIf(!tmuxAvailable())(
   "launch name survives exact resume composition and never leaks through new",
   async () => {
     const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-launch-name-resume-")));
-    const selectedHome = join(root, "selected-home");
-    const isolatedHome = join(root, "isolated-home");
+    const ambientHome = join(root, "ambient-home");
+    const selectedStateRoot = join(root, "selected-state-root");
+    const isolatedStateRoot = join(root, "isolated-state-root");
     const initialWorkspace = join(root, "initial-workspace");
     const reboundWorkspace = join(root, "rebound-workspace");
     const initialStderrPath = join(root, "initial-stderr.log");
     const resumedStderrPath = join(root, "resumed-stderr.log");
     const isolatedStderrPath = join(root, "isolated-stderr.log");
-    for (const path of [selectedHome, isolatedHome, initialWorkspace, reboundWorkspace]) {
+    for (const path of [
+      ambientHome,
+      selectedStateRoot,
+      isolatedStateRoot,
+      initialWorkspace,
+      reboundWorkspace,
+    ]) {
       mkdirSync(path);
     }
-    mkdirSync(join(selectedHome, ".fx"));
-    mkdirSync(join(isolatedHome, ".fx"));
+    mkdirSync(join(selectedStateRoot, ".fx"));
+    mkdirSync(join(isolatedStateRoot, ".fx"));
     writeFileSync(
-      join(selectedHome, ".fx", "settings.json"),
+      join(selectedStateRoot, ".fx", "settings.json"),
       JSON.stringify({
         sandbox: "none",
         permission_mode: "auto",
@@ -952,22 +959,22 @@ test.skipIf(!tmuxAvailable())(
     let active: TmuxSession | null = null;
     try {
       active = await TmuxSession.create({
-        cmd: `${FX_BIN} --name 'Initial launch title'`,
+        cmd: `${FX_BIN} --state-dir '${selectedStateRoot}' --name 'Initial launch title'`,
         cwd: realpathSync(initialWorkspace),
-        env: gatewayEnv(selectedHome, gateway),
+        env: gatewayEnv(ambientHome, gateway),
         stderrPath: initialStderrPath,
         width: 100,
         height: 30,
       });
       await active.waitForComposer(TIMEOUT);
-      const originalId = sessionIdFromHome(selectedHome);
+      const originalId = sessionIdFromHome(selectedStateRoot);
       await active.sendText("LAUNCH_NAME_INITIAL_PROMPT");
       await active.waitForText("LAUNCH_NAME_INITIAL_DONE", TIMEOUT);
       await active.waitForComposer(TIMEOUT);
       expect(namingRequests).toBe(0);
 
       const originalDisplayPath = join(
-        selectedHome,
+        selectedStateRoot,
         ".fx",
         "sessions",
         originalId,
@@ -979,11 +986,11 @@ test.skipIf(!tmuxAvailable())(
       await active.sendText("/new");
       await active.waitForComposer(TIMEOUT);
       await waitForCondition(
-        () => readdirSync(join(selectedHome, ".fx", "sessions"), { withFileTypes: true })
+        () => readdirSync(join(selectedStateRoot, ".fx", "sessions"), { withFileTypes: true })
           .filter((entry) => entry.name !== "latest" && entry.isDirectory()).length === 2,
         "fresh session after /new",
       );
-      const newId = readdirSync(join(selectedHome, ".fx", "sessions"), {
+      const newId = readdirSync(join(selectedStateRoot, ".fx", "sessions"), {
         withFileTypes: true,
       }).filter((entry) => entry.name !== "latest" && entry.isDirectory())
         .map((entry) => entry.name)
@@ -994,7 +1001,7 @@ test.skipIf(!tmuxAvailable())(
       await active.waitForComposer(TIMEOUT);
       await waitForCondition(() => {
         const displayPath = join(
-          selectedHome,
+          selectedStateRoot,
           ".fx",
           "sessions",
           newId,
@@ -1012,9 +1019,9 @@ test.skipIf(!tmuxAvailable())(
       active = null;
 
       active = await TmuxSession.create({
-        cmd: `${FX_BIN} --name 'Resumed launch title' resume ${originalId}`,
+        cmd: `${FX_BIN} --state-dir '${selectedStateRoot}' --name 'Resumed launch title' resume ${originalId}`,
         cwd: reboundRoot,
-        env: gatewayEnv(selectedHome, gateway),
+        env: gatewayEnv(ambientHome, gateway),
         stderrPath: resumedStderrPath,
         width: 100,
         height: 30,
@@ -1029,14 +1036,14 @@ test.skipIf(!tmuxAvailable())(
       expect(namingRequests).toBe(1);
 
       const resumedState = JSON.parse(readFileSync(
-        join(selectedHome, ".fx", "sessions", originalId, "session.json"),
+        join(selectedStateRoot, ".fx", "sessions", originalId, "session.json"),
         "utf8",
       )) as { workspace_root?: unknown };
       expect(resumedState.workspace_root).toBe(reboundRoot);
       expect((JSON.parse(readFileSync(originalDisplayPath, "utf8")) as { title: string }).title)
         .toBe("Resumed launch title");
       const index = JSON.parse(readFileSync(
-        join(selectedHome, ".fx", "sessions", "index.json"),
+        join(selectedStateRoot, ".fx", "sessions", "index.json"),
         "utf8",
       )) as { sessions?: Array<{ id?: unknown; title?: unknown }> };
       expect(index.sessions?.find((entry) => entry.id === originalId)?.title)
@@ -1048,9 +1055,9 @@ test.skipIf(!tmuxAvailable())(
       active = null;
 
       active = await TmuxSession.create({
-        cmd: `${FX_BIN} --name 'Wrong state root' resume ${originalId}`,
+        cmd: `${FX_BIN} --state-dir '${isolatedStateRoot}' --name 'Wrong state root' resume ${originalId}`,
         cwd: reboundRoot,
-        env: gatewayEnv(isolatedHome, gateway),
+        env: gatewayEnv(ambientHome, gateway),
         stderrPath: isolatedStderrPath,
         remainOnExit: true,
         width: 100,
@@ -1063,7 +1070,8 @@ test.skipIf(!tmuxAvailable())(
       expect(paneExitMatches(active.paneStatus(), 1)).toBe(true);
       expect(readFileSync(isolatedStderrPath, "utf8"))
         .toContain("fx: saved session not found");
-      expect(existsSync(join(isolatedHome, ".fx", "sessions", originalId))).toBe(false);
+      expect(existsSync(join(isolatedStateRoot, ".fx", "sessions", originalId))).toBe(false);
+      expect(existsSync(join(ambientHome, ".fx", "sessions", originalId))).toBe(false);
       await active.kill();
       active = null;
 

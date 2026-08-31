@@ -317,6 +317,13 @@ fn runInteractiveWithDeps(comptime App: type, comptime cooperative: bool, alloc:
         relaunch_request != null,
     );
     defer freeInvocationSkillRoots(alloc, relaunch_skill_roots);
+    const relaunch_session_name = try clonePendingLaunchSessionNameForRelaunch(
+        App,
+        alloc,
+        &app,
+        relaunch_request != null,
+    );
+    defer if (relaunch_session_name) |name| alloc.free(name);
     const resume_handoff_columns: u16 = if (comptime cooperative)
         0
     else if (comptime @hasDecl(App, "resumeHandoffColumns"))
@@ -337,6 +344,7 @@ fn runInteractiveWithDeps(comptime App: type, comptime cooperative: bool, alloc:
                 launch,
                 handoff.session_id,
                 relaunch_skill_roots,
+                relaunch_session_name,
             );
             defer relaunch_args.deinit(alloc);
             var process_argv = try relaunch_args.processArgv(
@@ -389,6 +397,7 @@ const UpgradeRelaunchArguments = struct {
         launch: *const cli_surface.InteractiveLaunch,
         session_id: []const u8,
         invocation_skill_roots: []const []const u8,
+        pending_session_name: ?[]const u8,
     ) !UpgradeRelaunchArguments {
         var result = UpgradeRelaunchArguments{};
         errdefer result.deinit(alloc);
@@ -442,6 +451,9 @@ const UpgradeRelaunchArguments = struct {
         }
         if (!launch.modifiers.project_instructions_enabled) {
             try result.append(alloc, "--no-project-instructions");
+        }
+        if (pending_session_name) |name| {
+            try result.appendPair(alloc, "--name", name);
         }
         try result.appendPair(alloc, "resume", session_id);
         if (launch.record_requested) try result.append(alloc, "--record");
@@ -531,6 +543,19 @@ fn cloneInvocationSkillRootsForRelaunch(
 fn freeInvocationSkillRoots(alloc: Allocator, roots: [][]u8) void {
     for (roots) |root| alloc.free(root);
     if (roots.len > 0) alloc.free(roots);
+}
+
+fn clonePendingLaunchSessionNameForRelaunch(
+    comptime App: type,
+    alloc: Allocator,
+    app: *const App,
+    enabled: bool,
+) !?[]u8 {
+    if (!enabled) return null;
+    if (comptime !@hasDecl(App, "clonePendingLaunchSessionNameForRelaunch")) {
+        return null;
+    }
+    return app.clonePendingLaunchSessionNameForRelaunch(alloc);
 }
 
 fn replaceProcessDefault(
@@ -931,6 +956,7 @@ fn startWorkerThreadForTest(ctx: ?*anyopaque, _: *anyopaque) !void {
 const TestApp = struct {
     requested_resume: ?cli_surface.ResumeTarget = null,
     invocation_skill_roots: [][]u8 = &.{},
+    pending_launch_session_name: ?[]u8 = null,
     terminal_released: bool = false,
 
     fn init(_: Allocator, launch: *cli_surface.InteractiveLaunch) !TestApp {
@@ -939,7 +965,9 @@ const TestApp = struct {
 
         var app = TestApp{
             .invocation_skill_roots = launch.modifiers.takeInvocationSkillRoots(),
+            .pending_launch_session_name = launch.modifiers.session_name,
         };
+        launch.modifiers.session_name = null;
         if (launch.requested_resume) |target| {
             app.requested_resume = target;
             launch.requested_resume = null;
@@ -951,6 +979,7 @@ const TestApp = struct {
         self.releaseTerminal();
         if (self.requested_resume) |*target| target.deinit(std.testing.allocator);
         freeInvocationSkillRoots(std.testing.allocator, self.invocation_skill_roots);
+        if (self.pending_launch_session_name) |name| std.testing.allocator.free(name);
         appendTestEvent("deinit");
         self.* = undefined;
     }
@@ -974,6 +1003,14 @@ const TestApp = struct {
         };
         @memcpy(request.executable_path_buf[0..path.len], path);
         return request;
+    }
+
+    fn clonePendingLaunchSessionNameForRelaunch(
+        self: *const TestApp,
+        alloc: Allocator,
+    ) Allocator.Error!?[]u8 {
+        const name = self.pending_launch_session_name orelse return null;
+        return try alloc.dupe(u8, name);
     }
 
     fn releaseTerminal(self: *TestApp) void {
@@ -1419,6 +1456,7 @@ test "app entry preserves every launch control across an upgrade relaunch" {
     skill_roots[1] = try alloc.dupe(u8, "/opt/shared-skills");
     const state_home = try alloc.dupe(u8, "/tmp/fx-state");
     const permission_path = try alloc.dupe(u8, "/tmp/fx-policy.json");
+    const session_name = try alloc.dupe(u8, "Pending launch title");
     var capture = TestCapture.init(.{ .interactive = .{
         .record_requested = true,
         .modifiers = .{
@@ -1439,6 +1477,7 @@ test "app entry preserves every launch control across an upgrade relaunch" {
                 .path = permission_path,
                 .rules = .{},
             },
+            .session_name = session_name,
         },
     } });
     defer capture.deinit();
@@ -1481,6 +1520,8 @@ test "app entry preserves every launch control across an upgrade relaunch" {
         "--skills-dir",
         "/opt/shared-skills",
         "--no-project-instructions",
+        "--name",
+        "Pending launch title",
         "resume",
         "session-123",
         "--upgrade-relaunch",
@@ -1500,7 +1541,8 @@ test "app entry preserves every launch control across an upgrade relaunch" {
             " --state-dir /tmp/fx-state --permissions-file /tmp/fx-policy.json" ++
             " --tool terminal:exec --tool read_file --no-default-skills" ++
             " --skills-dir '/tmp/team skills' --skills-dir /opt/shared-skills" ++
-            " --no-project-instructions resume session-123 --record\n",
+            " --no-project-instructions --name 'Pending launch title'" ++
+            " resume session-123 --record\n",
         capture.stderr.written(),
     );
 }
