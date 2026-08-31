@@ -890,6 +890,15 @@ pub fn attemptProjectMcpMutation(
     action: project_config.ProjectMcpAction,
 ) CommitAttempt {
     const home = io_mod.getenv("HOME") orelse return .{ .failure = .{ .err = error.HomeNotSet } };
+    return attemptProjectMcpMutationFromHome(alloc, home, workspace_root, action);
+}
+
+pub fn attemptProjectMcpMutationFromHome(
+    alloc: Allocator,
+    home: []const u8,
+    workspace_root: []const u8,
+    action: project_config.ProjectMcpAction,
+) CommitAttempt {
     var store = settings_store.Store.initFromHome(alloc, home, .writable) catch |err| {
         return .{ .failure = .{ .err = err } };
     };

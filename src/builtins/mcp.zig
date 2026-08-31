@@ -512,6 +512,14 @@ pub fn addProfileServer(
     intent: command_provider_contract.AddIntent,
 ) !command_provider_contract.ProfileAddResult {
     const home = io_mod.getenv("HOME") orelse return error.HomeNotSet;
+    return addProfileServerFromHome(alloc, home, intent);
+}
+
+pub fn addProfileServerFromHome(
+    alloc: Allocator,
+    home: []const u8,
+    intent: command_provider_contract.AddIntent,
+) !command_provider_contract.ProfileAddResult {
     const config_path = try configPathFromHome(alloc, home);
     errdefer alloc.free(config_path);
     const warning = try addProfileServerToPath(alloc, config_path, intent);
@@ -523,6 +531,14 @@ pub fn removeProfileServer(
     name: []const u8,
 ) !command_provider_contract.ProfileRemoveResult {
     const home = io_mod.getenv("HOME") orelse return error.HomeNotSet;
+    return removeProfileServerFromHome(alloc, home, name);
+}
+
+pub fn removeProfileServerFromHome(
+    alloc: Allocator,
+    home: []const u8,
+    name: []const u8,
+) !command_provider_contract.ProfileRemoveResult {
     const config_path = try configPathFromHome(alloc, home);
     errdefer alloc.free(config_path);
     const result = try removeProfileServerFromPath(alloc, config_path, name);
@@ -547,7 +563,10 @@ pub fn loadRuntime(
         profile = try loadConfigFromPath(alloc, config_path);
     }
 
-    var choice_load = config_runtime.loadProjectMcpChoices(alloc, workspace_root) catch |err| {
+    var choice_load = (if (profile_home) |home|
+        config_runtime.loadProjectMcpChoicesFromHome(alloc, home, workspace_root)
+    else
+        config_runtime.loadProjectMcpChoices(alloc, workspace_root)) catch |err| {
         if (err == error.OutOfMemory) return error.OutOfMemory;
         debug_trace.logf("mcp", "workspace MCP choices unavailable err={s}", .{@errorName(err)});
         return runtimeFromConfigs(alloc, &profile, elicitation_capabilities, profile_home);
@@ -581,11 +600,17 @@ pub fn loadRuntime(
     defer freeConfigs(alloc, &configs);
     var runtime = try runtimeFromConfigs(alloc, &configs, elicitation_capabilities, profile_home);
     if (runtime == null and workspace.diagnostics.items.len > 0) {
-        runtime = try alloc.create(mcp_runtime.McpRuntime);
-        runtime.?.* = mcp_runtime.McpRuntime.initWithElicitation(
+        const diagnostic_runtime = try alloc.create(mcp_runtime.McpRuntime);
+        diagnostic_runtime.* = mcp_runtime.McpRuntime.initWithElicitation(
             alloc,
             elicitation_capabilities,
         );
+        diagnostic_runtime.setProfileHome(profile_home) catch |err| {
+            diagnostic_runtime.deinit();
+            alloc.destroy(diagnostic_runtime);
+            return err;
+        };
+        runtime = diagnostic_runtime;
     }
     if (runtime) |value| {
         value.takeWorkspaceDiagnostics(&workspace.diagnostics) catch |err| {
@@ -600,8 +625,12 @@ pub fn loadRuntime(
 pub fn previewNativeWorkspaceAuthority(
     alloc: Allocator,
     workspace_root: []const u8,
+    profile_home: ?[]const u8,
 ) ![][]u8 {
-    var choice_load = config_runtime.loadProjectMcpChoices(alloc, workspace_root) catch |err| {
+    var choice_load = (if (profile_home) |home|
+        config_runtime.loadProjectMcpChoicesFromHome(alloc, home, workspace_root)
+    else
+        config_runtime.loadProjectMcpChoices(alloc, workspace_root)) catch |err| {
         if (err == error.OutOfMemory) return error.OutOfMemory;
         debug_trace.logf("mcp", "workspace MCP authority unavailable err={s}", .{@errorName(err)});
         return alloc.alloc([]u8, 0);
