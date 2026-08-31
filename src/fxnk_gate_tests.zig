@@ -19,6 +19,7 @@ test {
     _ = @import("core/auth/auth_runtime.zig");
     _ = @import("core/control/work_control.zig");
     _ = @import("core/hosts/native_external_editor.zig");
+    _ = @import("core/mcp/mcp_runtime.zig");
     _ = @import("core/notifications/sound.zig");
     _ = @import("core/output/output_contracts.zig");
     _ = @import("core/session/session_naming.zig");
