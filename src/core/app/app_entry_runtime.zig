@@ -141,10 +141,6 @@ fn runWithDeps(comptime App: type, alloc: Allocator, args: []const [:0]const u8,
 }
 
 pub fn runBeforeInteractive(alloc: Allocator, args: []const [:0]const u8, cfg: Config) !BeforeInteractiveResult {
-    _ = cli_surface.recordRequested(args) catch {
-        writeStderr(.{}, cli_surface.record_modifier_usage);
-        return .{ .exit = 1 };
-    };
     const run_result = cli_surface.runIfRequested(alloc, args, cliSurfaceConfig(cfg)) catch |err| switch (err) {
         error.UnknownCliCommand => return .{ .exit = 1 },
         else => {
@@ -166,10 +162,6 @@ pub fn runNoConfigBeforeInteractive(
 }
 
 fn runBeforeInteractiveWithDeps(alloc: Allocator, args: []const [:0]const u8, cfg: Config, deps: RunDeps) !BeforeInteractiveResult {
-    _ = cli_surface.recordRequested(args) catch {
-        writeStderr(deps, cli_surface.record_modifier_usage);
-        return .{ .exit = 1 };
-    };
     const run_result = deps.run_if_requested(deps.cli_ctx, alloc, args, cliSurfaceConfig(cfg)) catch |err| switch (err) {
         error.UnknownCliCommand => return .{ .exit = 1 },
         else => {
@@ -456,7 +448,6 @@ const UpgradeRelaunchArguments = struct {
             try result.appendPair(alloc, "--name", name);
         }
         try result.appendPair(alloc, "resume", session_id);
-        if (launch.record_requested) try result.append(alloc, "--record");
         return result;
     }
 
@@ -506,13 +497,8 @@ const UpgradeRelaunchArguments = struct {
         var argv: std.ArrayList([]const u8) = .empty;
         errdefer argv.deinit(alloc);
         try argv.append(alloc, executable_path);
-
-        const has_record = self.args.items.len > 0 and
-            std.mem.eql(u8, self.args.items[self.args.items.len - 1], "--record");
-        const public_end = self.args.items.len - @intFromBool(has_record);
-        try argv.appendSlice(alloc, self.args.items[0..public_end]);
+        try argv.appendSlice(alloc, self.args.items);
         try argv.append(alloc, cli_surface.upgrade_relaunch_arg);
-        if (has_record) try argv.append(alloc, "--record");
         return argv;
     }
 };
@@ -1458,7 +1444,6 @@ test "app entry preserves every launch control across an upgrade relaunch" {
     const permission_path = try alloc.dupe(u8, "/tmp/fx-policy.json");
     const session_name = try alloc.dupe(u8, "Pending launch title");
     var capture = TestCapture.init(.{ .interactive = .{
-        .record_requested = true,
         .modifiers = .{
             .context_limit_overrides = overrides,
             .additional_directories = directories,
@@ -1525,7 +1510,6 @@ test "app entry preserves every launch control across an upgrade relaunch" {
         "resume",
         "session-123",
         "--upgrade-relaunch",
-        "--record",
     };
     try std.testing.expectEqual(expected.len, capture.replace_arg_count);
     for (expected, 0..) |arg, index| {
@@ -1542,7 +1526,7 @@ test "app entry preserves every launch control across an upgrade relaunch" {
             " --tool terminal:exec --tool read_file --no-default-skills" ++
             " --skills-dir '/tmp/team skills' --skills-dir /opt/shared-skills" ++
             " --no-project-instructions --name 'Pending launch title'" ++
-            " resume session-123 --record\n",
+            " resume session-123\n",
         capture.stderr.written(),
     );
 }

@@ -1247,7 +1247,6 @@ fn isKnownAllowlistTool(tool_registry: tool_dispatch.Registry, name: []const u8)
         "glob",
         "grep",
         "skill",
-        "memory",
         permissions.web_search_permission,
     };
     for (categories) |category| {
@@ -2666,27 +2665,28 @@ test "session_commands handleAllowlist recognizes tools from the active registry
     defer home.deinit();
 
     const provider_tool = blk: {
-        var tool = builtin_tools.memory;
-        tool.name = "provider_memory";
+        var tool = builtin_tools.read_file;
+        tool.name = "provider_custom";
         break :blk tool;
     };
     var app = try FakeApp.init(std.testing.allocator, workspace_root, "test-model");
     defer app.deinit();
     app.tool_registry = .{ .tools = &.{provider_tool} };
 
-    try Commands(FakeApp).handleAllowlist(&app, "add tool provider_memory");
-    try expectTranscriptContains(&app, "● Allowlist: added tool provider_memory: \"*\"");
+    try Commands(FakeApp).handleAllowlist(&app, "add tool provider_custom");
+    try expectTranscriptContains(&app, "● Allowlist: added tool provider_custom: \"*\"");
 
     var settings = try config_runtime.loadMergedSettings(std.testing.allocator, workspace_root);
     defer settings.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(usize, 1), settings.permission_rules.rules.len);
-    try expectRule(settings.permission_rules.rules[0], "provider_memory", "*", .allow);
+    try expectRule(settings.permission_rules.rules[0], "provider_custom", "*", .allow);
 
     app.tool_registry = .{};
     app.clearTranscript();
-    try Commands(FakeApp).handleAllowlist(&app, "remove tool provider_memory");
+    try Commands(FakeApp).handleAllowlist(&app, "remove tool provider_custom");
     try expectTranscriptContains(&app, "usage: /allowlist remove [command|tool|url|web-fetch-domain] <pattern>");
     try std.testing.expect(parseAllowlistTarget(.{}, "tool read") != null);
+    try std.testing.expect(parseAllowlistTarget(.{}, "tool memory") == null);
 }
 
 test "session_commands toggleFast reports unsupported model and redraws footer" {

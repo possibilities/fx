@@ -20,7 +20,6 @@ pub const system_prompt_append_file_name = "SYSTEM_APPEND.md";
 const settings_file_name = "settings.json";
 const mcp_config_file_name = "mcp.json";
 const managed_skills_dir_name = "skills";
-const memories_file_name = "memories.json";
 const logs_dir_name = "logs";
 const trace_log_file_name = "trace.log";
 const recordings_dir_name = "recordings";
@@ -84,10 +83,6 @@ pub fn sessionsDir(alloc: Allocator, home: []const u8) ![]u8 {
 
 pub fn promptHistoryPath(alloc: Allocator, home: []const u8) ![]u8 {
     return std.fs.path.join(alloc, &.{ home, root_dir_name, prompt_history_file_name });
-}
-
-pub fn memoriesPath(alloc: Allocator, home: []const u8) ![]u8 {
-    return std.fs.path.join(alloc, &.{ home, root_dir_name, memories_file_name });
 }
 
 pub fn backupsDir(alloc: Allocator, home: []const u8) ![]u8 {
@@ -169,10 +164,6 @@ test "profile path helpers preserve current default locations" {
     const history = try promptHistoryPath(alloc, "/tmp/fake-home");
     defer alloc.free(history);
     try std.testing.expectEqualStrings("/tmp/fake-home/.fx/history.jsonl", history);
-
-    const memories = try memoriesPath(alloc, "/tmp/fake-home");
-    defer alloc.free(memories);
-    try std.testing.expectEqualStrings("/tmp/fake-home/.fx/memories.json", memories);
 
     const backups = try backupsDir(alloc, "/tmp/fake-home");
     defer alloc.free(backups);

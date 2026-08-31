@@ -70,8 +70,8 @@ committed by the launch request. Fx parses that string as one strict object,
 rejects noncanonical or additional fields, an object larger than 131,072 bytes,
 more than 128 arguments, empty entries, entries larger than 1,024 UTF-8 bytes,
 NUL, ASCII controls through U+001F, and DEL U+007F. The only value-free flags
-are `--record`, `--no-additional-dirs`, `--no-native-tools`,
-`--no-default-skills`, and `--no-project-instructions`. The only value options
+are `--no-additional-dirs`, `--no-native-tools`, `--no-default-skills`, and
+`--no-project-instructions`. The only value options
 are `--system-prompt-file`, `--append-system-prompt-file`, `--skills-dir`,
 `--context-limit`, `--add-dir`, `--tool`, and `--permissions-file`, in separate
 or nonempty `--option=value` form. A separate value may not begin with `-`.

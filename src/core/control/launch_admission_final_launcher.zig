@@ -304,7 +304,6 @@ fn validateExternalGlobalArgs(args: []const []const u8) !void {
 
 fn isFlagGlobalOption(arg: []const u8) bool {
     return stringIn(arg, &.{
-        "--record",
         "--no-additional-dirs",
         "--no-native-tools",
         "--no-default-skills",
@@ -664,7 +663,7 @@ test "native launch preparation reserves fresh identity and exact resume before 
     defer exact.deinit();
     try std.testing.expectEqualStrings(exact_id, exact.accepted.record.initial_conversation_id);
 
-    var invocation = try exact.buildFxInvocation("/path/to/fx", &.{"--record"}, .initial);
+    var invocation = try exact.buildFxInvocation("/path/to/fx", &.{"--no-additional-dirs"}, .initial);
     defer invocation.deinit();
     try expectArgv(&.{
         "/path/to/fx",
@@ -672,7 +671,7 @@ test "native launch preparation reserves fresh identity and exact resume before 
         root,
         "--name",
         "Native supervisor fixture",
-        "--record",
+        "--no-additional-dirs",
         "resume",
         exact_id,
     }, invocation.argv);

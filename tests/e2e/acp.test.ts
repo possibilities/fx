@@ -17,7 +17,7 @@ import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 import { FX_BIN, HAS_API_KEY, REPO_ROOT, runFx } from "../evals/eval-helpers";
 import {
-  AUTO_PERPLEXITY_SERIALIZED_TOOL_NAMES,
+  AUTO_EXA_SERIALIZED_TOOL_NAMES,
   customProviderGuidanceState,
   findUnavailableCapabilityReferences,
   parseGatewayRequest,
@@ -33,6 +33,7 @@ import {
   fakeGatewaySerializedToolCall,
   fakeGatewaySse,
   fakeGatewayToolCall,
+  POST_TOOL_DECISION_PROMPT,
   startDynamicFakeGateway,
   startFakeGateway,
   terminalFixtureShell,
@@ -263,7 +264,11 @@ function acpPromptText(body: string): string {
 
 function acpLatestPromptText(body: string): string {
   const prompt = acpGatewayRequest(body).prompt;
-  return acpContentText(prompt.at(-1)?.content);
+  for (let index = prompt.length - 1; index >= 0; index -= 1) {
+    const text = acpContentText(prompt[index]?.content);
+    if (text !== POST_TOOL_DECISION_PROMPT) return text;
+  }
+  return "";
 }
 
 function expectNoAcpParentDeliveries(body: string) {
@@ -565,9 +570,27 @@ function codexToolCall(callId: string, name: string, args: object): string {
 
 function codexLatestToolResult(body: string): { callId: string; output: string } | null {
   const request = JSON.parse(body) as {
-    input?: Array<{ type?: string; call_id?: string; output?: string }>;
+    input?: Array<{
+      type?: string;
+      role?: string;
+      content?: Array<{ type?: string; text?: string }>;
+      call_id?: string;
+      output?: string;
+    }>;
   };
-  const result = request.input?.at(-1);
+  const input = request.input ?? [];
+  let lastUserIndex = -1;
+  for (let index = input.length - 1; index >= 0; index -= 1) {
+    const item = input[index];
+    if (item?.role !== "user") continue;
+    const text = item.content?.map((part) => part.text ?? "").join("") ?? "";
+    if (text === POST_TOOL_DECISION_PROMPT) continue;
+    lastUserIndex = index;
+    break;
+  }
+  const result = input
+    .slice(lastUserIndex + 1)
+    .findLast((item) => item.type === "function_call_output");
   if (result?.type !== "function_call_output" || !result.call_id || !result.output) {
     return null;
   }
@@ -1596,17 +1619,17 @@ describe("acp: model-independent", () => {
           .map((message) => acpContentText(message.content))
           .join("\n");
         expect(prompt).toContain(submitted);
-        expect(request.tools).toHaveLength(18);
+        expect(request.tools).toHaveLength(17);
         const toolNames = serializedToolNames(oracleRequest);
         expect(toolNames).toEqual(
-          AUTO_PERPLEXITY_SERIALIZED_TOOL_NAMES,
+          AUTO_EXA_SERIALIZED_TOOL_NAMES,
         );
         expect(toolNames.filter((name) => name === "terminal")).toHaveLength(1);
-        expect(toolNames.filter((name) => name === "perplexity_search"))
+        expect(toolNames.filter((name) => name === "exa_search"))
           .toHaveLength(1);
         expect(findUnavailableCapabilityReferences(oracleRequest)).toEqual([]);
         expect(customProviderGuidanceState(oracleRequest)).toEqual({
-          providerToolIndices: [15],
+          providerToolIndices: [14],
           guidanceMessageIndices: [1],
         });
         expect(gateway.requests[0]!.body).not.toContain(
@@ -2323,6 +2346,11 @@ describe("acp: model-independent", () => {
         const prompt = await runPrompt(client, "Find and call the supplied MCP echo tool.", TIMEOUT);
         expect(prompt.promptResult.result.stopReason).toBe("end_turn");
         expect(gateway.requests).toHaveLength(requestStart + 4);
+        expect(
+          acpGatewayRequest(gateway.requests[requestStart]!.body).tools.some(
+            (tool) => tool.name === "memory",
+          ),
+        ).toBe(false);
         expect(acpToolResultText(gateway.requests[requestStart + 1]!.body, "search_http"))
           .toContain(MCP_TOOL_NAME);
         expect(acpToolResultText(gateway.requests[requestStart + 3]!.body, "call_http"))
@@ -8486,7 +8514,7 @@ describe("acp: model-independent", () => {
         await waitForCondition("the code-mode Gateway request", () => gateway.requests.length === 1);
         const codeRequest = parseGatewayRequest(gateway.requests[0]!.body);
         expect(serializedToolNames(codeRequest)).toEqual(
-          AUTO_PERPLEXITY_SERIALIZED_TOOL_NAMES,
+          AUTO_EXA_SERIALIZED_TOOL_NAMES,
         );
         expect(findUnavailableCapabilityReferences(codeRequest)).toEqual([]);
         expect(customProviderGuidanceState(codeRequest).guidanceMessageIndices).toEqual([1]);

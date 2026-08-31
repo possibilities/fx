@@ -672,20 +672,20 @@ test "classifiers are ordered" {
 
 test "classifier validation failures remain terminal before execution" {
     const builtin_tools = @import("../../builtins/tools.zig");
-    const tools = [_]tool_dispatch.Tool{builtin_tools.memory};
+    const tools = [_]tool_dispatch.Tool{builtin_tools.read_file};
     const registry = tool_dispatch.Registry{ .tools = &tools };
     const Fixture = struct {
         fn validation(_: ?*anyopaque, alloc: Allocator, _: ToolCall) anyerror!?CallbackTerminal {
             return .{
-                .model_output = try alloc.dupe(u8, "invalid memory arguments"),
+                .model_output = try alloc.dupe(u8, "invalid read arguments"),
                 .status = .failure,
             };
         }
     };
 
     var result = try prepareReadyCall(std.testing.allocator, .{
-        .id = "invalid-memory",
-        .name = "memory",
+        .id = "invalid-read",
+        .name = "read_file",
         .arguments_json = "{}",
     }, .{
         .tool_registry = registry,
@@ -970,12 +970,12 @@ fn checkPreparationAllocationFailures(alloc: Allocator, workspace: []const u8) !
 test "preparation cancellation and allocation failures clean owned state" {
     const builtin_tools = @import("../../builtins/tools.zig");
     const alloc = std.testing.allocator;
-    const tools = [_]tool_dispatch.Tool{builtin_tools.memory};
+    const tools = [_]tool_dispatch.Tool{builtin_tools.read_file};
     var cancelled = std.atomic.Value(bool).init(true);
     try std.testing.expectError(error.Cancelled, prepareReadyCall(alloc, .{
         .id = "cancelled",
-        .name = "memory",
-        .arguments_json = "{\"action\":\"list\"}",
+        .name = "read_file",
+        .arguments_json = "{\"path\":\"README.md\"}",
     }, .{
         .tool_registry = .{ .tools = &tools },
         .workspace_root = "/tmp/workspace",

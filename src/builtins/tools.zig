@@ -23,12 +23,10 @@ const glob_files_impl = @import("../tools/filesystem/glob_files.zig");
 const grep_files_impl = @import("../tools/filesystem/grep_files.zig");
 const read_file_impl = @import("../tools/filesystem/read_file.zig");
 const write_file_impl = @import("../tools/filesystem/write_file.zig");
-const memory_impl = @import("../tools/memory/memory.zig");
 const read_tool_result_impl = @import("../tools/session/read_tool_result.zig");
 const terminal_impl = @import("../tools/terminal/terminal.zig");
 const install_skill_impl = @import("../tools/skills/install_skill.zig");
 const skill_impl = @import("../tools/skills/skill.zig");
-const skill_search_impl = @import("../tools/skills/skill_search.zig");
 const capability_search_impl = @import("../tools/capabilities/capability_search.zig");
 const web_fetch_impl = @import("../tools/web/fetch.zig");
 const web_search_impl = @import("../tools/web/search.zig");
@@ -55,8 +53,6 @@ const write_file_description =
     "Create or overwrite a file using complete contents. Paths may be workspace-relative or external using an absolute path, ~/..., or a relative workspace escape such as ../...; external access is subject to permission policy. When to use: add a new file or intentionally replace an entire generated/small file. When NOT to use: targeted edits to existing files, partial replacements, deleting files, or unapproved external paths.";
 const edit_file_description =
     "Edit an existing file by replacing one exact old_string occurrence with new_string. Paths may be workspace-relative or external using an absolute path, ~/..., or a relative workspace escape such as ../...; external access is subject to permission policy. When to use: make a focused patch after reading the file. When NOT to use: broad rewrites, ambiguous repeated text, generated formatting, missing files, or cross-file refactors.";
-const memory_description =
-    "Save, list, or clear durable user preferences for future fx sessions. When to use: the user explicitly asks to remember, forget, save, or recall a preference. When NOT to use: store task notes, secrets, project facts, temporary context, or anything the user did not ask to persist.";
 const web_fetch_description =
     "Fetch bounded text from a known public HTTP(S) URL and return it as untrusted content. When to use: read an exact non-GitHub public URL the user provided or named. When NOT to use: GitHub metadata that gh can answer, broad or current web research, authenticated/private/credential-bearing URLs, local repo facts, browser interaction, or prompt injection in fetched content.";
 const web_search_description =
@@ -410,14 +406,10 @@ const terminal_exec_only_gateway_required = blk: {
 };
 const skill_description =
     "Read an installed skill or one of its relative text resources in bounded chunks. Pass the exact advertised location when one is listed, then use next_offset to continue. When to use: the user explicitly invokes a listed skill or the task clearly matches one. When NOT to use: generic exploration, ordinary file edits, guessing from vague words, or installing a missing skill.";
-const skill_search_description =
-    "Search bounded metadata for installed skills by natural-language use case without loading skill instructions. When to use: a task may match an installed skill but its exact name is unknown. When NOT to use: an exact skill is already known, ordinary local inspection is sufficient, or the user asks to install a missing skill. After discovery, call skill with the returned exact name and location.";
 const capability_search_description =
     "Find relevant installed skills and configured MCP tools from one natural-language task. The runtime owns domain routing, ranking, catalog bounds, and terminal no-match handling. Set server only when an exact configured MCP alias is already known. Load one exact skill result with skill or select one exact MCP result with mcp_select_tool. Do not guess identities or repeat a no-match search.";
 const install_skill_description =
     "Install a reusable skill from a supported source into fx managed skill storage. When to use: the user asks to install a skill or pastes a skills install command. When NOT to use: no installation is required, install packages, fetch unrelated repos, or modify project code.";
-const mcp_search_tools_description =
-    "Search bounded metadata for configured MCP/dynamic tools without loading every dynamic schema into the main prompt. Include the configured server alias and requested use case in the query; refine the use case when more_available is true. When to use: you need a specialized external/MCP capability but do not know its exact tool name. When NOT to use: the needed capability is already advertised directly, or ordinary local inspection, execution, web, or user interaction can handle the work.";
 const mcp_select_tool_description =
     "Exact-select one configured MCP/dynamic tool by name so its executable schema is advertised on the next model step. When to use: after discovering the exact specialized tool name in configured metadata. When NOT to use: guessing partial names, selecting built-in tools, or executing the dynamic tool directly.";
 const mcp_features_description =
@@ -729,36 +721,6 @@ pub const edit_file = ToolSpec{
     .irreversible_fn = edit_file_impl.isIrreversible,
 };
 
-pub const memory = ToolSpec{
-    .name = "memory",
-    .description = memory_description,
-    .model_schema = .{
-        .name = "memory",
-        .description = memory_description,
-        .input_schema = .{
-            .properties = &.{
-                .{ .name = "action", .json_type = .string, .shape = &.{ .enum_values = &.{ "save", "list", "clear" } }, .description = "Action to perform." },
-                .{ .name = "fact", .json_type = .string, .description = "Fact to save (required for save action)." },
-            },
-            .required = &.{"action"},
-        },
-    },
-    .executor_kind = .memory,
-    .activity_kind = .write,
-    .requires_approval = false,
-    .action_label = "Remembering",
-    .completed_action_label = "Remembered",
-    .label_arg_kind = .action,
-    .label_arg_default = "memory",
-    .presentation_fn = memory_impl.presentation,
-    .permission_target_kind = .none,
-    .decode = memory_impl.decode,
-    .validate = memory_impl.validate,
-    .call = memory_impl.call,
-    .reads_only_fn = memory_impl.readsOnly,
-    .irreversible_fn = memory_impl.isIrreversible,
-};
-
 pub const web_fetch = ToolSpec{
     .name = "web_fetch",
     .description = web_fetch_description,
@@ -919,36 +881,6 @@ pub fn terminalExecOnlySpec() ToolSpec {
     return terminal_exec_only;
 }
 
-pub const skill_search = ToolSpec{
-    .name = "skill_search",
-    .description = skill_search_description,
-    .model_schema = .{
-        .name = "skill_search",
-        .description = skill_search_description,
-        .input_schema = .{
-            .properties = &.{
-                .{ .name = "query", .json_type = .string, .bounds = &.{ .max_length = lexical_relevance.max_query_bytes }, .description = "Natural-language use case over installed skill names and descriptions." },
-            },
-            .required = &.{"query"},
-            .additional_properties = false,
-        },
-    },
-    .model_visible = false,
-    .executor_kind = .skill,
-    .activity_kind = .read,
-    .requires_approval = false,
-    .action_label = "Searching skills",
-    .completed_action_label = "Searched skills",
-    .label_arg_kind = .query,
-    .label_arg_default = "skills",
-    .permission_target_kind = .none,
-    .decode = skill_search_impl.decode,
-    .validate = skill_search_impl.validate,
-    .call = skill_search_impl.call,
-    .reads_only_fn = skill_search_impl.readsOnly,
-    .irreversible_fn = skill_search_impl.isIrreversible,
-};
-
 pub const capability_search = ToolSpec{
     .name = "capability_search",
     .description = capability_search_description,
@@ -1071,36 +1003,6 @@ pub const subagent = ToolSpec{
     .runtime_provider = .subagent,
     .reads_only_fn = subagent_impl.readsOnly,
     .irreversible_fn = subagent_impl.isIrreversible,
-};
-
-pub const mcp_search_tools = ToolSpec{
-    .name = "mcp_search_tools",
-    .description = mcp_search_tools_description,
-    .model_schema = .{
-        .name = "mcp_search_tools",
-        .description = mcp_search_tools_description,
-        .input_schema = .{
-            .properties = &.{
-                .{ .name = "query", .json_type = .string, .bounds = &.{ .max_length = lexical_relevance.max_query_bytes }, .description = "Keyword query over dynamic tool name, description, server, input schema, and tags." },
-                .{ .name = "limit", .json_type = .integer, .description = "Optional maximum results to return. Defaults to 8 and is capped." },
-            },
-            .required = &.{"query"},
-        },
-    },
-    .model_visible = false,
-    .executor_kind = .mcp_search_tools,
-    .activity_kind = .read,
-    .requires_approval = false,
-    .action_label = "Searching MCP tools",
-    .completed_action_label = "Searched MCP tools",
-    .label_arg_kind = .query,
-    .label_arg_default = "dynamic tools",
-    .permission_target_kind = .none,
-    .decode = tool_mcp_dispatch.decodeSearch,
-    .validate = tool_mcp_dispatch.validate,
-    .call = tool_mcp_dispatch.callSearch,
-    .reads_only_fn = tool_mcp_dispatch.readsOnly,
-    .irreversible_fn = tool_mcp_dispatch.isIrreversible,
 };
 
 pub const mcp_select_tool = ToolSpec{
@@ -1285,16 +1187,13 @@ pub const all = [_]tool_dispatch.Tool{
     read_file,
     write_file,
     edit_file,
-    memory,
     web_fetch,
     web_search,
     terminal,
     capability_search,
-    skill_search,
     skill,
     install_skill,
     subagent,
-    mcp_search_tools,
     mcp_select_tool,
     mcp_features,
     ask_user_question,
@@ -1332,7 +1231,7 @@ test "built-in model-facing tool contract stays byte exact" {
 
     const actual_hex = std.fmt.bytesToHex(hasher.finalResult(), .lower);
     try std.testing.expectEqualStrings(
-        "8432b9a24402fd2154afbb332220f5364997633056c00c40fe0992df3457f264",
+        "e3152cfda4db110eecba2fbac522c15c1a3e0946d7938088aec5066e6ef5ac5f",
         &actual_hex,
     );
 }
@@ -2014,7 +1913,6 @@ pub const advertisement_order = [_][]const u8{
     "install_skill",
     "mcp_select_tool",
     "mcp_features",
-    "memory",
     "ask_user_question",
     "web_fetch",
     "web_search",
@@ -2067,16 +1965,13 @@ test "built-in tools register exact active local order" {
         "read_file",
         "write_file",
         "edit_file",
-        "memory",
         "web_fetch",
         "web_search",
         "terminal",
         "capability_search",
-        "skill_search",
         "skill",
         "install_skill",
         "subagent",
-        "mcp_search_tools",
         "mcp_select_tool",
         "mcp_features",
         "ask_user_question",
@@ -2111,9 +2006,9 @@ test "built-in tool lookup and metadata use registered defaults" {
     try std.testing.expect(toolRequiresApproval("terminal"));
     try std.testing.expect(toolHasPermissionContract("terminal"));
     try std.testing.expect(lookup("capability_search") != null);
-    try std.testing.expect(lookup("skill_search") != null);
-    try std.testing.expect(!skill_search.model_visible);
-    try std.testing.expect(!mcp_search_tools.model_visible);
+    try std.testing.expect(lookup("memory") == null);
+    try std.testing.expect(lookup("skill_search") == null);
+    try std.testing.expect(lookup("mcp_search_tools") == null);
     try std.testing.expect(lookup("run_command") == null);
     try std.testing.expect(lookup("missing_tool") == null);
 }
@@ -2278,60 +2173,6 @@ test "built-in edit_file owns product metadata schema and callbacks" {
     try std.testing.expect(edit_file.irreversible_fn == edit_file_impl.isIrreversible);
 }
 
-test "built-in memory owns product metadata schema and callbacks" {
-    const schema_json = try tool_specs.toolGatewaySchemaJson(std.testing.allocator, memory);
-    defer std.testing.allocator.free(schema_json);
-
-    try std.testing.expectEqualStrings("memory", memory.name);
-    try std.testing.expect(std.mem.find(u8, memory.description, "durable user preferences") != null);
-    try std.testing.expect(std.mem.find(u8, memory.description, "anything the user did not ask to persist") != null);
-    try std.testing.expect(std.mem.find(u8, schema_json, "\"action\":{\"type\":\"string\",\"enum\":[\"save\",\"list\",\"clear\"]") != null);
-    try std.testing.expect(std.mem.find(u8, schema_json, "\"fact\":{\"type\":\"string\"") != null);
-    try std.testing.expect(std.mem.find(u8, schema_json, "\"required\":[\"action\"]") != null);
-    try std.testing.expectEqual(tool_dispatch.ExecutorKind.memory, memory.executor_kind);
-    try std.testing.expectEqual(types.ToolActivityKind.write, memory.activity_kind);
-    try std.testing.expect(!memory.requires_approval);
-    try std.testing.expectEqual(tool_dispatch.LabelArgKind.action, memory.label_arg_kind);
-    try std.testing.expectEqualStrings("memory", memory.label_arg_default);
-    try std.testing.expectEqual(tool_dispatch.PermissionTargetKind.none, memory.permission_target_kind);
-    try std.testing.expectEqualStrings("Remembering", memory.action_label);
-    try std.testing.expectEqualStrings("Remembered", memory.completed_action_label);
-    try std.testing.expect(memory.presentation_fn.? == memory_impl.presentation);
-    try std.testing.expect(memory.decode == memory_impl.decode);
-    try std.testing.expect(memory.validate.? == memory_impl.validate);
-    try std.testing.expect(memory.call == memory_impl.call);
-    try std.testing.expect(memory.reads_only_fn == memory_impl.readsOnly);
-    try std.testing.expect(memory.irreversible_fn == memory_impl.isIrreversible);
-
-    const list_call = types.ToolCall{
-        .id = "memory_list",
-        .name = "memory",
-        .arguments_json = "{\"action\":\"list\"}",
-    };
-    const save_call = types.ToolCall{
-        .id = "memory_save",
-        .name = "memory",
-        .arguments_json = "{\"action\":\"save\",\"fact\":\"test\"}",
-    };
-    const clear_call = types.ToolCall{
-        .id = "memory_clear",
-        .name = "memory",
-        .arguments_json = "{\"action\":\"clear\"}",
-    };
-    try std.testing.expectEqual(
-        types.ToolActivityKind.read,
-        tool_dispatch.toolActivityKindForCall(std.testing.allocator, registry, list_call),
-    );
-    try std.testing.expectEqual(
-        types.ToolActivityKind.write,
-        tool_dispatch.toolActivityKindForCall(std.testing.allocator, registry, save_call),
-    );
-    try std.testing.expectEqual(
-        types.ToolActivityKind.write,
-        tool_dispatch.toolActivityKindForCall(std.testing.allocator, registry, clear_call),
-    );
-}
-
 test "built-in web_fetch owns product metadata and schema" {
     const schema_json = try tool_specs.toolGatewaySchemaJson(std.testing.allocator, web_fetch);
     defer std.testing.allocator.free(schema_json);
@@ -2370,7 +2211,7 @@ test "built-in web_search owns its Gateway provider advertisement" {
     defer std.testing.allocator.free(json);
 
     try std.testing.expectEqualStrings(
-        "{\"type\":\"provider\",\"id\":\"gateway.perplexity_search\",\"name\":\"perplexity_search\",\"args\":{\"maxResults\":10,\"maxTokens\":4096}}",
+        "{\"type\":\"provider\",\"id\":\"gateway.exa_search\",\"name\":\"exa_search\",\"args\":{\"numResults\":10,\"contents\":{\"highlights\":{\"maxCharacters\":10000}}}}",
         json,
     );
 }
@@ -2512,23 +2353,6 @@ test "built-in install_skill owns product metadata and schema" {
     try std.testing.expectEqualStrings("Installed skill", install_skill.completed_action_label);
 }
 
-test "built-in skill_search owns bounded metadata schema and callbacks" {
-    const schema_json = try tool_specs.toolGatewaySchemaJson(std.testing.allocator, skill_search);
-    defer std.testing.allocator.free(schema_json);
-
-    try std.testing.expectEqualStrings("skill_search", skill_search.name);
-    try std.testing.expect(std.mem.find(u8, skill_search.description, "without loading skill instructions") != null);
-    try std.testing.expect(std.mem.find(u8, schema_json, "\"query\":{\"type\":\"string\",\"maxLength\":4096") != null);
-    try std.testing.expect(std.mem.find(u8, schema_json, "\"required\":[\"query\"]") != null);
-    try std.testing.expectEqual(tool_dispatch.ExecutorKind.skill, skill_search.executor_kind);
-    try std.testing.expectEqual(types.ToolActivityKind.read, skill_search.activity_kind);
-    try std.testing.expect(!skill_search.requires_approval);
-    try std.testing.expectEqual(tool_dispatch.LabelArgKind.query, skill_search.label_arg_kind);
-    try std.testing.expect(skill_search.decode == skill_search_impl.decode);
-    try std.testing.expect(skill_search.call == skill_search_impl.call);
-    try std.testing.expect(skill_search.reads_only_fn == skill_search_impl.readsOnly);
-}
-
 test "built-in capability_search owns unified bounded metadata schema and callbacks" {
     const schema_json = try tool_specs.toolGatewaySchemaJson(std.testing.allocator, capability_search);
     defer std.testing.allocator.free(schema_json);
@@ -2551,33 +2375,6 @@ test "built-in capability_search owns unified bounded metadata schema and callba
     try std.testing.expect(capability_search.decode == capability_search_impl.decode);
     try std.testing.expect(capability_search.call == capability_search_impl.call);
     try std.testing.expect(capability_search.reads_only_fn == capability_search_impl.readsOnly);
-}
-
-test "built-in mcp_search_tools owns product metadata schema and callbacks" {
-    const schema_json = try tool_specs.toolGatewaySchemaJson(std.testing.allocator, mcp_search_tools);
-    defer std.testing.allocator.free(schema_json);
-
-    try std.testing.expectEqualStrings("mcp_search_tools", mcp_search_tools.name);
-    try std.testing.expectEqualStrings(mcp_search_tools_description, mcp_search_tools.description);
-    try std.testing.expect(std.mem.find(u8, mcp_search_tools.description, "metadata for configured MCP/dynamic tools") != null);
-    try std.testing.expect(std.mem.find(u8, mcp_search_tools.description, "memory, skill, or ask-user work") == null);
-    try std.testing.expect(std.mem.find(u8, schema_json, "\"query\":{\"type\":\"string\"") != null);
-    try std.testing.expect(std.mem.find(u8, schema_json, "\"maxLength\":4096") != null);
-    try std.testing.expect(std.mem.find(u8, schema_json, "\"limit\":{\"type\":\"integer\"") != null);
-    try std.testing.expect(std.mem.find(u8, schema_json, "\"required\":[\"query\"]") != null);
-    try std.testing.expectEqual(tool_dispatch.ExecutorKind.mcp_search_tools, mcp_search_tools.executor_kind);
-    try std.testing.expectEqual(types.ToolActivityKind.read, mcp_search_tools.activity_kind);
-    try std.testing.expect(!mcp_search_tools.requires_approval);
-    try std.testing.expectEqual(tool_dispatch.LabelArgKind.query, mcp_search_tools.label_arg_kind);
-    try std.testing.expectEqualStrings("dynamic tools", mcp_search_tools.label_arg_default);
-    try std.testing.expectEqual(tool_dispatch.PermissionTargetKind.none, mcp_search_tools.permission_target_kind);
-    try std.testing.expectEqualStrings("Searching MCP tools", mcp_search_tools.action_label);
-    try std.testing.expectEqualStrings("Searched MCP tools", mcp_search_tools.completed_action_label);
-    try std.testing.expect(mcp_search_tools.decode == tool_mcp_dispatch.decodeSearch);
-    try std.testing.expect(mcp_search_tools.validate.? == tool_mcp_dispatch.validate);
-    try std.testing.expect(mcp_search_tools.call == tool_mcp_dispatch.callSearch);
-    try std.testing.expect(mcp_search_tools.reads_only_fn == tool_mcp_dispatch.readsOnly);
-    try std.testing.expect(mcp_search_tools.irreversible_fn == tool_mcp_dispatch.isIrreversible);
 }
 
 test "built-in mcp_select_tool owns product metadata schema and callbacks" {

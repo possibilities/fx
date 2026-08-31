@@ -2481,7 +2481,6 @@ pub fn mapToolKind(tool_name: []const u8) acp_types.ToolCallKind {
     if (std.mem.eql(u8, tool_name, "edit_file")) return .edit;
     if (std.mem.eql(u8, tool_name, "terminal")) return .execute;
     if (std.mem.eql(u8, tool_name, "run_command")) return .execute;
-    if (std.mem.eql(u8, tool_name, "memory")) return .other;
     if (std.mem.eql(u8, tool_name, "skill")) return .other;
     if (std.mem.eql(u8, tool_name, "install_skill")) return .other;
     return .other;
@@ -2994,7 +2993,6 @@ test "parsePromptInput releases partial resource state across allocation failure
 
 test "mapToolKind maps surviving tools" {
     try std.testing.expectEqual(acp_types.ToolCallKind.read, mapToolKind("glob_files"));
-    try std.testing.expectEqual(acp_types.ToolCallKind.other, mapToolKind("memory"));
     try std.testing.expectEqual(acp_types.ToolCallKind.other, mapToolKind("skill"));
     try std.testing.expectEqual(acp_types.ToolCallKind.other, mapToolKind("install_skill"));
 }

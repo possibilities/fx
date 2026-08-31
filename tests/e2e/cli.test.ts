@@ -483,17 +483,28 @@ With --prompt-permissions, JSON and quiet requests may prompt on stderr only whe
 
   for (const alias of ["help", "--help", "-h"]) {
     test(
-      `fx ${alias} --record rejects the interactive-only modifier`,
+      `fx ${alias} hides developer recording surfaces`,
       async () => {
-        const r = await runFx([alias, "--record"]);
-        expect(r.code).not.toBe(0);
-        expect(r.stderr).toContain(
-          "usage: fx --record is only supported for interactive startup",
-        );
+        const r = await runFx([alias]);
+        expect(r.code).toBe(0);
+        expect(r.stdout).not.toContain("--record");
+        expect(r.stdout).not.toContain("replay <tape>");
+        expect(r.stderr).toBe("");
       },
       TIMEOUT,
     );
   }
+
+  test(
+    "fx rejects the removed record flag as unknown input",
+    async () => {
+      const r = await runFx(["--record"]);
+      expect(r.code).not.toBe(0);
+      expect(r.stderr).toContain("fx: unknown subcommand: --record");
+      expect(r.stderr).not.toContain("visual terminal capture:");
+    },
+    TIMEOUT,
+  );
 });
 
 describe("cli: version", () => {

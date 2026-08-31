@@ -742,7 +742,6 @@ const App = struct {
             builtin_gateway.default_model,
             default_max_agent_steps,
             handle_sigwinch,
-            launch.record_requested,
             .{
                 .load_mcp_runtime = if (comptime host_target.is_wasm) loadNoMcpRuntime else builtin_mcp.loadRuntime,
                 .skill_root_policy = app.skill_root_policy,
@@ -3666,10 +3665,6 @@ fn mainC(c_argc: c_int, c_argv: [*][*:0]c_char, c_envp: [*:null]?[*:0]c_char) !v
         try command_runner.runForegroundSessionBootstrap(cli_args);
         return;
     }
-    _ = cli_surface.recordRequested(cli_args) catch {
-        try writeStderrFast(cli_surface.record_modifier_usage);
-        exitFast(1);
-    };
     if (cli_args.len > 0 and isTopLevelHelp(cli_args)) {
         try writeTopLevelHelpFast(raw_env);
         exitFast(0);
@@ -4820,7 +4815,6 @@ test {
     _ = @import("tools/web/html_to_markdown.zig");
     _ = @import("tools/filesystem/read_file.zig");
     _ = @import("tools/session/read_tool_result.zig");
-    _ = @import("tools/memory/memory.zig");
     _ = @import("tools/skills/install_skill.zig");
     _ = @import("tools/skills/skill.zig");
     _ = @import("core/upgrade/upgrade_helpers.zig");

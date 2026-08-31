@@ -11,7 +11,6 @@ export const CANONICAL_BUILTIN_NAMES = [
   "install_skill",
   "mcp_select_tool",
   "mcp_features",
-  "memory",
   "ask_user_question",
   "web_fetch",
   "web_search",
@@ -30,20 +29,20 @@ export const VERIFY_SERIALIZED_TOOL_NAMES = [
   "terminal",
 ] as const;
 
-export const WEB_PERPLEXITY_SERIALIZED_TOOL_NAMES = [
+export const WEB_EXA_SERIALIZED_TOOL_NAMES = [
   ...READ_ONLY_SERIALIZED_TOOL_NAMES,
   "web_fetch",
-  "perplexity_search",
+  "exa_search",
 ] as const;
 
-export const AUTO_PERPLEXITY_SERIALIZED_TOOL_NAMES = CANONICAL_BUILTIN_NAMES.map(
-  (name) => (name === "web_search" ? "perplexity_search" : name),
+export const AUTO_EXA_SERIALIZED_TOOL_NAMES = CANONICAL_BUILTIN_NAMES.map(
+  (name) => (name === "web_search" ? "exa_search" : name),
 );
 
 // Durable-only tools are capability-gated on a writable session. `terminal`
 // remains available because its exec action does not require a session store.
-export const AUTO_PERPLEXITY_WITHOUT_DURABLE_TOOLS_SERIALIZED_TOOL_NAMES =
-  AUTO_PERPLEXITY_SERIALIZED_TOOL_NAMES.filter((name) =>
+export const AUTO_EXA_WITHOUT_DURABLE_TOOLS_SERIALIZED_TOOL_NAMES =
+  AUTO_EXA_SERIALIZED_TOOL_NAMES.filter((name) =>
     name !== "subagent"
   );
 
@@ -62,12 +61,6 @@ export const AMBIGUOUS_CAPABILITY_CLAUSES = {
     "Read an installed skill",
     "load an already-installed skill",
     "skill changes, subagents, and user questions may require approval",
-    "memory, skill, or ask-user work",
-  ],
-  memory: [
-    "Use memory to save durable user preferences",
-    "Save, list, or clear durable user preferences",
-    "memory, skill, or ask-user work",
   ],
 } as const;
 
@@ -118,7 +111,11 @@ export function contentText(content: unknown): string {
 }
 
 export function canonicalToolName(name: string): string {
-  if (name === "perplexity_search" || name === "parallel_search") {
+  if (
+    name === "exa_search" ||
+    name === "perplexity_search" ||
+    name === "parallel_search"
+  ) {
     return "web_search";
   }
   return name;
@@ -216,7 +213,7 @@ export function findUnavailableCapabilityReferences(
     }
   }
 
-  for (const name of ["terminal", "subagent", "skill", "memory"] as const) {
+  for (const name of ["terminal", "subagent", "skill"] as const) {
     if (advertised.has(name)) continue;
     for (const clause of AMBIGUOUS_CAPABILITY_CLAUSES[name]) {
       for (const fragment of fragments) {

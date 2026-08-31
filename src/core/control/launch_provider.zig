@@ -742,7 +742,6 @@ test "private launch provider prepares builds inspects and records external fina
     const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(root);
     const args = [_][]const u8{
-        "--record",
         "--no-additional-dirs",
         "--no-native-tools",
         "--no-default-skills",
@@ -955,7 +954,7 @@ test "private launch provider rejects wrong auth unknown fields and conflicting 
     );
     try std.testing.expectError(
         error.InvalidLaunchControlArgument,
-        launcher.encodeLaunchControls(alloc, &.{ "--skills-dir", "--record" }),
+        launcher.encodeLaunchControls(alloc, &.{ "--skills-dir", "--no-native-tools" }),
     );
     const oversized_arg = try alloc.alloc(u8, 1025);
     defer alloc.free(oversized_arg);

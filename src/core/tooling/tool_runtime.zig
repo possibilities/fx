@@ -359,7 +359,7 @@ pub fn validateToolCall(ctx: Context, arena: Allocator, call: ToolCall) !tool_co
     };
     switch (spec.executor_kind) {
         // Preserve execution-time argument failures for MCP control tool calls.
-        .mcp_search_tools, .mcp_select_tool, .mcp_features => return .{ .valid = .{} },
+        .mcp_select_tool, .mcp_features => return .{ .valid = .{} },
         // File mutation arguments are decoded once by shared permission preflight.
         .write_file, .edit_file => return .{ .valid = .{} },
         else => {},
@@ -2681,14 +2681,13 @@ const test_tool_registry = tool_dispatch.Registry{ .tools = &.{
     test_builtin_tools.read_file,
     test_builtin_tools.write_file,
     test_builtin_tools.edit_file,
-    test_builtin_tools.memory,
     test_builtin_tools.web_fetch,
     test_builtin_tools.web_search,
     test_builtin_tools.terminal,
+    test_builtin_tools.capability_search,
     test_builtin_tools.skill,
     test_builtin_tools.install_skill,
     test_builtin_tools.subagent,
-    test_builtin_tools.mcp_search_tools,
     test_builtin_tools.mcp_select_tool,
     test_builtin_tools.ask_user_question,
     test_builtin_tools.read_tool_result,
@@ -4419,6 +4418,25 @@ test "tool runtime validates and executes only tools from supplied registry" {
     try std.testing.expect((try validateToolCall(read_rt.context(), arena, call)) == .valid);
 }
 
+test "removed tool names are not callable" {
+    var rt = TestRuntime{};
+    defer rt.deinit(std.testing.allocator);
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    for ([_][]const u8{ "memory", "skill_search", "mcp_search_tools" }) |name| {
+        const result = try executeToolCall(rt.context(), arena, .{
+            .id = "removed-tool",
+            .name = name,
+            .arguments_json = "{\"query\":\"review runtime\"}",
+        });
+        try std.testing.expectEqual(tool_contracts.ToolExecutionStatus.failure, result.status);
+        const expected = try std.fmt.allocPrint(arena, "Unsupported tool: {s}", .{name});
+        try std.testing.expectEqualStrings(expected, result.model_output);
+    }
+}
+
 fn registryOwnedWebFetchCall(
     ctx: tool_dispatch.DispatchContext,
     input: tool_dispatch.ToolInput,
@@ -4454,14 +4472,6 @@ fn registryOwnedAskQuestionCall(
     return .{ .success = try ctx.allocator.dupe(u8, "registry-owned ask_user_question") };
 }
 
-fn registryOwnedMemoryCall(
-    ctx: tool_dispatch.DispatchContext,
-    input: tool_dispatch.ToolInput,
-) tool_dispatch.DispatchError!tool_dispatch.ToolResult {
-    _ = input;
-    return .{ .success = try ctx.allocator.dupe(u8, "registry-owned memory") };
-}
-
 fn registryOwnedSkillCall(
     ctx: tool_dispatch.DispatchContext,
     input: tool_dispatch.ToolInput,
@@ -4478,12 +4488,12 @@ fn registryOwnedInstallSkillCall(
     return .{ .success = try ctx.allocator.dupe(u8, "registry-owned install_skill") };
 }
 
-fn registryOwnedMcpSearchCall(
+fn registryOwnedCapabilitySearchCall(
     ctx: tool_dispatch.DispatchContext,
     input: tool_dispatch.ToolInput,
 ) tool_dispatch.DispatchError!tool_dispatch.ToolResult {
     _ = input;
-    return .{ .success = try ctx.allocator.dupe(u8, "registry-owned mcp_search_tools") };
+    return .{ .success = try ctx.allocator.dupe(u8, "registry-owned capability_search") };
 }
 
 fn registryOwnedMcpSelectCall(
@@ -4690,21 +4700,18 @@ test "terminal exec execution uses supplied registry entry" {
     try std.testing.expectEqualStrings("registry-owned terminal exec", result.model_output);
 }
 
-test "stateful local tool execution uses supplied registry entries" {
+test "stateful skill tool execution uses supplied registry entries" {
     const alloc = std.testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(alloc);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    var registered_memory = test_builtin_tools.memory;
-    registered_memory.call = registryOwnedMemoryCall;
     var registered_skill = test_builtin_tools.skill;
     registered_skill.call = registryOwnedSkillCall;
     var registered_install_skill = test_builtin_tools.install_skill;
     registered_install_skill.call = registryOwnedInstallSkillCall;
 
     const tools = [_]tool_dispatch.Tool{
-        registered_memory,
         registered_skill,
         registered_install_skill,
     };
@@ -4718,7 +4725,6 @@ test "stateful local tool execution uses supplied registry entries" {
         args: []const u8,
         expected: []const u8,
     }{
-        .{ .name = "memory", .args = "{\"action\":\"save\",\"fact\":\"likes registries\"}", .expected = "registry-owned memory" },
         .{ .name = "skill", .args = "{\"name\":\"workflow\"}", .expected = "registry-owned skill" },
         .{ .name = "install_skill", .args = "{\"source\":\"/tmp/skills\",\"skill\":\"workflow\"}", .expected = "registry-owned install_skill" },
     };
@@ -4734,7 +4740,7 @@ test "stateful local tool execution uses supplied registry entries" {
     }
 }
 
-test "MCP control tool execution preserves argument failures" {
+test "capability and MCP selection execution preserve argument failures" {
     const alloc = std.testing.allocator;
     var rt = TestRuntime{};
     defer rt.deinit(alloc);
@@ -4747,7 +4753,7 @@ test "MCP control tool execution preserves argument failures" {
         args: []const u8,
         expected: []const u8,
     }{
-        .{ .name = "mcp_search_tools", .args = "{\"query\":1}", .expected = "mcp_search_tools requires a string query." },
+        .{ .name = "capability_search", .args = "{\"query\":1}", .expected = "capability_search field \"query\" must be a string" },
         .{ .name = "mcp_select_tool", .args = "{\"name\":1}", .expected = "mcp_select_tool requires an exact dynamic tool name." },
     };
 
@@ -4762,14 +4768,14 @@ test "MCP control tool execution preserves argument failures" {
     }
 }
 
-test "MCP control tool execution uses supplied registry entries" {
+test "capability and MCP selection execution use supplied registry entries" {
     const alloc = std.testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(alloc);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    var registered_search = test_builtin_tools.mcp_search_tools;
-    registered_search.call = registryOwnedMcpSearchCall;
+    var registered_search = test_builtin_tools.capability_search;
+    registered_search.call = registryOwnedCapabilitySearchCall;
     var registered_select = test_builtin_tools.mcp_select_tool;
     registered_select.call = registryOwnedMcpSelectCall;
     const tools = [_]tool_dispatch.Tool{ registered_search, registered_select };
@@ -4783,7 +4789,7 @@ test "MCP control tool execution uses supplied registry entries" {
         args: []const u8,
         expected: []const u8,
     }{
-        .{ .name = "mcp_search_tools", .args = "{\"query\":\"read\"}", .expected = "registry-owned mcp_search_tools" },
+        .{ .name = "capability_search", .args = "{\"query\":\"read\"}", .expected = "registry-owned capability_search" },
         .{ .name = "mcp_select_tool", .args = "{\"name\":\"mcp_fs_read\"}", .expected = "registry-owned mcp_select_tool" },
     };
 
@@ -7695,7 +7701,7 @@ const McpFixture = struct {
     }
 };
 
-test "MCP control tools forward permission rules through registered execution" {
+test "capability search and MCP selection forward permission rules through registered execution" {
     var permission_context = McpFixture.PermissionContext{};
     var rules = [_]types.PermissionRule{
         .{ .permission = @constCast("mcp_other"), .pattern = @constCast("*"), .action = .deny },
@@ -7714,8 +7720,8 @@ test "MCP control tools forward permission rules through registered execution" {
 
     _ = try executeToolCall(rt.context(), arena, .{
         .id = "search",
-        .name = "mcp_search_tools",
-        .arguments_json = "{\"query\":\"read\"}",
+        .name = "capability_search",
+        .arguments_json = "{\"query\":\"read\",\"server\":\"fixture\"}",
     });
     _ = try executeToolCall(rt.context(), arena, .{
         .id = "select",
@@ -7730,8 +7736,8 @@ test "MCP control tools forward permission rules through registered execution" {
     permission_context = .{};
     _ = try executeToolCall(rt.context(), arena, .{
         .id = "yolo-search",
-        .name = "mcp_search_tools",
-        .arguments_json = "{\"query\":\"read\"}",
+        .name = "capability_search",
+        .arguments_json = "{\"query\":\"read\",\"server\":\"fixture\"}",
     });
     _ = try executeToolCall(rt.context(), arena, .{
         .id = "yolo-select",
@@ -8047,84 +8053,6 @@ test "terminal exec cannot reuse or replace a persisted legacy background task" 
     defer tasks.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 1), tasks.items.len);
     try std.testing.expectEqual(task_id, tasks.items[0].id);
-}
-
-test "memory tool uses isolated HOME and preserves outputs" {
-    const alloc = std.testing.allocator;
-    var no_home_rt = TestRuntime{};
-    defer no_home_rt.deinit(alloc);
-    try setTestHome(null);
-    try expectToolOutput(no_home_rt.context(), "memory", "{\"action\":\"list\"}", "memory unavailable: HOME not set");
-
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    try tmp.dir.createDirPath(io_mod.getIo(), "home");
-    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
-    defer alloc.free(home);
-    try setTestHome(home);
-
-    var rt = TestRuntime{};
-    defer rt.deinit(alloc);
-    const ctx = rt.context();
-    try expectToolOutput(ctx, "memory", "{\"action\":\"list\"}", "No saved memories");
-
-    var rejected_arena_state = std.heap.ArenaAllocator.init(alloc);
-    defer rejected_arena_state.deinit();
-    const rejected = try executeToolCall(ctx, rejected_arena_state.allocator(), .{
-        .id = "invalid-memory-action",
-        .name = "memory",
-        .arguments_json = "{\"action\":\"replace\",\"fact\":\"new value\"}",
-    });
-    try std.testing.expectEqual(tool_contracts.ToolExecutionStatus.failure, rejected.status);
-    try std.testing.expectEqualStrings(
-        "memory field \"action\" must be one of: save, list, clear",
-        rejected.model_output,
-    );
-
-    try expectToolOutput(ctx, "memory", "{\"action\":\"save\",\"fact\":\"likes Zig\"}", "remembered");
-    try expectToolOutput(ctx, "memory", "{\"action\":\"save\",\"fact\":\"likes Zig\"}", "remembered");
-    try expectToolOutput(ctx, "memory", "{\"action\":\"list\"}", "- likes Zig\n");
-
-    const memories_path = try std.fs.path.join(alloc, &.{ home, ".fx", "memories.json" });
-    defer alloc.free(memories_path);
-    var file = try std.Io.Dir.openFileAbsolute(io_mod.getIo(), memories_path, .{});
-    const content = blk: {
-        defer file.close(io_mod.getIo());
-        break :blk try io_mod.readFileToEnd(alloc, &file, 4096);
-    };
-    defer alloc.free(content);
-    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, content, .{});
-    defer parsed.deinit();
-    try std.testing.expectEqual(@as(usize, 1), parsed.value.array.items.len);
-    try std.testing.expectEqualStrings("likes Zig", parsed.value.array.items[0].string);
-
-    try expectToolOutput(ctx, "memory", "{\"action\":\"clear\"}", "memories cleared");
-    try expectToolOutput(ctx, "memory", "{\"action\":\"clear\"}", "memories cleared");
-    try expectToolOutput(ctx, "memory", "{\"action\":\"list\"}", "No saved memories");
-
-    try std.Io.Dir.createDirAbsolute(io_mod.getIo(), memories_path, .default_dir);
-    const survivor_path = try std.fs.path.join(alloc, &.{ memories_path, "must-survive.txt" });
-    defer alloc.free(survivor_path);
-    {
-        var survivor = try std.Io.Dir.createFileAbsolute(io_mod.getIo(), survivor_path, .{});
-        survivor.close(io_mod.getIo());
-    }
-
-    var failed_clear_arena_state = std.heap.ArenaAllocator.init(alloc);
-    defer failed_clear_arena_state.deinit();
-    const failed_clear = try executeToolCall(ctx, failed_clear_arena_state.allocator(), .{
-        .id = "failed-memory-clear",
-        .name = "memory",
-        .arguments_json = "{\"action\":\"clear\"}",
-    });
-    try std.testing.expectEqual(tool_contracts.ToolExecutionStatus.failure, failed_clear.status);
-    try std.testing.expectEqualStrings(
-        "memory clear failed: saved memories were not removed; ensure ~/.fx/memories.json is a removable file and retry",
-        failed_clear.model_output,
-    );
-
-    var survivor = try std.Io.Dir.openFileAbsolute(io_mod.getIo(), survivor_path, .{});
-    survivor.close(io_mod.getIo());
 }
 
 test "install_skill explicit tool installs local skill source" {

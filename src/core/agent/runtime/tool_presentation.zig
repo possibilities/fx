@@ -1315,7 +1315,7 @@ const test_tools = [_]tool_dispatch.Tool{
 };
 const test_tool_registry = tool_dispatch.Registry{ .tools = test_tools[0..] };
 const custom_activity_tool = blk: {
-    var tool = test_builtin_tools.memory;
+    var tool = test_builtin_tools.read_file;
     tool.name = "custom_activity";
     tool.action_label = "Custom activity";
     tool.activity_kind = .open;
@@ -1453,7 +1453,7 @@ test "provisional lifecycle preflight distinguishes unknown eligible and ineligi
         .ineligible => return error.TestExpectedEqual,
     }
 
-    for ([_][]const u8{ "perplexity_search", "parallel_search" }) |name| {
+    for ([_][]const u8{ "exa_search", "perplexity_search", "parallel_search" }) |name| {
         const provider_preflight = ProvisionalToolStatuses.preflight(test_tool_registry, name) orelse return error.TestExpectedEqual;
         switch (provider_preflight) {
             .eligible => |metadata| try std.testing.expectEqualStrings("Searching", metadata.action_label),
@@ -1474,6 +1474,10 @@ test "stream start execution certainty follows provider ownership" {
     try std.testing.expect(streamStartMayHaveExecutedAtProvider(
         provider_registry,
         "web_search",
+    ));
+    try std.testing.expect(streamStartMayHaveExecutedAtProvider(
+        test_tool_registry,
+        "exa_search",
     ));
     try std.testing.expect(streamStartMayHaveExecutedAtProvider(
         test_tool_registry,
@@ -1516,41 +1520,6 @@ test "tool lifecycle uses activity metadata from the supplied registry" {
         &.{},
     ));
     try std.testing.expectEqual(types.ToolActivityKind.open, capture.events.items[0].authoritative_started.activity_kind);
-}
-
-test "memory list authoritative lifecycle is classified as a read" {
-    const alloc = std.testing.allocator;
-    var arena_state = std.heap.ArenaAllocator.init(alloc);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-    var capture = ProvisionalStatusTestCapture{
-        .alloc = alloc,
-        .tool_registry = .{ .tools = &.{test_builtin_tools.memory} },
-    };
-    defer capture.deinit();
-    const hooks = capture.hooks();
-
-    try std.testing.expect(try startToolVisibleLifecycle(
-        &hooks,
-        arena,
-        1,
-        null,
-        .{
-            .id = "memory_list",
-            .name = "memory",
-            .arguments_json = "{\"action\":\"list\"}",
-        },
-        null,
-        &.{},
-    ));
-
-    switch (capture.events.items[0]) {
-        .authoritative_started => |event| try std.testing.expectEqual(
-            types.ToolActivityKind.read,
-            event.activity_kind,
-        ),
-        else => return error.TestExpectedEqual,
-    }
 }
 
 test "presentation grouping spans silent tool steps and splits on visible prose" {

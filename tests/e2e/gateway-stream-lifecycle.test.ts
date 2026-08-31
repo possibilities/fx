@@ -19,7 +19,7 @@ import { join } from "node:path";
 import { FX_BIN, runFx } from "../evals/eval-helpers";
 import {
   AMBIGUOUS_CAPABILITY_CLAUSES,
-  AUTO_PERPLEXITY_WITHOUT_DURABLE_TOOLS_SERIALIZED_TOOL_NAMES,
+  AUTO_EXA_WITHOUT_DURABLE_TOOLS_SERIALIZED_TOOL_NAMES,
   customProviderGuidanceState,
   findUnavailableCapabilityReferences,
   parseGatewayRequest,
@@ -37,6 +37,7 @@ import {
   fakeGatewayToolCall,
   hasEmptyComposer,
   paneExitMatches,
+  POST_TOOL_DECISION_PROMPT,
   startDynamicFakeGateway,
   TmuxSession,
   tmuxAvailable,
@@ -223,7 +224,7 @@ function providerToolResultResponse(finish: "provider_error" | "tool-calls"): Re
     `data: ${JSON.stringify({
       type: "tool-call",
       toolCallId: "provider_search_recovery_1",
-      toolName: "perplexity_search",
+      toolName: "exa_search",
       input: { query: "zig recovery" },
       providerExecuted: true,
     })}\n\n` +
@@ -361,7 +362,7 @@ function toolResultOutput(body: string, callId: string): string {
   const parts = gatewayRequest(body).prompt.flatMap((message) =>
     Array.isArray(message.content) ? message.content : []
   ) as Array<Record<string, unknown>>;
-  const result = parts.find((part) =>
+  const result = parts.findLast((part) =>
     part.type === "tool-result" && part.toolCallId === callId
   );
   if (!result) throw new Error(`Missing tool result for ${callId}`);
@@ -369,10 +370,20 @@ function toolResultOutput(body: string, callId: string): string {
 }
 
 function hasCurrentToolResult(body: string, callId: string): boolean {
-  const last = gatewayRequest(body).prompt.at(-1);
-  if (!last || !Array.isArray(last.content)) return false;
-  return (last.content as Array<Record<string, unknown>>).some((part) =>
-    part.type === "tool-result" && part.toolCallId === callId
+  const prompt = gatewayRequest(body).prompt;
+  let lastUserIndex = -1;
+  for (let index = prompt.length - 1; index >= 0; index -= 1) {
+    const message = prompt[index];
+    if (message?.role !== "user") continue;
+    if (contentText(message.content) === POST_TOOL_DECISION_PROMPT) continue;
+    lastUserIndex = index;
+    break;
+  }
+  return prompt.slice(lastUserIndex + 1).some((message) =>
+    Array.isArray(message.content) &&
+    (message.content as Array<Record<string, unknown>>).some((part) =>
+      part.type === "tool-result" && part.toolCallId === callId
+    )
   );
 }
 
@@ -620,7 +631,7 @@ describe("gateway stream lifecycle", () => {
     );
     expect(findUnavailableCapabilityReferences(ordinary)).toEqual([]);
 
-    for (const capability of ["subagent", "skill", "memory"] as const) {
+    for (const capability of ["subagent", "skill"] as const) {
       for (const clause of AMBIGUOUS_CAPABILITY_CLAUSES[capability]) {
         expect(findUnavailableCapabilityReferences(fixture(clause))).toContainEqual({
           capability,
@@ -658,24 +669,6 @@ describe("gateway stream lifecycle", () => {
     }]);
     expect(findUnavailableCapabilityReferences(installSkillCurrent)).toEqual([]);
 
-    const capabilitySearchOld = fixture("neutral", [{
-      type: "function",
-      name: "capability_search",
-      description: "When NOT to use: memory, skill, or ask-user work.",
-      inputSchema: { type: "object", properties: {} },
-    }]);
-    expect(findUnavailableCapabilityReferences(capabilitySearchOld)).toEqual([
-      {
-        capability: "skill",
-        source: "tool:capability_search",
-        clause: "memory, skill, or ask-user work",
-      },
-      {
-        capability: "memory",
-        source: "tool:capability_search",
-        clause: "memory, skill, or ask-user work",
-      },
-    ]);
     const capabilitySearchCurrent = fixture("neutral", [{
       type: "function",
       name: "capability_search",
@@ -688,7 +681,6 @@ describe("gateway stream lifecycle", () => {
       "Use terminal and web_search.",
       AMBIGUOUS_CAPABILITY_CLAUSES.subagent[0],
       AMBIGUOUS_CAPABILITY_CLAUSES.skill[0],
-      AMBIGUOUS_CAPABILITY_CLAUSES.memory[0],
     ].join(" ");
     expect(findUnavailableCapabilityReferences({
       prompt: [
@@ -732,12 +724,12 @@ describe("gateway stream lifecycle", () => {
       const oracleRequest = parseGatewayRequest(gateway.requests[0]!.body);
       expect(promptText(gateway.requests[0]!.body)).toContain(submitted);
       expect(serializedToolNames(oracleRequest)).toEqual(
-        AUTO_PERPLEXITY_WITHOUT_DURABLE_TOOLS_SERIALIZED_TOOL_NAMES,
+        AUTO_EXA_WITHOUT_DURABLE_TOOLS_SERIALIZED_TOOL_NAMES,
       );
-      expect(request.tools).toHaveLength(17);
+      expect(request.tools).toHaveLength(16);
       expect(findUnavailableCapabilityReferences(oracleRequest)).toEqual([]);
       expect(customProviderGuidanceState(oracleRequest)).toEqual({
-        providerToolIndices: [14],
+        providerToolIndices: [13],
         guidanceMessageIndices: [1],
       });
       expect(request.prompt[0]?.role).toBe("system");
@@ -764,26 +756,44 @@ describe("gateway stream lifecycle", () => {
     }
   }, 30_000);
 
-  test("memory clear deletion failure remains failed and preserves state", async () => {
-    const root = createFixtureRoot("memory-clear-failure");
+  test("removed memory tool is absent and stale calls cannot touch persisted bytes", async () => {
+    const root = createFixtureRoot("memory-removed");
     const tracePath = join(root.root, "trace.log");
     const memoriesPath = join(root.home, ".fx", "memories.json");
-    const survivorPath = join(memoriesPath, "must-survive.txt");
-    mkdirSync(memoriesPath);
-    writeFileSync(survivorPath, "still present\n");
+    const legacyStore = '["must survive removal"]\n';
+    writeFileSync(memoriesPath, legacyStore);
+    writeFileSync(join(root.workspace, "surviving.txt"), "surviving tool works\n");
 
-    const callId = "memory_clear_failure_1";
-    const responses = [
-      fakeGatewayToolCall(callId, "memory", { action: "clear" }),
-      fakeGatewayFinalText("Memory clear failure handled."),
-    ];
-    const gateway = startGateway(() =>
-      responses.shift() ?? new Response("unexpected request", { status: 500 })
-    );
+    const memoryCallId = "removed_memory_call";
+    const readCallId = "surviving_read_call";
+    let requestIndex = 0;
+    let gateway: GatewayFixture;
+    gateway = startDynamicFakeGateway(() => {
+      switch (requestIndex++) {
+        case 0: {
+          const request = gatewayRequest(gateway.requests[0]!.body);
+          expect(request.tools.some((tool) => tool.name === "memory")).toBe(false);
+          return fakeGatewayToolCall(memoryCallId, "memory", { action: "list" });
+        }
+        case 1:
+          expect(toolResultOutput(gateway.requests[1]!.body, memoryCallId)).toContain(
+            "Unsupported tool: memory",
+          );
+          expect(readFileSync(memoriesPath, "utf8")).toBe(legacyStore);
+          return fakeGatewayToolCall(readCallId, "read_file", { path: "surviving.txt" });
+        case 2:
+          expect(toolResultOutput(gateway.requests[2]!.body, readCallId)).toContain(
+            "surviving tool works",
+          );
+          return fakeGatewayFinalText("Memory removal verified.");
+        default:
+          return new Response("unexpected request", { status: 500 });
+      }
+    });
 
     try {
       const result = await runFx(
-        ["ask", "--yolo", "--json", "--no-save", "Clear saved memories."],
+        ["ask", "--auto", "--json", "--no-save", "Verify removed memory behavior."],
         {
           cwd: root.workspace,
           env: fixtureEnv(root, gateway, tracePath),
@@ -795,65 +805,12 @@ describe("gateway stream lifecycle", () => {
       expect(result.code).toBe(0);
       expect(json.exit_code).toBe(0);
       expect(json.error).toBeUndefined();
-      expect(json.output).toContain("Memory clear failure handled.");
-      expect(json.tool_calls).toContainEqual({
-        name: "memory",
-        status: "error",
-      });
-      expect(gateway.requestCount()).toBe(2);
-      expect(toolResultOutput(gateway.requests[1]!.body, callId)).toContain(
-        "memory clear failed: saved memories were not removed; ensure ~/.fx/memories.json is a removable file and retry",
-      );
-      expect(readFileSync(survivorPath, "utf8")).toBe("still present\n");
-    } finally {
-      gateway.stop();
-      rmSync(root.root, { recursive: true, force: true });
-    }
-  }, 30_000);
-
-  test("memory save rejects a corrupt store without replacing it", async () => {
-    const root = createFixtureRoot("memory-corrupt-save");
-    const tracePath = join(root.root, "trace.log");
-    const memoriesPath = join(root.home, ".fx", "memories.json");
-    const corruptStore = '["recoverable prior memory",\n';
-    writeFileSync(memoriesPath, corruptStore);
-
-    const callId = "memory_corrupt_save_1";
-    const responses = [
-      fakeGatewayToolCall(callId, "memory", {
-        action: "save",
-        fact: "replacement memory",
-      }),
-      fakeGatewayFinalText("Corrupt memory store handled."),
-    ];
-    const gateway = startGateway(() =>
-      responses.shift() ?? new Response("unexpected request", { status: 500 })
-    );
-
-    try {
-      const result = await runFx(
-        ["ask", "--auto", "--json", "--no-save", "Save a memory."],
-        {
-          cwd: root.workspace,
-          env: fixtureEnv(root, gateway, tracePath),
-          timeoutMs: 15_000,
-        },
-      );
-      const json = parseAskJson(result.stdout);
-
-      expect(result.code).toBe(0);
-      expect(json.exit_code).toBe(0);
-      expect(json.error).toBeUndefined();
-      expect(json.output).toContain("Corrupt memory store handled.");
-      expect(json.tool_calls).toContainEqual({
-        name: "memory",
-        status: "error",
-      });
-      expect(gateway.requestCount()).toBe(2);
-      expect(toolResultOutput(gateway.requests[1]!.body, callId)).toContain(
-        "memory store is malformed; ~/.fx/memories.json was not modified",
-      );
-      expect(readFileSync(memoriesPath, "utf8")).toBe(corruptStore);
+      expect(json.output).toContain("Memory removal verified.");
+      expect(json.tool_calls).toEqual([
+        { name: "read_file", status: "success" },
+      ]);
+      expect(gateway.requestCount()).toBe(3);
+      expect(readFileSync(memoriesPath, "utf8")).toBe(legacyStore);
     } finally {
       gateway.stop();
       rmSync(root.root, { recursive: true, force: true });
