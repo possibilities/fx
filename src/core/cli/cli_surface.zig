@@ -896,8 +896,8 @@ fn runIfRequestedWithDeps(alloc: Allocator, args: []const [:0]const u8, cfg: Con
         .interactive => |value| {
             var launch = value;
             if (tool_selection.validate(cfg.tool_selection_catalog, launch.modifiers.selected_native_tools)) |issue| {
-                defer launch.deinit(alloc);
                 try writeNativeToolSelectionIssue(alloc, deps, issue);
+                launch.deinit(alloc);
                 return .handled_failure;
             }
             try writeMcpProfileWarningIfPresent(alloc, cfg, deps);
@@ -4275,6 +4275,25 @@ test "global native tool selections preserve order and fail closed when malforme
             @constCast("read_file"),
             @constCast("--no-native-tools"),
         }),
+    );
+}
+
+test "interactive unknown native tool selection renders missing_native_tool before launch teardown" {
+    var capture = CaptureOutput.init(std.testing.allocator);
+    defer capture.deinit();
+
+    const result = try runIfRequestedWithDeps(
+        std.testing.allocator,
+        &.{ @constCast("--tool"), @constCast("missing_native_tool") },
+        testConfig(),
+        capture.deps(),
+    );
+
+    try std.testing.expectEqual(RunResult.handled_failure, result);
+    try std.testing.expectEqualStrings("", capture.stdout.written());
+    try std.testing.expectEqualStrings(
+        "fx: unknown native tool selection: missing_native_tool\n",
+        capture.stderr.written(),
     );
 }
 
