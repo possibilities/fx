@@ -37,6 +37,7 @@ const session_commands = @import("../session/session_commands.zig");
 const usage_recovery = @import("../session/usage_recovery.zig");
 const usage_dashboard_runtime = @import("usage_dashboard_runtime.zig");
 const usage_report = @import("../session/usage_report.zig");
+const profile_usage_runtime = @import("../session/profile_usage_runtime.zig");
 const types = @import("../shared/types.zig");
 const assistant_presentation = @import("../agent/assistant_presentation.zig");
 const worker_runtime = @import("../agent/worker_runtime.zig");
@@ -1171,7 +1172,7 @@ pub fn Handlers(comptime App: type) type {
         }
 
         fn requestUsageDashboardRefresh(app: *App) !void {
-            const home = io_mod.getenv("HOME") orelse return error.HomeNotSet;
+            const home = app_profile_runtime.home(app) orelse return error.HomeNotSet;
             const availability = try app.session.ensureProfileUsageReadable(
                 app.alloc,
                 home,
@@ -4240,6 +4241,70 @@ test "app_commands exposes active handler API surface" {
     try std.testing.expectEqual(@as(usize, 1), handlers_info.params.len);
     try std.testing.expect(handlers_info.params[0].type.? == *SurfaceOnlyApp);
     try std.testing.expect(handlers_info.return_type.? == command_router.CommandHandlers);
+}
+
+test "state-isolated usage dashboard refresh never reads ambient home" {
+    const FakeSession = struct {
+        profile_usage: profile_usage_runtime.Runtime = .{},
+        ensured_home: ?[]const u8 = null,
+
+        fn ensureProfileUsageReadable(
+            self: *@This(),
+            _: std.mem.Allocator,
+            home_path: ?[]const u8,
+        ) !profile_usage_runtime.InitializeOutcome {
+            self.ensured_home = home_path;
+            return .available;
+        }
+    };
+    const FakeDashboard = struct {
+        requested_home: ?[]const u8 = null,
+
+        fn requestRefresh(
+            self: *@This(),
+            _: usage_dashboard_runtime.Provider,
+            home_path: []const u8,
+            _: i64,
+        ) !bool {
+            self.requested_home = home_path;
+            return true;
+        }
+    };
+    const FakeApp = struct {
+        alloc: std.mem.Allocator,
+        profile_home: ?[]const u8,
+        session: FakeSession = .{},
+        usage_dashboard: FakeDashboard = .{},
+    };
+
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "selected-state");
+    const selected_home = try io_mod.dirRealpathAlloc(
+        alloc,
+        tmp.dir,
+        "selected-state",
+    );
+    defer alloc.free(selected_home);
+    if (io_mod.getenv("HOME")) |ambient_home| {
+        try std.testing.expect(!std.mem.eql(u8, selected_home, ambient_home));
+    }
+
+    var app = FakeApp{
+        .alloc = alloc,
+        .profile_home = selected_home,
+    };
+    try Handlers(FakeApp).requestUsageDashboardRefresh(&app);
+
+    try std.testing.expectEqualStrings(
+        selected_home,
+        app.session.ensured_home.?,
+    );
+    try std.testing.expectEqualStrings(
+        selected_home,
+        app.usage_dashboard.requested_home.?,
+    );
 }
 
 test "credits command renders through the composed provider" {
