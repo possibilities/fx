@@ -1454,9 +1454,19 @@ pub fn Runtime(comptime App: type) type {
                 app.alloc,
                 state,
             ) catch |err| {
+                if (comptime @hasField(App, "launch_admission_context")) {
+                    if (app.launch_admission_context != null) return err;
+                }
                 try warnNonDurable(app, "session creation failed", err);
                 return;
             };
+            errdefer {
+                if (app.session_persistence.writable) |*loaded| {
+                    loaded.deinit(app.alloc);
+                }
+                app.session_persistence.writable = null;
+            }
+            try publishLaunchActiveConversation(app);
             app.session_persistence.degraded_warning_emitted = false;
             app.total_input_tokens = 0;
             app.total_output_tokens = 0;
@@ -1929,6 +1939,7 @@ pub fn Runtime(comptime App: type) type {
             }
             const active = &app.session_persistence.writable.?;
             try hydrateResumedSession(app, active.state, display.title, notice);
+            try publishLaunchActiveConversation(app);
             active.resume_view_stale = true;
             reportSessionIdentityChanged(app);
             enableSessionStores(app);
@@ -2907,6 +2918,14 @@ pub fn Runtime(comptime App: type) type {
             if (app.session_persistence.writable) |*loaded| return loaded.active_id;
             if (app.session_persistence.js_host_session) |*owner| return owner.state.id;
             return null;
+        }
+
+        fn publishLaunchActiveConversation(app: *App) !void {
+            if (comptime !@hasField(App, "launch_admission_context")) return;
+            const context = if (app.launch_admission_context) |*value| value else return;
+            const active_id = activeSessionId(app) orelse
+                return error.LaunchConversationUnavailable;
+            try context.publishActiveConversation(active_id);
         }
 
         /// Replaces the cached footer title. App owns the copy. Keeps the
@@ -4989,7 +5008,14 @@ pub fn Runtime(comptime App: type) type {
             preferences: session_codec.DurableSessionPreferences,
         ) !session_codec.DurableSessionState {
             const now = io_mod.milliTimestamp();
-            const id = try session_store.generateSessionId(app.alloc);
+            const id = if (comptime @hasField(App, "launch_admission_context")) id: {
+                if (app.launch_admission_context) |*context| {
+                    if (try context.takeReservedFreshConversationId()) |reserved| {
+                        break :id reserved;
+                    }
+                }
+                break :id try session_store.generateSessionId(app.alloc);
+            } else try session_store.generateSessionId(app.alloc);
             errdefer app.alloc.free(id);
             const origin = try app.alloc.dupe(u8, app.workspace_root);
             errdefer app.alloc.free(origin);
@@ -5273,11 +5299,41 @@ const ReplayEvent = enum {
     raw_transcript,
 };
 
+const FakeLaunchAdmissionContext = struct {
+    alloc: Allocator,
+    reserved_id: []const u8,
+    consumed: bool = false,
+    published: [256]u8 = undefined,
+    published_len: usize = 0,
+    publish_count: usize = 0,
+
+    fn takeReservedFreshConversationId(self: *FakeLaunchAdmissionContext) !?[]u8 {
+        if (self.consumed) return null;
+        self.consumed = true;
+        return try self.alloc.dupe(u8, self.reserved_id);
+    }
+
+    fn publishActiveConversation(
+        self: *FakeLaunchAdmissionContext,
+        conversation_id: []const u8,
+    ) !void {
+        if (conversation_id.len > self.published.len) return error.NameTooLong;
+        @memcpy(self.published[0..conversation_id.len], conversation_id);
+        self.published_len = conversation_id.len;
+        self.publish_count += 1;
+    }
+
+    fn publishedId(self: *const FakeLaunchAdmissionContext) []const u8 {
+        return self.published[0..self.published_len];
+    }
+};
+
 const TestApp = struct {
     alloc: Allocator,
     workspace_root: []u8,
     session: session_runtime.SessionRuntime = .{ .max_history_turns = 8 },
     session_persistence: Persistence = .{},
+    launch_admission_context: ?FakeLaunchAdmissionContext = null,
     session_title: std.ArrayList(u8) = .empty,
     terminal_title_label: [128]u8 = undefined,
     terminal_title_label_len: usize = 0,
@@ -6630,6 +6686,104 @@ test "enableSessionStores replaces existing subagent host without leaking" {
 
     Runtime(TestApp).enableSessionStores(&app);
     try std.testing.expect(app.session_persistence.subagent_host != null);
+}
+
+test "launch-correlated fresh session consumes its reservation once and publishes every active Conversation" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const paths = try testPaths(alloc, &tmp);
+    defer {
+        alloc.free(paths.home);
+        alloc.free(paths.workspace);
+    }
+    const home = try TestHome.install(alloc, paths.home);
+    defer home.deinit();
+
+    var app = try TestApp.init(alloc, paths.workspace);
+    defer app.deinit();
+    app.launch_admission_context = .{
+        .alloc = alloc,
+        .reserved_id = "1788000000000-1788000000000000000-abcd1234",
+    };
+    try configureTestPreferences(&app);
+    try Runtime(TestApp).initializePersistence(&app, true);
+    try Runtime(TestApp).beginFreshPersistedSession(&app);
+    try std.testing.expectEqualStrings(
+        app.launch_admission_context.?.reserved_id,
+        app.session_persistence.writable.?.active_id,
+    );
+    try std.testing.expectEqualStrings(
+        app.session_persistence.writable.?.active_id,
+        app.launch_admission_context.?.publishedId(),
+    );
+
+    const reserved = try alloc.dupe(
+        u8,
+        app.session_persistence.writable.?.active_id,
+    );
+    defer alloc.free(reserved);
+    try Runtime(TestApp).beginFreshPersistedSession(&app);
+    try std.testing.expect(!std.mem.eql(
+        u8,
+        reserved,
+        app.session_persistence.writable.?.active_id,
+    ));
+    try std.testing.expectEqualStrings(
+        app.session_persistence.writable.?.active_id,
+        app.launch_admission_context.?.publishedId(),
+    );
+    try std.testing.expectEqual(
+        @as(usize, 2),
+        app.launch_admission_context.?.publish_count,
+    );
+}
+
+test "launch-correlated exact resume publishes the restored active Conversation" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const paths = try testPaths(alloc, &tmp);
+    defer {
+        alloc.free(paths.home);
+        alloc.free(paths.workspace);
+    }
+    const home = try TestHome.install(alloc, paths.home);
+    defer home.deinit();
+
+    var app = try TestApp.init(alloc, paths.workspace);
+    defer app.deinit();
+    app.launch_admission_context = .{
+        .alloc = alloc,
+        .reserved_id = "unused-fresh-reservation",
+    };
+    try configureTestPreferences(&app);
+    try Runtime(TestApp).initializePersistence(&app, true);
+    const history: [0]types.HistoryTurn = .{};
+    try writeSessionFixture(
+        alloc,
+        app.session_persistence.store.?,
+        "exact-resumed-conversation",
+        &history,
+        0,
+    );
+    app.requested_resume = .{
+        .id = try alloc.dupe(u8, "exact-resumed-conversation"),
+    };
+
+    try Runtime(TestApp).resumeRequestedSession(&app);
+    try std.testing.expectEqualStrings(
+        "exact-resumed-conversation",
+        app.session_persistence.writable.?.active_id,
+    );
+    try std.testing.expectEqualStrings(
+        "exact-resumed-conversation",
+        app.launch_admission_context.?.publishedId(),
+    );
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        app.launch_admission_context.?.publish_count,
+    );
 }
 
 test "interactive subagent host resolves current tools rules grants and integrations" {

@@ -347,10 +347,12 @@ pub fn Runtime(comptime App: type) type {
                     startup.notification_max,
                 );
             }
-            try deps.initialize_persistence(
-                app,
-                app.requested_resume != null,
-            );
+            const persistence_required = app.requested_resume != null or
+                (if (comptime @hasDecl(App, "requiresDurableLaunchSession"))
+                    app.requiresDurableLaunchSession()
+                else
+                    false);
+            try deps.initialize_persistence(app, persistence_required);
             const staged_resume_view = if (app.requested_resume != null)
                 deps.stage_requested_resume_view(app)
             else
