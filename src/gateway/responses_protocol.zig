@@ -219,6 +219,7 @@ pub const Reducer = struct {
     generation_id: ?[]u8 = null,
     terminal_seen: bool = false,
     saw_content_delta: bool = false,
+    saw_refusal: bool = false,
     event_count: usize = 0,
     aggregate_bytes: usize = 0,
 
@@ -246,7 +247,6 @@ pub const Reducer = struct {
         content_capture_limit: ?usize,
         limits: StreamLimits,
     ) !bool {
-        if (cancel_flag.load(.seq_cst)) return error.Cancelled;
         self.event_count = try checkedAccumulatedSize(self.event_count, 1, limits.events);
         if (limits.count_json_bytes) {
             self.aggregate_bytes = try checkedAccumulatedSize(
@@ -260,6 +260,9 @@ pub const Reducer = struct {
         defer parsed.deinit();
         if (parsed.value != .object) return false;
         const event_type = stringField(parsed.value.object, "type") orelse return false;
+        if (cancel_flag.load(.seq_cst) and !isProviderTerminalEvent(event_type)) {
+            return error.Cancelled;
+        }
 
         if (std.mem.eql(u8, event_type, "response.output_item.added")) {
             const output_index = integerField(parsed.value.object, "output_index") orelse return false;
@@ -280,6 +283,7 @@ pub const Reducer = struct {
             std.mem.eql(u8, event_type, "response.refusal.delta"))
         {
             const delta = stringField(parsed.value.object, "delta") orelse return false;
+            if (std.mem.eql(u8, event_type, "response.refusal.delta")) self.saw_refusal = true;
             self.saw_content_delta = true;
             callbacks.on_content(callbacks.context, delta);
             try appendCaptured(alloc, &self.content, delta, content_capture_limit);
@@ -350,8 +354,11 @@ pub const Reducer = struct {
                 if (item.object.get("content")) |parts| if (parts == .array) {
                     for (parts.array.items) |part| {
                         if (part != .object) continue;
-                        const text = stringField(part.object, "text") orelse
-                            stringField(part.object, "refusal") orelse continue;
+                        const text = stringField(part.object, "text") orelse refusal: {
+                            const refusal = stringField(part.object, "refusal") orelse continue;
+                            self.saw_refusal = true;
+                            break :refusal refusal;
+                        };
                         callbacks.on_content(callbacks.context, text);
                         try appendCaptured(alloc, &self.content, text, content_capture_limit);
                     }
@@ -364,11 +371,14 @@ pub const Reducer = struct {
             const response_value = parsed.value.object.get("response") orelse return false;
             if (response_value != .object) return false;
             self.terminal_seen = true;
-            self.finish_reason = finishReason(
-                stringField(response_value.object, "status"),
-                response_value.object,
-                self.tools.items.len > 0,
-            );
+            self.finish_reason = if (self.saw_refusal)
+                .content_filter
+            else
+                finishReason(
+                    stringField(response_value.object, "status"),
+                    response_value.object,
+                    self.tools.items.len > 0,
+                );
             self.usage = parseUsage(response_value.object);
             if (stringField(response_value.object, "id")) |id| {
                 if (self.generation_id) |prior| alloc.free(prior);
@@ -389,8 +399,10 @@ pub const Reducer = struct {
         cancel_flag: *std.atomic.Value(bool),
         limits: StreamLimits,
     ) !types.ModelCompletion {
-        if (cancel_flag.load(.seq_cst)) return error.Cancelled;
-        if (!self.terminal_seen) return error.StreamIncomplete;
+        if (!self.terminal_seen) {
+            if (cancel_flag.load(.seq_cst)) return error.Cancelled;
+            return error.StreamIncomplete;
+        }
 
         const owned_content = if (self.content.items.len > 0)
             try self.content.toOwnedSlice(alloc)
@@ -468,6 +480,19 @@ fn appendTool(
         .id = id,
         .name = owned_name,
     });
+}
+
+fn isProviderTerminalEvent(event_type: []const u8) bool {
+    inline for (.{
+        "response.completed",
+        "response.done",
+        "response.incomplete",
+        "response.failed",
+        "error",
+    }) |candidate| {
+        if (std.mem.eql(u8, event_type, candidate)) return true;
+    }
+    return false;
 }
 
 fn appendToolArguments(
@@ -736,6 +761,129 @@ test "Responses usage projection retains optional cached and reasoning detail" {
     try std.testing.expectEqual(@as(?u64, 5), usage.cache_read_tokens);
     try std.testing.expectEqual(@as(?u64, 2), usage.cache_write_tokens);
     try std.testing.expectEqual(@as(?u64, 3), usage.reasoning_tokens);
+}
+
+test "Responses reducer classifies refusal content as content filter" {
+    const alloc = std.testing.allocator;
+    var reducer = Reducer.init(alloc);
+    defer reducer.deinit(alloc);
+    var cancelled = std.atomic.Value(bool).init(false);
+    var ignored: u8 = 0;
+    const callbacks = StreamCallbacks{
+        .context = &ignored,
+        .on_content = struct {
+            fn emit(_: *anyopaque, _: []const u8) void {}
+        }.emit,
+    };
+    const limits = StreamLimits{
+        .aggregate_bytes = 4096,
+        .events = 8,
+        .tool_calls = 0,
+        .tool_identity_bytes = 0,
+        .tool_arguments_bytes = 0,
+        .provider_state_bytes = 0,
+    };
+    try std.testing.expect(!try reducer.applyJson(
+        alloc,
+        "{\"type\":\"response.refusal.delta\",\"delta\":\"refused\"}",
+        callbacks,
+        &cancelled,
+        1024,
+        limits,
+    ));
+    try std.testing.expect(try reducer.applyJson(
+        alloc,
+        "{\"type\":\"response.completed\",\"response\":{\"id\":\"resp_refused\",\"status\":\"completed\"}}",
+        callbacks,
+        &cancelled,
+        1024,
+        limits,
+    ));
+    const completion = try reducer.finish(alloc, &cancelled, limits);
+    var result = stream_provider.Result{ .completed = .{
+        .completion = completion,
+        .ownership = .owned,
+    } };
+    defer result.deinit(alloc);
+    try std.testing.expectEqual(types.ProviderFinishReason.content_filter, completion.finish_reason.?);
+    try std.testing.expectEqualStrings("refused", completion.content.?);
+}
+
+test "Responses reducer preserves a terminal provider outcome after late cancellation" {
+    const alloc = std.testing.allocator;
+    var reducer = Reducer.init(alloc);
+    defer reducer.deinit(alloc);
+    var cancelled = std.atomic.Value(bool).init(false);
+    var ignored: u8 = 0;
+    const callbacks = StreamCallbacks{
+        .context = &ignored,
+        .on_content = struct {
+            fn emit(_: *anyopaque, _: []const u8) void {}
+        }.emit,
+    };
+    const limits = StreamLimits{
+        .aggregate_bytes = 4096,
+        .events = 4,
+        .tool_calls = 0,
+        .tool_identity_bytes = 0,
+        .tool_arguments_bytes = 0,
+        .provider_state_bytes = 0,
+    };
+    try std.testing.expect(try reducer.applyJson(
+        alloc,
+        "{\"type\":\"response.completed\",\"response\":{\"id\":\"resp_terminal\",\"status\":\"completed\"}}",
+        callbacks,
+        &cancelled,
+        1024,
+        limits,
+    ));
+    cancelled.store(true, .seq_cst);
+    const completion = try reducer.finish(alloc, &cancelled, limits);
+    var result = stream_provider.Result{ .completed = .{
+        .completion = completion,
+        .ownership = .owned,
+    } };
+    defer result.deinit(alloc);
+    try std.testing.expectEqual(types.ProviderFinishReason.stop, completion.finish_reason.?);
+    try std.testing.expectEqualStrings("resp_terminal", completion.generation_id.?);
+}
+
+test "Responses reducer honors an already-read terminal event over cancellation" {
+    const alloc = std.testing.allocator;
+    var reducer = Reducer.init(alloc);
+    defer reducer.deinit(alloc);
+    var cancelled = std.atomic.Value(bool).init(true);
+    var ignored: u8 = 0;
+    const callbacks = StreamCallbacks{
+        .context = &ignored,
+        .on_content = struct {
+            fn emit(_: *anyopaque, _: []const u8) void {}
+        }.emit,
+    };
+    const limits = StreamLimits{
+        .aggregate_bytes = 4096,
+        .events = 4,
+        .tool_calls = 0,
+        .tool_identity_bytes = 0,
+        .tool_arguments_bytes = 0,
+        .provider_state_bytes = 0,
+    };
+    try std.testing.expect(try reducer.applyJson(
+        alloc,
+        "{\"type\":\"response.completed\",\"response\":{\"id\":\"resp_already_read\",\"status\":\"completed\"}}",
+        callbacks,
+        &cancelled,
+        1024,
+        limits,
+    ));
+    const completion = try reducer.finish(alloc, &cancelled, limits);
+    var result = stream_provider.Result{ .completed = .{
+        .completion = completion,
+        .ownership = .owned,
+    } };
+    defer result.deinit(alloc);
+    try std.testing.expectEqual(types.ProviderFinishReason.stop, completion.finish_reason.?);
+    try std.testing.expectEqualStrings("resp_already_read", completion.generation_id.?);
 }
 
 test "Responses protocol owns one subscription billing projection" {

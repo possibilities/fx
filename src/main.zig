@@ -3906,7 +3906,8 @@ fn needsEarlyThreadedIo(args: []const [:0]const u8) bool {
         std.mem.eql(u8, command, "status") or
         std.mem.eql(u8, command, "doctor") or
         std.mem.eql(u8, command, "models") or
-        std.mem.eql(u8, command, "credits");
+        std.mem.eql(u8, command, "credits") or
+        std.mem.eql(u8, command, "structured-inference");
 }
 
 test "auth and upgrade commands use early threaded io without full entry config" {
@@ -3921,7 +3922,7 @@ test "auth and upgrade commands use early threaded io without full entry config"
 }
 
 test "credential-reading commands use early threaded io without full entry config" {
-    for ([_][:0]const u8{ "status", "doctor", "models", "credits" }) |command| {
+    for ([_][:0]const u8{ "status", "doctor", "models", "credits", "structured-inference" }) |command| {
         const args = &.{command};
         try std.testing.expect(!needsFullEntryConfig(args));
         try std.testing.expect(needsEarlyThreadedIo(args));
@@ -4653,6 +4654,10 @@ test {
     _ = @import("core/cli/cli_ask.zig");
     _ = @import("core/cli/cli_replay.zig");
     _ = @import("core/cli/cli_surface.zig");
+    _ = @import("core/inference/structured_schema.zig");
+    _ = @import("core/inference/structured_receipt_ledger.zig");
+    _ = @import("core/inference/structured_subscription.zig");
+    _ = @import("core/inference/structured_subscription_cli.zig");
     _ = @import("core/workspace/change_tracker.zig");
     _ = @import("core/shared/collections.zig");
     _ = @import("core/slash_commands/command_router.zig");
@@ -4673,6 +4678,7 @@ test {
     _ = @import("core/auth/provider_catalog.zig");
     _ = @import("gateway/openai_codex_models.zig");
     _ = @import("gateway/openai_codex.zig");
+    _ = @import("gateway/responses_protocol.zig");
     _ = @import("gateway/openai_codex_permission_reviewer.zig");
     _ = @import("core/auth/grok_session.zig");
     _ = @import("core/auth/grok_oauth.zig");

@@ -61,6 +61,7 @@ const tool_selection = @import("../tooling/tool_selection.zig");
 const workspace_access = @import("../workspace/workspace_access.zig");
 const workspace_commands = @import("../workspace/workspace_commands.zig");
 const usage_cli_runtime = @import("usage_cli_runtime.zig");
+const structured_subscription_native = @import("../../gateway/structured_subscription_native.zig");
 
 const Allocator = std.mem.Allocator;
 const CommandCatalog = command_specs.TopLevelRegistry;
@@ -92,6 +93,7 @@ pub const Command = union(enum) {
     upgrade: []const [:0]const u8,
     replay: []const [:0]const u8,
     workspace: []const [:0]const u8,
+    structured_inference: []const [:0]const u8,
     unknown: []const u8,
 };
 
@@ -796,6 +798,7 @@ pub fn parse(command_catalog: CommandCatalog, args: []const [:0]const u8) Comman
             if (command_specs.matchesTopLevel(command_catalog, command, .replay)) return .{ .replay = args[1..] };
         },
         's' => {
+            if (command_specs.matchesTopLevel(command_catalog, command, .structured_inference)) return .{ .structured_inference = args[1..] };
             if (command_specs.matchesTopLevel(command_catalog, command, .setup)) return .{ .setup = args[1..] };
             if (command_specs.matchesTopLevel(command_catalog, command, .status)) return .{ .status = args[1..] };
             if (command_specs.matchesTopLevel(command_catalog, command, .sessions)) return .{ .sessions = args[1..] };
@@ -2003,6 +2006,16 @@ fn runNonInteractiveWithDeps(
                     return .handled_failure;
                 },
             }
+        },
+        .structured_inference => |rest| {
+            const exit_code = try structured_subscription_native.run(
+                alloc,
+                rest,
+                cfg.gateway_provider.oauth_transport,
+                cfg.secret_store,
+                cfg.provider_set,
+            );
+            return if (exit_code == 0) .handled_success else .{ .handled_exit = exit_code };
         },
         .credits => |rest| {
             const opts = parseLocalSurfaceArgs(rest) catch |err| {
@@ -4722,6 +4735,10 @@ test "parse recognizes every top-level command and preserves unknown commands" {
     }
     switch (parse(command_catalog, &.{ @constCast("replay"), @constCast("tape") })) {
         .replay => |rest| try std.testing.expectEqual(@as(usize, 1), rest.len),
+        else => return error.TestExpectedEqual,
+    }
+    switch (parse(command_catalog, &.{ @constCast("structured-inference"), @constCast("--state-root"), @constCast("/tmp/state") })) {
+        .structured_inference => |rest| try std.testing.expectEqual(@as(usize, 2), rest.len),
         else => return error.TestExpectedEqual,
     }
     switch (parse(command_catalog, &.{@constCast("wat")})) {
