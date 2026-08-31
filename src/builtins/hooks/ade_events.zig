@@ -1055,7 +1055,7 @@ test "ADE feed serializes native session metadata as a generic raw event" {
 test "ADE feed serializes an additive Git root discovery record" {
     var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer output.deinit();
-    try writeRecord(&output.writer, 2, "instance-17", .{ .git_root_discovered = .{
+    try writeRecord(std.testing.allocator, &output.writer, 2, "instance-17", .{ .git_root_discovered = .{
         .git_root = "/workspace/linked-root",
         .revision = 3,
         .reason = "subagent_file_mutation",
