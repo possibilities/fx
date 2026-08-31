@@ -1027,7 +1027,7 @@ test "ADE feed serializes attention resolution with a working snapshot" {
 test "ADE feed serializes native session metadata as a generic raw event" {
     var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer output.deinit();
-    try writeRecord(&output.writer, 8, "instance-3", .{ .session_metadata_changed = .{
+    try writeRecord(std.testing.allocator, &output.writer, 8, "instance-3", .{ .session_metadata_changed = .{
         .title = "Prompt submit session naming",
     } }, .{
         .agent_role = .main,
