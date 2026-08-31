@@ -39,6 +39,7 @@ const web_fetch_runtime = @import("../core/tooling/web_fetch_runtime.zig");
 const web_search_runtime = @import("../core/tooling/web_search_runtime.zig");
 const elicitation = @import("../core/mcp/elicitation.zig");
 const tool_mcp_runtime = @import("../core/tooling/tool_mcp_runtime.zig");
+const tool_set_contract = @import("../core/tooling/tool_set.zig");
 const permissions = @import("../core/permissions/permissions.zig");
 
 const Allocator = std.mem.Allocator;
@@ -291,6 +292,12 @@ pub const ServerState = struct {
         self.pending_legacy_urls.deinit(self.alloc);
     }
 };
+
+pub fn activeToolSet(state: *const ServerState) tool_set_contract.ToolSet {
+    if (comptime host_target.is_wasm) return tool_set_contract.empty;
+    if (!state.cfg.allow_native_tools) return tool_set_contract.empty;
+    return state.cfg.native_tool_set orelse builtin_tools.advertisement_set;
+}
 
 fn credentialMatchesProvider(
     source: ?types.CredentialSource,
@@ -571,6 +578,7 @@ fn resolveSubagentAuthority(
     }
     state.subagent_authority_mutex.lockUncancelable(io_mod.getIo());
     defer state.subagent_authority_mutex.unlock(io_mod.getIo());
+    const tool_set = activeToolSet(state);
     const integrations = if (active.mcp) |mcp|
         mcp.snapshotToolNames(alloc, active.permission_rules)
     else
@@ -586,7 +594,7 @@ fn resolveSubagentAuthority(
             root_id,
             root_id,
             active.permission_rules,
-            state.cfg.mode_registry.toolAllowed(builtin_tools.advertisement_set, active.mode, "mcp_features") and
+            state.cfg.mode_registry.toolAllowed(tool_set, active.mode, "mcp_features") and
                 !permissions.rulesDenyAllTargetsForTool(active.permission_rules, "mcp_features"),
         )
     else
@@ -600,7 +608,7 @@ fn resolveSubagentAuthority(
     return subagent_tool_host.captureHostAuthorityWithMcpView(
         alloc,
         .{
-            .tool_set = builtin_tools.advertisement_set,
+            .tool_set = tool_set,
             .mode = .{
                 .active = .{
                     .registry = state.cfg.mode_registry,
@@ -613,6 +621,57 @@ fn resolveSubagentAuthority(
         active.session_grants,
         permission_state,
         if (mcp_view) |*view| view else null,
+    );
+}
+
+test "ACP child authority preserves native-tool suppression and allowlisting" {
+    const alloc = std.testing.allocator;
+    const modes = [_]mode_registry.ModeSpec{
+        .{ .id = "full", .name = "Full", .permission_mode = .ask },
+    };
+    const selected = tool_set_contract.ToolSet{
+        .registry = .{ .tools = builtin_tools.registry.tools[0..1] },
+        .order = builtin_tools.advertisement_set.order[0..1],
+        .read_only_tool_names = &.{},
+    };
+    var state: ServerState = undefined;
+    state.alloc = alloc;
+    state.cfg.allow_native_tools = false;
+    state.cfg.native_tool_set = selected;
+    state.cfg.mode_registry = .{
+        .default_mode_id = "full",
+        .modes = modes[0..],
+    };
+    state.active_session = .{
+        .session_id = @constCast("root"),
+        .model = @constCast("model"),
+        .mode = "full",
+        .workspace_root = "/tmp/workspace",
+        .api_key = "",
+        .agent_step_limit = 0,
+        .max_tool_result_bytes = 0,
+        .fast_mode = false,
+        .effort = .auto,
+        .first_call_tool_choice = .auto,
+        .permission_mode = .ask,
+        .permission_rules = .{},
+        .session_rt = .{ .max_history_turns = 0 },
+        .cancel_flag = std.atomic.Value(bool).init(false),
+        .pending_prompt_id = null,
+    };
+    state.subagent_authority_mutex = .init;
+
+    var suppressed = try resolveSubagentAuthority(&state, alloc, "root");
+    defer suppressed.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 0), suppressed.tools.len);
+
+    state.cfg.allow_native_tools = true;
+    var allowlisted = try resolveSubagentAuthority(&state, alloc, "root");
+    defer allowlisted.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), allowlisted.tools.len);
+    try std.testing.expectEqualStrings(
+        selected.registry.tools[0].name,
+        allowlisted.tools[0],
     );
 }
 
