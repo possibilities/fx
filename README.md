@@ -87,6 +87,20 @@ fx session resume last
 fx session resume --id <id>
 ```
 
+Give a fresh conversation or an exact resumed conversation an explicit native
+display name at launch:
+
+```bash
+fx --name "Compiler investigation"
+fx --name "Compiler investigation follow-up" session resume --id <id>
+```
+
+The value is trimmed, must be valid UTF-8 without ASCII control bytes, and may
+be at most 240 bytes. It is display metadata only, never session identity or
+authorization. An explicit name suppresses automatic name generation for that
+conversation. Omitting `--name` preserves the existing naming behavior, and
+`/new` does not inherit a launch name.
+
 Each interactive session names its terminal tab. The title prefers the session name, falls back to the workspace name, and keeps the active model as secondary context. Renaming or resuming a session updates the tab, and exiting clears the fx-owned title. Noninteractive commands do not emit terminal-title controls.
 
 On the first submitted prompt, fx starts a small naming request alongside the
