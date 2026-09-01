@@ -1006,6 +1006,8 @@ test "private launch provider prepares builds inspects and records external fina
         "--tool",
         "read",
         "--permissions-file=/tmp/permissions",
+        "--permission-mode",
+        "auto",
     };
     const args_digest = try launcher.computeLaunchControlsDigest(alloc, &args);
     const launch_controls = try launcher.encodeLaunchControls(alloc, &args);
@@ -1053,6 +1055,7 @@ test "private launch provider prepares builds inspects and records external fina
     defer alloc.free(build_response);
     try std.testing.expect(std.mem.find(u8, build_response, child_runtime.conversation_id_env) != null);
     try std.testing.expect(std.mem.find(u8, build_response, "\"arguments\":[\"--state-dir\"") != null);
+    try std.testing.expect(std.mem.find(u8, build_response, "\"--permission-mode\",\"auto\"") != null);
     try std.testing.expect(std.mem.find(u8, build_response, "\"FX_MODEL\":\"fixture/model\"") != null);
     try std.testing.expect(std.mem.find(u8, build_response, "\"FX_EFFORT\":\"medium\"") != null);
 

@@ -299,6 +299,7 @@ pub const BootstrapConfig = struct {
     default_agent_step_limit: usize,
     secret_store: host.SecretStore,
     profile_home: ?[]const u8 = null,
+    launch_permission_mode_override: ?PermissionMode = null,
     resize_handler: ResizeHandler,
     fx_version: []const u8 = "",
 };
@@ -553,6 +554,7 @@ pub fn bootstrapInteractiveApp(cfg: BootstrapConfig) !StartupState {
             cfg.default_agent_step_limit,
         );
     errdefer state.deinit(cfg.alloc);
+    try applyLaunchPermissionModeOverride(&state, cfg.launch_permission_mode_override);
 
     state.credential_onboarding_skipped = credentialOnboardingDisabled();
 
@@ -1223,6 +1225,16 @@ fn loadPermissionMode(configured: ?PermissionMode) PermissionMode {
     return config_runtime.parsePermissionMode(mode) orelse fallback;
 }
 
+fn applyLaunchPermissionModeOverride(
+    state: *StartupState,
+    launch_override: ?PermissionMode,
+) !void {
+    if (launch_override) |mode| {
+        if (mode != .auto) return error.InvalidLaunchPermissionMode;
+        state.permission_mode = .auto;
+    }
+}
+
 fn loadAgentStepLimit(fallback: usize, configured: ?usize) usize {
     return agent_steps.resolveMaxAgentStepsWithOverride(
         configured,
@@ -1385,6 +1397,88 @@ test "permission mode environment accepts yolo without changing fallback" {
     defer env.deinit();
 
     try std.testing.expectEqual(PermissionMode.yolo, loadPermissionMode(.ask));
+}
+
+test "explicit launch auto defeats ambient and workspace yolo without persistence" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(std.testing.io, "home/.fx");
+    try tmp.dir.createDirPath(std.testing.io, "ambient-workspace");
+    try tmp.dir.createDirPath(std.testing.io, "saved-yolo-workspace");
+    const home_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
+    defer alloc.free(home_root);
+    const ambient_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "ambient-workspace");
+    defer alloc.free(ambient_root);
+    const saved_yolo_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "saved-yolo-workspace");
+    defer alloc.free(saved_yolo_root);
+
+    const fixture = try std.fmt.allocPrint(
+        alloc,
+        "{{\"permission_mode\":\"ask\",\"workspaces\":{{\"{s}\":{{\"permission_mode\":\"ask\"}},\"{s}\":{{\"permission_mode\":\"yolo\"}}}}}}\n",
+        .{ ambient_root, saved_yolo_root },
+    );
+    defer alloc.free(fixture);
+    try writeFixtureFile(tmp.dir, "home/.fx/settings.json", fixture);
+
+    {
+        var env = try TestEnv.install(alloc, &.{
+            .{ .key = "HOME", .value = home_root },
+            .{ .key = "FX_PERMISSION_MODE", .value = "yolo" },
+        });
+        defer env.deinit();
+
+        var state = try loadStartupStateForWorkspace(
+            alloc,
+            ambient_root,
+            "default-model",
+            agent_steps.default_max_agent_steps,
+        );
+        defer state.deinit(alloc);
+        try std.testing.expectEqual(PermissionMode.yolo, state.permission_mode);
+        try applyLaunchPermissionModeOverride(&state, .auto);
+        try std.testing.expectEqual(PermissionMode.auto, state.permission_mode);
+    }
+
+    {
+        var env = try TestEnv.install(alloc, &.{
+            .{ .key = "HOME", .value = home_root },
+        });
+        defer env.deinit();
+
+        var explicit = try loadStartupStateForWorkspace(
+            alloc,
+            saved_yolo_root,
+            "default-model",
+            agent_steps.default_max_agent_steps,
+        );
+        defer explicit.deinit(alloc);
+        try std.testing.expectEqual(PermissionMode.yolo, explicit.permission_mode);
+        try applyLaunchPermissionModeOverride(&explicit, .auto);
+        try std.testing.expectEqual(PermissionMode.auto, explicit.permission_mode);
+
+        var ordinary = try loadStartupStateForWorkspace(
+            alloc,
+            saved_yolo_root,
+            "default-model",
+            agent_steps.default_max_agent_steps,
+        );
+        defer ordinary.deinit(alloc);
+        try applyLaunchPermissionModeOverride(&ordinary, null);
+        try std.testing.expectEqual(PermissionMode.yolo, ordinary.permission_mode);
+        try std.testing.expectError(
+            error.InvalidLaunchPermissionMode,
+            applyLaunchPermissionModeOverride(&ordinary, .yolo),
+        );
+        try std.testing.expectEqual(PermissionMode.yolo, ordinary.permission_mode);
+    }
+
+    var settings_file = try tmp.dir.openFile(std.testing.io, "home/.fx/settings.json", .{});
+    defer settings_file.close(std.testing.io);
+    const retained = try io_mod.readFileToEnd(alloc, &settings_file, fixture.len + 1);
+    defer alloc.free(retained);
+    try std.testing.expectEqualStrings(fixture, retained);
 }
 
 test "agent step limit loader distinguishes missing and explicit zero" {

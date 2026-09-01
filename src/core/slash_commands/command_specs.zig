@@ -1673,6 +1673,7 @@ test "top-level help renders flags as compact aligned rows" {
     try std.testing.expect(lineContainsBoth(wide, "--tool <name>", "Allow only this native tool; repeatable"));
     try std.testing.expect(lineContainsBoth(wide, "--no-default-skills", "Use only --skills-dir roots"));
     try std.testing.expect(lineContainsBoth(wide, "--no-project-instructions", "Ignore repository instructions for TUI or ACP"));
+    try std.testing.expect(lineContainsBoth(wide, "--permission-mode <auto>", "Force auto mode for this TUI launch only"));
     try std.testing.expect(lineContainsBoth(wide, "-c, --continue", "Resume the latest workspace session"));
     try std.testing.expect(lineContainsBoth(wide, "-r", "Open the saved-session picker"));
     try std.testing.expect(lineContainsBoth(wide, "--resume [last|<id>]", "Resume the latest workspace session or an exact ID"));

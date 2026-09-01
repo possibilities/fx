@@ -313,11 +313,30 @@ fn validateExternalGlobalArgs(args: []const []const u8) !void {
         };
     }
 
+    var permission_mode_seen = false;
     var index: usize = 0;
     while (index < args.len) : (index += 1) {
         const arg = args[index];
         if (isProviderOwnedArgument(arg)) return error.ProviderOwnedLaunchControl;
         if (isResumeSelection(arg)) return error.ProviderOwnedLaunchControl;
+        if (std.mem.eql(u8, arg, "--permission-mode")) {
+            if (permission_mode_seen) return error.InvalidLaunchControlArgument;
+            permission_mode_seen = true;
+            index += 1;
+            if (index >= args.len or !std.mem.eql(u8, args[index], "auto")) {
+                return error.InvalidLaunchControlArgument;
+            }
+            continue;
+        }
+        if (std.mem.startsWith(u8, arg, "--permission-mode=")) {
+            if (permission_mode_seen or
+                !std.mem.eql(u8, arg["--permission-mode=".len..], "auto"))
+            {
+                return error.InvalidLaunchControlArgument;
+            }
+            permission_mode_seen = true;
+            continue;
+        }
         if (isFlagGlobalOption(arg)) continue;
         if (isValueGlobalOption(arg)) {
             index += 1;
@@ -669,6 +688,26 @@ fn launcherTestTimestampMs() i64 {
     return 0;
 }
 
+test "external launch controls admit only one exact auto permission mode" {
+    try validateExternalGlobalArgs(&.{ "--permission-mode", "auto" });
+    try validateExternalGlobalArgs(&.{"--permission-mode=auto"});
+
+    for ([_][]const []const u8{
+        &.{"--permission-mode"},
+        &.{ "--permission-mode", "ask" },
+        &.{ "--permission-mode", "yolo" },
+        &.{ "--permission-mode", "AUTO" },
+        &.{"--permission-mode="},
+        &.{"--permission-mode=ask"},
+        &.{ "--permission-mode=auto", "--permission-mode", "auto" },
+    }) |args| {
+        try std.testing.expectError(
+            error.InvalidLaunchControlArgument,
+            validateExternalGlobalArgs(args),
+        );
+    }
+}
+
 test "native launch preparation reserves fresh identity and exact resume before exec" {
     const alloc = std.testing.allocator;
     try installLauncherTestEnviron();
@@ -696,7 +735,11 @@ test "native launch preparation reserves fresh identity and exact resume before 
     defer exact.deinit();
     try std.testing.expectEqualStrings(exact_id, exact.accepted.record.initial_conversation_id);
 
-    var invocation = try exact.buildFxInvocation("/path/to/fx", &.{"--no-additional-dirs"}, .initial);
+    var invocation = try exact.buildFxInvocation(
+        "/path/to/fx",
+        &.{ "--permission-mode", "auto", "--no-additional-dirs" },
+        .initial,
+    );
     defer invocation.deinit();
     try expectArgv(&.{
         "/path/to/fx",
@@ -704,6 +747,8 @@ test "native launch preparation reserves fresh identity and exact resume before 
         root,
         "--name",
         "Native supervisor fixture",
+        "--permission-mode",
+        "auto",
         "--no-additional-dirs",
         "resume",
         exact_id,

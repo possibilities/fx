@@ -96,6 +96,7 @@ pub fn Runtime(comptime App: type) type {
             default_model: []const u8,
             default_agent_step_limit: usize,
             resize_handler: app_lifecycle.ResizeHandler,
+            launch_permission_mode_override: ?types.PermissionMode,
             capability_providers: CapabilityProviders,
         ) !void {
             try bootstrapWithDeps(
@@ -104,6 +105,7 @@ pub fn Runtime(comptime App: type) type {
                 default_model,
                 default_agent_step_limit,
                 resize_handler,
+                launch_permission_mode_override,
                 defaultDeps(capability_providers),
             );
         }
@@ -199,6 +201,7 @@ pub fn Runtime(comptime App: type) type {
             default_model: []const u8,
             default_agent_step_limit: usize,
             resize_handler: app_lifecycle.ResizeHandler,
+            launch_permission_mode_override: ?types.PermissionMode,
             deps: BootstrapDeps(App),
         ) !void {
             errdefer app.deinit();
@@ -221,6 +224,7 @@ pub fn Runtime(comptime App: type) type {
                     app.profile_home
                 else
                     null,
+                .launch_permission_mode_override = launch_permission_mode_override,
                 .resize_handler = resize_handler,
                 .fx_version = App.app_version,
             });
@@ -534,6 +538,7 @@ const TestCapture = struct {
     default_model: []const u8 = "",
     default_agent_step_limit: usize = 0,
     fx_version: []const u8 = "",
+    launch_permission_mode_override: ?types.PermissionMode = null,
     configured_model: [64]u8 = undefined,
     configured_model_len: usize = 0,
     configured_model_source: config_runtime.ModelSource = .compiled_default,
@@ -728,6 +733,7 @@ fn bootstrapInteractiveAppForTest(cfg: app_lifecycle.BootstrapConfig) !app_lifec
     capture.default_model = cfg.default_model;
     capture.default_agent_step_limit = cfg.default_agent_step_limit;
     capture.fx_version = cfg.fx_version;
+    capture.launch_permission_mode_override = cfg.launch_permission_mode_override;
     try std.testing.expect(cfg.terminal == &active_app_for_pointer_check.?.terminal);
     active_app_for_pointer_check.?.shell.layout = .{
         .rows = 24,
@@ -927,12 +933,21 @@ fn clearTerminalTitleForTest(_: ?*anyopaque) void {
 }
 
 fn runBootstrapForTest(app: *TestApp, capture: *TestCapture) !void {
-    return runBootstrapForTestWithRoots(app, capture, &.{});
+    return runBootstrapForTestWithModeAndRoots(app, capture, null, &.{});
 }
 
 fn runBootstrapForTestWithRoots(
     app: *TestApp,
     capture: *TestCapture,
+    invocation_skill_roots: []const []const u8,
+) !void {
+    return runBootstrapForTestWithModeAndRoots(app, capture, null, invocation_skill_roots);
+}
+
+fn runBootstrapForTestWithModeAndRoots(
+    app: *TestApp,
+    capture: *TestCapture,
+    launch_permission_mode_override: ?types.PermissionMode,
     invocation_skill_roots: []const []const u8,
 ) !void {
     active_capture = capture;
@@ -950,6 +965,7 @@ fn runBootstrapForTestWithRoots(
         "default-model",
         24,
         resizeHandlerForTest,
+        launch_permission_mode_override,
         deps,
     );
 }
@@ -1051,6 +1067,20 @@ test "app_bootstrap_runtime transfers startup state and starts a fresh session" 
     try std.testing.expect(app.transcript_recorded);
     try std.testing.expect(app.shell.render_requests.hasReason(.first_frame));
     try std.testing.expect(app.begin_fresh_called);
+}
+
+test "app bootstrap forwards explicit permission mode to lifecycle authority" {
+    const alloc = std.testing.allocator;
+    var capture = TestCapture.init(alloc);
+    var app = TestApp.init(alloc);
+    defer app.deinit();
+
+    try runBootstrapForTestWithModeAndRoots(&app, &capture, .auto, &.{});
+
+    try std.testing.expectEqual(
+        @as(?types.PermissionMode, .auto),
+        capture.launch_permission_mode_override,
+    );
 }
 
 test "app_bootstrap_runtime passes invocation skill roots to discovery" {

@@ -425,6 +425,10 @@ const UpgradeRelaunchArguments = struct {
         if (launch.modifiers.state_home) |home| {
             try result.appendPair(alloc, "--state-dir", home);
         }
+        if (launch.modifiers.permission_mode_override) |mode| {
+            if (mode != .auto) return error.InvalidLaunchPermissionMode;
+            try result.appendPair(alloc, "--permission-mode", "auto");
+        }
         if (launch.modifiers.permission_policy) |policy| {
             try result.appendPair(alloc, "--permissions-file", policy.path);
         }
@@ -835,8 +839,8 @@ const TestCapture = struct {
     replace_error: std.process.ReplaceError = error.InvalidExe,
     replace_calls: usize = 0,
     replace_arg_count: usize = 0,
-    replace_arg_bufs: [32][256]u8 = undefined,
-    replace_arg_lens: [32]usize = [_]usize{0} ** 32,
+    replace_arg_bufs: [40][256]u8 = undefined,
+    replace_arg_lens: [40]usize = [_]usize{0} ** 40,
     fail_unexpected_format: bool = false,
 
     fn init(run_result: cli_surface.RunResult) TestCapture {
@@ -1458,6 +1462,7 @@ test "app entry preserves every launch control across an upgrade relaunch" {
             .no_default_skills = true,
             .project_instructions_enabled = false,
             .state_home = state_home,
+            .permission_mode_override = .auto,
             .permission_policy = .{
                 .path = permission_path,
                 .rules = .{},
@@ -1493,6 +1498,8 @@ test "app entry preserves every launch control across an upgrade relaunch" {
         "/tmp/second extra.md",
         "--state-dir",
         "/tmp/fx-state",
+        "--permission-mode",
+        "auto",
         "--permissions-file",
         "/tmp/fx-policy.json",
         "--tool",
@@ -1522,7 +1529,8 @@ test "app entry preserves every launch control across an upgrade relaunch" {
             " --system-prompt-file '/tmp/base prompt.md'" ++
             " --append-system-prompt-file /tmp/first-extra.md" ++
             " --append-system-prompt-file '/tmp/second extra.md'" ++
-            " --state-dir /tmp/fx-state --permissions-file /tmp/fx-policy.json" ++
+            " --state-dir /tmp/fx-state --permission-mode auto" ++
+            " --permissions-file /tmp/fx-policy.json" ++
             " --tool terminal:exec --tool read_file --no-default-skills" ++
             " --skills-dir '/tmp/team skills' --skills-dir /opt/shared-skills" ++
             " --no-project-instructions --name 'Pending launch title'" ++

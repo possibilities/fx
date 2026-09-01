@@ -401,6 +401,10 @@ pub const top_level_flags = [_]TopLevelFlag{
         .description = "Replace configured rules for TUI or ACP",
     },
     .{
+        .usage = "--permission-mode <auto>",
+        .description = "Force auto mode for this TUI launch only",
+    },
+    .{
         .usage = "-c, --continue",
         .description = "Resume the latest workspace session",
     },

@@ -742,6 +742,7 @@ const App = struct {
             builtin_gateway.default_model,
             default_max_agent_steps,
             handle_sigwinch,
+            launch.modifiers.permission_mode_override,
             .{
                 .load_mcp_runtime = if (comptime host_target.is_wasm) loadNoMcpRuntime else builtin_mcp.loadRuntime,
                 .skill_root_policy = app.skill_root_policy,

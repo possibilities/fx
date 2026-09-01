@@ -78,6 +78,10 @@ are `--no-additional-dirs`, `--no-native-tools`, `--no-default-skills`, and
 are `--system-prompt-file`, `--append-system-prompt-file`, `--skills-dir`,
 `--context-limit`, `--add-dir`, `--tool`, and `--permissions-file`, in separate
 or nonempty `--option=value` form. A separate value may not begin with `-`.
+The process-only permission authority is the one additional value option:
+`--permission-mode auto` or `--permission-mode=auto`. It may appear once and
+accepts only the exact lowercase value `auto`; the provider rejects every
+other value before returning an invocation.
 All other flags and positional entries are rejected, including provider-owned
 state, name, model, effort, and every resume selector. The result contains:
 

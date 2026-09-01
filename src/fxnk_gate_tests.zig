@@ -8,6 +8,7 @@ test {
     _ = @import("builtins/hooks/lifecycle_state.zig");
     _ = @import("core/agent/runtime/gateway_step.zig");
     _ = @import("core/app/app_entry_runtime.zig");
+    _ = @import("core/app/app_bootstrap_runtime.zig");
     _ = @import("core/app/app_input_runtime.zig");
     _ = @import("core/app/app_lifecycle.zig");
     _ = @import("core/app/app_profile_runtime.zig");

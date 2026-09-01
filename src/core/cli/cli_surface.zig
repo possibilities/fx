@@ -136,6 +136,7 @@ pub const LaunchModifiers = struct {
     project_instructions_enabled: bool = true,
     state_home: ?[]u8 = null,
     permission_policy: ?config_runtime.LaunchPermissionPolicy = null,
+    permission_mode_override: ?types.PermissionMode = null,
     session_name: ?[]u8 = null,
 
     pub fn deinit(self: *LaunchModifiers, alloc: Allocator) void {
@@ -195,6 +196,10 @@ pub const LaunchModifiers = struct {
 
     pub fn hasPermissionPolicy(self: LaunchModifiers) bool {
         return self.permission_policy != null;
+    }
+
+    pub fn hasPermissionModeOverride(self: LaunchModifiers) bool {
+        return self.permission_mode_override != null;
     }
 
     pub fn hasSessionName(self: LaunchModifiers) bool {
@@ -471,6 +476,7 @@ fn parseGlobalLaunchArgs(
     errdefer if (state_home) |path| alloc.free(path);
     var permission_policy: ?config_runtime.LaunchPermissionPolicy = null;
     errdefer if (permission_policy) |*policy| policy.deinit(alloc);
+    var permission_mode_override: ?types.PermissionMode = null;
     var session_name: ?[]u8 = null;
     errdefer if (session_name) |name| alloc.free(name);
 
@@ -571,6 +577,16 @@ fn parseGlobalLaunchArgs(
             const value = arg["--permissions-file=".len..];
             if (value.len == 0) return error.MissingPermissionsFileValue;
             permission_policy = try config_runtime.loadLaunchPermissionPolicy(alloc, value);
+        } else if (std.mem.eql(u8, arg, "--permission-mode")) {
+            if (permission_mode_override != null) return error.DuplicateLaunchPermissionMode;
+            index += 1;
+            if (index >= args.len or args[index].len == 0) return error.MissingLaunchPermissionModeValue;
+            permission_mode_override = try parseLaunchPermissionMode(args[index]);
+        } else if (std.mem.startsWith(u8, arg, "--permission-mode=")) {
+            if (permission_mode_override != null) return error.DuplicateLaunchPermissionMode;
+            const value = arg["--permission-mode=".len..];
+            if (value.len == 0) return error.MissingLaunchPermissionModeValue;
+            permission_mode_override = try parseLaunchPermissionMode(value);
         } else if (std.mem.eql(u8, arg, "--name")) {
             if (session_name != null) return error.DuplicateSessionName;
             index += 1;
@@ -626,9 +642,15 @@ fn parseGlobalLaunchArgs(
             .project_instructions_enabled = project_instructions_enabled,
             .state_home = state_home,
             .permission_policy = permission_policy,
+            .permission_mode_override = permission_mode_override,
             .session_name = session_name,
         },
     };
+}
+
+fn parseLaunchPermissionMode(raw: []const u8) !types.PermissionMode {
+    if (std.mem.eql(u8, raw, "auto")) return .auto;
+    return error.InvalidLaunchPermissionMode;
 }
 
 fn canonicalizeStateHome(alloc: Allocator, path: []const u8) ![]u8 {
@@ -659,6 +681,7 @@ pub fn argsAfterGlobalLaunchArgs(args: []const [:0]const u8) []const [:0]const u
             std.mem.eql(u8, arg, "--tool") or
             std.mem.eql(u8, arg, "--state-dir") or
             std.mem.eql(u8, arg, "--permissions-file") or
+            std.mem.eql(u8, arg, "--permission-mode") or
             std.mem.eql(u8, arg, "--name"))
         {
             index += 1;
@@ -675,6 +698,7 @@ pub fn argsAfterGlobalLaunchArgs(args: []const [:0]const u8) []const [:0]const u
             !std.mem.eql(u8, arg, "--no-project-instructions") and
             !std.mem.startsWith(u8, arg, "--state-dir=") and
             !std.mem.startsWith(u8, arg, "--permissions-file=") and
+            !std.mem.startsWith(u8, arg, "--permission-mode=") and
             !std.mem.startsWith(u8, arg, "--name="))
         {
             return args[index..];
@@ -703,7 +727,8 @@ pub fn systemPromptFilesRequested(args: []const [:0]const u8) bool {
         }
         if (std.mem.eql(u8, arg, "--context-limit") or std.mem.eql(u8, arg, "--add-dir") or
             std.mem.eql(u8, arg, "--skills-dir") or std.mem.eql(u8, arg, "--tool") or
-            std.mem.eql(u8, arg, "--state-dir") or std.mem.eql(u8, arg, "--permissions-file"))
+            std.mem.eql(u8, arg, "--state-dir") or std.mem.eql(u8, arg, "--permissions-file") or
+            std.mem.eql(u8, arg, "--permission-mode"))
         {
             index += 1;
             if (index >= args.len) return false;
@@ -713,6 +738,7 @@ pub fn systemPromptFilesRequested(args: []const [:0]const u8) bool {
             !std.mem.startsWith(u8, arg, "--tool=") and
             !std.mem.startsWith(u8, arg, "--state-dir=") and
             !std.mem.startsWith(u8, arg, "--permissions-file=") and
+            !std.mem.startsWith(u8, arg, "--permission-mode=") and
             !std.mem.eql(u8, arg, "--no-additional-dirs") and
             !std.mem.eql(u8, arg, "--no-native-tools") and
             !std.mem.eql(u8, arg, "--no-default-skills") and
@@ -1088,7 +1114,7 @@ fn runIfRequestedWithDeps(alloc: Allocator, args: []const [:0]const u8, cfg: Con
         } else {
             try writer.writer.print("fx: invalid global launch option: {s}\n", .{@errorName(err)});
         }
-        try writer.writer.writeAll("usage: fx [--name TITLE] [--skills-dir PATH]... [--no-default-skills] [--no-project-instructions] [--system-prompt-file PATH] [--append-system-prompt-file PATH]... [--context-limit NAME=BYTES|off] [--add-dir PATH]... [--no-additional-dirs] [--state-dir DIR] [--permissions-file FILE] [--no-native-tools | --tool NAME]... <command>\n");
+        try writer.writer.writeAll("usage: fx [--name TITLE] [--permission-mode auto] [--skills-dir PATH]... [--no-default-skills] [--no-project-instructions] [--system-prompt-file PATH] [--append-system-prompt-file PATH]... [--context-limit NAME=BYTES|off] [--add-dir PATH]... [--no-additional-dirs] [--state-dir DIR] [--permissions-file FILE] [--no-native-tools | --tool NAME]... <command>\n");
         try writeStderr(deps, writer.written());
         return .handled_failure;
     };
@@ -1212,6 +1238,12 @@ fn runNonInteractiveWithDeps(
         !commandSupportsLaunchPermissionPolicy(parsed_command))
     {
         try writeLaunchPermissionPolicyUsage(deps);
+        return .handled_failure;
+    }
+    if (global_args.modifiers.hasPermissionModeOverride() and
+        !commandSupportsLaunchPermissionMode(parsed_command))
+    {
+        try writeLaunchPermissionModeUsage(deps);
         return .handled_failure;
     }
     if (global_args.modifiers.hasSessionName() and
@@ -3911,6 +3943,13 @@ fn commandSupportsLaunchPermissionPolicy(command: Command) bool {
     };
 }
 
+fn commandSupportsLaunchPermissionMode(command: Command) bool {
+    return switch (command) {
+        .interactive, .resume_session => true,
+        else => false,
+    };
+}
+
 fn commandSupportsStateHome(command: Command) bool {
     return switch (command) {
         .interactive, .acp, .resume_session => true,
@@ -4143,6 +4182,13 @@ fn writeLaunchPermissionPolicyUsage(deps: RunDeps) !void {
     );
 }
 
+fn writeLaunchPermissionModeUsage(deps: RunDeps) !void {
+    try writeStderr(
+        deps,
+        "fx: --permission-mode is only supported for interactive and resume launches\n",
+    );
+}
+
 fn writeSessionNameModifierUsage(deps: RunDeps) !void {
     try writeStderr(
         deps,
@@ -4171,6 +4217,9 @@ fn globalLaunchErrorMessage(err: anyerror) ?[]const u8 {
         error.PermissionPolicyUnavailable => "--permissions-file must name a readable regular file",
         error.PermissionPolicyTooLarge => "--permissions-file exceeds the 64 KiB limit",
         error.InvalidPermissionPolicy => "--permissions-file must contain valid permission-rule JSON",
+        error.MissingLaunchPermissionModeValue => "--permission-mode requires the exact value auto",
+        error.InvalidLaunchPermissionMode => "--permission-mode requires the exact value auto",
+        error.DuplicateLaunchPermissionMode => "--permission-mode may only be specified once",
         error.MissingSessionNameValue => "--name requires a session name",
         error.DuplicateSessionName => "--name may only be specified once",
         error.EmptyTitle => "--name requires a nonblank session name",
@@ -4968,6 +5017,8 @@ test "global prompt detection scans across shared TUI and ACP controls" {
     try std.testing.expect(systemPromptFilesRequested(&.{
         @constCast("--permissions-file"),
         @constCast("/tmp/policy.json"),
+        @constCast("--permission-mode"),
+        @constCast("auto"),
         @constCast("--state-dir=/tmp/fx-state"),
         @constCast("--system-prompt-file"),
         @constCast("base.md"),
@@ -5416,6 +5467,206 @@ test "global launch permission policy owns canonical rules before the command" {
             policy_arg,
         }),
     );
+}
+
+test "global launch permission mode accepts exact auto for fresh and exact resume" {
+    const alloc = std.testing.allocator;
+
+    const fresh_result = try parseInteractiveLaunch(
+        alloc,
+        &.{ @constCast("--permission-mode"), @constCast("auto") },
+        testCommandCatalog(),
+    );
+    switch (fresh_result) {
+        .interactive => |value| {
+            var launch = value;
+            defer launch.deinit(alloc);
+            try std.testing.expect(launch.requested_resume == null);
+            try std.testing.expectEqual(
+                @as(?types.PermissionMode, .auto),
+                launch.modifiers.permission_mode_override,
+            );
+        },
+        .noninteractive => |value| {
+            var launch = value;
+            defer launch.deinit(alloc);
+            return error.TestExpectedInteractiveLaunch;
+        },
+    }
+
+    const resume_result = try parseInteractiveLaunch(
+        alloc,
+        &.{
+            @constCast("--permission-mode=auto"),
+            @constCast("resume"),
+            @constCast("session-123"),
+        },
+        testCommandCatalog(),
+    );
+    switch (resume_result) {
+        .interactive => |value| {
+            var launch = value;
+            defer launch.deinit(alloc);
+            try std.testing.expectEqual(
+                @as(?types.PermissionMode, .auto),
+                launch.modifiers.permission_mode_override,
+            );
+            switch (launch.requested_resume.?) {
+                .id => |id| try std.testing.expectEqualStrings("session-123", id),
+                .pick, .last => return error.TestExpectedExactResumeId,
+            }
+        },
+        .noninteractive => |value| {
+            var launch = value;
+            defer launch.deinit(alloc);
+            return error.TestExpectedInteractiveLaunch;
+        },
+    }
+
+    try std.testing.expectEqualStrings(
+        "resume",
+        commandAfterGlobalLaunchArgs(&.{
+            @constCast("--permission-mode"),
+            @constCast("auto"),
+            @constCast("resume"),
+            @constCast("session-123"),
+        }).?,
+    );
+
+    var omitted = try parseGlobalLaunchArgs(alloc, &.{});
+    defer omitted.deinit(alloc);
+    try std.testing.expect(omitted.modifiers.permission_mode_override == null);
+}
+
+test "global launch permission mode rejects widening duplicates and non-launch commands" {
+    const alloc = std.testing.allocator;
+    for ([_][]const [:0]const u8{
+        &.{@constCast("--permission-mode")},
+        &.{@constCast("--permission-mode=")},
+    }) |args| {
+        try std.testing.expectError(
+            error.MissingLaunchPermissionModeValue,
+            parseGlobalLaunchArgs(alloc, args),
+        );
+    }
+    for ([_][]const [:0]const u8{
+        &.{ @constCast("--permission-mode"), @constCast("ask") },
+        &.{@constCast("--permission-mode=AUTO")},
+        &.{@constCast("--permission-mode=yolo")},
+    }) |args| {
+        try std.testing.expectError(
+            error.InvalidLaunchPermissionMode,
+            parseGlobalLaunchArgs(alloc, args),
+        );
+    }
+    try std.testing.expectError(
+        error.DuplicateLaunchPermissionMode,
+        parseGlobalLaunchArgs(alloc, &.{
+            @constCast("--permission-mode=auto"),
+            @constCast("--permission-mode"),
+            @constCast("auto"),
+        }),
+    );
+
+    var capture = CaptureOutput.init(alloc);
+    defer capture.deinit();
+    const result = try runIfRequestedWithDeps(
+        alloc,
+        &.{ @constCast("--permission-mode=auto"), @constCast("status") },
+        testConfig(),
+        capture.deps(),
+    );
+    try std.testing.expectEqual(RunResult.handled_failure, result);
+    try std.testing.expectEqualStrings("", capture.stdout.written());
+    try std.testing.expectEqualStrings(
+        "fx: --permission-mode is only supported for interactive and resume launches\n",
+        capture.stderr.written(),
+    );
+}
+
+test "process-only auto permissions file matches exact AgentWorkplace MCP names" {
+    const alloc = std.testing.allocator;
+    const permissions = @import("../permissions/permissions.zig");
+    const exact_names = [_][]const u8{
+        "mcp_agentworkplace_manager_get_orientation",
+        "mcp_agentworkplace_manager_get_position_health",
+        "mcp_agentworkplace_manager_list_open_events",
+    };
+    const double_underscore_names = [_][]const u8{
+        "mcp__agentworkplace__manager__get_orientation",
+        "mcp__agentworkplace__manager__get_position_health",
+        "mcp__agentworkplace__manager__list_open_events",
+    };
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    {
+        var file = try tmp.dir.createFile(std.testing.io, "policy.json", .{});
+        defer file.close(std.testing.io);
+        try file.writeStreamingAll(
+            std.testing.io,
+            "{\"mcp_agentworkplace_manager_get_orientation\":\"allow\"," ++
+                "\"mcp_agentworkplace_manager_get_position_health\":\"allow\"," ++
+                "\"mcp_agentworkplace_manager_list_open_events\":\"allow\"}",
+        );
+    }
+    const policy_path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "policy.json");
+    defer alloc.free(policy_path);
+    const policy_arg = try alloc.dupeZ(u8, policy_path);
+    defer alloc.free(policy_arg);
+
+    const result = try parseInteractiveLaunch(
+        alloc,
+        &.{
+            @constCast("--permission-mode=auto"),
+            @constCast("--permissions-file"),
+            policy_arg,
+        },
+        testCommandCatalog(),
+    );
+    switch (result) {
+        .interactive => |value| {
+            var launch = value;
+            defer launch.deinit(alloc);
+
+            try std.testing.expectEqual(
+                @as(?types.PermissionMode, .auto),
+                launch.modifiers.permission_mode_override,
+            );
+            const policy = launch.modifiers.permission_policy.?;
+            try std.testing.expectEqual(exact_names.len, policy.rules.rules.len);
+            for (exact_names, double_underscore_names, 0..) |exact, wrong, index| {
+                try std.testing.expectEqualStrings(exact, policy.rules.rules[index].permission);
+                try std.testing.expectEqual(
+                    types.RuleDecision.allow,
+                    try permissions.ruleDecisionFor(
+                        alloc,
+                        policy.rules,
+                        "/tmp/workspace",
+                        exact,
+                        exact,
+                        .none,
+                    ),
+                );
+                try std.testing.expectEqual(
+                    types.RuleDecision.none,
+                    try permissions.ruleDecisionFor(
+                        alloc,
+                        policy.rules,
+                        "/tmp/workspace",
+                        wrong,
+                        wrong,
+                        .none,
+                    ),
+                );
+            }
+        },
+        .noninteractive => |value| {
+            var launch = value;
+            defer launch.deinit(alloc);
+            return error.TestExpectedInteractiveLaunch;
+        },
+    }
 }
 
 test "global launch name parsing owns one normalized optional title" {

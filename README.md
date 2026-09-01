@@ -169,6 +169,8 @@ JSON and quiet requests stay noninteractive by default. Add `--prompt-permission
 
 Inside a saved session, `/permissions remember <allow|deny> <tool-name> <arguments-json>` stores an exact confirmed rule without running the action. `/permissions` lists stable rule IDs, and `/permissions revoke <rule-id>` removes a stored rule even when its original workspace or file state has changed.
 
+Use `--permission-mode auto` before a fresh interactive launch or exact resume to force `auto` mode for that process. This explicit launch value overrides `FX_PERMISSION_MODE` and profile or workspace mode preferences, is not saved, and must be the exact lowercase value `auto`. Both `--permission-mode auto` and `--permission-mode=auto` are accepted.
+
 Use `--permissions-file <path>` before an interactive launch, resume command, or `acp` command to replace profile, workspace, and project permission rules for that process. The file uses the same permission-rule JSON shape as `settings.json`; saved-session exact grants still apply, but cannot override a deny from the launch policy:
 
 ```json

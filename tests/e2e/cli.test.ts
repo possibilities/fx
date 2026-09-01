@@ -306,6 +306,8 @@ describe("cli: help", () => {
       expect(r.stdout).toContain("--no-project-instructions");
       expect(r.stdout).toContain("--permissions-file <path>");
       expect(r.stdout).toContain("Replace configured rules for TUI or ACP");
+      expect(r.stdout).toContain("--permission-mode <auto>");
+      expect(r.stdout).toContain("Force auto mode for this TUI launch only");
       expect(r.stdout).toContain("-c, --continue");
       expect(r.stdout).toContain("-r");
       expect(r.stdout).toContain("Open the saved-session picker");
