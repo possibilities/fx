@@ -272,7 +272,7 @@ const HelpRole = enum {
 };
 
 pub fn matchesTopLevel(registry: TopLevelRegistry, token: []const u8, kind: TopLevelKind) bool {
-    const spec = topLevelSpec(registry, kind);
+    const spec = findTopLevelSpec(registry, kind) orelse return false;
     return matchesCommandToken(token, spec.token, spec.aliases);
 }
 
@@ -1277,10 +1277,14 @@ fn renderSlashEntries(alloc: Allocator, registry: SlashRegistry, welcome_only: b
 }
 
 fn topLevelSpec(registry: TopLevelRegistry, kind: TopLevelKind) TopLevelSpec {
+    return findTopLevelSpec(registry, kind) orelse unreachable;
+}
+
+fn findTopLevelSpec(registry: TopLevelRegistry, kind: TopLevelKind) ?TopLevelSpec {
     for (registry.specs) |spec| {
         if (spec.kind == kind) return spec;
     }
-    unreachable;
+    return null;
 }
 
 fn slashSpec(registry: SlashRegistry, kind: SlashKind) SlashSpec {

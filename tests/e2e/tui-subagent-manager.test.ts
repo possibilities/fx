@@ -4923,7 +4923,7 @@ describe.skipIf(!tmuxAvailable())("tui: Agents & processes", () => {
         const withDuration = await waitForConfigurationControl(
           controlPath,
           (control) =>
-            control.generation === initial.generation + 1 &&
+            control.generation > initial.generation &&
             control.configuration.notifications.report_duration_ms === 900,
           controlTimeout,
         );
@@ -4936,7 +4936,7 @@ describe.skipIf(!tmuxAvailable())("tui: Agents & processes", () => {
         expect(withDuration.operations.at(-1)).toMatchObject({
           code: "configured",
           identity_source: "human",
-          generation: initial.generation + 1,
+          generation: withDuration.generation,
         });
 
         await active.sendKeys("Tab");

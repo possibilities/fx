@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const io_mod = @import("../shared/io.zig");
 const session_codec = @import("../session/session_codec.zig");
 const session_store = @import("../session/session_store.zig");
@@ -7,6 +8,14 @@ const launcher = @import("launch_admission_final_launcher.zig");
 const child_runtime = @import("launch_admission_final_runtime.zig");
 
 const Allocator = std.mem.Allocator;
+
+const NativeFileIdentity = struct {
+    device_major: u64,
+    device_minor: u64,
+    inode: u64,
+    uid: u64,
+    mode: u32,
+};
 
 pub const schema_id = "fx.private-launch-provider";
 pub const schema_version: u16 = 1;
@@ -50,7 +59,7 @@ const EndpointDirectory = struct {
     dir: std.Io.Dir,
     name: []u8,
     path: []u8,
-    identity: std.c.Stat,
+    identity: NativeFileIdentity,
 
     fn create(alloc: Allocator, path: []const u8) !EndpointDirectory {
         if (!std.fs.path.isAbsolute(path)) return error.InvalidLaunchProviderConfiguration;
@@ -154,7 +163,7 @@ const EndpointDirectory = struct {
         try self.verifySocketPath(anchored);
     }
 
-    fn verifySocketPath(self: *EndpointDirectory, anchored: std.c.Stat) !void {
+    fn verifySocketPath(self: *EndpointDirectory, anchored: NativeFileIdentity) !void {
         var current = std.Io.Dir.openDirAbsolute(io_mod.getIo(), self.path, .{
             .follow_symlinks = false,
         }) catch return error.LaunchProviderDirectorySubstituted;
@@ -737,39 +746,95 @@ fn schemaVersionBestEffort(alloc: Allocator, frame: []const u8) u16 {
     return if (version == schema_version_resume_status) version else schema_version;
 }
 
-fn nativeStatFd(fd: std.posix.fd_t) !std.c.Stat {
-    while (true) {
-        var stat = std.mem.zeroes(std.c.Stat);
-        switch (std.c.errno(std.c.fstat(fd, &stat))) {
-            .SUCCESS => return stat,
-            .INTR => continue,
-            else => return error.LaunchProviderFilesystemStatFailed,
-        }
-    }
+fn nativeStatFd(fd: std.posix.fd_t) !NativeFileIdentity {
+    return switch (builtin.os.tag) {
+        .linux => nativeStatLinux(fd, "", std.os.linux.AT.EMPTY_PATH),
+        else => blk: {
+            while (true) {
+                var stat = std.mem.zeroes(std.c.Stat);
+                switch (std.c.errno(std.c.fstat(fd, &stat))) {
+                    .SUCCESS => break :blk nativeIdentityFromPosix(stat),
+                    .INTR => continue,
+                    else => return error.LaunchProviderFilesystemStatFailed,
+                }
+            }
+        },
+    };
 }
 
-fn nativeStatAt(dir_fd: std.posix.fd_t, name: [:0]const u8) !std.c.Stat {
+fn nativeStatAt(dir_fd: std.posix.fd_t, name: [:0]const u8) !NativeFileIdentity {
+    return switch (builtin.os.tag) {
+        .linux => nativeStatLinux(dir_fd, name, std.os.linux.AT.SYMLINK_NOFOLLOW),
+        else => blk: {
+            while (true) {
+                var stat = std.mem.zeroes(std.c.Stat);
+                switch (std.c.errno(std.c.fstatat(
+                    dir_fd,
+                    name.ptr,
+                    &stat,
+                    std.c.AT.SYMLINK_NOFOLLOW,
+                ))) {
+                    .SUCCESS => break :blk nativeIdentityFromPosix(stat),
+                    .INTR => continue,
+                    else => return error.LaunchProviderFilesystemStatFailed,
+                }
+            }
+        },
+    };
+}
+
+fn nativeStatLinux(
+    dir_fd: std.posix.fd_t,
+    name: [:0]const u8,
+    flags: u32,
+) !NativeFileIdentity {
+    const linux = std.os.linux;
     while (true) {
-        var stat = std.mem.zeroes(std.c.Stat);
-        switch (std.c.errno(std.c.fstatat(
+        var stat = std.mem.zeroes(linux.Statx);
+        switch (linux.errno(linux.statx(
             dir_fd,
             name.ptr,
+            flags,
+            linux.STATX.BASIC_STATS,
             &stat,
-            std.c.AT.SYMLINK_NOFOLLOW,
         ))) {
-            .SUCCESS => return stat,
+            .SUCCESS => {
+                if (!stat.mask.TYPE or !stat.mask.MODE or !stat.mask.UID or !stat.mask.INO) {
+                    return error.LaunchProviderFilesystemStatFailed;
+                }
+                return .{
+                    .device_major = stat.dev_major,
+                    .device_minor = stat.dev_minor,
+                    .inode = stat.ino,
+                    .uid = stat.uid,
+                    .mode = stat.mode,
+                };
+            },
             .INTR => continue,
             else => return error.LaunchProviderFilesystemStatFailed,
         }
     }
 }
 
-fn sameFileIdentity(a: std.c.Stat, b: std.c.Stat) bool {
-    return a.dev == b.dev and a.ino == b.ino and a.uid == b.uid;
+fn nativeIdentityFromPosix(stat: std.c.Stat) NativeFileIdentity {
+    return .{
+        .device_major = @intCast(stat.dev),
+        .device_minor = 0,
+        .inode = @intCast(stat.ino),
+        .uid = @intCast(stat.uid),
+        .mode = @intCast(stat.mode),
+    };
 }
 
-fn validateEndpointDirectory(stat: std.c.Stat) !void {
-    if (!std.c.S.ISDIR(stat.mode) or
+fn sameFileIdentity(a: NativeFileIdentity, b: NativeFileIdentity) bool {
+    return a.device_major == b.device_major and
+        a.device_minor == b.device_minor and
+        a.inode == b.inode and
+        a.uid == b.uid;
+}
+
+fn validateEndpointDirectory(stat: NativeFileIdentity) !void {
+    if (!std.posix.S.ISDIR(stat.mode) or
         stat.uid != std.c.geteuid() or
         stat.mode & 0o777 != 0o700)
     {
@@ -777,8 +842,8 @@ fn validateEndpointDirectory(stat: std.c.Stat) !void {
     }
 }
 
-fn validateSocketIdentity(stat: std.c.Stat, require_private_mode: bool) !void {
-    if (!std.c.S.ISSOCK(stat.mode) or stat.uid != std.c.geteuid()) {
+fn validateSocketIdentity(stat: NativeFileIdentity, require_private_mode: bool) !void {
+    if (!std.posix.S.ISSOCK(stat.mode) or stat.uid != std.c.geteuid()) {
         return error.LaunchProviderSocketUnsafe;
     }
     if (require_private_mode and stat.mode & 0o777 != 0o600) {
