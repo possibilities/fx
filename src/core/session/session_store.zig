@@ -1362,6 +1362,26 @@ pub const Store = struct {
         return state;
     }
 
+    /// Loads a durable session when its exact directory entry exists. Returns
+    /// null only when that entry is absent. Once an entry is observed, a later
+    /// `SessionNotFound` means incomplete or concurrently changing state and
+    /// remains an error rather than becoming evidence of durable absence.
+    pub fn loadReadOnlyIfEntryExists(
+        self: Store,
+        alloc: Allocator,
+        session_id: []const u8,
+    ) !?session_codec.DurableSessionState {
+        var entry = self.openSessionDir(session_id) catch |err| switch (err) {
+            error.SessionNotFound => return null,
+            else => return err,
+        };
+        defer entry.close();
+        return self.loadReadOnly(alloc, session_id) catch |err| switch (err) {
+            error.SessionNotFound => error.SessionStateIncomplete,
+            else => return err,
+        };
+    }
+
     /// Reads one bounded chronological history page without acquiring the
     /// session writer lock. The cursor is opaque and anchored to the history
     /// length that produced it, so later appends cannot duplicate older pages.

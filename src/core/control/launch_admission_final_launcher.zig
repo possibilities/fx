@@ -17,6 +17,15 @@ pub const SpawnMode = enum {
     recover_after_definitive_end,
 };
 
+pub const ExactResumeStatus = struct {
+    admission_key: []const u8,
+    available: bool,
+    conversation_id: []const u8,
+    launch_digest: []const u8,
+    launch_id: []const u8,
+    state_root: []const u8,
+};
+
 pub const PreparedLaunch = struct {
     alloc: Allocator,
     ledger: ledger_mod.Ledger,
@@ -123,6 +132,30 @@ pub const PreparedLaunch = struct {
             outcome,
             observed_at,
         );
+    }
+
+    /// Resolve an exact resume target through Fx's read-only durable Session
+    /// authority. A missing Session is the one semantic unavailable result;
+    /// malformed or unreadable state remains an error and must not be
+    /// classified as permanent by an external process owner.
+    pub fn exactResumeStatus(self: *PreparedLaunch) !ExactResumeStatus {
+        const conversation_id = switch (self.accepted.record.resume_target) {
+            .fresh => return error.LaunchResumeTargetNotExact,
+            .exact => |value| value,
+        };
+        return .{
+            .admission_key = self.accepted.record.admission_key,
+            .available = try durableConversationExists(
+                self.alloc,
+                self.accepted.record.state_root,
+                self.accepted.record.directory,
+                conversation_id,
+            ),
+            .conversation_id = conversation_id,
+            .launch_digest = self.accepted.record.launch_digest,
+            .launch_id = self.accepted.record.launch_id,
+            .state_root = self.accepted.record.state_root,
+        };
     }
 
     /// Builds the exact argument and correlation-environment delta for a
@@ -413,12 +446,12 @@ fn durableConversationExists(
         workspace_root,
     );
     defer store.deinit(alloc);
-    var state = store.loadReadOnly(alloc, conversation_id) catch |err| switch (err) {
-        error.SessionNotFound => return false,
-        else => return err,
-    };
-    state.deinit(alloc);
-    return true;
+    if (try store.loadReadOnlyIfEntryExists(alloc, conversation_id)) |loaded| {
+        var state = loaded;
+        state.deinit(alloc);
+        return true;
+    }
+    return false;
 }
 
 pub const FxInvocation = struct {

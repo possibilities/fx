@@ -1,5 +1,7 @@
 const std = @import("std");
 const io_mod = @import("../shared/io.zig");
+const session_codec = @import("../session/session_codec.zig");
+const session_store = @import("../session/session_store.zig");
 const public_protocol = @import("launch_admission_final.zig");
 const launcher = @import("launch_admission_final_launcher.zig");
 const child_runtime = @import("launch_admission_final_runtime.zig");
@@ -8,6 +10,7 @@ const Allocator = std.mem.Allocator;
 
 pub const schema_id = "fx.private-launch-provider";
 pub const schema_version: u16 = 1;
+pub const schema_version_resume_status: u16 = 2;
 pub const internal_mode = "--internal-launch-provider";
 pub const directory_env = "FX_INTERNAL_LAUNCH_PROVIDER_DIRECTORY";
 pub const instance_id_env = "FX_INTERNAL_LAUNCH_PROVIDER_INSTANCE_ID";
@@ -22,6 +25,7 @@ const Operation = enum {
     prepare,
     build,
     inspect,
+    resume_status,
     cancel,
     record_final,
     acknowledge_final,
@@ -30,6 +34,7 @@ const Operation = enum {
 const Request = struct {
     arena: std.heap.ArenaAllocator,
     request_id: []const u8,
+    schema_version: u16,
     operation: Operation,
     object: std.json.ObjectMap,
 
@@ -200,7 +205,13 @@ pub fn runOne(alloc: Allocator) !void {
     const frame = try readFrame(alloc, stream.socket);
     defer alloc.free(frame);
     const response = handleFrame(alloc, frame, instance_id, token) catch |err|
-        try encodeError(alloc, instance_id, requestIdBestEffort(alloc, frame), @errorName(err));
+        try encodeError(
+            alloc,
+            instance_id,
+            requestIdBestEffort(alloc, frame),
+            schemaVersionBestEffort(alloc, frame),
+            @errorName(err),
+        );
     defer alloc.free(response);
     try writeFrame(stream.socket.handle, response);
 }
@@ -217,6 +228,7 @@ pub fn handleFrame(
         .prepare => handlePrepare(alloc, request),
         .build => handleBuild(alloc, request),
         .inspect => handleInspect(alloc, request),
+        .resume_status => handleResumeStatus(alloc, request),
         .cancel => handleCancel(alloc, request),
         .record_final => handleRecordFinal(alloc, request),
         .acknowledge_final => handleAcknowledge(alloc, request),
@@ -304,6 +316,119 @@ fn handleInspect(alloc: Allocator, request: Request) ![]u8 {
     var loaded = try prepared.retained();
     defer loaded.deinit();
     return encodeInspection(alloc, request, loaded.record);
+}
+
+const resume_status_authority = "fx.private-launch-provider/resume-status-v2";
+
+fn handleResumeStatus(alloc: Allocator, request: Request) ![]u8 {
+    if (request.schema_version != schema_version_resume_status) {
+        return error.UnknownLaunchProviderOperation;
+    }
+    try requireCount(request.object, 10);
+    var prepared = try openCorrelated(alloc, request.object);
+    defer prepared.deinit();
+    const status = try prepared.exactResumeStatus();
+
+    const identity_digest = try resumeStatusIdentityDigest(alloc, status);
+    var decision_id_buffer: ["resume-status-".len + 64]u8 = undefined;
+    const decision_id = try std.fmt.bufPrint(
+        &decision_id_buffer,
+        "resume-status-{s}",
+        .{&identity_digest},
+    );
+    const decision_digest = try resumeStatusDecisionDigest(
+        alloc,
+        status,
+        decision_id,
+    );
+
+    var out = try responsePrefix(alloc, request);
+    errdefer out.deinit();
+    try out.writer.writeAll("\"result\":{\"resume_status\":{\"admission_key\":");
+    try writeString(&out.writer, status.admission_key);
+    try out.writer.writeAll(",\"authority\":\"");
+    try out.writer.writeAll(resume_status_authority);
+    try out.writer.writeAll("\",\"conversation_id\":");
+    try writeString(&out.writer, status.conversation_id);
+    try out.writer.writeAll(",\"decision_digest\":");
+    try writeString(&out.writer, &decision_digest);
+    try out.writer.writeAll(",\"decision_id\":");
+    try writeString(&out.writer, decision_id);
+    try out.writer.writeAll(",\"launch_digest\":");
+    try writeString(&out.writer, status.launch_digest);
+    try out.writer.writeAll(",\"launch_id\":");
+    try writeString(&out.writer, status.launch_id);
+    try out.writer.writeAll(",\"semantic_decision\":");
+    try writeString(&out.writer, resumeStatusSemanticDecision(status.available));
+    try out.writer.writeAll(",\"state_root\":");
+    try writeString(&out.writer, status.state_root);
+    try out.writer.writeAll(",\"status\":");
+    try writeString(&out.writer, resumeStatusName(status.available));
+    try out.writer.writeAll("}}}");
+    return out.toOwnedSlice();
+}
+
+fn resumeStatusIdentityDigest(
+    alloc: Allocator,
+    status: launcher.ExactResumeStatus,
+) ![64]u8 {
+    var canonical: std.Io.Writer.Allocating = .init(alloc);
+    defer canonical.deinit();
+    try writeResumeStatusDecisionFields(&canonical.writer, status, null);
+    return sha256Hex(canonical.written());
+}
+
+fn resumeStatusDecisionDigest(
+    alloc: Allocator,
+    status: launcher.ExactResumeStatus,
+    decision_id: []const u8,
+) ![64]u8 {
+    var canonical: std.Io.Writer.Allocating = .init(alloc);
+    defer canonical.deinit();
+    try writeResumeStatusDecisionFields(&canonical.writer, status, decision_id);
+    return sha256Hex(canonical.written());
+}
+
+fn writeResumeStatusDecisionFields(
+    writer: *std.Io.Writer,
+    status: launcher.ExactResumeStatus,
+    decision_id: ?[]const u8,
+) !void {
+    try writer.writeAll("{\"admission_key\":");
+    try writeString(writer, status.admission_key);
+    try writer.writeAll(",\"authority\":\"");
+    try writer.writeAll(resume_status_authority);
+    try writer.writeAll("\",\"conversation_id\":");
+    try writeString(writer, status.conversation_id);
+    if (decision_id) |value| {
+        try writer.writeAll(",\"decision_id\":");
+        try writeString(writer, value);
+    }
+    try writer.writeAll(",\"launch_digest\":");
+    try writeString(writer, status.launch_digest);
+    try writer.writeAll(",\"launch_id\":");
+    try writeString(writer, status.launch_id);
+    try writer.writeAll(",\"semantic_decision\":");
+    try writeString(writer, resumeStatusSemanticDecision(status.available));
+    try writer.writeAll(",\"state_root\":");
+    try writeString(writer, status.state_root);
+    try writer.writeAll(",\"status\":");
+    try writeString(writer, resumeStatusName(status.available));
+    try writer.writeByte('}');
+}
+
+fn resumeStatusName(available: bool) []const u8 {
+    return if (available) "available" else "unavailable";
+}
+
+fn resumeStatusSemanticDecision(available: bool) []const u8 {
+    return if (available) "exact_resume_available" else "exact_resume_unavailable";
+}
+
+fn sha256Hex(payload: []const u8) [64]u8 {
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(payload, &digest, .{});
+    return std.fmt.bytesToHex(digest, .lower);
 }
 
 fn handleCancel(alloc: Allocator, request: Request) ![]u8 {
@@ -485,11 +610,18 @@ fn responsePrefix(alloc: Allocator, request: Request) !std.Io.Writer.Allocating 
     try writeString(&out.writer, try objectString(request.object, "instance_id"));
     try out.writer.writeAll(",\"ok\":true,\"request_id\":");
     try writeString(&out.writer, request.request_id);
-    try out.writer.writeAll(",\"schema_id\":\"fx.private-launch-provider\",\"schema_version\":1,");
+    try out.writer.writeAll(",\"schema_id\":\"fx.private-launch-provider\",\"schema_version\":");
+    try out.writer.print("{d},", .{request.schema_version});
     return out;
 }
 
-fn encodeError(alloc: Allocator, instance_id: []const u8, request_id: ?[]u8, code: []const u8) ![]u8 {
+fn encodeError(
+    alloc: Allocator,
+    instance_id: []const u8,
+    request_id: ?[]u8,
+    request_schema_version: u16,
+    code: []const u8,
+) ![]u8 {
     defer if (request_id) |value| alloc.free(value);
     var out: std.Io.Writer.Allocating = .init(alloc);
     errdefer out.deinit();
@@ -499,7 +631,8 @@ fn encodeError(alloc: Allocator, instance_id: []const u8, request_id: ?[]u8, cod
     try writeString(&out.writer, instance_id);
     try out.writer.writeAll(",\"ok\":false,\"request_id\":");
     if (request_id) |value| try writeString(&out.writer, value) else try out.writer.writeAll("null");
-    try out.writer.writeAll(",\"schema_id\":\"fx.private-launch-provider\",\"schema_version\":1}");
+    try out.writer.writeAll(",\"schema_id\":\"fx.private-launch-provider\",\"schema_version\":");
+    try out.writer.print("{d}}}", .{request_schema_version});
     return out.toOwnedSlice();
 }
 
@@ -525,8 +658,11 @@ fn decodeRequest(alloc: Allocator, frame: []const u8, instance_id: []const u8, t
     if (value != .object) return error.InvalidLaunchProviderRequest;
     const object = value.object;
     if (!std.mem.eql(u8, try objectString(object, "schema_id"), schema_id)) return error.UnsupportedLaunchProviderSchema;
-    const version = object.get("schema_version") orelse return error.InvalidLaunchProviderRequest;
-    if (version != .number_string or !std.mem.eql(u8, version.number_string, "1")) {
+    const version_value = object.get("schema_version") orelse return error.InvalidLaunchProviderRequest;
+    if (version_value != .number_string) return error.UnsupportedLaunchProviderVersion;
+    const version = std.fmt.parseInt(u16, version_value.number_string, 10) catch
+        return error.UnsupportedLaunchProviderVersion;
+    if (version != schema_version and version != schema_version_resume_status) {
         return error.UnsupportedLaunchProviderVersion;
     }
     if (!std.mem.eql(u8, try objectString(object, "instance_id"), instance_id)) {
@@ -538,7 +674,16 @@ fn decodeRequest(alloc: Allocator, frame: []const u8, instance_id: []const u8, t
     const operation_text = try objectString(object, "operation");
     const operation = std.meta.stringToEnum(Operation, operation_text) orelse
         return error.UnknownLaunchProviderOperation;
-    return .{ .arena = arena, .request_id = request_id, .operation = operation, .object = object };
+    if (operation == .resume_status and version != schema_version_resume_status) {
+        return error.UnknownLaunchProviderOperation;
+    }
+    return .{
+        .arena = arena,
+        .request_id = request_id,
+        .schema_version = version,
+        .operation = operation,
+        .object = object,
+    };
 }
 
 fn tokensEqual(a: []const u8, b: []const u8) bool {
@@ -578,6 +723,18 @@ fn requestIdBestEffort(alloc: Allocator, frame: []const u8) ?[]u8 {
     const value = parsed.value.object.get("request_id") orelse return null;
     if (value != .string or value.string.len == 0 or value.string.len > 256) return null;
     return alloc.dupe(u8, value.string) catch null;
+}
+
+fn schemaVersionBestEffort(alloc: Allocator, frame: []const u8) u16 {
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, frame, .{
+        .duplicate_field_behavior = .@"error",
+    }) catch return schema_version;
+    defer parsed.deinit();
+    if (parsed.value != .object) return schema_version;
+    const value = parsed.value.object.get("schema_version") orelse return schema_version;
+    if (value != .integer) return schema_version;
+    const version = std.math.cast(u16, value.integer) orelse return schema_version;
+    return if (version == schema_version_resume_status) version else schema_version;
 }
 
 fn nativeStatFd(fd: std.posix.fd_t) !std.c.Stat {
@@ -732,6 +889,34 @@ fn installProviderTestEnviron() !void {
         stable_provider_test_environ = map;
     }
     io_mod.setEnvironMap(stable_provider_test_environ.?);
+}
+
+fn createProviderTestConversation(
+    alloc: Allocator,
+    state_root: []const u8,
+    conversation_id: []const u8,
+) !void {
+    var store = try session_store.Store.initFromHome(alloc, state_root, state_root);
+    defer store.deinit(alloc);
+    var state: session_codec.DurableSessionState = .{
+        .id = try alloc.dupe(u8, conversation_id),
+        .origin_workspace_root = try alloc.dupe(u8, state_root),
+        .workspace_root = try alloc.dupe(u8, state_root),
+        .created_at_ms = 10,
+        .updated_at_ms = 10,
+        .conversation_language = .literal("en"),
+        .preferences = .{
+            .model = try alloc.dupe(u8, "fixture/model"),
+            .effort = .literal("medium"),
+            .fast_mode = false,
+        },
+        .history = &.{},
+        .total_input_tokens = 0,
+        .total_output_tokens = 0,
+    };
+    defer state.deinit(alloc);
+    var writable = try store.startWritableSession(alloc, state);
+    writable.deinit(alloc);
 }
 
 test "private launch provider prepares builds inspects and records external final receipts" {
@@ -940,6 +1125,323 @@ test "private launch provider prepares builds inspects and records external fina
     const acknowledgement_response = try handleFrame(alloc, acknowledge.written(), "instance", "01234567890123456789012345678901");
     defer alloc.free(acknowledgement_response);
     try std.testing.expect(std.mem.find(u8, acknowledgement_response, "provider-ack") != null);
+}
+
+test "private launch provider v2 proves exact resume availability through durable Session authority" {
+    const alloc = std.testing.allocator;
+    try installProviderTestEnviron();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(root);
+    const conversation_id = "1788000000000-1788000000000000000-abcd1234";
+    const empty_args = [_][]const u8{};
+    const args_digest = try launcher.computeLaunchControlsDigest(alloc, &empty_args);
+    var launch_request: public_protocol.LaunchRequest = .{
+        .admission_key = "resume-status-key",
+        .conversation_name = "Resume status fixture",
+        .directory = root,
+        .effort = null,
+        .initial_work_digest = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+        .launch_digest = &([_]u8{'0'} ** 64),
+        .launch_id = "resume-status-launch",
+        .model = null,
+        .remaining_launch_controls_digest = &args_digest,
+        .request_id = "resume-status-prepare",
+        .resume_target = .{ .exact = conversation_id },
+        .state_root = root,
+    };
+    var launch_digest = try public_protocol.computeLaunchDigest(alloc, launch_request);
+    launch_request.launch_digest = &launch_digest;
+    var prepared = try launcher.PreparedLaunch.prepare(alloc, launch_request);
+    defer prepared.deinit();
+
+    var version_one = std.Io.Writer.Allocating.init(alloc);
+    defer version_one.deinit();
+    try version_one.writer.writeAll("{\"schema_id\":\"fx.private-launch-provider\",\"schema_version\":1,\"instance_id\":\"instance\",\"token\":\"01234567890123456789012345678901\",\"request_id\":\"resume-v1\",\"operation\":\"resume_status\",\"state_root\":");
+    try writeString(&version_one.writer, root);
+    try version_one.writer.writeAll(",\"admission_key\":\"resume-status-key\",\"launch_digest\":");
+    try writeString(&version_one.writer, &launch_digest);
+    try version_one.writer.writeAll(",\"launch_id\":\"resume-status-launch\"}");
+    try std.testing.expectError(
+        error.UnknownLaunchProviderOperation,
+        handleFrame(
+            alloc,
+            version_one.written(),
+            "instance",
+            "01234567890123456789012345678901",
+        ),
+    );
+
+    var version_one_inspect = std.Io.Writer.Allocating.init(alloc);
+    defer version_one_inspect.deinit();
+    try version_one_inspect.writer.writeAll("{\"schema_id\":\"fx.private-launch-provider\",\"schema_version\":1,\"instance_id\":\"instance\",\"token\":\"01234567890123456789012345678901\",\"request_id\":\"v1-prefix\",\"operation\":\"inspect\",\"state_root\":");
+    try writeString(&version_one_inspect.writer, root);
+    try version_one_inspect.writer.writeAll(",\"admission_key\":\"resume-status-key\",\"launch_digest\":");
+    try writeString(&version_one_inspect.writer, &launch_digest);
+    try version_one_inspect.writer.writeAll(",\"launch_id\":\"resume-status-launch\"}");
+    var decoded_version_one = try decodeRequest(
+        alloc,
+        version_one_inspect.written(),
+        "instance",
+        "01234567890123456789012345678901",
+    );
+    defer decoded_version_one.deinit();
+    var version_one_prefix = try responsePrefix(alloc, decoded_version_one);
+    defer version_one_prefix.deinit();
+    try std.testing.expectEqualStrings(
+        "{\"instance_id\":\"instance\",\"ok\":true,\"request_id\":\"v1-prefix\",\"schema_id\":\"fx.private-launch-provider\",\"schema_version\":1,",
+        version_one_prefix.written(),
+    );
+    const version_one_error = try encodeError(
+        alloc,
+        "instance",
+        try alloc.dupe(u8, "v1-error"),
+        schema_version,
+        "ExampleError",
+    );
+    defer alloc.free(version_one_error);
+    try std.testing.expectEqualStrings(
+        "{\"error\":{\"code\":\"ExampleError\"},\"instance_id\":\"instance\",\"ok\":false,\"request_id\":\"v1-error\",\"schema_id\":\"fx.private-launch-provider\",\"schema_version\":1}",
+        version_one_error,
+    );
+    const version_two_error = try encodeError(
+        alloc,
+        "instance",
+        try alloc.dupe(u8, "v2-error"),
+        schema_version_resume_status,
+        "ExampleError",
+    );
+    defer alloc.free(version_two_error);
+    try std.testing.expectEqualStrings(
+        "{\"error\":{\"code\":\"ExampleError\"},\"instance_id\":\"instance\",\"ok\":false,\"request_id\":\"v2-error\",\"schema_id\":\"fx.private-launch-provider\",\"schema_version\":2}",
+        version_two_error,
+    );
+
+    var unavailable_request = std.Io.Writer.Allocating.init(alloc);
+    defer unavailable_request.deinit();
+    try unavailable_request.writer.writeAll("{\"schema_id\":\"fx.private-launch-provider\",\"schema_version\":2,\"instance_id\":\"instance\",\"token\":\"01234567890123456789012345678901\",\"request_id\":\"resume-unavailable\",\"operation\":\"resume_status\",\"state_root\":");
+    try writeString(&unavailable_request.writer, root);
+    try unavailable_request.writer.writeAll(",\"admission_key\":\"resume-status-key\",\"launch_digest\":");
+    try writeString(&unavailable_request.writer, &launch_digest);
+    try unavailable_request.writer.writeAll(",\"launch_id\":\"resume-status-launch\"}");
+    const unavailable_response = try handleFrame(
+        alloc,
+        unavailable_request.written(),
+        "instance",
+        "01234567890123456789012345678901",
+    );
+    defer alloc.free(unavailable_response);
+    var unavailable_json = try std.json.parseFromSlice(std.json.Value, alloc, unavailable_response, .{});
+    defer unavailable_json.deinit();
+    const unavailable_result = unavailable_json.value.object.get("result").?.object;
+    const unavailable_proof = unavailable_result.get("resume_status").?.object;
+    try std.testing.expectEqual(@as(usize, 10), unavailable_proof.count());
+    try std.testing.expectEqualStrings("unavailable", try objectString(unavailable_proof, "status"));
+    try std.testing.expectEqualStrings(
+        "exact_resume_unavailable",
+        try objectString(unavailable_proof, "semantic_decision"),
+    );
+    const unavailable_status = try prepared.exactResumeStatus();
+    try std.testing.expect(!unavailable_status.available);
+    const unavailable_identity = try resumeStatusIdentityDigest(alloc, unavailable_status);
+    var unavailable_id_buffer: ["resume-status-".len + 64]u8 = undefined;
+    const unavailable_id = try std.fmt.bufPrint(
+        &unavailable_id_buffer,
+        "resume-status-{s}",
+        .{&unavailable_identity},
+    );
+    try std.testing.expectEqualStrings(
+        unavailable_id,
+        try objectString(unavailable_proof, "decision_id"),
+    );
+    const unavailable_digest = try resumeStatusDecisionDigest(
+        alloc,
+        unavailable_status,
+        unavailable_id,
+    );
+    try std.testing.expectEqualStrings(
+        &unavailable_digest,
+        try objectString(unavailable_proof, "decision_digest"),
+    );
+
+    const vector_status: launcher.ExactResumeStatus = .{
+        .admission_key = "vector-key",
+        .available = true,
+        .conversation_id = conversation_id,
+        .launch_digest = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        .launch_id = "vector-launch",
+        .state_root = "/tmp/vector-root",
+    };
+    const vector_identity = try resumeStatusIdentityDigest(alloc, vector_status);
+    try std.testing.expectEqualStrings(
+        "c0dcafe6ba3af7c4a65883c204f0cee6c94b84f569e925262f5d1f81f69da273",
+        &vector_identity,
+    );
+    const vector_decision_id =
+        "resume-status-c0dcafe6ba3af7c4a65883c204f0cee6c94b84f569e925262f5d1f81f69da273";
+    const vector_decision_digest = try resumeStatusDecisionDigest(
+        alloc,
+        vector_status,
+        vector_decision_id,
+    );
+    try std.testing.expectEqualStrings(
+        "9e89a9264fbed92094529d255ecc3ae2f8c5aa793dd8ea312d0993bc8f7c18ed",
+        &vector_decision_digest,
+    );
+
+    var incomplete_store = try session_store.Store.initFromHome(alloc, root, root);
+    defer incomplete_store.deinit(alloc);
+    const incomplete_path = try session_store.sessionDirPath(
+        alloc,
+        incomplete_store.sessions_dir,
+        conversation_id,
+    );
+    defer alloc.free(incomplete_path);
+    try std.Io.Dir.createDirAbsolute(
+        std.testing.io,
+        incomplete_path,
+        .fromMode(0o700),
+    );
+    try std.testing.expectError(
+        error.SessionStateIncomplete,
+        prepared.exactResumeStatus(),
+    );
+    try std.testing.expectError(
+        error.SessionStateIncomplete,
+        handleFrame(
+            alloc,
+            unavailable_request.written(),
+            "instance",
+            "01234567890123456789012345678901",
+        ),
+    );
+    try std.Io.Dir.deleteDirAbsolute(std.testing.io, incomplete_path);
+
+    var fresh_request = launch_request;
+    fresh_request.admission_key = "resume-status-fresh-key";
+    fresh_request.launch_id = "resume-status-fresh-launch";
+    fresh_request.request_id = "resume-status-fresh-prepare";
+    fresh_request.resume_target = .fresh;
+    fresh_request.launch_digest = &([_]u8{'0'} ** 64);
+    var fresh_digest = try public_protocol.computeLaunchDigest(alloc, fresh_request);
+    fresh_request.launch_digest = &fresh_digest;
+    var fresh_prepared = try launcher.PreparedLaunch.prepare(alloc, fresh_request);
+    defer fresh_prepared.deinit();
+    try std.testing.expectError(
+        error.LaunchResumeTargetNotExact,
+        fresh_prepared.exactResumeStatus(),
+    );
+    var fresh_status_request = std.Io.Writer.Allocating.init(alloc);
+    defer fresh_status_request.deinit();
+    try fresh_status_request.writer.writeAll("{\"schema_id\":\"fx.private-launch-provider\",\"schema_version\":2,\"instance_id\":\"instance\",\"token\":\"01234567890123456789012345678901\",\"request_id\":\"resume-fresh\",\"operation\":\"resume_status\",\"state_root\":");
+    try writeString(&fresh_status_request.writer, root);
+    try fresh_status_request.writer.writeAll(",\"admission_key\":\"resume-status-fresh-key\",\"launch_digest\":");
+    try writeString(&fresh_status_request.writer, &fresh_digest);
+    try fresh_status_request.writer.writeAll(",\"launch_id\":\"resume-status-fresh-launch\"}");
+    try std.testing.expectError(
+        error.LaunchResumeTargetNotExact,
+        handleFrame(
+            alloc,
+            fresh_status_request.written(),
+            "instance",
+            "01234567890123456789012345678901",
+        ),
+    );
+
+    var mismatch_request = std.Io.Writer.Allocating.init(alloc);
+    defer mismatch_request.deinit();
+    try mismatch_request.writer.writeAll("{\"schema_id\":\"fx.private-launch-provider\",\"schema_version\":2,\"instance_id\":\"instance\",\"token\":\"01234567890123456789012345678901\",\"request_id\":\"resume-mismatch\",\"operation\":\"resume_status\",\"state_root\":");
+    try writeString(&mismatch_request.writer, root);
+    try mismatch_request.writer.writeAll(",\"admission_key\":\"resume-status-key\",\"launch_digest\":");
+    try writeString(&mismatch_request.writer, &launch_digest);
+    try mismatch_request.writer.writeAll(",\"launch_id\":\"wrong-launch\"}");
+    try std.testing.expectError(
+        error.CorrelationMismatch,
+        handleFrame(
+            alloc,
+            mismatch_request.written(),
+            "instance",
+            "01234567890123456789012345678901",
+        ),
+    );
+
+    try createProviderTestConversation(alloc, root, conversation_id);
+    var available_request = std.Io.Writer.Allocating.init(alloc);
+    defer available_request.deinit();
+    try available_request.writer.writeAll("{\"schema_id\":\"fx.private-launch-provider\",\"schema_version\":2,\"instance_id\":\"instance\",\"token\":\"01234567890123456789012345678901\",\"request_id\":\"resume-available\",\"operation\":\"resume_status\",\"state_root\":");
+    try writeString(&available_request.writer, root);
+    try available_request.writer.writeAll(",\"admission_key\":\"resume-status-key\",\"launch_digest\":");
+    try writeString(&available_request.writer, &launch_digest);
+    try available_request.writer.writeAll(",\"launch_id\":\"resume-status-launch\"}");
+    const available_response = try handleFrame(
+        alloc,
+        available_request.written(),
+        "instance",
+        "01234567890123456789012345678901",
+    );
+    defer alloc.free(available_response);
+    var available_json = try std.json.parseFromSlice(std.json.Value, alloc, available_response, .{});
+    defer available_json.deinit();
+    const available_proof = available_json.value.object.get("result").?.object.get("resume_status").?.object;
+    try std.testing.expectEqualStrings("available", try objectString(available_proof, "status"));
+    try std.testing.expectEqualStrings(
+        "exact_resume_available",
+        try objectString(available_proof, "semantic_decision"),
+    );
+    try std.testing.expectEqualStrings(
+        resume_status_authority,
+        try objectString(available_proof, "authority"),
+    );
+    try std.testing.expectEqualStrings(
+        conversation_id,
+        try objectString(available_proof, "conversation_id"),
+    );
+    const available_status = try prepared.exactResumeStatus();
+    try std.testing.expect(available_status.available);
+    const available_decision_id = try objectString(available_proof, "decision_id");
+    const available_digest = try resumeStatusDecisionDigest(
+        alloc,
+        available_status,
+        available_decision_id,
+    );
+    try std.testing.expectEqualStrings(
+        &available_digest,
+        try objectString(available_proof, "decision_digest"),
+    );
+    try std.testing.expect(!std.mem.eql(u8, unavailable_id, available_decision_id));
+
+    const conversation_path = try session_store.sessionDirPath(
+        alloc,
+        incomplete_store.sessions_dir,
+        conversation_id,
+    );
+    defer alloc.free(conversation_path);
+    const authority_path = try std.fs.path.join(
+        alloc,
+        &.{ conversation_path, "authority.json" },
+    );
+    defer alloc.free(authority_path);
+    var authority = try std.Io.Dir.createFileAbsolute(
+        std.testing.io,
+        authority_path,
+        .{ .truncate = true },
+    );
+    try authority.writeStreamingAll(std.testing.io, "corrupt");
+    authority.close(std.testing.io);
+    try std.testing.expectError(
+        error.InvalidSessionFormat,
+        prepared.exactResumeStatus(),
+    );
+    try std.testing.expectError(
+        error.InvalidSessionFormat,
+        handleFrame(
+            alloc,
+            unavailable_request.written(),
+            "instance",
+            "01234567890123456789012345678901",
+        ),
+    );
 }
 
 test "private launch provider rejects wrong auth unknown fields and conflicting correlation" {

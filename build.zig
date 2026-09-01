@@ -218,6 +218,7 @@ pub fn build(b: *std.Build) void {
             "native supervisor retries final receipt persistence without reaping a second time",
             "native supervisor never starts a launch cancelled before its first Turn",
             "private launch provider prepares builds inspects and records external final receipts",
+            "private launch provider v2 proves exact resume availability through durable Session authority",
             "private launch provider rejects wrong auth unknown fields and conflicting correlation",
             "private launch provider endpoint directory is exact user-owned mode 0700",
             "durable initial Work-control admission reserves capacity before decision and publishes exact Turn",

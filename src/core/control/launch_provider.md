@@ -2,9 +2,11 @@
 
 `fx.private-launch-provider` schema version 1 is the native adapter between an
 external Fx process owner and Fx's durable `fx.launch-admission-final` schema
-version 1 authority. It is private, local, role neutral, and independently
-versioned. It does not change the frozen public fixture or authenticated
-Work-control schema version 1.
+version 1 authority. Schema version 2 preserves every version-1 operation and
+adds one read-only exact-resume status decision. The provider is private,
+local, role neutral, and independently versioned. Neither private version
+changes the frozen public fixture or authenticated Work-control schema version
+1.
 
 The provider never starts, signals, waits for, or reaps the interactive Fx
 process. Fmx's Companion remains the sole process and PTY owner. The provider
@@ -38,10 +40,10 @@ frame is a four-byte big-endian length followed by UTF-8 JSON. The caller uses
 a fresh endpoint directory for a retry after helper loss; durable operation
 recovery comes from Fx's existing launch ledger, not endpoint files.
 
-Every request has these fields:
+Every request has these fields, with `N` equal to supported version 1 or 2:
 
 ```json
-{"schema_id":"fx.private-launch-provider","schema_version":1,"instance_id":"opaque","token":"secret","request_id":"opaque","operation":"inspect"}
+{"schema_id":"fx.private-launch-provider","schema_version":N,"instance_id":"opaque","token":"secret","request_id":"opaque","operation":"inspect"}
 ```
 
 Unknown fields, duplicate keys at any private-envelope depth, wrong field
@@ -51,6 +53,7 @@ Successful responses echo `instance_id` and `request_id`, set `ok` to true,
 and carry `result`. Errors set `ok` to false and carry `error.code`. A
 public-contract message in a private field is its exact canonical public JSON
 encoded as a JSON string; the public codec validates it without translation.
+Version-1 requests receive version-1 responses byte for byte as before.
 
 ## Operations
 
@@ -97,6 +100,36 @@ returned environment.
 `inspect` adds the state root and correlation triple. It returns canonical
 public `launch_receipt`, optional `decision`, optional `final_receipt`, and
 optional `final_acknowledgement_id`. It never creates a launch.
+
+`resume_status` is available only with private schema version 2. It adds the
+state root and correlation triple and requires the retained public launch to
+name an exact resume target. Fx opens that exact Conversation through its
+read-only durable Session store. Only `SessionNotFound` produces the semantic
+`unavailable` result; malformed, unreadable, mismatched, fresh, or otherwise
+indeterminate state remains an error and is never translated into permanent
+absence. The strict result is:
+
+```json
+{"resume_status":{"admission_key":"...","authority":"fx.private-launch-provider/resume-status-v2","conversation_id":"...","decision_digest":"...","decision_id":"resume-status-...","launch_digest":"...","launch_id":"...","semantic_decision":"exact_resume_available|exact_resume_unavailable","state_root":"...","status":"available|unavailable"}}
+```
+
+The semantic decision and status must be the matching pair. The decision id is
+`resume-status-` followed by lowercase SHA-256 of the canonical UTF-8 JSON
+object containing, in canonical key order, `admission_key`, `authority`,
+`conversation_id`, `launch_digest`, `launch_id`, `semantic_decision`,
+`state_root`, and `status`. The decision digest is lowercase SHA-256 of the
+same canonical object with `decision_id` inserted after `conversation_id`;
+`decision_digest` itself is excluded. This makes the proof independently
+verifiable and stable across helper retries without treating a diagnostic
+error name as contract authority.
+
+Fmx requests status before a Companion effect for an exact-resume managed
+launch. `available` permits the ordinary build and start path but does not
+promise that a later process effect succeeds. `unavailable`, together with
+fmx's durable proof that the process did not start, is the only provider result
+that can support a permanent exact-resume outcome. A human recovery action
+rechecks the status; an old unavailable decision does not authorize fresh work
+after the Conversation becomes available.
 
 `cancel` adds `state_root` and `cancel_request`, an exact canonical public
 `admission_cancel_request`. It returns the inspection result after the one

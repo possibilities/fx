@@ -99,6 +99,7 @@ const expected_names = [_][]const u8{
     "core.control.launch_admission_final_launcher.test.native supervisor retries final receipt persistence without reaping a second time",
     "core.control.launch_admission_final_launcher.test.native supervisor never starts a launch cancelled before its first Turn",
     "core.control.launch_provider.test.private launch provider prepares builds inspects and records external final receipts",
+    "core.control.launch_provider.test.private launch provider v2 proves exact resume availability through durable Session authority",
     "core.control.launch_provider.test.private launch provider rejects wrong auth unknown fields and conflicting correlation",
     "core.control.launch_provider.test.private launch provider endpoint directory is exact user-owned mode 0700",
     "core.agent.worker_runtime.test.durable initial Work-control admission reserves capacity before decision and publishes exact Turn",
