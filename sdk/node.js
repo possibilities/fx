@@ -13,11 +13,20 @@ import {
 } from "./fx-sdk.js";
 
 export { encodeXtermKeyEvent, fxSdkApiVersion, supportsJspi, xtermAdapter };
-export const libfxApiVersion = 2;
+export const libfxApiVersion = 3;
 
 const fetchOperationStale = 0;
 const fetchOperationApplied = 1;
 const fetchOperationBackpressure = 2;
+const sessionOperationStale = 0;
+const sessionOperationApplied = 1;
+const sessionStatusSuccess = 0;
+const sessionStatusMissing = 1;
+const sessionStatusConflict = 2;
+const sessionStatusFailure = 3;
+const defaultCodexSessionTimeoutMs = 30_000;
+const profileSessionBrand = Symbol("libfx.profile-session");
+const normalizedAuthBrand = Symbol("libfx.normalized-auth");
 
 const require = createRequire(import.meta.url);
 const defaultCoreWasm = new URL("./fx-core.wasm", import.meta.url);
@@ -27,6 +36,99 @@ const defaultNativeCandidates = [
   `./libfx.${process.platform}-${process.arch}.node`,
 ];
 let nativeBackendPromise;
+
+function codexSessionTimeoutMs() {
+  const configured = process.env.FX_E2E_CODEX_SESSION_TIMEOUT_MS;
+  if (configured === undefined) return defaultCodexSessionTimeoutMs;
+  const value = Number(configured);
+  return Number.isSafeInteger(value) && value > 0 && value <= defaultCodexSessionTimeoutMs
+    ? value
+    : defaultCodexSessionTimeoutMs;
+}
+
+export function fxProfileSession(options = {}) {
+  if (!options || typeof options !== "object" || Array.isArray(options)) {
+    throw new TypeError("fxProfileSession options must be an object");
+  }
+  const keys = Object.keys(options);
+  if (keys.some((key) => key !== "home")) throw new TypeError("fxProfileSession accepts only home");
+  const home = options.home ?? homedir();
+  if (typeof home !== "string" || !isAbsolute(home)) {
+    throw new TypeError("fxProfileSession home must be an absolute path");
+  }
+  return Object.freeze({ [profileSessionBrand]: true, home });
+}
+
+function normalizeAgentAuth(options) {
+  const envApiKey = options.env?.AI_GATEWAY_API_KEY;
+  if (envApiKey !== undefined && typeof envApiKey !== "string") {
+    throw new TypeError("AI_GATEWAY_API_KEY must be a string");
+  }
+  const explicit = options.auth === undefined
+    ? []
+    : (Array.isArray(options.auth) ? options.auth : [options.auth]);
+  if (options.auth !== undefined && explicit.length === 0) {
+    throw new TypeError("auth must contain at least one provider authorization");
+  }
+
+  const entries = [];
+  const providers = new Set();
+  for (const entry of explicit) {
+    if (!entry || typeof entry !== "object" || Array.isArray(entry)) {
+      throw new TypeError("each auth entry must be an object");
+    }
+    if (entry.provider !== "gateway" && entry.provider !== "codex") {
+      throw new TypeError('auth provider must be "gateway" or "codex"');
+    }
+    if (providers.has(entry.provider)) throw new TypeError(`auth contains duplicate ${entry.provider} authorization`);
+    providers.add(entry.provider);
+    if (entry.provider === "gateway") {
+      if (Object.keys(entry).some((key) => key !== "provider" && key !== "apiKey")) {
+        throw new TypeError("Gateway auth accepts only provider and apiKey");
+      }
+      if (typeof entry.apiKey !== "string" || !entry.apiKey.length) {
+        throw new TypeError("Gateway auth requires a non-empty apiKey");
+      }
+      entries.push({ provider: "gateway", apiKey: entry.apiKey });
+      continue;
+    }
+    if (Object.keys(entry).some((key) => key !== "provider" && key !== "session")) {
+      throw new TypeError("Codex auth accepts only provider and session");
+    }
+    const session = entry.session;
+    const profile = session?.[profileSessionBrand] === true;
+    const store = session && typeof session.load === "function" && typeof session.commit === "function";
+    if (profile === store) {
+      throw new TypeError("Codex auth requires fxProfileSession() or a session store with load() and commit()");
+    }
+    entries.push({ provider: "codex", session, profile, store });
+  }
+
+  if (!providers.has("gateway") && envApiKey !== undefined) {
+    providers.add("gateway");
+    entries.push({ provider: "gateway", apiKey: envApiKey });
+  } else if (providers.has("gateway") && envApiKey !== undefined) {
+    const explicitGateway = entries.find((entry) => entry.provider === "gateway");
+    if (explicitGateway.apiKey !== envApiKey) {
+      throw new TypeError("Gateway auth conflicts with env.AI_GATEWAY_API_KEY");
+    }
+  }
+  if (entries.length === 0) entries.push({ provider: "gateway", apiKey: envApiKey });
+
+  const codex = entries.find((entry) => entry.provider === "codex");
+  const gateway = entries.find((entry) => entry.provider === "gateway");
+  const { auth: _auth, ...rest } = options;
+  const normalizedOptions = {
+    ...rest,
+    env: { ...rest.env, ...(gateway?.apiKey === undefined ? {} : { AI_GATEWAY_API_KEY: gateway.apiKey }) },
+    [normalizedAuthBrand]: {
+      initialProvider: entries[0].provider,
+      gateway,
+      codex,
+    },
+  };
+  return normalizedOptions;
+}
 
 function jspiFallbackError(surface, nativeError) {
   const nativeDetail = nativeError ? ` Native loading failed: ${nativeError.message}.` : " No compatible native addon was found.";
@@ -126,12 +228,18 @@ function validateGatewayChatUrl(value) {
 }
 
 function createNativeCoreRuntime(addon, options) {
-  const apiKey = options.env?.AI_GATEWAY_API_KEY;
+  const auth = options[normalizedAuthBrand] ?? normalizeAgentAuth(options)[normalizedAuthBrand];
+  const apiKey = auth.gateway?.apiKey;
   const model = options.env?.FX_MODEL;
   const gatewayChatUrl = options.env?.FX_GATEWAY_CHAT_URL;
   validateGatewayChatUrl(gatewayChatUrl);
   const core = addon.createCore({
-    apiKey,
+    ...(apiKey === undefined ? {} : { apiKey }),
+    provider: auth.initialProvider,
+    allowGateway: Boolean(auth.gateway),
+    allowCodex: Boolean(auth.codex),
+    ...(auth.codex?.profile ? { codexProfileHome: auth.codex.session.home } : {}),
+    codexSessionStore: Boolean(auth.codex?.store),
     home: options.home ?? homedir(),
     workspaceRoot: options.workspaceRoot ?? process.cwd(),
     ...(model === undefined ? {} : { model }),
@@ -142,9 +250,11 @@ function createNativeCoreRuntime(addon, options) {
   let lineBuffer = "";
   let settled = false;
   let fetchState = null;
+  let codexSessionState = null;
   const exited = new Promise((resolve) => { exitedResolve = resolve; });
   const abortHostEffects = () => {
     fetchState?.controller.abort();
+    codexSessionState?.controller.abort();
     try { addon.abortCoreFetch(core); } catch {}
   };
   const finish = (code) => {
@@ -200,6 +310,102 @@ function createNativeCoreRuntime(addon, options) {
       if (fetchState === state) fetchState = null;
     }
   };
+  const finishCodexSessionOperation = (request, status, bytes = Buffer.alloc(0), revision = "") => {
+    const result = addon.finishCoreCodexSessionOperation(core, request.handle, status, bytes, revision);
+    if (result !== sessionOperationApplied && result !== sessionOperationStale) {
+      throw new Error(`invalid native Codex session operation result ${result}`);
+    }
+  };
+  const pumpCodexSession = async (request) => {
+    const controller = new AbortController();
+    const state = { handle: request.handle, controller };
+    codexSessionState = state;
+    const store = auth.codex?.session;
+    let timeout;
+    let operation;
+    let operationBytes;
+    let operationSettled = true;
+    let adapterSettled = false;
+    let responseBytes;
+    const releaseState = () => {
+      if (codexSessionState === state) codexSessionState = null;
+    };
+    const settleOperation = () => {
+      operationSettled = true;
+      operationBytes?.fill(0);
+      if (adapterSettled) releaseState();
+    };
+    try {
+      if (!store || auth.codex?.profile) throw new Error("Codex host session store is unavailable");
+      operationSettled = false;
+      if (request.kind === "load") {
+        operation = Promise.resolve().then(() => store.load({ signal: controller.signal }));
+      } else {
+        operationBytes = Buffer.from(request.bytes);
+        operation = Promise.resolve().then(() => store.commit(
+          operationBytes,
+          request.expectedRevision ?? undefined,
+          { signal: controller.signal },
+        ));
+      }
+      operation.then(
+        settleOperation,
+        settleOperation,
+      );
+      const aborted = new Promise((_, reject) => {
+        controller.signal.addEventListener("abort", () => {
+          reject(controller.signal.reason ?? new DOMException("Codex session store operation aborted", "AbortError"));
+        }, { once: true });
+      });
+      timeout = setTimeout(() => {
+        const error = new Error("Codex session store operation timed out");
+        error.code = "LIBFX_CODEX_SESSION_TIMEOUT";
+        controller.abort(error);
+      }, codexSessionTimeoutMs());
+      const result = await Promise.race([
+        operation,
+        aborted,
+      ]);
+      if (request.kind === "load") {
+        if (result == null) {
+          finishCodexSessionOperation(request, sessionStatusMissing);
+        } else {
+          responseBytes = result.bytes instanceof Uint8Array ? Buffer.from(result.bytes) : null;
+          if (!responseBytes || typeof result.revision !== "string") {
+            throw new TypeError("Codex session load() must return { bytes: Uint8Array, revision: string } or null");
+          }
+          finishCodexSessionOperation(request, sessionStatusSuccess, responseBytes, result.revision);
+        }
+      } else {
+        if (typeof result?.revision !== "string") {
+          throw new TypeError("Codex session commit() must return { revision: string }");
+        }
+        finishCodexSessionOperation(request, sessionStatusSuccess, Buffer.alloc(0), result.revision);
+      }
+    } catch (error) {
+      const timedOut = error?.code === "LIBFX_CODEX_SESSION_TIMEOUT";
+      try {
+        finishCodexSessionOperation(
+          request,
+          error?.code === "FX_CODEX_SESSION_REVISION_CONFLICT" ? sessionStatusConflict : sessionStatusFailure,
+        );
+      } catch {}
+      // A host operation that ignores timeout may never settle. Close this
+      // runtime after failing the matching native operation so no later Codex
+      // request can become stranded behind a permanently quarantined pump.
+      if (timedOut) finish(1);
+    } finally {
+      if (timeout) clearTimeout(timeout);
+      request.bytes?.fill(0);
+      responseBytes?.fill(0);
+      adapterSettled = true;
+      // Abort is advisory for a host store. Keep the pump quarantined until an
+      // operation that ignored its signal actually settles, so its late side
+      // effect cannot overlap a newer load or optimistic commit.
+      if (!operation) operationBytes?.fill(0);
+      if (!operation || operationSettled) releaseState();
+    }
+  };
   const timer = setInterval(() => {
     try {
       if (fetchState) {
@@ -209,6 +415,10 @@ function createNativeCoreRuntime(addon, options) {
       } else {
         const fetchRequest = addon.takeCoreFetch(core);
         if (fetchRequest) void pumpFetch(JSON.parse(fetchRequest.toString("utf8")));
+      }
+      if (!codexSessionState) {
+        const sessionRequest = addon.takeCoreCodexSessionOperation(core);
+        if (sessionRequest) void pumpCodexSession(sessionRequest);
       }
       const chunk = addon.drainCore(core);
       if (chunk.length && lineHandler) {
@@ -248,12 +458,19 @@ function createNativeAgent(addon, options) {
 
 async function createWithFallback(surface, nativeMethod, wasmFactory, defaultWasm, options) {
   const { nativeAddon, backend = "auto", ...runtimeOptions } = options ?? {};
-  validateGatewayChatUrl(runtimeOptions.env?.FX_GATEWAY_CHAT_URL);
+  const effectiveOptions = surface === "agent" ? normalizeAgentAuth(runtimeOptions) : runtimeOptions;
+  validateGatewayChatUrl(effectiveOptions.env?.FX_GATEWAY_CHAT_URL);
   if (!new Set(["auto", "native", "wasm"]).has(backend)) {
     throw new TypeError('backend must be "auto", "native", or "wasm"');
   }
 
   let nativeError;
+  const requiresNativeCodex = surface === "agent" && Boolean(effectiveOptions[normalizedAuthBrand]?.codex);
+  if (backend === "wasm" && requiresNativeCodex) {
+    const error = new Error("Codex auth requires the native Node backend");
+    error.code = "LIBFX_CODEX_NATIVE_REQUIRED";
+    throw error;
+  }
   if (backend !== "wasm") {
     const native = await resolveNativeBackend(nativeAddon);
     nativeError = native.error;
@@ -261,9 +478,12 @@ async function createWithFallback(surface, nativeMethod, wasmFactory, defaultWas
       (surface === "agent" && typeof native.backend?.createCore === "function")) {
       try {
         if (typeof native.backend?.[nativeMethod] === "function") {
-          return await native.backend[nativeMethod](runtimeOptions);
+          const nativeOptions = surface === "agent" && runtimeOptions.auth !== undefined
+            ? { ...effectiveOptions, auth: runtimeOptions.auth }
+            : effectiveOptions;
+          return await native.backend[nativeMethod](nativeOptions);
         }
-        return await createNativeAgent(native.backend, runtimeOptions);
+        return await createNativeAgent(native.backend, effectiveOptions);
       } catch (error) {
         nativeError = error;
         if (backend === "native") throw error;
@@ -276,10 +496,15 @@ async function createWithFallback(surface, nativeMethod, wasmFactory, defaultWas
     }
   }
 
+  if (requiresNativeCodex) {
+    const error = nativeError ?? new Error("No compatible native addon was found");
+    error.code ??= "LIBFX_CODEX_NATIVE_REQUIRED";
+    throw error;
+  }
   if (!supportsJspi()) throw jspiFallbackError(surface, nativeError);
   return wasmFactory({
-    ...runtimeOptions,
-    wasm: await wasmBytes(runtimeOptions.wasm ?? defaultWasm),
+    ...effectiveOptions,
+    wasm: await wasmBytes(effectiveOptions.wasm ?? defaultWasm),
   });
 }
 

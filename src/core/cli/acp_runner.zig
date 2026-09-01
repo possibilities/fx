@@ -1,5 +1,7 @@
 const std = @import("std");
+const chatgpt_session = @import("../auth/chatgpt_session.zig");
 const config_runtime = @import("../config/config_runtime.zig");
+const model_provider = @import("../config/model_provider.zig");
 const background_process_provider = @import(
     "../execution/background_process_provider.zig",
 );
@@ -8,7 +10,10 @@ const provider_set = @import("../gateway/provider_set.zig");
 const host = @import("../hosts/host.zig");
 const mode_registry = @import("../modes/mode_registry.zig");
 const prompt_policy = @import("../config/prompt_policy.zig");
+const tool_set_contract = @import("../tooling/tool_set.zig");
+const skill_contract = @import("../skills/skill_contract.zig");
 const context_contract = @import("../workspace/context_contract.zig");
+const types = @import("../shared/types.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -35,15 +40,25 @@ pub const Config = struct {
     context_registry: context_contract.Registry,
     mode_registry: mode_registry.Registry,
     model_override: ?[]const u8 = null,
+    effort_override: ?types.ReasoningEffort = null,
+    provider_override: ?model_provider.ProviderId = null,
+    allowed_providers: std.EnumSet(model_provider.ProviderId) = .initFull(),
     credential_override: ?[]const u8 = null,
+    chatgpt_session_store: chatgpt_session.Store = chatgpt_session.default_store,
     home_override: ?[]const u8 = null,
     workspace_root_override: ?[]const u8 = null,
     log_file: ?[]const u8 = null,
     context_limit_overrides: []const config_runtime.context_limits.Override = &.{},
     additional_directories: []const []const u8 = &.{},
+    invocation_skill_roots: []const []const u8 = &.{},
     saved_directories_suppressed: bool = false,
+    skill_root_policy: skill_contract.RootPolicy = .{ .managed_root_source = null },
+    /// Borrowed invocation policy; the server duplicates it during initialize.
+    permission_rules_override: ?types.PermissionRuleSet = null,
     allow_acp_mcp: bool = true,
     allow_native_tools: bool = true,
+    native_tool_set: ?tool_set_contract.ToolSet = null,
+    project_instructions_enabled: bool = true,
 };
 
 pub const RunFn = *const fn (?*anyopaque, Allocator, Config) anyerror!void;

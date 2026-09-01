@@ -219,6 +219,7 @@ const AcpContext = struct {
         }
         var tc: tool_runtime.Context = .{
             .workspace_root = self.state.workspace_root,
+            .profile_home = self.state.cfg.home_override,
             .access_scope = self.state.workspace_access.scope(self.state.workspace_root),
             .ignored_list_entries = self.state.cfg.ignored_list_entries,
             .max_list_entries = self.state.cfg.max_list_entries,
@@ -263,6 +264,8 @@ const AcpContext = struct {
             .session = &session.session_rt,
             .session_allocator = self.alloc,
             .skills_dir = self.state.skills.dir,
+            .invocation_skill_roots = self.state.cfg.invocation_skill_roots,
+            .skill_root_policy = self.state.cfg.skill_root_policy,
             .context_limits = self.state.context_limits,
             .context_enabled = self.state.context_enabled,
             .context_registry = self.state.cfg.context_registry,
@@ -314,14 +317,9 @@ const AcpContext = struct {
     }
 
     fn toolRegistry(self: *const AcpContext) tool_dispatch.Registry {
-        return activeToolSet(self.state).registry;
+        return server.activeToolSet(self.state).registry;
     }
 };
-
-fn activeToolSet(state: *const server.ServerState) tool_set_contract.ToolSet {
-    if (comptime host_target.is_wasm) return tool_set_contract.empty;
-    return if (state.cfg.allow_native_tools) builtin_tools.advertisement_set else tool_set_contract.empty;
-}
 
 const AcpElicitationResponderContext = struct {
     const AcceptedLegacyUrl = struct {
@@ -526,7 +524,7 @@ pub fn handlePrompt(
         recovery_checkpoint = try checkpoint.dupe(alloc);
     }
 
-    var tool_projection = try state.cfg.mode_registry.buildModelToolProjection(alloc, activeToolSet(state), captured_mode, .{
+    var tool_projection = try state.cfg.mode_registry.buildModelToolProjection(alloc, server.activeToolSet(state), captured_mode, .{
         .permission_mode = captured_permission_mode,
         .permission_rules = session.permission_rules,
         .mcp_runtime = session.mcp,
@@ -682,7 +680,7 @@ pub fn runSubagentChild(
     defer ctx.deinitPublishedToolCalls();
     var child_projection = state.cfg.mode_registry.buildModelToolProjection(
         alloc,
-        builtin_tools.advertisement_set,
+        server.activeToolSet(state),
         captured_mode,
         .{
             .permission_mode = admission.permission_mode,
@@ -719,9 +717,35 @@ pub fn runSubagentChild(
         .custom_tool_guidance = child_projection.custom_guidance,
         .context_registry = state.cfg.context_registry,
         .context_enabled = state.context_enabled,
+        .project_instructions_enabled = state.cfg.project_instructions_enabled,
         .project_context = state.context_snapshot.modelVisibleBytes(),
         .lifecycle_view = state.lifecycle_view,
     }, turn, message, admission, cancel);
+}
+
+test "ACP native tool gate keeps the native set empty" {
+    var state: server.ServerState = undefined;
+    state.cfg.allow_native_tools = false;
+    state.cfg.native_tool_set = builtin_tools.advertisement_set;
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        server.activeToolSet(&state).registry.tools.len,
+    );
+    if (comptime !host_target.is_wasm) {
+        state.cfg.allow_native_tools = true;
+        state.cfg.native_tool_set = null;
+        try std.testing.expect(server.activeToolSet(&state).registry.tools.len > 0);
+        const selected = tool_set_contract.ToolSet{
+            .registry = .{ .tools = builtin_tools.registry.tools[0..1] },
+            .order = builtin_tools.advertisement_set.order[0..1],
+            .read_only_tool_names = &.{},
+        };
+        state.cfg.native_tool_set = selected;
+        try std.testing.expectEqual(
+            @as(usize, 1),
+            server.activeToolSet(&state).registry.tools.len,
+        );
+    }
 }
 
 fn refreshProjectContext(
@@ -736,7 +760,9 @@ fn refreshProjectContext(
 
     state.context_snapshot = state.cfg.context_registry.gatherDefaultSnapshot(alloc, .{
         .workspace_root = state.workspace_root,
+        .profile_home = state.cfg.home_override,
         .access_scope = state.workspace_access.scope(state.workspace_root),
+        .project_instructions_enabled = state.cfg.project_instructions_enabled,
         .targets = targets,
         .omissions = omissions,
         .omission_summary = omission_summary,
@@ -983,6 +1009,7 @@ fn agentRuntimeDeps(ctx: *AcpContext) agent_runtime.AgentRuntimeDeps {
         .tool_registry = ctx.toolRegistry(),
         .context_registry = ctx.state.cfg.context_registry,
         .context_enabled = ctx.state.context_enabled,
+        .project_instructions_enabled = ctx.state.cfg.project_instructions_enabled,
         .finalize_turn = finalizeTurn,
         .release_agent_terminal_lease = releaseAgentTerminalLease,
         .prepare_parent_turn_context = prepareParentTurnContext,
@@ -1225,7 +1252,7 @@ fn validateToolCall(raw_ctx: *anyopaque, arena: Allocator, call: ToolCall) !agen
     const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
     if (ctx.state.active_session) |session| {
         const mode = ctx.captured_mode orelse session.mode;
-        if (try ctx.state.cfg.mode_registry.toolPolicyDeniedJson(arena, activeToolSet(ctx.state), mode, call.name)) |reason| {
+        if (try ctx.state.cfg.mode_registry.toolPolicyDeniedJson(arena, server.activeToolSet(ctx.state), mode, call.name)) |reason| {
             return .{ .failure = reason };
         }
     }
@@ -3528,6 +3555,46 @@ test "ACP refreshes typed registry context and propagates enabled gathering erro
     );
     try std.testing.expectEqual(@as(usize, 3), AcpContextRegistryFixture.gather_calls);
     try std.testing.expect(state.context_snapshot.contribution == null);
+}
+
+test "fxnk ACP project instruction suppression retains runtime context" {
+    const alloc = std.testing.allocator;
+    AcpContextRegistryFixture.reset();
+
+    var state = try initTestAcpState(alloc, "/tmp/workspace", .ask);
+    defer state.deinit();
+    state.cfg.project_instructions_enabled = false;
+
+    try refreshProjectContext(&state, alloc, &.{}, &.{}, null);
+    try std.testing.expectEqual(@as(usize, 0), AcpContextRegistryFixture.gather_calls);
+    try std.testing.expect(state.context_snapshot.contribution == null);
+
+    var ctx = AcpContext{
+        .alloc = alloc,
+        .state = &state,
+        .session_id = state.active_session.?.session_id,
+        .captured_permission_mode = .auto,
+    };
+    const deps = agentRuntimeDeps(&ctx);
+    try std.testing.expect(deps.context_enabled);
+    try std.testing.expect(!deps.project_instructions_enabled);
+
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var messages: std.ArrayList(ChatMessage) = .empty;
+    defer messages.deinit(arena);
+
+    try deps.append_static_context.?(deps.ctx, arena, &messages);
+    try deps.append_runtime_context(deps.ctx, arena, &messages);
+
+    try std.testing.expectEqualStrings("", AcpContextRegistryFixture.static_context.?);
+    try std.testing.expectEqual(@as(usize, 1), AcpContextRegistryFixture.transient_calls);
+    try std.testing.expectEqual(
+        PermissionMode.auto,
+        AcpContextRegistryFixture.transient_permission_mode orelse return error.TestExpectedEqual,
+    );
+    try std.testing.expectEqualStrings("ACP registry transient", messages.items[messages.items.len - 1].content.?);
 }
 
 test "ACP prompt propagates context provider errors before pending prompt state" {

@@ -58,11 +58,13 @@ pub const top_level_specs = [_]TopLevelSpec{
     .{
         .kind = .acp,
         .token = "acp",
-        .usage = "acp [--model <id>] [--log-file <path>]",
+        .usage = "acp [--model <id>] [--effort <name>] [--log-file <path>] [--no-acp-mcp]",
         .summary = "Start an ACP server over stdio",
         .options = &.{
             .{ .flag = "--model <id>", .description = "Override the default model" },
+            .{ .flag = "--effort <name>", .description = "Override reasoning effort without saving" },
             .{ .flag = "--log-file <path>", .description = "Write ACP logs to a file" },
+            .{ .flag = "--no-acp-mcp", .description = "Reject client-supplied MCP servers for this server" },
         },
     },
     .{
@@ -292,6 +294,16 @@ pub const top_level_specs = [_]TopLevelSpec{
             "Additional directories are stored for the current primary workspace.",
         },
     },
+    .{
+        .kind = .structured_inference,
+        .token = "structured-inference",
+        .usage = "structured-inference [--state-root <absolute-path>]",
+        .summary = "Run one internal structured Codex subscription request",
+        .options = &.{
+            .{ .flag = "--state-root <absolute-path>", .description = "Override the private receipt-ledger root" },
+        },
+        .hidden_from_top_level_help = true,
+    },
 };
 
 pub const top_level_help_default_width = command_specs.top_level_help_default_width;
@@ -337,6 +349,22 @@ pub const top_level_help_groups = [_]TopLevelHelpGroup{
 
 pub const top_level_flags = [_]TopLevelFlag{
     .{
+        .usage = "--system-prompt-file <path>",
+        .description = "Replace launch system prompt from UTF-8 file",
+    },
+    .{
+        .usage = "--append-system-prompt-file <path>",
+        .description = "Append UTF-8 system prompt file; repeatable",
+    },
+    .{
+        .usage = "--skills-dir <path>",
+        .description = "Load an invocation skill root; repeatable",
+    },
+    .{
+        .usage = "--name <title>",
+        .description = "Name a launched or resumed conversation",
+    },
+    .{
         .usage = "--context-limit <spec>",
         .description = "Set name=bytes|off; repeatable",
     },
@@ -347,6 +375,30 @@ pub const top_level_flags = [_]TopLevelFlag{
     .{
         .usage = "--no-additional-dirs",
         .description = "Ignore saved additional directories",
+    },
+    .{
+        .usage = "--no-native-tools",
+        .description = "Disable native tools for TUI or ACP",
+    },
+    .{
+        .usage = "--tool <name>",
+        .description = "Allow only this native tool; repeatable",
+    },
+    .{
+        .usage = "--no-default-skills",
+        .description = "Use only --skills-dir roots",
+    },
+    .{
+        .usage = "--no-project-instructions",
+        .description = "Ignore repository instructions for TUI or ACP",
+    },
+    .{
+        .usage = "--state-dir <path>",
+        .description = "Use an isolated Fx profile and prompt for TUI or ACP",
+    },
+    .{
+        .usage = "--permissions-file <path>",
+        .description = "Replace configured rules for TUI or ACP",
     },
     .{
         .usage = "-c, --continue",

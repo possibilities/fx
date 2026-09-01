@@ -16,6 +16,7 @@ const secret = @import("core/auth/secret.zig");
 const model_cache_runtime = @import("core/app/model_cache_runtime.zig");
 const usage_dashboard_runtime = @import("core/app/usage_dashboard_runtime.zig");
 const app_auth_runtime = @import("core/app/app_auth_runtime.zig");
+const app_external_editor_runtime = @import("core/app/app_external_editor_runtime.zig");
 const app_host_config_runtime = @import("core/app/app_host_config_runtime.zig");
 const app_entry_runtime = @import("core/app/app_entry_runtime.zig");
 const acp_runner = @import("core/cli/acp_runner.zig");
@@ -33,8 +34,10 @@ const app_agent_runtime = @import("core/app/app_agent_runtime.zig");
 const app_runtime_setup = @import("core/app/app_runtime_setup.zig");
 const app_render_runtime = @import("core/app/app_render_runtime.zig");
 const app_session_runtime = @import("core/app/app_session_runtime.zig");
+const app_session_naming_runtime = @import("core/app/app_session_naming_runtime.zig");
 const app_upgrade_runtime = @import("core/app/app_upgrade_runtime.zig");
 const app_worker_runtime = @import("core/app/app_worker_runtime.zig");
+const app_work_control_runtime = @import("core/app/app_work_control_runtime.zig");
 const app_workspace_runtime = @import("core/app/app_workspace_runtime.zig");
 const app_callbacks = @import("core/app/app_callbacks.zig");
 const app_commands = @import("core/app/app_commands.zig");
@@ -58,6 +61,7 @@ const provider_set = @import("core/gateway/provider_set.zig");
 const provider_catalog = @import("core/auth/provider_catalog.zig");
 const vercel_model_policy = @import("gateway/vercel_model_policy.zig");
 const model_catalog = @import("core/gateway/model_catalog.zig");
+const session_naming_runtime = @import("core/session/session_naming.zig");
 const agent_stream_provider = @import("core/agent/stream_provider.zig");
 const builtin_hooks = @import("builtins/hooks.zig");
 const builtin_mcp = @import("builtins/mcp.zig");
@@ -69,6 +73,7 @@ const js_host_url_opener = @import("core/hosts/js_host_url_opener.zig");
 const js_host_workspace = @import("core/hosts/js_host_workspace.zig");
 const host_target = @import("core/hosts/target.zig");
 const native_host = @import("core/hosts/native.zig");
+const native_external_editor = @import("core/hosts/native_external_editor.zig");
 const debug_trace = @import("core/shared/debug_trace.zig");
 const display_width = @import("core/shared/display_width.zig");
 const file_index_mod = @import("core/workspace/file_index.zig");
@@ -87,6 +92,9 @@ const github_publish = @import("core/github/github_publish.zig");
 const subagent_domain = @import("core/subagent/domain.zig");
 const subagent_execution = @import("core/subagent/execution.zig");
 const types = @import("core/shared/types.zig");
+const work_control = @import("core/control/work_control.zig");
+const launch_admission_final_runtime = @import("core/control/launch_admission_final_runtime.zig");
+const launch_provider = @import("core/control/launch_provider.zig");
 const image_attachments = @import("core/images/image_attachments.zig");
 const permissions = @import("core/permissions/permissions.zig");
 const command_runner = @import("core/execution/command_runner.zig");
@@ -124,6 +132,7 @@ const tool_admission = @import("core/tooling/tool_admission.zig");
 const tool_projection = @import("core/tooling/tool_projection.zig");
 const command_output_content = @import("core/tooling/command_output_content.zig");
 const tool_dispatch = @import("core/tooling/tool_dispatch.zig");
+const tool_selection = @import("core/tooling/tool_selection.zig");
 const tool_set_contract = @import("core/tooling/tool_set.zig");
 const tool_mcp_runtime = @import("core/tooling/tool_mcp_runtime.zig");
 const tool_runtime = @import("core/tooling/tool_runtime.zig");
@@ -375,6 +384,14 @@ else
 const wasm_skill_root_policy: @import("core/skills/skill_contract.zig").RootPolicy = .{
     .managed_root_source = null,
 };
+const native_tool_selection_aliases = [_]tool_selection.Alias{.{
+    .token = "terminal:exec",
+    .tool = builtin_tools.terminalExecOnlySpec(),
+}};
+const native_tool_selection_catalog = tool_selection.Catalog{
+    .default_set = builtin_tools.advertisement_set,
+    .aliases = &native_tool_selection_aliases,
+};
 fn currentBuild() update_target.CurrentBuild {
     return .{
         .channel = compiled_update_channel,
@@ -392,6 +409,7 @@ const App = struct {
     const Self = @This();
     const AgentAppRuntime = app_agent_runtime.Runtime(Self);
     const AuthAppRuntime = app_auth_runtime.Runtime(Self);
+    const ExternalEditorAppRuntime = app_external_editor_runtime.Runtime(Self);
     const HostConfigAppRuntime = app_host_config_runtime.Runtime(Self);
     const BootstrapAppRuntime = app_bootstrap_runtime.Runtime(Self);
     const InputAppRuntime = app_input_runtime.Runtime(Self);
@@ -400,15 +418,21 @@ const App = struct {
         Self,
         builtin_hooks.notifications.provider(Self),
     );
-    const HerdrAppRuntime = builtin_hooks.Runtime(Self);
+    const LifecycleAppRuntime = builtin_hooks.Runtime(Self);
     const RenderAppRuntime = app_render_runtime.Runtime(Self);
     const SessionAppRuntime = app_session_runtime.Runtime(Self);
+    const SessionNamingAppRuntime = app_session_naming_runtime.Runtime(Self);
     const UpgradeAppRuntime = app_upgrade_runtime.Runtime(Self);
     const WorkerAppRuntime = app_worker_runtime.Runtime(Self);
+    const WorkControlAppRuntime = app_work_control_runtime.Runtime(Self);
     const WorkspaceAppRuntime = app_workspace_runtime.Runtime(Self);
 
     pub fn contextRegistry(_: *const Self) context_contract.Registry {
         return default_context_registry;
+    }
+
+    pub fn editedPathObserver(self: *Self) ?tool_runtime.EditedPathObserver {
+        return LifecycleAppRuntime.editedPathObserver(self);
     }
 
     pub fn workspaceHostInfo(self: *const Self) ?*const js_host_workspace.Info {
@@ -421,8 +445,10 @@ const App = struct {
         return null;
     }
 
-    pub fn promptPolicy(_: *const Self) prompt_policy.Policy {
-        return builtin_context.prompt_policy;
+    pub fn promptPolicy(self: *const Self) prompt_policy.Policy {
+        var policy = builtin_context.prompt_policy;
+        if (self.system_prompt_override) |prompt| policy.system_prompt = prompt;
+        return policy;
     }
 
     pub fn slashRegistry(_: *const Self) command_specs.SlashRegistry {
@@ -444,6 +470,13 @@ const App = struct {
             js_host_url_opener.opener
         else
             host.unavailable_url_opener;
+    }
+
+    pub fn externalEditor(_: *const Self) host.ExternalEditor {
+        return if (comptime host_profile.external_editor)
+            native_external_editor.external_editor
+        else
+            host.unavailable_external_editor;
     }
 
     pub fn creditsProvider(self: *const Self) gateway_provider.CreditsProvider {
@@ -503,6 +536,10 @@ const App = struct {
         return ui_render.terminalTitleFor(&self.shell.stdout_file);
     }
 
+    pub fn requiresDurableLaunchSession(self: *const Self) bool {
+        return self.launch_admission_context != null;
+    }
+
     alloc: Allocator,
     terminal: TerminalState = .{},
 
@@ -514,11 +551,15 @@ const App = struct {
     provider_selection: provider_runtime.Runtime = provider_runtime.Runtime.init(std.heap.c_allocator),
     model_cache: model_cache_runtime.Runtime = model_cache_runtime.Runtime.init(std.heap.c_allocator, builtin_gateway.models_path),
     usage_dashboard: usage_dashboard_runtime.Runtime = usage_dashboard_runtime.Runtime.init(std.heap.c_allocator),
+    /// Explicit Fx profile home; child processes continue to inherit real HOME.
+    profile_home: ?[]const u8 = null,
     workspace_root: []u8 = &.{},
     workspace_identity: statusline_identity.Runtime = .{},
     workspace_host: WorkspaceHostRuntime = .{},
     workspace: app_workspace_runtime.State = .{},
     permission_engine: PermissionEngine = .{},
+    /// Prevent ambient allowlist reloads from replacing invocation policy.
+    launch_permission_policy_active: bool = false,
     permission_state: app_permission_runtime.State = .{},
     agent_step_limit: usize = default_max_agent_steps,
     web_fetch_runtime: web_fetch_runtime.Runtime = web_fetch_runtime.Runtime.init(.{}),
@@ -529,6 +570,8 @@ const App = struct {
     lifecycle_runtime: hooks.Runtime = hooks.Runtime.init(std.heap.c_allocator),
     lifecycle_view: hooks.RuntimeView = hooks.RuntimeView.empty(),
     notifications: builtin_hooks.notifications.State = .{},
+    lifecycle_state: builtin_hooks.lifecycle_state.Reducer = .{},
+    ade_events: builtin_hooks.ade_events.Client = .{},
     herdr: builtin_hooks.Client = .{},
 
     session: SessionRuntime = SessionRuntime.initWithProviders(
@@ -539,8 +582,11 @@ const App = struct {
             .{},
     ),
     session_persistence: app_session_runtime.Persistence = .{},
+    session_naming: session_naming_runtime.Runtime = .{},
+    pending_launch_session_name: app_session_naming_runtime.PendingLaunchName = .{},
     prompt_history: PromptHistoryRuntime = .{},
     requested_resume: ?cli_surface.ResumeTarget = null,
+    system_prompt_override: ?[]u8 = null,
     approval_prompt: ApprovalPrompt = .{},
     approval_screen: ApprovalScreenState = .{},
     question_prompt: QuestionPrompt = .{},
@@ -557,6 +603,8 @@ const App = struct {
 
     worker_thread: ?std.Thread = null,
     worker: WorkerRuntime = .{},
+    work_control: work_control.Endpoint = .{},
+    launch_admission_context: ?launch_admission_final_runtime.ChildContext = null,
     background: BackgroundRuntime = .{},
     terminal_client: terminal_client_runtime.Runtime = .{},
     terminal_direct: terminal_direct_runtime.Runtime = .{},
@@ -566,9 +614,15 @@ const App = struct {
     change_tracker: change_tracker_mod.ChangeTracker = .{},
     mcp: app_mcp_runtime.State = .{},
     skills: skill_runtime.Runtime = .{},
+    invocation_skill_roots: [][]u8 = &.{},
+    skill_root_policy: @import("core/skills/skill_contract.zig").RootPolicy = builtin_skills.root_policy,
     context_snapshot: context_contract.GatheredContextSnapshot = .{},
     file_index: file_index_mod.FileIndex = .{},
     context_enabled: bool = true,
+    allow_native_tools: bool = true,
+    native_tool_selection: tool_selection.Resolved =
+        tool_selection.Resolved.borrowed(builtin_tools.advertisement_set),
+    project_instructions_enabled: bool = true,
     context_limits: config_runtime.context_limits.Values = .{},
     fast_mode: bool = false,
     auto_upgrade_enabled: bool = true,
@@ -591,6 +645,7 @@ const App = struct {
         _: Allocator,
         _: []const u8,
         _: @import("core/mcp/elicitation.zig").Capabilities,
+        _: ?[]const u8,
     ) !?*mcp_runtime_mod.McpRuntime {
         return null;
     }
@@ -612,6 +667,8 @@ const App = struct {
                 background_process_provider.unavailable_provider
             else
                 background_process.provider),
+            .allow_native_tools = launch.modifiers.allow_native_tools,
+            .project_instructions_enabled = launch.modifiers.project_instructions_enabled,
         };
         auth_runtime.Runtime.initInto(
             &app.auth,
@@ -621,6 +678,34 @@ const App = struct {
         );
         usage_dashboard_runtime.Runtime.initInto(&app.usage_dashboard, std.heap.c_allocator);
         app_session_runtime.Persistence.initInto(&app.session_persistence);
+        app.skill_root_policy = launch.modifiers.skillRootPolicy(if (comptime host_target.is_wasm)
+            wasm_skill_root_policy
+        else
+            builtin_skills.root_policy);
+        if (comptime !host_target.is_wasm) {
+            app.launch_admission_context = try launch_admission_final_runtime.ChildContext.fromEnvironment(alloc);
+            if (app.launch_admission_context) |*context| {
+                const requested_exact_id: ?[]const u8 = if (launch.requested_resume) |target|
+                    switch (target) {
+                        .id => |id| id,
+                        .pick, .last => null,
+                    }
+                else
+                    null;
+                context.validateInteractiveResume(
+                    launch.requested_resume != null,
+                    requested_exact_id,
+                ) catch |err| {
+                    context.deinit();
+                    app.launch_admission_context = null;
+                    return err;
+                };
+            }
+        }
+        errdefer if (app.launch_admission_context) |*context| {
+            context.deinit();
+            app.launch_admission_context = null;
+        };
         if (comptime host_profile.js_host_workspace) {
             app.workspace_host = js_host_workspace.Runtime.init(alloc) catch |err| blk: {
                 if (err != error.WorkspaceUnavailable) {
@@ -637,7 +722,15 @@ const App = struct {
                 );
             }
         }
+        app.profile_home = launch.modifiers.state_home;
+        app.mcp.setProfileHome(app.profile_home);
+        app.auth.setProfileHome(app.profile_home);
         app.shell.max_transcript_bytes = max_transcript_bytes;
+        SessionNamingAppRuntime.adoptPendingLaunchName(
+            &app,
+            &launch.modifiers.session_name,
+        );
+        errdefer SessionNamingAppRuntime.discardPendingLaunchName(&app);
         if (launch.requested_resume) |target| {
             app.requested_resume = target;
             launch.requested_resume = null;
@@ -651,11 +744,34 @@ const App = struct {
             handle_sigwinch,
             .{
                 .load_mcp_runtime = if (comptime host_target.is_wasm) loadNoMcpRuntime else builtin_mcp.loadRuntime,
-                .skill_root_policy = if (comptime host_target.is_wasm) wasm_skill_root_policy else builtin_skills.root_policy,
+                .skill_root_policy = app.skill_root_policy,
+                .invocation_skill_roots = launch.modifiers.invocation_skill_roots,
                 .terminal_title = app.terminalTitle(),
             },
         );
+        app.invocation_skill_roots = launch.modifiers.takeInvocationSkillRoots();
         errdefer app.deinit();
+        app.system_prompt_override = launch.modifiers.takeEffectiveSystemPrompt();
+        if (comptime !host_target.is_wasm) {
+            try app.work_control.configureFromEnvironment();
+            if (app.launch_admission_context != null and
+                !app.work_control.configured())
+            {
+                return error.LaunchAdmissionRequiresWorkControl;
+            }
+        }
+        app.native_tool_selection = try tool_selection.resolve(
+            alloc,
+            native_tool_selection_catalog,
+            launch.modifiers.selected_native_tools,
+        );
+        if (launch.modifiers.permission_policy) |policy| {
+            app.permission_engine.replaceRules(
+                app.alloc,
+                try types.dupePermissionRuleSet(app.alloc, policy.rules),
+            );
+            app.launch_permission_policy_active = true;
+        }
         try WorkspaceAppRuntime.applyLaunch(
             &app,
             launch.modifiers.additional_directories,
@@ -673,6 +789,11 @@ const App = struct {
                     try SessionAppRuntime.resumeRequestedSession(&app);
                 }
                 SessionAppRuntime.syncTerminalTitle(&app);
+            }
+        }
+        if (comptime host_profile.durable_sessions) {
+            if (app.session_persistence.writable != null) {
+                try SessionNamingAppRuntime.applyPendingLaunchName(&app);
             }
         }
         if (comptime host_profile.durable_sessions) {
@@ -700,14 +821,62 @@ const App = struct {
     }
 
     pub fn configureNotifications(self: *App) !void {
-        // Register herdr hooks before NotificationAppRuntime.configure freezes
-        // the lifecycle runtime (its call to freeze() is the sole freeze site).
-        try HerdrAppRuntime.configure(self, SessionAppRuntime.activeSessionId(self));
+        // Register built-in observers before NotificationAppRuntime.configure
+        // freezes the lifecycle runtime (its call to freeze() is the sole
+        // freeze site).
+        try LifecycleAppRuntime.configure(self, SessionAppRuntime.activeSessionId(self));
+        if (SessionAppRuntime.durableCachedSessionTitle(self)) |title| {
+            LifecycleAppRuntime.reportSessionMetadataChanged(self, title);
+        }
         try NotificationAppRuntime.configure(self);
+    }
+
+    pub fn configureSessionNaming(
+        self: *App,
+        config: session_naming_runtime.Config,
+    ) void {
+        SessionNamingAppRuntime.configure(self, config);
+    }
+
+    pub fn reportSessionIdentityChanged(self: *App, session_id: ?[]const u8) void {
+        SessionNamingAppRuntime.invalidate(self);
+        LifecycleAppRuntime.reportSessionChanged(self, session_id);
+        if (SessionAppRuntime.durableCachedSessionTitle(self)) |title| {
+            LifecycleAppRuntime.reportSessionMetadataChanged(self, title);
+        }
+    }
+
+    pub fn reportSessionMetadataChanged(self: *App, title: []const u8) void {
+        LifecycleAppRuntime.reportSessionMetadataChanged(self, title);
+    }
+
+    pub fn cancelPendingSessionName(self: *App) void {
+        SessionNamingAppRuntime.invalidate(self);
+    }
+
+    pub fn applyPendingLaunchSessionName(self: *App) !void {
+        try SessionNamingAppRuntime.applyPendingLaunchName(self);
+    }
+
+    pub fn discardPendingLaunchSessionName(self: *App) void {
+        SessionNamingAppRuntime.discardPendingLaunchName(self);
+    }
+
+    pub fn clonePendingLaunchSessionNameForRelaunch(
+        self: *const App,
+        alloc: Allocator,
+    ) Allocator.Error!?[]u8 {
+        return SessionNamingAppRuntime.clonePendingLaunchNameForRelaunch(
+            self,
+            alloc,
+        );
     }
 
     pub fn rebindAfterInit(self: *App) void {
         SessionAppRuntime.rebindSubagentHost(self);
+        if (self.launch_admission_context) |*context| {
+            self.worker.setDurableInitialAdmissionHook(context.workerHook());
+        }
     }
 
     pub fn setNotificationPreferences(
@@ -770,8 +939,83 @@ const App = struct {
         self: *App,
         turn_id: u64,
         kind: hooks.AttentionKind,
+        child_session_id: ?[]const u8,
     ) void {
-        NotificationAppRuntime.dispatchAttentionRequired(self, turn_id, kind);
+        self.dispatchAttentionRequiredTokenized(turn_id, kind, child_session_id, null);
+    }
+
+    pub fn dispatchAttentionRequiredTokenized(
+        self: *App,
+        turn_id: u64,
+        kind: hooks.AttentionKind,
+        child_session_id: ?[]const u8,
+        attention_token: ?hooks.AttentionToken,
+    ) void {
+        agent_runtime.dispatchAttentionRequiredCheckpoint(.{
+            .view = self.lifecycle_view,
+            .scope = self.attentionScope(child_session_id),
+            .outcome_allocator = self.alloc,
+        }, .{
+            .turn_id = if (child_session_id == null) turn_id else null,
+            .kind = kind,
+            .presented_interactively = true,
+            .attention_token = attention_token,
+        });
+    }
+
+    pub fn dispatchAttentionResolved(
+        self: *App,
+        turn_id: u64,
+        kind: hooks.AttentionKind,
+        child_session_id: ?[]const u8,
+    ) void {
+        self.dispatchAttentionResolvedTokenized(turn_id, kind, child_session_id, null);
+    }
+
+    pub fn dispatchAttentionResolvedTokenized(
+        self: *App,
+        turn_id: u64,
+        kind: hooks.AttentionKind,
+        child_session_id: ?[]const u8,
+        attention_token: ?hooks.AttentionToken,
+    ) void {
+        agent_runtime.dispatchAttentionResolvedCheckpoint(.{
+            .view = self.lifecycle_view,
+            .scope = self.attentionScope(child_session_id),
+            .outcome_allocator = self.alloc,
+        }, .{
+            .turn_id = if (child_session_id == null) turn_id else null,
+            .kind = kind,
+            .presented_interactively = true,
+            .attention_token = attention_token,
+        });
+    }
+
+    pub fn invalidateSubagentAttentionToken(
+        self: *App,
+        child_session_id: []const u8,
+        attention_token: hooks.AttentionToken,
+    ) void {
+        _ = self.lifecycle_state.closeAttentionToken(
+            .{ .subagent_session = child_session_id },
+            .permission,
+            attention_token,
+        );
+    }
+
+    fn attentionScope(
+        self: *App,
+        child_session_id: ?[]const u8,
+    ) hooks.Scope {
+        return if (child_session_id) |session_id| .{
+            .kind = .subagent,
+            .workspace_root = self.workspace_root,
+            .session_id = session_id,
+        } else .{
+            .kind = .interactive,
+            .workspace_root = self.workspace_root,
+            .session_id = SessionAppRuntime.activeSessionId(self),
+        };
     }
 
     /// Must be called after init() returns so the AutoUpgrade thread
@@ -780,6 +1024,13 @@ const App = struct {
         if (self.auto_upgrade_enabled) {
             self.upgrader.start(self.alloc, currentBuild());
         }
+    }
+
+    /// Starts only after init() returns so the listener retains the final App
+    /// address through its pending main-loop handoff.
+    pub fn startWorkControl(self: *App) !void {
+        if (comptime host_target.is_wasm) return;
+        try self.work_control.start();
     }
 
     pub fn applyReadyUpgradeShortcut(self: *App) !void {
@@ -831,9 +1082,11 @@ const App = struct {
     fn deinitImpl(self: *App, capture_resume_handoff: bool) ?app_session_runtime.ResumeHandoff {
         // Client.deinit releases the herdr pane (clear agent + label) when enabled.
         self.herdr.deinit();
+        if (comptime !host_target.is_wasm) self.work_control.deinit();
         self.stopStream();
 
         self.worker.requestShutdown();
+        SessionNamingAppRuntime.requestStop(self);
         self.background.requestStop();
         self.upgrader.stop();
         self.file_index.requestStop();
@@ -841,6 +1094,9 @@ const App = struct {
         self.terminal_takeover.shutdown(App, self);
         self.releaseTerminal();
         if (self.worker_thread) |thread| thread.join();
+        SessionNamingAppRuntime.deinit(self);
+        SessionNamingAppRuntime.discardPendingLaunchName(self);
+        self.notifications.deinit();
         self.terminal_takeover.deinit(self.alloc);
         const direct_deinit_disposition = if (capture_resume_handoff)
             self.terminal_direct.deinitSettled(self.alloc)
@@ -861,9 +1117,13 @@ const App = struct {
         };
         self.background.deinit(std.heap.c_allocator);
         self.worker.deinit(std.heap.c_allocator);
+        if (self.launch_admission_context) |*context| context.deinit();
+        self.launch_admission_context = null;
         self.web_fetch_runtime.deinit(self.alloc);
         self.web_search_runtime.deinit();
         self.subagents.deinit(self.alloc);
+        LifecycleAppRuntime.prepareStopped(self);
+        self.ade_events.deinit();
         self.queued_prompt_review.deinit(self.alloc);
         self.prompt_history.deinit(self.alloc);
         self.clearPendingImages();
@@ -879,6 +1139,7 @@ const App = struct {
             target.deinit(self.alloc);
             self.requested_resume = null;
         }
+        if (self.system_prompt_override) |prompt| self.alloc.free(prompt);
         self.session.deinit(self.alloc);
         self.permission_engine.deinit(self.alloc);
         self.approval_prompt.deinit(self.alloc);
@@ -888,10 +1149,14 @@ const App = struct {
         for (self.diff_entries.items) |*entry| entry.deinit(std.heap.c_allocator);
         self.diff_entries.deinit(std.heap.c_allocator);
         self.mcp.deinit(self.alloc);
+        self.native_tool_selection.deinit(self.alloc);
         self.skills.deinit(std.heap.c_allocator);
+        for (self.invocation_skill_roots) |path| self.alloc.free(path);
+        if (self.invocation_skill_roots.len > 0) self.alloc.free(self.invocation_skill_roots);
         self.context_snapshot.deinit(self.alloc);
         self.file_index.deinit(std.heap.c_allocator);
         self.lifecycle_runtime.deinit();
+        LifecycleAppRuntime.deinit(self);
 
         self.auth.deinit(self.alloc);
         WorkspaceAppRuntime.deinit(self);
@@ -910,37 +1175,55 @@ const App = struct {
         );
     }
 
-    pub fn runExternalInteractive(self: *App, argv: []const []const u8) !void {
+    pub fn editComposerWithExternalEditor(self: *App, max_bytes: usize) !bool {
+        return ExternalEditorAppRuntime.editComposer(
+            self,
+            self.externalEditor(),
+            max_bytes,
+        );
+    }
+
+    pub fn runExternalInteractive(
+        self: *App,
+        editor: host.ExternalEditor,
+        seed: []const u8,
+        max_bytes: usize,
+    ) !host.ExternalEditor.EditResult {
         try self.flushBeforeBlockingExternalWork();
 
-        self.terminal.disableRawMode();
-        var raw_restored = false;
-        defer if (!raw_restored) {
-            self.terminal.enableRawMode() catch {};
+        const signal_guard = app_lifecycle.ExternalInteractiveSignalGuard.install();
+        defer signal_guard.deinit();
+        app_lifecycle.suspendForExternalInteractive(
+            &self.terminal,
+            &self.shell,
+            &self.metrics,
+        );
+        var terminal_restored = false;
+        defer if (!terminal_restored) {
+            app_lifecycle.resumeAfterExternalInteractive(
+                &self.terminal,
+                &self.shell,
+                &self.metrics,
+                footer_rows,
+            ) catch |err| {
+                debug_trace.logf(
+                    "input",
+                    "external editor terminal restore failed err={s}",
+                    .{@errorName(err)},
+                );
+            };
         };
 
-        const io = io_mod.getIo();
-        try std.Io.File.stdout().writeStreamingAll(io, "\n");
-        var child = std.process.spawn(io, .{
-            .argv = argv,
-            .stdin = .inherit,
-            .stdout = .inherit,
-            .stderr = .inherit,
-        }) catch return error.ExternalInteractiveFailed;
-        const term = child.wait(io) catch return error.ExternalInteractiveFailed;
-        try std.Io.File.stdout().writeStreamingAll(io, "\n");
-
-        try self.terminal.captureOriginalTermios();
-        try self.terminal.enableRawMode();
-        raw_restored = true;
-        self.shell.layout = self.terminal.queryLayout(footer_rows) catch self.shell.layout;
-        try self.shell.requestTerminalReset(&self.metrics);
-        self.shell.render_requests.request(.first_frame);
-
-        switch (term) {
-            .exited => |code| if (code != 0) return error.ExternalInteractiveFailed,
-            else => return error.ExternalInteractiveFailed,
-        }
+        var result = try editor.edit(self.alloc, seed, max_bytes);
+        errdefer result.deinit(self.alloc);
+        try app_lifecycle.resumeAfterExternalInteractive(
+            &self.terminal,
+            &self.shell,
+            &self.metrics,
+            footer_rows,
+        );
+        terminal_restored = true;
+        return result;
     }
 
     pub fn flushBeforeBlockingExternalWork(self: *App) !void {
@@ -1098,7 +1381,7 @@ const App = struct {
         );
     }
 
-    const PromptSubmitIntent = enum { queue, steer };
+    pub const PromptSubmitIntent = enum { queue, steer };
 
     fn enqueuePromptWithOptionalReview(
         self: *App,
@@ -1343,6 +1626,41 @@ const App = struct {
         );
     }
 
+    /// Applies host-supplied semantic work through the same snapshot and
+    /// worker admission path as interactive submission, with deliberately
+    /// empty image and skill state rather than borrowing the composer.
+    pub fn admitWorkControlPrompt(
+        self: *App,
+        prompt: []const u8,
+        intent: PromptSubmitIntent,
+    ) !worker_runtime.PromptAdmissionResult {
+        const no_images: []const types.ImageAttachment = &.{};
+        const context_targets = if (self.context_enabled)
+            try context_contract.applicableTargetsForImages(self.alloc, no_images)
+        else
+            &.{};
+        defer if (context_targets.len > 0) self.alloc.free(context_targets);
+
+        try AgentAppRuntime.refreshProjectContext(self, context_targets);
+        self.session.setConversationLanguageFromUserMessage(prompt);
+        const admission = try self.snapshotAndAdmitPrompt(
+            prompt,
+            &.{},
+            null,
+            null,
+            no_images,
+            0,
+            false,
+            intent,
+            true,
+        );
+        WorkerAppRuntime.syncState(
+            self,
+            app_callbacks.Bindings(App).worker_tool_lifecycle_presenter(self),
+        );
+        return admission;
+    }
+
     pub fn continuePausedRecovery(self: *App) !bool {
         return SessionAppRuntime.continuePausedRecovery(self);
     }
@@ -1379,6 +1697,32 @@ const App = struct {
         user_prompt_already_presented: bool,
         intent: PromptSubmitIntent,
     ) !bool {
+        _ = try self.snapshotAndAdmitPrompt(
+            prompt,
+            skill_tokens,
+            review_draft,
+            recovery_checkpoint,
+            prompt_images,
+            turn_id,
+            user_prompt_already_presented,
+            intent,
+            false,
+        );
+        return true;
+    }
+
+    fn snapshotAndAdmitPrompt(
+        self: *App,
+        prompt: []const u8,
+        skill_tokens: []const registered_entities.SkillTokenSpan,
+        review_draft: ?worker_runtime.QueueReviewDraft,
+        recovery_checkpoint: ?*const session_codec.RecoveryCheckpoint,
+        prompt_images: ?[]const types.ImageAttachment,
+        turn_id: u64,
+        user_prompt_already_presented: bool,
+        intent: PromptSubmitIntent,
+        durable_work_control_admission: bool,
+    ) !worker_runtime.PromptAdmissionResult {
         try self.reloadSkills();
 
         const source_images = if (recovery_checkpoint) |checkpoint|
@@ -1465,7 +1809,14 @@ const App = struct {
                 review,
             );
 
-        try self.worker.admitPrompt(std.heap.c_allocator, .{
+        var naming_admission = try SessionNamingAppRuntime.prepareAdmission(self, prompt);
+        defer if (naming_admission) |*prepared| prepared.deinit();
+        var admission_context = PromptAdmissionContext{
+            .app = self,
+            .naming_admission = &naming_admission,
+        };
+
+        const queued_prompt = worker_runtime.QueuedPrompt{
             .turn_id = if (recovery_checkpoint) |checkpoint| checkpoint.turn_id else turn_id,
             .prompt = prompt_copy,
             .images = images_copy,
@@ -1487,9 +1838,41 @@ const App = struct {
             .recovery_checkpoint = recovery_checkpoint_copy,
             .recovery_source_already_presented = recovery_checkpoint != null,
             .user_prompt_already_presented = user_prompt_already_presented,
-        }, recovery_checkpoint == null and intent == .steer);
-        HerdrAppRuntime.reportWorking(self);
-        return true;
+        };
+        const observer = worker_runtime.WorkerRuntime.PromptAdmissionObserver{
+            .ctx = &admission_context,
+            .report = reportPromptAdmission,
+        };
+        const admission = if (durable_work_control_admission)
+            try self.worker.admitWorkControlPromptObservedWithObserver(
+                std.heap.c_allocator,
+                queued_prompt,
+                recovery_checkpoint == null and intent == .steer,
+                observer,
+            )
+        else
+            try self.worker.admitPromptObserved(
+                std.heap.c_allocator,
+                queued_prompt,
+                recovery_checkpoint == null and intent == .steer,
+                observer,
+            );
+        LifecycleAppRuntime.reportPromptWorking(self);
+        return admission;
+    }
+
+    const PromptAdmissionContext = struct {
+        app: *App,
+        naming_admission: *?session_naming_runtime.PreparedAdmission,
+    };
+
+    fn reportPromptAdmission(raw: *anyopaque) void {
+        const context: *PromptAdmissionContext = @ptrCast(@alignCast(raw));
+        LifecycleAppRuntime.reportPromptQueued(context.app);
+        if (context.naming_admission.*) |*prepared| {
+            SessionNamingAppRuntime.admit(context.app, prepared);
+            context.naming_admission.* = null;
+        }
     }
 
     pub fn installInitialMcpRuntime(self: *App, runtime: ?*mcp_runtime_mod.McpRuntime) void {
@@ -1697,8 +2080,9 @@ const App = struct {
     }
 
     fn effectiveToolSet(self: *const App) tool_set_contract.ToolSet {
+        if (!self.allow_native_tools) return tool_set_contract.empty;
         if (comptime host_profile.tools) {
-            return builtin_tools.advertisement_set;
+            return self.native_tool_selection.tool_set;
         }
         return browser_workspace_tools.selectToolSet(
             false,
@@ -1882,7 +2266,21 @@ const App = struct {
     }
 
     pub fn reloadSkills(self: *App) !void {
-        const loaded = try app_runtime_setup.loadSkills(std.heap.c_allocator, self.workspace_root, builtin_skills.root_policy);
+        const loaded = if (self.profile_home) |home_dir|
+            try app_runtime_setup.loadSkillsFromHome(
+                std.heap.c_allocator,
+                self.workspace_root,
+                home_dir,
+                self.invocation_skill_roots,
+                self.skill_root_policy,
+            )
+        else
+            try app_runtime_setup.loadSkills(
+                std.heap.c_allocator,
+                self.workspace_root,
+                self.invocation_skill_roots,
+                self.skill_root_policy,
+            );
         skill_runtime.traceDiagnostics("interactive_reload", loaded.diagnostics);
         self.skills.replaceLoaded(std.heap.c_allocator, loaded.dir, loaded.skills, loaded.diagnostics);
     }
@@ -2813,6 +3211,7 @@ const App = struct {
 
     pub fn loopCollectFacts(ctx: *anyopaque) !void {
         const self: *App = @ptrCast(@alignCast(ctx));
+        if (comptime !host_target.is_wasm) try WorkControlAppRuntime.collect(self);
         if (!try WorkerAppRuntime.authorizeInteractiveAdmission(self)) return;
         InputSubmitRuntime.collectPendingSubmissionFacts(self);
 
@@ -2851,6 +3250,7 @@ const App = struct {
                 RenderAppRuntime.requestActiveSurfaceFrame(self, .footer);
             },
         }
+        SessionNamingAppRuntime.collectFacts(self);
         try app_commands.Handlers(App).collectMcpAuthenticationFacts(self);
         try app_commands.Handlers(App).collectMcpReloadFacts(self);
         if (comptime host_profile.native_auth or host_profile.js_host_auth) {
@@ -3129,6 +3529,9 @@ pub fn runWasmTerminal(init: std.process.Init) !void {
         },
     };
     defer launch.deinit(alloc);
+    if (launch.modifiers.hasInvocationSkillRoots()) {
+        return error.WasmTerminalInvocationSkillRootsUnsupported;
+    }
     const outcome = try app_entry_runtime.runInteractiveCooperative(App, alloc, &launch);
     switch (outcome) {
         .returned => {},
@@ -3144,6 +3547,28 @@ pub fn main(c_argc: c_int, c_argv: [*][*:0]c_char, c_envp: [*:null]?[*:0]c_char)
 fn mainC(c_argc: c_int, c_argv: [*][*:0]c_char, c_envp: [*:null]?[*:0]c_char) !void {
     const raw_args = rawArgs(c_argc, c_argv);
     const raw_env: RawEnviron = @ptrCast(c_envp);
+
+    if (launch_provider.isProviderModeRaw(raw_args)) {
+        io_mod.setRawEnviron(raw_env);
+        const process_args = argsFromRaw(raw_args);
+        var threaded = std.Io.Threaded.init(processAllocator(), .{
+            .argv0 = .init(process_args),
+            .environ = .{ .block = environBlockFromRaw(raw_env) },
+        });
+        defer threaded.deinit();
+        io_mod.setIo(threaded.io());
+        launch_provider.runOne(processAllocator()) catch |err| {
+            var buffer: [160]u8 = undefined;
+            const message = std.fmt.bufPrint(
+                &buffer,
+                "fx launch provider: {s}\n",
+                .{@errorName(err)},
+            ) catch "fx launch provider: failed\n";
+            try writeStderrFast(message);
+            return err;
+        };
+        return;
+    }
 
     if (comptime terminal_host.isSupported()) {
         if (terminal_tmux_session.isCaptureModeRaw(raw_args)) {
@@ -3470,6 +3895,7 @@ fn hasPosixArgVector() bool {
 }
 
 fn needsFullEntryConfig(args: []const [:0]const u8) bool {
+    if (cli_surface.systemPromptFilesRequested(args)) return true;
     const command = cli_surface.commandAfterGlobalLaunchArgs(args) orelse return false;
     return std.mem.eql(u8, command, "ask") or
         std.mem.eql(u8, command, "acp") or
@@ -3498,7 +3924,8 @@ fn needsEarlyThreadedIo(args: []const [:0]const u8) bool {
         std.mem.eql(u8, command, "status") or
         std.mem.eql(u8, command, "doctor") or
         std.mem.eql(u8, command, "models") or
-        std.mem.eql(u8, command, "credits");
+        std.mem.eql(u8, command, "credits") or
+        std.mem.eql(u8, command, "structured-inference");
 }
 
 test "auth and upgrade commands use early threaded io without full entry config" {
@@ -3513,7 +3940,7 @@ test "auth and upgrade commands use early threaded io without full entry config"
 }
 
 test "credential-reading commands use early threaded io without full entry config" {
-    for ([_][:0]const u8{ "status", "doctor", "models", "credits" }) |command| {
+    for ([_][:0]const u8{ "status", "doctor", "models", "credits", "structured-inference" }) |command| {
         const args = &.{command};
         try std.testing.expect(!needsFullEntryConfig(args));
         try std.testing.expect(needsEarlyThreadedIo(args));
@@ -3561,8 +3988,36 @@ test "full entry config commands also use early threaded io" {
     try std.testing.expect(needsEarlyThreadedIo(&.{
         @as([:0]const u8, "--context-limit=project_bytes=2048"),
         @as([:0]const u8, "--no-additional-dirs"),
+        @as([:0]const u8, "--no-native-tools"),
+        @as([:0]const u8, "--no-default-skills"),
+        @as([:0]const u8, "--skills-dir=/tmp/acp-skills"),
+        @as([:0]const u8, "--no-project-instructions"),
         @as([:0]const u8, "acp"),
     }));
+    try std.testing.expect(needsFullEntryConfig(&.{
+        @as([:0]const u8, "--append-system-prompt-file"),
+        @as([:0]const u8, "/tmp/prompt"),
+        @as([:0]const u8, "resume"),
+        @as([:0]const u8, "last"),
+    }));
+}
+
+test "interactive and resumed launch prompts transfer into the app policy" {
+    const prompt: []u8 = @constCast("INTERACTIVE_FILE_SYSTEM_PROMPT");
+    for ([_]cli_surface.InteractiveLaunch{
+        .{ .modifiers = .{ .effective_system_prompt = prompt } },
+        .{ .requested_resume = .last, .modifiers = .{ .effective_system_prompt = prompt } },
+    }) |launch_value| {
+        var launch = launch_value;
+        var app = App{ .alloc = std.testing.allocator };
+        app.system_prompt_override = launch.modifiers.takeEffectiveSystemPrompt();
+
+        try std.testing.expect(launch.modifiers.effective_system_prompt == null);
+        try std.testing.expectEqualStrings(
+            "INTERACTIVE_FILE_SYSTEM_PROMPT",
+            app.promptPolicy().system_prompt,
+        );
+    }
 }
 
 test "lightweight local commands do not request early threaded io" {
@@ -3607,6 +4062,35 @@ test "native app preserves the built-in tool set without workspace metadata" {
     try std.testing.expectEqual(builtin_tools.advertisement_set.order.len, advertised.order.len);
 }
 
+test "interactive native tool suppression controls advertisement and dispatch" {
+    var app = App{
+        .alloc = std.testing.allocator,
+        .allow_native_tools = false,
+    };
+
+    try std.testing.expectEqual(@as(usize, 0), app.toolRegistry().tools.len);
+    try std.testing.expectEqual(@as(usize, 0), app.toolAdvertisementSet().order.len);
+}
+
+test "interactive native tool selection controls advertisement and dispatch" {
+    var app = App{ .alloc = std.testing.allocator };
+    app.native_tool_selection = try tool_selection.resolve(
+        std.testing.allocator,
+        native_tool_selection_catalog,
+        &.{ "terminal:exec", "read_file" },
+    );
+    defer app.native_tool_selection.deinit(std.testing.allocator);
+
+    const selected = app.toolAdvertisementSet();
+    try std.testing.expectEqual(@as(usize, 2), selected.order.len);
+    try std.testing.expectEqualStrings("terminal", selected.order[0]);
+    try std.testing.expectEqualStrings("read_file", selected.order[1]);
+    try std.testing.expectEqualStrings(
+        builtin_tools.terminalExecOnlySpec().description,
+        app.toolRegistry().lookup("terminal").?.description,
+    );
+}
+
 fn fullEntryConfig() app_entry_runtime.Config {
     return .{
         .version = version,
@@ -3636,6 +4120,7 @@ fn fullEntryConfig() app_entry_runtime.Config {
         .context_registry = default_context_registry,
         .mode_registry = builtin_modes.registry,
         .tool_set = builtin_tools.advertisement_set,
+        .tool_selection_catalog = native_tool_selection_catalog,
         .inspect_mcp_profile_config = builtin_mcp.inspectProfileConfig,
         .inspect_mcp_local_config = builtin_mcp.inspectLocalConfig,
         .load_mcp_runtime = builtin_mcp.loadRuntime,
@@ -3674,6 +4159,7 @@ fn localEntryConfig() app_entry_runtime.Config {
         .context_registry = default_context_registry,
         .mode_registry = builtin_modes.registry,
         .tool_set = builtin_tools.advertisement_set,
+        .tool_selection_catalog = native_tool_selection_catalog,
         .inspect_mcp_profile_config = builtin_mcp.inspectProfileConfig,
         .inspect_mcp_local_config = builtin_mcp.inspectLocalConfig,
         .load_mcp_runtime = builtin_mcp.loadRuntime,
@@ -3712,6 +4198,7 @@ fn emptyEntryConfig() app_entry_runtime.Config {
         .context_registry = default_context_registry,
         .mode_registry = builtin_modes.registry,
         .tool_set = builtin_tools.advertisement_set,
+        .tool_selection_catalog = native_tool_selection_catalog,
         .inspect_mcp_profile_config = builtin_mcp.inspectProfileConfig,
         .inspect_mcp_local_config = builtin_mcp.inspectLocalConfig,
         .load_mcp_runtime = builtin_mcp.loadRuntime,
@@ -4134,6 +4621,7 @@ test "semantic code block preserves indentation on wrapped continuation rows" {
 }
 
 test {
+    _ = @import("core/control/launch_admission_final_launcher.zig");
     _ = @import("napi_fetch_state.zig");
     _ = @import("core/config/model_provider.zig");
     _ = provider_runtime;
@@ -4154,7 +4642,9 @@ test {
     _ = @import("core/app/app_bootstrap_runtime.zig");
     _ = @import("core/app/app_callbacks.zig");
     _ = @import("core/app/app_commands.zig");
+    _ = @import("core/app/app_profile_runtime.zig");
     _ = @import("core/app/app_entry_runtime.zig");
+    _ = @import("core/app/app_external_editor_runtime.zig");
     _ = @import("core/app/app_input_runtime.zig");
     _ = @import("core/app/app_lifecycle.zig");
     _ = @import("core/app/model_cache_runtime.zig");
@@ -4182,6 +4672,11 @@ test {
     _ = @import("core/cli/cli_ask.zig");
     _ = @import("core/cli/cli_replay.zig");
     _ = @import("core/cli/cli_surface.zig");
+    _ = @import("core/inference/structured_schema.zig");
+    _ = @import("core/inference/structured_receipt_ledger.zig");
+    _ = @import("core/inference/structured_subscription.zig");
+    _ = @import("core/inference/structured_subscription_cli.zig");
+    _ = @import("core/control/launch_provider.zig");
     _ = @import("core/workspace/change_tracker.zig");
     _ = @import("core/shared/collections.zig");
     _ = @import("core/slash_commands/command_router.zig");
@@ -4192,6 +4687,7 @@ test {
     _ = @import("ui/footer/settings_menu_presentation.zig");
     _ = @import("builtins/context.zig");
     _ = @import("builtins/gateway.zig");
+    _ = @import("builtins/hooks.zig");
     _ = @import("core/shared/debug_trace.zig");
     _ = @import("core/output/diff.zig");
     _ = @import("core/shared/display_width.zig");
@@ -4201,6 +4697,7 @@ test {
     _ = @import("core/auth/provider_catalog.zig");
     _ = @import("gateway/openai_codex_models.zig");
     _ = @import("gateway/openai_codex.zig");
+    _ = @import("gateway/responses_protocol.zig");
     _ = @import("gateway/openai_codex_permission_reviewer.zig");
     _ = @import("core/auth/grok_session.zig");
     _ = @import("core/auth/grok_oauth.zig");
@@ -4217,6 +4714,7 @@ test {
     _ = @import("core/github/github_publish.zig");
     _ = @import("core/github/github_workflows.zig");
     _ = @import("core/hosts/host.zig");
+    _ = @import("core/hosts/native_external_editor.zig");
     _ = @import("core/hooks/common.zig");
     _ = @import("core/hooks/definitions.zig");
     _ = @import("core/hooks/prompt.zig");
@@ -4232,6 +4730,7 @@ test {
     _ = @import("core/permissions/auto_classifier.zig");
     _ = @import("core/permissions/command_admission.zig");
     _ = @import("core/mcp/mcp_runtime.zig");
+    _ = @import("core/mcp/mcp_auth_store.zig");
     _ = @import("core/mcp/features/common.zig");
     _ = @import("core/mcp/features/resources.zig");
     _ = @import("core/mcp/features/prompts.zig");
@@ -4245,6 +4744,7 @@ test {
     _ = @import("core/background/process_supervisor.zig");
     _ = @import("core/execution/process_tree.zig");
     _ = @import("core/config/prompt_policy.zig");
+    _ = @import("core/config/system_prompt_files.zig");
     _ = @import("core/workspace/record_tape.zig");
     _ = @import("core/session/session.zig");
     _ = @import("core/session/session_commands.zig");

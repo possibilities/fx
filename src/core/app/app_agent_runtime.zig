@@ -1,4 +1,6 @@
 const std = @import("std");
+const ade_events = @import("../../builtins/hooks/ade_events.zig");
+const ade_git_roots = @import("../../builtins/hooks/ade_git_roots.zig");
 const agent_runtime = @import("../agent/agent_runtime.zig");
 const agent_stream_provider = @import("../agent/stream_provider.zig");
 const command_admission = @import("../permissions/command_admission.zig");
@@ -25,10 +27,14 @@ const prompt_policy_contract = @import("../config/prompt_policy.zig");
 const model_provider = @import("../config/model_provider.zig");
 const session_runtime = @import("../session/session.zig");
 const session_child_store = @import("../session/session_child_store.zig");
+const session_codec = @import("../session/session_codec.zig");
+const session_store = @import("../session/session_store.zig");
 const skill_runtime = @import("../skills/skill_runtime.zig");
 const subagent_agent_adapter = @import("../subagent/agent_adapter.zig");
+const subagent_authority = @import("../subagent/authority.zig");
 const subagent_domain = @import("../subagent/domain.zig");
 const subagent_execution = @import("../subagent/execution.zig");
+const subagent_tool_host = @import("../subagent/tool_host.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const text_utils = @import("../shared/text_utils.zig");
 const tool_args = @import("../tooling/tool_args.zig");
@@ -67,6 +73,28 @@ const ToolPermissionDecision = types.ToolPermissionDecision;
 
 pub fn Runtime(comptime App: type) type {
     return struct {
+        const McpAttentionResolutionObserver = struct {
+            app: *App,
+
+            fn interface(self: *@This()) worker_runtime.DecisionObserver {
+                return .{
+                    .context = self,
+                    .observe_fn = observe,
+                };
+            }
+
+            fn observe(raw: *anyopaque, turn_id: u64) void {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                if (comptime @hasDecl(App, "dispatchAttentionResolved")) {
+                    self.app.dispatchAttentionResolved(
+                        turn_id,
+                        .question,
+                        null,
+                    );
+                }
+            }
+        };
+
         const ToolAuthorityView = struct {
             mode: PermissionMode,
             grants: []const PermissionGrant,
@@ -91,13 +119,35 @@ pub fn Runtime(comptime App: type) type {
             if (comptime @hasField(App, "context_enabled")) {
                 if (!app.context_enabled) return "";
             }
+            if (comptime @hasField(App, "project_instructions_enabled")) {
+                if (!app.project_instructions_enabled) return "";
+            }
             if (app.worker.active_context_snapshot) |snapshot| return snapshot.modelVisibleBytes();
             return app.context_snapshot.modelVisibleBytes();
         }
 
-        fn childToolContext(root_context: tool_runtime.Context) tool_runtime.Context {
+        fn childToolContext(
+            root_context: tool_runtime.Context,
+            root_session_id: []const u8,
+        ) tool_runtime.Context {
             var child_context = root_context;
             child_context.tracker = null;
+            child_context.lifecycle_parent_session_id = root_session_id;
+            return child_context;
+        }
+
+        fn childToolContextForAdmission(
+            root_context: tool_runtime.Context,
+            admission: subagent_domain.AdmissionSnapshot,
+            child_session_id: ?[]const u8,
+        ) tool_runtime.Context {
+            var child_context = childToolContext(root_context, admission.root_id);
+            child_context.lifecycle_scope = .{
+                .kind = .subagent,
+                .workspace_root = child_context.workspace_root,
+                .session_id = child_session_id,
+                .parent_session_id = admission.root_id,
+            };
             return child_context;
         }
 
@@ -202,6 +252,7 @@ pub fn Runtime(comptime App: type) type {
                 provider_set.Bundle.Capabilities{};
             var ctx: tool_runtime.Context = .{
                 .workspace_root = workspace_root,
+                .profile_home = if (comptime @hasField(App, "profile_home")) app.profile_home else null,
                 .access_scope = if (host_workspace != null)
                     workspace_access.AccessScope.primaryOnly(workspace_root)
                 else
@@ -260,6 +311,14 @@ pub fn Runtime(comptime App: type) type {
                 .session = &app.session,
                 .session_allocator = app.alloc,
                 .skills_dir = app.skills.dir,
+                .invocation_skill_roots = if (comptime @hasField(App, "invocation_skill_roots"))
+                    app.invocation_skill_roots
+                else
+                    &.{},
+                .skill_root_policy = if (comptime @hasField(App, "skill_root_policy"))
+                    app.skill_root_policy
+                else
+                    null,
                 .context_limits = if (comptime @hasField(App, "context_limits")) app.context_limits else .{},
                 .context_enabled = if (comptime @hasField(App, "context_enabled")) app.context_enabled else true,
                 .context_registry = app.contextRegistry(),
@@ -285,6 +344,10 @@ pub fn Runtime(comptime App: type) type {
                 .on_mcp_progress = app_callbacks.Bindings(App).onMcpProgress,
                 .lifecycle_view = app.lifecycle_view,
                 .lifecycle_scope = lifecycleContext(app).scope,
+                .edited_path_observer = if (comptime @hasDecl(App, "editedPathObserver"))
+                    app.editedPathObserver()
+                else
+                    null,
             };
             if (comptime @hasField(App, "web_fetch_runtime")) {
                 ctx.web_fetch_runtime = &app.web_fetch_runtime;
@@ -404,10 +467,18 @@ pub fn Runtime(comptime App: type) type {
                         false;
                     const timed_out = currentAwakeMillis() >= self.deadline_ms;
                     if (cancelled or lifecycle_cancelled or timed_out) {
-                        if (timed_out and !cancelled and !lifecycle_cancelled) {
-                            self.timed_out.store(true, .release);
+                        const timeout_only = timed_out and
+                            !cancelled and
+                            !lifecycle_cancelled;
+                        var observation = McpAttentionResolutionObserver{
+                            .app = self.app,
+                        };
+                        if (self.app.worker.cancelPendingQuestionBatchObserved(
+                            observation.interface(),
+                        ) == .accepted) {
+                            if (timeout_only) self.timed_out.store(true, .release);
+                            return;
                         }
-                        if (self.app.worker.cancelPendingQuestionBatch()) return;
                     }
                     io_mod.sleep(20 * std.time.ns_per_ms);
                 }
@@ -845,7 +916,9 @@ pub fn Runtime(comptime App: type) type {
 
             app.context_snapshot = app.contextRegistry().gatherDefaultSnapshot(app.alloc, .{
                 .workspace_root = app.workspace_root,
+                .profile_home = if (comptime @hasField(App, "profile_home")) app.profile_home else null,
                 .access_scope = appAccessScope(app),
+                .project_instructions_enabled = if (comptime @hasField(App, "project_instructions_enabled")) app.project_instructions_enabled else true,
                 .targets = targets,
                 .context_limits = if (comptime @hasField(App, "context_limits")) app.context_limits else .{},
             }) catch |err| {
@@ -1046,7 +1119,11 @@ pub fn Runtime(comptime App: type) type {
             ) catch return error.OutOfMemory;
             defer explicit_skills.deinit(alloc);
             const prompt_policy = app.promptPolicy();
-            const tool_context = childToolContext(app.subagentToolContextForAdmission(admission));
+            const tool_context = childToolContextForAdmission(
+                app.subagentToolContextForAdmission(admission),
+                admission,
+                turn.child_id,
+            );
             const providers = if (comptime @hasDecl(App, "providerSet"))
                 app.providerSet()
             else
@@ -1081,6 +1158,7 @@ pub fn Runtime(comptime App: type) type {
                 .custom_tool_guidance = child_projection.custom_guidance,
                 .context_registry = app.contextRegistry(),
                 .context_enabled = if (comptime @hasField(App, "context_enabled")) app.context_enabled else true,
+                .project_instructions_enabled = if (comptime @hasField(App, "project_instructions_enabled")) app.project_instructions_enabled else true,
                 .project_context = modelVisibleProjectContext(app),
                 .lifecycle_view = app.lifecycle_view,
             }, turn, message, admission, cancel);
@@ -1479,6 +1557,8 @@ const FakeApp = struct {
     mcp_name: []const u8 = "mcp_lookup",
     mcp_has_tool_calls: usize = 0,
     mcp_result: []const u8 = "{\"ok\":true}",
+    attention_resolved_count: std.atomic.Value(usize) = .init(0),
+    attention_resolved_turn_id: std.atomic.Value(u64) = .init(0),
     diff_blocks: usize = 0,
     web_fetch_runtime: web_fetch_runtime.Runtime = web_fetch_runtime.Runtime.init(.{}),
     web_search_runtime: web_search_runtime.Runtime = web_search_runtime.Runtime.init(.{
@@ -1487,6 +1567,7 @@ const FakeApp = struct {
     web_search_models_path: []const u8 = "/models",
     lifecycle_runtime: hooks.Runtime,
     lifecycle_view: hooks.RuntimeView,
+    test_edited_path_observer: ?tool_runtime.EditedPathObserver = null,
     tool_registry: tool_dispatch.Registry = test_tool_registry,
     context_registry: context_contract.Registry = test_context_registry,
 
@@ -1577,6 +1658,10 @@ const FakeApp = struct {
             test_gateway_chat_url,
             admission,
         );
+    }
+
+    fn editedPathObserver(self: *FakeApp) ?tool_runtime.EditedPathObserver {
+        return self.test_edited_path_observer;
     }
 
     fn snapshotModelToolProjection(
@@ -1698,11 +1783,319 @@ const FakeApp = struct {
         self.diff_blocks += 1;
     }
 
+    pub fn dispatchAttentionResolved(
+        self: *FakeApp,
+        turn_id: u64,
+        kind: hooks.AttentionKind,
+        child_session_id: ?[]const u8,
+    ) void {
+        std.debug.assert(kind == .question);
+        std.debug.assert(child_session_id == null);
+        self.attention_resolved_turn_id.store(turn_id, .release);
+        _ = self.attention_resolved_count.fetchAdd(1, .release);
+    }
+
     pub fn formatToolExecutionErrorForAgent(self: *FakeApp, arena: Allocator, tool_name: []const u8, err: anyerror) ![]const u8 {
         _ = self;
         return std.fmt.allocPrint(arena, "Tool {s} failed: {s}", .{ tool_name, @errorName(err) });
     }
 };
+
+const McpQuestionThreadState = struct {
+    completed: std.atomic.Value(bool) = .init(false),
+    answers: ?[][]u8 = null,
+    err: ?anyerror = null,
+
+    fn run(
+        self: *@This(),
+        worker: *worker_runtime.WorkerRuntime,
+        entries: []const types.QuestionBatchEntry,
+    ) void {
+        self.answers = worker.requestMcpElicitationAnswerBlocking(
+            std.heap.c_allocator,
+            entries,
+        ) catch |err| {
+            self.err = err;
+            self.completed.store(true, .release);
+            return;
+        };
+        self.completed.store(true, .release);
+    }
+
+    fn deinit(self: *@This()) void {
+        if (self.answers) |answers| {
+            for (answers) |answer| std.heap.c_allocator.free(answer);
+            std.heap.c_allocator.free(answers);
+        }
+    }
+};
+
+const McpPresentationObserver = struct {
+    barrier: ?*ProjectionBarrier = null,
+    count: std.atomic.Value(usize) = .init(0),
+    turn_id: std.atomic.Value(u64) = .init(0),
+
+    fn interface(self: *@This()) worker_runtime.QuestionPresentationObserver {
+        return .{
+            .context = self,
+            .observe_fn = observe,
+        };
+    }
+
+    fn observe(
+        raw: *anyopaque,
+        turn_id: u64,
+        source: worker_runtime.QuestionPromptSource,
+    ) void {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        std.debug.assert(source == .mcp_elicitation);
+        self.turn_id.store(turn_id, .release);
+        _ = self.count.fetchAdd(1, .release);
+        if (self.barrier) |barrier| barrier.wait();
+    }
+};
+
+const McpResolutionObserver = struct {
+    app: *FakeApp,
+
+    fn interface(self: *@This()) worker_runtime.DecisionObserver {
+        return .{
+            .context = self,
+            .observe_fn = observe,
+        };
+    }
+
+    fn observe(raw: *anyopaque, turn_id: u64) void {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        self.app.dispatchAttentionResolved(turn_id, .question, null);
+    }
+};
+
+fn waitForMcpQuestion(
+    worker: *worker_runtime.WorkerRuntime,
+) !worker_runtime.PendingQuestionBatchSnapshot {
+    var attempts: usize = 0;
+    while (attempts < 1000) : (attempts += 1) {
+        if (try worker.snapshotPendingQuestionBatch(std.testing.allocator)) |snapshot| {
+            try std.testing.expectEqual(
+                worker_runtime.QuestionPromptSource.mcp_elicitation,
+                snapshot.source,
+            );
+            return snapshot;
+        }
+        io_mod.sleep(std.time.ns_per_ms);
+    }
+    return error.TestExpectedMcpQuestion;
+}
+
+test "MCP deadline cancellation waits for surfaced attention projection" {
+    const alloc = std.testing.allocator;
+    var app = try FakeApp.init(alloc);
+    defer app.deinit();
+    app.worker.worker_processing = true;
+    app.worker.active_turn_id = 61;
+
+    const options = [_]types.QuestionOption{
+        .{ .label = "Continue", .description = null },
+    };
+    const entries = [_]types.QuestionBatchEntry{.{
+        .question = "Continue MCP input?",
+        .options = &options,
+    }};
+    var question = McpQuestionThreadState{};
+    defer question.deinit();
+    const question_thread = try std.Thread.spawn(
+        .{},
+        McpQuestionThreadState.run,
+        .{ &question, &app.worker, &entries },
+    );
+    var snapshot = try waitForMcpQuestion(&app.worker);
+    snapshot.deinit(alloc);
+
+    const Presenter = struct {
+        worker: *worker_runtime.WorkerRuntime,
+        observer: *McpPresentationObserver,
+        presented: bool = false,
+
+        fn run(self: *@This()) void {
+            self.presented = self.worker.presentPendingQuestionBatchObserved(
+                self.observer.interface(),
+            );
+        }
+    };
+    var barrier = ProjectionBarrier{};
+    var presentation = McpPresentationObserver{ .barrier = &barrier };
+    var presenter = Presenter{
+        .worker = &app.worker,
+        .observer = &presentation,
+    };
+    const presenter_thread = try std.Thread.spawn(.{}, Presenter.run, .{&presenter});
+    while (!barrier.entered.load(.acquire)) io_mod.sleep(std.time.ns_per_ms);
+
+    var lifecycle_cancelled = std.atomic.Value(bool).init(true);
+    var watch = Runtime(FakeApp).DeadlineWatch{
+        .app = &app,
+        .deadline_ms = std.math.maxInt(i64),
+        .lifecycle_cancel_flag = &lifecycle_cancelled,
+    };
+    const watcher_thread = try std.Thread.spawn(
+        .{},
+        Runtime(FakeApp).DeadlineWatch.run,
+        .{&watch},
+    );
+    io_mod.sleep(25 * std.time.ns_per_ms);
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        app.attention_resolved_count.load(.acquire),
+    );
+    try std.testing.expect(!question.completed.load(.acquire));
+
+    barrier.release.store(true, .release);
+    presenter_thread.join();
+    watcher_thread.join();
+    question_thread.join();
+
+    try std.testing.expect(presenter.presented);
+    try std.testing.expect(question.err == null);
+    try std.testing.expect(question.answers == null);
+    try std.testing.expectEqual(@as(usize, 1), presentation.count.load(.acquire));
+    try std.testing.expectEqual(@as(u64, 61), presentation.turn_id.load(.acquire));
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        app.attention_resolved_count.load(.acquire),
+    );
+    try std.testing.expectEqual(
+        @as(u64, 61),
+        app.attention_resolved_turn_id.load(.acquire),
+    );
+}
+
+test "surfaced MCP timeout and worker cancellation each resolve attention" {
+    const cases = [_]enum { timeout, worker_cancel }{
+        .timeout,
+        .worker_cancel,
+    };
+    const options = [_]types.QuestionOption{
+        .{ .label = "Continue", .description = null },
+    };
+    const entries = [_]types.QuestionBatchEntry{.{
+        .question = "Continue MCP input?",
+        .options = &options,
+    }};
+
+    for (cases, 0..) |case, index| {
+        var app = try FakeApp.init(std.testing.allocator);
+        defer app.deinit();
+        app.worker.worker_processing = true;
+        app.worker.active_turn_id = 70 + index;
+
+        var question = McpQuestionThreadState{};
+        defer question.deinit();
+        const question_thread = try std.Thread.spawn(
+            .{},
+            McpQuestionThreadState.run,
+            .{ &question, &app.worker, &entries },
+        );
+        var snapshot = try waitForMcpQuestion(&app.worker);
+        snapshot.deinit(std.testing.allocator);
+
+        var presentation = McpPresentationObserver{};
+        try std.testing.expect(app.worker.presentPendingQuestionBatchObserved(
+            presentation.interface(),
+        ));
+        if (case == .worker_cancel) app.worker.requestCancel();
+        var watch = Runtime(FakeApp).DeadlineWatch{
+            .app = &app,
+            .deadline_ms = if (case == .timeout)
+                std.math.minInt(i64)
+            else
+                std.math.maxInt(i64),
+            .lifecycle_cancel_flag = null,
+        };
+        const watcher_thread = try std.Thread.spawn(
+            .{},
+            Runtime(FakeApp).DeadlineWatch.run,
+            .{&watch},
+        );
+        watcher_thread.join();
+        question_thread.join();
+
+        try std.testing.expect(question.err == null);
+        try std.testing.expect(question.answers == null);
+        try std.testing.expectEqual(@as(usize, 1), presentation.count.load(.acquire));
+        try std.testing.expectEqual(
+            @as(usize, 1),
+            app.attention_resolved_count.load(.acquire),
+        );
+        try std.testing.expectEqual(
+            case == .timeout,
+            watch.timed_out.load(.acquire),
+        );
+    }
+}
+
+test "MCP UI and deadline cancellation race resolves attention once" {
+    var app = try FakeApp.init(std.testing.allocator);
+    defer app.deinit();
+    app.worker.worker_processing = true;
+    app.worker.active_turn_id = 81;
+
+    const options = [_]types.QuestionOption{
+        .{ .label = "Continue", .description = null },
+    };
+    const entries = [_]types.QuestionBatchEntry{.{
+        .question = "Cancel MCP input?",
+        .options = &options,
+    }};
+    var question = McpQuestionThreadState{};
+    defer question.deinit();
+    const question_thread = try std.Thread.spawn(
+        .{},
+        McpQuestionThreadState.run,
+        .{ &question, &app.worker, &entries },
+    );
+    var snapshot = try waitForMcpQuestion(&app.worker);
+    snapshot.deinit(std.testing.allocator);
+
+    var presentation = McpPresentationObserver{};
+    try std.testing.expect(app.worker.presentPendingQuestionBatchObserved(
+        presentation.interface(),
+    ));
+    app.worker.requestCancel();
+    var watch = Runtime(FakeApp).DeadlineWatch{
+        .app = &app,
+        .deadline_ms = std.math.maxInt(i64),
+        .lifecycle_cancel_flag = null,
+    };
+    const watcher_thread = try std.Thread.spawn(
+        .{},
+        Runtime(FakeApp).DeadlineWatch.run,
+        .{&watch},
+    );
+
+    var ui_observer = McpResolutionObserver{ .app = &app };
+    const ui_result = app.worker.cancelPendingQuestionBatchObserved(
+        ui_observer.interface(),
+    );
+    question_thread.join();
+    watch.done.store(true, .release);
+    watcher_thread.join();
+
+    try std.testing.expect(
+        ui_result == .accepted or ui_result == .no_pending,
+    );
+    try std.testing.expect(question.err == null);
+    try std.testing.expect(question.answers == null);
+    try std.testing.expectEqual(@as(usize, 1), presentation.count.load(.acquire));
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        app.attention_resolved_count.load(.acquire),
+    );
+    try std.testing.expectEqual(
+        @as(u64, 81),
+        app.attention_resolved_turn_id.load(.acquire),
+    );
+}
 
 fn testAgentStreamProvider(stream_fn: agent_stream_provider.StreamFn) agent_stream_provider.Provider {
     var provider = test_builtin_gateway.agent_stream_provider;
@@ -1813,8 +2206,12 @@ test "app agent runtime builds tool context from app state and MCP callbacks" {
     try std.testing.expect(ctx.subagent_caller_id == null);
     try std.testing.expectEqual(&app.session, ctx.session);
     try std.testing.expectEqual(&app.change_tracker, ctx.tracker.?);
-    const child_ctx = Runtime(FakeApp).childToolContext(ctx);
+    const child_ctx = Runtime(FakeApp).childToolContext(ctx, "root-session");
     try std.testing.expect(child_ctx.tracker == null);
+    try std.testing.expectEqualStrings(
+        "root-session",
+        child_ctx.lifecycle_parent_session_id.?,
+    );
     try std.testing.expect(ctx.mcp_has_tool.?(ctx.mcp_ctx.?, "mcp_lookup", .unrestricted));
 
     const result = try ctx.mcp_call_tool.?(
@@ -2590,6 +2987,7 @@ test "subagent tool projection uses immutable admission permission rules" {
         .action = .allow,
     }};
     var admission = try subagent_domain.captureAdmission(alloc, .{
+        .root_id = "root-session",
         .parent_id = "parent",
         .source_id = "parent",
         .model = "test-model",
@@ -2701,7 +3099,8 @@ test "subagent tool context uses immutable admission authority" {
         .target_path = @constCast("/tmp/workspace::zig build"),
     }};
     var admission = try subagent_domain.captureAdmission(alloc, .{
-        .parent_id = "parent",
+        .root_id = "root-session",
+        .parent_id = "direct-parent-session",
         .source_id = "parent",
         .model = "test-model",
         .effort = .auto,
@@ -2711,7 +3110,21 @@ test "subagent tool context uses immutable admission authority" {
     });
     defer admission.deinit(alloc);
 
-    const ctx = app.subagentToolContextForAdmission(admission);
+    const ctx = Runtime(FakeApp).childToolContextForAdmission(
+        app.subagentToolContextForAdmission(admission),
+        admission,
+        "nested-session",
+    );
+    try std.testing.expectEqualStrings("direct-parent-session", admission.parent_id);
+    try std.testing.expectEqualStrings(
+        "root-session",
+        ctx.lifecycle_parent_session_id.?,
+    );
+    try std.testing.expectEqual(hooks.ScopeKind.subagent, ctx.lifecycle_scope.kind);
+    try std.testing.expectEqualStrings(
+        "nested-session",
+        ctx.lifecycle_scope.session_id.?,
+    );
     try std.testing.expectEqual(PermissionMode.auto, ctx.permission_mode);
     try std.testing.expectEqual(@as(usize, 1), ctx.permission_rules.rules.len);
     try std.testing.expectEqualStrings(
@@ -2722,6 +3135,384 @@ test "subagent tool context uses immutable admission authority" {
     try std.testing.expectEqualStrings(
         "run_command",
         ctx.permission_grants[0].tool_name,
+    );
+}
+
+const NestedTestHostAuthority = struct {
+    root_id: []const u8,
+    parent_id: ?[]const u8 = null,
+    nested_id: ?[]const u8 = null,
+    saw_root_host_resolution: std.atomic.Value(bool) = .init(false),
+    saw_attached_host_resolution: std.atomic.Value(bool) = .init(false),
+
+    fn resolver(self: *NestedTestHostAuthority) subagent_authority.HostResolver {
+        return .{ .context = self, .resolve_fn = resolve };
+    }
+
+    fn resolve(
+        raw: ?*anyopaque,
+        alloc: Allocator,
+        root_id: []const u8,
+    ) subagent_authority.HostResolveError!subagent_authority.HostAuthority {
+        const self: *NestedTestHostAuthority = @ptrCast(@alignCast(raw.?));
+        const is_root = std.mem.eql(u8, self.root_id, root_id);
+        const is_parent = if (self.parent_id) |parent_id|
+            std.mem.eql(u8, parent_id, root_id)
+        else
+            false;
+        const is_nested = if (self.nested_id) |nested_id|
+            std.mem.eql(u8, nested_id, root_id)
+        else
+            false;
+        if (!is_root and !is_parent and !is_nested) {
+            return error.HostAuthorityUnavailable;
+        }
+        if (is_root) {
+            self.saw_root_host_resolution.store(true, .release);
+        } else {
+            self.saw_attached_host_resolution.store(true, .release);
+        }
+        return subagent_authority.HostAuthority.capture(
+            alloc,
+            &.{"subagent"},
+            &.{},
+            .{},
+            &.{},
+        );
+    }
+};
+
+const DelayedGitRootClientSink = struct {
+    client: *ade_events.Client,
+    entered: std.atomic.Value(bool) = .init(false),
+    release: std.atomic.Value(bool) = .init(false),
+    delivered: std.atomic.Value(bool) = .init(false),
+
+    fn report(raw: *anyopaque, discovery: ade_git_roots.Discovery) void {
+        const self: *DelayedGitRootClientSink = @ptrCast(@alignCast(raw));
+        if (discovery.reason == .launch_directory) return;
+        self.entered.store(true, .release);
+        while (!self.release.load(.acquire)) io_mod.sleep(std.time.ns_per_ms);
+        ade_events.TestAdapter.reportGitRootDiscovered(self.client, discovery);
+        self.delivered.store(true, .release);
+    }
+};
+
+const NestedGitRootObservationRunner = struct {
+    app: *FakeApp,
+    client: *ade_events.Client,
+    edited_path: []const u8,
+    expected_root_id: []const u8,
+    expected_parent_id: []const u8 = "",
+    authority_matches: std.atomic.Value(bool) = .init(false),
+    observation_reported: std.atomic.Value(bool) = .init(false),
+
+    fn run(
+        raw: ?*anyopaque,
+        turn: *subagent_execution.TurnContext,
+        message: subagent_domain.QueuedMessage,
+        admission: subagent_domain.AdmissionSnapshot,
+        cancel: *std.atomic.Value(bool),
+    ) subagent_execution.ServiceError!subagent_execution.RunOutcome {
+        const self: *NestedGitRootObservationRunner = @ptrCast(@alignCast(raw.?));
+        if (cancel.load(.acquire)) return error.Cancelled;
+        self.authority_matches.store(
+            std.mem.eql(u8, admission.root_id, self.expected_root_id) and
+                std.mem.eql(u8, admission.parent_id, self.expected_parent_id),
+            .release,
+        );
+
+        const child_context = Runtime(FakeApp).childToolContextForAdmission(
+            self.app.subagentToolContextForAdmission(admission),
+            admission,
+            turn.child_id,
+        );
+        self.client.reportTurnStarted(.{
+            .scope = child_context.lifecycle_scope,
+            .turn_id = 42,
+        });
+        const observer = child_context.edited_path_observer orelse
+            return error.ProviderFailed;
+        observer.report(tool_runtime.TestAdapter.editedPathObservationForContext(
+            child_context,
+            .file_mutation,
+            &.{self.edited_path},
+        ));
+        self.observation_reported.store(true, .release);
+
+        const history_turn = session_runtime.makeAssistantTurn(
+            turn.alloc,
+            message.content,
+            "completed",
+        ) catch return error.OutOfMemory;
+        defer session_runtime.freeHistoryTurn(turn.alloc, history_turn);
+        turn.commit(message.id, history_turn, 1, 1, io_mod.milliTimestamp()) catch
+            return error.ProviderFailed;
+        return .completed;
+    }
+};
+
+fn makeNestedTestSessionState(
+    alloc: Allocator,
+    id: []const u8,
+    workspace_root: []const u8,
+) !session_codec.DurableSessionState {
+    const owned_id = try alloc.dupe(u8, id);
+    errdefer alloc.free(owned_id);
+    const origin = try alloc.dupe(u8, workspace_root);
+    errdefer alloc.free(origin);
+    const workspace = try alloc.dupe(u8, workspace_root);
+    errdefer alloc.free(workspace);
+    const model = try alloc.dupe(u8, "test/model");
+    errdefer alloc.free(model);
+    const history = try alloc.alloc(types.HistoryTurn, 0);
+    return .{
+        .id = owned_id,
+        .origin_workspace_root = origin,
+        .workspace_root = workspace,
+        .created_at_ms = 1,
+        .updated_at_ms = 1,
+        .conversation_language = session_runtime.ConversationLanguage.literal("en"),
+        .preferences = .{
+            .model = model,
+            .effort = types.ReasoningEffort.literal("high"),
+            .fast_mode = false,
+        },
+        .history = history,
+        .total_input_tokens = 0,
+        .total_output_tokens = 0,
+    };
+}
+
+fn createNestedTestSession(
+    alloc: Allocator,
+    store: *session_store.Store,
+    id: []const u8,
+    workspace_root: []const u8,
+) !void {
+    var state = try makeNestedTestSessionState(alloc, id, workspace_root);
+    defer state.deinit(alloc);
+    var loaded = try store.startWritableSession(alloc, state);
+    loaded.deinit(alloc);
+}
+
+fn nestedHostOptions(
+    caller_id: []const u8,
+    invocation_id: []const u8,
+) subagent_tool_host.ExecuteOptions {
+    return .{
+        .caller_id = caller_id,
+        .invocation_id = invocation_id,
+        .defaults = .{
+            .provider = .gateway,
+            .model = "test/model",
+            .effort = types.ReasoningEffort.literal("high"),
+            .conversation_language = session_runtime.ConversationLanguage.literal("en"),
+        },
+        .max_result_bytes = 64 * 1024,
+        .timestamp_ms = 10,
+    };
+}
+
+fn nestedResultChildIdAlloc(alloc: Allocator, encoded: []const u8) ![]u8 {
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, encoded, .{});
+    defer parsed.deinit();
+    const child_id = parsed.value.object.get("child_id") orelse
+        return error.TestUnexpectedResult;
+    if (child_id != .string) return error.TestUnexpectedResult;
+    return alloc.dupe(u8, child_id.string);
+}
+
+test "nested host ADE observation keeps root parent through delayed discovery" {
+    const alloc = std.testing.allocator;
+    const root_id = "01J00000000000000000000000";
+    const next_root_id = "01J00000000000000000000001";
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "home/.fx");
+    try tmp.dir.createDirPath(std.testing.io, "workspace");
+    try tmp.dir.createDirPath(std.testing.io, "launch");
+    try tmp.dir.createDirPath(std.testing.io, "repository/.git");
+    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
+    defer alloc.free(home);
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
+    defer alloc.free(workspace);
+    const launch = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "launch");
+    defer alloc.free(launch);
+    const repository = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "repository");
+    defer alloc.free(repository);
+    const edited_path = try std.fs.path.join(alloc, &.{ repository, "edited.txt" });
+    defer alloc.free(edited_path);
+
+    var client = ade_events.Client{
+        .enabled = true,
+        .alloc = alloc,
+        .socket_path = try alloc.dupe(u8, "/tmp/unused-ade.sock"),
+        .instance_id = try alloc.dupe(u8, "instance-nested"),
+        .workspace_root = try alloc.dupe(u8, repository),
+        .main_session_id = try alloc.dupe(u8, root_id),
+    };
+    defer client.deinit();
+    var delayed_sink = DelayedGitRootClientSink{ .client = &client };
+    try client.git_roots.init(
+        alloc,
+        "instance-nested",
+        null,
+        .{ .context = &delayed_sink, .report_fn = DelayedGitRootClientSink.report },
+        .{ .kind = .interactive, .workspace_root = launch },
+    );
+
+    var app = try FakeApp.init(alloc);
+    defer app.deinit();
+    app.workspace_root = repository;
+    app.test_edited_path_observer = client.git_roots.editedPathObserver();
+    var store = try session_store.Store.initFromHome(alloc, home, workspace);
+    defer store.deinit(alloc);
+    try createNestedTestSession(alloc, &store, root_id, workspace);
+    var authority = NestedTestHostAuthority{ .root_id = root_id };
+    var runner = NestedGitRootObservationRunner{
+        .app = &app,
+        .client = &client,
+        .edited_path = edited_path,
+        .expected_root_id = root_id,
+    };
+    const subagent_host = try subagent_tool_host.Runtime.create(
+        alloc,
+        &store,
+        root_id,
+        authority.resolver(),
+        .{ .context = &runner, .run_fn = NestedGitRootObservationRunner.run },
+    );
+    defer subagent_host.deinit();
+    defer delayed_sink.release.store(true, .release);
+
+    var parent_command = try subagent_domain.validateCommand(alloc, .{ .create = .{
+        .name = "parent-child",
+        .mode = .persistent,
+    } });
+    defer parent_command.deinit(alloc);
+    const parent_result = try subagent_host.execute(
+        alloc,
+        &parent_command,
+        nestedHostOptions(root_id, "create-parent-child"),
+    );
+    defer alloc.free(parent_result);
+    const parent_id = try nestedResultChildIdAlloc(alloc, parent_result);
+    defer alloc.free(parent_id);
+    authority.parent_id = parent_id;
+    runner.expected_parent_id = parent_id;
+
+    var nested_command = try subagent_domain.validateCommand(alloc, .{ .create = .{
+        .name = "nested-child",
+        .mode = .persistent,
+    } });
+    defer nested_command.deinit(alloc);
+    const nested_result = try subagent_host.execute(
+        alloc,
+        &nested_command,
+        nestedHostOptions(parent_id, "create-nested-child"),
+    );
+    defer alloc.free(nested_result);
+    const nested_id = try nestedResultChildIdAlloc(alloc, nested_result);
+    defer alloc.free(nested_id);
+    authority.nested_id = nested_id;
+
+    var send_command = try subagent_domain.validateCommand(alloc, .{ .message = .{ .send = .{
+        .id = nested_id,
+        .content = "observe one edited path",
+    } } });
+    defer send_command.deinit(alloc);
+    const send_result = try subagent_host.execute(
+        alloc,
+        &send_command,
+        nestedHostOptions(parent_id, "message-nested-child"),
+    );
+    defer alloc.free(send_result);
+
+    const delivery_deadline = io_mod.milliTimestamp() + 5_000;
+    while (!delayed_sink.entered.load(.acquire) and
+        io_mod.milliTimestamp() < delivery_deadline)
+    {
+        io_mod.sleep(std.time.ns_per_ms);
+    }
+    if (!delayed_sink.entered.load(.acquire)) return error.TestUnexpectedResult;
+    client.reportSessionChanged(next_root_id);
+    delayed_sink.release.store(true, .release);
+    try std.testing.expectEqual(
+        subagent_execution.ChildResult.idle,
+        try subagent_host.owner.join(nested_id),
+    );
+
+    const serialization_deadline = io_mod.milliTimestamp() + 5_000;
+    while (!delayed_sink.delivered.load(.acquire) and
+        io_mod.milliTimestamp() < serialization_deadline)
+    {
+        io_mod.sleep(std.time.ns_per_ms);
+    }
+    if (!delayed_sink.delivered.load(.acquire)) return error.TestUnexpectedResult;
+    try std.testing.expect(runner.authority_matches.load(.acquire));
+    try std.testing.expect(runner.observation_reported.load(.acquire));
+    // Runtime accepts a HostResolver: the production authority resolver walks
+    // attached child IDs and calls the host only with their canonical root.
+    try std.testing.expect(authority.saw_root_host_resolution.load(.acquire));
+    try std.testing.expect(!authority.saw_attached_host_resolution.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 3), client.queue_len);
+
+    var lifecycle = try std.json.parseFromSlice(
+        std.json.Value,
+        alloc,
+        client.queue[0].?.bytes,
+        .{},
+    );
+    defer lifecycle.deinit();
+    var session_changed = try std.json.parseFromSlice(
+        std.json.Value,
+        alloc,
+        client.queue[1].?.bytes,
+        .{},
+    );
+    defer session_changed.deinit();
+    var discovery = try std.json.parseFromSlice(
+        std.json.Value,
+        alloc,
+        client.queue[2].?.bytes,
+        .{},
+    );
+    defer discovery.deinit();
+    try std.testing.expectEqualStrings(
+        "TurnStarted",
+        lifecycle.value.object.get("event").?.string,
+    );
+    try std.testing.expectEqualStrings(
+        "SessionChanged",
+        session_changed.value.object.get("event").?.string,
+    );
+    try std.testing.expectEqualStrings(
+        "GitRootDiscovered",
+        discovery.value.object.get("event").?.string,
+    );
+    const lifecycle_context = lifecycle.value.object.get("context").?.object;
+    const session_context = session_changed.value.object.get("context").?.object;
+    const discovery_context = discovery.value.object.get("context").?.object;
+    try std.testing.expectEqualStrings(
+        next_root_id,
+        session_context.get("session_id").?.string,
+    );
+    try std.testing.expectEqualStrings(
+        root_id,
+        lifecycle_context.get("parent_session_id").?.string,
+    );
+    try std.testing.expectEqualStrings(
+        nested_id,
+        lifecycle_context.get("session_id").?.string,
+    );
+    try std.testing.expectEqualStrings(
+        lifecycle_context.get("parent_session_id").?.string,
+        discovery_context.get("parent_session_id").?.string,
+    );
+    try std.testing.expectEqualStrings(
+        nested_id,
+        discovery_context.get("session_id").?.string,
     );
 }
 

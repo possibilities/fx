@@ -14,6 +14,7 @@ const host_target = @import("../hosts/target.zig");
 const diff = @import("../output/diff.zig");
 const diagnostics = @import("../workspace/diagnostics.zig");
 const app_lifecycle = @import("app_lifecycle.zig");
+const app_profile_runtime = @import("app_profile_runtime.zig");
 const provider_runtime = @import("provider_runtime.zig");
 const input_completion_runtime = @import("input_completion_runtime.zig");
 const input_queue_runtime = @import("input_queue_runtime.zig");
@@ -40,6 +41,7 @@ const session_resume_view = @import("../session/session_resume_view.zig");
 const session_store = @import("../session/session_store.zig");
 const session_summary_codec = @import("../session/session_summary_codec.zig");
 const subagent_tool_host = @import("../subagent/tool_host.zig");
+const approval_registry = @import("../subagent/approval_registry.zig");
 const subagent_authority = @import("../subagent/authority.zig");
 const subagent_resume_admission = @import("../subagent/resume_admission.zig");
 const tool_set_contract = @import("../tooling/tool_set.zig");
@@ -1080,6 +1082,7 @@ pub const Persistence = struct {
     js_host_store: JsHostSessionStore = .{},
     js_host_session: ?JsHostSessionOwner = null,
     process_model_override: ?[]u8 = null,
+    process_effort_override: ?types.ReasoningEffort = null,
     session_picker: SessionPicker = .{},
     session_picker_load: SessionPickerLoad = .{},
     session_picker_current_cache: SessionPickerPageCache = .{},
@@ -1095,7 +1098,7 @@ pub const Persistence = struct {
     /// in a static release-binary template.
     pub fn initInto(storage: *Persistence) void {
         comptime {
-            if (std.meta.fields(Persistence).len != 19) {
+            if (std.meta.fields(Persistence).len != 20) {
                 @compileError("update Persistence.initInto for the changed field set");
             }
         }
@@ -1109,6 +1112,7 @@ pub const Persistence = struct {
         storage.js_host_store = .{};
         storage.js_host_session = null;
         storage.process_model_override = null;
+        storage.process_effort_override = null;
         storage.session_picker = .{};
         storage.session_picker_load = .{};
         storage.session_picker_current_cache = .{};
@@ -1158,6 +1162,7 @@ test "persistence in-place initialization preserves empty ownership" {
     try std.testing.expect(persistence.store == null);
     try std.testing.expect(persistence.writable == null);
     try std.testing.expect(persistence.subagent_host == null);
+    try std.testing.expect(persistence.process_effort_override == null);
     try std.testing.expect(!persistence.session_picker.active);
     try std.testing.expect(persistence.session_picker_load.task == null);
     try std.testing.expect(!persistence.session_picker_current_cache.ready);
@@ -1335,6 +1340,8 @@ pub fn Runtime(comptime App: type) type {
             configured_model: []const u8,
             model_source: config_runtime.ModelSource,
             selected_model: []const u8,
+            configured_effort: types.ReasoningEffort,
+            effort_source: config_runtime.ConfigSource,
             effort: types.ReasoningEffort,
             fast_mode: bool,
         ) !void {
@@ -1344,7 +1351,7 @@ pub fn Runtime(comptime App: type) type {
                 .{
                     .provider = provider,
                     .model = @constCast(configured_model),
-                    .effort = effort,
+                    .effort = configured_effort,
                     .fast_mode = fast_mode,
                 },
             );
@@ -1361,6 +1368,8 @@ pub fn Runtime(comptime App: type) type {
                 app.session_persistence.process_model_override =
                     try app.alloc.dupe(u8, selected_model);
             }
+            app.session_persistence.process_effort_override =
+                if (effort_source == .process_override) effort else null;
         }
 
         pub fn initializePersistence(
@@ -1368,10 +1377,13 @@ pub fn Runtime(comptime App: type) type {
             required: bool,
         ) !void {
             if (comptime !runtime_profile.allows(App, .durable_sessions)) return;
-            var store = session_store.Store.init(
-                app.alloc,
-                app.workspace_root,
-            ) catch |err| {
+            var store = (if (comptime @hasField(App, "profile_home"))
+                if (app.profile_home) |home_dir|
+                    session_store.Store.initFromHome(app.alloc, home_dir, app.workspace_root)
+                else
+                    session_store.Store.init(app.alloc, app.workspace_root)
+            else
+                session_store.Store.init(app.alloc, app.workspace_root)) catch |err| {
                 if (required) return err;
                 return;
             };
@@ -1442,9 +1454,19 @@ pub fn Runtime(comptime App: type) type {
                 app.alloc,
                 state,
             ) catch |err| {
+                if (comptime @hasField(App, "launch_admission_context")) {
+                    if (app.launch_admission_context != null) return err;
+                }
                 try warnNonDurable(app, "session creation failed", err);
                 return;
             };
+            errdefer {
+                if (app.session_persistence.writable) |*loaded| {
+                    loaded.deinit(app.alloc);
+                }
+                app.session_persistence.writable = null;
+            }
+            try publishLaunchActiveConversation(app);
             app.session_persistence.degraded_warning_emitted = false;
             app.total_input_tokens = 0;
             app.total_output_tokens = 0;
@@ -1477,6 +1499,9 @@ pub fn Runtime(comptime App: type) type {
         }
 
         pub fn newSession(app: *App) !void {
+            if (comptime @hasDecl(App, "discardPendingLaunchSessionName")) {
+                app.discardPendingLaunchSessionName();
+            }
             try resetSessionWithBackgroundPolicy(app, .carry_forward);
         }
 
@@ -1543,6 +1568,7 @@ pub fn Runtime(comptime App: type) type {
 
         fn installFreshLiveSession(app: *App) !void {
             try beginFreshPersistedSession(app);
+            reportSessionIdentityChanged(app);
             enableSessionStores(app);
             refreshSubagentProjectionAfterSessionInstall(app);
             try finishLiveSessionTransition(app);
@@ -1913,9 +1939,20 @@ pub fn Runtime(comptime App: type) type {
             }
             const active = &app.session_persistence.writable.?;
             try hydrateResumedSession(app, active.state, display.title, notice);
+            try publishLaunchActiveConversation(app);
             active.resume_view_stale = true;
+            reportSessionIdentityChanged(app);
             enableSessionStores(app);
+            if (comptime @hasDecl(App, "applyPendingLaunchSessionName")) {
+                try app.applyPendingLaunchSessionName();
+            }
             refreshSubagentProjectionAfterSessionInstall(app);
+        }
+
+        fn reportSessionIdentityChanged(app: *App) void {
+            if (comptime @hasDecl(App, "reportSessionIdentityChanged")) {
+                app.reportSessionIdentityChanged(activeSessionId(app));
+            }
         }
 
         fn hydrateResumedSession(
@@ -2360,7 +2397,41 @@ pub fn Runtime(comptime App: type) type {
                 );
                 return;
             };
+            reportSessionIdentityChanged(app);
             enableSessionStores(app);
+            if (comptime @hasDecl(App, "applyPendingLaunchSessionName")) {
+                app.applyPendingLaunchSessionName() catch |err| {
+                    debug_trace.logf(
+                        "session_naming",
+                        "launch title after picker cancel unavailable err={s}",
+                        .{@errorName(err)},
+                    );
+                    const notice = std.fmt.allocPrint(
+                        app.alloc,
+                        "unable to persist launch name: {s}; the explicit name remains pending",
+                        .{@errorName(err)},
+                    ) catch |notice_err| {
+                        debug_trace.logf(
+                            "session_naming",
+                            "launch title persistence notice unavailable err={s}",
+                            .{@errorName(notice_err)},
+                        );
+                        return;
+                    };
+                    defer app.alloc.free(notice);
+                    app.writeDomainNotice(.{
+                        .topic = "session",
+                        .tone = .@"error",
+                        .body = notice,
+                    }, true) catch |notice_err| {
+                        debug_trace.logf(
+                            "session_naming",
+                            "launch title persistence notice unavailable err={s}",
+                            .{@errorName(notice_err)},
+                        );
+                    };
+                };
+            }
         }
 
         fn invalidateSessionPickerCaches(app: *App) void {
@@ -2782,8 +2853,8 @@ pub fn Runtime(comptime App: type) type {
                 result.session_error = err;
             };
 
-            var settings_attempt = config_runtime.attemptUserPreferences(
-                app.alloc,
+            var settings_attempt = app_profile_runtime.attemptUserPreferences(
+                app,
                 patch.userSettingsPatch(),
             );
             switch (settings_attempt) {
@@ -2847,6 +2918,14 @@ pub fn Runtime(comptime App: type) type {
             if (app.session_persistence.writable) |*loaded| return loaded.active_id;
             if (app.session_persistence.js_host_session) |*owner| return owner.state.id;
             return null;
+        }
+
+        fn publishLaunchActiveConversation(app: *App) !void {
+            if (comptime !@hasField(App, "launch_admission_context")) return;
+            const context = if (app.launch_admission_context) |*value| value else return;
+            const active_id = activeSessionId(app) orelse
+                return error.LaunchConversationUnavailable;
+            try context.publishActiveConversation(active_id);
         }
 
         /// Replaces the cached footer title. App owns the copy. Keeps the
@@ -2954,6 +3033,27 @@ pub fn Runtime(comptime App: type) type {
             return if (app.session_title.items.len == 0) null else app.session_title.items;
         }
 
+        /// Returns the cached title only when the active session's sidecar is
+        /// readable and names the same value. Resume can derive a cosmetic
+        /// title from legacy history when display metadata is missing; raw
+        /// metadata observers must not mistake that fallback for a committed
+        /// native name.
+        pub fn durableCachedSessionTitle(app: *App) ?[]const u8 {
+            if (comptime !@hasField(App, "session_persistence")) return null;
+            const title = cachedSessionTitle(app) orelse return null;
+            const loaded = if (app.session_persistence.writable) |*value|
+                value
+            else
+                return null;
+            var display = session_display_metadata.readSidecarOrFallback(
+                app.alloc,
+                &loaded.log.dir,
+            ) catch return null;
+            defer display.deinit(app.alloc);
+            if (!display.present or !std.mem.eql(u8, display.title, title)) return null;
+            return title;
+        }
+
         /// Derives and caches the title on the first turn of a fresh session.
         /// Derivation freezes at the first usable prompt, so this is a no-op
         /// once a title is cached.
@@ -2969,27 +3069,23 @@ pub fn Runtime(comptime App: type) type {
             };
             defer display.deinit(app.alloc);
             if (!display.present) return;
+            if (comptime @hasField(App, "session_persistence")) {
+                if (app.session_persistence.writable != null) {
+                    try persistActiveSessionTitle(app, display.title);
+                    return;
+                }
+            }
             try setCachedSessionTitle(app, display.title);
         }
 
-        pub const RenameError = error{
-            EmptyTitle,
-            TitleTooLong,
-            InvalidTitle,
+        pub const RenameError = session_display_metadata.TitleValidationError || error{
             NoActiveSession,
         };
 
         /// Validates a user-supplied session title. Returns the trimmed slice,
         /// which borrows from `raw`.
         pub fn validateSessionTitle(raw: []const u8) RenameError![]const u8 {
-            const trimmed = std.mem.trim(u8, raw, " \t\r\n");
-            if (trimmed.len == 0) return error.EmptyTitle;
-            if (trimmed.len > session_display_metadata.max_title_bytes) return error.TitleTooLong;
-            if (!std.unicode.utf8ValidateSlice(trimmed)) return error.InvalidTitle;
-            for (trimmed) |byte| {
-                if (byte < 0x20 or byte == 0x7f) return error.InvalidTitle;
-            }
-            return trimmed;
+            return session_display_metadata.validateTitle(raw);
         }
 
         /// Renames the active session: caches the title for the footer and
@@ -2999,40 +3095,61 @@ pub fn Runtime(comptime App: type) type {
             const title = try validateSessionTitle(raw);
             if (comptime !@hasField(App, "session_persistence")) return error.NoActiveSession;
             if (app.session_persistence.writable == null) return error.NoActiveSession;
+            if (comptime @hasDecl(App, "cancelPendingSessionName")) {
+                app.cancelPendingSessionName();
+            }
+            try persistActiveSessionTitle(app, title);
+        }
+
+        pub fn applyGeneratedSessionTitle(app: *App, raw: []const u8) !void {
+            const title = try validateSessionTitle(raw);
+            if (comptime !@hasField(App, "session_persistence")) return error.NoActiveSession;
+            if (app.session_persistence.writable == null) return error.NoActiveSession;
+            try persistActiveSessionTitle(app, title);
+        }
+
+        /// Installs one native title through the same sidecar and index path
+        /// for generated, derived, and manually supplied names. Publication
+        /// to observers happens only after the durable sidecar replacement.
+        fn persistActiveSessionTitle(app: *App, title: []const u8) !void {
+            {
+                app.session_persistence.write_mutex.lockUncancelable(io_mod.getIo());
+                defer app.session_persistence.write_mutex.unlock(io_mod.getIo());
+
+                const loaded = &app.session_persistence.writable.?;
+                var display = session_display_metadata.readSidecarOrFallback(
+                    app.alloc,
+                    &loaded.log.dir,
+                ) catch |err| switch (err) {
+                    error.OutOfMemory => return error.OutOfMemory,
+                    else => try session_display_metadata.missingFallback(app.alloc),
+                };
+                defer display.deinit(app.alloc);
+
+                const owned_title = try app.alloc.dupe(u8, title);
+                app.alloc.free(display.title);
+                display.title = owned_title;
+                display.present = true;
+                if (display.origin_workspace_root == null) {
+                    display.origin_workspace_root = try app.alloc.dupe(u8, loaded.state.origin_workspace_root);
+                }
+                try session_display_metadata.writeSidecar(app.alloc, &loaded.log.dir, display);
+
+                if (app.session_persistence.store) |*store| {
+                    store.updateIndexedTitle(app.alloc, loaded.active_id, title) catch |err| switch (err) {
+                        error.OutOfMemory => return error.OutOfMemory,
+                        else => debug_trace.logf(
+                            "session",
+                            "event=session_title_index_update_failed id={s} err={s}",
+                            .{ loaded.active_id, @errorName(err) },
+                        ),
+                    };
+                }
+            }
 
             try setCachedSessionTitle(app, title);
-
-            app.session_persistence.write_mutex.lockUncancelable(io_mod.getIo());
-            defer app.session_persistence.write_mutex.unlock(io_mod.getIo());
-
-            const loaded = &app.session_persistence.writable.?;
-            var display = session_display_metadata.readSidecarOrFallback(
-                app.alloc,
-                &loaded.log.dir,
-            ) catch |err| switch (err) {
-                error.OutOfMemory => return error.OutOfMemory,
-                else => try session_display_metadata.missingFallback(app.alloc),
-            };
-            defer display.deinit(app.alloc);
-
-            const owned_title = try app.alloc.dupe(u8, title);
-            app.alloc.free(display.title);
-            display.title = owned_title;
-            display.present = true;
-            if (display.origin_workspace_root == null) {
-                display.origin_workspace_root = try app.alloc.dupe(u8, loaded.state.origin_workspace_root);
-            }
-            try session_display_metadata.writeSidecar(app.alloc, &loaded.log.dir, display);
-
-            if (app.session_persistence.store) |*store| {
-                store.updateIndexedTitle(app.alloc, loaded.active_id, title) catch |err| switch (err) {
-                    error.OutOfMemory => return error.OutOfMemory,
-                    else => debug_trace.logf(
-                        "session",
-                        "event=rename_index_update_failed id={s} err={s}",
-                        .{ loaded.active_id, @errorName(err) },
-                    ),
-                };
+            if (comptime @hasDecl(App, "reportSessionMetadataChanged")) {
+                app.reportSessionMetadataChanged(title);
             }
         }
 
@@ -4548,7 +4665,7 @@ pub fn Runtime(comptime App: type) type {
         ) void {
             disableSubagentHost(app);
             const store = if (app.session_persistence.store) |*value| value else return;
-            app.session_persistence.subagent_host = subagent_tool_host.Runtime.create(
+            const host = subagent_tool_host.Runtime.create(
                 app.alloc,
                 store,
                 loaded.active_id,
@@ -4565,6 +4682,27 @@ pub fn Runtime(comptime App: type) type {
                 );
                 return;
             };
+            if (comptime @hasDecl(App, "invalidateSubagentAttentionToken")) {
+                host.approvals.setAttentionInvalidationObserver(.{
+                    .context = app,
+                    .observe_fn = observeSubagentAttentionInvalidation,
+                });
+            }
+            app.session_persistence.subagent_host = host;
+        }
+
+        fn observeSubagentAttentionInvalidation(
+            raw: ?*anyopaque,
+            child_session_id: []const u8,
+            attention_token: approval_registry.AttentionToken,
+        ) void {
+            const app: *App = @ptrCast(@alignCast(raw.?));
+            if (comptime @hasDecl(App, "invalidateSubagentAttentionToken")) {
+                app.invalidateSubagentAttentionToken(
+                    child_session_id,
+                    attention_token,
+                );
+            }
         }
 
         fn subagentAuthorityResolver(app: *App) subagent_authority.HostResolver {
@@ -4870,7 +5008,14 @@ pub fn Runtime(comptime App: type) type {
             preferences: session_codec.DurableSessionPreferences,
         ) !session_codec.DurableSessionState {
             const now = io_mod.milliTimestamp();
-            const id = try session_store.generateSessionId(app.alloc);
+            const id = if (comptime @hasField(App, "launch_admission_context")) id: {
+                if (app.launch_admission_context) |*context| {
+                    if (try context.takeReservedFreshConversationId()) |reserved| {
+                        break :id reserved;
+                    }
+                }
+                break :id try session_store.generateSessionId(app.alloc);
+            } else try session_store.generateSessionId(app.alloc);
             errdefer app.alloc.free(id);
             const origin = try app.alloc.dupe(u8, app.workspace_root);
             errdefer app.alloc.free(origin);
@@ -4917,9 +5062,9 @@ pub fn Runtime(comptime App: type) type {
                 std.heap.c_allocator,
                 provider_runtime.model(app),
             );
-            app.effort = preferences.effort;
+            app.effort = app.session_persistence.process_effort_override orelse preferences.effort;
             app.fast_mode = preferences.fast_mode;
-            app.worker.syncQueuedPromptEffort(preferences.effort);
+            app.worker.syncQueuedPromptEffort(app.effort);
             app.worker.syncQueuedPromptFastMode(preferences.fast_mode);
         }
 
@@ -5154,11 +5299,41 @@ const ReplayEvent = enum {
     raw_transcript,
 };
 
+const FakeLaunchAdmissionContext = struct {
+    alloc: Allocator,
+    reserved_id: []const u8,
+    consumed: bool = false,
+    published: [256]u8 = undefined,
+    published_len: usize = 0,
+    publish_count: usize = 0,
+
+    fn takeReservedFreshConversationId(self: *FakeLaunchAdmissionContext) !?[]u8 {
+        if (self.consumed) return null;
+        self.consumed = true;
+        return try self.alloc.dupe(u8, self.reserved_id);
+    }
+
+    fn publishActiveConversation(
+        self: *FakeLaunchAdmissionContext,
+        conversation_id: []const u8,
+    ) !void {
+        if (conversation_id.len > self.published.len) return error.NameTooLong;
+        @memcpy(self.published[0..conversation_id.len], conversation_id);
+        self.published_len = conversation_id.len;
+        self.publish_count += 1;
+    }
+
+    fn publishedId(self: *const FakeLaunchAdmissionContext) []const u8 {
+        return self.published[0..self.published_len];
+    }
+};
+
 const TestApp = struct {
     alloc: Allocator,
     workspace_root: []u8,
     session: session_runtime.SessionRuntime = .{ .max_history_turns = 8 },
     session_persistence: Persistence = .{},
+    launch_admission_context: ?FakeLaunchAdmissionContext = null,
     session_title: std.ArrayList(u8) = .empty,
     terminal_title_label: [128]u8 = undefined,
     terminal_title_label_len: usize = 0,
@@ -5169,6 +5344,7 @@ const TestApp = struct {
     pending_images: std.ArrayList(types.ImageAttachment) = .empty,
     next_image_id: usize = 1,
     requested_resume: ?TestResumeTarget = null,
+    pending_launch_session_name: ?[]u8 = null,
     terminal: shell_runtime.TerminalState = .{},
     stream: types.StreamState = .{},
     background: FakeBackground = .{},
@@ -5202,6 +5378,7 @@ const TestApp = struct {
     assistant_thematic_rule_count: usize = 0,
     assistant_presentation_events: std.ArrayList(AssistantPresentationEvent) = .empty,
     fail_system_notice: bool = false,
+    fail_pending_launch_name_apply: bool = false,
     fail_assistant_table_append: bool = false,
     fail_assistant_code_block_append: bool = false,
     writable_seen_during_notice_failure: bool = false,
@@ -5220,12 +5397,67 @@ const TestApp = struct {
         authority_mutex: std.Io.Mutex = .init,
     } = .{},
     mcp_tool_names: std.ArrayList([]u8) = .empty,
+    reported_session_identity_count: usize = 0,
+    last_reported_session_id: ?[]const u8 = null,
+    cancelled_session_name_count: usize = 0,
+    reported_session_metadata_count: usize = 0,
+    reported_session_metadata_after_sidecar: bool = false,
+    reported_session_metadata_title: [session_display_metadata.max_title_bytes]u8 = undefined,
+    reported_session_metadata_title_len: usize = 0,
 
     fn init(alloc: Allocator, workspace_root: []const u8) !TestApp {
         return .{
             .alloc = alloc,
             .workspace_root = try alloc.dupe(u8, workspace_root),
         };
+    }
+
+    fn reportSessionIdentityChanged(self: *TestApp, session_id: ?[]const u8) void {
+        self.reported_session_identity_count += 1;
+        self.last_reported_session_id = session_id;
+    }
+
+    fn cancelPendingSessionName(self: *TestApp) void {
+        self.cancelled_session_name_count += 1;
+    }
+
+    fn applyPendingLaunchSessionName(self: *TestApp) !void {
+        const name = self.pending_launch_session_name orelse return;
+        if (self.fail_pending_launch_name_apply) {
+            return error.TestLaunchNamePersistenceFailure;
+        }
+        try Runtime(TestApp).renameActiveSession(self, name);
+        self.alloc.free(name);
+        self.pending_launch_session_name = null;
+    }
+
+    fn discardPendingLaunchSessionName(self: *TestApp) void {
+        if (self.pending_launch_session_name) |name| self.alloc.free(name);
+        self.pending_launch_session_name = null;
+    }
+
+    fn reportSessionMetadataChanged(self: *TestApp, title: []const u8) void {
+        self.reported_session_metadata_count += 1;
+        self.reported_session_metadata_title_len = @min(
+            title.len,
+            self.reported_session_metadata_title.len,
+        );
+        @memcpy(
+            self.reported_session_metadata_title[0..self.reported_session_metadata_title_len],
+            title[0..self.reported_session_metadata_title_len],
+        );
+        const loaded = if (self.session_persistence.writable) |*value| value else return;
+        var display = session_display_metadata.readSidecarOrFallback(
+            self.alloc,
+            &loaded.log.dir,
+        ) catch return;
+        defer display.deinit(self.alloc);
+        self.reported_session_metadata_after_sidecar = display.present and
+            std.mem.eql(u8, display.title, title);
+    }
+
+    fn reportedSessionMetadataTitle(self: *const TestApp) []const u8 {
+        return self.reported_session_metadata_title[0..self.reported_session_metadata_title_len];
     }
 
     fn toolAdvertisementSet(_: *const TestApp) tool_set_contract.ToolSet {
@@ -5302,6 +5534,7 @@ const TestApp = struct {
         self.assistant_presentation_events.deinit(self.alloc);
         Runtime(TestApp).deinitPersistence(self);
         if (self.requested_resume) |*target| target.deinit(self.alloc);
+        self.discardPendingLaunchSessionName();
         self.session.deinit(self.alloc);
         self.background.deinit();
         self.worker.deinit(std.heap.c_allocator);
@@ -5648,6 +5881,8 @@ test "js-host resume restores transcript context preferences usage and revision"
         .user_global,
         "startup/model",
         .auto,
+        .compiled_default,
+        .auto,
         false,
     );
     app.session_persistence.js_host_store = fake.store();
@@ -5704,6 +5939,8 @@ test "js-host resume store failures and missing records fall back to fresh sessi
             .user_global,
             "fresh/model",
             .auto,
+            .compiled_default,
+            .auto,
             false,
         );
         app.session_persistence.js_host_store = fake.store();
@@ -5733,6 +5970,8 @@ test "js-host picker request stays unsupported and starts fresh" {
         .user_global,
         "fresh/model",
         .auto,
+        .compiled_default,
+        .auto,
         false,
     );
     app.session_persistence.js_host_store = fake.store();
@@ -5757,6 +5996,8 @@ test "js-host completed and interrupted turns propagate revisions preserve owner
         "fresh/model",
         .user_global,
         "fresh/model",
+        .auto,
+        .compiled_default,
         .auto,
         false,
     );
@@ -5824,6 +6065,8 @@ test "js-host preference changes snapshot the updated session preferences" {
         "fresh/model",
         .user_global,
         "fresh/model",
+        .auto,
+        .compiled_default,
         .auto,
         false,
     );
@@ -5919,6 +6162,8 @@ fn configureTestPreferences(app: *TestApp) !void {
         "configured/model",
         .user_workspace,
         "configured/model",
+        types.ReasoningEffort.literal("high"),
+        .compiled_default,
         types.ReasoningEffort.literal("high"),
         true,
     );
@@ -6441,6 +6686,104 @@ test "enableSessionStores replaces existing subagent host without leaking" {
 
     Runtime(TestApp).enableSessionStores(&app);
     try std.testing.expect(app.session_persistence.subagent_host != null);
+}
+
+test "launch-correlated fresh session consumes its reservation once and publishes every active Conversation" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const paths = try testPaths(alloc, &tmp);
+    defer {
+        alloc.free(paths.home);
+        alloc.free(paths.workspace);
+    }
+    const home = try TestHome.install(alloc, paths.home);
+    defer home.deinit();
+
+    var app = try TestApp.init(alloc, paths.workspace);
+    defer app.deinit();
+    app.launch_admission_context = .{
+        .alloc = alloc,
+        .reserved_id = "1788000000000-1788000000000000000-abcd1234",
+    };
+    try configureTestPreferences(&app);
+    try Runtime(TestApp).initializePersistence(&app, true);
+    try Runtime(TestApp).beginFreshPersistedSession(&app);
+    try std.testing.expectEqualStrings(
+        app.launch_admission_context.?.reserved_id,
+        app.session_persistence.writable.?.active_id,
+    );
+    try std.testing.expectEqualStrings(
+        app.session_persistence.writable.?.active_id,
+        app.launch_admission_context.?.publishedId(),
+    );
+
+    const reserved = try alloc.dupe(
+        u8,
+        app.session_persistence.writable.?.active_id,
+    );
+    defer alloc.free(reserved);
+    try Runtime(TestApp).beginFreshPersistedSession(&app);
+    try std.testing.expect(!std.mem.eql(
+        u8,
+        reserved,
+        app.session_persistence.writable.?.active_id,
+    ));
+    try std.testing.expectEqualStrings(
+        app.session_persistence.writable.?.active_id,
+        app.launch_admission_context.?.publishedId(),
+    );
+    try std.testing.expectEqual(
+        @as(usize, 2),
+        app.launch_admission_context.?.publish_count,
+    );
+}
+
+test "launch-correlated exact resume publishes the restored active Conversation" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const paths = try testPaths(alloc, &tmp);
+    defer {
+        alloc.free(paths.home);
+        alloc.free(paths.workspace);
+    }
+    const home = try TestHome.install(alloc, paths.home);
+    defer home.deinit();
+
+    var app = try TestApp.init(alloc, paths.workspace);
+    defer app.deinit();
+    app.launch_admission_context = .{
+        .alloc = alloc,
+        .reserved_id = "unused-fresh-reservation",
+    };
+    try configureTestPreferences(&app);
+    try Runtime(TestApp).initializePersistence(&app, true);
+    const history: [0]types.HistoryTurn = .{};
+    try writeSessionFixture(
+        alloc,
+        app.session_persistence.store.?,
+        "exact-resumed-conversation",
+        &history,
+        0,
+    );
+    app.requested_resume = .{
+        .id = try alloc.dupe(u8, "exact-resumed-conversation"),
+    };
+
+    try Runtime(TestApp).resumeRequestedSession(&app);
+    try std.testing.expectEqualStrings(
+        "exact-resumed-conversation",
+        app.session_persistence.writable.?.active_id,
+    );
+    try std.testing.expectEqualStrings(
+        "exact-resumed-conversation",
+        app.launch_admission_context.?.publishedId(),
+    );
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        app.launch_admission_context.?.publish_count,
+    );
 }
 
 test "interactive subagent host resolves current tools rules grants and integrations" {
@@ -7549,9 +7892,13 @@ test "upgrade resume restores active session with the installed version notice" 
         "configured/model",
         .process_override,
         "env/model",
+        types.ReasoningEffort.literal("low"),
+        .process_override,
         types.ReasoningEffort.literal("high"),
         true,
     );
+    try std.testing.expect(app.session_persistence.workspace_preferences.?.effort.eql(types.ReasoningEffort.literal("low")));
+    try std.testing.expect(app.session_persistence.process_effort_override.?.eql(types.ReasoningEffort.literal("high")));
     try Runtime(TestApp).initializePersistence(&app, true);
     var calls = [_]types.ToolCall{.{
         .id = "call_read",
@@ -7662,7 +8009,11 @@ test "upgrade resume restores active session with the installed version notice" 
         "saved/model",
         app.session_persistence.session_preferences.?.model,
     );
-    try std.testing.expectEqual(types.ReasoningEffort.literal("medium"), app.effort);
+    try std.testing.expectEqual(types.ReasoningEffort.literal("high"), app.effort);
+    try std.testing.expectEqual(
+        types.ReasoningEffort.literal("medium"),
+        app.session_persistence.session_preferences.?.effort,
+    );
     try std.testing.expect(!app.fast_mode);
 }
 
@@ -7925,6 +8276,77 @@ test "canceling a startup session picker starts a writable fresh session" {
 
     try std.testing.expect(!app.session_persistence.session_picker.active);
     try std.testing.expect(app.session_persistence.writable != null);
+    try std.testing.expectEqual(@as(usize, 1), app.reported_session_identity_count);
+    try std.testing.expectEqualStrings(
+        app.session_persistence.writable.?.active_id,
+        app.last_reported_session_id.?,
+    );
+}
+
+test "startup picker cancellation retains launch name until persistence and a fresh session cannot inherit it" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const paths = try testPaths(alloc, &tmp);
+    defer {
+        alloc.free(paths.home);
+        alloc.free(paths.workspace);
+    }
+
+    const home = try TestHome.install(alloc, paths.home);
+    defer home.deinit();
+
+    var app = try TestApp.init(alloc, paths.workspace);
+    defer app.deinit();
+    try configureTestPreferences(&app);
+    try Runtime(TestApp).initializePersistence(&app, true);
+    try Runtime(TestApp).openSessionPicker(&app);
+    app.pending_launch_session_name = try alloc.dupe(
+        u8,
+        "Fresh name after picker cancellation",
+    );
+    app.fail_pending_launch_name_apply = true;
+
+    Runtime(TestApp).cancelSessionPickerToComposer(&app);
+
+    try std.testing.expect(!app.session_persistence.session_picker.active);
+    try std.testing.expect(app.session_persistence.writable != null);
+    try std.testing.expectEqualStrings(
+        "Fresh name after picker cancellation",
+        app.pending_launch_session_name.?,
+    );
+    try std.testing.expect(Runtime(TestApp).cachedSessionTitle(&app) == null);
+    try std.testing.expectEqual(@as(usize, 1), app.notices.items.len);
+    try std.testing.expect(std.mem.find(
+        u8,
+        app.notices.items[0],
+        "the explicit name remains pending",
+    ) != null);
+
+    app.fail_pending_launch_name_apply = false;
+    try app.applyPendingLaunchSessionName();
+    try std.testing.expect(app.pending_launch_session_name == null);
+    try std.testing.expectEqualStrings(
+        "Fresh name after picker cancellation",
+        Runtime(TestApp).cachedSessionTitle(&app).?,
+    );
+    var display = try session_display_metadata.readSidecarOrFallback(
+        alloc,
+        &app.session_persistence.writable.?.log.dir,
+    );
+    defer display.deinit(alloc);
+    try std.testing.expect(display.present);
+    try std.testing.expectEqualStrings(
+        "Fresh name after picker cancellation",
+        display.title,
+    );
+    try std.testing.expectEqual(@as(usize, 1), app.reported_session_metadata_count);
+
+    try Runtime(TestApp).beginFreshPersistedSession(&app);
+    Runtime(TestApp).enableSessionStores(&app);
+    try std.testing.expect(app.pending_launch_session_name == null);
+    try std.testing.expect(Runtime(TestApp).durableCachedSessionTitle(&app) == null);
 }
 
 test "interactive session resume uses the live transition and shared restore path" {
@@ -7960,6 +8382,10 @@ test "interactive session resume uses the live transition and shared restore pat
     try Runtime(TestApp).openSessionPicker(&app);
     try std.testing.expect(app.session_persistence.session_picker.isLoading());
     try waitForSessionPickerLoad(&app);
+    app.pending_launch_session_name = try alloc.dupe(
+        u8,
+        "Picker-selected launch title",
+    );
 
     try std.testing.expect(try Runtime(TestApp).resumeSelectedSession(&app));
     try std.testing.expectEqual(@as(usize, 1), app.live_resume_prepare_count);
@@ -7974,6 +8400,9 @@ test "interactive session resume uses the live transition and shared restore pat
     try std.testing.expectEqual(@as(usize, 1), app.notices.items.len);
     try std.testing.expectEqualStrings("● Session resumed: saved prompt", app.notices.items[0]);
     try std.testing.expect(!app.session_persistence.session_picker.active);
+    try std.testing.expect(app.pending_launch_session_name == null);
+    try expectActiveTitleDurable(&app, "Picker-selected launch title");
+    try std.testing.expectEqual(@as(usize, 1), app.cancelled_session_name_count);
 
     const host = app.session_persistence.subagent_host.?;
     const recovery_deadline = io_mod.milliTimestamp() + 5_000;
@@ -9007,6 +9436,8 @@ test "fresh interactive session retains one writable schema-v3 handle" {
         .user_workspace,
         "configured/model",
         types.ReasoningEffort.literal("high"),
+        .compiled_default,
+        types.ReasoningEffort.literal("high"),
         true,
     );
     try Runtime(TestApp).initializePersistence(&app, true);
@@ -9910,6 +10341,36 @@ test "renameActiveSession requires an active session" {
     );
 }
 
+fn expectActiveTitleDurable(app: *TestApp, expected: []const u8) !void {
+    const alloc = std.testing.allocator;
+    const loaded = &app.session_persistence.writable.?;
+    var display = try session_display_metadata.readSidecarOrFallback(alloc, &loaded.log.dir);
+    defer display.deinit(alloc);
+    try std.testing.expect(display.present);
+    try std.testing.expectEqualStrings(expected, display.title);
+
+    const store = app.session_persistence.store.?;
+    var page = try store.listResumablePage(alloc, null, null);
+    page.deinit(alloc);
+    const index_path = try std.fs.path.join(alloc, &.{ store.sessions_dir, "index.json" });
+    defer alloc.free(index_path);
+    var index_file = try std.Io.Dir.openFileAbsolute(io_mod.getIo(), index_path, .{});
+    defer index_file.close(io_mod.getIo());
+    const bytes = try io_mod.readFileToEnd(alloc, &index_file, 2 * 1024 * 1024);
+    defer alloc.free(bytes);
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, bytes, .{});
+    defer parsed.deinit();
+    const summaries = parsed.value.object.get("sessions").?.array.items;
+    for (summaries) |summary| {
+        const object = summary.object;
+        if (!std.mem.eql(u8, object.get("id").?.string, loaded.active_id)) continue;
+        try std.testing.expect(object.get("display_metadata_present").?.bool);
+        try std.testing.expectEqualStrings(expected, object.get("title").?.string);
+        return;
+    }
+    return error.TestExpectedIndexedSession;
+}
+
 test "renameActiveSession persists the title to the sidecar and session index" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -9933,6 +10394,14 @@ test "renameActiveSession persists the title to the sidecar and session index" {
 
     try Runtime(TestApp).renameActiveSession(&app, "  deploy pipeline fix  ");
 
+    try std.testing.expectEqual(@as(usize, 1), app.cancelled_session_name_count);
+    try std.testing.expectEqual(@as(usize, 1), app.reported_session_metadata_count);
+    try std.testing.expect(app.reported_session_metadata_after_sidecar);
+    try std.testing.expectEqualStrings(
+        "deploy pipeline fix",
+        app.reportedSessionMetadataTitle(),
+    );
+
     // Cached for the footer without re-reading the sidecar.
     try std.testing.expectEqualStrings(
         "deploy pipeline fix",
@@ -9948,6 +10417,231 @@ test "renameActiveSession persists the title to the sidecar and session index" {
     defer display.deinit(alloc);
     try std.testing.expect(display.present);
     try std.testing.expectEqualStrings("deploy pipeline fix", display.title);
+}
+
+test "launch name applies to the exact resumed target after new and does not leak" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const paths = try testPaths(alloc, &tmp);
+    defer {
+        alloc.free(paths.home);
+        alloc.free(paths.workspace);
+    }
+    try tmp.dir.createDirPath(io_mod.getIo(), "rebound-workspace");
+    const rebound_workspace = try io_mod.dirRealpathAlloc(
+        alloc,
+        tmp.dir,
+        "rebound-workspace",
+    );
+    defer alloc.free(rebound_workspace);
+
+    const home = try TestHome.install(alloc, paths.home);
+    defer home.deinit();
+
+    var app = try TestApp.init(alloc, paths.workspace);
+    defer app.deinit();
+    try configureTestPreferences(&app);
+    try Runtime(TestApp).initializePersistence(&app, true);
+    try Runtime(TestApp).beginFreshPersistedSession(&app);
+    Runtime(TestApp).enableSessionStores(&app);
+
+    const original_id = try alloc.dupe(
+        u8,
+        app.session_persistence.writable.?.active_id,
+    );
+    defer alloc.free(original_id);
+    const original_turn = try session_runtime.makeAssistantTurn(
+        alloc,
+        "persist the exact session before new",
+        "saved",
+    );
+    defer session_runtime.freeHistoryTurn(alloc, original_turn);
+    try Runtime(TestApp).appendHistoryTurn(&app, original_turn);
+
+    // `/new` installs another writable session before launch resumes the
+    // original ID, so resolving `last` would select the wrong conversation.
+    try Runtime(TestApp).beginFreshPersistedSession(&app);
+    Runtime(TestApp).enableSessionStores(&app);
+    try std.testing.expect(!std.mem.eql(
+        u8,
+        original_id,
+        app.session_persistence.writable.?.active_id,
+    ));
+
+    alloc.free(app.workspace_root);
+    app.workspace_root = try alloc.dupe(u8, rebound_workspace);
+    app.cancelled_session_name_count = 0;
+    app.reported_session_metadata_count = 0;
+    app.reported_session_metadata_after_sidecar = false;
+    app.pending_launch_session_name = try alloc.dupe(
+        u8,
+        "Exact resumed launch title",
+    );
+    app.requested_resume = .{ .id = try alloc.dupe(u8, original_id) };
+
+    try Runtime(TestApp).resumeRequestedSession(&app);
+
+    const resumed = &app.session_persistence.writable.?;
+    try std.testing.expectEqualStrings(original_id, resumed.active_id);
+    try std.testing.expectEqualStrings(rebound_workspace, resumed.state.workspace_root);
+    try std.testing.expect(app.pending_launch_session_name == null);
+    try expectActiveTitleDurable(&app, "Exact resumed launch title");
+    try std.testing.expectEqual(@as(usize, 1), app.cancelled_session_name_count);
+    try std.testing.expectEqual(@as(usize, 1), app.reported_session_metadata_count);
+
+    // The consumed launch value cannot name the next fresh session.
+    try Runtime(TestApp).beginFreshPersistedSession(&app);
+    Runtime(TestApp).enableSessionStores(&app);
+    try std.testing.expect(app.pending_launch_session_name == null);
+    try std.testing.expect(Runtime(TestApp).durableCachedSessionTitle(&app) == null);
+}
+
+test "fallback generated and manual titles share one durable metadata path" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const paths = try testPaths(alloc, &tmp);
+    defer {
+        alloc.free(paths.home);
+        alloc.free(paths.workspace);
+    }
+    const home = try TestHome.install(alloc, paths.home);
+    defer home.deinit();
+
+    var app = try TestApp.init(alloc, paths.workspace);
+    defer app.deinit();
+    try configureTestPreferences(&app);
+    try Runtime(TestApp).initializePersistence(&app, true);
+    try Runtime(TestApp).beginFreshPersistedSession(&app);
+    Runtime(TestApp).enableSessionStores(&app);
+
+    const turn = try session_runtime.makeAssistantTurn(
+        alloc,
+        "fallback title from the admitted first user prompt",
+        "answer",
+    );
+    defer session_runtime.freeHistoryTurn(alloc, turn);
+    try Runtime(TestApp).appendHistoryTurn(&app, turn);
+    try expectActiveTitleDurable(&app, "fallback title from the admitted first user prompt");
+    try std.testing.expect(app.reported_session_metadata_after_sidecar);
+    try std.testing.expectEqualStrings(
+        "fallback title from the admitted first user prompt",
+        app.reportedSessionMetadataTitle(),
+    );
+
+    app.reported_session_metadata_after_sidecar = false;
+    try Runtime(TestApp).applyGeneratedSessionTitle(&app, "Generated native title");
+    try expectActiveTitleDurable(&app, "Generated native title");
+    try std.testing.expect(app.reported_session_metadata_after_sidecar);
+    try std.testing.expectEqualStrings("Generated native title", app.reportedSessionMetadataTitle());
+    try std.testing.expectEqual(@as(usize, 0), app.cancelled_session_name_count);
+
+    app.reported_session_metadata_after_sidecar = false;
+    try Runtime(TestApp).renameActiveSession(&app, "Manual native title");
+    try expectActiveTitleDurable(&app, "Manual native title");
+    try std.testing.expect(app.reported_session_metadata_after_sidecar);
+    try std.testing.expectEqualStrings("Manual native title", app.reportedSessionMetadataTitle());
+    try std.testing.expectEqual(@as(usize, 1), app.cancelled_session_name_count);
+    try std.testing.expectEqual(@as(usize, 3), app.reported_session_metadata_count);
+}
+
+test "generated title committed before first history remains authoritative in the index" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const paths = try testPaths(alloc, &tmp);
+    defer {
+        alloc.free(paths.home);
+        alloc.free(paths.workspace);
+    }
+    const home = try TestHome.install(alloc, paths.home);
+    defer home.deinit();
+
+    var app = try TestApp.init(alloc, paths.workspace);
+    defer app.deinit();
+    try configureTestPreferences(&app);
+    try Runtime(TestApp).initializePersistence(&app, true);
+    try Runtime(TestApp).beginFreshPersistedSession(&app);
+    Runtime(TestApp).enableSessionStores(&app);
+
+    const seed_turn = try session_runtime.makeAssistantTurn(
+        alloc,
+        "seed the existing native session index",
+        "answer",
+    );
+    defer session_runtime.freeHistoryTurn(alloc, seed_turn);
+    try Runtime(TestApp).appendHistoryTurn(&app, seed_turn);
+    try expectActiveTitleDurable(&app, "seed the existing native session index");
+
+    try Runtime(TestApp).beginFreshPersistedSession(&app);
+    Runtime(TestApp).enableSessionStores(&app);
+    try Runtime(TestApp).applyGeneratedSessionTitle(&app, "Fast generated title");
+    const turn = try session_runtime.makeAssistantTurn(
+        alloc,
+        "a much longer fallback title that must never replace generation",
+        "answer",
+    );
+    defer session_runtime.freeHistoryTurn(alloc, turn);
+    try Runtime(TestApp).appendHistoryTurn(&app, turn);
+
+    try expectActiveTitleDurable(&app, "Fast generated title");
+    try std.testing.expectEqualStrings(
+        "Fast generated title",
+        Runtime(TestApp).cachedSessionTitle(&app).?,
+    );
+}
+
+test "derived legacy resume title is not exposed as durable native metadata" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const paths = try testPaths(alloc, &tmp);
+    defer {
+        alloc.free(paths.home);
+        alloc.free(paths.workspace);
+    }
+    const home = try TestHome.install(alloc, paths.home);
+    defer home.deinit();
+
+    var app = try TestApp.init(alloc, paths.workspace);
+    defer app.deinit();
+    try configureTestPreferences(&app);
+    try Runtime(TestApp).initializePersistence(&app, true);
+
+    const history = [_]types.HistoryTurn{.{ .assistant = .{
+        .user = .{ .text = @constCast("legacy resume title from saved history") },
+        .assistant = @constCast("saved response"),
+    } }};
+    const store = app.session_persistence.store.?;
+    try writeSessionFixture(alloc, store, "legacy-display-gap", &history, 0);
+    {
+        var fixture = try store.resumeForWrite(alloc, "legacy-display-gap");
+        defer fixture.deinit(alloc);
+        try fixture.log.dir.dir.deleteFile(
+            io_mod.getIo(),
+            session_display_metadata.sidecar_file,
+        );
+    }
+
+    app.requested_resume = .{ .id = try alloc.dupe(u8, "legacy-display-gap") };
+    try Runtime(TestApp).resumeRequestedSession(&app);
+
+    try std.testing.expectEqualStrings(
+        "legacy resume title from saved history",
+        Runtime(TestApp).cachedSessionTitle(&app).?,
+    );
+    try std.testing.expect(Runtime(TestApp).durableCachedSessionTitle(&app) == null);
+
+    try Runtime(TestApp).applyGeneratedSessionTitle(&app, "Committed native title");
+    try std.testing.expectEqualStrings(
+        "Committed native title",
+        Runtime(TestApp).durableCachedSessionTitle(&app).?,
+    );
 }
 
 const ReconciliationOriginUsage = struct {

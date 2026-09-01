@@ -337,6 +337,7 @@ pub const QueueStatus = enum {
 /// Immutable authority and routing values captured for one admitted child turn.
 /// All slices are allocator-owned and must be released with `deinit`.
 pub const AdmissionSnapshot = struct {
+    root_id: []u8,
     parent_id: []u8,
     source_id: []u8,
     model: []u8,
@@ -352,6 +353,7 @@ pub const AdmissionSnapshot = struct {
     mcp_view: ?mcp_access.View = null,
 
     pub fn deinit(self: *AdmissionSnapshot, alloc: Allocator) void {
+        alloc.free(self.root_id);
         alloc.free(self.parent_id);
         alloc.free(self.source_id);
         alloc.free(self.model);
@@ -366,6 +368,8 @@ pub const AdmissionSnapshot = struct {
 
     /// Returns an owned copy; caller frees it with `deinit`.
     pub fn clone(self: AdmissionSnapshot, alloc: Allocator) !AdmissionSnapshot {
+        const root_id = try alloc.dupe(u8, self.root_id);
+        errdefer alloc.free(root_id);
         const parent_id = try alloc.dupe(u8, self.parent_id);
         errdefer alloc.free(parent_id);
         const source_id = try alloc.dupe(u8, self.source_id);
@@ -390,6 +394,7 @@ pub const AdmissionSnapshot = struct {
         errdefer if (mcp_view) |*view| view.deinit(alloc);
         const integration_names = try cloneStrings(alloc, self.integration_names);
         return .{
+            .root_id = root_id,
             .parent_id = parent_id,
             .source_id = source_id,
             .model = model,
@@ -408,6 +413,7 @@ pub const AdmissionSnapshot = struct {
 };
 
 pub const AdmissionInput = struct {
+    root_id: []const u8,
     parent_id: []const u8,
     source_id: []const u8,
     model: []const u8,
@@ -435,6 +441,7 @@ pub fn captureAdmission(
     alloc: Allocator,
     input: AdmissionInput,
 ) AdmissionError!AdmissionSnapshot {
+    validateId(input.root_id) catch return error.InvalidAdmissionItem;
     validateId(input.parent_id) catch return error.InvalidAdmissionItem;
     validateId(input.source_id) catch return error.InvalidAdmissionItem;
     validateBoundedText(input.model, max_model_bytes, error.InvalidModel) catch
@@ -459,6 +466,8 @@ pub fn captureAdmission(
     session_permission_state.validate(input.permission_state) catch
         return error.InvalidAdmissionItem;
 
+    const root_id = try alloc.dupe(u8, input.root_id);
+    errdefer alloc.free(root_id);
     const parent_id = try alloc.dupe(u8, input.parent_id);
     errdefer alloc.free(parent_id);
     const source_id = try alloc.dupe(u8, input.source_id);
@@ -486,6 +495,7 @@ pub fn captureAdmission(
     errdefer if (mcp_view) |*view| view.deinit(alloc);
     const integration_names = try cloneStrings(alloc, input.integration_names);
     return .{
+        .root_id = root_id,
         .parent_id = parent_id,
         .source_id = source_id,
         .model = model,

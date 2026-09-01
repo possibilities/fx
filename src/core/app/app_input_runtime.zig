@@ -41,6 +41,7 @@ const usage_report = @import("../session/usage_report.zig");
 const skill_runtime = @import("../skills/skill_runtime.zig");
 const file_index = @import("../workspace/file_index.zig");
 const command_specs = @import("../slash_commands/command_specs.zig");
+const hooks = @import("../hooks/hooks.zig");
 const types = @import("../shared/types.zig");
 const subagent_input = @import("../subagent/input_action.zig");
 const worker_runtime = @import("../agent/worker_runtime.zig");
@@ -80,7 +81,8 @@ const ModelPickerStage = picker_state.ModelPickerStage;
 const ToolPermissionDecision = types.ToolPermissionDecision;
 
 pub const file_picker_completion_cap = input_completion_runtime.file_picker_completion_cap;
-const ctrl_g_upgrade_byte: u8 = 7;
+const ctrl_g_external_editor_byte: u8 = 7;
+const ctrl_t_upgrade_byte: u8 = 20;
 const ctrl_x_manager_byte: u8 = 24;
 
 fn classifyResumeFailure(err: anyerror) session_catalog.ResumeFailure {
@@ -995,6 +997,7 @@ pub fn Runtime(comptime App: type) type {
             if (try full_transcript_rt.routeByte(app, byte)) return;
             if (try routeProjectMcpPromptByte(app, byte)) return;
             if (try routeActiveModalInput(app, raw, input_limits.decision_bytes)) return;
+            if (try routeExternalEditorShortcut(app, byte, max_input_len)) return;
             if (byte >= 0x80) {
                 try handleTextByte(app, .composer, byte, max_input_len);
                 return;
@@ -1293,9 +1296,33 @@ pub fn Runtime(comptime App: type) type {
         }
 
         fn routeUpgradeShortcut(app: *App, byte: u8) !bool {
-            if (byte != ctrl_g_upgrade_byte) return false;
+            if (byte != ctrl_t_upgrade_byte) return false;
             if (comptime @hasDecl(App, "applyReadyUpgradeShortcut")) {
                 try app.applyReadyUpgradeShortcut();
+            }
+            return true;
+        }
+
+        fn routeExternalEditorShortcut(app: *App, byte: u8, max_input_len: usize) !bool {
+            if (byte != ctrl_g_external_editor_byte) return false;
+            if (comptime @hasField(App, "terminal")) {
+                if (app.terminal.alternate_screen_owner != .none) {
+                    try app.writeDomainNotice(.{
+                        .topic = "editor",
+                        .tone = .warning,
+                        .body = "external editing is unavailable while another screen owns the terminal",
+                    }, true);
+                    app.shell.render_requests.request(.footer);
+                    return true;
+                }
+            }
+            dismissActiveMenusThenRedraw(app);
+            if (comptime @hasDecl(App, "editComposerWithExternalEditor")) {
+                if (try app.editComposerWithExternalEditor(max_input_len)) {
+                    if (comptime @hasField(App, "queued_prompt_review")) {
+                        queue_rt.markVisibleSelectionDirty(app);
+                    }
+                }
             }
             return true;
         }
@@ -1306,7 +1333,7 @@ pub fn Runtime(comptime App: type) type {
             max_input_len: usize,
         ) !bool {
             const byte = raw.byte;
-            if ((app.question_prompt.isActive() or approvalOwnsCurrentSurface(app)) and byte == ctrl_g_upgrade_byte) {
+            if ((app.question_prompt.isActive() or approvalOwnsCurrentSurface(app)) and byte == ctrl_t_upgrade_byte) {
                 _ = try routeUpgradeShortcut(app, byte);
                 return true;
             }
@@ -1759,7 +1786,7 @@ pub fn Runtime(comptime App: type) type {
             debug_trace.logf("input", "ctrl_c_exit_hint_armed", .{});
 
             if (app.stream.active) {
-                try interrupt_rt.cancelActiveOperation(app);
+                try interrupt_rt.cancelActiveOperation(app, .open);
                 app.shell.render_requests.request(.footer);
                 return;
             }
@@ -3050,7 +3077,7 @@ pub fn Runtime(comptime App: type) type {
                     _ = disarmEscapeClear(app);
                     if (approvalOwnsCurrentSurface(app)) {
                         if (was_cancel_pending) {
-                            try approval_rt.cancelApprovalOperation(app);
+                            try approval_rt.cancelApprovalOperation(app, .open);
                         }
                         return;
                     }
@@ -3082,11 +3109,11 @@ pub fn Runtime(comptime App: type) type {
                         app.shell.render_requests.request(.footer);
                         return;
                     }
-                    try question_rt.cancelQuestionPrompt(app);
+                    try question_rt.cancelQuestionPrompt(app, .open);
                     return;
                 }
                 if (app.approval_prompt.isActive()) {
-                    try approval_rt.cancelApprovalOperation(app);
+                    try approval_rt.cancelApprovalOperation(app, .open);
                     _ = disarmEscapeClear(app);
                     return;
                 }
@@ -3107,7 +3134,7 @@ pub fn Runtime(comptime App: type) type {
                     }
                 }
                 if (!interrupt_rt.pauseActiveRecovery(app)) {
-                    try interrupt_rt.cancelActiveOperation(app);
+                    try interrupt_rt.cancelActiveOperation(app, .open);
                 }
                 _ = disarmEscapeClear(app);
                 return;
@@ -3594,6 +3621,8 @@ const RoutingWorker = struct {
     submitted_question_answers: [2][64]u8 = undefined,
     submitted_question_answer_lens: [2]usize = .{ 0, 0 },
     submitted_question_count: usize = 0,
+    question_pending: bool = true,
+    observed_question_submission_count: usize = 0,
     cancel_requested: bool = false,
     question_source: worker_runtime.QuestionPromptSource = .agent_question,
     admission_snapshot: worker_runtime.InteractiveAdmissionSnapshot = .open,
@@ -3681,6 +3710,20 @@ const RoutingWorker = struct {
                 @memcpy(self.submitted_question_answer[0..len], answer[0..len]);
             }
         }
+    }
+
+    pub fn submitQuestionBatchAnswerObserved(
+        self: *RoutingWorker,
+        alloc: std.mem.Allocator,
+        answers: ?[]const []const u8,
+        observer: ?worker_runtime.DecisionObserver,
+    ) !worker_runtime.QuestionSubmissionResult {
+        if (!self.question_pending) return .no_pending;
+        self.question_pending = false;
+        self.observed_question_submission_count += 1;
+        if (observer) |value| value.observe_fn(value.context, 1);
+        try self.submitQuestionBatchAnswer(alloc, answers);
+        return .accepted;
     }
 
     pub fn pendingQuestionBatchSource(self: *RoutingWorker) worker_runtime.QuestionPromptSource {
@@ -3874,8 +3917,12 @@ const RoutingFakeApp = struct {
     selected_auth_team: ?usize = null,
     upgrade_apply_count: usize = 0,
     upgrade_denied_count: usize = 0,
+    external_editor_count: usize = 0,
     suspend_count: usize = 0,
     workspace_access: app_workspace_runtime.Access = .{},
+    attention_resolved_count: usize = 0,
+    attention_resolved_turn_id: ?u64 = null,
+    attention_resolved_kind: ?hooks.AttentionKind = null,
 
     pub fn slashRegistry(_: *const RoutingFakeApp) command_specs.SlashRegistry {
         return routing_test_slash_registry;
@@ -3932,10 +3979,27 @@ const RoutingFakeApp = struct {
         return &self.workspace_access;
     }
 
+    pub fn dispatchAttentionResolved(
+        self: *RoutingFakeApp,
+        turn_id: u64,
+        kind: hooks.AttentionKind,
+        child_session_id: ?[]const u8,
+    ) void {
+        std.debug.assert(child_session_id == null);
+        self.attention_resolved_count += 1;
+        self.attention_resolved_turn_id = turn_id;
+        self.attention_resolved_kind = kind;
+    }
+
     pub fn flushBeforeBlockingExternalWork(_: *RoutingFakeApp) !void {}
 
     pub fn suspendToJobControl(self: *RoutingFakeApp) !void {
         self.suspend_count += 1;
+    }
+
+    pub fn editComposerWithExternalEditor(self: *RoutingFakeApp, _: usize) !bool {
+        self.external_editor_count += 1;
+        return true;
     }
 
     pub fn modelCompletions(self: *RoutingFakeApp, query: []const u8, out: *[32][]const u8) usize {
@@ -8081,17 +8145,65 @@ test "app_input_runtime remapped ctrl+c reaches prompt cancellation" {
     }
 }
 
-test "app_input_runtime ctrl+g invokes upgrade shortcut without composer mutation" {
+test "app_input_runtime ctrl+t invokes upgrade shortcut without composer mutation" {
     const alloc = std.testing.allocator;
     var app = try RoutingFakeApp.init(alloc);
     defer app.deinit();
 
-    try Runtime(RoutingFakeApp).handleByte(&app, ctrl_g_upgrade_byte, 4096, 100);
+    try Runtime(RoutingFakeApp).handleByte(&app, ctrl_t_upgrade_byte, 4096, 100);
 
     try std.testing.expectEqual(@as(usize, 1), app.upgrade_apply_count);
     try std.testing.expectEqual(@as(usize, 0), app.upgrade_denied_count);
     try std.testing.expectEqual(@as(usize, 0), app.input_runtime.edit_state.input.items.len);
     try std.testing.expectEqual(@as(usize, 0), app.submitted_prompt_count);
+}
+
+test "app_input_runtime immediate ctrl+t follows bare Escape" {
+    const alloc = std.testing.allocator;
+    var app = try RoutingFakeApp.init(alloc);
+    defer app.deinit();
+
+    try feedRoutingBytes(&app, "\x1b\x14");
+
+    try std.testing.expectEqual(@as(usize, 1), app.upgrade_apply_count);
+    try std.testing.expectEqual(@as(usize, 0), app.upgrade_denied_count);
+    try std.testing.expectEqual(@as(u8, 0), app.terminal_input_runtime.terminal_action_decoder.stage);
+}
+
+test "app_input_runtime ctrl+g invokes external editor without composer mutation" {
+    const alloc = std.testing.allocator;
+    var app = try RoutingFakeApp.init(alloc);
+    defer app.deinit();
+    try app.input_runtime.textReplacementState().replace(alloc, "draft");
+
+    try Runtime(RoutingFakeApp).handleByte(&app, ctrl_g_external_editor_byte, 4096, 100);
+
+    try std.testing.expectEqual(@as(usize, 1), app.external_editor_count);
+    try std.testing.expectEqualStrings("draft", app.input_runtime.edit_state.input.items);
+    try std.testing.expectEqual(@as(usize, 0), app.submitted_prompt_count);
+}
+
+test "app_input_runtime ctrl+g remains available while a response streams" {
+    const alloc = std.testing.allocator;
+    var app = try RoutingFakeApp.init(alloc);
+    defer app.deinit();
+    app.stream.active = true;
+
+    try Runtime(RoutingFakeApp).handleByte(&app, ctrl_g_external_editor_byte, 4096, 100);
+
+    try std.testing.expectEqual(@as(usize, 1), app.external_editor_count);
+}
+
+test "app_input_runtime ctrl+g is denied while an alternate screen owns the terminal" {
+    const alloc = std.testing.allocator;
+    var app = try RoutingFakeApp.init(alloc);
+    defer app.deinit();
+    app.terminal.alternate_screen_owner = .catalog_menu;
+
+    try Runtime(RoutingFakeApp).handleByte(&app, ctrl_g_external_editor_byte, 4096, 100);
+
+    try std.testing.expectEqual(@as(usize, 0), app.external_editor_count);
+    try std.testing.expect(std.mem.find(u8, app.notice_body.items, "another screen") != null);
 }
 
 test "app_input_runtime immediate ctrl+g follows bare Escape" {
@@ -8101,8 +8213,7 @@ test "app_input_runtime immediate ctrl+g follows bare Escape" {
 
     try feedRoutingBytes(&app, "\x1b\x07");
 
-    try std.testing.expectEqual(@as(usize, 1), app.upgrade_apply_count);
-    try std.testing.expectEqual(@as(usize, 0), app.upgrade_denied_count);
+    try std.testing.expectEqual(@as(usize, 1), app.external_editor_count);
     try std.testing.expectEqual(@as(u8, 0), app.terminal_input_runtime.terminal_action_decoder.stage);
 }
 
@@ -8221,7 +8332,7 @@ test "app_input_runtime ctrl+d does not exit while a response is streaming" {
     try std.testing.expect(!app.should_exit);
 }
 
-test "app_input_runtime ctrl+g is denied while stream or modal owns state" {
+test "app_input_runtime ctrl+t is denied while stream or modal owns state" {
     const alloc = std.testing.allocator;
 
     {
@@ -8229,7 +8340,7 @@ test "app_input_runtime ctrl+g is denied while stream or modal owns state" {
         defer app.deinit();
         app.stream.active = true;
 
-        try Runtime(RoutingFakeApp).handleByte(&app, ctrl_g_upgrade_byte, 4096, 100);
+        try Runtime(RoutingFakeApp).handleByte(&app, ctrl_t_upgrade_byte, 4096, 100);
 
         try std.testing.expectEqual(@as(usize, 0), app.upgrade_apply_count);
         try std.testing.expectEqual(@as(usize, 1), app.upgrade_denied_count);
@@ -8247,7 +8358,7 @@ test "app_input_runtime ctrl+g is denied while stream or modal owns state" {
         };
         try app.question_prompt.syncFrom(alloc, &entries);
 
-        try Runtime(RoutingFakeApp).handleByte(&app, ctrl_g_upgrade_byte, 4096, 100);
+        try Runtime(RoutingFakeApp).handleByte(&app, ctrl_t_upgrade_byte, 4096, 100);
 
         try std.testing.expectEqual(@as(usize, 0), app.upgrade_apply_count);
         try std.testing.expectEqual(@as(usize, 1), app.upgrade_denied_count);
@@ -10943,7 +11054,7 @@ test "approval cancellation uses one worker-owned terminal transition" {
         .{ .label = "terminal.exec npm test" },
     ));
 
-    try Runtime(FakeApprovalCancelApp).cancelApprovalOperation(&app);
+    try Runtime(FakeApprovalCancelApp).cancelApprovalOperation(&app, .open);
 
     try std.testing.expect(app.worker.cancel_requested);
     try std.testing.expectEqual(@as(usize, 1), app.worker.order_len);
@@ -11651,14 +11762,90 @@ test "route recovery question cancel stays local" {
     };
     try app.question_prompt.syncFrom(alloc, &entries);
 
-    try input_question_runtime.QuestionRuntime(RoutingFakeApp).cancelQuestionPrompt(&app);
+    try input_question_runtime.QuestionRuntime(RoutingFakeApp).cancelQuestionPrompt(&app, .open);
 
     try std.testing.expect(app.worker.question_cancelled);
+    try std.testing.expectEqual(@as(usize, 1), app.worker.observed_question_submission_count);
+    try std.testing.expectEqual(@as(usize, 1), app.attention_resolved_count);
+    try std.testing.expectEqual(@as(?u64, 1), app.attention_resolved_turn_id);
+    try std.testing.expectEqual(@as(?hooks.AttentionKind, .route_recovery), app.attention_resolved_kind);
     try std.testing.expect(!app.worker.cancel_requested_when_question_cancelled);
     try std.testing.expect(!app.worker.cancel_requested);
     try std.testing.expect(!app.question_prompt.isActive());
     try std.testing.expect(!app.stream.active);
     try std.testing.expectEqual(@as(usize, 0), countOccurrences(app.transcript.items, "Route failed. What should fx do?"));
+}
+
+test "agent and MCP question cancellation resolve accepted question attention" {
+    const alloc = std.testing.allocator;
+    const sources = [_]worker_runtime.QuestionPromptSource{
+        .agent_question,
+        .mcp_elicitation,
+    };
+
+    for (sources) |source| {
+        var app = try RoutingFakeApp.init(alloc);
+        defer app.deinit();
+        app.worker.question_source = source;
+        app.stream.active = true;
+
+        const opts = [_]types.QuestionOption{
+            .{ .label = "Stop", .description = null },
+        };
+        const entries = [_]types.QuestionBatchEntry{
+            .{ .question = "Cancel this question?", .options = &opts },
+        };
+        try app.question_prompt.syncFrom(alloc, &entries);
+
+        try input_question_runtime.QuestionRuntime(RoutingFakeApp).cancelQuestionPrompt(&app, .open);
+
+        try std.testing.expect(app.worker.question_cancelled);
+        try std.testing.expect(app.worker.cancel_requested_when_question_cancelled);
+        try std.testing.expect(app.worker.cancel_requested);
+        try std.testing.expectEqual(@as(usize, 1), app.worker.observed_question_submission_count);
+        try std.testing.expectEqual(@as(usize, 1), app.attention_resolved_count);
+        try std.testing.expectEqual(@as(?u64, 1), app.attention_resolved_turn_id);
+        try std.testing.expectEqual(@as(?hooks.AttentionKind, .question), app.attention_resolved_kind);
+        try std.testing.expect(!app.question_prompt.isActive());
+        try std.testing.expect(!app.stream.active);
+    }
+}
+
+test "late question cancellations do not resolve attention" {
+    const alloc = std.testing.allocator;
+    const sources = [_]worker_runtime.QuestionPromptSource{
+        .agent_question,
+        .mcp_elicitation,
+        .route_recovery,
+    };
+
+    for (sources) |source| {
+        var app = try RoutingFakeApp.init(alloc);
+        defer app.deinit();
+        app.worker.question_source = source;
+        app.worker.question_pending = false;
+
+        const opts = [_]types.QuestionOption{
+            .{ .label = "Continue", .description = null },
+        };
+        const entries = [_]types.QuestionBatchEntry{
+            .{ .question = "This question is already stale.", .options = &opts },
+        };
+        try app.question_prompt.syncFrom(alloc, &entries);
+
+        try input_question_runtime.QuestionRuntime(RoutingFakeApp).cancelQuestionPrompt(&app, .open);
+
+        try std.testing.expect(!app.worker.question_cancelled);
+        try std.testing.expectEqual(@as(usize, 0), app.worker.observed_question_submission_count);
+        try std.testing.expectEqual(@as(usize, 0), app.attention_resolved_count);
+        try std.testing.expect(app.attention_resolved_turn_id == null);
+        try std.testing.expect(app.attention_resolved_kind == null);
+        try std.testing.expectEqual(
+            source != .route_recovery,
+            app.worker.cancel_requested,
+        );
+        try std.testing.expect(!app.question_prompt.isActive());
+    }
 }
 
 test "app_input_runtime submits multi-question answers in entry order" {

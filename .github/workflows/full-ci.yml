@@ -3,11 +3,14 @@ name: Full CI
 on:
   workflow_dispatch:
   push:
-    branches-ignore:
-      - main
+    branches:
+      - integration
 
+# One suite at a time for the maintained workflow. The group is deliberately
+# constant rather than the ref: a newer Integration tip cancels the run in
+# flight, because only the current tip's verdict is worth waiting for.
 concurrency:
-  group: full-ci-${{ github.ref }}
+  group: full-ci
   cancel-in-progress: true
 
 permissions:

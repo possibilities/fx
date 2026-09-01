@@ -9,11 +9,35 @@ const question_ui = @import("../../ui/footer/question_ui.zig");
 const question_freeform_layout = @import("../../ui/footer/question_freeform_layout.zig");
 const input_interrupt_runtime = @import("input_interrupt_runtime.zig");
 const input_queue_runtime = @import("input_queue_runtime.zig");
+const hooks = @import("../hooks/hooks.zig");
 
 pub fn QuestionRuntime(comptime App: type) type {
     return struct {
         const interrupt = input_interrupt_runtime.InterruptRuntime(App);
         const queue_rt = input_queue_runtime.Runtime(App);
+
+        const AttentionResolutionObserver = struct {
+            app: *App,
+            kind: hooks.AttentionKind,
+
+            fn interface(self: *@This()) worker_runtime.DecisionObserver {
+                return .{
+                    .context = self,
+                    .observe_fn = observe,
+                };
+            }
+
+            fn observe(raw: *anyopaque, turn_id: u64) void {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                if (comptime @hasDecl(App, "dispatchAttentionResolved")) {
+                    self.app.dispatchAttentionResolved(
+                        turn_id,
+                        self.kind,
+                        null,
+                    );
+                }
+            }
+        };
 
         pub fn handleQuestionAction(app: *App, action: question_prompt.Action) !bool {
             return switch (try handleQuestionActionWithLimit(app, action, null)) {
@@ -51,27 +75,35 @@ pub fn QuestionRuntime(comptime App: type) type {
                     return .consumed;
                 },
                 .cancelled => {
-                    try cancelQuestionPrompt(app);
+                    try cancelQuestionPrompt(app, .open);
                     return .consumed;
                 },
                 .limit_exceeded => return .limit_exceeded,
             }
         }
 
-        pub fn cancelQuestionPrompt(app: *App) !void {
+        pub fn cancelQuestionPrompt(
+            app: *App,
+            comptime presentation: input_queue_runtime.ReviewPresentation,
+        ) !void {
             const route_recovery = isRouteRecoveryPrompt(app);
             const mcp_elicitation = isMcpElicitationPrompt(app);
+            const attention_kind = currentAttentionKind(app);
             interrupt.traceInterruptRequested(app, "input_question");
             if (!route_recovery) {
                 if (comptime @hasField(App, "queued_prompt_review")) {
-                    _ = queue_rt.requestCancelAndOpen(app);
+                    if (comptime presentation == .open) {
+                        _ = queue_rt.requestCancelAndOpen(app);
+                    } else {
+                        _ = app.worker.requestCancelWithQueueReview();
+                    }
                 } else {
                     app.worker.requestCancel();
                 }
             }
             app.pacer.clear(app.alloc);
             if (!route_recovery and !mcp_elicitation) try finalizeQuestionTranscript(app, true);
-            try app.worker.submitQuestionBatchAnswer(std.heap.c_allocator, null);
+            _ = try submitQuestionBatchDecision(app, null, attention_kind);
             app.question_prompt.discard(app.alloc, "cancelled");
             app.input_runtime.input_limit_rejection = input_limit_rejection.clear();
             const gesture_transition = gesture_state.disarmEscapeClear(
@@ -83,6 +115,7 @@ pub fn QuestionRuntime(comptime App: type) type {
         }
 
         pub fn submitQuestionBatch(app: *App) !void {
+            const attention_kind = currentAttentionKind(app);
             var labels: std.ArrayList([]const u8) = .empty;
             defer labels.deinit(app.alloc);
             try labels.ensureTotalCapacity(app.alloc, app.question_prompt.entries.items.len);
@@ -93,10 +126,47 @@ pub fn QuestionRuntime(comptime App: type) type {
             if (!isRouteRecoveryPrompt(app) and !isMcpElicitationPrompt(app)) {
                 try finalizeQuestionTranscript(app, false);
             }
-            try app.worker.submitQuestionBatchAnswer(std.heap.c_allocator, labels.items);
+            _ = try submitQuestionBatchDecision(app, labels.items, attention_kind);
             app.question_prompt.resetAfterSubmission(app.alloc);
             app.input_runtime.input_limit_rejection = input_limit_rejection.clear();
             app.shell.render_requests.request(.modal);
+        }
+
+        fn submitQuestionBatchDecision(
+            app: *App,
+            answers: ?[]const []const u8,
+            attention_kind: hooks.AttentionKind,
+        ) !worker_runtime.QuestionSubmissionResult {
+            const Worker = switch (@typeInfo(@TypeOf(app.worker))) {
+                .pointer => |pointer| pointer.child,
+                else => @TypeOf(app.worker),
+            };
+            return if (comptime @hasDecl(Worker, "submitQuestionBatchAnswerObserved") and
+                @hasDecl(App, "dispatchAttentionResolved"))
+            observed: {
+                var observation = AttentionResolutionObserver{
+                    .app = app,
+                    .kind = attention_kind,
+                };
+                break :observed try app.worker.submitQuestionBatchAnswerObserved(
+                    std.heap.c_allocator,
+                    answers,
+                    observation.interface(),
+                );
+            } else fallback: {
+                try app.worker.submitQuestionBatchAnswer(
+                    std.heap.c_allocator,
+                    answers,
+                );
+                if (comptime @hasDecl(App, "dispatchAttentionResolved")) {
+                    app.dispatchAttentionResolved(
+                        app.worker.activeTurnId(),
+                        attention_kind,
+                        null,
+                    );
+                }
+                break :fallback worker_runtime.QuestionSubmissionResult.accepted;
+            };
         }
 
         pub fn rerenderQuestionBlock(app: *App) !void {
@@ -117,6 +187,17 @@ pub fn QuestionRuntime(comptime App: type) type {
                 return app.worker.pendingQuestionBatchSource() == worker_runtime.QuestionPromptSource.mcp_elicitation;
             }
             return false;
+        }
+
+        fn currentAttentionKind(app: *App) hooks.AttentionKind {
+            const Worker = @TypeOf(app.worker);
+            if (comptime @hasDecl(Worker, "pendingQuestionBatchSource")) {
+                return switch (app.worker.pendingQuestionBatchSource()) {
+                    .agent_question, .mcp_elicitation => .question,
+                    .route_recovery => .route_recovery,
+                };
+            }
+            return .question;
         }
 
         fn finalizeQuestionTranscript(app: *App, cancelled: bool) !void {

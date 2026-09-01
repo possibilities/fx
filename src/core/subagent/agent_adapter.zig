@@ -53,6 +53,7 @@ pub const Config = struct {
     custom_tool_guidance: []const u8 = "",
     context_registry: context_contract.Registry,
     context_enabled: bool,
+    project_instructions_enabled: bool = true,
     project_context: []const u8 = "",
     lifecycle_view: hooks.RuntimeView = hooks.RuntimeView.empty(),
 };
@@ -107,6 +108,7 @@ const Context = struct {
             .workspace_root = result.workspace_root,
             .session_id = self.turn.child_id,
             .subagent_id = self.subagent_id,
+            .parent_session_id = self.admission.root_id,
         };
         return result;
     }
@@ -149,14 +151,24 @@ pub fn run(
         admission.provider,
         config.tool_context.credential_source,
     )) {
-        const resolution = credentials.resolveForProvider(
-            turn.alloc,
-            config.tool_context.oauth_transport,
-            config.tool_context.secret_store,
-            .refresh_if_needed,
-            admission.provider,
-            config.tool_context.credential_source,
-        ) catch |err| {
+        const resolution = (if (config.tool_context.profile_home) |home|
+            credentials.resolveForProviderFromHome(
+                turn.alloc,
+                config.tool_context.oauth_transport,
+                .refresh_if_needed,
+                admission.provider,
+                config.tool_context.credential_source,
+                home,
+            )
+        else
+            credentials.resolveForProvider(
+                turn.alloc,
+                config.tool_context.oauth_transport,
+                config.tool_context.secret_store,
+                .refresh_if_needed,
+                admission.provider,
+                config.tool_context.credential_source,
+            )) catch |err| {
             if (err == error.OutOfMemory) return error.OutOfMemory;
             turn.setFailureDiagnostic("model_credential_resolution_failed", @errorName(err)) catch
                 return error.OutOfMemory;
@@ -248,6 +260,7 @@ pub fn run(
                 .workspace_root = config.tool_context.workspace_root,
                 .session_id = turn.child_id,
                 .subagent_id = trace_context.subagent_id,
+                .parent_session_id = admission.root_id,
             },
             .outcome_allocator = turn.alloc,
         },
@@ -301,6 +314,7 @@ fn runtimeDeps(context: *Context) agent_runtime.AgentRuntimeDeps {
         .tool_registry = context.config.tool_context.tool_registry,
         .context_registry = context.config.context_registry,
         .context_enabled = context.config.context_enabled,
+        .project_instructions_enabled = context.config.project_instructions_enabled,
         .finalize_turn = finalizeTurn,
         .release_agent_terminal_lease = releaseAgentTerminalLease,
         .live_tool_authority = context.turn.liveToolAuthorityProvider(),
@@ -354,6 +368,16 @@ fn refreshGatewayCredential(
     expected_account_id: ?[]const u8,
 ) !?[]u8 {
     const context: *Context = @ptrCast(@alignCast(raw));
+    if (context.config.tool_context.profile_home) |home| {
+        return auth_runtime.refreshCredentialTokenForAccountFromHome(
+            context.config.tool_context.oauth_transport,
+            alloc,
+            source,
+            mode,
+            expected_account_id,
+            home,
+        );
+    }
     return auth_runtime.refreshCredentialTokenForAccount(
         context.config.tool_context.oauth_transport,
         alloc,

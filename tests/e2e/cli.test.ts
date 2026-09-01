@@ -57,6 +57,16 @@ function sourceVersion(): string {
   return match[1];
 }
 
+function fxnkVersion(): string {
+  const source = readFileSync(
+    join(REPO_ROOT, "src/core/cli/fxnk_identity.zig"),
+    "utf8",
+  );
+  const match = source.match(/pub const version = "([^"]+)";/);
+  if (!match) throw new Error("fxnk identity version declaration not found");
+  return match[1];
+}
+
 function doctorSessionDiagnosticsLimit(): number {
   const source = readFileSync(
     join(REPO_ROOT, "src/core/cli/doctor_runtime.zig"),
@@ -94,6 +104,28 @@ function writeSeededFxAuth(
     auth.team_slug = "vercel-labs";
   }
   writeFileSync(authPath, JSON.stringify(auth) + "\n", { mode: 0o600 });
+  chmodSync(authPath, 0o600);
+}
+
+function chatgptAccessToken(accountId: string): string {
+  const payload = Buffer.from(JSON.stringify({
+    "https://api.openai.com/auth": { chatgpt_account_id: accountId },
+  })).toString("base64url");
+  return `header.${payload}.signature`;
+}
+
+function writeSeededChatGptLogin(home: string, accessToken: string, accountId: string): void {
+  const fxDir = join(home, ".fx");
+  mkdirSync(fxDir, { recursive: true, mode: 0o700 });
+  chmodSync(fxDir, 0o700);
+  const authPath = join(fxDir, "chatgpt-auth.json");
+  writeFileSync(authPath, JSON.stringify({
+    version: 1,
+    access_token: accessToken,
+    refresh_token: "chatgpt-refresh",
+    expires_at_ms: Date.now() + 60 * 60 * 1000,
+    account_id: accountId,
+  }) + "\n", { mode: 0o600 });
   chmodSync(authPath, 0o600);
 }
 
@@ -262,9 +294,18 @@ describe("cli: help", () => {
       expect(r.stdout).toContain("Run one noninteractive request");
       expect(r.stdout).toContain("credits|balance");
       expect(r.stdout).toContain("Flags:\n");
+      expect(r.stdout).toContain("--system-prompt-file <path>");
+      expect(r.stdout).toContain("--append-system-prompt-file <path>");
       expect(r.stdout).toContain("--context-limit <spec>");
       expect(r.stdout).toContain("Set name=bytes|off; repeatable");
       expect(r.stdout).toContain("--add-dir <path>");
+      expect(r.stdout).toContain("--skills-dir <path>");
+      expect(r.stdout).toContain("--no-default-skills");
+      expect(r.stdout).toContain("--no-native-tools");
+      expect(r.stdout).toContain("--tool <name>");
+      expect(r.stdout).toContain("--no-project-instructions");
+      expect(r.stdout).toContain("--permissions-file <path>");
+      expect(r.stdout).toContain("Replace configured rules for TUI or ACP");
       expect(r.stdout).toContain("-c, --continue");
       expect(r.stdout).toContain("-r");
       expect(r.stdout).toContain("Open the saved-session picker");
@@ -273,6 +314,7 @@ describe("cli: help", () => {
       expect(r.stdout).toContain("--resume-last");
       expect(r.stdout).toContain("session resume [last|id]");
       expect(r.stdout).toContain("-v, --version");
+      expect(r.stdout).not.toContain("--fxnk-version");
       expect(r.stdout).not.toContain("Must appear before the command");
       expect(r.stdout).toContain("Examples:\n");
       expect(r.stdout).toContain("https://fx.sh/docs");
@@ -377,9 +419,10 @@ With --prompt-permissions, JSON and quiet requests may prompt on stderr only whe
         expect(r.code).toBe(0);
         expect(r.stderr).toBe("");
         expect(r.stdout).toContain(
-          "Usage:\n  fx acp [--model <id>] [--log-file <path>]",
+          "Usage:\n  fx acp [--model <id>] [--effort <name>] [--log-file <path>]",
         );
         expect(r.stdout).toContain("--model <id>");
+        expect(r.stdout).toContain("--effort <name>");
         expect(r.stdout).toContain("--log-file <path>");
       }
     },
@@ -402,12 +445,18 @@ With --prompt-permissions, JSON and quiet requests may prompt on stderr only whe
   test(
     "fx acp rejects unknown options and missing option values",
     async () => {
-      for (const args of [["--bogus"], ["--model"], ["--log-file"]]) {
+      for (const args of [
+        ["--bogus"],
+        ["--model"],
+        ["--effort"],
+        ["--effort", "not valid"],
+        ["--log-file"],
+      ]) {
         const result = await runFx(["acp", ...args]);
         expect(result.code).toBe(1);
         expect(result.stdout).toBe("");
         expect(result.stderr).toBe(
-          "usage: fx acp [--model <id>] [--log-file <path>]\n",
+          "usage: fx acp [--model <id>] [--effort <name>] [--log-file <path>] [--no-acp-mcp]\n",
         );
       }
     },
@@ -471,6 +520,19 @@ describe("cli: version", () => {
       TIMEOUT,
     );
   }
+
+  test(
+    "fx --fxnk-version prints the fork and source versions",
+    async () => {
+      const r = await runFx(["--fxnk-version"]);
+      expect(r.code).toBe(0);
+      expect(r.stdout).toBe(
+        `fxnk ${fxnkVersion()} (fx ${sourceVersion()})\n`,
+      );
+      expect(r.stderr).toBe("");
+    },
+    TIMEOUT,
+  );
 });
 
 describe("cli: status", () => {
@@ -849,7 +911,7 @@ describe("cli: status", () => {
   );
 
   test(
-    "status and doctor apply an exact FX_MAX_AGENT_STEPS override",
+    "status and doctor apply exact FX_MAX_AGENT_STEPS and FX_EFFORT overrides",
     async () => {
       const root = mkdtempSync(join(tmpdir(), "fx-e2e-agent-step-limit-"));
       try {
@@ -861,6 +923,7 @@ describe("cli: status", () => {
           ...NO_GATEWAY_AUTH,
           HOME: realpathSync(home),
           FX_MAX_AGENT_STEPS: "3",
+          FX_EFFORT: "high",
         };
 
         const status = await runFx(["status", "--json"], {
@@ -877,10 +940,13 @@ describe("cli: status", () => {
           timeoutMs: TIMEOUT,
         });
         expect(doctor.code).toBe(0);
-        const startup = JSON.parse(doctor.stdout.trim()).checks.find(
+        const doctorJson = JSON.parse(doctor.stdout.trim());
+        expect(doctorJson.effort).toBe("high");
+        const startup = doctorJson.checks.find(
           (check: { name: string }) => check.name === "startup",
         );
         expect(startup.detail).toContain("agent_step_limit=3");
+        expect(startup.detail).toContain("effort=high");
       } finally {
         rmSync(root, { recursive: true, force: true });
       }
@@ -3210,6 +3276,104 @@ function catalogTraceEvents(trace: string): string[] {
 }
 
 describe("cli: models", () => {
+  test(
+    "fx models --json preserves ordered efforts for the configured Codex catalog",
+    async () => {
+      const root = mkdtempSync(join(tmpdir(), "fx-e2e-codex-models-"));
+      const home = join(root, "home");
+      const workspace = join(root, "workspace");
+      const accountId = "acct_codex_models";
+      const accessToken = chatgptAccessToken(accountId);
+      const requests: Array<{ path: string; authorization: string | null }> = [];
+      const server = Bun.serve({
+        hostname: "127.0.0.1",
+        port: 0,
+        fetch(request) {
+          const url = new URL(request.url);
+          requests.push({
+            path: url.pathname,
+            authorization: request.headers.get("authorization"),
+          });
+          if (url.pathname !== "/models") return new Response("not found", { status: 404 });
+          return Response.json({ models: [
+            {
+              slug: "gpt-5.6-sol",
+              visibility: "list",
+              supported_in_api: true,
+              supported_reasoning_levels: [
+                { effort: "high" },
+                { effort: "future-tier" },
+                { effort: "low" },
+              ],
+              additional_speed_tiers: ["fast"],
+              input_modalities: ["text", "image"],
+              context_window: 272000,
+            },
+            {
+              slug: "gpt-5.4-mini",
+              visibility: "list",
+              supported_in_api: true,
+              supported_reasoning_levels: [{ effort: "low" }],
+              additional_speed_tiers: [],
+              input_modalities: ["text"],
+              context_window: 128000,
+            },
+          ] });
+        },
+      });
+
+      try {
+        mkdirSync(home);
+        mkdirSync(workspace);
+        writeSeededChatGptLogin(home, accessToken, accountId);
+        writeFileSync(
+          join(home, ".fx", "settings.json"),
+          JSON.stringify({ provider: "codex", codex_model: "gpt-5.6-sol" }) + "\n",
+        );
+
+        const result = await runFx(["models", "--json"], {
+          cwd: realpathSync(workspace),
+          env: {
+            ...NO_GATEWAY_AUTH,
+            HOME: realpathSync(home),
+            FX_DISABLE_KEYCHAIN: "1",
+            FX_AUTO_UPGRADE: "0",
+            FX_MODEL: undefined,
+            FX_GATEWAY_BASE_URL: `http://127.0.0.1:${server.port}`,
+            FX_E2E_GATEWAY_MODELS_URL: `http://127.0.0.1:${server.port}/gateway-models`,
+            FX_E2E_OPENAI_CODEX_MODELS_URL: `http://127.0.0.1:${server.port}/models`,
+          },
+          timeoutMs: TIMEOUT,
+        });
+
+        expect(result.code).toBe(0);
+        expect(result.stderr).toBe("");
+        const json = JSON.parse(result.stdout.trim());
+        expect(json.ids).toEqual(["gpt-5.6-sol", "gpt-5.4-mini"]);
+        expect(json.models).toEqual([
+          {
+            id: "gpt-5.6-sol",
+            source: "Codex subscription",
+            reasoning_efforts: ["high", "future-tier", "low"],
+          },
+          {
+            id: "gpt-5.4-mini",
+            source: "Codex subscription",
+            reasoning_efforts: ["low"],
+          },
+        ]);
+        expect(requests).toEqual([{
+          path: "/models",
+          authorization: `Bearer ${accessToken}`,
+        }]);
+      } finally {
+        server.stop(true);
+        rmSync(root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
   for (const scenario of [
     {
       name: "an ordinary public empty catalog",
@@ -3297,6 +3461,11 @@ describe("cli: models", () => {
             more_count: 0,
             private_models_hidden: true,
             ids: ["public/fallback"],
+            models: [{
+              id: "public/fallback",
+              source: "Vercel AI Gateway",
+              reasoning_efforts: [],
+            }],
           });
 
           expect(gateway.modelRequests).toHaveLength(2);
@@ -3585,7 +3754,14 @@ describe("cli: models", () => {
               (!scenario.seedFxLogin || url.searchParams.get("teamId") === "team_123");
             return Response.json({
               data: [
-                { id: "public/sentinel", type: "language", tags: ["tool-use"] },
+                {
+                  id: "public/sentinel",
+                  type: "language",
+                  tags: ["tool-use"],
+                  reasoning_options: [
+                    { type: "effort", values: ["low", "future-tier", "high"] },
+                  ],
+                },
                 ...(seededAuth
                   ? [{ id: "private/blue-hornbill", type: "language", tags: ["tool-use"] }]
                   : []),
@@ -3632,6 +3808,11 @@ describe("cli: models", () => {
           const json = JSON.parse(r.stdout.trim());
           expect(json.kind).toBe("models");
           expect(json.ids).toContain("public/sentinel");
+          expect(json.models).toContainEqual({
+            id: "public/sentinel",
+            source: "Vercel AI Gateway",
+            reasoning_efforts: ["low", "future-tier", "high"],
+          });
           if (scenario.expectPrivate) {
             expect(json.ids).toContain("private/blue-hornbill");
           } else {
@@ -3917,9 +4098,136 @@ describe("cli: issue", () => {
     },
     TIMEOUT,
   );
+
+  test(
+    "system prompt files reach issue and PR model launches",
+    async () => {
+      const root = mkdtempSync(join(tmpdir(), "fx-e2e-workflow-system-prompts-"));
+      const home = join(root, "home");
+      const workspace = join(root, "workspace");
+      const replacement = join(root, "replacement.md");
+      const appended = join(root, "appended.md");
+      const gateway = startFakeGateway([
+        fakeGatewayFinalText("issue prompt complete"),
+        fakeGatewayFinalText("pr prompt complete"),
+      ]);
+      try {
+        mkdirSync(home);
+        mkdirSync(workspace);
+        writeFileSync(replacement, "ISSUE_FILE_SYSTEM_PROMPT");
+        writeFileSync(appended, "PR_FILE_SYSTEM_PROMPT");
+        const gitInit = spawnSync("git", ["init", "--quiet"], { cwd: workspace });
+        expect(gitInit.status).toBe(0);
+
+        const env = {
+          HOME: realpathSync(home),
+          AI_GATEWAY_API_KEY: "fake-workflow-system-prompt-key",
+          VERCEL_OIDC_TOKEN: undefined,
+          FX_GATEWAY_BASE_URL: gateway.baseUrl,
+          FX_GATEWAY_CHAT_URL: gateway.chatUrl,
+          FX_MODEL: FAKE_GATEWAY_MODEL,
+          FX_AUTO_UPGRADE: "0",
+        };
+        const issue = await runFx(
+          ["--system-prompt-file", replacement, "issue", "--auto"],
+          { cwd: realpathSync(workspace), env, timeoutMs: TIMEOUT },
+        );
+        const pr = await runFx(
+          ["--append-system-prompt-file", appended, "pr", "--auto"],
+          { cwd: realpathSync(workspace), env, timeoutMs: TIMEOUT },
+        );
+
+        expect(issue.code).toBe(0);
+        expect(pr.code).toBe(0);
+        expect(issue.stderr).toBe("");
+        expect(pr.stderr).toBe("");
+        expect(gateway.requests).toHaveLength(2);
+        expect(gateway.requests[0]!.body).toContain("ISSUE_FILE_SYSTEM_PROMPT");
+        expect(gateway.requests[1]!.body).toContain("PR_FILE_SYSTEM_PROMPT");
+        expect(gateway.requests[1]!.body).toContain(
+          "You are fx, a local coding CLI assistant",
+        );
+      } finally {
+        gateway.stop();
+        rmSync(root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
 });
 
 describe("cli: ask success", () => {
+  test(
+    "system prompt files replace and append in command-line order",
+    async () => {
+      const root = mkdtempSync(join(tmpdir(), "fx-e2e-system-prompt-files-"));
+      const home = join(root, "home");
+      const workspace = join(root, "workspace");
+      const replacement = join(root, "replacement.md");
+      const first = join(root, "first.md");
+      const second = join(root, "second.md");
+      const gateway = startFakeGateway([fakeGatewayFinalText("prompt files complete")]);
+      try {
+        mkdirSync(home);
+        mkdirSync(workspace);
+        writeFileSync(replacement, "REPLACEMENT_SYSTEM_SENTINEL");
+        writeFileSync(first, "FIRST_APPEND_SENTINEL");
+        writeFileSync(second, "SECOND_APPEND_SENTINEL");
+        const env = {
+          HOME: realpathSync(home),
+          AI_GATEWAY_API_KEY: "fake-system-prompt-key",
+          VERCEL_OIDC_TOKEN: undefined,
+          FX_GATEWAY_BASE_URL: gateway.baseUrl,
+          FX_GATEWAY_CHAT_URL: gateway.chatUrl,
+          FX_MODEL: FAKE_GATEWAY_MODEL,
+          FX_AUTO_UPGRADE: "0",
+        };
+        const result = await runFx(
+          [
+            "--append-system-prompt-file", first,
+            "--system-prompt-file", replacement,
+            "--append-system-prompt-file", second,
+            "ask", "--json", "--auto", "--no-save", "check the prompt",
+          ],
+          { cwd: realpathSync(workspace), env, timeoutMs: TIMEOUT },
+        );
+
+        expect(result.code).toBe(0);
+        expect(result.stderr).toBe("");
+        expect(JSON.parse(result.stdout).output.trim()).toBe("prompt files complete");
+        expect(gateway.requests).toHaveLength(1);
+        const body = gateway.requests[0]!.body;
+        const replacementIndex = body.indexOf("REPLACEMENT_SYSTEM_SENTINEL");
+        const firstIndex = body.indexOf("FIRST_APPEND_SENTINEL");
+        const secondIndex = body.indexOf("SECOND_APPEND_SENTINEL");
+        expect(replacementIndex).toBeGreaterThan(-1);
+        expect(firstIndex).toBeGreaterThan(replacementIndex);
+        expect(secondIndex).toBeGreaterThan(firstIndex);
+        expect(body).not.toContain("You are fx, a local coding CLI assistant");
+
+        const conflict = await runFx(
+          ["--system-prompt-file", replacement, "ask", "--system", "inline", "prompt"],
+          { cwd: realpathSync(workspace), env, timeoutMs: TIMEOUT },
+        );
+        expect(conflict.code).toBe(1);
+        expect(conflict.stderr).toContain("--system cannot be combined");
+        expect(gateway.requests).toHaveLength(1);
+
+        const missing = await runFx(
+          ["--system-prompt-file", join(root, "missing.md"), "ask", "prompt"],
+          { cwd: realpathSync(workspace), env, timeoutMs: TIMEOUT },
+        );
+        expect(missing.code).toBe(1);
+        expect(missing.stderr).toContain("missing.md: file is missing or unreadable");
+        expect(gateway.requests).toHaveLength(1);
+      } finally {
+        gateway.stop();
+        rmSync(root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
   test(
     "fx ask binds an explicitly invoked skill into the prompt",
     async () => {
@@ -3983,6 +4291,146 @@ describe("cli: ask success", () => {
     },
     TIMEOUT,
   );
+
+  test(
+    "repeatable --skills-dir roots load in invocation order",
+    async () => {
+      const root = mkdtempSync(join(tmpdir(), "fx-e2e-invocation-skills-"));
+      const home = join(root, "home");
+      const workspace = join(root, "workspace");
+      const firstRoot = join(root, "first-root");
+      const secondRoot = join(root, "second-root");
+      const firstBody = "FIRST_INVOCATION_SKILL_BODY";
+      const secondBody = "SECOND_INVOCATION_SKILL_BODY";
+      const gateway = startFakeGateway([
+        fakeGatewayFinalText("invocation skills complete"),
+      ]);
+      try {
+        mkdirSync(home);
+        mkdirSync(workspace);
+        mkdirSync(join(firstRoot, "first-invocation"), { recursive: true });
+        mkdirSync(join(secondRoot, "second-invocation"), { recursive: true });
+        writeFileSync(
+          join(firstRoot, "first-invocation", "SKILL.md"),
+          `---\nname: first-invocation\ndescription: first invocation root\n---\n\n${firstBody}\n`,
+        );
+        writeFileSync(
+          join(secondRoot, "second-invocation", "SKILL.md"),
+          `---\nname: second-invocation\ndescription: second invocation root\n---\n\n${secondBody}\n`,
+        );
+
+        const result = await runFx(
+          [
+            "--skills-dir",
+            "../first-root",
+            `--skills-dir=${realpathSync(secondRoot)}`,
+            "ask",
+            "--json",
+            "--auto",
+            "--no-save",
+            "$first-invocation apply the selected skill.",
+          ],
+          {
+            cwd: realpathSync(workspace),
+            env: {
+              HOME: realpathSync(home),
+              AI_GATEWAY_API_KEY: "fake-invocation-skills-key",
+              VERCEL_OIDC_TOKEN: undefined,
+              FX_GATEWAY_BASE_URL: gateway.baseUrl,
+              FX_GATEWAY_CHAT_URL: gateway.chatUrl,
+              FX_MODEL: FAKE_GATEWAY_MODEL,
+              FX_AUTO_UPGRADE: "0",
+            },
+            timeoutMs: TIMEOUT,
+          },
+        );
+
+        expect(result.code).toBe(0);
+        expect(result.stderr).toBe("");
+        expect(JSON.parse(result.stdout).output.trim()).toBe(
+          "invocation skills complete",
+        );
+        expect(gateway.requests).toHaveLength(1);
+        const body = gateway.requests[0]!.body;
+        expect(body.indexOf("first invocation root")).toBeLessThan(
+          body.indexOf("second invocation root"),
+        );
+        expect(body).toContain(firstBody);
+        expect(body).not.toContain(secondBody);
+      } finally {
+        gateway.stop();
+        rmSync(root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test("--skills-dir remains usable without HOME", async () => {
+    const root = mkdtempSync(join(tmpdir(), "fx-e2e-home-free-skills-"));
+    const workspace = join(root, "workspace");
+    const invocationRoot = join(root, "invocation-root");
+    const skillBody = "HOME_FREE_INVOCATION_SKILL_BODY";
+    const gateway = startFakeGateway([
+      fakeGatewayFinalText("home-free invocation skill complete"),
+    ]);
+    try {
+      mkdirSync(workspace);
+      mkdirSync(join(invocationRoot, "home-free"), { recursive: true });
+      writeFileSync(
+        join(invocationRoot, "home-free", "SKILL.md"),
+        `---\nname: home-free\ndescription: home-free invocation root\n---\n\n${skillBody}\n`,
+      );
+
+      const result = await runFx(
+        [
+          "--skills-dir",
+          invocationRoot,
+          "ask",
+          "--json",
+          "--auto",
+          "--no-save",
+          "$home-free apply the selected skill.",
+        ],
+        {
+          cwd: realpathSync(workspace),
+          env: {
+            HOME: undefined,
+            AI_GATEWAY_API_KEY: "fake-home-free-skills-key",
+            VERCEL_OIDC_TOKEN: undefined,
+            FX_GATEWAY_BASE_URL: gateway.baseUrl,
+            FX_GATEWAY_CHAT_URL: gateway.chatUrl,
+            FX_MODEL: FAKE_GATEWAY_MODEL,
+            FX_AUTO_UPGRADE: "0",
+          },
+          timeoutMs: TIMEOUT,
+        },
+      );
+
+      expect(result.code).toBe(0);
+      expect(JSON.parse(result.stdout).output.trim()).toBe(
+        "home-free invocation skill complete",
+      );
+      expect(result.stderr).toContain("reason=home unavailable");
+      expect(gateway.requests).toHaveLength(1);
+      expect(gateway.requests[0]!.body).toContain(skillBody);
+    } finally {
+      gateway.stop();
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("--skills-dir rejects a missing directory before agent startup", async () => {
+    const result = await runFx(
+      ["--skills-dir", "/definitely/missing/fx-skills", "ask", "hello"],
+      { env: NO_GATEWAY_AUTH, timeoutMs: TIMEOUT },
+    );
+
+    expect(result.code).toBe(1);
+    expect(result.stdout).toBe("");
+    expect(result.stderr).toContain(
+      "could not use skills directory /definitely/missing/fx-skills: directory is missing or unreadable",
+    );
+  });
 
   test(
     "fx ask stdin prompts above the old 1 MiB limit reach Gateway byte-for-byte",
@@ -4066,6 +4514,108 @@ describe("cli: ask success", () => {
       );
     },
     120_000,
+  );
+
+  test(
+    "FX_EFFORT overrides the configured effort for fx ask without saving it",
+    async () => {
+      const root = mkdtempSync(join(tmpdir(), "fx-e2e-ask-effort-override-"));
+      const home = join(root, "home");
+      const workspace = join(root, "workspace");
+      const model = "provider/effort-override-model";
+      const gateway = startFakeGateway(
+        [
+          fakeGatewayFinalText("override complete"),
+          fakeGatewayFinalText("resume complete"),
+          fakeGatewayFinalText("override resume complete"),
+        ],
+        {
+          models: [{
+            id: model,
+            type: "language",
+            tags: ["reasoning", "tool-use"],
+            context_window: 750_000,
+            max_tokens: 64_000,
+            reasoning_options: [{ type: "effort", values: ["low", "high"] }],
+          }],
+        },
+      );
+      try {
+        mkdirSync(join(home, ".fx"), { recursive: true, mode: 0o700 });
+        mkdirSync(workspace);
+        writeFileSync(
+          join(home, ".fx", "settings.json"),
+          `${JSON.stringify({ model, effort: "low" })}\n`,
+        );
+        const env = {
+          HOME: home,
+          AI_GATEWAY_API_KEY: "fake-effort-override-key",
+          VERCEL_OIDC_TOKEN: undefined,
+          FX_GATEWAY_BASE_URL: gateway.baseUrl,
+          FX_GATEWAY_CHAT_URL: gateway.chatUrl,
+          FX_E2E_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+          FX_AUTO_UPGRADE: "0",
+          FX_EFFORT: undefined,
+        };
+
+        const first = await runFx(
+          ["ask", "--json", "--auto", "Use the overridden effort."],
+          {
+            cwd: realpathSync(workspace),
+            env: { ...env, FX_EFFORT: " high " },
+            timeoutMs: 60_000,
+          },
+        );
+        expect(first.code).toBe(0);
+        const firstJson = JSON.parse(first.stdout.trim());
+        expect(firstJson.output.trim()).toBe("override complete");
+        expect(gateway.requests).toHaveLength(1);
+        expect(JSON.parse(gateway.requests[0]!.body)).toMatchObject({
+          reasoning: "high",
+        });
+        expect(
+          JSON.parse(readFileSync(join(home, ".fx", "settings.json"), "utf8")),
+        ).toEqual({ model, effort: "low" });
+
+        const resumed = await runFx(
+          ["ask", "--json", "--auto", "--resume", "last", "Use the saved effort."],
+          {
+            cwd: realpathSync(workspace),
+            env,
+            timeoutMs: 60_000,
+          },
+        );
+        expect(resumed.code).toBe(0);
+        expect(JSON.parse(resumed.stdout.trim()).session_id).toBe(
+          firstJson.session_id,
+        );
+        expect(gateway.requests).toHaveLength(2);
+        expect(JSON.parse(gateway.requests[1]!.body)).toMatchObject({
+          reasoning: "low",
+        });
+
+        const overrideResumed = await runFx(
+          ["ask", "--json", "--auto", "--resume", "last", "Use the overridden effort again."],
+          {
+            cwd: realpathSync(workspace),
+            env: { ...env, FX_EFFORT: "high" },
+            timeoutMs: 60_000,
+          },
+        );
+        expect(overrideResumed.code).toBe(0);
+        expect(JSON.parse(overrideResumed.stdout.trim()).session_id).toBe(
+          firstJson.session_id,
+        );
+        expect(gateway.requests).toHaveLength(3);
+        expect(JSON.parse(gateway.requests[2]!.body)).toMatchObject({
+          reasoning: "high",
+        });
+      } finally {
+        gateway.stop();
+        rmSync(root, { recursive: true, force: true });
+      }
+    },
+    60_000,
   );
 
   test(
@@ -4657,6 +5207,108 @@ describe("cli: error handling", () => {
   );
 });
 
+describe("cli: launch permission policy", () => {
+  test(
+    "permissions file validates before TUI or ACP startup with stable errors",
+    async () => {
+      const root = mkdtempSync(join(tmpdir(), "fx-permissions-file-cli-"));
+      try {
+        const valid = join(root, "valid.json");
+        const malformed = join(root, "malformed.json");
+        const invalidRule = join(root, "invalid-rule.json");
+        const unreadable = join(root, "unreadable.json");
+        const oversized = join(root, "oversized.json");
+        const directory = join(root, "directory");
+        writeFileSync(valid, JSON.stringify({ bash: { "git *": "allow" } }));
+        writeFileSync(malformed, "{not json");
+        writeFileSync(invalidRule, JSON.stringify({ bash: "sometimes" }));
+        writeFileSync(unreadable, JSON.stringify({ edit: "deny" }), { mode: 0o000 });
+        writeFileSync(oversized, Buffer.alloc(64 * 1024 + 1, "x"));
+        mkdirSync(directory);
+
+        const help = await runFx([
+          `--permissions-file=${valid}`,
+          "acp",
+          "--help",
+        ]);
+        expect(help.code).toBe(0);
+        expect(help.stdout.startsWith("fx acp\n\n")).toBe(true);
+        expect(help.stderr).toBe("");
+
+        const cases: Array<{
+          args: string[];
+          message: string;
+          hidden: string;
+        }> = [
+          {
+            args: ["--permissions-file"],
+            message: "--permissions-file requires a file path",
+            hidden: "MissingPermissionsFileValue",
+          },
+          {
+            args: [
+              "--permissions-file",
+              valid,
+              "--permissions-file",
+              valid,
+              "acp",
+            ],
+            message: "--permissions-file may only be specified once",
+            hidden: "DuplicatePermissionsFile",
+          },
+          {
+            args: ["--permissions-file", join(root, "missing.json"), "acp"],
+            message: "--permissions-file must name a readable regular file",
+            hidden: "PermissionPolicyUnavailable",
+          },
+          {
+            args: ["--permissions-file", directory, "acp"],
+            message: "--permissions-file must name a readable regular file",
+            hidden: "PermissionPolicyUnavailable",
+          },
+          {
+            args: ["--permissions-file", unreadable, "acp"],
+            message: "--permissions-file must name a readable regular file",
+            hidden: "PermissionPolicyUnavailable",
+          },
+          {
+            args: ["--permissions-file", malformed, "acp"],
+            message: "--permissions-file must contain valid permission-rule JSON",
+            hidden: "InvalidPermissionPolicy",
+          },
+          {
+            args: ["--permissions-file", invalidRule, "acp"],
+            message: "--permissions-file must contain valid permission-rule JSON",
+            hidden: "InvalidPermissionPolicy",
+          },
+          {
+            args: ["--permissions-file", oversized, "acp"],
+            message: "--permissions-file exceeds the 64 KiB limit",
+            hidden: "PermissionPolicyTooLarge",
+          },
+          {
+            args: ["--permissions-file", valid, "status"],
+            message:
+              "--permissions-file is only supported for interactive, resume, and ACP launches",
+            hidden: "InvalidPermissionPolicy",
+          },
+        ];
+
+        for (const fixture of cases) {
+          const result = await runFx(fixture.args);
+          expect(result.code).toBe(1);
+          expect(result.stdout).toBe("");
+          expect(result.stderr).toContain(fixture.message);
+          expect(result.stderr).not.toContain(fixture.hidden);
+        }
+      } finally {
+        rmSync(root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+});
+
 describe("cli: workspace access", () => {
   test(
     "workspace launch modifiers preserve ask help and report friendly option errors",
@@ -4688,6 +5340,117 @@ describe("cli: workspace access", () => {
       );
       expect(duplicate.stderr).not.toContain(
         "DuplicateAdditionalDirectorySuppression",
+      );
+
+      const duplicateNativeToolGate = await runFx(
+        ["--no-native-tools", "--no-native-tools"],
+        { env: enabled },
+      );
+      expect(duplicateNativeToolGate.code).toBe(1);
+      expect(duplicateNativeToolGate.stderr).toContain(
+        "--no-native-tools may only be specified once",
+      );
+
+      const unsupportedNativeToolGate = await runFx(
+        ["--no-native-tools", "ask", "hello"],
+        { env: enabled },
+      );
+      expect(unsupportedNativeToolGate.code).toBe(1);
+      expect(unsupportedNativeToolGate.stderr).toContain(
+        "--no-native-tools is only supported for interactive, resume, and ACP launches",
+      );
+
+      const missingNativeTool = await runFx(["--tool"], { env: enabled });
+      expect(missingNativeTool.code).toBe(1);
+      expect(missingNativeTool.stderr).toContain(
+        "--tool requires a native tool name",
+      );
+
+      const unknownNativeTool = await runFx(
+        ["--tool", "missing_native_tool"],
+        { env: enabled },
+      );
+      expect(unknownNativeTool.code).toBe(1);
+      expect(unknownNativeTool.stderr).toContain(
+        "unknown native tool selection: missing_native_tool",
+      );
+
+      const duplicateNativeTool = await runFx(
+        ["--tool", "read_file", "--tool=read_file"],
+        { env: enabled },
+      );
+      expect(duplicateNativeTool.code).toBe(1);
+      expect(duplicateNativeTool.stderr).toContain(
+        "native tool may only be selected once: read_file",
+      );
+
+      const conflictingTerminalTool = await runFx(
+        ["--tool", "terminal", "--tool", "terminal:exec"],
+        { env: enabled },
+      );
+      expect(conflictingTerminalTool.code).toBe(1);
+      expect(conflictingTerminalTool.stderr).toContain(
+        "conflicting native tool selections: terminal and terminal:exec",
+      );
+
+      const conflictingNativeToolGate = await runFx(
+        ["--tool", "read_file", "--no-native-tools"],
+        { env: enabled },
+      );
+      expect(conflictingNativeToolGate.code).toBe(1);
+      expect(conflictingNativeToolGate.stderr).toContain(
+        "--tool cannot be combined with --no-native-tools",
+      );
+
+      const unsupportedNativeToolSelection = await runFx(
+        ["--tool", "read_file", "ask", "hello"],
+        { env: enabled },
+      );
+      expect(unsupportedNativeToolSelection.code).toBe(1);
+      expect(unsupportedNativeToolSelection.stderr).toContain(
+        "--tool is only supported for interactive, resume, and ACP launches",
+      );
+
+      const missingSkillsRoot = await runFx(["--skills-dir"], { env: enabled });
+      expect(missingSkillsRoot.code).toBe(1);
+      expect(missingSkillsRoot.stderr).toContain(
+        "--skills-dir requires a directory path",
+      );
+
+      const duplicateDefaultSkillGate = await runFx(
+        ["--no-default-skills", "--no-default-skills"],
+        { env: enabled },
+      );
+      expect(duplicateDefaultSkillGate.code).toBe(1);
+      expect(duplicateDefaultSkillGate.stderr).toContain(
+        "--no-default-skills may only be specified once",
+      );
+
+      const unsupportedSkillPolicy = await runFx(
+        ["--no-default-skills", "ask", "hello"],
+        { env: enabled },
+      );
+      expect(unsupportedSkillPolicy.code).toBe(1);
+      expect(unsupportedSkillPolicy.stderr).toContain(
+        "--no-default-skills is only supported for interactive, resume, and ACP launches",
+      );
+
+      const duplicateProjectInstructionGate = await runFx(
+        ["--no-project-instructions", "--no-project-instructions"],
+        { env: enabled },
+      );
+      expect(duplicateProjectInstructionGate.code).toBe(1);
+      expect(duplicateProjectInstructionGate.stderr).toContain(
+        "--no-project-instructions may only be specified once",
+      );
+
+      const unsupportedProjectInstructionGate = await runFx(
+        ["--no-project-instructions", "ask", "hello"],
+        { env: enabled },
+      );
+      expect(unsupportedProjectInstructionGate.code).toBe(1);
+      expect(unsupportedProjectInstructionGate.stderr).toContain(
+        "--no-project-instructions is only supported for interactive, resume, and ACP launches",
       );
     },
     TIMEOUT,

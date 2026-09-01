@@ -26,6 +26,11 @@ pub const ResolveResult = enum {
     relationship_ready,
 };
 
+pub const ObservedResolveResult = struct {
+    result: ResolveResult,
+    observer_ran: bool = false,
+};
+
 pub const RelationshipCompletion = enum {
     succeeded,
     retryable_failure,
@@ -93,6 +98,60 @@ pub const Persistence = struct {
     }
 };
 
+/// A bounded, allocation-free copy of the children currently holding an
+/// unresolved approval. Sized well above any realistic count of subagents
+/// blocked at one instant; a snapshot that would exceed it reports
+/// `truncated` rather than silently naming a subset as the whole set.
+pub const max_pending_child_snapshot: usize = 32;
+pub const max_pending_child_id_bytes: usize = 64;
+pub const AttentionToken = [32]u8;
+
+pub fn attentionToken(child_id: []const u8, request_id: []const u8) AttentionToken {
+    var hash = std.crypto.hash.sha2.Sha256.init(.{});
+    hash.update(child_id);
+    hash.update(&.{0});
+    hash.update(request_id);
+    var digest: AttentionToken = undefined;
+    hash.final(&digest);
+    return digest;
+}
+
+pub const AttentionInvalidationObserver = struct {
+    context: ?*anyopaque = null,
+    observe_fn: *const fn (?*anyopaque, []const u8, AttentionToken) void,
+
+    fn observe(
+        self: AttentionInvalidationObserver,
+        child_id: []const u8,
+        attention_token: AttentionToken,
+    ) void {
+        self.observe_fn(self.context, child_id, attention_token);
+    }
+};
+
+pub const PendingChildren = struct {
+    storage: [max_pending_child_snapshot][max_pending_child_id_bytes]u8 = undefined,
+    lengths: [max_pending_child_snapshot]usize = @splat(0),
+    attention_tokens: [max_pending_child_snapshot]AttentionToken = undefined,
+    len: usize = 0,
+    truncated: bool = false,
+
+    pub fn at(self: *const PendingChildren, index: usize) []const u8 {
+        return self.storage[index][0..self.lengths[index]];
+    }
+
+    pub fn attentionTokenAt(self: *const PendingChildren, index: usize) AttentionToken {
+        return self.attention_tokens[index];
+    }
+
+    fn contains(self: *const PendingChildren, child_id: []const u8) bool {
+        for (0..self.len) |index| {
+            if (std.mem.eql(u8, self.at(index), child_id)) return true;
+        }
+        return false;
+    }
+};
+
 const Binding = struct {
     request_id: []u8,
     child_id: []u8,
@@ -148,6 +207,17 @@ pub const Registry = struct {
     closed: bool = false,
     worker_routes_closed: bool = false,
     pending_revision: u64 = 0,
+    attention_invalidation_observer: ?AttentionInvalidationObserver = null,
+
+    pub fn setAttentionInvalidationObserver(
+        self: *Registry,
+        observer: AttentionInvalidationObserver,
+    ) void {
+        self.mutex.lockUncancelable(io_mod.getIo());
+        defer self.mutex.unlock(io_mod.getIo());
+        std.debug.assert(self.bindings.items.len == 0);
+        self.attention_invalidation_observer = observer;
+    }
 
     pub fn pendingRevision(self: *Registry) u64 {
         self.mutex.lockUncancelable(io_mod.getIo());
@@ -294,6 +364,47 @@ pub const Registry = struct {
         });
     }
 
+    /// Copies each distinct child holding an unresolved approval into the
+    /// caller's bounded buffer.
+    ///
+    /// The main approval prompt mirrors one child at a time, so nothing on
+    /// that surface can name a second child blocked at the same instant. The
+    /// registry is the one place that knows all of them. Copying happens under
+    /// the mutex so a concurrent resolution cannot free the bytes, and the
+    /// call returns before the caller projects anything: no reducer,
+    /// projection, or transport work may run under this lock.
+    pub fn snapshotPendingChildren(self: *Registry, out: *PendingChildren) void {
+        self.mutex.lockUncancelable(io_mod.getIo());
+        defer self.mutex.unlock(io_mod.getIo());
+        out.len = 0;
+        out.truncated = false;
+        if (self.closed) return;
+        for (self.bindings.items) |binding| {
+            // A detached route has no waiter left to unblock.
+            if (binding.worker_route_detached) continue;
+            if (binding.child_id.len > max_pending_child_id_bytes) {
+                out.truncated = true;
+                continue;
+            }
+            if (out.contains(binding.child_id)) continue;
+            if (out.len == max_pending_child_snapshot) {
+                out.truncated = true;
+                break;
+            }
+            @memcpy(out.storage[out.len][0..binding.child_id.len], binding.child_id);
+            out.lengths[out.len] = binding.child_id.len;
+            out.attention_tokens[out.len] = attentionToken(binding.child_id, binding.request_id);
+            out.len += 1;
+        }
+        if (out.truncated) {
+            debug_trace.logf(
+                "subagent",
+                "pending child attention snapshot truncated bindings={d} captured={d}",
+                .{ self.bindings.items.len, out.len },
+            );
+        }
+    }
+
     pub fn resolve(
         self: *Registry,
         request_id: []const u8,
@@ -302,6 +413,28 @@ pub const Registry = struct {
         feedback: ?[]const u8,
         timestamp_ms: i64,
     ) Error!ResolveResult {
+        return (try self.resolveObserved(
+            request_id,
+            child_id,
+            decision,
+            feedback,
+            timestamp_ms,
+            null,
+        )).result;
+    }
+
+    /// Keeps a stack-owned child worker pinned by the registry while its
+    /// response is reserved, observed without the worker mutex, and released.
+    /// The registry mutex remains the lifetime pin until the binding is removed.
+    pub fn resolveObserved(
+        self: *Registry,
+        request_id: []const u8,
+        child_id: []const u8,
+        decision: types.ToolPermissionDecision,
+        feedback: ?[]const u8,
+        timestamp_ms: i64,
+        observer: ?worker_runtime.DecisionObserver,
+    ) Error!ObservedResolveResult {
         self.mutex.lockUncancelable(io_mod.getIo());
         defer self.mutex.unlock(io_mod.getIo());
         if (self.closed) {
@@ -329,8 +462,9 @@ pub const Registry = struct {
         }
         if (binding.worker == null and binding.relationship_resolution_in_flight) {
             debug_trace.logf("subagent", "approval rejected request_id={s} child_id={s} outcome=relationship_resolution_in_flight", .{ traceId(request_id), traceId(child_id) });
-            return .rejected;
+            return .{ .result = .rejected };
         }
+        var observer_ran = false;
         if (binding.worker) |worker| {
             const worker_request_id = binding.worker_request_id orelse {
                 debug_trace.logf("subagent", "approval rejected request_id={s} child_id={s} outcome=stale_waiter", .{ traceId(request_id), traceId(child_id) });
@@ -345,7 +479,7 @@ pub const Registry = struct {
                 .response = response,
                 .identity_fingerprint = binding.identity_fingerprint,
             };
-            const submission = worker.submitPermissionResponseAfterCommit(
+            const submission = worker.submitPermissionResponseAfterCommitObserved(
                 worker_request_id,
                 permission_request.OwnedPermissionResponse.init(
                     self.alloc,
@@ -356,6 +490,7 @@ pub const Registry = struct {
                     .context = &commit_context,
                     .commit_fn = CommitContext.run,
                 },
+                observer,
             ) catch |err| return switch (err) {
                 error.OutOfMemory => error.OutOfMemory,
                 error.PermissionCapacityExceeded => error.CapacityExceeded,
@@ -363,8 +498,9 @@ pub const Registry = struct {
             };
             if (submission != .accepted) {
                 debug_trace.logf("subagent", "approval rejected request_id={s} child_id={s} outcome=stale_waiter", .{ traceId(request_id), traceId(child_id) });
-                return .rejected;
+                return .{ .result = .rejected };
             }
+            observer_ran = observer != null;
         } else {
             self.persistence.commitResponse(
                 response,
@@ -376,13 +512,16 @@ pub const Registry = struct {
             if (decision == .once) {
                 binding.relationship_resolution_in_flight = true;
                 debug_trace.logf("subagent", "relationship approval authorized request_id={s} child_id={s} outcome=ready", .{ traceId(request_id), traceId(child_id) });
-                return .relationship_ready;
+                return .{ .result = .relationship_ready };
             }
         }
         self.removeBinding(index);
         self.advancePendingRevision();
         debug_trace.logf("subagent", "approval resolved request_id={s} child_id={s} outcome={s}", .{ traceId(request_id), traceId(child_id), @tagName(decision) });
-        return .accepted;
+        return .{
+            .result = .accepted,
+            .observer_ran = observer_ran,
+        };
     }
 
     pub fn completeRelationship(
@@ -425,6 +564,18 @@ pub const Registry = struct {
         debug_trace.logf("subagent", "relationship approval continuation completed request_id={s} child_id={s} outcome={s}", .{ traceId(request_id), traceId(child_id), @tagName(completion) });
     }
 
+    /// Closes copied lifecycle attention identities without mutating their
+    /// persisted routes or releasing their worker waiters. A committed owner
+    /// cancellation calls this before it emits any live cancellation signal.
+    pub fn closeChildAttention(self: *Registry, child_id: []const u8) void {
+        self.mutex.lockUncancelable(io_mod.getIo());
+        defer self.mutex.unlock(io_mod.getIo());
+        for (self.bindings.items) |binding| {
+            if (!std.mem.eql(u8, binding.child_id, child_id)) continue;
+            self.observeAttentionInvalidatedLocked(binding);
+        }
+    }
+
     /// Retires persisted routes while the registry lock still pins every
     /// stack-owned worker. Failed persistence leaves only a detached, stale
     /// route for a later invalidation retry; every waiter is still denied.
@@ -444,6 +595,7 @@ pub const Registry = struct {
             index -= 1;
             const binding = &self.bindings.items[index];
             if (!std.mem.eql(u8, binding.child_id, child_id)) continue;
+            self.observeAttentionInvalidatedLocked(binding.*);
             var persisted = true;
             self.persistence.invalidate(
                 binding.request_id,
@@ -486,6 +638,7 @@ pub const Registry = struct {
         while (index > 0) {
             index -= 1;
             if (self.bindings.items[index].worker == null) continue;
+            self.observeAttentionInvalidatedLocked(self.bindings.items[index]);
             debug_trace.logf("subagent", "approval route retired request_id={s} child_id={s} reason=owner_shutdown", .{
                 traceId(self.bindings.items[index].request_id),
                 traceId(self.bindings.items[index].child_id),
@@ -499,8 +652,19 @@ pub const Registry = struct {
         self.mutex.lockUncancelable(io_mod.getIo());
         defer self.mutex.unlock(io_mod.getIo());
         self.closed = true;
-        for (self.bindings.items) |*binding| binding.deinit(self.alloc);
+        for (self.bindings.items) |*binding| {
+            self.observeAttentionInvalidatedLocked(binding.*);
+            binding.deinit(self.alloc);
+        }
         self.bindings.deinit(self.alloc);
+    }
+
+    fn observeAttentionInvalidatedLocked(self: *Registry, binding: Binding) void {
+        const observer = self.attention_invalidation_observer orelse return;
+        observer.observe(
+            binding.child_id,
+            attentionToken(binding.child_id, binding.request_id),
+        );
     }
 
     fn persistAndAdd(
@@ -696,6 +860,187 @@ const CommitContext = struct {
         };
     }
 };
+
+test "child approval observation completes before worker release" {
+    const FakePersistence = struct {
+        fn register(
+            _: ?*anyopaque,
+            _: communication.ApprovalInput,
+        ) PersistenceError!void {}
+
+        fn commit(
+            _: ?*anyopaque,
+            _: communication.ApprovalResponse,
+            _: [32]u8,
+        ) PersistenceError!void {}
+
+        fn invalidate(
+            _: ?*anyopaque,
+            _: []const u8,
+            _: []const u8,
+            _: communication.ApprovalStatus,
+            _: i64,
+        ) PersistenceError!void {}
+    };
+    const Registration = struct {
+        registry: *Registry,
+
+        fn observe(
+            raw: *anyopaque,
+            worker: *worker_runtime.WorkerRuntime,
+            request: permission_request.PermissionRequest,
+        ) error{
+            OutOfMemory,
+            PermissionRegistrationFailed,
+            PermissionCapacityExceeded,
+        }!void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.registry.registerTool(
+                "child-observed-approval",
+                "child-session",
+                "root-session",
+                "work",
+                request,
+                &.{},
+                worker,
+                1,
+            ) catch |err| return switch (err) {
+                error.OutOfMemory => error.OutOfMemory,
+                error.CapacityExceeded => error.PermissionCapacityExceeded,
+                else => error.PermissionRegistrationFailed,
+            };
+        }
+    };
+    const Waiter = struct {
+        worker: *worker_runtime.WorkerRuntime,
+        registration: *Registration,
+        completed: *std.atomic.Value(bool),
+        decision: ?types.ToolPermissionDecision = null,
+        err: ?anyerror = null,
+
+        fn run(self: *@This()) void {
+            var response = self.worker.requestPermissionBlockingObserved(
+                std.testing.allocator,
+                .{ .label = "child action" },
+                null,
+                .{
+                    .context = self.registration,
+                    .observe_fn = Registration.observe,
+                },
+            ) catch |err| {
+                self.err = err;
+                self.completed.store(true, .seq_cst);
+                return;
+            };
+            defer response.deinit();
+            self.decision = response.decision;
+            self.worker.finishProcessing();
+            self.completed.store(true, .seq_cst);
+        }
+    };
+    const BlockingObserver = struct {
+        entered: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+        release: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+        turn_id: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+
+        fn interface(self: *@This()) worker_runtime.DecisionObserver {
+            return .{
+                .context = self,
+                .observe_fn = observe,
+            };
+        }
+
+        fn observe(raw: *anyopaque, turn_id: u64) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.turn_id.store(turn_id, .seq_cst);
+            self.entered.store(true, .seq_cst);
+            while (!self.release.load(.seq_cst)) {
+                std.Thread.yield() catch std.atomic.spinLoopHint();
+            }
+        }
+    };
+    const Resolver = struct {
+        registry: *Registry,
+        observer: *BlockingObserver,
+        result: ?ObservedResolveResult = null,
+        err: ?anyerror = null,
+
+        fn run(self: *@This()) void {
+            self.result = self.registry.resolveObserved(
+                "child-observed-approval",
+                "child-session",
+                .once,
+                null,
+                2,
+                self.observer.interface(),
+            ) catch |err| {
+                self.err = err;
+                return;
+            };
+        }
+    };
+
+    const alloc = std.testing.allocator;
+    var registry = Registry{
+        .alloc = alloc,
+        .persistence = .{
+            .register_fn = FakePersistence.register,
+            .commit_response_fn = FakePersistence.commit,
+            .invalidate_fn = FakePersistence.invalidate,
+        },
+    };
+    defer registry.deinit();
+    var worker = worker_runtime.WorkerRuntime{};
+    defer worker.deinit(alloc);
+    worker.worker_processing = true;
+    worker.active_turn_id = 97;
+
+    var completed = std.atomic.Value(bool).init(false);
+    var registration = Registration{ .registry = &registry };
+    var waiter = Waiter{
+        .worker = &worker,
+        .registration = &registration,
+        .completed = &completed,
+    };
+    const waiter_thread = try std.Thread.spawn(.{}, Waiter.run, .{&waiter});
+    var attempts: usize = 0;
+    while (attempts < 100) : (attempts += 1) {
+        var snapshot = try registry.snapshotPendingRoutes(alloc, 0, 8);
+        const registered = snapshot.total == 1;
+        snapshot.deinit(alloc);
+        if (registered) break;
+        io_mod.sleep(std.time.ns_per_ms);
+    }
+    try std.testing.expect(attempts < 100);
+
+    var observer = BlockingObserver{};
+    var resolver = Resolver{
+        .registry = &registry,
+        .observer = &observer,
+    };
+    const resolver_thread = try std.Thread.spawn(.{}, Resolver.run, .{&resolver});
+    while (!observer.entered.load(.seq_cst)) {
+        std.Thread.yield() catch std.atomic.spinLoopHint();
+    }
+
+    worker.requestStop();
+    io_mod.sleep(5 * std.time.ns_per_ms);
+    try std.testing.expect(!completed.load(.seq_cst));
+    try std.testing.expectEqual(@as(u64, 97), worker.activeTurnId());
+    try std.testing.expectEqual(@as(u64, 97), observer.turn_id.load(.seq_cst));
+
+    observer.release.store(true, .seq_cst);
+    resolver_thread.join();
+    waiter_thread.join();
+
+    try std.testing.expect(resolver.err == null);
+    try std.testing.expectEqual(ResolveResult.accepted, resolver.result.?.result);
+    try std.testing.expect(resolver.result.?.observer_ran);
+    try std.testing.expect(waiter.err == null);
+    try std.testing.expectEqual(types.ToolPermissionDecision.once, waiter.decision.?);
+    try std.testing.expect(completed.load(.seq_cst));
+    try std.testing.expectEqual(@as(u64, 0), worker.activeTurnId());
+}
 
 test "simultaneous approval surfaces resolve one durable request exactly once" {
     const FakePersistence = struct {
@@ -1102,9 +1447,32 @@ test "child invalidation failure detaches and wakes the worker route until retry
             }
         }
     };
+    const RecordingInvalidation = struct {
+        worker: *worker_runtime.WorkerRuntime,
+        count: usize = 0,
+        first_ran_before_waiter_release: bool = false,
+        first_token: AttentionToken = undefined,
+
+        fn observe(
+            raw: ?*anyopaque,
+            _: []const u8,
+            token: AttentionToken,
+        ) void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            if (self.count == 0) {
+                self.first_ran_before_waiter_release =
+                    self.worker.pending_permission_response == null;
+                self.first_token = token;
+            }
+            self.count += 1;
+        }
+    };
 
     const alloc = std.testing.allocator;
     var persisted = FailingPersistence{};
+    var worker = worker_runtime.WorkerRuntime{};
+    defer worker.deinit(alloc);
+    var invalidation = RecordingInvalidation{ .worker = &worker };
     var registry = Registry{
         .alloc = alloc,
         .persistence = .{
@@ -1113,10 +1481,12 @@ test "child invalidation failure detaches and wakes the worker route until retry
             .commit_response_fn = FailingPersistence.commit,
             .invalidate_fn = FailingPersistence.invalidate,
         },
+        .attention_invalidation_observer = .{
+            .context = &invalidation,
+            .observe_fn = RecordingInvalidation.observe,
+        },
     };
     defer registry.deinit();
-    var worker = worker_runtime.WorkerRuntime{};
-    defer worker.deinit(alloc);
     worker.worker_processing = true;
     worker.pending_permission_waiting = true;
     worker.pending_permission_request_shared =
@@ -1134,6 +1504,18 @@ test "child invalidation failure detaches and wakes the worker route until retry
         &worker,
         1,
     );
+    var pending: PendingChildren = .{};
+    registry.snapshotPendingChildren(&pending);
+    try std.testing.expectEqual(@as(usize, 1), pending.len);
+    const copied_token = pending.attentionTokenAt(0);
+    registry.closeChildAttention("child");
+    try std.testing.expectEqual(@as(usize, 1), invalidation.count);
+    try std.testing.expect(invalidation.first_ran_before_waiter_release);
+    try std.testing.expectEqualSlices(
+        u8,
+        copied_token[0..],
+        invalidation.first_token[0..],
+    );
 
     try std.testing.expectError(
         error.CommitFailed,
@@ -1143,6 +1525,7 @@ test "child invalidation failure detaches and wakes the worker route until retry
     try std.testing.expect(registry.bindings.items[0].worker == null);
     try std.testing.expect(registry.bindings.items[0].worker_route_detached);
     try std.testing.expect(worker.pending_permission_response != null);
+    try std.testing.expectEqual(@as(usize, 2), invalidation.count);
     try std.testing.expectEqual(
         types.ToolPermissionDecision.deny,
         worker.pending_permission_response.?.decision,
@@ -1162,6 +1545,7 @@ test "child invalidation failure detaches and wakes the worker route until retry
         try registry.invalidateChild("child", .cancelled, 4),
     );
     try std.testing.expectEqual(@as(usize, 0), registry.bindings.items.len);
+    try std.testing.expectEqual(@as(usize, 3), invalidation.count);
 }
 
 test "capacity rejection publishes no pending approval route" {

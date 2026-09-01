@@ -172,6 +172,7 @@ pub const AgentRuntimeDeps = struct {
     tool_registry: tool_dispatch.Registry = .{},
     context_registry: ?context_contract.Registry = null,
     context_enabled: bool = false,
+    project_instructions_enabled: bool = true,
     live_tool_authority: ?LiveToolAuthorityProvider = null,
     /// Samples host-owned root permission mode at an action boundary.
     snapshot_root_permission_mode: ?*const fn (ctx: *anyopaque) PermissionMode = null,

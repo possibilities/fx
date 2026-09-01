@@ -280,6 +280,7 @@ pub fn Bindings(comptime App: type) type {
                 .tool_registry = if (comptime @hasDecl(App, "toolRegistry")) app.toolRegistry() else .{},
                 .context_registry = if (comptime @hasDecl(App, "contextRegistry")) app.contextRegistry() else null,
                 .context_enabled = if (comptime @hasField(App, "context_enabled")) app.context_enabled else false,
+                .project_instructions_enabled = if (comptime @hasField(App, "project_instructions_enabled")) app.project_instructions_enabled else true,
                 .snapshot_root_permission_mode = if (comptime @hasField(App, "permission_engine"))
                     agentSnapshotRootPermissionMode
                 else
@@ -381,6 +382,18 @@ pub fn Bindings(comptime App: type) type {
             expected_account_id: ?[]const u8,
         ) !?[]u8 {
             const app: *App = @ptrCast(@alignCast(raw_ctx));
+            if (comptime @hasField(App, "profile_home")) {
+                if (app.profile_home) |home_dir| {
+                    return auth_runtime.refreshCredentialTokenForAccountFromHome(
+                        app.auth.oauthTransport(),
+                        alloc,
+                        source,
+                        mode,
+                        expected_account_id,
+                        home_dir,
+                    );
+                }
+            }
             return auth_runtime.refreshCredentialTokenForAccount(
                 app.auth.oauthTransport(),
                 alloc,

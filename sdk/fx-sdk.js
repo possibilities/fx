@@ -931,6 +931,25 @@ function normalizePromptInput(input) {
 }
 
 export async function createFxAgent(options) {
+  if (options?.auth !== undefined) {
+    const entries = Array.isArray(options.auth) ? options.auth : [options.auth];
+    if (entries.length !== 1 || !entries[0] || entries[0].provider !== "gateway") {
+      const error = new Error("WebAssembly libfx supports only Gateway auth; Codex requires the native Node backend");
+      error.code = "LIBFX_CODEX_NATIVE_REQUIRED";
+      throw error;
+    }
+    if (Object.keys(entries[0]).some((key) => key !== "provider" && key !== "apiKey")) {
+      throw new TypeError("Gateway auth accepts only provider and apiKey");
+    }
+    if (typeof entries[0].apiKey !== "string" || !entries[0].apiKey.length) {
+      throw new TypeError("Gateway auth requires a non-empty apiKey");
+    }
+    if (options.env?.AI_GATEWAY_API_KEY !== undefined && options.env.AI_GATEWAY_API_KEY !== entries[0].apiKey) {
+      throw new TypeError("Gateway auth conflicts with env.AI_GATEWAY_API_KEY");
+    }
+    const { auth: _auth, ...rest } = options;
+    options = { ...rest, env: { ...rest.env, AI_GATEWAY_API_KEY: entries[0].apiKey } };
+  }
   options = { ...options, sessionStore: options.sessionStore || createMemorySessionStore() };
   const pending = new Map();
   const turns = new Map();
@@ -983,7 +1002,14 @@ export async function createFxAgent(options) {
     const waiter = pending.get(message.id); if (!waiter) return; pending.delete(message.id);
     if (message.error) waiter.reject(new Error(message.error.message)); else waiter.resolve(message.result);
   });
-  await request("initialize", { protocolVersion: 1, clientCapabilities: {} });
+  try {
+    await request("initialize", { protocolVersion: 1, clientCapabilities: {} });
+  } catch (error) {
+    closing = true;
+    try { runtime.abort(); } catch {}
+    await runtime.exited.catch(() => {});
+    throw error;
+  }
 
   const agent = {
     exited: runtime.exited,

@@ -11,7 +11,6 @@ const prompt_handler = @import("prompt.zig");
 const prompt_test_controls = @import("prompt_test_controls.zig");
 const app_lifecycle = @import("../core/app/app_lifecycle.zig");
 const app_runtime_setup = @import("../core/app/app_runtime_setup.zig");
-const builtin_skills = @import("../builtins/skills.zig");
 const builtin_tools = @import("../builtins/tools.zig");
 const credentials = @import("../core/auth/credentials.zig");
 const secret = @import("../core/auth/secret.zig");
@@ -40,6 +39,7 @@ const web_fetch_runtime = @import("../core/tooling/web_fetch_runtime.zig");
 const web_search_runtime = @import("../core/tooling/web_search_runtime.zig");
 const elicitation = @import("../core/mcp/elicitation.zig");
 const tool_mcp_runtime = @import("../core/tooling/tool_mcp_runtime.zig");
+const tool_set_contract = @import("../core/tooling/tool_set.zig");
 const permissions = @import("../core/permissions/permissions.zig");
 
 const Allocator = std.mem.Allocator;
@@ -223,6 +223,7 @@ pub const ServerState = struct {
     provider: model_provider.ProviderId = .gateway,
     configured_model: []u8 = &.{},
     process_model_override: bool = false,
+    process_effort_override: bool = false,
     permission_mode: types.PermissionMode = .ask,
     permission_rules: types.PermissionRuleSet = .{},
     agent_step_limit: usize = 0,
@@ -230,6 +231,7 @@ pub const ServerState = struct {
     context_limits: config_runtime.context_limits.Values = .{},
     fast_mode: bool = false,
     effort: types.ReasoningEffort = .auto,
+    configured_effort: types.ReasoningEffort = .auto,
     first_call_tool_choice: types.ToolChoice = .auto,
     context_enabled: bool = true,
     active_session: ?ActiveSessionState = null,
@@ -291,11 +293,44 @@ pub const ServerState = struct {
     }
 };
 
+pub fn activeToolSet(state: *const ServerState) tool_set_contract.ToolSet {
+    if (comptime host_target.is_wasm) return tool_set_contract.empty;
+    if (!state.cfg.allow_native_tools) return tool_set_contract.empty;
+    return state.cfg.native_tool_set orelse builtin_tools.advertisement_set;
+}
+
 fn credentialMatchesProvider(
     source: ?types.CredentialSource,
     provider: model_provider.ProviderId,
 ) bool {
     return model_provider.authorizesCredential(provider, source);
+}
+
+fn resolveConfiguredCredential(
+    state: *const ServerState,
+    alloc: Allocator,
+    provider: model_provider.ProviderId,
+    preferred: ?credentials.Source,
+) !credentials.Resolution {
+    if (state.cfg.home_override) |home| {
+        return credentials.resolveForProviderFromHome(
+            alloc,
+            state.cfg.gateway_provider.oauth_transport,
+            .refresh_if_needed,
+            provider,
+            preferred,
+            home,
+        );
+    }
+    return credentials.resolveForProviderWithStore(
+        alloc,
+        state.cfg.gateway_provider.oauth_transport,
+        state.cfg.secret_store,
+        .refresh_if_needed,
+        provider,
+        preferred,
+        state.cfg.chatgpt_session_store,
+    );
 }
 
 fn adoptServerCredential(state: *ServerState, credential: *credentials.Credential) void {
@@ -335,6 +370,7 @@ pub fn selectCredentialForProvider(
     state: *ServerState,
     provider: model_provider.ProviderId,
 ) !bool {
+    if (!state.cfg.allowed_providers.contains(provider)) return false;
     if (state.active_session) |active| {
         if (credentialMatchesProvider(active.credential_source, provider)) return true;
     }
@@ -346,14 +382,7 @@ pub fn selectCredentialForProvider(
             .source = .ai_gateway_api_key,
         }
     else blk: {
-        const resolution = try credentials.resolveForProvider(
-            state.alloc,
-            state.cfg.gateway_provider.oauth_transport,
-            state.cfg.secret_store,
-            .refresh_if_needed,
-            provider,
-            state.credential_source,
-        );
+        const resolution = try resolveConfiguredCredential(state, state.alloc, provider, state.credential_source);
         break :blk resolution.credential orelse return false;
     };
     defer credential.deinit(state.alloc);
@@ -383,13 +412,25 @@ pub fn refreshModelCredential(
     expected_account_id: ?[]const u8,
 ) !?[]u8 {
     const state: *ServerState = @ptrCast(@alignCast(raw));
-    const refreshed = try auth_runtime.refreshCredentialTokenForAccount(
-        state.cfg.gateway_provider.oauth_transport,
-        alloc,
-        source,
-        mode,
-        expected_account_id,
-    ) orelse return null;
+    const maybe_refreshed = if (state.cfg.home_override) |home|
+        try auth_runtime.refreshCredentialTokenForAccountFromHome(
+            state.cfg.gateway_provider.oauth_transport,
+            alloc,
+            source,
+            mode,
+            expected_account_id,
+            home,
+        )
+    else
+        try auth_runtime.refreshCredentialTokenForAccountWithStore(
+            state.cfg.gateway_provider.oauth_transport,
+            alloc,
+            source,
+            mode,
+            expected_account_id,
+            state.cfg.chatgpt_session_store,
+        );
+    const refreshed = maybe_refreshed orelse return null;
     errdefer secret.zeroAndFree(alloc, refreshed);
     if (source == .chatgpt_subscription or source == .grok_subscription) {
         try publishRefreshedSubscriptionToken(state, refreshed, source, expected_account_id);
@@ -495,7 +536,10 @@ pub fn enableSubagentHost(state: *ServerState) void {
     disableSubagentHost(state);
     const active = if (state.active_session) |*session| session else return;
     if (active.writable == null) return;
-    state.subagent_store = session_store.Store.init(state.alloc, state.workspace_root) catch |err| {
+    state.subagent_store = (if (state.cfg.home_override) |home|
+        session_store.Store.initFromHome(state.alloc, home, state.workspace_root)
+    else
+        session_store.Store.init(state.alloc, state.workspace_root)) catch |err| {
         debug_trace.logf("acp", "subagent host store unavailable session={s} err={s}", .{ active.session_id, @errorName(err) });
         return;
     };
@@ -534,6 +578,7 @@ fn resolveSubagentAuthority(
     }
     state.subagent_authority_mutex.lockUncancelable(io_mod.getIo());
     defer state.subagent_authority_mutex.unlock(io_mod.getIo());
+    const tool_set = activeToolSet(state);
     const integrations = if (active.mcp) |mcp|
         mcp.snapshotToolNames(alloc, active.permission_rules)
     else
@@ -549,7 +594,7 @@ fn resolveSubagentAuthority(
             root_id,
             root_id,
             active.permission_rules,
-            state.cfg.mode_registry.toolAllowed(builtin_tools.advertisement_set, active.mode, "mcp_features") and
+            state.cfg.mode_registry.toolAllowed(tool_set, active.mode, "mcp_features") and
                 !permissions.rulesDenyAllTargetsForTool(active.permission_rules, "mcp_features"),
         )
     else
@@ -563,7 +608,7 @@ fn resolveSubagentAuthority(
     return subagent_tool_host.captureHostAuthorityWithMcpView(
         alloc,
         .{
-            .tool_set = builtin_tools.advertisement_set,
+            .tool_set = tool_set,
             .mode = .{
                 .active = .{
                     .registry = state.cfg.mode_registry,
@@ -576,6 +621,57 @@ fn resolveSubagentAuthority(
         active.session_grants,
         permission_state,
         if (mcp_view) |*view| view else null,
+    );
+}
+
+test "ACP child authority preserves native-tool suppression and allowlisting" {
+    const alloc = std.testing.allocator;
+    const modes = [_]mode_registry.ModeSpec{
+        .{ .id = "full", .name = "Full", .permission_mode = .ask },
+    };
+    const selected = tool_set_contract.ToolSet{
+        .registry = .{ .tools = builtin_tools.registry.tools[0..1] },
+        .order = builtin_tools.advertisement_set.order[0..1],
+        .read_only_tool_names = &.{},
+    };
+    var state: ServerState = undefined;
+    state.alloc = alloc;
+    state.cfg.allow_native_tools = false;
+    state.cfg.native_tool_set = selected;
+    state.cfg.mode_registry = .{
+        .default_mode_id = "full",
+        .modes = modes[0..],
+    };
+    state.active_session = .{
+        .session_id = @constCast("root"),
+        .model = @constCast("model"),
+        .mode = "full",
+        .workspace_root = "/tmp/workspace",
+        .api_key = "",
+        .agent_step_limit = 0,
+        .max_tool_result_bytes = 0,
+        .fast_mode = false,
+        .effort = .auto,
+        .first_call_tool_choice = .auto,
+        .permission_mode = .ask,
+        .permission_rules = .{},
+        .session_rt = .{ .max_history_turns = 0 },
+        .cancel_flag = std.atomic.Value(bool).init(false),
+        .pending_prompt_id = null,
+    };
+    state.subagent_authority_mutex = .init;
+
+    var suppressed = try resolveSubagentAuthority(&state, alloc, "root");
+    defer suppressed.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 0), suppressed.tools.len);
+
+    state.cfg.allow_native_tools = true;
+    var allowlisted = try resolveSubagentAuthority(&state, alloc, "root");
+    defer allowlisted.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), allowlisted.tools.len);
+    try std.testing.expectEqualStrings(
+        selected.registry.tools[0].name,
+        allowlisted.tools[0],
     );
 }
 
@@ -1270,15 +1366,14 @@ fn parseInitializeRequest(
 
 fn loadConfiguredStartupState(state: *const ServerState, alloc: Allocator) !app_lifecycle.StartupState {
     if (state.cfg.home_override) |home_dir| {
-        if (state.cfg.workspace_root_override) |workspace_root| {
-            return app_lifecycle.loadEmbeddedStartupState(
-                alloc,
-                home_dir,
-                workspace_root,
-                state.cfg.default_model,
-                state.cfg.default_agent_step_limit,
-            );
-        }
+        const workspace_root = state.cfg.workspace_root_override orelse ".";
+        return app_lifecycle.loadEmbeddedStartupState(
+            alloc,
+            home_dir,
+            workspace_root,
+            state.cfg.default_model,
+            state.cfg.default_agent_step_limit,
+        );
     }
     return app_lifecycle.loadStartupState(
         alloc,
@@ -1342,7 +1437,13 @@ fn handleInitialize(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message
         state.selected_model = startup.takeSelectedModel();
         state.process_model_override = startup.model_source == .process_override;
     }
-    state.provider = startup.provider;
+    state.provider = state.cfg.provider_override orelse startup.provider;
+    if (!state.cfg.allowed_providers.contains(state.provider)) {
+        return state.writer.writeError(alloc, msg.id, .{
+            .code = ErrorCode.invalid_request,
+            .message = "Selected provider was not authorized by this host",
+        });
+    }
     state.configured_model = try alloc.dupe(u8, startup.configured_model);
 
     var startup_credential = startup.takeCredential();
@@ -1363,14 +1464,7 @@ fn handleInitialize(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message
         &startup_credential.?
     else routed: {
         const preferred = if (startup_credential) |value| value.source else null;
-        const resolution = try credentials.resolveForProvider(
-            alloc,
-            state.cfg.gateway_provider.oauth_transport,
-            state.cfg.secret_store,
-            .refresh_if_needed,
-            state.provider,
-            preferred,
-        );
+        const resolution = try resolveConfiguredCredential(state, alloc, state.provider, preferred);
         routed_credential = resolution.credential;
         if (routed_credential == null) {
             return state.writer.writeError(alloc, msg.id, .{
@@ -1399,19 +1493,39 @@ fn handleInitialize(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message
     adoptServerCredential(state, credential);
 
     state.permission_mode = startup.permission_mode;
-    state.permission_rules = startup.takePermissionRules();
+    state.permission_rules = if (state.cfg.permission_rules_override) |rules|
+        try types.dupePermissionRuleSet(alloc, rules)
+    else
+        startup.takePermissionRules();
     state.agent_step_limit = startup.agent_step_limit;
     state.max_tool_result_bytes = startup.max_tool_result_bytes;
     state.context_limits = startup.context_limits;
     state.context_limits.applyCommandLine(state.cfg.context_limit_overrides);
-    state.fast_mode = startup.fast_mode and
+    state.fast_mode = startup.fast_mode and state.provider == startup.provider and
         (state.cfg.model_override == null or startup.fast_mode_source != .compiled_default);
-    state.effort = startup.effort;
+    state.effort = state.cfg.effort_override orelse startup.effort;
+    state.configured_effort = startup.configured_effort;
+    state.process_effort_override = state.cfg.effort_override != null or
+        startup.effort_source == .process_override;
     state.first_call_tool_choice = startup.first_call_tool_choice;
     state.context_enabled = startup.context_enabled;
 
     if (comptime !host_target.is_wasm) {
-        const loaded_skills = try app_runtime_setup.loadSkills(alloc, state.workspace_root, builtin_skills.root_policy);
+        const loaded_skills = if (state.cfg.home_override) |home|
+            try app_runtime_setup.loadSkillsFromHome(
+                alloc,
+                state.workspace_root,
+                home,
+                state.cfg.invocation_skill_roots,
+                state.cfg.skill_root_policy,
+            )
+        else
+            try app_runtime_setup.loadSkills(
+                alloc,
+                state.workspace_root,
+                state.cfg.invocation_skill_roots,
+                state.cfg.skill_root_policy,
+            );
         skill_runtime.traceDiagnostics("acp_startup", loaded_skills.diagnostics);
         state.skills.replaceLoaded(alloc, loaded_skills.dir, loaded_skills.skills, loaded_skills.diagnostics);
     }
@@ -1438,6 +1552,41 @@ fn handleInitialize(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message
         state.selected_model,
         state.cfg.provider_set.select(state.provider).fallbackModelCapabilities(state.selected_model),
     );
+    if (state.cfg.provider_override == .codex) {
+        const entries = state.capability_resolver.catalogEntries() orelse
+            return state.writer.writeError(alloc, msg.id, .{
+                .code = ErrorCode.invalid_request,
+                .message = "Failed to load Codex model catalog",
+            });
+        if (entries.len == 0) {
+            return state.writer.writeError(alloc, msg.id, .{
+                .code = ErrorCode.invalid_request,
+                .message = "Codex provider returned no supported models",
+            });
+        }
+        var selected_available = false;
+        for (entries) |entry| {
+            if (std.mem.eql(u8, entry.id, state.selected_model)) {
+                selected_available = true;
+                break;
+            }
+        }
+        if (!selected_available and state.cfg.model_override != null) {
+            return state.writer.writeError(alloc, msg.id, .{
+                .code = ErrorCode.invalid_request,
+                .message = "Model is not available for the selected provider",
+            });
+        }
+        if (!selected_available) {
+            const selected = try alloc.dupe(u8, entries[0].id);
+            errdefer alloc.free(selected);
+            const configured = try alloc.dupe(u8, selected);
+            alloc.free(state.selected_model);
+            state.selected_model = selected;
+            alloc.free(state.configured_model);
+            state.configured_model = configured;
+        }
+    }
 
     state.client_fs_read = request.client_fs_read;
     state.client_fs_write = request.client_fs_write;
@@ -1627,6 +1776,12 @@ fn handleSetConfigOption(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Me
                 .code = ErrorCode.invalid_params,
                 .message = "Invalid provider",
             });
+        if (!state.cfg.allowed_providers.contains(target)) {
+            return state.writer.writeError(alloc, msg.id, .{
+                .code = ErrorCode.invalid_request,
+                .message = "Provider was not supplied by this host",
+            });
+        }
         const session = if (state.active_session) |*active| active else return state.writer.writeError(alloc, msg.id, .{
             .code = ErrorCode.invalid_request,
             .message = "No active session",
@@ -1644,14 +1799,7 @@ fn handleSetConfigOption(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Me
                     .source = .ai_gateway_api_key,
                 }
             else credential: {
-                const resolution = try credentials.resolveForProvider(
-                    alloc,
-                    state.cfg.gateway_provider.oauth_transport,
-                    state.cfg.secret_store,
-                    .refresh_if_needed,
-                    target,
-                    null,
-                );
+                const resolution = try resolveConfiguredCredential(state, alloc, target, null);
                 break :credential resolution.credential orelse
                     return state.writer.writeError(alloc, msg.id, .{
                         .code = ErrorCode.invalid_request,
@@ -1752,6 +1900,7 @@ fn handleSetConfigOption(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Me
         try sessions.writeProviderConfigOption(
             &out.writer,
             if (state.active_session) |session| session.provider else state.provider,
+            state.cfg.allowed_providers,
         );
         try out.writer.writeAll(",");
     }
@@ -2022,6 +2171,29 @@ test "ACP permission responses map canonical option ids" {
         defer parsed.deinit();
         try std.testing.expect(parsePermissionDecision(parsed.value) == null);
     }
+}
+
+test "ACP selected profile state loads settings without workspace override" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "state/.fx");
+    {
+        var file = try tmp.dir.createFile(std.testing.io, "state/.fx/settings.json", .{});
+        defer file.close(std.testing.io);
+        try file.writeStreamingAll(std.testing.io, "{\"model\":\"isolated/model\"}\n");
+    }
+    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "state");
+    defer alloc.free(home);
+
+    var state: ServerState = undefined;
+    state.cfg.home_override = home;
+    state.cfg.workspace_root_override = null;
+    state.cfg.default_model = "default/model";
+    state.cfg.default_agent_step_limit = 50;
+    var startup = try loadConfiguredStartupState(&state, alloc);
+    defer startup.deinit(alloc);
+    try std.testing.expectEqualStrings("isolated/model", startup.configured_model);
 }
 
 test "ACP outbound waiters resolve to deny on cancellation" {
