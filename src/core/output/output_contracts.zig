@@ -5,6 +5,7 @@ const doctor_runtime = @import("../cli/doctor_runtime.zig");
 const model_provider = @import("../config/model_provider.zig");
 const mcp_contract = @import("../mcp/mcp_contract.zig");
 const mcp_health = @import("../mcp/health.zig");
+const model_catalog = @import("../gateway/model_catalog.zig");
 const provider_catalog = @import("../auth/provider_catalog.zig");
 const permissions = @import("../permissions/permissions.zig");
 const session_display_metadata = @import("../session/session_display_metadata.zig");
@@ -746,7 +747,8 @@ pub const PermissionsSnapshot = struct {
 };
 
 pub const ModelListSnapshot = struct {
-    ids: []const []const u8,
+    ids: []const []const u8 = &.{},
+    catalog: ?[]const model_catalog.ModelCatalogEntry = null,
     provider: model_provider.ProviderId = .gateway,
     limit: ?usize = null,
     private_models_hidden: bool = false,
@@ -760,7 +762,7 @@ pub const ModelListSnapshot = struct {
     }
 
     pub fn renderText(self: ModelListSnapshot, alloc: Allocator) ![]u8 {
-        if (self.ids.len == 0) {
+        if (self.modelCount() == 0) {
             const provider_name = self.emptyCatalogProviderName();
             if (self.catalogExplanation()) |explanation| {
                 return std.fmt.allocPrint(alloc, "[models] no models returned by {s}\n[models] {s}\n", .{ provider_name, explanation });
@@ -771,18 +773,19 @@ pub const ModelListSnapshot = struct {
         var out: std.Io.Writer.Allocating = .init(alloc);
         defer out.deinit();
 
-        try out.writer.print("[models] {d} available\n", .{self.ids.len});
+        try out.writer.print("[models] {d} available\n", .{self.modelCount()});
 
         const shown = self.shownCount();
-        for (self.ids[0..shown]) |id| {
+        for (0..shown) |index| {
+            const id = self.modelId(index);
             if (self.provider != .gateway) {
                 try out.writer.print(" - {s} · {s}\n", .{ id, provider_catalog.label(self.provider) });
             } else {
                 try out.writer.print(" - {s}\n", .{id});
             }
         }
-        if (self.ids.len > shown) {
-            try out.writer.print(" ... and {d} more\n", .{self.ids.len - shown});
+        if (self.modelCount() > shown) {
+            try out.writer.print(" ... and {d} more\n", .{self.modelCount() - shown});
         }
         if (self.catalogExplanation()) |explanation| try out.writer.print("[models] {s}\n", .{explanation});
 
@@ -790,7 +793,7 @@ pub const ModelListSnapshot = struct {
     }
 
     pub fn renderInteractiveBody(self: ModelListSnapshot, alloc: Allocator) ![]u8 {
-        if (self.ids.len == 0) {
+        if (self.modelCount() == 0) {
             const provider_name = self.emptyCatalogProviderName();
             if (self.catalogExplanation()) |explanation| {
                 return std.fmt.allocPrint(alloc, "no models returned by {s}\n{s}", .{ provider_name, explanation });
@@ -800,16 +803,17 @@ pub const ModelListSnapshot = struct {
 
         var out: std.Io.Writer.Allocating = .init(alloc);
         defer out.deinit();
-        try out.writer.print("{d} available", .{self.ids.len});
+        try out.writer.print("{d} available", .{self.modelCount()});
         const shown = self.shownCount();
-        for (self.ids[0..shown]) |id| {
+        for (0..shown) |index| {
+            const id = self.modelId(index);
             if (self.provider != .gateway) {
                 try out.writer.print("\n - {s} · {s}", .{ id, provider_catalog.label(self.provider) });
             } else {
                 try out.writer.print("\n - {s}", .{id});
             }
         }
-        if (self.ids.len > shown) try out.writer.print("\n ... and {d} more", .{self.ids.len - shown});
+        if (self.modelCount() > shown) try out.writer.print("\n ... and {d} more", .{self.modelCount() - shown});
         if (self.catalogExplanation()) |explanation| try out.writer.print("\n{s}", .{explanation});
         return try out.toOwnedSlice();
     }
@@ -821,20 +825,26 @@ pub const ModelListSnapshot = struct {
         const shown = self.shownCount();
         try out.writer.print(
             "{{\"kind\":\"models\",\"count\":{d},\"shown_count\":{d},\"more_count\":{d},\"private_models_hidden\":{},\"ids\":[",
-            .{ self.ids.len, shown, self.ids.len - shown, self.private_models_hidden },
+            .{ self.modelCount(), shown, self.modelCount() - shown, self.private_models_hidden },
         );
-        for (self.ids[0..shown], 0..) |id, i| {
-            if (i > 0) try out.writer.writeByte(',');
-            try std.json.Stringify.value(id, .{}, &out.writer);
+        for (0..shown) |index| {
+            if (index > 0) try out.writer.writeByte(',');
+            try std.json.Stringify.value(self.modelId(index), .{}, &out.writer);
         }
-        if (self.provider != .gateway) {
+        if (self.catalog != null or self.provider != .gateway) {
             try out.writer.writeAll("],\"models\":[");
-            for (self.ids[0..shown], 0..) |id, i| {
-                if (i > 0) try out.writer.writeByte(',');
+            for (0..shown) |index| {
+                if (index > 0) try out.writer.writeByte(',');
                 try out.writer.writeAll("{\"id\":");
-                try std.json.Stringify.value(id, .{}, &out.writer);
+                try std.json.Stringify.value(self.modelId(index), .{}, &out.writer);
                 try out.writer.writeAll(",\"source\":");
                 try std.json.Stringify.value(provider_catalog.label(self.provider), .{}, &out.writer);
+                try out.writer.writeAll(",\"reasoning_efforts\":[");
+                for (self.modelReasoningEfforts(index), 0..) |effort, effort_index| {
+                    if (effort_index > 0) try out.writer.writeByte(',');
+                    try std.json.Stringify.value(effort.label(), .{}, &out.writer);
+                }
+                try out.writer.writeByte(']');
                 try out.writer.writeByte('}');
             }
         }
@@ -843,7 +853,19 @@ pub const ModelListSnapshot = struct {
     }
 
     fn shownCount(self: ModelListSnapshot) usize {
-        return if (self.limit) |value| @min(self.ids.len, value) else self.ids.len;
+        return if (self.limit) |value| @min(self.modelCount(), value) else self.modelCount();
+    }
+
+    fn modelCount(self: ModelListSnapshot) usize {
+        return if (self.catalog) |catalog| catalog.len else self.ids.len;
+    }
+
+    fn modelId(self: ModelListSnapshot, index: usize) []const u8 {
+        return if (self.catalog) |catalog| catalog[index].id else self.ids[index];
+    }
+
+    fn modelReasoningEfforts(self: ModelListSnapshot, index: usize) []const types.ReasoningEffort {
+        return if (self.catalog) |catalog| catalog[index].reasoning_efforts.items else &.{};
     }
 
     fn emptyCatalogProviderName(self: ModelListSnapshot) []const u8 {
@@ -2206,6 +2228,30 @@ test "core model list snapshot handles limits and empty lists" {
     try std.testing.expectEqualStrings(
         "{\"kind\":\"models\",\"count\":0,\"shown_count\":0,\"more_count\":0,\"private_models_hidden\":false,\"ids\":[]}",
         empty_json,
+    );
+}
+
+test "model list JSON preserves ordered reasoning efforts per provider model" {
+    var efforts = [_]types.ReasoningEffort{
+        types.ReasoningEffort.literal("future-tier"),
+        types.ReasoningEffort.literal("medium"),
+    };
+    const catalog = [_]model_catalog.ModelCatalogEntry{
+        .{
+            .id = @constCast("gpt-future"),
+            .model_type = @constCast("language"),
+            .reasoning_efforts = .{ .items = &efforts, .capacity = efforts.len },
+        },
+    };
+
+    const json = try (ModelListSnapshot{
+        .catalog = &catalog,
+        .provider = .codex,
+    }).renderJson(std.testing.allocator);
+    defer std.testing.allocator.free(json);
+    try std.testing.expectEqualStrings(
+        "{\"kind\":\"models\",\"count\":1,\"shown_count\":1,\"more_count\":0,\"private_models_hidden\":false,\"ids\":[\"gpt-future\"],\"models\":[{\"id\":\"gpt-future\",\"source\":\"Codex subscription\",\"reasoning_efforts\":[\"future-tier\",\"medium\"]}]}",
+        json,
     );
 }
 

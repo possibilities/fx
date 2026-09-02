@@ -921,15 +921,8 @@ fn fetchCliModelCatalog(
     });
     return switch (result) {
         .loaded => |loaded| project: {
-            var catalog = loaded.catalog;
-            defer freeModelCatalog(alloc, &catalog);
-            const ids = model_catalog.projectModelIds(alloc, catalog.items) catch return .{ .failure = .{
-                .access = loaded.provenance.access,
-                .anonymous_fallback_used = loaded.provenance.anonymous_fallback_used,
-                .failure = .{ .category = .resource_exhausted },
-            } };
             break :project .{ .loaded = .{
-                .ids = ids,
+                .catalog = loaded.catalog,
                 .provenance = loaded.provenance,
             } };
         },
@@ -2245,8 +2238,8 @@ test "built-in CLI catalog provider preserves cancellation detail" {
             failure.failure.category,
         ),
         .loaded => |loaded| {
-            var ids = loaded.ids;
-            collections.freeStringList(std.testing.allocator, &ids);
+            var catalog = loaded.catalog;
+            freeModelCatalog(std.testing.allocator, &catalog);
             return error.TestExpectedEqual;
         },
     }
