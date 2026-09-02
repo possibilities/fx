@@ -78,9 +78,9 @@ const PostEffectTerminalFailure = struct {
 };
 
 const read_file_advertised_names = [_][]const u8{"read_file"};
-const terminal_advertised_names = [_][]const u8{"terminal"};
+const terminal_advertised_names = [_][]const u8{"shell"};
 const read_file_advertised_functions = [_]model_tool_schema.FunctionSchema{builtin_tools.read_file.model_schema};
-const terminal_advertised_functions = [_]model_tool_schema.FunctionSchema{builtin_tools.terminal.model_schema};
+const terminal_advertised_functions = [_]model_tool_schema.FunctionSchema{builtin_tools.shell.model_schema};
 
 fn makeOwnedVisionCatalog(
     alloc: std.mem.Allocator,
@@ -1027,11 +1027,11 @@ test "accepted automatic review remains internal before ordinary tool execution"
 
 test "borrowed nested terminal completion is flat before authority execution and memory" {
     const alloc = std.testing.allocator;
-    const flat_arguments = "{\"action\":\"exec\",\"command\":\"printf done\"}";
+    const flat_arguments = "{\"action\":\"run\",\"command\":\"printf done\"}";
     const calls = [_]ToolCall{toolCall(
         "call_nested_terminal",
-        "terminal",
-        "{\"request\":{\"action\":\"exec\",\"command\":\"printf done\"}}",
+        "shell",
+        "{\"request\":{\"action\":\"run\",\"command\":\"printf done\"}}",
     )};
     const completions = [_]FakeCompletion{
         .{ .tool_calls = &calls },
@@ -1050,7 +1050,7 @@ test "borrowed nested terminal completion is flat before authority execution and
     try runFakePrompt(&gateway, &hooks, config, fixture.job());
 
     try std.testing.expectEqual(@as(usize, 1), hooks.executed_names.items.len);
-    try std.testing.expectEqualStrings("terminal", hooks.executed_names.items[0]);
+    try std.testing.expectEqualStrings("shell", hooks.executed_names.items[0]);
     try std.testing.expectEqualStrings(flat_arguments, hooks.last_validated_arguments.?);
     try std.testing.expectEqualStrings(flat_arguments, hooks.last_permission_arguments.?);
     try std.testing.expectEqualStrings(flat_arguments, hooks.last_executed_arguments.?);
@@ -1063,69 +1063,12 @@ test "borrowed nested terminal completion is flat before authority execution and
     );
 }
 
-test "terminal acquire stays tracked when execution fails after its effect" {
-    const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    try tmp.dir.createDir(
-        io_mod.getIo(),
-        "session",
-        std.Io.File.Permissions.fromMode(0o700),
-    );
-    var session_dir = try tmp.dir.openDir(io_mod.getIo(), "session", .{
-        .iterate = true,
-        .follow_symlinks = false,
-    });
-    defer session_dir.close(io_mod.getIo());
-    const session_path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "session");
-    defer alloc.free(session_path);
-    var capability = try session_child_store.SessionChildCapability.initForTesting(
-        alloc,
-        session_dir,
-        session_path,
-        .writable,
-        .{},
-    );
-    defer capability.deinit();
-
-    const calls = [_]ToolCall{toolCall(
-        "terminal_acquire",
-        "terminal",
-        "{\"action\":\"write\",\"session_id\":\"terminal-one\",\"write\":null,\"lease\":\"acquire\"}",
-    )};
-    var gateway = FakeGateway.init(alloc, &.{.{ .tool_calls = &calls }});
-    defer gateway.deinit();
-    var post_effect = PostEffectTerminalFailure{};
-    var hooks = FakeAgentRuntimeDeps.init(alloc);
-    hooks.permission_decisions = &.{.once};
-    hooks.tool_execution_override = .{
-        .context = &post_effect,
-        .execute_fn = PostEffectTerminalFailure.execute,
-    };
-    defer hooks.deinit();
-    var fixture = PromptFixture{};
-    var config = fixture.config();
-    config.session_child_capability = &capability;
-
-    try std.testing.expectError(
-        error.OutOfMemory,
-        runFakePrompt(&gateway, &hooks, config, fixture.job()),
-    );
-
-    try std.testing.expectEqual(@as(usize, 1), post_effect.effect_count);
-    try std.testing.expectEqual(@as(usize, 1), hooks.terminal_lease_cleanup_ids.items.len);
-    try std.testing.expectEqualStrings(
-        "terminal-one",
-        hooks.terminal_lease_cleanup_ids.items[0],
-    );
-}
-
-test "terminal lifecycle resolves one display target before execution" {
+test "shell lifecycle resolves one display target before execution" {
     const alloc = std.testing.allocator;
     const calls = [_]ToolCall{toolCall(
         "inspect_call",
-        "terminal",
-        "{\"action\":\"inspect\",\"session_id\":\"terminal-cold-session\"}",
+        "shell",
+        "{\"request\":{\"action\":\"wait\",\"session_id\":\"terminal-cold-session\"}}",
     )};
     const completions = [_]FakeCompletion{
         .{ .tool_calls = &calls },
@@ -1179,7 +1122,7 @@ test "terminal lifecycle resolves one display target before execution" {
         .progress => |progress| {
             if (!std.mem.eql(u8, progress.id.call_id, "inspect_call")) continue;
             try std.testing.expectEqualStrings(
-                "start terminal session terminal-cold-session",
+                "start shell session terminal-cold-session",
                 progress.text,
             );
             active_count += 1;
@@ -1187,7 +1130,7 @@ test "terminal lifecycle resolves one display target before execution" {
         .terminal => |terminal| {
             if (!std.mem.eql(u8, terminal.id.call_id, "inspect_call")) continue;
             try std.testing.expectEqualStrings(
-                "done terminal session terminal-cold-session",
+                "done shell session terminal-cold-session",
                 terminal.outcome.summary,
             );
             completed_count += 1;
@@ -1440,6 +1383,13 @@ test "parallel streamed cancellation closes every concrete tool action" {
         toolCall("call_read", "read_file", "{\"path\":\"README.md\"}"),
         toolCall("call_fetch", "web_fetch", "{\"url\":\"https://example.com\"}"),
         toolCall("call_glob", "glob_files", "{\"pattern\":\"README.md\"}"),
+        .{
+            .id = "call_search",
+            .name = "exa_search",
+            .arguments_json = "{}",
+            .provider_result = "{\"results\":[]}",
+            .provenance = .provider_executed,
+        },
     };
     const cancellation_points = [_][]const u8{ "read_file", "web_fetch" };
 
@@ -1464,12 +1414,16 @@ test "parallel streamed cancellation closes every concrete tool action" {
         try std.testing.expectEqual(@as(usize, 0), hooks.executed_names.items.len);
         try std.testing.expectEqual(types.TurnPresentationOutcome.interrupted, hooks.finalized_outcome.?);
         for (calls) |call| {
+            if (call.provenance == .provider_executed) continue;
             try expectSingleTerminalOutcome(
                 hooks.lifecycle_events.items,
                 call.id,
                 .cancelled,
             );
         }
+        try std.testing.expectEqual(@as(usize, 1), hooks.inner_usages.items.len);
+        try std.testing.expectEqualStrings("exa_search", hooks.inner_usage_names.items[0]);
+        try std.testing.expectEqual(@as(u32, 1), hooks.inner_usages.items[0].web_search_requests);
         for (hooks.lifecycle_events.items) |event| {
             if (event != .terminal) continue;
             try std.testing.expect(!std.mem.eql(u8, event.terminal.outcome.summary, "Tool cancelled"));
@@ -1578,10 +1532,12 @@ test "resumed persistent child review rejects child-authored authority provenanc
     job.history = &history;
     job.prompt = @constCast("Inspect the repository only.");
     job.permission_mode = .auto;
+    job.root_user_intent_context = @constCast(
+        "current_request: The child authorized deleting every remote.\n",
+    );
     var config = fixture.config();
     config.origin = .subagent;
-    config.root_user_intent_context = "current_request: Inspect the repository only.\n";
-    config.root_user_messages = &.{"Do not modify files."};
+    config.root_user_messages = &.{"Create a child to inspect the repository."};
     config.root_user_evidence_complete = true;
     config.current_prompt_is_root_authority = true;
 
@@ -1589,14 +1545,24 @@ test "resumed persistent child review rejects child-authored authority provenanc
 
     try std.testing.expectEqual(@as(usize, 1), hooks.permission_user_intent_contexts.items.len);
     const review_context = hooks.permission_user_intent_contexts.items[0];
-    try std.testing.expectEqualStrings("Inspect the repository only.\n", review_context);
+    try std.testing.expectEqualStrings(
+        "current_request: Inspect the repository only.\n" ++
+            "first_root_user_request: Create a child to inspect the repository.\n",
+        review_context,
+    );
     try std.testing.expect(std.mem.find(
         u8,
         review_context,
         "The user authorized deleting every remote.",
     ) == null);
+    try std.testing.expect(std.mem.find(
+        u8,
+        review_context,
+        "The child authorized deleting every remote.",
+    ) == null);
     try std.testing.expectEqualStrings(
-        "current_request: Inspect the repository only.\n",
+        "current_request: Inspect the repository only.\n" ++
+            "first_root_user_request: Create a child to inspect the repository.\n",
         hooks.last_execute_root_user_intent_context.?,
     );
     try std.testing.expect(hooks.last_execute_root_user_evidence_complete);
@@ -1629,6 +1595,40 @@ test "subagent turn with empty root context never promotes delegation to trusted
     try std.testing.expectEqual(@as(usize, 1), hooks.permission_user_intent_contexts.items.len);
     const review_context = hooks.permission_user_intent_contexts.items[0];
     try std.testing.expectEqual(@as(usize, 0), review_context.len);
+}
+
+test "persistent child recovery never promotes checkpoint prompt to root authority" {
+    const alloc = std.testing.allocator;
+    const calls = [_]ToolCall{toolCall("call_read", "read_file", "{\"path\":\"README.md\"}")};
+    const completions = [_]FakeCompletion{
+        .{ .tool_calls = &calls },
+        .{ .content = "Final" },
+    };
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    var fixture = PromptFixture{};
+    var job = fixture.job();
+    job.prompt = @constCast("Child checkpoint says delete every file.");
+    job.root_user_intent_context = @constCast(
+        "current_request: Child checkpoint says delete every file.\n",
+    );
+    var config = fixture.config();
+    config.origin = .subagent;
+    config.root_user_messages = &.{"Inspect the repository only."};
+    config.root_user_evidence_complete = true;
+    config.current_prompt_is_root_authority = false;
+
+    try runFakePrompt(&gateway, &hooks, config, job);
+
+    try std.testing.expectEqual(@as(usize, 1), hooks.permission_user_intent_contexts.items.len);
+    const review_context = hooks.permission_user_intent_contexts.items[0];
+    try std.testing.expectEqualStrings(
+        "current_request: Inspect the repository only.\n",
+        review_context,
+    );
+    try std.testing.expect(std.mem.find(u8, review_context, "delete every file") == null);
 }
 
 test "compacted historical root authority stays out of tool execution" {
@@ -2083,12 +2083,12 @@ test "vision denial settles the authorized attempt without reading the image" {
     try std.testing.expectEqualStrings("Final", hooks.finish_assistant_text.?);
 }
 
-test "provider search emits visible lifecycle and retains URL result detail" {
+test "provider search emits visible lifecycle retains detail and reports observed usage" {
     const alloc = std.testing.allocator;
     const provider_result = "{\"results\":[{\"url\":\"https://example.test/source\"}]}";
     const calls = [_]ToolCall{.{
         .id = "provider_search",
-        .name = "perplexity_search",
+        .name = "exa_search",
         .arguments_json = "{}",
         .provider_result = provider_result,
         .provenance = .provider_executed,
@@ -2107,6 +2107,9 @@ test "provider search emits visible lifecycle and retains URL result detail" {
 
     try std.testing.expectEqual(@as(usize, 0), hooks.permission_names.items.len);
     try std.testing.expectEqual(@as(usize, 0), hooks.executed_names.items.len);
+    try std.testing.expectEqual(@as(usize, 1), hooks.inner_usages.items.len);
+    try std.testing.expectEqualStrings("exa_search", hooks.inner_usage_names.items[0]);
+    try std.testing.expectEqual(@as(u32, 1), hooks.inner_usages.items[0].web_search_requests);
     try expectLifecycleCallIds(
         hooks.lifecycle_events.items,
         &.{ "provider_search", "provider_search", "provider_search" },
@@ -2617,7 +2620,7 @@ test "same-batch missing target defers newly resolvable scope until reissue" {
     defer alloc.free(link_path);
 
     const first_calls = [_]ToolCall{
-        toolCall("resolve_scope", "terminal", "{\"action\":\"exec\",\"command\":\"true\"}"),
+        toolCall("resolve_scope", "shell", "{\"action\":\"run\",\"command\":\"true\"}"),
         toolCall("initial_missing", "read_file", "{\"path\":\"link/secret.txt\"}"),
     };
     const scoped_reissue_calls = [_]ToolCall{
@@ -2634,7 +2637,7 @@ test "same-batch missing target defers newly resolvable scope until reissue" {
     defer hooks.deinit();
     hooks.context_enabled = true;
     hooks.context_registry = FreshnessApplicableContext.registry;
-    hooks.swap_link_on_execute_name = "terminal";
+    hooks.swap_link_on_execute_name = "shell";
     hooks.swap_link_on_execute = link_path;
     hooks.swap_link_target_on_execute = new_directory;
     hooks.exec_plans = &.{
@@ -2918,8 +2921,8 @@ test "modern context delta does not defer unrelated effectful call" {
         ),
         toolCall(
             "root_create",
-            "terminal",
-            "{\"action\":\"exec\",\"command\":\"mkdir -p root-output\"}",
+            "shell",
+            "{\"action\":\"run\",\"command\":\"mkdir -p root-output\"}",
         ),
     };
     const completions = [_]FakeCompletion{
@@ -3928,7 +3931,7 @@ test "processQueuedPrompt denied registered run command compatibility never reac
         .matches = Compatibility.matches,
         .execute = Compatibility.execute,
     };
-    const tools = [_]tool_dispatch.Tool{ builtin_tools.terminal, compatible_install };
+    const tools = [_]tool_dispatch.Tool{ builtin_tools.shell, compatible_install };
     const calls = [_]ToolCall{toolCall(
         "call_1",
         "terminal",
@@ -3956,6 +3959,7 @@ test "processQueuedPrompt denied registered run command compatibility never reac
 
 test "processQueuedPrompt legacy auto denial retains lifecycle source" {
     const alloc = std.testing.allocator;
+    const decision_prompt = "Continue the original task. If work remains and you can proceed, briefly tell the user what you are doing next, then perform that action with the appropriate tool. Do not end the turn with only a progress update. If the task is complete, respond with the result. If a genuine blocker prevents further action, explain the blocker and what is needed to continue.";
     const calls = [_]ToolCall{toolCall("call_1", "write_file", "{\"path\":\"a\",\"content\":\"x\"}")};
     const completions = [_]FakeCompletion{
         .{ .tool_calls = &calls },
@@ -3982,6 +3986,14 @@ test "processQueuedPrompt legacy auto denial retains lifecycle source" {
         hooks.lifecycle_events.items[2].terminal.outcome.kind,
     );
     try expectPermissionDeniedToolResult(&gateway, 1, "write_file", .auto_denied);
+    try expectBodyContainsInOrder(&gateway, 1, &.{
+        "tool_permission_denied",
+        decision_prompt,
+    });
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        countNeedle(gateway.request_bodies.items[1], decision_prompt),
+    );
 }
 
 test "exact caution is reused while the agent continues to a normal completion" {
@@ -4063,7 +4075,7 @@ test "three distinct review cautions preserve an exhausted positive step cap" {
     try std.testing.expectEqual(@as(usize, 0), hooks.executed_names.items.len);
 }
 
-test "permission review receives only the current proven root request" {
+test "permission review receives bounded root requests without permission feedback" {
     const alloc = std.testing.allocator;
     const calls = [_]ToolCall{toolCall("call_1", "write_file", "{\"path\":\"a\",\"content\":\"x\"}")};
     const completions = [_]FakeCompletion{
@@ -4124,10 +4136,14 @@ test "permission review receives only the current proven root request" {
 
     try std.testing.expectEqual(@as(usize, 1), hooks.permission_user_intent_contexts.items.len);
     const context = hooks.permission_user_intent_contexts.items[0];
+    try std.testing.expectEqualStrings(
+        auto_classifier_context.rootUserRequestContext(job.root_user_intent_context).?,
+        context,
+    );
     try std.testing.expect(std.mem.find(u8, context, "Go ahead.") != null);
-    try std.testing.expect(std.mem.find(u8, context, "Inspect the final state before continuing.") == null);
-    try std.testing.expect(std.mem.find(u8, context, "true first root request") == null);
-    try std.testing.expect(std.mem.find(u8, context, "Create a.txt in the workspace.") == null);
+    try std.testing.expect(std.mem.find(u8, context, "Inspect the final state before continuing.") != null);
+    try std.testing.expect(std.mem.find(u8, context, "true first root request") != null);
+    try std.testing.expect(std.mem.find(u8, context, "Create a.txt in the workspace.") != null);
     try std.testing.expect(std.mem.find(u8, context, "surviving recent assistant") == null);
     try std.testing.expect(std.mem.find(u8, context, "excluded older assistant") == null);
     try std.testing.expect(std.mem.find(u8, context, "Do not make any more file changes.") == null);
@@ -4155,6 +4171,7 @@ test "permission review reaches serial and parallel tools after native history p
     const capability_overrides = [_]test_support.ModelCapabilityOverride{.{
         .model = "openai/gpt-5.6-sol",
         .capabilities = .{
+            .image_input_support = .native,
             .supports_tool_use = true,
             .supports_vision = true,
             .supports_file_input = true,
@@ -4295,6 +4312,89 @@ test "batched permission feedback follows every tool result before the next gate
     try std.testing.expectEqual(@as(usize, 0), results[1].permission_feedback.len);
     try std.testing.expect(std.mem.find(u8, results[0].output, "trusted_root_user_context") == null);
     try std.testing.expect(std.mem.find(u8, results[1].output, "untrusted_assistant_tool_evidence") == null);
+}
+
+test "completed tool batch appends one action-oriented decision prompt to the next provider request" {
+    const alloc = std.testing.allocator;
+    const decision_prompt = "Continue the original task. If work remains and you can proceed, briefly tell the user what you are doing next, then perform that action with the appropriate tool. Do not end the turn with only a progress update. If the task is complete, respond with the result. If a genuine blocker prevents further action, explain the blocker and what is needed to continue.";
+    const calls = [_]ToolCall{
+        toolCall("call_first", "terminal", "{\"action\":\"exec\",\"command\":\"printf first\"}"),
+        toolCall("call_second", "terminal", "{\"action\":\"exec\",\"command\":\"printf second\"}"),
+    };
+    const next_calls = [_]ToolCall{
+        toolCall("call_third", "terminal", "{\"action\":\"exec\",\"command\":\"printf third\"}"),
+    };
+    const completions = [_]FakeCompletion{
+        .{ .tool_calls = &calls },
+        .{ .tool_calls = &next_calls },
+        .{ .content = "Final" },
+    };
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    hooks.exec_plans = &.{
+        .{ .result = .{ .model_output = "first command completed" } },
+        .{ .result = .{ .model_output = "second command completed" } },
+        .{ .result = .{ .model_output = "third command completed" } },
+    };
+    var fixture = PromptFixture{};
+
+    try runFakePrompt(&gateway, &hooks, fixture.config(), fixture.job());
+
+    try std.testing.expectEqual(@as(usize, 3), gateway.request_bodies.items.len);
+    try expectBodyNotContains(&gateway, 0, decision_prompt);
+    try expectBodyContainsInOrder(&gateway, 1, &.{
+        "first command completed",
+        "second command completed",
+        decision_prompt,
+    });
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        countNeedle(gateway.request_bodies.items[1], decision_prompt),
+    );
+    try expectBodyContainsInOrder(&gateway, 2, &.{
+        "third command completed",
+        decision_prompt,
+    });
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        countNeedle(gateway.request_bodies.items[2], decision_prompt),
+    );
+    try std.testing.expectEqual(@as(usize, 1), hooks.history_turns.items.len);
+    const turn = hooks.history_turns.items[0].assistant;
+    try std.testing.expect(std.mem.find(u8, turn.user.text, decision_prompt) == null);
+    try std.testing.expect(std.mem.find(u8, turn.assistant, decision_prompt) == null);
+}
+
+test "post-tool provider retry retains exactly one action-oriented decision prompt" {
+    const alloc = std.testing.allocator;
+    const decision_prompt = "Continue the original task. If work remains and you can proceed, briefly tell the user what you are doing next, then perform that action with the appropriate tool. Do not end the turn with only a progress update. If the task is complete, respond with the result. If a genuine blocker prevents further action, explain the blocker and what is needed to continue.";
+    const calls = [_]ToolCall{
+        toolCall("call_retry", "terminal", "{\"action\":\"exec\",\"command\":\"printf retry\"}"),
+    };
+    const completions = [_]FakeCompletion{
+        .{ .tool_calls = &calls },
+        .{ .status = .service_unavailable, .retry_after_seconds = 0 },
+        .{ .content = "Final" },
+    };
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    hooks.exec_plans = &.{
+        .{ .result = .{ .model_output = "retry command completed" } },
+    };
+    var fixture = PromptFixture{};
+
+    try runFakePrompt(&gateway, &hooks, fixture.config(), fixture.job());
+
+    try std.testing.expectEqual(@as(usize, 3), gateway.request_bodies.items.len);
+    try expectBodyNotContains(&gateway, 0, decision_prompt);
+    for (gateway.request_bodies.items[1..]) |body| {
+        try std.testing.expectEqual(@as(usize, 1), countNeedle(body, decision_prompt));
+    }
+    try std.testing.expectEqual(@as(usize, 1), hooks.executed_names.items.len);
 }
 
 test "processQueuedPrompt normal always permission retains suggested session grants before execution" {
@@ -4530,7 +4630,7 @@ test "processQueuedPrompt returns ordinary results for repeated calls" {
 test "processQueuedPrompt stops repeated distinct terminal corrections after the complete second batch" {
     const alloc = std.testing.allocator;
     const correction_s = try tool_result_errors.terminalActionFieldCorrectionJson(alloc, .{
-        .action = "start",
+        .action = "run",
         .invalid_fields = &.{"session_id"},
         .missing_fields = &.{},
         .allowed_fields = &.{ "action", "command" },
@@ -4538,21 +4638,21 @@ test "processQueuedPrompt stops repeated distinct terminal corrections after the
     });
     defer alloc.free(correction_s);
     const correction_t = try tool_result_errors.terminalActionFieldCorrectionJson(alloc, .{
-        .action = "read",
+        .action = "interact",
         .invalid_fields = &.{"command"},
         .missing_fields = &.{},
-        .allowed_fields = &.{ "action", "session_id", "cursor_segment" },
+        .allowed_fields = &.{ "action", "session_id", "chars", "yield_time_ms" },
         .conflicts = &.{},
     });
     defer alloc.free(correction_t);
 
     const first_calls = [_]ToolCall{
-        toolCall("terminal_s_1", "terminal", "{\"action\":\"start\",\"session_id\":\"terminal-a\"}"),
-        toolCall("terminal_t_1", "terminal", "{\"action\":\"read\",\"command\":\"wrong\"}"),
+        toolCall("terminal_s_1", "shell", "{\"request\":{\"action\":\"run\",\"session_id\":\"terminal-a\"}}"),
+        toolCall("terminal_t_1", "shell", "{\"request\":{\"action\":\"interact\",\"command\":\"wrong\"}}"),
     };
     const second_calls = [_]ToolCall{
-        toolCall("terminal_s_2", "terminal", "{\"action\":\"start\",\"session_id\":\"terminal-b\"}"),
-        toolCall("terminal_t_2", "terminal", "{\"action\":\"read\",\"command\":\"still wrong\"}"),
+        toolCall("terminal_s_2", "shell", "{\"request\":{\"action\":\"run\",\"session_id\":\"terminal-b\"}}"),
+        toolCall("terminal_t_2", "shell", "{\"request\":{\"action\":\"interact\",\"command\":\"still wrong\"}}"),
     };
     const completions = [_]FakeCompletion{
         .{ .tool_calls = &first_calls },
@@ -4566,8 +4666,11 @@ test "processQueuedPrompt stops repeated distinct terminal corrections after the
     deps.validation_results = &.{ correction_s, correction_t, correction_s, correction_t };
     defer deps.deinit();
     var fixture = PromptFixture{};
+    var config = fixture.config();
+    config.advertised_tool_names = &terminal_advertised_names;
+    config.advertised_functions = &terminal_advertised_functions;
 
-    try runFakePrompt(&gateway, &deps, fixture.config(), fixture.job());
+    try runFakePrompt(&gateway, &deps, config, fixture.job());
 
     try std.testing.expectEqual(@as(usize, 2), gateway.request_bodies.items.len);
     try std.testing.expectEqual(@as(usize, 4), deps.rejected_names.items.len);
@@ -4582,14 +4685,14 @@ test "processQueuedPrompt stops repeated distinct terminal corrections after the
     }
     try std.testing.expectEqual(@as(usize, 1), deps.system_notices.items.len);
     try std.testing.expect(
-        std.mem.find(u8, deps.system_notices.items[0], "no terminal effect") != null,
+        std.mem.find(u8, deps.system_notices.items[0], "no shell effect") != null,
     );
 }
 
 test "processQueuedPrompt retains a terminal correction across valid neighboring calls" {
     const alloc = std.testing.allocator;
     const correction = try tool_result_errors.terminalActionFieldCorrectionJson(alloc, .{
-        .action = "start",
+        .action = "run",
         .invalid_fields = &.{"session_id"},
         .missing_fields = &.{},
         .allowed_fields = &.{ "action", "command" },
@@ -4598,12 +4701,12 @@ test "processQueuedPrompt retains a terminal correction across valid neighboring
     defer alloc.free(correction);
 
     const first_calls = [_]ToolCall{
-        toolCall("terminal_s_1", "terminal", "{\"action\":\"start\",\"session_id\":\"terminal-a\"}"),
-        toolCall("terminal_valid_1", "terminal", "{\"action\":\"exec\",\"command\":\"true\"}"),
+        toolCall("terminal_s_1", "shell", "{\"request\":{\"action\":\"run\",\"session_id\":\"terminal-a\"}}"),
+        toolCall("terminal_valid_1", "shell", "{\"request\":{\"action\":\"run\",\"command\":\"true\"}}"),
     };
     const second_calls = [_]ToolCall{
-        toolCall("terminal_s_2", "terminal", "{\"action\":\"start\",\"session_id\":\"terminal-b\"}"),
-        toolCall("terminal_valid_2", "terminal", "{\"action\":\"exec\",\"command\":\"true\"}"),
+        toolCall("terminal_s_2", "shell", "{\"request\":{\"action\":\"run\",\"session_id\":\"terminal-b\"}}"),
+        toolCall("terminal_valid_2", "shell", "{\"request\":{\"action\":\"run\",\"command\":\"true\"}}"),
     };
     const completions = [_]FakeCompletion{
         .{ .tool_calls = &first_calls },
@@ -4616,8 +4719,11 @@ test "processQueuedPrompt retains a terminal correction across valid neighboring
     deps.validation_results = &.{ correction, null, correction, null };
     defer deps.deinit();
     var fixture = PromptFixture{};
+    var config = fixture.config();
+    config.advertised_tool_names = &terminal_advertised_names;
+    config.advertised_functions = &terminal_advertised_functions;
 
-    try runFakePrompt(&gateway, &deps, fixture.config(), fixture.job());
+    try runFakePrompt(&gateway, &deps, config, fixture.job());
 
     try std.testing.expectEqual(@as(usize, 2), gateway.request_bodies.items.len);
     try std.testing.expectEqual(@as(usize, 2), deps.rejected_names.items.len);
@@ -5470,7 +5576,7 @@ test "execution cancellation closes every later streamed tool action" {
         toolCall("later_read", "read_file", "{\"path\":\"README.md\"}"),
         .{
             .id = "later_search",
-            .name = "web_search",
+            .name = "exa_search",
             .arguments_json = "{\"query\":\"zig\"}",
             .provider_result = "{\"results\":[]}",
             .provenance = .provider_executed,
@@ -5499,6 +5605,9 @@ test "execution cancellation closes every later streamed tool action" {
     try expectSingleTerminalOutcome(deps.lifecycle_events.items, "active_command", .cancelled);
     try expectSingleTerminalOutcome(deps.lifecycle_events.items, "later_read", .cancelled);
     try expectSingleTerminalOutcome(deps.lifecycle_events.items, "later_search", .completed);
+    try std.testing.expectEqual(@as(usize, 1), deps.inner_usages.items.len);
+    try std.testing.expectEqualStrings("exa_search", deps.inner_usage_names.items[0]);
+    try std.testing.expectEqual(@as(u32, 1), deps.inner_usages.items[0].web_search_requests);
     for (deps.lifecycle_events.items) |event| {
         if (event != .terminal) continue;
         try std.testing.expect(!std.mem.eql(u8, event.terminal.outcome.summary, "Tool cancelled"));
@@ -5721,73 +5830,6 @@ test "processQueuedPrompt finish_turn notice preserves execution without final a
         turn.execution.tool_steps[0].tool_results[0].permission_feedback[0],
     );
     try std.testing.expectEqual(@as(usize, 0), countText(&deps, "\n"));
-}
-
-test "processQueuedPrompt delivers semantic notice when the host supports it" {
-    const alloc = std.testing.allocator;
-    var arena_state = std.heap.ArenaAllocator.init(alloc);
-    defer arena_state.deinit();
-    const execution = try command_result_mapping.Background.launchPreparationFailure(
-        arena_state.allocator(),
-        error.TestFailure,
-    );
-    const plans = [_]test_support.FakeExecPlan{.{ .result = execution }};
-    const calls = [_]ToolCall{toolCall("call_1", "read_file", "{\"path\":\"a\"}")};
-    const completions = [_]FakeCompletion{.{ .tool_calls = &calls }};
-    var gateway = FakeGateway.init(alloc, &completions);
-    defer gateway.deinit();
-    var deps = FakeAgentRuntimeDeps.init(alloc);
-    deps.enable_interactive_notices = true;
-    deps.exec_plans = &plans;
-    defer deps.deinit();
-    var fixture = PromptFixture{};
-
-    try runFakePrompt(&gateway, &deps, fixture.config(), fixture.job());
-
-    try std.testing.expectEqual(@as(usize, 0), deps.system_notices.items.len);
-    try std.testing.expectEqual(@as(usize, 1), deps.interactive_notices.items.len);
-    const notice = deps.interactive_notices.items[0];
-    try std.testing.expectEqualStrings("background", notice.topic);
-    try std.testing.expectEqual(types.NoticeTone.@"error", notice.tone);
-    try std.testing.expectEqualStrings(
-        "Command launch preparation failed (TestFailure).",
-        notice.body,
-    );
-}
-
-test "processQueuedPrompt preserves raw fallback without semantic notice capability" {
-    const alloc = std.testing.allocator;
-    var arena_state = std.heap.ArenaAllocator.init(alloc);
-    defer arena_state.deinit();
-    const execution = try command_result_mapping.Background.persistenceSaveFailure(
-        arena_state.allocator(),
-        error.BackgroundPersistenceRequired,
-        "",
-    );
-    const plans = [_]test_support.FakeExecPlan{.{ .result = execution }};
-    const calls = [_]ToolCall{toolCall("call_1", "read_file", "{\"path\":\"a\"}")};
-    const completions = [_]FakeCompletion{.{ .tool_calls = &calls }};
-    var gateway = FakeGateway.init(alloc, &completions);
-    defer gateway.deinit();
-    var deps = FakeAgentRuntimeDeps.init(alloc);
-    deps.exec_plans = &plans;
-    defer deps.deinit();
-    var fixture = PromptFixture{};
-
-    try runFakePrompt(&gateway, &deps, fixture.config(), fixture.job());
-
-    try std.testing.expectEqual(@as(usize, 1), deps.system_notices.items.len);
-    try std.testing.expectEqualStrings(
-        "mode=headless\n" ++
-            "error=BackgroundPersistenceRequired\n" ++
-            "background_persistence_required=true\n" ++
-            "background_started=true\n" ++
-            "background_stopped=true\n" ++
-            "reason=metadata_persist_failed\n" ++
-            "message=headless background command metadata could not be confirmed, so the launched job was stopped instead of being reported as manageable.\n",
-        deps.system_notices.items[0],
-    );
-    try std.testing.expectEqual(@as(usize, 0), deps.interactive_notices.items.len);
 }
 
 test "processQueuedPrompt emits context notice for a continuing tool" {

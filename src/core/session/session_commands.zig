@@ -723,7 +723,11 @@ pub fn Commands(comptime App: type) type {
             if (persist) {
                 try persistPreferenceTargets(
                     app,
-                    .{ .fast_mode = app.fast_mode },
+                    .{
+                        .provider = provider_runtime.provider(app),
+                        .model = provider_runtime.model(app),
+                        .fast_mode = app.fast_mode,
+                    },
                     "fast",
                     !announce,
                 );
@@ -767,19 +771,15 @@ pub fn Commands(comptime App: type) type {
                 .model = model,
             };
             const capabilities = model_capabilities.resolveForApp(App, app, model);
-            if (capabilities.reasoning_efforts.len == 0) {
-                if (capabilities.supports_fast_mode) {
-                    try applyFastMode(app, fast_mode, false, false);
-                    patch.fast_mode = fast_mode;
-                }
-            } else {
+            if (capabilities.reasoning_efforts.len > 0) {
                 try applyEffort(app, effort, false, false);
                 patch.effort = effort;
-                if (capabilities.supports_fast_mode) {
-                    try applyFastMode(app, fast_mode, false, false);
-                    patch.fast_mode = fast_mode;
-                }
             }
+            const selected_fast_mode = capabilities.supports_fast_mode and fast_mode;
+            if (selected_fast_mode != app.fast_mode) {
+                try applyFastMode(app, selected_fast_mode, false, false);
+            }
+            patch.fast_mode = selected_fast_mode;
             try persistPreferenceTargets(app, patch, "model picker", false);
         }
 
@@ -1035,12 +1035,17 @@ pub fn Commands(comptime App: type) type {
         }
 
         fn setResolvedModel(app: *App, resolved: []const u8, announce: bool) !void {
+            const model_changed = !std.mem.eql(u8, provider_runtime.model(app), resolved);
             try setResolvedModelRuntime(app, resolved, announce);
+            if (model_changed and app.fast_mode) {
+                try applyFastMode(app, false, false, false);
+            }
             try persistPreferenceTargets(
                 app,
                 .{
                     .provider = provider_runtime.provider(app),
                     .model = resolved,
+                    .fast_mode = app.fast_mode,
                 },
                 "model",
                 !announce,
@@ -1243,7 +1248,6 @@ fn isKnownAllowlistTool(tool_registry: tool_dispatch.Registry, name: []const u8)
         "glob",
         "grep",
         "skill",
-        "memory",
         permissions.web_search_permission,
     };
     for (categories) |category| {
@@ -2615,27 +2619,28 @@ test "session_commands handleAllowlist recognizes tools from the active registry
     defer home.deinit();
 
     const provider_tool = blk: {
-        var tool = builtin_tools.memory;
-        tool.name = "provider_memory";
+        var tool = builtin_tools.read_file;
+        tool.name = "provider_custom";
         break :blk tool;
     };
     var app = try FakeApp.init(std.testing.allocator, workspace_root, "test-model");
     defer app.deinit();
     app.tool_registry = .{ .tools = &.{provider_tool} };
 
-    try Commands(FakeApp).handleAllowlist(&app, "add tool provider_memory");
-    try expectTranscriptContains(&app, "● Allowlist: added tool provider_memory: \"*\"");
+    try Commands(FakeApp).handleAllowlist(&app, "add tool provider_custom");
+    try expectTranscriptContains(&app, "● Allowlist: added tool provider_custom: \"*\"");
 
     var settings = try config_runtime.loadMergedSettings(std.testing.allocator, workspace_root);
     defer settings.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(usize, 1), settings.permission_rules.rules.len);
-    try expectRule(settings.permission_rules.rules[0], "provider_memory", "*", .allow);
+    try expectRule(settings.permission_rules.rules[0], "provider_custom", "*", .allow);
 
     app.tool_registry = .{};
     app.clearTranscript();
-    try Commands(FakeApp).handleAllowlist(&app, "remove tool provider_memory");
+    try Commands(FakeApp).handleAllowlist(&app, "remove tool provider_custom");
     try expectTranscriptContains(&app, "usage: /allowlist remove [command|tool|url|web-fetch-domain] <pattern>");
     try std.testing.expect(parseAllowlistTarget(.{}, "tool read") != null);
+    try std.testing.expect(parseAllowlistTarget(.{}, "tool memory") == null);
 }
 
 test "session_commands toggleFast reports unsupported model and redraws footer" {
@@ -2768,7 +2773,29 @@ test "session_commands selectModelFromPicker persists portable Gateway reasoning
     try std.testing.expectEqual(@as(?types.ReasoningEffort, types.ReasoningEffort.literal("low")), app.worker.synced_effort);
     try std.testing.expectEqual(@as(usize, 1), app.worker.effort_sync_count);
     try std.testing.expectEqual(types.ReasoningEffort.literal("low"), app.last_preference_effort.?);
-    try std.testing.expect(app.last_preference_fast_mode == null);
+    try std.testing.expectEqual(false, app.last_preference_fast_mode.?);
+}
+
+test "session_commands model selection clears fast mode when the selected model has no fast control" {
+    const alloc = std.testing.allocator;
+    var app = try FakeApp.init(alloc, "/tmp/workspace", "anthropic/claude-opus-4.6");
+    defer app.deinit();
+    app.fast_mode = true;
+    app.worker.synced_fast_mode = true;
+    const efforts = [_]types.ReasoningEffort{types.ReasoningEffort.literal("max")};
+    app.setGatewayControls("zai/glm-5.3", &efforts, false);
+
+    try Commands(FakeApp).selectModelFromPicker(
+        &app,
+        "zai/glm-5.3",
+        types.ReasoningEffort.literal("max"),
+        true,
+    );
+
+    try std.testing.expectEqualStrings("zai/glm-5.3", app.selected_model.items);
+    try std.testing.expect(!app.fast_mode);
+    try std.testing.expectEqual(@as(?bool, false), app.worker.synced_fast_mode);
+    try std.testing.expectEqual(false, app.last_preference_fast_mode.?);
 }
 
 test "session_commands selectModelFromPicker syncs queued fast mode and effort for supported models" {
@@ -3057,7 +3084,7 @@ test "session_commands no-op model still attempts its durable targets" {
     );
 }
 
-test "session_commands model controls remain catalog validated" {
+test "session_commands model controls remain catalog validated and clear unsupported fast state" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -3078,9 +3105,9 @@ test "session_commands model controls remain catalog validated" {
 
     try Commands(FakeApp).selectModelFromPicker(&app, "openai/gpt-4o", types.ReasoningEffort.literal("low"), false);
 
-    try std.testing.expect(app.fast_mode);
-    try std.testing.expectEqual(@as(usize, 0), app.worker.fast_sync_count);
-    try std.testing.expectEqual(@as(?bool, true), app.worker.synced_fast_mode);
+    try std.testing.expect(!app.fast_mode);
+    try std.testing.expectEqual(@as(usize, 1), app.worker.fast_sync_count);
+    try std.testing.expectEqual(@as(?bool, false), app.worker.synced_fast_mode);
     const unsupported_options = model_capabilities.resolveProviderOptionsForCapabilities(
         app.resolvedModelCapabilities(app.selected_model.items),
         app.effort,
@@ -3099,7 +3126,7 @@ test "session_commands model controls remain catalog validated" {
     try Commands(FakeApp).selectModelFromPicker(&app, "anthropic/claude-opus-4.6", types.ReasoningEffort.literal("high"), true);
 
     try std.testing.expectEqual(@as(?bool, true), app.worker.synced_fast_mode);
-    try std.testing.expectEqual(@as(usize, 1), app.worker.fast_sync_count);
+    try std.testing.expectEqual(@as(usize, 2), app.worker.fast_sync_count);
     const supported_options = model_capabilities.resolveProviderOptionsForCapabilities(
         app.resolvedModelCapabilities(app.selected_model.items),
         app.effort,

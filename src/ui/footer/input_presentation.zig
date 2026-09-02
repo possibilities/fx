@@ -243,17 +243,21 @@ pub fn cappedInputRows(total_rows: usize, content_bottom: u16, input_visible: bo
     };
 }
 
-fn slashCompletionPickerActive(ctx: RenderContext, modal_active: bool, show_model_query: bool, show_file_query: bool) bool {
-    if (ctx.input.picker.isInlinePickerDismissed(.slash) or modal_active or show_model_query or show_file_query) return false;
-    if (ctx.input.picker.inlinePickerTriggerKind(&ctx.input.edit_state) != .slash) return false;
+pub fn slashCompletionPickerPrefix(ctx: RenderContext, modal_active: bool, show_model_query: bool, show_file_query: bool) ?[]const u8 {
+    if (ctx.input.picker.isInlinePickerSuppressed(.slash) or modal_active or show_model_query or show_file_query) return null;
+    if (ctx.input.picker.inlinePickerTriggerKind(&ctx.input.edit_state) != .slash) return null;
     // Mid-turn model-shaped input owns the footer slot even while the model list is hidden.
-    if (ctx.stream.active and ctx.input.picker.isModelShapedInput(&ctx.input.edit_state)) return false;
-    return slashInputPrefix(ctx.slash_registry, ctx.input.edit_state.input.items).len > 0;
+    if (ctx.stream.active and ctx.input.picker.isModelShapedInput(&ctx.input.edit_state)) return null;
+    const prefix = slashInputPrefix(ctx.slash_registry, ctx.input.edit_state.input.items);
+    return if (prefix.len > 0) prefix else null;
+}
+
+fn slashCompletionPickerActive(ctx: RenderContext, modal_active: bool, show_model_query: bool, show_file_query: bool) bool {
+    return slashCompletionPickerPrefix(ctx, modal_active, show_model_query, show_file_query) != null;
 }
 
 pub fn slashCompletionPickerCount(ctx: RenderContext, modal_active: bool, show_model_query: bool, show_file_query: bool) usize {
-    if (!slashCompletionPickerActive(ctx, modal_active, show_model_query, show_file_query)) return 0;
-    const prefix = slashInputPrefix(ctx.slash_registry, ctx.input.edit_state.input.items);
+    const prefix = slashCompletionPickerPrefix(ctx, modal_active, show_model_query, show_file_query) orelse return 0;
     return picker_presentation.mixedSlashCompletionCount(ctx.slash_registry, prefix, ctx.skills_menu.items);
 }
 
@@ -272,6 +276,28 @@ pub fn measureRawInputGeometry(
     modal_active: bool,
     show_model_query: bool,
     show_file_query: bool,
+) RawInputGeometry {
+    return measureRawInputGeometryPrepared(
+        ctx,
+        terminal_cols,
+        content_bottom,
+        input_visible,
+        modal_active,
+        show_model_query,
+        show_file_query,
+        null,
+    );
+}
+
+pub fn measureRawInputGeometryPrepared(
+    ctx: RenderContext,
+    terminal_cols: u16,
+    content_bottom: u16,
+    input_visible: bool,
+    modal_active: bool,
+    show_model_query: bool,
+    show_file_query: bool,
+    prepared_slash_completion_count: ?usize,
 ) RawInputGeometry {
     const display_input: []const u8 = if (ctx.queued_editor_active) "" else ctx.input.edit_state.input.items;
     const display_cursor: usize = if (ctx.queued_editor_active) 0 else ctx.input.edit_state.cursor;
@@ -300,11 +326,13 @@ pub fn measureRawInputGeometry(
     }, raw_anchor);
     const capped = cappedInputRows(summary.total_rows, content_bottom, input_visible);
     const window = visual_layout.visibleWindow(summary.cursor.row_index, summary.total_rows, capped.row_limit);
-    const show_slash_query = slashCompletionPickerActive(ctx, modal_active, show_model_query, show_file_query);
-    const slash_completion_count = if (show_slash_query)
-        slashCompletionPickerCount(ctx, modal_active, show_model_query, show_file_query)
+    const slash_query_active = slashCompletionPickerActive(ctx, modal_active, show_model_query, show_file_query);
+    const slash_completion_count = if (slash_query_active)
+        prepared_slash_completion_count orelse
+            slashCompletionPickerCount(ctx, modal_active, show_model_query, show_file_query)
     else
         0;
+    const show_slash_query = slash_query_active and slash_completion_count > 0;
     const picker_start_col = if (show_model_query or show_file_query or show_slash_query)
         visual_layout.projectedAnchorColumn(summary, terminal_cols)
     else
@@ -404,7 +432,6 @@ pub fn composeHintRow(
     else
         null;
     var hint_buf: [max_status_line_len]u8 = undefined;
-    var hint_with_subagents_buf: [max_status_line_len + 128]u8 = undefined;
     const base_hint_line = ui_render.buildHintLine(
         ctx.stream.active,
         approval_active,
@@ -413,8 +440,7 @@ pub fn composeHintRow(
         ctx.permission_mode,
         ctx.queued_count,
         active_label,
-        ctx.fast_mode,
-        ctx.model_supports_fast,
+        ctx.fast_indicator_active,
         ctx.effort,
         ctx.model_supports_effort,
         ctx.statusline,
@@ -427,24 +453,6 @@ pub fn composeHintRow(
         "press ctrl+c again to exit"
     else if (auth_hint) |hint|
         hint
-    else if (ctx.selected_subagent_label) |label|
-        if (ctx.selected_subagent_status) |status|
-            std.fmt.bufPrint(
-                &hint_with_subagents_buf,
-                "{s} · {s} · {s}",
-                .{
-                    label,
-                    switch (status) {
-                        .awaiting_approval => "approval",
-                        else => @tagName(status),
-                    },
-                    base_hint_line,
-                },
-            ) catch base_hint_line
-        else
-            base_hint_line
-    else if (ctx.subagent_view_active)
-        std.fmt.bufPrint(&hint_with_subagents_buf, "Subagent manager · tracked {d} · ctrl+x exit", .{ctx.subagent_count}) catch base_hint_line
     else
         base_hint_line;
 
@@ -1006,31 +1014,6 @@ fn appendLayoutUnitContent(
             }
             try row.appendSlice(alloc, ui_render.tag_style);
             try row_text.appendClipped(alloc, row, token.name, @intCast(@min(emit_cells, std.math.maxInt(u16))));
-            if (visual_layout.skillTokenSourceLabel(token)) |source_label| {
-                const emitted_name_cells = @min(display_width.visibleWidth(token.name), emit_cells);
-                const label_cells = emit_cells - emitted_name_cells;
-                if (label_cells > 0) {
-                    try row_text.appendClipped(
-                        alloc,
-                        row,
-                        visual_layout.skill_source_separator,
-                        @intCast(@min(label_cells, std.math.maxInt(u16))),
-                    );
-                    const emitted_separator_cells = @min(
-                        display_width.visibleWidth(visual_layout.skill_source_separator),
-                        label_cells,
-                    );
-                    const source_cells = label_cells - emitted_separator_cells;
-                    if (source_cells > 0) {
-                        try row_text.appendClipped(
-                            alloc,
-                            row,
-                            source_label,
-                            @intCast(@min(source_cells, std.math.maxInt(u16))),
-                        );
-                    }
-                }
-            }
             try row.appendSlice(alloc, ui_render.reset_style);
             remaining_cells.* -= emit_cells;
             omitted_positive_unit.* = unit.cell_width > emit_cells;
@@ -1068,11 +1051,6 @@ fn testRenderContext(input: *const InputRuntime) RenderContext {
         .has_api_key = true,
         .model = "gpt-5.1",
         .queued_count = 0,
-        .subagent_count = 0,
-        .subagent_view_active = false,
-        .selected_subagent_id = null,
-        .selected_subagent_label = null,
-        .selected_subagent_status = null,
         .input = input,
     };
 }
@@ -1101,6 +1079,31 @@ test "composer badge labels a later-turn image with its own id" {
     try std.testing.expectEqual(@as(usize, 1), composed.rows.items.len);
     try std.testing.expect(std.mem.find(u8, composed.rows.items[0].items, "[Image 2]") != null);
     try std.testing.expect(std.mem.find(u8, composed.rows.items[0].items, "[Image 1]") == null);
+}
+
+test "composer skill token shows only its name" {
+    const alloc = std.testing.allocator;
+    const skill_tokens = [_]visual_layout.SkillTokenSpan{.{
+        .raw_start = 0,
+        .raw_end = "$review".len,
+        .name = "review",
+        .path = "/tmp/review",
+        .display_source = .workspace_codex,
+    }};
+    const source = visual_layout.Source{
+        .input = "$review",
+        .cursor = "$review".len,
+        .terminal_cols = 40,
+        .skill_tokens = &skill_tokens,
+    };
+    const summary = visual_layout.summarize(source, null);
+    const window = visual_layout.visibleWindow(summary.cursor.row_index, summary.total_rows, 1);
+    var composed = try composeVisibleInputRows(alloc, source, window);
+    defer composed.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 1), composed.rows.items.len);
+    try std.testing.expect(std.mem.find(u8, composed.rows.items[0].items, "review") != null);
+    try std.testing.expect(std.mem.find(u8, composed.rows.items[0].items, "workspace .codex") == null);
 }
 
 test "composeVisibleInputRows avoids clear-to-eol after full-width input" {
@@ -1438,15 +1441,31 @@ test "footer slash completion remains active across capped input rows" {
     try std.testing.expect(tiny_geometry.slash_completion_count > 0);
 }
 
-test "footer slash completion separates query activity from candidate count" {
+test "footer slash completion follows candidate visibility transitions" {
     const alloc = std.testing.allocator;
     var input = InputRuntime{};
     defer input.deinit(alloc);
 
-    try input.textReplacementState().replace(alloc, "/hezzzzz");
+    try input.textReplacementState().replace(alloc, "/mo");
+    const matching = measureRawInputGeometry(testRenderContext(&input), 80, 20, true, false, false, false);
+    try std.testing.expect(matching.show_slash_query);
+    try std.testing.expect(matching.slash_completion_count > 0);
+
+    try input.textReplacementState().replace(alloc, "/mozzzzz");
     const no_match = measureRawInputGeometry(testRenderContext(&input), 80, 20, true, false, false, false);
-    try std.testing.expect(no_match.show_slash_query);
+    try std.testing.expect(!no_match.show_slash_query);
     try std.testing.expectEqual(@as(usize, 0), no_match.slash_completion_count);
+
+    try input.textReplacementState().replace(alloc, "/mo");
+    const restored = measureRawInputGeometry(testRenderContext(&input), 80, 20, true, false, false, false);
+    try std.testing.expect(restored.show_slash_query);
+    try std.testing.expect(restored.slash_completion_count > 0);
+}
+
+test "footer slash completion preserves command argument ownership" {
+    const alloc = std.testing.allocator;
+    var input = InputRuntime{};
+    defer input.deinit(alloc);
 
     try input.textReplacementState().replace(alloc, "/resume ");
     const no_args = measureRawInputGeometry(testRenderContext(&input), 80, 20, true, false, false, false);
@@ -1546,13 +1565,7 @@ test "compose hint row keeps model in left hint text" {
         .has_api_key = true,
         .model = "gpt-5.1",
         .queued_count = 0,
-        .subagent_count = 0,
-        .subagent_view_active = false,
-        .selected_subagent_id = null,
-        .selected_subagent_label = null,
-        .selected_subagent_status = null,
-        .fast_mode = true,
-        .model_supports_fast = true,
+        .fast_indicator_active = true,
         .input = &input,
     };
 
@@ -1637,7 +1650,7 @@ test "compose hint row replaces model status with subscription sign-in controls"
     }
 }
 
-test "compose hint row uses dots in subagent view" {
+test "compose hint row keeps configured fast mode visible" {
     var input = InputRuntime{};
     defer input.deinit(std.testing.allocator);
 
@@ -1646,51 +1659,7 @@ test "compose hint row uses dots in subagent view" {
         .has_api_key = true,
         .model = "gpt-5.1",
         .queued_count = 0,
-        .subagent_count = 2,
-        .subagent_view_active = true,
-        .selected_subagent_id = null,
-        .selected_subagent_label = null,
-        .selected_subagent_status = null,
-        .input = &input,
-    };
-
-    var row = try composeHintRow(std.testing.allocator, false, null, ctx, 96);
-    defer row.deinit(std.testing.allocator);
-
-    try std.testing.expect(std.mem.find(u8, row.items, "Subagent manager · tracked 2 · ctrl+x exit") != null);
-    try std.testing.expect(std.mem.find(u8, row.items, " | ") == null);
-}
-
-test "compose hint row keeps active child identity ahead of model status" {
-    var input = InputRuntime{};
-    defer input.deinit(std.testing.allocator);
-    var ctx = testRenderContext(&input);
-    ctx.selected_subagent_label = "header-child";
-    ctx.selected_subagent_status = .awaiting_approval;
-
-    var row = try composeHintRow(std.testing.allocator, false, null, ctx, 64);
-    defer row.deinit(std.testing.allocator);
-
-    try std.testing.expect(std.mem.find(u8, row.items, "header-child · approval") != null);
-    try std.testing.expect(std.mem.find(u8, row.items, "gpt-5.1") != null);
-}
-
-test "compose hint row omits the inactive subagent manager marker" {
-    var input = InputRuntime{};
-    defer input.deinit(std.testing.allocator);
-
-    const ctx: RenderContext = .{
-        .stream = .{},
-        .has_api_key = true,
-        .model = "gpt-5.1",
-        .queued_count = 0,
-        .subagent_count = 2,
-        .subagent_view_active = false,
-        .selected_subagent_id = null,
-        .selected_subagent_label = null,
-        .selected_subagent_status = null,
-        .fast_mode = true,
-        .model_supports_fast = true,
+        .fast_indicator_active = true,
         .input = &input,
     };
 
@@ -1698,11 +1667,9 @@ test "compose hint row omits the inactive subagent manager marker" {
     defer row.deinit(std.testing.allocator);
 
     try std.testing.expect(std.mem.find(u8, row.items, "gpt-5.1 · ⚡︎") != null);
-    try std.testing.expect(std.mem.find(u8, row.items, "subagents 2") == null);
-    try std.testing.expect(std.mem.find(u8, row.items, "ctrl+x manager") == null);
 }
 
-test "compose hint row does not advertise background terminals or the manager shortcut" {
+test "compose hint row does not advertise background terminals" {
     var input = InputRuntime{};
     defer input.deinit(std.testing.allocator);
     var ctx = testRenderContext(&input);
@@ -1713,7 +1680,6 @@ test "compose hint row does not advertise background terminals or the manager sh
 
     try std.testing.expect(std.mem.find(u8, row.items, "gpt-5.1") != null);
     try std.testing.expect(std.mem.find(u8, row.items, "background (") == null);
-    try std.testing.expect(std.mem.find(u8, row.items, "ctrl+x manager") == null);
 }
 
 test "compose hint row right-aligns upgrade status" {
@@ -1725,11 +1691,6 @@ test "compose hint row right-aligns upgrade status" {
         .has_api_key = true,
         .model = "gpt-5.1",
         .queued_count = 0,
-        .subagent_count = 0,
-        .subagent_view_active = false,
-        .selected_subagent_id = null,
-        .selected_subagent_label = null,
-        .selected_subagent_status = null,
         .upgrade_status = "update ready: ctrl+g to reload",
         .statusline = .{
             .workspace_label = "/a/long/workspace/path/that/uses/the/statusline-tail",
@@ -1755,11 +1716,6 @@ test "compose hint row right-aligns upgrade status after styled auto mode" {
         .model = "openai/gpt-4o",
         .permission_mode = .auto,
         .queued_count = 0,
-        .subagent_count = 0,
-        .subagent_view_active = false,
-        .selected_subagent_id = null,
-        .selected_subagent_label = null,
-        .selected_subagent_status = null,
         .upgrade_status = "update ready: ctrl+g to reload",
         .input = &input,
     };

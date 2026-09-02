@@ -956,6 +956,31 @@ test "provider patch writes one bounded provider model collection" {
     try std.testing.expectEqual(model_provider.ProviderId.codex, model_provider.parse(root.object.get("provider").?.string).?);
 }
 
+test "model and fast patch binds the fast preference atomically" {
+    const alloc = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+
+    var root = try std.json.parseFromSliceLeaky(
+        std.json.Value,
+        arena.allocator(),
+        "{\"models\":{\"gateway\":\"provider/old\"},\"fast_mode\":true}",
+        .{},
+    );
+    _ = try applyUserPatchToRoot(arena.allocator(), &root, .{
+        .model_preference = .{ .provider = .gateway, .model = "provider/fast-toggle" },
+        .fast_mode = true,
+    });
+    const binding = root.object.get("fast_mode_model_bound");
+    try std.testing.expect(binding != null);
+    try std.testing.expect(binding.?.bool);
+
+    _ = try applyUserPatchToRoot(arena.allocator(), &root, .{
+        .model_preference = .{ .provider = .gateway, .model = "provider/default" },
+    });
+    try std.testing.expect(!root.object.contains("fast_mode_model_bound"));
+}
+
 fn applyMutationToRoot(
     arena: Allocator,
     root: *std.json.Value,
@@ -995,6 +1020,12 @@ fn applyUserPatchToRoot(
     if (patch.yolo_acknowledged) |value| application.changed = try putBool(arena, &root.object, "yolo_acknowledged", value) or application.changed;
     if (patch.effort) |value| application.changed = try putString(arena, &root.object, "effort", value.label()) or application.changed;
     if (patch.fast_mode) |value| application.changed = try putBool(arena, &root.object, "fast_mode", value) or application.changed;
+    if (patch.model_preference != null and patch.fast_mode != null) {
+        application.changed = try putBool(arena, &root.object, "fast_mode_model_bound", true) or application.changed;
+    } else if ((patch.model_preference != null or patch.fast_mode != null) and root.object.contains("fast_mode_model_bound")) {
+        _ = root.object.orderedRemove("fast_mode_model_bound");
+        application.changed = true;
+    }
     if (patch.slash_menu_categories) |value| application.changed = try putBool(arena, &root.object, "slash_menu_categories", value) or application.changed;
     if (patch.collapse_tool_calls) |value| application.changed = try putBool(arena, &root.object, "collapse_tool_calls", value) or application.changed;
     if (patch.update_channel) |value| application.changed = try putString(arena, &root.object, "update_channel", value.label()) or application.changed;
@@ -1115,6 +1146,12 @@ fn cleanupLegacyWorkspacePreferences(
             patch.fast_mode != null,
             application,
         );
+        if ((patch.model_preference != null or patch.fast_mode != null) and
+            entry.value_ptr.object.contains("fast_mode_model_bound"))
+        {
+            _ = entry.value_ptr.object.orderedRemove("fast_mode_model_bound");
+            application.legacy_fields_removed += 1;
+        }
         removeLegacyLeaf(
             &entry.value_ptr.object,
             "slash_menu_categories",
