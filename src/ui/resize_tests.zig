@@ -909,11 +909,6 @@ fn defaultFooterContext(input: *const InputRuntime) render_input.RenderContext {
         .has_api_key = true,
         .model = "test-model",
         .queued_count = 0,
-        .subagent_count = 0,
-        .subagent_view_active = false,
-        .selected_subagent_id = null,
-        .selected_subagent_label = null,
-        .selected_subagent_status = null,
         .input = input,
     };
 }
@@ -5947,7 +5942,7 @@ test "slash main page renders header categories selection range and contextual c
     try renderTestFooter(&h, &input, &approval, &h.frame_redraw);
     try h.flush();
 
-    try expectGridContains(&h, "Commands 36 · Type to filter");
+    try expectGridContains(&h, "Commands 35 · Type to filter");
     try expectGridContains(&h, "1–6");
     try expectGridContains(&h, "/help");
     try expectGridContains(&h, "General");
@@ -5968,7 +5963,7 @@ test "slash main page renders header categories selection range and contextual c
 
     try expectGridContains(&h, "ask");
     try expectGridContains(&h, "test-model");
-    try expectGridNotContains(&h, "Commands 36");
+    try expectGridNotContains(&h, "Commands 35");
     try expectGridNotContains(&h, "↑↓ Navigate");
 }
 
@@ -6243,7 +6238,7 @@ test "compact command completion keeps restored history footer stable" {
         .arguments_json = "{\"command\":\"sleep 5\"}",
     } });
     try std.testing.expect(try approval.syncRequest(alloc, .{
-        .label = "terminal.exec sleep 5",
+        .label = "shell.run sleep 5",
         .command = "sleep 5",
     }));
 
@@ -6308,7 +6303,7 @@ test "inline approval footer reflow replays displaced transcript history" {
     const idle_footer_base_rows = h.shell.footer_reserved_base_rows;
 
     try std.testing.expect(try approval.syncRequest(alloc, .{
-        .label = "terminal.exec printf approval-scrollback",
+        .label = "shell.run printf approval-scrollback",
         .command = "printf approval-scrollback",
     }));
     h.frame_redraw = true;
@@ -6481,7 +6476,7 @@ test "inline approval footer reflow preserves concurrent transcript progress" {
     const append_one = "APPROVAL_MIXED_APPEND_01";
     const append_two = "APPROVAL_MIXED_APPEND_02";
     try std.testing.expect(try approval.syncRequest(alloc, .{
-        .label = "terminal.exec printf approval-mixed",
+        .label = "shell.run printf approval-mixed",
         .command = "printf approval-mixed",
     }));
     h.frame_redraw = true;

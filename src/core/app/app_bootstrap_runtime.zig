@@ -48,6 +48,7 @@ fn BootstrapDeps(comptime App: type) type {
             []const u8,
             types.ReasoningEffort,
             bool,
+            bool,
         ) anyerror!void;
         const InitializePersistenceFn = *const fn (*App, bool) anyerror!void;
         const StageRequestedResumeViewFn = *const fn (*App) app_session_runtime.ResumeViewStage;
@@ -90,7 +91,6 @@ pub fn Runtime(comptime App: type) type {
             default_model: []const u8,
             default_agent_step_limit: usize,
             resize_handler: app_lifecycle.ResizeHandler,
-            record_requested: bool,
             capability_providers: CapabilityProviders,
         ) !void {
             try bootstrapWithDeps(
@@ -99,7 +99,6 @@ pub fn Runtime(comptime App: type) type {
                 default_model,
                 default_agent_step_limit,
                 resize_handler,
-                record_requested,
                 defaultDeps(capability_providers),
             );
         }
@@ -152,6 +151,7 @@ pub fn Runtime(comptime App: type) type {
             selected_model: []const u8,
             effort: types.ReasoningEffort,
             fast_mode: bool,
+            fast_mode_model_bound: bool,
         ) !void {
             try app_session_runtime.Runtime(App).configureStartupPreferences(
                 app,
@@ -161,6 +161,7 @@ pub fn Runtime(comptime App: type) type {
                 selected_model,
                 effort,
                 fast_mode,
+                fast_mode_model_bound,
             );
         }
 
@@ -190,7 +191,6 @@ pub fn Runtime(comptime App: type) type {
             default_model: []const u8,
             default_agent_step_limit: usize,
             resize_handler: app_lifecycle.ResizeHandler,
-            record_requested: bool,
             deps: BootstrapDeps(App),
         ) !void {
             errdefer app.deinit();
@@ -215,7 +215,6 @@ pub fn Runtime(comptime App: type) type {
                     null,
                 .resize_handler = resize_handler,
                 .fx_version = App.app_version,
-                .record_requested = record_requested,
             });
             defer startup.deinit(app.alloc);
 
@@ -232,12 +231,12 @@ pub fn Runtime(comptime App: type) type {
                 startup.stored_key_status,
                 startup.credential_onboarding_skipped,
             );
-            if (comptime @hasDecl(@TypeOf(app.auth), "refreshChatGptSourceInventory")) {
-                app.auth.refreshChatGptSourceInventory(app.alloc) catch |err| {
-                    debug_trace.logf("auth", "startup ChatGPT inventory refresh failed err={s}", .{@errorName(err)});
-                };
-            } else {
+            if (comptime @hasDecl(@TypeOf(app.auth), "refreshSourceInventory")) {
                 app.auth.refreshSourceInventory(app.alloc) catch |err| {
+                    debug_trace.logf("auth", "startup source inventory refresh failed err={s}", .{@errorName(err)});
+                };
+            } else if (comptime @hasDecl(@TypeOf(app.auth), "refreshChatGptSourceInventory")) {
+                app.auth.refreshChatGptSourceInventory(app.alloc) catch |err| {
                     debug_trace.logf("auth", "startup source inventory refresh failed err={s}", .{@errorName(err)});
                 };
             }
@@ -298,6 +297,7 @@ pub fn Runtime(comptime App: type) type {
                 active_model,
                 startup.effort,
                 startup.fast_mode,
+                startup.fast_mode_model_bound,
             );
             app.permission_engine.mode = startup.permission_mode;
             app.permission_engine.replaceRules(app.alloc, startup.takePermissionRules());
@@ -351,7 +351,7 @@ pub fn Runtime(comptime App: type) type {
                 app.mcp_runtime = profile_mcp;
             }
 
-            const loaded = if (comptime @hasField(App, "profile_home"))
+            var loaded = if (comptime @hasField(App, "profile_home"))
                 if (app.profile_home) |home_dir|
                     try deps.load_skills_from_home(
                         std.heap.c_allocator,
@@ -371,8 +371,10 @@ pub fn Runtime(comptime App: type) type {
                     app.workspace_root,
                     deps.skill_root_policy,
                 );
+            errdefer loaded.deinit(std.heap.c_allocator);
             skill_runtime.traceDiagnostics("interactive_startup", loaded.diagnostics);
-            app.skills.replaceLoaded(std.heap.c_allocator, loaded.dir, loaded.skills, loaded.diagnostics);
+            try app.skills.replaceLoaded(std.heap.c_allocator, loaded.dir, loaded.skills, loaded.diagnostics);
+            loaded = .{};
 
             if (app.requested_resume == null) {
                 const welcome_message = try deps.welcome_message(app.alloc);
@@ -430,13 +432,14 @@ pub fn Runtime(comptime App: type) type {
                 const recording_body = try std.fmt.allocPrint(
                     app.alloc,
                     "visual terminal capture: {s}\nvisible terminal content, including typed prompt text, is recorded",
-                    .{recording.active},
+                    .{recording.active.path},
                 );
                 defer app.alloc.free(recording_body);
                 try app.writeDomainNotice(.{
                     .topic = "recording",
                     .tone = .warning,
                     .body = recording_body,
+                    .visibility = if (recording.active.show_inline_notice) .compact_and_full else .full_only,
                 }, true);
             }
             {
@@ -523,6 +526,7 @@ const TestCapture = struct {
     runtime_model_len: usize = 0,
     configured_effort: types.ReasoningEffort = .auto,
     configured_fast_mode: bool = false,
+    configured_fast_mode_model_bound: bool = false,
     initialize_required: bool = false,
     mcp_profile_home: ?[]const u8 = null,
     skill_profile_home: ?[]const u8 = null,
@@ -755,6 +759,7 @@ fn makeStartupState(alloc: Allocator) !app_lifecycle.StartupState {
     state.permission_mode = .auto;
     state.context_enabled = false;
     state.fast_mode = true;
+    state.fast_mode_model_bound = true;
     state.auto_upgrade = false;
     state.update_channel = .dev;
     state.effort = types.ReasoningEffort.literal("high");
@@ -848,6 +853,7 @@ fn configureSessionPreferencesForTest(
     selected_model: []const u8,
     effort: types.ReasoningEffort,
     fast_mode: bool,
+    fast_mode_model_bound: bool,
 ) !void {
     const capture = active_capture.?;
     capture.configured_model_len = @min(
@@ -869,6 +875,7 @@ fn configureSessionPreferencesForTest(
     );
     capture.configured_effort = effort;
     capture.configured_fast_mode = fast_mode;
+    capture.configured_fast_mode_model_bound = fast_mode_model_bound;
 }
 
 fn beginFreshPersistedSessionForTest(app: *TestApp) !void {
@@ -910,7 +917,6 @@ fn runBootstrapForTest(app: *TestApp, capture: *TestCapture) !void {
         "default-model",
         24,
         resizeHandlerForTest,
-        false,
         testDeps(),
     );
 }
@@ -959,6 +965,7 @@ test "app_bootstrap_runtime transfers startup state and starts a fresh session" 
         capture.configured_effort,
     );
     try std.testing.expect(capture.configured_fast_mode);
+    try std.testing.expect(capture.configured_fast_mode_model_bound);
     try std.testing.expectEqual(
         update_target.Channel.dev,
         app.upgrader.channel(),

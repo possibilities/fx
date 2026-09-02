@@ -13,6 +13,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { FX_BIN } from "../evals/eval-helpers";
 import {
+  composerContains,
   FAKE_GATEWAY_MODEL,
   fakeGatewayFinalText,
   startFakeGateway,
@@ -816,12 +817,17 @@ for (
 }
 
 tmuxTest(
-  "history recall preserves the selected duplicate skill source",
+  "history recall preserves duplicate skill provenance without showing it",
   async () => {
     const active = await startFx(true, 2, true);
 
     await selectReviewSkill(active, true);
-    await active.waitForText("review · workspace skills/", TIMEOUT);
+    await active.waitForPane(
+      (pane) =>
+        composerContains(pane, "review") &&
+        !composerContains(pane, "review · workspace skills/"),
+      TIMEOUT,
+    );
     await active.sendLiteralText("history skill");
     await active.sendKeys("Enter");
     await waitForGatewayRequest();
@@ -834,8 +840,13 @@ tmuxTest(
     );
 
     await active.sendKeys("Up");
-    await active.waitForText("history skill", TIMEOUT);
-    await active.waitForText("review · workspace skills/", TIMEOUT);
+    await active.waitForPane(
+      (pane) =>
+        composerContains(pane, "history skill") &&
+        composerContains(pane, "review") &&
+        !composerContains(pane, "review · workspace skills/"),
+      TIMEOUT,
+    );
     await active.sendKeys("Enter");
     await waitForGatewayRequest(2);
 

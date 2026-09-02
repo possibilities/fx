@@ -138,15 +138,29 @@ pub fn writeUserMessageChunk(w: *std.Io.Writer, text: []const u8) !void {
     try w.writeAll("}}");
 }
 
-pub fn writeToolCall(w: *std.Io.Writer, tool_call_id: []const u8, title: []const u8, kind: ToolCallKind, status: ToolCallStatus) !void {
+pub fn writeToolCall(
+    w: *std.Io.Writer,
+    tool_call_id: []const u8,
+    name: []const u8,
+    title: []const u8,
+    kind: ToolCallKind,
+    status: ToolCallStatus,
+    raw_input: ?std.json.Value,
+) !void {
     try w.writeAll("{\"sessionUpdate\":\"tool_call\",\"toolCallId\":");
     try writeJsonStr(tool_call_id, w);
+    try w.writeAll(",\"name\":");
+    try writeJsonStr(name, w);
     try w.writeAll(",\"title\":");
     try writeJsonStr(title, w);
     try w.writeAll(",\"kind\":");
     try writeJsonStr(kind.jsonString(), w);
     try w.writeAll(",\"status\":");
     try writeJsonStr(status.jsonString(), w);
+    if (raw_input) |value| {
+        try w.writeAll(",\"rawInput\":");
+        try std.json.Stringify.value(value, .{}, w);
+    }
     try w.writeAll("}");
 }
 
@@ -216,9 +230,33 @@ test "writeToolCall produces valid json" {
     const alloc = std.testing.allocator;
     var out: std.Io.Writer.Allocating = .init(alloc);
     defer out.deinit();
-    try writeToolCall(&out.writer, "call_001", "Reading file", .read, .pending);
-    try std.testing.expect(std.mem.find(u8, out.writer.buffered(), "\"toolCallId\":\"call_001\"") != null);
-    try std.testing.expect(std.mem.find(u8, out.writer.buffered(), "\"kind\":\"read\"") != null);
+    var raw_input = try std.json.parseFromSlice(
+        std.json.Value,
+        alloc,
+        "{\"path\":\"README.md\"}",
+        .{},
+    );
+    defer raw_input.deinit();
+
+    try writeToolCall(
+        &out.writer,
+        "call_001",
+        "read_file",
+        "Reading file",
+        .read,
+        .pending,
+        raw_input.value,
+    );
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, out.writer.buffered(), .{});
+    defer parsed.deinit();
+
+    try std.testing.expectEqualStrings("call_001", parsed.value.object.get("toolCallId").?.string);
+    try std.testing.expectEqualStrings("read_file", parsed.value.object.get("name").?.string);
+    try std.testing.expectEqualStrings("read", parsed.value.object.get("kind").?.string);
+    try std.testing.expectEqualStrings(
+        "README.md",
+        parsed.value.object.get("rawInput").?.object.get("path").?.string,
+    );
 }
 
 test "writePromptResponse produces valid json" {
@@ -240,6 +278,7 @@ test "ToolCallKind jsonString values" {
     try std.testing.expectEqualStrings("edit", ToolCallKind.edit.jsonString());
     try std.testing.expectEqualStrings("execute", ToolCallKind.execute.jsonString());
     try std.testing.expectEqualStrings("search", ToolCallKind.search.jsonString());
+    try std.testing.expectEqualStrings("fetch", ToolCallKind.fetch.jsonString());
     try std.testing.expectEqualStrings("other", ToolCallKind.other.jsonString());
 }
 
@@ -270,14 +309,14 @@ test "writeToolCallUpdate can include structured command result" {
         "call_002",
         .completed,
         "exit_code=0\n<stdout>\nok\n</stdout>\n",
-        "{\"kind\":\"foreground\",\"command\":\"printf ok\",\"cwd\":\"/tmp\",\"exit_code\":0,\"signal\":null,\"timed_out\":false,\"stdout_bytes\":2,\"stderr_bytes\":0,\"truncated\":false}",
+        "{\"kind\":\"command\",\"command\":\"printf ok\",\"cwd\":\"/tmp\",\"exit_code\":0,\"signal\":null,\"timed_out\":false,\"stdout_bytes\":2,\"stderr_bytes\":0,\"truncated\":false}",
     );
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, out.writer.buffered(), .{});
     defer parsed.deinit();
 
     try std.testing.expectEqualStrings("tool_call_update", parsed.value.object.get("sessionUpdate").?.string);
     const command_result = parsed.value.object.get("command_result").?.object;
-    try std.testing.expectEqualStrings("foreground", command_result.get("kind").?.string);
+    try std.testing.expectEqualStrings("command", command_result.get("kind").?.string);
     try std.testing.expectEqual(@as(i64, 0), command_result.get("exit_code").?.integer);
     try std.testing.expect(parsed.value.object.get("content") != null);
 }

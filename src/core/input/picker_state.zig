@@ -17,6 +17,18 @@ pub const InlinePickerKind = enum {
     skill,
 };
 
+const InlinePickerSuppression = union(enum) {
+    dismissed_until_trigger_change: InlinePickerKind,
+    history_slash_recall_until_edit,
+
+    fn kind(self: InlinePickerSuppression) InlinePickerKind {
+        return switch (self) {
+            .dismissed_until_trigger_change => |suppressed_kind| suppressed_kind,
+            .history_slash_recall_until_edit => .slash,
+        };
+    }
+};
+
 pub const model_picker_fast_options = [_][]const u8{ "normal", "fast" };
 
 pub const ModelPickerQuery = struct {
@@ -55,7 +67,7 @@ pub const InlineSlashQuery = struct {
 pub const State = struct {
     slash_completion_index: usize = 0,
     slash_completion_window_start: usize = 0,
-    dismissed_inline_picker: ?InlinePickerKind = null,
+    inline_picker_suppression: ?InlinePickerSuppression = null,
     model_completion_index: usize = 0,
     model_completion_window_start: usize = 0,
     model_completion_anchor_current: bool = false,
@@ -77,22 +89,40 @@ pub const State = struct {
     pub fn resetInlinePickerEpisode(self: *State) void {
         self.slash_completion_index = 0;
         self.slash_completion_window_start = 0;
-        self.dismissed_inline_picker = null;
+        self.inline_picker_suppression = null;
+    }
+
+    pub fn resetInlinePickerForHistoryRecall(self: *State, editor: *const editor_state.State) void {
+        self.resetInlinePickerEpisode();
+        self.inline_picker_suppression = suppressionForHistoryRecall(
+            self.inlinePickerTriggerKind(editor),
+        );
     }
 
     pub fn dismissInlinePicker(self: *State, kind: InlinePickerKind) void {
-        self.dismissed_inline_picker = kind;
+        self.inline_picker_suppression = .{ .dismissed_until_trigger_change = kind };
     }
 
     pub fn isInlinePickerDismissed(self: *const State, kind: InlinePickerKind) bool {
-        return self.dismissed_inline_picker == kind;
+        const suppression = self.inline_picker_suppression orelse return false;
+        return switch (suppression) {
+            .dismissed_until_trigger_change => |dismissed| dismissed == kind,
+            .history_slash_recall_until_edit => false,
+        };
+    }
+
+    pub fn isInlinePickerSuppressed(self: *const State, kind: InlinePickerKind) bool {
+        const suppression = self.inline_picker_suppression orelse return false;
+        return suppression.kind() == kind;
     }
 
     pub fn reconcileInlinePickerAfterEdit(self: *State, editor: *const editor_state.State) void {
         self.slash_completion_index = 0;
         self.slash_completion_window_start = 0;
-        const dismissed = self.dismissed_inline_picker orelse return;
-        if (self.inlinePickerTriggerKind(editor) != dismissed) self.dismissed_inline_picker = null;
+        self.inline_picker_suppression = suppressionAfterEdit(
+            self.inline_picker_suppression,
+            self.inlinePickerTriggerKind(editor),
+        );
     }
 
     pub fn resetFilePickerIndex(self: *State) void {
@@ -101,22 +131,22 @@ pub const State = struct {
     }
 
     pub fn activeFilePickerQuery(self: *const State, editor: *const editor_state.State) ?FilePickerQuery {
-        if (self.isInlinePickerDismissed(.file)) return null;
+        if (self.isInlinePickerSuppressed(.file)) return null;
         return self.rawFilePickerQuery(editor);
     }
 
     pub fn activeModelPickerQuery(self: *const State, editor: *const editor_state.State) ?ModelPickerQuery {
-        if (self.isInlinePickerDismissed(.model)) return null;
+        if (self.isInlinePickerSuppressed(.model)) return null;
         return self.rawModelPickerQuery(editor);
     }
 
     pub fn activeInlineSkillQuery(self: *const State, editor: *const editor_state.State) ?InlineSkillQuery {
-        if (self.isInlinePickerDismissed(.skill)) return null;
+        if (self.isInlinePickerSuppressed(.skill)) return null;
         return findInlineSkillQuery(editor.input.items, editor.cursor);
     }
 
     pub fn activeInlineSlashQuery(self: *const State, editor: *const editor_state.State) ?InlineSlashQuery {
-        if (self.isInlinePickerDismissed(.slash)) return null;
+        if (self.isInlinePickerSuppressed(.slash)) return null;
         return findInlineSlashQuery(editor.input.items, editor.cursor);
     }
 
@@ -235,6 +265,25 @@ pub const State = struct {
     }
 };
 
+fn suppressionForHistoryRecall(trigger: ?InlinePickerKind) ?InlinePickerSuppression {
+    if (trigger != .slash) return null;
+    return .history_slash_recall_until_edit;
+}
+
+fn suppressionAfterEdit(
+    current: ?InlinePickerSuppression,
+    trigger: ?InlinePickerKind,
+) ?InlinePickerSuppression {
+    const suppression = current orelse return null;
+    return switch (suppression) {
+        .dismissed_until_trigger_change => |dismissed| if (trigger == dismissed)
+            suppression
+        else
+            null,
+        .history_slash_recall_until_edit => null,
+    };
+}
+
 pub fn isBareModelCommandAtCursor(editor: *const editor_state.State) bool {
     if (editor.cursor != editor.input.items.len) return false;
     const trimmed = std.mem.trimStart(u8, editor.input.items, " \t");
@@ -313,19 +362,19 @@ fn findFilePickerQuery(items: []const u8, cursor: usize) ?FilePickerQuery {
 fn findInlineSkillQuery(items: []const u8, cursor: usize) ?InlineSkillQuery {
     if (cursor != items.len) return null;
 
-    var token_start = cursor;
-    while (token_start > 0 and !isFilePickerTerminator(items[token_start - 1])) {
-        token_start -= 1;
+    var index = cursor;
+    while (index > 0) {
+        const byte = items[index - 1];
+        if (isFilePickerTerminator(byte)) return null;
+        index -= 1;
+        if (byte != '$') continue;
+        return .{
+            .query = items[index + 1 .. cursor],
+            .dollar_offset = index,
+            .token_start = index + 1,
+        };
     }
-    if (token_start == 0 or token_start == cursor or items[token_start] != '$') return null;
-
-    const query_start = token_start + 1;
-    if (query_start == cursor) return null;
-    return .{
-        .query = items[query_start..cursor],
-        .dollar_offset = token_start,
-        .token_start = query_start,
-    };
+    return null;
 }
 
 fn findInlineSlashQuery(items: []const u8, cursor: usize) ?InlineSlashQuery {
@@ -395,6 +444,41 @@ test "picker state resolves model file skill and slash queries" {
 
     try editor.setText(alloc, "then /help");
     try std.testing.expectEqualStrings("/help", state.activeInlineSlashQuery(&editor).?.prefix);
+}
+
+test "skill query binds the nearest dollar anywhere at the cursor" {
+    const alloc = std.testing.allocator;
+    var editor: editor_state.State = .{};
+    defer editor.deinit(alloc);
+    var state: State = .{};
+    defer state.deinit(alloc);
+
+    const cases = [_]struct {
+        input: []const u8,
+        query: []const u8,
+        dollar_offset: usize,
+    }{
+        .{ .input = "$", .query = "", .dollar_offset = 0 },
+        .{ .input = "$blue", .query = "blue", .dollar_offset = 0 },
+        .{ .input = "use $", .query = "", .dollar_offset = "use ".len },
+        .{ .input = "price$100", .query = "100", .dollar_offset = "price".len },
+        .{ .input = "one$two$three", .query = "three", .dollar_offset = "one$two".len },
+    };
+
+    for (cases) |case| {
+        try editor.setText(alloc, case.input);
+        const maybe_query = state.activeInlineSkillQuery(&editor);
+        try std.testing.expect(maybe_query != null);
+        const query = maybe_query.?;
+        try std.testing.expectEqualStrings(case.query, query.query);
+        try std.testing.expectEqual(case.dollar_offset, query.dollar_offset);
+        try std.testing.expectEqual(case.dollar_offset + 1, query.token_start);
+    }
+
+    try editor.setText(alloc, "price$100 tail");
+    try std.testing.expect(state.activeInlineSkillQuery(&editor) == null);
+    _ = editor.setCursor("price$10".len);
+    try std.testing.expect(state.activeInlineSkillQuery(&editor) == null);
 }
 
 test "model picker query takes precedence over file syntax" {

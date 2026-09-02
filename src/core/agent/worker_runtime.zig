@@ -211,7 +211,6 @@ const SnapshotFileOwnershipState = struct {
 fn historyTurnImages(turn: types.HistoryTurn) []const types.ImageAttachment {
     return switch (turn) {
         .assistant => |value| value.user.images,
-        .background_command => |value| value.user.images,
         .interrupted => |value| value.user.images,
         .compacted_summary => &.{},
     };
@@ -573,6 +572,7 @@ pub const WorkerRuntime = struct {
     agent_turn_settings: AgentTurnSettings = .{},
     active_agent_turn_settings: ?AgentTurnSettings = null,
     active_context_snapshot: ?*const context_contract.GatheredContextSnapshot = null,
+    active_prompt_is_root_authority: bool = false,
     active_prompt_snapshot_ownership: ?*ActivePromptSnapshotOwnership = null,
     preserve_prompt_snapshot_turn_id: ?u64 = null,
 
@@ -1221,6 +1221,21 @@ pub const WorkerRuntime = struct {
         self.worker_connectivity_wait_active.store(false, .seq_cst);
         self.worker_cond.broadcast(io_mod.getIo());
         self.worker_mutex.unlock(io_mod.getIo());
+    }
+
+    /// Marks an agent turn that is executed directly rather than dequeued by
+    /// the interactive worker loop. The caller must pair a successful begin
+    /// with `finishProcessing`.
+    pub fn beginDirectProcessing(self: *WorkerRuntime, turn_id: u64) bool {
+        self.worker_mutex.lockUncancelable(io_mod.getIo());
+        defer self.worker_mutex.unlock(io_mod.getIo());
+        if (self.worker_processing or self.worker_stop_requested) return false;
+        self.worker_cancel_requested.store(false, .seq_cst);
+        self.worker_recovery_pause_requested.store(false, .seq_cst);
+        self.worker_connectivity_wait_active.store(false, .seq_cst);
+        self.worker_processing = true;
+        self.active_turn_id = turn_id;
+        return true;
     }
 
     pub fn waitUntilIdle(self: *WorkerRuntime) void {
@@ -4583,7 +4598,7 @@ test "submitted text only queues while a prompt is active" {
     runtime.pending_permission_request_shared =
         try permission_request.OwnedPermissionRequest.dupe(
             alloc,
-            .{ .id = 1, .label = "terminal.exec launch chrome" },
+            .{ .id = 1, .label = "shell.run launch chrome" },
         );
     const question_options = [_]types.QuestionOption{.{ .label = "Wait", .description = null }};
     const question_entries = [_]types.QuestionBatchEntry{.{
