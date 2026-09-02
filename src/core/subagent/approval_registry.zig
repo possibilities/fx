@@ -549,3 +549,233 @@ test "approval identity is deterministic" {
         stableApprovalId("child", "work", prepared),
     );
 }
+
+/// A worker route that records the exact order in which the lifecycle observer
+/// runs and the response becomes visible to the waiting child. Answering owes
+/// the child its resolution before the child can be released, so the order is
+/// the behavior under test rather than an incidental harness detail.
+const OrderingRoute = struct {
+    step: usize = 0,
+    observed_step: ?usize = null,
+    visible_step: ?usize = null,
+    observed_turn: ?u64 = null,
+    pins: usize = 0,
+    releases: usize = 0,
+    cancels: usize = 0,
+    submits: usize = 0,
+    turn_id: u64 = 0,
+    pin_succeeds: bool = true,
+
+    fn route(self: *OrderingRoute) WorkerRoute {
+        return .{
+            .context = self,
+            .submit_fn = submitPlain,
+            .submit_observed_fn = submitObservedRoute,
+            .cancel_fn = cancelRoute,
+            .pin_fn = pinRoute,
+            .release_fn = releaseRoute,
+        };
+    }
+
+    fn submitPlain(
+        raw: *anyopaque,
+        request_id: u64,
+        response: permission_request.OwnedPermissionResponse,
+        commit: ?worker_runtime.WorkerRuntime.PermissionCommit,
+    ) worker_runtime.WorkerRuntime.PermissionCommitError!worker_runtime.PermissionSubmissionResult {
+        return submitObservedRoute(raw, request_id, response, commit, null);
+    }
+
+    fn submitObservedRoute(
+        raw: *anyopaque,
+        _: u64,
+        response: permission_request.OwnedPermissionResponse,
+        commit: ?worker_runtime.WorkerRuntime.PermissionCommit,
+        observer: ?worker_runtime.DecisionObserver,
+    ) worker_runtime.WorkerRuntime.PermissionCommitError!worker_runtime.PermissionSubmissionResult {
+        const self: *OrderingRoute = @ptrCast(@alignCast(raw));
+        var owned = response;
+        defer owned.deinit();
+        self.submits += 1;
+        if (commit) |effect| try effect.commit_fn(effect.context);
+        if (observer) |value| {
+            self.step += 1;
+            self.observed_step = self.step;
+            self.observed_turn = self.turn_id;
+            value.observe_fn(value.context, self.turn_id);
+        }
+        self.step += 1;
+        self.visible_step = self.step;
+        return .accepted;
+    }
+
+    fn cancelRoute(raw: *anyopaque) void {
+        const self: *OrderingRoute = @ptrCast(@alignCast(raw));
+        self.cancels += 1;
+    }
+
+    fn pinRoute(raw: *anyopaque) bool {
+        const self: *OrderingRoute = @ptrCast(@alignCast(raw));
+        if (!self.pin_succeeds) return false;
+        self.pins += 1;
+        return true;
+    }
+
+    fn releaseRoute(raw: *anyopaque) void {
+        const self: *OrderingRoute = @ptrCast(@alignCast(raw));
+        self.releases += 1;
+    }
+};
+
+const RecordedResolution = struct {
+    turns: [8]u64 = @splat(0),
+    len: usize = 0,
+
+    fn observer(self: *RecordedResolution) worker_runtime.DecisionObserver {
+        return .{ .context = self, .observe_fn = record };
+    }
+
+    fn record(raw: *anyopaque, turn_id: u64) void {
+        const self: *RecordedResolution = @ptrCast(@alignCast(raw));
+        if (self.len == self.turns.len) return;
+        self.turns[self.len] = turn_id;
+        self.len += 1;
+    }
+};
+
+fn registerForTest(
+    registry: *Registry,
+    stable_id: []const u8,
+    child_id: []const u8,
+    worker_request_id: u64,
+    route: *OrderingRoute,
+) !void {
+    try registry.registerTool(
+        stable_id,
+        child_id,
+        "root",
+        "work",
+        .{ .id = worker_request_id, .label = "shell.run" },
+        &.{},
+        route.route(),
+        0,
+    );
+}
+
+test "child approval publishes its resolution before the child is released" {
+    const alloc = std.testing.allocator;
+    var registry = Registry{ .alloc = alloc };
+    defer registry.deinit();
+
+    var route = OrderingRoute{ .turn_id = 41 };
+    try registerForTest(&registry, "approval-1", "child-a", 7, &route);
+
+    var recorded = RecordedResolution{};
+    const observed = try registry.resolveObserved(
+        "approval-1",
+        "child-a",
+        .once,
+        null,
+        0,
+        recorded.observer(),
+    );
+
+    try std.testing.expectEqual(ResolveResult.accepted, observed.result);
+    try std.testing.expect(observed.observer_ran);
+    try std.testing.expectEqual(@as(usize, 1), recorded.len);
+    try std.testing.expectEqual(@as(u64, 41), recorded.turns[0]);
+    // The resolution is published strictly before the waiting child can see
+    // the response, so the child is never released without it.
+    try std.testing.expect(route.observed_step.? < route.visible_step.?);
+    try std.testing.expectEqual(@as(usize, 1), route.pins);
+    try std.testing.expectEqual(@as(usize, 1), route.releases);
+    try std.testing.expectEqual(@as(usize, 0), route.cancels);
+}
+
+test "parent prompt approval keeps exact child identity as the only answering surface" {
+    const alloc = std.testing.allocator;
+    var registry = Registry{ .alloc = alloc };
+    defer registry.deinit();
+
+    var route = OrderingRoute{ .turn_id = 5 };
+    try registerForTest(&registry, "approval-1", "child-a", 7, &route);
+
+    // A decision naming the wrong child never answers and never publishes.
+    var wrong = RecordedResolution{};
+    try std.testing.expectError(error.WrongChild, registry.resolveObserved(
+        "approval-1",
+        "child-b",
+        .once,
+        null,
+        0,
+        wrong.observer(),
+    ));
+    try std.testing.expectEqual(@as(usize, 0), wrong.len);
+    try std.testing.expectEqual(@as(usize, 0), route.submits);
+
+    // The copied attention identity belongs to the child and the request, so
+    // the one answering surface attributes the resolution to the child.
+    const token = attentionToken("child-a", "approval-1");
+    try std.testing.expectEqual(token, attentionToken("child-a", "approval-1"));
+    try std.testing.expect(!std.mem.eql(u8, &token, &attentionToken("child-b", "approval-1")));
+    try std.testing.expect(!std.mem.eql(u8, &token, &attentionToken("child-a", "approval-2")));
+
+    var recorded = RecordedResolution{};
+    const observed = try registry.resolveObserved(
+        "approval-1",
+        "child-a",
+        .deny,
+        null,
+        0,
+        recorded.observer(),
+    );
+    // A denial is an accepted decision and resolves.
+    try std.testing.expectEqual(ResolveResult.accepted, observed.result);
+    try std.testing.expectEqual(@as(usize, 1), recorded.len);
+}
+
+test "two pending child approvals each resolve exactly once with their own identity" {
+    const alloc = std.testing.allocator;
+    var registry = Registry{ .alloc = alloc };
+    defer registry.deinit();
+
+    var first_route = OrderingRoute{ .turn_id = 11 };
+    var second_route = OrderingRoute{ .turn_id = 22 };
+    try registerForTest(&registry, "approval-1", "child-a", 7, &first_route);
+    try registerForTest(&registry, "approval-2", "child-b", 9, &second_route);
+
+    var pending: PendingChildren = .{};
+    registry.snapshotPendingChildren(&pending);
+    try std.testing.expectEqual(@as(usize, 2), pending.len);
+    try std.testing.expect(!pending.truncated);
+
+    var first = RecordedResolution{};
+    var second = RecordedResolution{};
+    try std.testing.expectEqual(
+        ResolveResult.accepted,
+        (try registry.resolveObserved("approval-1", "child-a", .once, null, 0, first.observer())).result,
+    );
+    try std.testing.expectEqual(
+        ResolveResult.accepted,
+        (try registry.resolveObserved("approval-2", "child-b", .once, null, 0, second.observer())).result,
+    );
+    try std.testing.expectEqual(@as(usize, 1), first.len);
+    try std.testing.expectEqual(@as(u64, 11), first.turns[0]);
+    try std.testing.expectEqual(@as(usize, 1), second.len);
+    try std.testing.expectEqual(@as(u64, 22), second.turns[0]);
+
+    // Each request has exactly one winner: a replayed answer finds nothing and
+    // publishes nothing.
+    var replay = RecordedResolution{};
+    try std.testing.expectError(error.RequestNotFound, registry.resolveObserved(
+        "approval-1",
+        "child-a",
+        .once,
+        null,
+        0,
+        replay.observer(),
+    ));
+    try std.testing.expectEqual(@as(usize, 0), replay.len);
+    try std.testing.expectEqual(@as(usize, 1), first_route.submits);
+    try std.testing.expectEqual(@as(usize, 1), second_route.submits);
+}
