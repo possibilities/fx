@@ -1691,7 +1691,7 @@ test "compose hint row right-aligns upgrade status" {
         .has_api_key = true,
         .model = "gpt-5.1",
         .queued_count = 0,
-        .upgrade_status = "update ready: ctrl+g to reload",
+        .upgrade_status = "update ready: ctrl+t to reload",
         .statusline = .{
             .workspace_label = "/a/long/workspace/path/that/uses/the/statusline-tail",
         },
@@ -1702,7 +1702,7 @@ test "compose hint row right-aligns upgrade status" {
     defer row.deinit(std.testing.allocator);
 
     try std.testing.expect(std.mem.find(u8, row.items, "gpt-5.1") != null);
-    try std.testing.expect(std.mem.find(u8, row.items, "update ready: ctrl+g to reload") != null);
+    try std.testing.expect(std.mem.find(u8, row.items, "update ready: ctrl+t to reload") != null);
     try std.testing.expect(std.mem.find(u8, row.items, "\x1b[19G") != null);
 }
 
@@ -1716,7 +1716,7 @@ test "compose hint row right-aligns upgrade status after styled auto mode" {
         .model = "openai/gpt-4o",
         .permission_mode = .auto,
         .queued_count = 0,
-        .upgrade_status = "update ready: ctrl+g to reload",
+        .upgrade_status = "update ready: ctrl+t to reload",
         .input = &input,
     };
 
@@ -1726,7 +1726,7 @@ test "compose hint row right-aligns upgrade status after styled auto mode" {
 
     try std.testing.expect(std.mem.find(u8, row.items, "auto") != null);
     try std.testing.expect(std.mem.find(u8, row.items, "gpt-4o") != null);
-    try std.testing.expect(std.mem.find(u8, row.items, "update ready: ctrl+g to reload") != null);
+    try std.testing.expect(std.mem.find(u8, row.items, "update ready: ctrl+t to reload") != null);
     try std.testing.expect(std.mem.find(u8, row.items, "\x1b[27G") != null);
     try std.testing.expect(display_width.visibleWidthIgnoringAnsi(row.items) <= 56);
 }
@@ -1819,13 +1819,13 @@ test "question hint row excludes model and upgrade status at supported widths" {
         var ctx = testRenderContext(&input);
         ctx.question = prompt.projection();
         ctx.model = "model-x";
-        ctx.upgrade_status = "update ready: ctrl+g to reload";
+        ctx.upgrade_status = "update ready: ctrl+t to reload";
         var row = try composeHintRow(std.testing.allocator, false, null, ctx, case.width);
         defer row.deinit(std.testing.allocator);
 
         try std.testing.expect(std.mem.find(u8, row.items, case.hint) != null);
         try std.testing.expect(std.mem.find(u8, row.items, "model-x") == null);
-        try std.testing.expect(std.mem.find(u8, row.items, "update ready: ctrl+g to reload") == null);
+        try std.testing.expect(std.mem.find(u8, row.items, "update ready: ctrl+t to reload") == null);
         try std.testing.expect(display_width.visibleWidthIgnoringAnsi(row.items) <= case.width);
     }
 }
