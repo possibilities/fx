@@ -196,6 +196,10 @@ pub fn build(b: *std.Build) void {
             "Responses reducer classifies refusal content as content filter",
             "Responses reducer preserves a terminal provider outcome after late cancellation",
             "Responses reducer honors an already-read terminal event over cancellation",
+            "read-only authorization home requires one canonical directory beside selected state",
+            "read-only resolution refuses refresh-due subscription without rewriting its profile",
+            "selected state loads settings locally while borrowing only a stored credential",
+            "FX_PROVIDER selects one process provider and FX_MODEL supplies its missing profile model",
         },
     });
     const run_fxnk_gate_tests = b.addRunArtifact(fxnk_gate_tests);
