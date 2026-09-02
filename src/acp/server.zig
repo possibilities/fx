@@ -304,7 +304,21 @@ fn resolveConfiguredCredential(
     provider: model_provider.ProviderId,
     preferred: ?credentials.Source,
 ) !credentials.Resolution {
+    const borrowed_authorization_home =
+        try credentials.readOnlyAuthorizationHomeFromEnvironment(
+            alloc,
+            state.cfg.home_override,
+        );
+    defer if (borrowed_authorization_home) |home| alloc.free(home);
     if (state.cfg.home_override) |home| {
+        if (borrowed_authorization_home) |authorization_home| {
+            return credentials.resolveReadOnlyForProviderFromHome(
+                alloc,
+                provider,
+                preferred,
+                authorization_home,
+            );
+        }
         return credentials.resolveForProviderFromHome(
             alloc,
             state.cfg.gateway_provider.oauth_transport,
@@ -1302,6 +1316,12 @@ fn parseInitializeRequest(
 }
 
 fn loadConfiguredStartupState(state: *const ServerState, alloc: Allocator) !app_lifecycle.StartupState {
+    const borrowed_authorization_home =
+        try credentials.readOnlyAuthorizationHomeFromEnvironment(
+            alloc,
+            state.cfg.home_override,
+        );
+    defer if (borrowed_authorization_home) |home| alloc.free(home);
     if (state.cfg.home_override) |home_dir| {
         const workspace_root = state.cfg.workspace_root_override orelse ".";
         return app_lifecycle.loadEmbeddedStartupState(

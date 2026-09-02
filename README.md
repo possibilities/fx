@@ -128,6 +128,16 @@ authorization, profile instructions, profile-global skills, MCP state,
 memories, usage, prompt history, and sessions beneath `<path>/.fx` while
 terminal tools and MCP processes retain the normal `HOME` environment.
 
+An isolated launch can borrow one already-valid saved credential without
+copying it into that state root. Set `FX_AUTH_READ_ONLY_HOME` to the canonical
+home of another Fx profile and select the process provider with
+`FX_PROVIDER=gateway|codex|grok`. `FX_MODEL` supplies the process model when
+the isolated profile has no model for that provider. The borrowed profile is
+read only: Fx does not refresh, replace, or delete its credential, and every
+setting, session, history, skill, MCP entry, and authentication action remains
+owned by `--state-dir`. Fx rejects this authorization override when no
+`--state-dir` is selected.
+
 ## Extend fx
 
 In the interactive shell, bare `/mcp` opens an inline browser for servers, tools, resources, and prompts without adding anything to the transcript. Resource and prompt content enters the composer only after an explicit Insert action. Direct `/mcp SUBCOMMAND` forms remain available.

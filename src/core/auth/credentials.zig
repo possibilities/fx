@@ -14,6 +14,89 @@ const secret = @import("secret.zig");
 const types = @import("../shared/types.zig");
 
 pub const Source = types.CredentialSource;
+pub const read_only_authorization_home_env = "FX_AUTH_READ_ONLY_HOME";
+
+/// Resolves the optional profile whose already-valid saved credential may be
+/// borrowed by an explicit selected-state launch. The returned path is owned
+/// by the caller. Requiring the input to equal its real path keeps the
+/// authorization authority stable and prevents a retained state root from
+/// concealing a redirect through a symlink.
+pub fn resolveReadOnlyAuthorizationHome(
+    alloc: std.mem.Allocator,
+    selected_state_home: ?[]const u8,
+    configured: ?[]const u8,
+) !?[]u8 {
+    const raw = configured orelse return null;
+    if (selected_state_home == null) return error.ReadOnlyAuthorizationHomeRequiresStateDirectory;
+    if (raw.len == 0 or !std.unicode.utf8ValidateSlice(raw) or
+        !std.fs.path.isAbsolute(raw) or std.mem.eql(u8, raw, "/"))
+    {
+        return error.InvalidReadOnlyAuthorizationHome;
+    }
+
+    const canonical = io_mod.realpathAlloc(alloc, raw) catch
+        return error.InvalidReadOnlyAuthorizationHome;
+    errdefer alloc.free(canonical);
+    if (!std.mem.eql(u8, raw, canonical)) return error.InvalidReadOnlyAuthorizationHome;
+
+    var directory = io_mod.openDirAbsoluteNoFollow(canonical, .{}) catch
+        return error.InvalidReadOnlyAuthorizationHome;
+    directory.close(io_mod.getIo());
+    return canonical;
+}
+
+pub fn readOnlyAuthorizationHomeFromEnvironment(
+    alloc: std.mem.Allocator,
+    selected_state_home: ?[]const u8,
+) !?[]u8 {
+    return resolveReadOnlyAuthorizationHome(
+        alloc,
+        selected_state_home,
+        io_mod.getenv(read_only_authorization_home_env),
+    );
+}
+
+test "read-only authorization home requires one canonical directory beside selected state" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDir(std.testing.io, "state", .default_dir);
+    try tmp.dir.createDir(std.testing.io, "authorization", .default_dir);
+    try tmp.dir.symLink(std.testing.io, "authorization", "authorization-link", .{ .is_directory = true });
+    var file = try tmp.dir.createFile(std.testing.io, "not-a-directory", .{});
+    file.close(std.testing.io);
+
+    const state = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "state");
+    defer alloc.free(state);
+    const authorization = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "authorization");
+    defer alloc.free(authorization);
+    const linked = try std.fs.path.join(alloc, &.{ std.fs.path.dirname(authorization).?, "authorization-link" });
+    defer alloc.free(linked);
+    const wrong_kind = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "not-a-directory");
+    defer alloc.free(wrong_kind);
+
+    try std.testing.expect((try resolveReadOnlyAuthorizationHome(alloc, state, null)) == null);
+    try std.testing.expectError(
+        error.ReadOnlyAuthorizationHomeRequiresStateDirectory,
+        resolveReadOnlyAuthorizationHome(alloc, null, authorization),
+    );
+    try std.testing.expectError(
+        error.InvalidReadOnlyAuthorizationHome,
+        resolveReadOnlyAuthorizationHome(alloc, state, "relative"),
+    );
+    try std.testing.expectError(
+        error.InvalidReadOnlyAuthorizationHome,
+        resolveReadOnlyAuthorizationHome(alloc, state, linked),
+    );
+    try std.testing.expectError(
+        error.InvalidReadOnlyAuthorizationHome,
+        resolveReadOnlyAuthorizationHome(alloc, state, wrong_kind),
+    );
+
+    const selected = (try resolveReadOnlyAuthorizationHome(alloc, state, authorization)).?;
+    defer alloc.free(selected);
+    try std.testing.expectEqualStrings(authorization, selected);
+}
 
 pub const CatalogPublicOnly = union(enum) {
     no_credential,
@@ -332,6 +415,72 @@ pub fn resolveForProviderFromHome(
         if (preferred == .chatgpt_subscription or preferred == .grok_subscription) null else preferred,
         home,
     );
+}
+
+/// Resolves one already-valid saved credential without acquiring mutation
+/// authority over its profile. Expired or refresh-due sessions are treated as
+/// unavailable rather than refreshed through the borrowed home.
+pub fn resolveReadOnlyForProviderFromHome(
+    alloc: std.mem.Allocator,
+    provider: model_provider.ProviderId,
+    preferred: ?Source,
+    home: []const u8,
+) !Resolution {
+    var resolution = try resolveForProviderFromHome(
+        alloc,
+        oauth_transport.unavailable_provider,
+        .stored,
+        provider,
+        preferred,
+        home,
+    );
+    if (resolution.credential) |*credential| {
+        if (credential.needsRefreshAt(io_mod.milliTimestamp())) {
+            credential.deinit(alloc);
+            resolution.credential = null;
+        }
+    }
+    return resolution;
+}
+
+test "read-only resolution refuses refresh-due subscription without rewriting its profile" {
+    const fixture =
+        "{\"version\":1,\"access_token\":\"expired-token\",\"refresh_token\":\"do-not-send\",\"expires_at_ms\":1,\"account_id\":\"borrowed-account\"}\n";
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "authorization/.fx");
+    var auth_file = try tmp.dir.createFile(
+        std.testing.io,
+        "authorization/.fx/chatgpt-auth.json",
+        .{
+            .truncate = true,
+            .permissions = std.Io.File.Permissions.fromMode(0o600),
+        },
+    );
+    try auth_file.writeStreamingAll(std.testing.io, fixture);
+    auth_file.close(std.testing.io);
+
+    const authorization_home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "authorization");
+    defer alloc.free(authorization_home);
+    var resolution = try resolveReadOnlyForProviderFromHome(
+        alloc,
+        .codex,
+        null,
+        authorization_home,
+    );
+    defer if (resolution.credential) |*credential| credential.deinit(alloc);
+    try std.testing.expect(resolution.credential == null);
+
+    var retained_file = try tmp.dir.openFile(
+        std.testing.io,
+        "authorization/.fx/chatgpt-auth.json",
+        .{ .mode = .read_only },
+    );
+    defer retained_file.close(std.testing.io);
+    const retained = try io_mod.readFileToEnd(alloc, &retained_file, 4096);
+    defer alloc.free(retained);
+    try std.testing.expectEqualStrings(fixture, retained);
 }
 
 /// `preferred` is the source the user last chose in the hub. It wins over the
