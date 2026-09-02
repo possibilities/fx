@@ -2,7 +2,6 @@ const std = @import("std");
 const app_worker_runtime = @import("app_worker_runtime.zig");
 const image_attachments = @import("../images/image_attachments.zig");
 const tool_result_errors = @import("../tooling/tool_result_errors.zig");
-const task_helpers = @import("../tasks/task_helpers.zig");
 const types = @import("../shared/types.zig");
 const worker_runtime = @import("../agent/worker_runtime.zig");
 
@@ -16,7 +15,6 @@ pub fn Runtime(comptime App: type) type {
         /// is presented before agent work can suspend on host transport.
         pub fn processNextCooperativePrompt(
             app: *App,
-            on_task_completion: *const fn (*anyopaque, task_helpers.TaskCompletion) void,
             event_handlers: app_worker_runtime.WorkerEventHandlers,
             flush_frame: *const fn (*App) anyerror!void,
         ) !void {
@@ -25,7 +23,6 @@ pub fn Runtime(comptime App: type) type {
 
             try app_worker_runtime.Runtime(App).tick(
                 app,
-                on_task_completion,
                 event_handlers,
             );
             try flush_frame(app);
@@ -93,6 +90,7 @@ pub fn Runtime(comptime App: type) type {
             switch (err) {
                 error.ConnectionSetupTimedOut => return alloc.dupe(u8, "Connection setup timed out after 30 seconds."),
                 error.TlsInitializationFailed => return alloc.dupe(u8, "Connection setup failed: TLS could not be initialized."),
+                error.ModelImageCapabilityUnavailable => return alloc.dupe(u8, image_attachments.model_image_capability_unavailable_notice),
                 else => {},
             }
             if (detailedErrorSummary(err)) |detail| {
@@ -171,6 +169,23 @@ test "formatErrorBody describes an interrupted provider response without present
     try std.testing.expect(std.mem.find(u8, body, "StreamInterrupted") != null);
     try std.testing.expect(std.mem.find(u8, body, "\x1b[") == null);
     try std.testing.expect(!std.mem.endsWith(u8, body, "\n"));
+}
+
+test "formatErrorBody explains unresolved image capability" {
+    const alloc = std.testing.allocator;
+    const Rt = Runtime(DummyApp);
+    const body = try Rt.formatErrorBody(
+        alloc,
+        "request failed",
+        error.ModelImageCapabilityUnavailable,
+    );
+    defer alloc.free(body);
+
+    try std.testing.expectEqualStrings(
+        "Unable to verify image support for this model, so the image was not sent. Try again later, choose another model, or remove the image.",
+        body,
+    );
+    try std.testing.expect(std.mem.find(u8, body, "ModelImageCapabilityUnavailable") == null);
 }
 
 test "formatErrorBody describes terminal connection setup failures plainly" {

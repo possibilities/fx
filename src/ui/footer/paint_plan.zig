@@ -98,6 +98,7 @@ pub const FooterPlannerInput = struct {
     picker_failed: bool = false,
     slash_completion_count: usize = 0,
     slash_menu_layout: ?picker_presentation.SlashMenuLayout = null,
+    prepared_slash_menu: ?*const picker_presentation.PreparedSlashMenu = null,
     picker_start_col: u16 = 1,
     transcript_state: ?FooterTranscriptState = null,
 };
@@ -932,7 +933,10 @@ pub fn composeFooterFrame(
             }
         } else if (input.picker_kind == .slash) {
             const slash_prefix = input_presentation.slashInputPrefix(ctx.slash_registry, ctx.input.edit_state.input.items);
-            const count = picker_presentation.mixedSlashCompletionCount(ctx.slash_registry, slash_prefix, ctx.skills_menu.items);
+            const count = if (input.prepared_slash_menu) |prepared|
+                prepared.resultCount()
+            else
+                picker_presentation.mixedSlashCompletionCount(ctx.slash_registry, slash_prefix, ctx.skills_menu.items);
             if (count > 0) {
                 if (input.slash_menu_layout) |layout| {
                     var row = rows.picker_start;
@@ -946,26 +950,44 @@ pub fn composeFooterFrame(
                         row += 1;
                     }
 
-                    const column_widths = picker_presentation.mixedSlashMenuColumnWidths(
-                        ctx.slash_registry,
-                        slash_prefix,
-                        ctx.skills_menu.items,
-                        layout.window,
-                        ctx.input.slash_menu_categories,
-                    );
-                    var match_idx = layout.window.start;
-                    while (match_idx < layout.window.end) : (match_idx += 1) {
-                        var slash_row = try picker_presentation.composeSlashMenuOptionRow(
-                            alloc,
+                    const column_widths = if (input.prepared_slash_menu) |prepared|
+                        picker_presentation.preparedSlashMenuColumnWidths(
+                            prepared,
+                            layout.window,
+                            ctx.input.slash_menu_categories,
+                        )
+                    else
+                        picker_presentation.mixedSlashMenuColumnWidths(
                             ctx.slash_registry,
                             slash_prefix,
                             ctx.skills_menu.items,
-                            match_idx,
-                            match_idx == layout.selected,
-                            column_widths,
-                            shell.layout.cols,
+                            layout.window,
                             ctx.input.slash_menu_categories,
                         );
+                    var match_idx = layout.window.start;
+                    while (match_idx < layout.window.end) : (match_idx += 1) {
+                        var slash_row = if (input.prepared_slash_menu) |prepared|
+                            try picker_presentation.composePreparedSlashMenuOptionRow(
+                                alloc,
+                                prepared,
+                                match_idx,
+                                match_idx == layout.selected,
+                                column_widths,
+                                shell.layout.cols,
+                                ctx.input.slash_menu_categories,
+                            )
+                        else
+                            try picker_presentation.composeSlashMenuOptionRow(
+                                alloc,
+                                ctx.slash_registry,
+                                slash_prefix,
+                                ctx.skills_menu.items,
+                                match_idx,
+                                match_idx == layout.selected,
+                                column_widths,
+                                shell.layout.cols,
+                                ctx.input.slash_menu_categories,
+                            );
                         try pushFooterBandRow(alloc, &frame, plan, row, &slash_row);
                         row += 1;
                     }
@@ -982,9 +1004,6 @@ pub fn composeFooterFrame(
                         row += 1;
                     }
                 }
-            } else {
-                var status_row = try picker_presentation.composePickerStatusRow(alloc, .slash, ctx.model_picker_stage, false, false, input.picker_start_col, shell.layout.cols);
-                try pushFooterBandRow(alloc, &frame, plan, rows.picker_start, &status_row);
             }
         } else if (input.picker_kind == .file and input.file_picker_items.len > 0) {
             const selected = input.picker_selection_index % input.file_picker_items.len;
@@ -1278,11 +1297,6 @@ fn testContext(input: *const InputRuntime) render_input.RenderContext {
         .has_api_key = true,
         .model = "gpt-5.1",
         .queued_count = 0,
-        .subagent_count = 0,
-        .subagent_view_active = false,
-        .selected_subagent_id = null,
-        .selected_subagent_label = null,
-        .selected_subagent_status = null,
         .input = input,
     };
 }
@@ -2069,11 +2083,6 @@ test "footer paint plan keeps cursor visible during transient activity when inpu
         .has_api_key = true,
         .model = "gpt-5.1",
         .queued_count = 0,
-        .subagent_count = 0,
-        .subagent_view_active = false,
-        .selected_subagent_id = null,
-        .selected_subagent_label = null,
-        .selected_subagent_status = null,
         .input = &input,
     };
 
@@ -2105,7 +2114,7 @@ test "approval footer composition hides cursor while rendering command prompt" {
 
     var approval = ApprovalPrompt{};
     defer approval.deinit(alloc);
-    try std.testing.expect(try approval.syncRequest(alloc, .{ .label = "terminal.exec echo permission test" }));
+    try std.testing.expect(try approval.syncRequest(alloc, .{ .label = "shell.run echo permission test" }));
 
     var shell = TranscriptRuntime{
         .layout = .{
@@ -2129,11 +2138,6 @@ test "approval footer composition hides cursor while rendering command prompt" {
         .has_api_key = true,
         .model = "gpt-5.1",
         .queued_count = 0,
-        .subagent_count = 0,
-        .subagent_view_active = false,
-        .selected_subagent_id = null,
-        .selected_subagent_label = null,
-        .selected_subagent_status = null,
         .input = &input,
     };
     const request = approval.request.?.view();
@@ -2230,11 +2234,6 @@ test "footer paint plan keeps compact transient activity adjacent to footer" {
         .has_api_key = true,
         .model = "gpt-5.1",
         .queued_count = 0,
-        .subagent_count = 0,
-        .subagent_view_active = false,
-        .selected_subagent_id = null,
-        .selected_subagent_label = null,
-        .selected_subagent_status = null,
         .input = &input,
     };
     const selection: ViewportSelection = .{
@@ -2310,11 +2309,6 @@ test "footer paint plan owns reserved idle gap row without invalidation" {
         .has_api_key = true,
         .model = "gpt-5.1",
         .queued_count = 0,
-        .subagent_count = 0,
-        .subagent_view_active = false,
-        .selected_subagent_id = null,
-        .selected_subagent_label = null,
-        .selected_subagent_status = null,
         .input = &input,
     };
 
@@ -2366,11 +2360,6 @@ test "footer paint plan uses transcript preview for idle reservation" {
         .has_api_key = true,
         .model = "gpt-5.1",
         .queued_count = 0,
-        .subagent_count = 0,
-        .subagent_view_active = false,
-        .selected_subagent_id = null,
-        .selected_subagent_label = null,
-        .selected_subagent_status = null,
         .input = &input,
     };
 
@@ -2448,11 +2437,6 @@ test "footer paint plan keeps active tool in the transient band" {
         .has_api_key = true,
         .model = "gpt-5.1",
         .queued_count = 0,
-        .subagent_count = 0,
-        .subagent_view_active = false,
-        .selected_subagent_id = null,
-        .selected_subagent_label = null,
-        .selected_subagent_status = null,
         .activity = .{ .tool_slot = .{
             .entry_id = status_id,
             .fallback_label = "running read-only tools",
@@ -2517,11 +2501,6 @@ test "footer paint plan suppresses transient activity when footer clamps into it
         .has_api_key = true,
         .model = "gpt-5.1",
         .queued_count = 0,
-        .subagent_count = 0,
-        .subagent_view_active = false,
-        .selected_subagent_id = null,
-        .selected_subagent_label = null,
-        .selected_subagent_status = null,
         .input = &input,
     };
 

@@ -5,9 +5,7 @@ const app_session_runtime = @import("app_session_runtime.zig");
 const auto_upgrade = @import("../upgrade/auto_upgrade.zig");
 const acp_runner = @import("../cli/acp_runner.zig");
 const cli_surface = @import("../cli/cli_surface.zig");
-const background_process_provider = @import(
-    "../execution/background_process_provider.zig",
-);
+const process_provider = @import("../execution/process_provider.zig");
 const gateway_provider = @import("../gateway/gateway_provider.zig");
 const provider_set = @import("../gateway/provider_set.zig");
 const host = @import("../hosts/host.zig");
@@ -36,6 +34,35 @@ else
 
 const Allocator = std.mem.Allocator;
 
+const GracefulExitSigintGuard = if (host_target.is_wasm) struct {
+    fn install(_: bool) @This() {
+        return .{};
+    }
+
+    fn deinit(_: *@This()) void {}
+} else struct {
+    saved_action: ?std.posix.Sigaction = null,
+
+    fn install(enabled: bool) @This() {
+        if (!enabled) return .{};
+
+        const ignore_action: std.posix.Sigaction = .{
+            .handler = .{ .handler = std.posix.SIG.IGN },
+            .mask = std.posix.sigemptyset(),
+            .flags = 0,
+        };
+        var saved_action: std.posix.Sigaction = undefined;
+        std.posix.sigaction(std.posix.SIG.INT, &ignore_action, &saved_action);
+        return .{ .saved_action = saved_action };
+    }
+
+    fn deinit(self: *@This()) void {
+        const saved_action = self.saved_action orelse return;
+        std.posix.sigaction(std.posix.SIG.INT, &saved_action, null);
+        self.saved_action = null;
+    }
+};
+
 pub const Config = struct {
     version: []const u8 = "",
     revision: []const u8 = "",
@@ -48,8 +75,7 @@ pub const Config = struct {
     gateway_chat_url: []const u8,
     gateway_provider: gateway_provider.Provider,
     provider_set: provider_set.Set,
-    background_process_provider: background_process_provider.Provider =
-        background_process_provider.unavailable_provider,
+    process_provider: process_provider.Provider = process_provider.unavailable_provider,
     url_opener: host.UrlOpener,
     secret_store: host.SecretStore,
     prompt_policy: prompt_policy.Policy,
@@ -139,10 +165,6 @@ fn runWithDeps(comptime App: type, alloc: Allocator, args: []const [:0]const u8,
 }
 
 pub fn runBeforeInteractive(alloc: Allocator, args: []const [:0]const u8, cfg: Config) !BeforeInteractiveResult {
-    _ = cli_surface.recordRequested(args) catch {
-        writeStderr(.{}, cli_surface.record_modifier_usage);
-        return .{ .exit = 1 };
-    };
     const run_result = cli_surface.runIfRequested(alloc, args, cliSurfaceConfig(cfg)) catch |err| switch (err) {
         error.UnknownCliCommand => return .{ .exit = 1 },
         else => {
@@ -164,10 +186,6 @@ pub fn runNoConfigBeforeInteractive(
 }
 
 fn runBeforeInteractiveWithDeps(alloc: Allocator, args: []const [:0]const u8, cfg: Config, deps: RunDeps) !BeforeInteractiveResult {
-    _ = cli_surface.recordRequested(args) catch {
-        writeStderr(deps, cli_surface.record_modifier_usage);
-        return .{ .exit = 1 };
-    };
     const run_result = deps.run_if_requested(deps.cli_ctx, alloc, args, cliSurfaceConfig(cfg)) catch |err| switch (err) {
         error.UnknownCliCommand => return .{ .exit = 1 },
         else => {
@@ -255,7 +273,7 @@ fn runInteractiveWithDeps(comptime App: type, comptime cooperative: bool, alloc:
                 return .{ .exit = 1 };
             },
             error.OneOffSessionNotResumable => {
-                writeStderr(deps, "fx: one-off child sessions cannot accept additional prompts; create a persistent child to continue the conversation\n");
+                writeStderr(deps, "fx: subagent child sessions cannot be resumed directly; message the named agent from its parent session\n");
                 return .{ .exit = 1 };
             },
             error.InvalidSessionFormat => {
@@ -315,6 +333,10 @@ fn runInteractiveWithDeps(comptime App: type, comptime cooperative: bool, alloc:
         app.resumeHandoffColumns()
     else
         0;
+    var graceful_exit_sigint_guard = GracefulExitSigintGuard.install(
+        !cooperative and relaunch_request == null,
+    );
+    defer graceful_exit_sigint_guard.deinit();
     app_needs_deinit = false;
     const handoff_value = if (comptime cooperative) blk: {
         app.deinit();
@@ -366,7 +388,6 @@ fn runInteractiveWithDeps(comptime App: type, comptime cooperative: bool, alloc:
             try argv.append(alloc, "resume");
             try argv.append(alloc, handoff.session_id);
             try argv.append(alloc, cli_surface.upgrade_relaunch_arg);
-            if (launch.record_requested) try argv.append(alloc, "--record");
             const replace_err = deps.replace_process(
                 deps.replace_ctx,
                 io_mod.getIo(),
@@ -446,7 +467,7 @@ fn cliSurfaceConfig(cfg: Config) cli_surface.Config {
         .gateway_chat_url = cfg.gateway_chat_url,
         .gateway_provider = cfg.gateway_provider,
         .provider_set = cfg.provider_set,
-        .background_process_provider = cfg.background_process_provider,
+        .process_provider = cfg.process_provider,
         .url_opener = cfg.url_opener,
         .secret_store = cfg.secret_store,
         .prompt_policy = cfg.prompt_policy,
@@ -601,6 +622,11 @@ var test_events: [16][]const u8 = undefined;
 var test_event_count: usize = 0;
 var test_init_event_buf: [128]u8 = undefined;
 var active_capture: ?*TestCapture = null;
+var test_sigint_count = std.atomic.Value(usize).init(0);
+
+fn testSigintHandler(_: std.posix.SIG) callconv(.c) void {
+    _ = test_sigint_count.fetchAdd(1, .seq_cst);
+}
 
 fn resetTestEvents() void {
     test_event_count = 0;
@@ -647,6 +673,7 @@ const TestCapture = struct {
     record_stderr_event: bool = false,
     record_stdout_event: bool = false,
     resume_handoff_id: ?[]const u8 = null,
+    raise_sigint_during_deinit: bool = false,
     upgrade_relaunch_path: ?[]const u8 = null,
     replace_error: std.process.ReplaceError = error.InvalidExe,
     replace_calls: usize = 0,
@@ -786,6 +813,9 @@ const TestApp = struct {
             };
             break :blk .{ .session_id = session_id };
         } else null;
+        if (active_capture.?.raise_sigint_during_deinit) {
+            _ = std.c.raise(std.posix.SIG.INT);
+        }
         self.deinit();
         return handoff;
     }
@@ -862,10 +892,6 @@ test "app entry returns after handled CLI success without initializing app" {
     try std.testing.expect(capture.seen_config.?.provider_set.gateway.cli_model_catalog.?.fetch_fn == test_builtin_gateway.cli_model_catalog_provider.fetch_fn);
     try std.testing.expect(capture.seen_config.?.provider_set.gateway.fx_search.?.execute_fn == test_builtin_gateway.default_web_search_provider.execute_fn);
     try std.testing.expect(capture.seen_config.?.provider_set.gateway.model_catalog.?.fetch_fn == test_builtin_gateway.model_catalog_provider.fetch_fn);
-    try std.testing.expect(
-        capture.seen_config.?.background_process_provider.spawn_prepared_fn ==
-            cfg.background_process_provider.spawn_prepared_fn,
-    );
     try std.testing.expect(capture.seen_config.?.url_opener.context == cfg.url_opener.context);
     try std.testing.expect(capture.seen_config.?.url_opener.open_fn == cfg.url_opener.open_fn);
     try std.testing.expect(capture.seen_config.?.secret_store.context == cfg.secret_store.context);
@@ -961,6 +987,36 @@ test "app entry writes exact resume handoff after interactive teardown" {
     });
 }
 
+test "app entry bounds graceful-exit SIGINT suppression to handoff lifetime" {
+    const alloc = std.testing.allocator;
+    var original_action: std.posix.Sigaction = undefined;
+    const test_action: std.posix.Sigaction = .{
+        .handler = .{ .handler = testSigintHandler },
+        .mask = std.posix.sigemptyset(),
+        .flags = 0,
+    };
+    std.posix.sigaction(std.posix.SIG.INT, &test_action, &original_action);
+    defer std.posix.sigaction(std.posix.SIG.INT, &original_action, null);
+    test_sigint_count.store(0, .seq_cst);
+
+    var capture = TestCapture.init(.{ .interactive = .{} });
+    defer capture.deinit();
+    capture.resume_handoff_id = "session-123";
+    capture.raise_sigint_during_deinit = true;
+
+    const outcome = try runWithDeps(TestApp, alloc, &.{}, testConfig(), capture.deps());
+
+    try std.testing.expectEqual(RunOutcome.returned, outcome);
+    try std.testing.expectEqualStrings(
+        "Continue session with: fx --resume session-123\n",
+        capture.stdout.written(),
+    );
+    try std.testing.expectEqual(@as(usize, 0), test_sigint_count.load(.seq_cst));
+
+    _ = std.c.raise(std.posix.SIG.INT);
+    try std.testing.expectEqual(@as(usize, 1), test_sigint_count.load(.seq_cst));
+}
+
 test "app entry relaunches only after teardown with the validated handoff" {
     const alloc = std.testing.allocator;
     var capture = TestCapture.init(.{ .interactive = .{} });
@@ -1022,7 +1078,6 @@ test "app entry preserves launch controls across upgrade relaunch" {
     directories[0] = try alloc.dupe(u8, "/tmp/fx-extra");
     const state_home = try alloc.dupe(u8, "/tmp/fx-state");
     var capture = TestCapture.init(.{ .interactive = .{
-        .record_requested = true,
         .modifiers = .{
             .context_limit_overrides = overrides,
             .additional_directories = directories,
@@ -1055,7 +1110,6 @@ test "app entry preserves launch controls across upgrade relaunch" {
         "resume",
         "session-123",
         "--upgrade-relaunch",
-        "--record",
     };
     try std.testing.expectEqual(expected.len, capture.replace_arg_count);
     for (expected, 0..) |arg, index| {
@@ -1312,7 +1366,7 @@ test "app entry maps unavailable session state to one expected startup failure" 
         },
         .{
             .init_error = error.OneOffSessionNotResumable,
-            .message = "fx: one-off child sessions cannot accept additional prompts; create a persistent child to continue the conversation\n",
+            .message = "fx: subagent child sessions cannot be resumed directly; message the named agent from its parent session\n",
         },
     };
 

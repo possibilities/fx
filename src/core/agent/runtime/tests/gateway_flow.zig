@@ -58,10 +58,10 @@ const vision_and_read_file_tools = [_]tool_dispatch.Tool{
 const vision_read_and_terminal_tools = [_]tool_dispatch.Tool{
     builtin_tools.vision,
     builtin_tools.read_file,
-    builtin_tools.terminal,
+    builtin_tools.shell,
 };
-const terminal_advertised_names = [_][]const u8{"terminal"};
-const terminal_advertised_functions = [_]model_tool_schema.FunctionSchema{builtin_tools.terminal.model_schema};
+const terminal_advertised_names = [_][]const u8{"shell"};
+const terminal_advertised_functions = [_]model_tool_schema.FunctionSchema{builtin_tools.shell.model_schema};
 
 const VisionAndReadExecutor = struct {
     vision: ExecuteDelegate,
@@ -607,7 +607,7 @@ test "processQueuedPrompt gates text-only images through the real Vision runtime
     try std.testing.expectEqualStrings("Final selected-model answer", hooks.finish_assistant_text.?);
 }
 
-test "processQueuedPrompt recovers when a model rejects post-Vision assistant prefill" {
+test "processQueuedPrompt post-Vision decision prompt leaves the selected-model request ending in user guidance" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -622,13 +622,9 @@ test "processQueuedPrompt recovers when a model rejects post-Vision assistant pr
         "vision",
         "{\"image_ids\":[1],\"focus\":\"describe the image\"}",
     )};
-    const prefill_rejection =
-        "{\"error\":{\"message\":\"AI_APICallError: This model does not support " ++
-        "assistant message prefill. The conversation must end with a user message.\"}}";
     const completions = [_]FakeCompletion{
         .{ .tool_calls = &calls },
         .{ .content = "{\"images\":[{\"image_id\":1,\"status\":\"ok\",\"summary\":\"FX logo\",\"visible_text\":[],\"details\":[]}] }" },
-        .{ .status = .bad_request, .err_body = prefill_rejection },
         .{ .content = "Recovered final answer" },
     };
     var gateway = FakeGateway.init(alloc, &completions);
@@ -648,18 +644,12 @@ test "processQueuedPrompt recovers when a model rejects post-Vision assistant pr
 
     try runFakePrompt(&gateway, &hooks, fixture.config(), job);
 
-    try std.testing.expectEqual(@as(usize, 4), gateway.request_bodies.items.len);
+    try std.testing.expectEqual(@as(usize, 3), gateway.request_bodies.items.len);
     try expectGatewayPromptTailText(
         &gateway,
         2,
-        .tool,
-        "FX logo",
-    );
-    try expectGatewayPromptTailText(
-        &gateway,
-        3,
         .user,
-        "Continue from the preceding tool result.",
+        "Continue the original task. If work remains and you can proceed, briefly tell the user what you are doing next, then perform that action with the appropriate tool. Do not end the turn with only a progress update. If the task is complete, respond with the result. If a genuine blocker prevents further action, explain the blocker and what is needed to continue.",
     );
     try std.testing.expectEqual(@as(?std.http.Status, null), hooks.http_status);
     try std.testing.expectEqualStrings("Recovered final answer", hooks.finish_assistant_text.?);
@@ -969,10 +959,10 @@ test "required Vision rejects non-Vision before effects and stays required until
     var images = [_]types.ImageAttachment{image};
 
     const wrapped_terminal_arguments =
-        "{\"request\":{\"action\":\"exec\",\"command\":\"printf must-not-run\"}}";
+        "{\"request\":{\"action\":\"run\",\"command\":\"printf must-not-run\"}}";
     const blocked_calls = [_]ToolCall{toolCall(
         "call_terminal_while_vision_required",
-        "terminal",
+        "shell",
         wrapped_terminal_arguments,
     )};
     const vision_calls = [_]ToolCall{toolCall(
@@ -1074,7 +1064,7 @@ test "required Vision rejects non-Vision before effects and stays required until
         "call_terminal_while_vision_required",
     );
     try std.testing.expectEqual(@as(usize, 1), hooks.rejected_names.items.len);
-    try std.testing.expectEqualStrings("terminal", hooks.rejected_names.items[0]);
+    try std.testing.expectEqualStrings("shell", hooks.rejected_names.items[0]);
     try std.testing.expectEqual(@as(usize, 1), vision_runtime.execution_count);
     var persisted_arguments: ?[]const u8 = null;
     for (hooks.history_turns.items) |turn| {
@@ -2326,6 +2316,7 @@ test "processQueuedPrompt keeps native image parts for vision route model" {
     const capability_overrides = [_]ModelCapabilityOverride{.{
         .model = "google/gemini-2.5-flash",
         .capabilities = .{
+            .image_input_support = .native,
             .supports_vision = true,
             .supports_file_input = true,
         },
@@ -2364,7 +2355,7 @@ test "processQueuedPrompt never uses the vision fallback for Codex" {
     var images = [_]types.ImageAttachment{image};
     const capability_overrides = [_]ModelCapabilityOverride{.{
         .model = "gpt-5.6-sol",
-        .capabilities = .{},
+        .capabilities = .{ .image_input_support = .non_native },
     }};
     var gateway = FakeGateway.init(alloc, &.{});
     defer gateway.deinit();
@@ -2416,6 +2407,7 @@ test "processQueuedPrompt routes images natively only when vision and file input
         const capability_overrides = [_]ModelCapabilityOverride{.{
             .model = model,
             .capabilities = .{
+                .image_input_support = if (entry.expect_native) .native else .non_native,
                 .supports_vision = entry.supports_vision,
                 .supports_file_input = entry.supports_file_input,
             },
@@ -2461,7 +2453,7 @@ test "processQueuedPrompt routes images natively only when vision and file input
             try std.testing.expectEqual(@as(usize, 1), gateway.request_bodies.items.len);
             try expectBodyContains(&gateway, 0, "\"type\":\"file\"");
             try expectBodyContains(&gateway, 0, "iVBORw0KGgpmaXh0dXJlIGltYWdlIGJ5dGVz");
-            try expectBodyContains(&gateway, 0, "\"name\":\"vision\"");
+            try expectBodyNotContains(&gateway, 0, "\"name\":\"vision\"");
             try std.testing.expectEqualStrings("Native route answer", hooks.finish_assistant_text.?);
         } else {
             try std.testing.expectEqual(@as(usize, 3), gateway.request_bodies.items.len);
@@ -2482,7 +2474,7 @@ test "processQueuedPrompt routes images natively only when vision and file input
     }
 }
 
-test "processQueuedPrompt rejects native-route attachment ID Vision calls before permission or execution" {
+test "processQueuedPrompt rejects unadvertised native-route Vision calls before permission or execution" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -2507,6 +2499,7 @@ test "processQueuedPrompt rejects native-route attachment ID Vision calls before
     const capability_overrides = [_]ModelCapabilityOverride{.{
         .model = "native/test-vision",
         .capabilities = .{
+            .image_input_support = .native,
             .supports_vision = true,
             .supports_file_input = true,
         },
@@ -2532,7 +2525,7 @@ test "processQueuedPrompt rejects native-route attachment ID Vision calls before
     try std.testing.expectEqualStrings("native/test-vision", gateway.request_models.items[0]);
     try std.testing.expectEqualStrings("native/test-vision", gateway.request_models.items[1]);
     try expectBodyContains(&gateway, 0, "\"type\":\"file\"");
-    try expectBodyContains(&gateway, 0, "\"name\":\"vision\"");
+    try expectBodyNotContains(&gateway, 0, "\"name\":\"vision\"");
     try expectBodyNotContains(&gateway, 1, image_path);
     try std.testing.expectEqual(@as(usize, 0), hooks.permission_names.items.len);
     try std.testing.expectEqual(@as(usize, 0), hooks.executed_names.items.len);
@@ -3314,10 +3307,9 @@ test "processQueuedPrompt places transient overlay before history and current pr
     hooks.static_context_text = "static project context unique";
     hooks.runtime_context_text = "runtime tail context unique";
 
-    var history = [_]HistoryTurn{.{ .background_command = .{
+    var history = [_]HistoryTurn{.{ .assistant = .{
         .user = .{ .text = @constCast("past background prompt") },
-        .log_path = @constCast("/tmp/past-background.log"),
-        .expect_url = false,
+        .assistant = @constCast("historical command is no longer owned"),
     } }};
     var fixture = PromptFixture{};
     var job = fixture.job();
@@ -3375,7 +3367,7 @@ test "processQueuedPrompt keeps supplied system prompt components in stable orde
 
     try std.testing.expectEqual(@as(usize, 2), gateway.request_bodies.items.len);
     const first_roles = [_]types.ChatRole{ .system, .system, .system, .system, .system, .system, .user, .assistant, .user };
-    const second_roles = [_]types.ChatRole{ .system, .system, .system, .system, .system, .system, .user, .assistant, .user, .assistant, .tool };
+    const second_roles = [_]types.ChatRole{ .system, .system, .system, .system, .system, .system, .user, .assistant, .user, .assistant, .tool, .user };
     try expectGatewayPromptRoles(&gateway, 0, &first_roles);
     try expectGatewayPromptRoles(&gateway, 1, &second_roles);
     inline for (&.{ @as(usize, 0), @as(usize, 1) }) |request_index| {
@@ -3397,6 +3389,7 @@ test "processQueuedPrompt keeps supplied system prompt components in stable orde
         };
         try expectBodyContainsInOrder(&gateway, request_index, &order);
     }
+    try expectGatewayPromptTailText(&gateway, 1, .user, "Continue the original task. If work remains and you can proceed, briefly tell the user what you are doing next, then perform that action with the appropriate tool. Do not end the turn with only a progress update. If the task is complete, respond with the result. If a genuine blocker prevents further action, explain the blocker and what is needed to continue.");
 
     try std.testing.expectEqual(@as(usize, 1), hooks.history_turns.items.len);
     const persisted = hooks.history_turns.items[0].assistant;
@@ -3450,11 +3443,12 @@ test "processQueuedPrompt refreshes runtime overlay each step and preserves turn
     try expectBodyContains(&gateway, 1, "\"toolName\":\"read_file\"");
     try expectBodyContains(&gateway, 1, "\"value\":\"ok\"");
     const first_request_roles = [_]types.ChatRole{ .system, .system, .user };
-    const second_request_roles = [_]types.ChatRole{ .system, .system, .user, .assistant, .tool };
+    const second_request_roles = [_]types.ChatRole{ .system, .system, .user, .assistant, .tool, .user };
     try expectGatewayPromptRoles(&gateway, 0, &first_request_roles);
     try expectGatewayPromptRoles(&gateway, 1, &second_request_roles);
     const second_request_order = [_][]const u8{ "runtime overlay step two", "user prompt", "Checking.", "\"value\":\"ok\"" };
     try expectBodyContainsInOrder(&gateway, 1, &second_request_order);
+    try expectGatewayPromptTailText(&gateway, 1, .user, "Continue the original task. If work remains and you can proceed, briefly tell the user what you are doing next, then perform that action with the appropriate tool. Do not end the turn with only a progress update. If the task is complete, respond with the result. If a genuine blocker prevents further action, explain the blocker and what is needed to continue.");
 }
 
 test "processQueuedPrompt refreshes and acknowledges parent deliveries for each tool step" {
@@ -3612,48 +3606,6 @@ test "processQueuedPrompt delivers parent context created between tool steps" {
     try expectBodyContains(&first_gateway, 1, "late child delivery");
 }
 
-test "processQueuedPrompt blocks accidental terminal restart of non-live background history" {
-    const alloc = std.testing.allocator;
-    const command = "while true; do echo labs7; sleep 1; done";
-    const args = "{\"action\":\"start\",\"command\":\"while true; do echo labs7; sleep 1; done\"}";
-    const calls = [_]ToolCall{toolCall("call_restart", "terminal", args)};
-    const completions = [_]FakeCompletion{
-        .{ .content = "I will check it.", .tool_calls = &calls },
-        .{ .content = "No." },
-    };
-    var gateway = FakeGateway.init(alloc, &completions);
-    defer gateway.deinit();
-    var hooks = FakeAgentRuntimeDeps.init(alloc);
-    defer hooks.deinit();
-    hooks.runtime_context_text =
-        "Runtime context: previous background command history includes command(s) that are no longer live. Treat these as terminal historical records, not running tasks.\n" ++
-        "- command=while true; do echo labs7; sleep 1; done; log=/tmp/labs7.log; state=stopped\n" ++
-        "For any listed command, answer liveness questions from this state; do not assume it is still running or reuse it as a live background task. Restart a listed command only if the user explicitly asks.";
-
-    var fixture = PromptFixture{};
-    var job = fixture.job();
-    job.prompt = @constCast("Is the background command you just started still running? Do not run or restart it unless I ask.");
-    job.permission_mode = .auto;
-
-    try runFakePrompt(&gateway, &hooks, fixture.config(), job);
-
-    try std.testing.expectEqual(@as(usize, 0), hooks.executed_names.items.len);
-    try std.testing.expectEqual(@as(usize, 3), hooks.lifecycle_events.items.len);
-    try std.testing.expect(hooks.lifecycle_events.items[0] == .authoritative_started);
-    try std.testing.expect(hooks.lifecycle_events.items[1] == .progress);
-    try std.testing.expectEqual(
-        types.ToolOutcomeKind.denied,
-        hooks.lifecycle_events.items[2].terminal.outcome.kind,
-    );
-    try std.testing.expectEqualStrings("No.", hooks.finish_assistant_text.?);
-    try expectBodyContains(
-        &gateway,
-        1,
-        "Blocked restarting non-live background command from history",
-    );
-    try expectBodyContains(&gateway, 1, command);
-}
-
 test "processQueuedPrompt projects history exactly once into each gateway request" {
     const alloc = std.testing.allocator;
     var history = [_]HistoryTurn{.{ .assistant = .{
@@ -3677,7 +3629,7 @@ test "processQueuedPrompt projects history exactly once into each gateway reques
 
     try std.testing.expectEqual(@as(usize, 2), gateway.request_bodies.items.len);
     const first_request_roles = [_]types.ChatRole{ .system, .user, .assistant, .user };
-    const second_request_roles = [_]types.ChatRole{ .system, .user, .assistant, .user, .assistant, .tool };
+    const second_request_roles = [_]types.ChatRole{ .system, .user, .assistant, .user, .assistant, .tool, .user };
     try expectGatewayPromptRoles(&gateway, 0, &first_request_roles);
     try expectGatewayPromptRoles(&gateway, 1, &second_request_roles);
     for (0..gateway.request_bodies.items.len) |i| {
@@ -3685,6 +3637,7 @@ test "processQueuedPrompt projects history exactly once into each gateway reques
         try expectGatewayPromptTextCount(&gateway, i, "past assistant unique history needle", 1);
         try expectGatewayPromptTextCount(&gateway, i, "user prompt", 1);
     }
+    try expectGatewayPromptTailText(&gateway, 1, .user, "Continue the original task. If work remains and you can proceed, briefly tell the user what you are doing next, then perform that action with the appropriate tool. Do not end the turn with only a progress update. If the task is complete, respond with the result. If a genuine blocker prevents further action, explain the blocker and what is needed to continue.");
 }
 
 test "processQueuedPrompt keeps completed history before the final current user prompt" {
@@ -3790,6 +3743,7 @@ test "processQueuedPrompt pauses when uncertain tool reconciliation returns anot
 
 test "processQueuedPrompt preserves a confirmed provider tool result across recovery" {
     const alloc = std.testing.allocator;
+    const decision_prompt = "Continue the original task. If work remains and you can proceed, briefly tell the user what you are doing next, then perform that action with the appropriate tool. Do not end the turn with only a progress update. If the task is complete, respond with the result. If a genuine blocker prevents further action, explain the blocker and what is needed to continue.";
     const calls = [_]ToolCall{.{
         .id = "provider_search_1",
         .name = "perplexity_search",
@@ -3824,6 +3778,17 @@ test "processQueuedPrompt preserves a confirmed provider tool result across reco
     try expectBodyContains(&gateway, 1, "provider_search_1");
     try expectBodyContains(&gateway, 1, "exact provider evidence");
     try expectBodyContains(&gateway, 1, "confirmed tool result");
+    try expectGatewayPromptTailText(
+        &gateway,
+        1,
+        .system,
+        "confirmed tool result",
+    );
+    try expectGatewayPromptTextCount(&gateway, 1, decision_prompt, 1);
+    try expectBodyContainsInOrder(&gateway, 1, &.{
+        decision_prompt,
+        "confirmed tool result",
+    });
     const execution = hooks.history_turns.items[0].assistant.execution;
     try std.testing.expectEqual(@as(usize, 1), execution.tool_steps.len);
     try std.testing.expectEqual(@as(usize, 1), execution.tool_steps[0].tool_results.len);
@@ -3868,6 +3833,17 @@ test "processQueuedPrompt preserves a confirmed provider tool result across reco
 
     try expectBodyContains(&restored_gateway, 0, "provider_search_1");
     try expectBodyContains(&restored_gateway, 0, "exact provider evidence");
+    try expectGatewayPromptTailText(
+        &restored_gateway,
+        0,
+        .system,
+        "confirmed tool result",
+    );
+    try expectGatewayPromptTextCount(&restored_gateway, 0, decision_prompt, 1);
+    try expectBodyContainsInOrder(&restored_gateway, 0, &.{
+        decision_prompt,
+        "confirmed tool result",
+    });
 }
 
 test "processQueuedPrompt preserves the provider-executed subset of mixed failed tools" {
@@ -3953,6 +3929,7 @@ test "processQueuedPrompt pauses uncertain tool recovery with an inspection acti
 
 test "processQueuedPrompt suppresses a repeated confirmed provider tool identity" {
     const alloc = std.testing.allocator;
+    const decision_prompt = "Continue the original task. If work remains and you can proceed, briefly tell the user what you are doing next, then perform that action with the appropriate tool. Do not end the turn with only a progress update. If the task is complete, respond with the result. If a genuine blocker prevents further action, explain the blocker and what is needed to continue.";
     const calls = [_]ToolCall{.{
         .id = "provider_search_repeat",
         .name = "perplexity_search",
@@ -3977,6 +3954,14 @@ test "processQueuedPrompt suppresses a repeated confirmed provider tool identity
 
     try std.testing.expectEqual(@as(usize, 3), gateway.request_models.items.len);
     try std.testing.expectEqual(@as(usize, 0), hooks.executed_names.items.len);
+    try expectGatewayPromptTailText(&gateway, 1, .system, "confirmed tool result");
+    try expectGatewayPromptTextCount(&gateway, 1, decision_prompt, 1);
+    try expectBodyContainsInOrder(&gateway, 1, &.{
+        decision_prompt,
+        "confirmed tool result",
+    });
+    try expectGatewayPromptTailText(&gateway, 2, .user, decision_prompt);
+    try expectGatewayPromptTextCount(&gateway, 2, decision_prompt, 1);
     const execution = hooks.history_turns.items[0].assistant.execution;
     try std.testing.expectEqual(@as(usize, 1), execution.tool_steps.len);
     try std.testing.expectEqual(@as(usize, 1), execution.tool_steps[0].tool_results.len);
@@ -4044,6 +4029,38 @@ test "processQueuedPrompt retries replay-safe provider errors before success" {
     try expectRouteStatus(&hooks, 2, .auto_retry, "⚠ Provider unavailable · provider_error: route failed twice · retrying request in 1s · attempt 2/3");
     try expectRouteStatus(&hooks, 3, .auto_retry, "⚠ Provider unavailable · provider_error: route failed twice · retrying request · attempt 3/3");
     try expectRouteStatus(&hooks, 4, .auto_recovered, "✓ recovered · succeeded on attempt 3/3");
+}
+
+test "processQueuedPrompt keeps recovery system last after post-tool provider error" {
+    const alloc = std.testing.allocator;
+    const decision_prompt = "Continue the original task. If work remains and you can proceed, briefly tell the user what you are doing next, then perform that action with the appropriate tool. Do not end the turn with only a progress update. If the task is complete, respond with the result. If a genuine blocker prevents further action, explain the blocker and what is needed to continue.";
+    const calls = [_]ToolCall{toolCall("call_read", "read_file", "{\"path\":\"a\"}")};
+    const completions = [_]FakeCompletion{
+        .{ .tool_calls = &calls, .finish_reason = .tool_calls },
+        .{ .finish_reason = .provider_error, .provider_failure_detail = "route failed after tool" },
+        .{ .content = "Recovered after tool" },
+    };
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    var fixture = PromptFixture{};
+    var config = fixture.config();
+    config.gateway_retry_count = 1;
+    config.max_provider_attempts = 2;
+
+    try runFakePrompt(&gateway, &hooks, config, fixture.job());
+
+    try std.testing.expectEqual(@as(usize, 3), gateway.request_bodies.items.len);
+    const retry_roles = [_]types.ChatRole{ .system, .user, .assistant, .tool, .user, .system };
+    try expectGatewayPromptRoles(&gateway, 2, &retry_roles);
+    try expectGatewayPromptTextCount(&gateway, 2, decision_prompt, 1);
+    try expectBodyContainsInOrder(&gateway, 2, &.{
+        decision_prompt,
+        "<network_recovery>",
+    });
+    try std.testing.expectEqual(@as(usize, 1), hooks.executed_names.items.len);
+    try std.testing.expectEqualStrings("read_file", hooks.executed_names.items[0]);
 }
 
 test "processQueuedPrompt masks and terminal-encodes provider diagnostics" {
@@ -4630,6 +4647,7 @@ test "processQueuedPrompt fails closed without stable credential authority" {
 
 test "processQueuedPrompt counts only failed provider attempts across tool followups" {
     const alloc = std.testing.allocator;
+    const decision_prompt = "Continue the original task. If work remains and you can proceed, briefly tell the user what you are doing next, then perform that action with the appropriate tool. Do not end the turn with only a progress update. If the task is complete, respond with the result. If a genuine blocker prevents further action, explain the blocker and what is needed to continue.";
     const first_calls = [_]ToolCall{
         toolCall("call_first", "read_file", "{\"path\":\"first.txt\"}"),
     };
@@ -4680,6 +4698,22 @@ test "processQueuedPrompt counts only failed provider attempts across tool follo
     try std.testing.expectEqual(@as(usize, 1), continued_gateway.request_models.items.len);
     try expectBodyContains(&continued_gateway, 0, "call_first");
     try expectBodyContains(&continued_gateway, 0, "Re-run the response for the same user request.");
+    try expectGatewayPromptTailText(
+        &continued_gateway,
+        0,
+        .system,
+        "Re-run the response for the same user request.",
+    );
+    try expectGatewayPromptTextCount(
+        &continued_gateway,
+        0,
+        decision_prompt,
+        1,
+    );
+    try expectBodyContainsInOrder(&continued_gateway, 0, &.{
+        decision_prompt,
+        "Re-run the response for the same user request.",
+    });
     try std.testing.expectEqualStrings("Finished after Continue", continued_hooks.history_assistant_text.?);
 }
 

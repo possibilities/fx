@@ -2199,11 +2199,6 @@ test "permissionTargetForCall covers active target kinds" {
             .expected = app_file,
         },
         .{
-            .call = .{ .id = "memory", .name = "memory", .arguments_json = "{\"action\":\"list\"}" },
-            .target_kind = .none,
-            .expected = "memory",
-        },
-        .{
             .call = .{ .id = "ask", .name = "ask_user_question", .arguments_json = "{}" },
             .target_kind = .none,
             .expected = "ask_user_question",

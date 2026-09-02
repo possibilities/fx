@@ -12,6 +12,7 @@ const acp_types = @import("types.zig");
 const server = @import("server.zig");
 const sessions = @import("sessions.zig");
 const agent_runtime = @import("../core/agent/agent_runtime.zig");
+const agent_execution_memory = @import("../core/agent/execution_memory.zig");
 const diff_mod = @import("../core/output/diff.zig");
 const file_mutation = @import("../core/tooling/file_mutation.zig");
 const file_mutation_contract = @import("../core/tooling/file_mutation_contract.zig");
@@ -32,7 +33,6 @@ const subagent_agent_adapter = @import("../core/subagent/agent_adapter.zig");
 const subagent_domain = @import("../core/subagent/domain.zig");
 const subagent_execution = @import("../core/subagent/execution.zig");
 const subagent_resume_admission = @import("../core/subagent/resume_admission.zig");
-const parent_delivery_projector = @import("../core/subagent/parent_delivery_projector.zig");
 const usage_recovery = @import("../core/session/usage_recovery.zig");
 const skill_runtime = @import("../core/skills/skill_runtime.zig");
 const skill_invocation = @import("../core/skills/skill_invocation.zig");
@@ -84,6 +84,12 @@ pub const TerminalOutcome = union(enum) {
     rpc_error: jsonrpc.RpcError,
 };
 
+const ProviderTerminalPublication = enum {
+    not_applicable,
+    pending,
+    published,
+};
+
 const AcpContext = struct {
     alloc: Allocator,
     state: *server.ServerState,
@@ -91,7 +97,7 @@ const AcpContext = struct {
     /// Tool-call IDs already announced with a pending update. Keys are owned
     /// copies of provider call ids so the ID stays stable from permission
     /// review through execution.
-    published_tool_calls: std.StringHashMapUnmanaged(void) = .empty,
+    published_tool_calls: std.StringHashMapUnmanaged(ProviderTerminalPublication) = .empty,
     stop_reason: acp_types.StopReason = .end_turn,
     auto_classifier: permission_auto_classifier.Classifier =
         permission_auto_classifier.Classifier.disabled(),
@@ -99,6 +105,7 @@ const AcpContext = struct {
     /// session/set_mode changes never mutate a running turn.
     captured_mode: ?[]const u8 = null,
     captured_permission_mode: ?PermissionMode = null,
+    retain_external_root_user_turn: bool = false,
 
     fn deinitPublishedToolCalls(self: *AcpContext) void {
         var keys = self.published_tool_calls.keyIterator();
@@ -147,16 +154,53 @@ const AcpContext = struct {
         if (self.published_tool_calls.getKey(call.id)) |published| return published;
         const registry = self.toolRegistry();
         const title = describeToolTitle(registry, arena, call) catch "Tool call";
-        const kind = mapToolKind(call.name);
+        const name = acpToolName(call.name);
+        const kind = mapToolKind(name);
+        const masked_arguments = try agent_execution_memory.redactToolArgumentsJson(
+            arena,
+            call.name,
+            call.arguments_json,
+        );
+        defer arena.free(masked_arguments);
+        var parsed_arguments: ?std.json.Parsed(std.json.Value) = std.json.parseFromSlice(
+            std.json.Value,
+            arena,
+            masked_arguments,
+            .{},
+        ) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => null,
+        };
+        defer if (parsed_arguments) |*parsed| parsed.deinit();
+        const raw_input = if (parsed_arguments) |*parsed| parsed.value else null;
 
+        try self.published_tool_calls.ensureUnusedCapacity(self.alloc, 1);
         const owned_id = try self.alloc.dupe(u8, call.id);
         errdefer self.alloc.free(owned_id);
         var out: std.Io.Writer.Allocating = .init(self.alloc);
         defer out.deinit();
-        try acp_types.writeToolCall(&out.writer, owned_id, title, kind, .pending);
+        try acp_types.writeToolCall(&out.writer, owned_id, name, title, kind, .pending, raw_input);
         try self.sendUpdate(out.writer.buffered());
-        try self.published_tool_calls.put(self.alloc, owned_id, {});
+        self.published_tool_calls.putAssumeCapacity(
+            owned_id,
+            if (tool_presentation.isProviderSearchAlias(call.name)) .pending else .not_applicable,
+        );
         return owned_id;
+    }
+
+    fn sendProviderTerminal(self: *AcpContext, tool_call_id: []const u8, outcome: types.ToolOutcome) !void {
+        const publication = self.published_tool_calls.getPtr(tool_call_id) orelse return;
+        if (publication.* != .pending) return;
+        const status = providerTerminalStatus(outcome.kind) orelse return;
+
+        switch (status) {
+            .completed => try self.sendToolCallCompletedWithCommandResult(tool_call_id, "Web search completed", null),
+            .failed => try self.sendToolCallErrorWithCommandResult(tool_call_id, "Web search failed", null),
+            .pending, .in_progress => unreachable,
+        }
+        const updated = self.published_tool_calls.getPtr(tool_call_id) orelse
+            return error.ToolCallPublicationStateLost;
+        updated.* = .published;
     }
 
     fn sendToolCallProgressText(self: *AcpContext, tool_call_id: []const u8, text: ?[]const u8) !void {
@@ -260,7 +304,6 @@ const AcpContext = struct {
                 .retain_grant_fn = retainAcpGrant,
             } else null,
             .cancel_flag = &session.cancel_flag,
-            .background = &self.state.background,
             .session = &session.session_rt,
             .session_allocator = self.alloc,
             .skills_dir = self.state.skills.dir,
@@ -271,13 +314,13 @@ const AcpContext = struct {
             .on_output_chunk = onCommandOutputChunk,
             .mcp_progress_ctx = @ptrCast(self),
             .on_mcp_progress = onMcpProgress,
-            .background_url_ctx = @ptrCast(self),
-            .on_background_url_ready = onBackgroundUrlReady,
             .session_child_capability = if (session.writable) |*writable|
                 writable.childCapability() catch null
             else
                 null,
             .terminal_client = &self.state.terminal_client,
+            .managed_executions = &self.state.managed_executions,
+            .ephemeral_command_replay = self.state.managed_executions.replayStore(),
             .web_fetch_runtime = &self.state.web_fetch_runtime,
             .web_fetch_artifact_store = session.session_rt.webFetchArtifactStore(),
             .web_fetch_artifact_error = session.session_rt.webFetchArtifactError(),
@@ -535,18 +578,19 @@ pub fn handlePrompt(
     });
     defer tool_projection.deinit(alloc);
 
-    var bounded_skills = try state.skills.buildBoundedSystemPromptSection(alloc, state.context_limits);
+    const owned_prompt = try alloc.dupe(
+        u8,
+        if (recovery_checkpoint) |checkpoint| checkpoint.user.text else prompt_text,
+    );
+    defer alloc.free(owned_prompt);
+
+    var bounded_skills = try state.skills.buildRoutedSystemPromptSection(alloc, owned_prompt, state.context_limits);
     defer bounded_skills.deinit(alloc);
     if (bounded_skills.notice) |notice| try pushContextNotice(@ptrCast(&ctx), notice);
     if (bounded_skills.diagnostic_notice) |notice| try pushContextNotice(@ptrCast(&ctx), notice);
     for (state.context_snapshot.notices) |notice| try pushContextNotice(@ptrCast(&ctx), notice);
     const skills_section = bounded_skills.text;
 
-    const owned_prompt = try alloc.dupe(
-        u8,
-        if (recovery_checkpoint) |checkpoint| checkpoint.user.text else prompt_text,
-    );
-    defer alloc.free(owned_prompt);
     var explicit_skills = try skill_invocation.buildExplicitPromptSection(
         alloc,
         .{ .skills = state.skills.items, .diagnostics = state.skills.diagnostics },
@@ -619,13 +663,19 @@ pub fn handlePrompt(
     }
     defer session.session_rt.usage.configureCheckpointSink(null);
     const deps = agentRuntimeDeps(&ctx);
+    const current_prompt_is_root_authority = if (session.writable) |writable|
+        writable.external_prompt_origin == .persistent_child and
+            recovery_checkpoint == null
+    else
+        false;
+    ctx.retain_external_root_user_turn = current_prompt_is_root_authority;
     var agent_config = buildAgentConfig(state, session, .{
         .skills_prompt_section = skills_section,
         .explicit_skills_prompt_section = explicit_skills.text,
         .advertised_tool_names = tool_projection.advertised_names,
         .advertised_functions = tool_projection.advertised_functions,
         .custom_tool_guidance = tool_projection.custom_guidance,
-    });
+    }, current_prompt_is_root_authority);
     agent_config.session_child_capability = if (session.writable) |*writable|
         writable.childCapability() catch null
     else
@@ -692,8 +742,9 @@ pub fn runSubagentChild(
         },
     ) catch return error.OutOfMemory;
     defer child_projection.deinit(alloc);
-    var bounded_skills = state.skills.buildBoundedSystemPromptSection(
+    var bounded_skills = state.skills.buildRoutedSystemPromptSection(
         alloc,
+        message.content,
         state.context_limits,
     ) catch return error.OutOfMemory;
     defer bounded_skills.deinit(alloc);
@@ -755,7 +806,12 @@ const AgentConfigSections = struct {
     custom_tool_guidance: []const u8,
 };
 
-fn buildAgentConfig(state: *server.ServerState, session: *server.ActiveSessionState, sections: AgentConfigSections) agent_runtime.Config {
+fn buildAgentConfig(
+    state: *server.ServerState,
+    session: *server.ActiveSessionState,
+    sections: AgentConfigSections,
+    current_prompt_is_external: bool,
+) agent_runtime.Config {
     return .{
         .system_prompt = state.cfg.prompt_policy.system_prompt,
         .model_prompt_overlay = state.cfg.prompt_policy.modelPromptOverlay(session.model),
@@ -788,7 +844,8 @@ fn buildAgentConfig(state: *server.ServerState, session: *server.ActiveSessionSt
         else
             false,
         .current_prompt_is_root_authority = if (session.writable) |writable|
-            writable.external_prompt_origin == .persistent_child
+            writable.external_prompt_origin == .persistent_child and
+                current_prompt_is_external
         else
             false,
         .context_limits = state.context_limits,
@@ -985,8 +1042,6 @@ fn agentRuntimeDeps(ctx: *AcpContext) agent_runtime.AgentRuntimeDeps {
         .context_enabled = ctx.state.context_enabled,
         .finalize_turn = finalizeTurn,
         .release_agent_terminal_lease = releaseAgentTerminalLease,
-        .prepare_parent_turn_context = prepareParentTurnContext,
-        .acknowledge_parent_turn_context = acknowledgeParentTurnContext,
         .append_runtime_context = appendRuntimeContext,
         .append_static_context = appendStaticContext,
         .validate_tool_call = validateToolCall,
@@ -1161,43 +1216,7 @@ fn appendRuntimeContext(raw_ctx: *anyopaque, arena: Allocator, messages: *std.Ar
         .interactive = false,
         .permission_mode = ctx.captured_permission_mode orelse session.permission_mode,
         .tracker = null,
-        .background = &ctx.state.background,
-        .session = &session.session_rt,
     }, arena, messages);
-}
-
-fn prepareParentTurnContext(
-    raw_ctx: *anyopaque,
-    arena: Allocator,
-) !?agent_runtime.PreparedParentTurnContext {
-    const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
-    const subagent_host = ctx.state.subagent_host orelse return null;
-    const session = if (ctx.state.active_session) |*active| active else return null;
-    return parent_delivery_projector.prepare(
-        arena,
-        subagent_host.sessions,
-        session.session_id,
-        subagent_host.manager.options.child_store,
-    );
-}
-
-fn acknowledgeParentTurnContext(
-    raw_ctx: *anyopaque,
-    arena: Allocator,
-    acknowledgements: []const agent_runtime.ParentTurnDeliveryAck,
-) void {
-    const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
-    const subagent_host = ctx.state.subagent_host orelse return;
-    const retirement_ready = parent_delivery_projector
-        .acknowledgeWithRetirementSignal(
-        arena,
-        subagent_host.sessions,
-        subagent_host.manager.options.child_store,
-        acknowledgements,
-    );
-    if (retirement_ready) {
-        subagent_host.requestRetirementSweep(io_mod.milliTimestamp());
-    }
 }
 
 fn appendStaticContext(raw_ctx: *anyopaque, arena: Allocator, messages: *std.ArrayList(ChatMessage)) !void {
@@ -1305,7 +1324,7 @@ const TestReviewTurn = struct {
             .pending_assistant = .{ .role = .assistant, .tool_calls = &self.tool_calls },
             .target_call_id = self.tool_calls[0].id,
             .origin = .root,
-            .current_root_request = self.root_messages[0],
+            .trusted_root_context = self.root_messages[0],
         };
     }
 };
@@ -1339,6 +1358,8 @@ fn requestAcpPermission(
     try jsonrpc.writeJsonStr(ctx.session_id, &params.writer);
     try params.writer.writeAll(",\"toolCall\":{\"toolCallId\":");
     try jsonrpc.writeJsonStr(tool_call_id, &params.writer);
+    try params.writer.writeAll(",\"name\":");
+    try jsonrpc.writeJsonStr(acpToolName(call.name), &params.writer);
     try params.writer.writeAll(",\"title\":");
     try jsonrpc.writeJsonStr(request.label, &params.writer);
     try params.writer.writeAll(",\"kind\":");
@@ -1653,7 +1674,12 @@ fn toolUpdateContentText(result: ToolExecutionResult) []const u8 {
 fn propagateHistoryTurn(raw_ctx: *anyopaque, turn: HistoryTurn) !void {
     const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
     if (ctx.state.active_session) |*session| {
-        try persistAcpHistoryTurn(ctx.alloc, session, turn);
+        try persistAcpHistoryTurn(
+            ctx.alloc,
+            session,
+            turn,
+            ctx.retain_external_root_user_turn,
+        );
     }
 }
 
@@ -1661,6 +1687,7 @@ fn persistAcpHistoryTurn(
     alloc: Allocator,
     session: *server.ActiveSessionState,
     turn: HistoryTurn,
+    prompt_is_root_authority: bool,
 ) !void {
     session.session_write_mutex.lockUncancelable(io_mod.getIo());
     defer session.session_write_mutex.unlock(io_mod.getIo());
@@ -1671,9 +1698,11 @@ fn persistAcpHistoryTurn(
     }
     const writable = if (session.writable) |*value| value else return;
     try subagent_resume_admission.retainExternalRootUserTurn(
+        session.store,
         alloc,
         writable,
         turn,
+        prompt_is_root_authority,
     );
     if (writable.degradedTail() != null) {
         const now_ms = io_mod.milliTimestamp();
@@ -1784,7 +1813,7 @@ test "ACP degraded history repair commits the finished turn once" {
 
     const turn = try session_runtime.makeAssistantTurn(alloc, "hello", "done");
     defer types.freeHistoryTurn(alloc, turn);
-    try persistAcpHistoryTurn(alloc, &session, turn);
+    try persistAcpHistoryTurn(alloc, &session, turn, true);
 
     try std.testing.expect(session.writable.?.degradedTail() == null);
     try std.testing.expectEqual(@as(usize, 1), session.session_rt.history.items.len);
@@ -1916,6 +1945,18 @@ fn pushText(raw_ctx: *anyopaque, emission: agent_runtime.TextEmission) !void {
 fn pushToolLifecycle(raw_ctx: *anyopaque, event: types.ToolLifecycleEvent) !void {
     const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
     switch (event) {
+        .provisional => |provisional| {
+            const tool_name = provisional.tool_name orelse return;
+            if (!tool_presentation.isProviderSearchAlias(tool_name)) return;
+            var arena_state = std.heap.ArenaAllocator.init(ctx.alloc);
+            defer arena_state.deinit();
+            _ = try ctx.sendToolCallPending(arena_state.allocator(), .{
+                .id = provisional.id.call_id,
+                .name = tool_name,
+                .arguments_json = "{}",
+                .provenance = .provider_executed,
+            });
+        },
         .authoritative_started => |started| {
             var arena_state = std.heap.ArenaAllocator.init(ctx.alloc);
             defer arena_state.deinit();
@@ -1925,7 +1966,8 @@ fn pushToolLifecycle(raw_ctx: *anyopaque, event: types.ToolLifecycleEvent) !void
                 .arguments_json = started.arguments_json orelse "{}",
             });
         },
-        .provisional, .progress, .terminal, .turn_finished => {},
+        .terminal => |terminal| try ctx.sendProviderTerminal(terminal.id.call_id, terminal.outcome),
+        .progress, .turn_finished => {},
     }
 }
 
@@ -2408,10 +2450,10 @@ fn mcpCallTool(raw_ctx: *anyopaque, arena: Allocator, name: []const u8, argument
     );
 }
 
-fn mcpSearchTools(raw_ctx: *anyopaque, arena: Allocator, query: *const tool_mcp_runtime.PreparedQuery, limit: usize, permission_rules: types.PermissionRuleSet, limits: config_runtime.context_limits.Values, access: tool_mcp_runtime.Access) anyerror!tool_mcp_runtime.SearchResult {
+fn mcpSearchTools(raw_ctx: *anyopaque, arena: Allocator, request: tool_mcp_runtime.SearchRequest, permission_rules: types.PermissionRuleSet, limits: config_runtime.context_limits.Values, access: tool_mcp_runtime.Access) anyerror!tool_mcp_runtime.SearchResult {
     const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
     const mcp = activeMcp(ctx) orelse return error.McpServerNotFound;
-    return mcp.searchToolsPrepared(arena, query, limit, permission_rules, limits, access);
+    return mcp.searchToolsPrepared(arena, request, permission_rules, limits, access);
 }
 
 fn mcpToolSchemaJson(raw_ctx: *anyopaque, arena: Allocator, name: []const u8, permission_rules: types.PermissionRuleSet, limits: config_runtime.context_limits.Values, access: tool_mcp_runtime.Access) anyerror!?tool_mcp_runtime.ToolSchemaResult {
@@ -2442,40 +2484,57 @@ fn activeMcp(ctx: *AcpContext) ?*mcp_runtime.McpRuntime {
     return session.mcp;
 }
 
-fn onBackgroundUrlReady(_: *anyopaque, _: u64, _: []const u8) void {}
-
 pub fn mapToolKind(tool_name: []const u8) acp_types.ToolCallKind {
+    if (tool_presentation.isProviderSearchAlias(tool_name)) return .search;
     if (std.mem.eql(u8, tool_name, "glob_files")) return .read;
     if (std.mem.eql(u8, tool_name, "grep_files")) return .search;
     if (std.mem.eql(u8, tool_name, "read_file")) return .read;
-    if (std.mem.eql(u8, tool_name, "web_fetch")) return .read;
+    if (std.mem.eql(u8, tool_name, "web_fetch")) return .fetch;
     if (std.mem.eql(u8, tool_name, "web_search")) return .search;
     if (std.mem.eql(u8, tool_name, "write_file")) return .edit;
     if (std.mem.eql(u8, tool_name, "edit_file")) return .edit;
+    if (std.mem.eql(u8, tool_name, "shell")) return .execute;
     if (std.mem.eql(u8, tool_name, "terminal")) return .execute;
     if (std.mem.eql(u8, tool_name, "run_command")) return .execute;
-    if (std.mem.eql(u8, tool_name, "memory")) return .other;
     if (std.mem.eql(u8, tool_name, "skill")) return .other;
     if (std.mem.eql(u8, tool_name, "install_skill")) return .other;
     return .other;
 }
 
+fn acpToolName(tool_name: []const u8) []const u8 {
+    return if (tool_presentation.isProviderSearchAlias(tool_name)) "web_search" else tool_name;
+}
+
+fn providerTerminalStatus(outcome: types.ToolOutcomeKind) ?acp_types.ToolCallStatus {
+    return switch (outcome) {
+        .completed => .completed,
+        .denied, .cancelled, .failed => .failed,
+        .deferred => null,
+    };
+}
+
 fn describeToolTitle(registry: tool_dispatch.Registry, arena: Allocator, call: ToolCall) ![]const u8 {
+    if (tool_presentation.isProviderSearchAlias(call.name)) {
+        return tool_presentation.formatPlainAction(arena, .{
+            .tool_registry = registry,
+            .call = call,
+        });
+    }
     if (tool_dispatch.toolCallPresentation(arena, registry, call)) |presentation| {
         return std.fmt.allocPrint(arena, "{s}", .{presentation.action_label});
     }
     return std.fmt.allocPrint(arena, "{s}", .{call.name});
 }
 
-test "ACP terminal title uses the call-aware action label" {
+test "ACP shell title uses the call-aware action label" {
     const alloc = std.testing.allocator;
     const title = try describeToolTitle(builtin_tools.registry, alloc, .{
         .id = "close",
-        .name = "terminal",
-        .arguments_json = "{\"action\":\"close\",\"session_id\":\"terminal-a\",\"close_policy\":\"graceful\"}",
+        .name = "shell",
+        .arguments_json = "{\"action\":\"stop\",\"session_id\":\"terminal-a\"}",
     });
     defer alloc.free(title);
-    try std.testing.expectEqualStrings("Closing", title);
+    try std.testing.expectEqualStrings("Stopping", title);
 }
 
 test "ACP lifecycle action preserves dynamic MCP availability boundaries" {
@@ -2504,7 +2563,7 @@ test "ACP lifecycle action preserves dynamic MCP availability boundaries" {
     defer alloc.free(missing_label);
     try std.testing.expectEqualStrings("Working: mcp_lookup", missing_label);
 
-    const builtin = dynamicMcpToolAvailable(builtin_tools.registry, "terminal", &.{"terminal"}, @ptrCast(&fixture), Fixture.hasTool, .unrestricted);
+    const builtin = dynamicMcpToolAvailable(builtin_tools.registry, "terminal", &.{"shell"}, @ptrCast(&fixture), Fixture.hasTool, .unrestricted);
     try std.testing.expect(!builtin);
     try std.testing.expectEqual(@as(usize, 1), fixture.calls);
 }
@@ -2563,8 +2622,18 @@ test "mapToolKind maps common tools" {
     try std.testing.expectEqual(acp_types.ToolCallKind.edit, mapToolKind("write_file"));
     try std.testing.expectEqual(acp_types.ToolCallKind.edit, mapToolKind("edit_file"));
     try std.testing.expectEqual(acp_types.ToolCallKind.search, mapToolKind("grep_files"));
+    try std.testing.expectEqual(acp_types.ToolCallKind.fetch, mapToolKind("web_fetch"));
+    try std.testing.expectEqual(acp_types.ToolCallKind.search, mapToolKind("exa_search"));
     try std.testing.expectEqual(acp_types.ToolCallKind.execute, mapToolKind("run_command"));
     try std.testing.expectEqual(acp_types.ToolCallKind.other, mapToolKind("unknown_tool"));
+}
+
+test "provider terminal status maps only terminal outcomes" {
+    try std.testing.expectEqual(acp_types.ToolCallStatus.completed, providerTerminalStatus(.completed).?);
+    try std.testing.expectEqual(acp_types.ToolCallStatus.failed, providerTerminalStatus(.failed).?);
+    try std.testing.expectEqual(acp_types.ToolCallStatus.failed, providerTerminalStatus(.denied).?);
+    try std.testing.expectEqual(acp_types.ToolCallStatus.failed, providerTerminalStatus(.cancelled).?);
+    try std.testing.expect(providerTerminalStatus(.deferred) == null);
 }
 
 test "ACP usage checkpoints honor the active session write boundary" {
@@ -2967,7 +3036,6 @@ test "parsePromptInput releases partial resource state across allocation failure
 
 test "mapToolKind maps surviving tools" {
     try std.testing.expectEqual(acp_types.ToolCallKind.read, mapToolKind("glob_files"));
-    try std.testing.expectEqual(acp_types.ToolCallKind.other, mapToolKind("memory"));
     try std.testing.expectEqual(acp_types.ToolCallKind.other, mapToolKind("skill"));
     try std.testing.expectEqual(acp_types.ToolCallKind.other, mapToolKind("install_skill"));
 }
@@ -3451,13 +3519,19 @@ test "ACP pending tool_call updates keep provider ids stable and dedupe" {
 
     const call = ToolCall{
         .id = "provider_call_7",
-        .name = "terminal",
-        .arguments_json = "{\"action\":\"exec\",\"command\":\"ls\"}",
+        .name = "shell",
+        .arguments_json = "{\"action\":\"run\",\"command\":\"ls\",\"api_key\":\"secret-value\"}",
     };
     const first = try ctx.sendToolCallPending(alloc, call);
     const second = try ctx.sendToolCallPending(alloc, call);
     try std.testing.expectEqualStrings("provider_call_7", first);
     try std.testing.expect(first.ptr == second.ptr);
+    _ = try ctx.sendToolCallPending(alloc, .{
+        .id = "malformed_call",
+        .name = "read_file",
+        .arguments_json = "{",
+        .argument_integrity = .malformed_json,
+    });
     try capture.sync(io_mod.getIo());
 
     var captured_file = try tmp.dir.openFile(io_mod.getIo(), "acp-tool-call.jsonl", .{});
@@ -3465,13 +3539,168 @@ test "ACP pending tool_call updates keep provider ids stable and dedupe" {
     const captured = try io_mod.readFileToEnd(alloc, &captured_file, 64 * 1024);
     var lines = std.mem.splitScalar(u8, captured, '\n');
     var pending_count: usize = 0;
+    var malformed_count: usize = 0;
     while (lines.next()) |line| {
         if (line.len == 0) continue;
-        try std.testing.expect(std.mem.find(u8, line, "\"toolCallId\":\"provider_call_7\"") != null);
-        try std.testing.expect(std.mem.find(u8, line, "\"sessionUpdate\":\"tool_call\"") != null);
-        pending_count += 1;
+        var parsed = try std.json.parseFromSlice(std.json.Value, alloc, line, .{});
+        defer parsed.deinit();
+        const update = parsed.value.object.get("params").?.object.get("update").?.object;
+        try std.testing.expectEqualStrings("tool_call", update.get("sessionUpdate").?.string);
+        const call_id = update.get("toolCallId").?.string;
+        if (std.mem.eql(u8, call_id, "provider_call_7")) {
+            try std.testing.expectEqualStrings("shell", update.get("name").?.string);
+            const raw_input = update.get("rawInput").?.object;
+            try std.testing.expectEqualStrings("run", raw_input.get("action").?.string);
+            try std.testing.expectEqualStrings("ls", raw_input.get("command").?.string);
+            try std.testing.expectEqualStrings("[REDACTED]", raw_input.get("api_key").?.string);
+            pending_count += 1;
+        } else if (std.mem.eql(u8, call_id, "malformed_call")) {
+            try std.testing.expect(update.get("rawInput") == null);
+            malformed_count += 1;
+        }
     }
     try std.testing.expectEqual(@as(usize, 1), pending_count);
+    try std.testing.expectEqual(@as(usize, 1), malformed_count);
+}
+
+test "ACP provider search lifecycle publishes only public terminal updates" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const alloc = arena_state.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var capture = try tmp.dir.createFile(io_mod.getIo(), "acp-provider-search.jsonl", .{ .read = true });
+    defer capture.close(io_mod.getIo());
+    var state = try initTestAcpState(alloc, "/tmp/workspace", .ask);
+    defer state.deinit();
+    state.writer = .{ .stdout = capture };
+    var ctx = AcpContext{
+        .alloc = alloc,
+        .state = &state,
+        .session_id = "session_1",
+    };
+    defer ctx.deinitPublishedToolCalls();
+
+    try pushToolLifecycle(&ctx, .{ .provisional = .{
+        .id = .{ .turn_id = 1, .call_id = "provider_search_1" },
+        .tool_name = "exa_search",
+        .activity_kind = .read,
+    } });
+    const completed = types.ToolLifecycleEvent{ .terminal = .{
+        .id = .{ .turn_id = 1, .call_id = "provider_search_1" },
+        .outcome = .{ .kind = .completed, .summary = "Searched web" },
+    } };
+    try pushToolLifecycle(&ctx, completed);
+    try pushToolLifecycle(&ctx, completed);
+    try pushToolLifecycle(&ctx, .{ .provisional = .{
+        .id = .{ .turn_id = 1, .call_id = "provider_search_2" },
+        .tool_name = "perplexity_search",
+        .activity_kind = .read,
+    } });
+    const failed = types.ToolLifecycleEvent{ .terminal = .{
+        .id = .{ .turn_id = 1, .call_id = "provider_search_2" },
+        .outcome = .{ .kind = .failed, .summary = "perplexity_search failed: invalid JSON arguments" },
+    } };
+    try pushToolLifecycle(&ctx, failed);
+    try pushToolLifecycle(&ctx, failed);
+    try pushToolLifecycle(&ctx, .{ .provisional = .{
+        .id = .{ .turn_id = 1, .call_id = "provider_search_3" },
+        .tool_name = "parallel_search",
+        .activity_kind = .read,
+    } });
+    try pushToolLifecycle(&ctx, .{ .terminal = .{
+        .id = .{ .turn_id = 1, .call_id = "provider_search_3" },
+        .outcome = .{ .kind = .cancelled, .summary = "Cancelled parallel_search" },
+    } });
+    try pushToolLifecycle(&ctx, .{ .provisional = .{
+        .id = .{ .turn_id = 1, .call_id = "provider_search_4" },
+        .tool_name = "exa_search",
+        .activity_kind = .read,
+    } });
+    try pushToolLifecycle(&ctx, .{ .terminal = .{
+        .id = .{ .turn_id = 1, .call_id = "provider_search_4" },
+        .outcome = .{ .kind = .deferred, .summary = "Deferred exa_search" },
+    } });
+    try pushToolLifecycle(&ctx, .{ .terminal = .{
+        .id = .{ .turn_id = 1, .call_id = "unknown_provider_search" },
+        .outcome = .{ .kind = .failed, .summary = "exa_search failed" },
+    } });
+    try pushToolLifecycle(&ctx, .{ .authoritative_started = .{
+        .id = .{ .turn_id = 1, .call_id = "read_1" },
+        .reconciles_provisional_call_id = null,
+        .tool_name = "read_file",
+        .activity_kind = .read,
+        .arguments_json = "{\"path\":\"README.md\"}",
+    } });
+    try pushToolLifecycle(&ctx, .{ .terminal = .{
+        .id = .{ .turn_id = 1, .call_id = "read_1" },
+        .outcome = .{ .kind = .completed, .summary = "Read README.md" },
+    } });
+    try capture.sync(io_mod.getIo());
+
+    var captured_file = try tmp.dir.openFile(io_mod.getIo(), "acp-provider-search.jsonl", .{});
+    defer captured_file.close(io_mod.getIo());
+    const captured = try io_mod.readFileToEnd(alloc, &captured_file, 64 * 1024);
+    var lines = std.mem.splitScalar(u8, captured, '\n');
+    var provider_pending: usize = 0;
+    var provider_completed: usize = 0;
+    var provider_failed: usize = 0;
+    var read_pending: usize = 0;
+    var read_completed: usize = 0;
+    while (lines.next()) |line| {
+        if (line.len == 0) continue;
+        try std.testing.expect(std.mem.find(u8, line, "exa_search") == null);
+        try std.testing.expect(std.mem.find(u8, line, "perplexity_search") == null);
+        try std.testing.expect(std.mem.find(u8, line, "parallel_search") == null);
+        var parsed = try std.json.parseFromSlice(std.json.Value, alloc, line, .{});
+        defer parsed.deinit();
+        const update = parsed.value.object.get("params").?.object.get("update").?.object;
+        const call_id = update.get("toolCallId").?.string;
+        const session_update = update.get("sessionUpdate").?.string;
+        if (std.mem.eql(u8, call_id, "provider_search_1")) {
+            if (std.mem.eql(u8, session_update, "tool_call")) {
+                provider_pending += 1;
+                try std.testing.expectEqualStrings("web_search", update.get("name").?.string);
+                try std.testing.expectEqualStrings("Searching web", update.get("title").?.string);
+                try std.testing.expectEqualStrings("search", update.get("kind").?.string);
+                try std.testing.expectEqual(@as(usize, 0), update.get("rawInput").?.object.count());
+            } else if (std.mem.eql(u8, session_update, "tool_call_update")) {
+                provider_completed += 1;
+                try std.testing.expectEqualStrings("completed", update.get("status").?.string);
+                try std.testing.expectEqualStrings(
+                    "Web search completed",
+                    update.get("content").?.array.items[0].object.get("content").?.object.get("text").?.string,
+                );
+            }
+        } else if (std.mem.eql(u8, call_id, "provider_search_2") or
+            std.mem.eql(u8, call_id, "provider_search_3"))
+        {
+            if (std.mem.eql(u8, session_update, "tool_call")) {
+                provider_pending += 1;
+            } else if (std.mem.eql(u8, session_update, "tool_call_update")) {
+                provider_failed += 1;
+                try std.testing.expectEqualStrings("failed", update.get("status").?.string);
+                try std.testing.expectEqualStrings(
+                    "Web search failed",
+                    update.get("content").?.array.items[0].object.get("content").?.object.get("text").?.string,
+                );
+            }
+        } else if (std.mem.eql(u8, call_id, "provider_search_4")) {
+            try std.testing.expectEqualStrings("tool_call", session_update);
+            provider_pending += 1;
+        } else if (std.mem.eql(u8, call_id, "read_1")) {
+            if (std.mem.eql(u8, session_update, "tool_call")) read_pending += 1;
+            if (std.mem.eql(u8, session_update, "tool_call_update")) read_completed += 1;
+        } else {
+            return error.TestUnexpectedToolCallId;
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 4), provider_pending);
+    try std.testing.expectEqual(@as(usize, 1), provider_completed);
+    try std.testing.expectEqual(@as(usize, 2), provider_failed);
+    try std.testing.expectEqual(@as(usize, 1), read_pending);
+    try std.testing.expectEqual(@as(usize, 0), read_completed);
 }
 
 test "ACP propagateGrant stores deduped runtime session grants" {
@@ -3582,8 +3811,8 @@ test "ACP registry callbacks preserve snapshot bytes before transient context" {
         deps.context_registry.?.defaultProvider().id,
     );
     try std.testing.expect(deps.request_prepared_file_mutation_permission != null);
-    try std.testing.expect(deps.prepare_parent_turn_context != null);
-    try std.testing.expect(deps.acknowledge_parent_turn_context != null);
+    try std.testing.expect(deps.prepare_parent_turn_context == null);
+    try std.testing.expect(deps.acknowledge_parent_turn_context == null);
 
     var arena_state = std.heap.ArenaAllocator.init(alloc);
     defer arena_state.deinit();
@@ -3836,16 +4065,16 @@ test "ACP default user commands require configured authority or review" {
 
     const direct = (try requestToolPermissionOutcome(&ctx, arena, .{
         .id = "direct",
-        .name = "terminal",
-        .arguments_json = "{\"action\":\"exec\",\"command\":\"pwd\"}",
+        .name = "shell",
+        .arguments_json = "{\"action\":\"run\",\"command\":\"pwd\"}",
     }, .ask, &.{}, &.{}));
     try std.testing.expectEqual(ToolPermissionDecision.permission_required, direct.decision);
     try std.testing.expect(direct.execution_authority == null);
 
     const blocked = (try requestToolPermissionOutcome(&ctx, arena, .{
         .id = "blocked",
-        .name = "terminal",
-        .arguments_json = "{\"action\":\"exec\",\"command\":\"touch blocked.txt\"}",
+        .name = "shell",
+        .arguments_json = "{\"action\":\"run\",\"command\":\"touch blocked.txt\"}",
     }, .ask, &.{}, &.{}));
     try std.testing.expectEqual(ToolPermissionDecision.permission_required, blocked.decision);
     try std.testing.expect(blocked.execution_authority == null);
@@ -3853,8 +4082,8 @@ test "ACP default user commands require configured authority or review" {
     state.active_session.?.permission_rules = try testPermissionRuleSet(alloc, "bash", "touch *", .allow);
     const configured = (try requestToolPermissionOutcome(&ctx, arena, .{
         .id = "configured",
-        .name = "terminal",
-        .arguments_json = "{\"action\":\"exec\",\"command\":\"touch configured.txt\"}",
+        .name = "shell",
+        .arguments_json = "{\"action\":\"run\",\"command\":\"touch configured.txt\"}",
     }, .ask, &.{}, &.{}));
     switch ((configured.execution_authority orelse return error.TestExpectedEqual).run_command) {
         .direct_only => return error.TestExpectedShellAllowed,
@@ -3865,8 +4094,8 @@ test "ACP default user commands require configured authority or review" {
     state.active_session.?.permission_rules = .{};
     const automatic = (try requestToolPermissionOutcome(&ctx, arena, .{
         .id = "automatic",
-        .name = "terminal",
-        .arguments_json = "{\"action\":\"exec\",\"command\":\"touch automatic.txt\"}",
+        .name = "shell",
+        .arguments_json = "{\"action\":\"run\",\"command\":\"touch automatic.txt\"}",
     }, .auto, &.{}, &.{}));
     try std.testing.expectEqual(ToolPermissionDecision.deny, automatic.decision);
     try std.testing.expectEqual(types.ToolPermissionDenialReason.review_unavailable, automatic.denial_reason.?);
@@ -3886,7 +4115,7 @@ test "ACP auto mode uses automatic review clear and caution without prompting" {
         ) anyerror!permission_auto_classifier.ParseOutcome {
             const self: *@This() = @ptrCast(@alignCast(raw_ctx));
             self.calls += 1;
-            self.root_text = request.review_turn.current_root_request;
+            self.root_text = request.review_turn.trusted_root_context;
             return .{ .valid = .{
                 .risk = if (self.decision == .clear) .low else .high,
                 .decision = self.decision,
@@ -3914,8 +4143,8 @@ test "ACP auto mode uses automatic review clear and caution without prompting" {
 
     const direct_call: ToolCall = .{
         .id = "direct",
-        .name = "terminal",
-        .arguments_json = "{\"action\":\"exec\",\"command\":\"pwd\"}",
+        .name = "shell",
+        .arguments_json = "{\"action\":\"run\",\"command\":\"pwd\"}",
     };
     var direct_review = TestReviewTurn.init("Inspect the workspace.", direct_call);
     const direct = try requestToolPermissionOutcomeWithRequest(
@@ -3937,8 +4166,8 @@ test "ACP auto mode uses automatic review clear and caution without prompting" {
 
     const accepted_call: ToolCall = .{
         .id = "accepted",
-        .name = "terminal",
-        .arguments_json = "{\"action\":\"exec\",\"command\":\"touch accepted.txt\"}",
+        .name = "shell",
+        .arguments_json = "{\"action\":\"run\",\"command\":\"touch accepted.txt\"}",
     };
     var accepted_review = TestReviewTurn.init("Create accepted.txt.", accepted_call);
     const accepted = try requestToolPermissionOutcomeWithRequest(&ctx, arena, accepted_call, accepted_review.context(), .auto, &.{}, null, null, &.{});
@@ -3958,8 +4187,8 @@ test "ACP auto mode uses automatic review clear and caution without prompting" {
     fake.decision = .caution;
     const blocked_call: ToolCall = .{
         .id = "check",
-        .name = "terminal",
-        .arguments_json = "{\"action\":\"exec\",\"command\":\"touch check.txt\"}",
+        .name = "shell",
+        .arguments_json = "{\"action\":\"run\",\"command\":\"touch check.txt\"}",
     };
     var blocked_review = TestReviewTurn.init("Check whether this is allowed.", blocked_call);
     const blocked = try requestToolPermissionOutcomeWithRequest(&ctx, arena, blocked_call, blocked_review.context(), .auto, &.{}, null, null, &.{});
@@ -3986,7 +4215,7 @@ test "ACP auto mode automatic review clears or cautions prepared external file m
         ) anyerror!permission_auto_classifier.ParseOutcome {
             const self: *@This() = @ptrCast(@alignCast(raw_ctx));
             self.calls += 1;
-            self.root_text = request.review_turn.current_root_request;
+            self.root_text = request.review_turn.trusted_root_context;
             self.saw_file_mutation_context = std.meta.activeTag(request.action) == .file_mutation;
             return .{ .valid = .{
                 .risk = if (self.decision == .clear) .low else .high,
@@ -4176,7 +4405,7 @@ test "ACP prompt agent config carries request options from active session" {
         .advertised_tool_names = &.{"read_file"},
         .advertised_functions = &.{builtin_tools.read_file.model_schema},
         .custom_tool_guidance = "acp custom tool guidance",
-    });
+    }, true);
 
     try std.testing.expect(config.fast_mode);
     try std.testing.expectEqual(types.ReasoningEffort.literal("high"), config.effort);
