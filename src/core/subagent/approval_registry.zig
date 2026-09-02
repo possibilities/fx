@@ -20,6 +20,71 @@ pub const Error = error{
 
 pub const ResolveResult = enum { accepted, rejected };
 
+/// A copied, stable identity for one child's outstanding attention. The ADE
+/// feed attributes a resolution to the child rather than to the surface the
+/// human answered on, so the identity must survive the binding it came from.
+pub const AttentionToken = [32]u8;
+
+pub fn attentionToken(child_id: []const u8, request_id: []const u8) AttentionToken {
+    var hash = std.crypto.hash.sha2.Sha256.init(.{});
+    hash.update(child_id);
+    hash.update(&.{0});
+    hash.update(request_id);
+    var digest: AttentionToken = undefined;
+    hash.final(&digest);
+    return digest;
+}
+
+/// Notified when an outstanding attention identity is abandoned rather than
+/// answered, so a consumer never waits forever on a resolution that can no
+/// longer arrive.
+pub const AttentionInvalidationObserver = struct {
+    context: ?*anyopaque = null,
+    observe_fn: *const fn (?*anyopaque, []const u8, AttentionToken) void,
+
+    fn observe(
+        self: AttentionInvalidationObserver,
+        child_id: []const u8,
+        token: AttentionToken,
+    ) void {
+        self.observe_fn(self.context, child_id, token);
+    }
+};
+
+pub const ObservedResolveResult = struct {
+    result: ResolveResult,
+    observer_ran: bool = false,
+};
+
+pub const max_pending_child_snapshot: usize = 32;
+pub const max_pending_child_id_bytes: usize = 64;
+
+/// Every distinct child currently blocked on a permission, with the attention
+/// identity each one owns. The consumer announces every blocked child, not
+/// only the one the main prompt happens to mirror.
+pub const PendingChildren = struct {
+    storage: [max_pending_child_snapshot][max_pending_child_id_bytes]u8 = undefined,
+    lengths: [max_pending_child_snapshot]usize = @splat(0),
+    attention_tokens: [max_pending_child_snapshot]AttentionToken = undefined,
+    len: usize = 0,
+    truncated: bool = false,
+
+    pub fn at(self: *const PendingChildren, index: usize) []const u8 {
+        return self.storage[index][0..self.lengths[index]];
+    }
+
+    pub fn attentionTokenAt(self: *const PendingChildren, index: usize) AttentionToken {
+        return self.attention_tokens[index];
+    }
+
+    fn contains(self: *const PendingChildren, child_id: []const u8) bool {
+        for (0..self.len) |index| {
+            if (std.mem.eql(u8, self.at(index), child_id)) return true;
+        }
+        return false;
+    }
+};
+
 pub const WorkerRoute = struct {
     context: *anyopaque,
     submit_fn: *const fn (
@@ -31,10 +96,21 @@ pub const WorkerRoute = struct {
     cancel_fn: *const fn (*anyopaque) void,
     pin_fn: *const fn (*anyopaque) bool,
     release_fn: *const fn (*anyopaque) void,
+    /// Runs a lifecycle observer at the worker's release point, without the
+    /// worker mutex. Absent for routes that cannot observe; those fall back to
+    /// the plain submit and report `observer_ran = false`.
+    submit_observed_fn: ?*const fn (
+        *anyopaque,
+        u64,
+        permission_request.OwnedPermissionResponse,
+        ?worker_runtime.WorkerRuntime.PermissionCommit,
+        ?worker_runtime.DecisionObserver,
+    ) worker_runtime.WorkerRuntime.PermissionCommitError!worker_runtime.PermissionSubmissionResult = null,
 
     fn eql(self: WorkerRoute, other: WorkerRoute) bool {
         return self.context == other.context and
             self.submit_fn == other.submit_fn and
+            self.submit_observed_fn == other.submit_observed_fn and
             self.cancel_fn == other.cancel_fn and
             self.pin_fn == other.pin_fn and
             self.release_fn == other.release_fn;
@@ -46,6 +122,19 @@ pub const WorkerRoute = struct {
         response: permission_request.OwnedPermissionResponse,
         commit: ?worker_runtime.WorkerRuntime.PermissionCommit,
     ) worker_runtime.WorkerRuntime.PermissionCommitError!worker_runtime.PermissionSubmissionResult {
+        return self.submit_fn(self.context, request_id, response, commit);
+    }
+
+    fn submitObserved(
+        self: WorkerRoute,
+        request_id: u64,
+        response: permission_request.OwnedPermissionResponse,
+        commit: ?worker_runtime.WorkerRuntime.PermissionCommit,
+        observer: ?worker_runtime.DecisionObserver,
+    ) worker_runtime.WorkerRuntime.PermissionCommitError!worker_runtime.PermissionSubmissionResult {
+        if (self.submit_observed_fn) |observed| {
+            return observed(self.context, request_id, response, commit, observer);
+        }
         return self.submit_fn(self.context, request_id, response, commit);
     }
 
@@ -100,6 +189,18 @@ pub const Registry = struct {
     bindings: std.ArrayList(Binding) = .empty,
     pending_revision: u64 = 0,
     closed: bool = false,
+    worker_routes_closed: bool = false,
+    attention_invalidation_observer: ?AttentionInvalidationObserver = null,
+
+    pub fn setAttentionInvalidationObserver(
+        self: *Registry,
+        observer: AttentionInvalidationObserver,
+    ) void {
+        self.mutex.lockUncancelable(io_mod.getIo());
+        defer self.mutex.unlock(io_mod.getIo());
+        std.debug.assert(self.bindings.items.len == 0);
+        self.attention_invalidation_observer = observer;
+    }
 
     pub fn pendingRevision(self: *Registry) u64 {
         self.mutex.lockUncancelable(io_mod.getIo());
@@ -202,8 +303,31 @@ pub const Registry = struct {
         child_id: []const u8,
         decision: types.ToolPermissionDecision,
         feedback: ?[]const u8,
-        _: i64,
+        timestamp_ms: i64,
     ) Error!ResolveResult {
+        return (try self.resolveObserved(
+            request_id,
+            child_id,
+            decision,
+            feedback,
+            timestamp_ms,
+            null,
+        )).result;
+    }
+
+    /// Answers one child's outstanding permission and runs `observer` at the
+    /// worker's release point, so the child's own resolution is published
+    /// before the worker can resume. The registry pins the route across the
+    /// observation, so the worker cannot be freed while the observer runs.
+    pub fn resolveObserved(
+        self: *Registry,
+        request_id: []const u8,
+        child_id: []const u8,
+        decision: types.ToolPermissionDecision,
+        feedback: ?[]const u8,
+        _: i64,
+        observer: ?worker_runtime.DecisionObserver,
+    ) Error!ObservedResolveResult {
         const owned_feedback = if (feedback) |value|
             try self.alloc.dupe(u8, value)
         else
@@ -215,6 +339,10 @@ pub const Registry = struct {
         if (self.closed) {
             self.mutex.unlock(io_mod.getIo());
             return error.RegistryClosed;
+        }
+        if (self.worker_routes_closed) {
+            self.mutex.unlock(io_mod.getIo());
+            return error.StaleRequest;
         }
         const index = self.find(request_id) orelse {
             self.mutex.unlock(io_mod.getIo());
@@ -234,7 +362,7 @@ pub const Registry = struct {
                 self.alloc.free(owned_feedback.?);
                 feedback_owned = false;
             }
-            return .rejected;
+            return .{ .result = .rejected };
         }
         var removed = self.bindings.orderedRemove(index);
         self.pending_revision +|= 1;
@@ -242,7 +370,8 @@ pub const Registry = struct {
         defer removed.deinit(self.alloc);
         defer removed.worker.release();
 
-        const submission = removed.worker.submit(
+        const observable = observer != null and removed.worker.submit_observed_fn != null;
+        const submission = removed.worker.submitObserved(
             removed.worker_request_id,
             permission_request.OwnedPermissionResponse.init(
                 self.alloc,
@@ -250,6 +379,7 @@ pub const Registry = struct {
                 owned_feedback,
             ),
             .{ .context = self, .commit_fn = commitNoop },
+            observer,
         ) catch |err| {
             feedback_owned = false;
             removed.worker.cancel();
@@ -260,8 +390,69 @@ pub const Registry = struct {
             };
         };
         feedback_owned = false;
-        if (submission != .accepted) return .rejected;
-        return .accepted;
+        if (submission != .accepted) return .{ .result = .rejected };
+        return .{ .result = .accepted, .observer_ran = observable };
+    }
+
+    /// Closes every outstanding attention identity this child still owns,
+    /// without answering it. Durable cancellation calls this before any worker
+    /// or waiter can publish a late edge from the abandoned approval.
+    pub fn closeChildAttention(self: *Registry, child_id: []const u8) void {
+        self.mutex.lockUncancelable(io_mod.getIo());
+        defer self.mutex.unlock(io_mod.getIo());
+        for (self.bindings.items) |binding| {
+            if (!std.mem.eql(u8, binding.child_id, child_id)) continue;
+            self.observeAttentionInvalidatedLocked(binding);
+        }
+    }
+
+    /// Retires every worker route before shutdown signals let workers publish
+    /// terminal lifecycle edges, and refuses later resolution as stale.
+    pub fn detachWorkerRoutes(self: *Registry) void {
+        self.mutex.lockUncancelable(io_mod.getIo());
+        defer self.mutex.unlock(io_mod.getIo());
+        self.worker_routes_closed = true;
+        var index = self.bindings.items.len;
+        while (index > 0) {
+            index -= 1;
+            self.observeAttentionInvalidatedLocked(self.bindings.items[index]);
+            var removed = self.bindings.orderedRemove(index);
+            removed.worker.cancel();
+            removed.deinit(self.alloc);
+            self.pending_revision +|= 1;
+        }
+    }
+
+    fn observeAttentionInvalidatedLocked(self: *Registry, binding: Binding) void {
+        const observer = self.attention_invalidation_observer orelse return;
+        observer.observe(
+            binding.child_id,
+            attentionToken(binding.child_id, binding.request_id),
+        );
+    }
+
+    pub fn snapshotPendingChildren(self: *Registry, out: *PendingChildren) void {
+        self.mutex.lockUncancelable(io_mod.getIo());
+        defer self.mutex.unlock(io_mod.getIo());
+        out.len = 0;
+        out.truncated = false;
+        // A closed registry or a retired route has no waiter left to unblock.
+        if (self.closed or self.worker_routes_closed) return;
+        for (self.bindings.items) |binding| {
+            if (binding.child_id.len > max_pending_child_id_bytes) {
+                out.truncated = true;
+                continue;
+            }
+            if (out.contains(binding.child_id)) continue;
+            if (out.len == max_pending_child_snapshot) {
+                out.truncated = true;
+                break;
+            }
+            @memcpy(out.storage[out.len][0..binding.child_id.len], binding.child_id);
+            out.lengths[out.len] = binding.child_id.len;
+            out.attention_tokens[out.len] = attentionToken(binding.child_id, binding.request_id);
+            out.len += 1;
+        }
     }
 
     pub fn invalidateChild(
@@ -275,6 +466,7 @@ pub const Registry = struct {
         while (index > 0) {
             index -= 1;
             if (!std.mem.eql(u8, self.bindings.items[index].child_id, child_id)) continue;
+            self.observeAttentionInvalidatedLocked(self.bindings.items[index]);
             var removed = self.bindings.orderedRemove(index);
             removed.worker.cancel();
             removed.deinit(self.alloc);
@@ -288,6 +480,7 @@ pub const Registry = struct {
         self.mutex.lockUncancelable(io_mod.getIo());
         self.closed = true;
         for (self.bindings.items) |*binding| {
+            self.observeAttentionInvalidatedLocked(binding.*);
             binding.worker.cancel();
             binding.deinit(self.alloc);
         }
