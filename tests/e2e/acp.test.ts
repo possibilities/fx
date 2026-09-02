@@ -1007,6 +1007,82 @@ describe("acp: model-independent", () => {
   });
 
   test(
+    "ACP capability gates keep native tools and client MCP admission independent",
+    async () => {
+      const root = createIsolatedRoot("fx-acp-capability-gates-");
+      const allowedMcpPid = join(root.root, "allowed-mcp.pid");
+      const rejectedMcpPid = join(root.root, "rejected-mcp.pid");
+      const gateway = startFakeGateway([
+        finalText("ACP native tools disabled"),
+        finalText("ACP native tools preserved"),
+      ]);
+      try {
+        client = await AcpClient.create({
+          cwd: root.workspace,
+          args: ["--no-native-tools", "acp"],
+          env: fakeGatewayEnv(root, gateway),
+        });
+        await client.request("initialize", { protocolVersion: 1 }, 1);
+        const native_disabled = await client.request(
+          "session/new",
+          {
+            mcpServers: [acpStdioServer(
+              "UNUSED",
+              allowedMcpPid,
+            )],
+          },
+          2,
+        ) as any;
+        expect(native_disabled.error).toBeUndefined();
+        await client.readLine();
+        await client.request("session/set_mode", { modeId: "code" }, 3);
+        const disabled_prompt = await runPrompt(client, "Answer without tools.", TIMEOUT);
+        expect(disabled_prompt.promptResult.result.stopReason).toBe("end_turn");
+        expect(acpGatewayRequest(gateway.requests[0]!.body).tools).toEqual([]);
+        await client.close();
+        await expectMcpProcessExited(allowedMcpPid);
+
+        client = await AcpClient.create({
+          cwd: root.workspace,
+          args: ["acp", "--no-acp-mcp"],
+          env: fakeGatewayEnv(root, gateway),
+        });
+        await client.request("initialize", { protocolVersion: 1 }, 10);
+        const native_enabled = await client.request(
+          "session/new",
+          { mcpServers: [] },
+          11,
+        ) as any;
+        expect(native_enabled.error).toBeUndefined();
+        await client.readLine();
+        await client.request("session/set_mode", { modeId: "code" }, 12);
+        const enabled_prompt = await runPrompt(client, "Answer with the normal tool catalog.", TIMEOUT);
+        expect(enabled_prompt.promptResult.result.stopReason).toBe("end_turn");
+        expect(acpGatewayRequest(gateway.requests[1]!.body).tools.map((tool) => tool.name))
+          .toContain("read_file");
+
+        const rejected = await client.request(
+          "session/load",
+          {
+            sessionId: native_enabled.result.sessionId,
+            mcpServers: [acpStdioServer("UNUSED", rejectedMcpPid)],
+          },
+          13,
+        ) as any;
+        expect(rejected.error.code).toBe(-32602);
+        expect(rejected.error.message).toContain("MCP servers are unavailable");
+        expect(existsSync(rejectedMcpPid)).toBe(false);
+        expect(client.stderr).toBe("");
+      } finally {
+        await client?.close();
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
     "active ACP session uses typed MCP Resources Prompts and Completion state",
     async () => {
       const root = createIsolatedRoot("fx-acp-mcp-features-");

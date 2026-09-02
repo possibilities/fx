@@ -397,6 +397,20 @@ pub fn handleListWasmSessions(state: *server.ServerState, alloc: Allocator, msg:
     try state.writer.writeResponse(alloc, msg.id, out.writer.buffered());
 }
 
+fn rejectUnavailableMcpServers(
+    state: *server.ServerState,
+    alloc: Allocator,
+    msg: *jsonrpc.Message,
+    server_count: usize,
+) !bool {
+    if (state.cfg.allow_acp_mcp or server_count == 0) return false;
+    try state.writer.writeError(alloc, msg.id, .{
+        .code = ErrorCode.invalid_params,
+        .message = "MCP servers are unavailable in this runtime",
+    });
+    return true;
+}
+
 pub fn handleRemoveWasmSession(state: *server.ServerState, alloc: Allocator, msg: *jsonrpc.Message) !void {
     const params = msg.params_raw orelse return state.writer.writeError(alloc, msg.id, .{ .code = ErrorCode.invalid_params, .message = "Missing params" });
     const parsed = std.json.parseFromSlice(std.json.Value, alloc, params, .{}) catch
@@ -1565,6 +1579,62 @@ test "ACP load maps one-off child denial to invalid params" {
         captured,
         "Subagent child sessions cannot be resumed directly",
     ) != null);
+}
+
+test "ACP restore rejects MCP servers when host capability is disabled" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
+    defer alloc.free(workspace);
+    var capture = try tmp.dir.createFile(
+        io_mod.getIo(),
+        "acp-disabled-mcp-restore.jsonl",
+        .{ .read = true },
+    );
+    defer capture.close(io_mod.getIo());
+
+    {
+        var state = try initAcpSessionTestState(arena, workspace, capture);
+        defer state.deinit();
+        state.cfg.allow_acp_mcp = false;
+        const params =
+            "{\"sessionId\":\"missing\",\"cwd\":\"/\",\"mcpServers\":[" ++
+            "{\"name\":\"blocked\",\"command\":\"/usr/bin/true\",\"args\":[],\"env\":[]}" ++
+            "]}";
+        var load_msg = jsonrpc.Message{
+            .id = .{ .integer = 1 },
+            .method = "session/load",
+            .params_raw = params,
+        };
+        try handleLoadSession(&state, arena, &load_msg);
+        var resume_msg = jsonrpc.Message{
+            .id = .{ .integer = 2 },
+            .method = "session/resume",
+            .params_raw = params,
+        };
+        try handleResumeSession(&state, arena, &resume_msg);
+        try std.testing.expect(state.active_session == null);
+        try capture.sync(io_mod.getIo());
+    }
+
+    var captured_file = try tmp.dir.openFile(
+        io_mod.getIo(),
+        "acp-disabled-mcp-restore.jsonl",
+        .{},
+    );
+    defer captured_file.close(io_mod.getIo());
+    const captured = try io_mod.readFileToEnd(alloc, &captured_file, 4096);
+    defer alloc.free(captured);
+    try std.testing.expectEqual(
+        @as(usize, 2),
+        std.mem.count(u8, captured, "MCP servers are unavailable in this runtime"),
+    );
+    try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, captured, "failed to start"));
 }
 
 var acp_session_stable_test_environ: ?*std.process.Environ.Map = null;
