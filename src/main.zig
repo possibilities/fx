@@ -35,6 +35,7 @@ const app_agent_runtime = @import("core/app/app_agent_runtime.zig");
 const app_runtime_setup = @import("core/app/app_runtime_setup.zig");
 const app_render_runtime = @import("core/app/app_render_runtime.zig");
 const app_session_runtime = @import("core/app/app_session_runtime.zig");
+const app_session_naming_runtime = @import("core/app/app_session_naming_runtime.zig");
 const app_upgrade_runtime = @import("core/app/app_upgrade_runtime.zig");
 const app_worker_runtime = @import("core/app/app_worker_runtime.zig");
 const app_workspace_runtime = @import("core/app/app_workspace_runtime.zig");
@@ -60,6 +61,7 @@ const provider_set = @import("core/gateway/provider_set.zig");
 const provider_catalog = @import("core/auth/provider_catalog.zig");
 const vercel_model_policy = @import("gateway/vercel_model_policy.zig");
 const model_catalog = @import("core/gateway/model_catalog.zig");
+const session_naming_runtime = @import("core/session/session_naming.zig");
 const agent_stream_provider = @import("core/agent/stream_provider.zig");
 const builtin_hooks = @import("builtins/hooks.zig");
 const builtin_mcp = @import("builtins/mcp.zig");
@@ -412,6 +414,7 @@ const App = struct {
     const LifecycleAppRuntime = builtin_hooks.Runtime(Self);
     const RenderAppRuntime = app_render_runtime.Runtime(Self);
     const SessionAppRuntime = app_session_runtime.Runtime(Self);
+    const SessionNamingAppRuntime = app_session_naming_runtime.Runtime(Self);
     const UpgradeAppRuntime = app_upgrade_runtime.Runtime(Self);
     const WorkerAppRuntime = app_worker_runtime.Runtime(Self);
     const WorkspaceAppRuntime = app_workspace_runtime.Runtime(Self);
@@ -549,6 +552,7 @@ const App = struct {
             .{},
     ),
     session_persistence: app_session_runtime.Persistence = .{},
+    session_naming: session_naming_runtime.Runtime = .{},
     prompt_history: PromptHistoryRuntime = .{},
     requested_resume: ?cli_surface.ResumeTarget = null,
     approval_prompt: ApprovalPrompt = .{},
@@ -711,11 +715,33 @@ const App = struct {
         // freezes the lifecycle runtime (its call to freeze() is the sole
         // freeze site).
         try LifecycleAppRuntime.configure(self, SessionAppRuntime.activeSessionId(self));
+        if (SessionAppRuntime.durableCachedSessionTitle(self)) |title| {
+            LifecycleAppRuntime.reportSessionMetadataChanged(self, title);
+        }
         try NotificationAppRuntime.configure(self);
     }
 
+    pub fn configureSessionNaming(
+        self: *App,
+        config: session_naming_runtime.Config,
+    ) void {
+        SessionNamingAppRuntime.configure(self, config);
+    }
+
     pub fn reportSessionIdentityChanged(self: *App, session_id: ?[]const u8) void {
+        SessionNamingAppRuntime.invalidate(self);
         LifecycleAppRuntime.reportSessionChanged(self, session_id);
+        if (SessionAppRuntime.durableCachedSessionTitle(self)) |title| {
+            LifecycleAppRuntime.reportSessionMetadataChanged(self, title);
+        }
+    }
+
+    pub fn reportSessionMetadataChanged(self: *App, title: []const u8) void {
+        LifecycleAppRuntime.reportSessionMetadataChanged(self, title);
+    }
+
+    pub fn cancelPendingSessionName(self: *App) void {
+        SessionNamingAppRuntime.invalidate(self);
     }
 
     pub fn rebindAfterInit(self: *App) void {
@@ -922,11 +948,13 @@ const App = struct {
 
         self.worker.requestShutdown();
         self.managed_executions.shutdown();
+        SessionNamingAppRuntime.requestStop(self);
         self.upgrader.stop();
         self.file_index.requestStop();
 
         self.releaseTerminal();
         if (self.worker_thread) |thread| thread.join();
+        SessionNamingAppRuntime.deinit(self);
         self.terminal_client.deinit();
         self.managed_executions.deinit();
         self.model_cache.deinit();
@@ -1548,6 +1576,13 @@ const App = struct {
                 review,
             );
 
+        var naming_admission = SessionNamingAppRuntime.prepareAdmission(self, prompt);
+        defer if (naming_admission) |*prepared| prepared.deinit();
+        var admission_context = PromptAdmissionContext{
+            .app = self,
+            .naming_admission = &naming_admission,
+        };
+
         try self.worker.admitPromptObserved(std.heap.c_allocator, .{
             .turn_id = if (recovery_checkpoint) |checkpoint| checkpoint.turn_id else turn_id,
             .prompt = prompt_copy,
@@ -1571,16 +1606,25 @@ const App = struct {
             .recovery_source_already_presented = recovery_checkpoint != null,
             .user_prompt_already_presented = user_prompt_already_presented,
         }, recovery_checkpoint == null and intent == .steer, .{
-            .ctx = self,
+            .ctx = &admission_context,
             .report = reportPromptAdmission,
         });
         LifecycleAppRuntime.reportPromptWorking(self);
         return true;
     }
 
+    const PromptAdmissionContext = struct {
+        app: *App,
+        naming_admission: *?session_naming_runtime.PreparedAdmission,
+    };
+
     fn reportPromptAdmission(raw: *anyopaque) void {
-        const self: *App = @ptrCast(@alignCast(raw));
-        LifecycleAppRuntime.reportPromptQueued(self);
+        const context: *PromptAdmissionContext = @ptrCast(@alignCast(raw));
+        LifecycleAppRuntime.reportPromptQueued(context.app);
+        if (context.naming_admission.*) |*prepared| {
+            SessionNamingAppRuntime.admit(context.app, prepared);
+            context.naming_admission.* = null;
+        }
     }
 
     pub fn installInitialMcpRuntime(self: *App, runtime: ?*mcp_runtime_mod.McpRuntime) void {
@@ -2951,6 +2995,7 @@ const App = struct {
                 RenderAppRuntime.requestActiveSurfaceFrame(self, .footer);
             },
         }
+        SessionNamingAppRuntime.collectFacts(self);
         try app_commands.Handlers(App).collectMcpAuthenticationFacts(self);
         try app_commands.Handlers(App).collectMcpReloadFacts(self);
         if (comptime host_profile.native_auth or host_profile.js_host_auth) {

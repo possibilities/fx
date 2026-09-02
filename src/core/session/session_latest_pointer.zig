@@ -1,6 +1,7 @@
 const std = @import("std");
 const io_mod = @import("../shared/io.zig");
 const session_codec = @import("session_codec.zig");
+const session_display_metadata = @import("session_display_metadata.zig");
 const session_log = @import("session_log.zig");
 const Allocator = std.mem.Allocator;
 
@@ -292,6 +293,7 @@ pub const LatestCache = struct {
             var summary_owned = true;
             errdefer if (summary_owned) summary.deinit(alloc);
             try summary_codec.preserveIndexedDisplayMetadata(alloc, index.items, &summary);
+            try adoptFrozenSidecar(alloc, &self.sessions, &summary);
             try replaceIndexedSummary(alloc, index, &summary);
             summary_owned = false;
             try writeSessionIndex(alloc, &self.sessions, index.items);
@@ -302,6 +304,40 @@ pub const LatestCache = struct {
             state.id,
             position,
         );
+    }
+
+    /// The sidecar is the native display-metadata authority. A generated title
+    /// can be committed before the first history turn creates an index entry,
+    /// so the first index publication must adopt that already-durable title.
+    fn adoptFrozenSidecar(
+        alloc: Allocator,
+        sessions: *io_mod.VerifiedDir,
+        summary: *SessionSummary,
+    ) !void {
+        const opened = sessions.dir.openDir(io_mod.getIo(), summary.id, .{
+            .iterate = true,
+            .follow_symlinks = false,
+        }) catch return;
+        var session_dir = io_mod.VerifiedDir{ .dir = opened };
+        defer session_dir.close();
+        var display = session_display_metadata.readSidecarOrFallback(
+            alloc,
+            &session_dir,
+        ) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return,
+        };
+        if (!display.present) {
+            display.deinit(alloc);
+            return;
+        }
+
+        if (display.origin_workspace_root) |root| alloc.free(root);
+        if (summary.title) |title| alloc.free(title);
+        if (summary.preview) |preview| alloc.free(preview);
+        summary.title = display.title;
+        summary.preview = display.preview;
+        summary.display_metadata_present = true;
     }
 
     fn clearDeferredTokenIfCovered(
