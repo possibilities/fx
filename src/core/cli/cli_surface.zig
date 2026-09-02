@@ -7,6 +7,7 @@ const grok_oauth = @import("../auth/grok_oauth.zig");
 const acp_runner = @import("acp_runner.zig");
 const cli_ask = @import("cli_ask.zig");
 const cli_replay = @import("cli_replay.zig");
+const fxnk_identity = @import("fxnk_identity.zig");
 const command_specs = @import("../slash_commands/command_specs.zig");
 const collections = @import("../shared/collections.zig");
 const config_runtime = @import("../config/config_runtime.zig");
@@ -146,6 +147,7 @@ pub const RunResult = union(enum) {
 };
 
 const version_usage = "usage: fx --version\n";
+const fxnk_version_usage = "usage: fx --fxnk-version\n";
 
 pub const Config = struct {
     version: []const u8 = "",
@@ -812,6 +814,21 @@ fn runNonInteractiveWithDeps(
         }
         try writeStdout(deps, cfg.version);
         try writeStdout(deps, "\n");
+        return .handled_success;
+    }
+
+    if (isFxnkVersionFlag(effective_args[0])) {
+        if (effective_args.len != 1) {
+            try writeStderr(deps, fxnk_version_usage);
+            return .handled_failure;
+        }
+        const line = try std.fmt.allocPrint(
+            alloc,
+            "fxnk {s} (fx {s})\n",
+            .{ fxnk_identity.version, cfg.version },
+        );
+        defer alloc.free(line);
+        try writeStdout(deps, line);
         return .handled_success;
     }
 
@@ -3417,6 +3434,10 @@ fn joinArgs(alloc: Allocator, args: []const [:0]const u8) ![]u8 {
 
 fn isVersionFlag(arg: []const u8) bool {
     return std.mem.eql(u8, arg, "--version") or std.mem.eql(u8, arg, "-v");
+}
+
+fn isFxnkVersionFlag(arg: []const u8) bool {
+    return std.mem.eql(u8, arg, "--fxnk-version");
 }
 
 fn testCommandCatalog() CommandCatalog {
