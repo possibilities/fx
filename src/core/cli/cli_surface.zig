@@ -113,6 +113,7 @@ pub const LaunchModifiers = struct {
     context_limit_overrides: []config_runtime.context_limits.Override = &.{},
     additional_directories: [][]u8 = &.{},
     saved_directories_suppressed: bool = false,
+    project_instructions_enabled: bool = true,
 
     pub fn deinit(self: *LaunchModifiers, alloc: Allocator) void {
         if (self.context_limit_overrides.len > 0) alloc.free(self.context_limit_overrides);
@@ -346,6 +347,7 @@ fn parseGlobalLaunchArgs(
         directories.deinit(alloc);
     }
     var suppress_saved = false;
+    var project_instructions_enabled = true;
 
     var index: usize = 0;
     while (index < args.len) {
@@ -367,6 +369,9 @@ fn parseGlobalLaunchArgs(
         } else if (std.mem.eql(u8, arg, "--no-additional-dirs")) {
             if (suppress_saved) return error.DuplicateAdditionalDirectorySuppression;
             suppress_saved = true;
+        } else if (std.mem.eql(u8, arg, "--no-project-instructions")) {
+            if (!project_instructions_enabled) return error.DuplicateProjectInstructionSuppression;
+            project_instructions_enabled = false;
         } else {
             break;
         }
@@ -382,6 +387,7 @@ fn parseGlobalLaunchArgs(
             .context_limit_overrides = override_slice,
             .additional_directories = directory_slice,
             .saved_directories_suppressed = suppress_saved,
+            .project_instructions_enabled = project_instructions_enabled,
         },
     };
 }
@@ -403,7 +409,8 @@ pub fn argsAfterGlobalLaunchArgs(args: []const [:0]const u8) []const [:0]const u
             if (index >= args.len) return &.{};
         } else if (!std.mem.startsWith(u8, arg, "--context-limit=") and
             !std.mem.startsWith(u8, arg, "--add-dir=") and
-            !std.mem.eql(u8, arg, "--no-additional-dirs"))
+            !std.mem.eql(u8, arg, "--no-additional-dirs") and
+            !std.mem.eql(u8, arg, "--no-project-instructions"))
         {
             return args[index..];
         }
@@ -804,6 +811,12 @@ fn runNonInteractiveWithDeps(
         try writeWorkspaceModifierUsage(deps);
         return .handled_failure;
     }
+    if (!global_args.modifiers.project_instructions_enabled and
+        !commandSupportsProjectInstructionModifier(parsed_command))
+    {
+        try writeProjectInstructionModifierUsage(deps);
+        return .handled_failure;
+    }
 
     if (isVersionFlag(effective_args[0])) {
         if (effective_args.len != 1) {
@@ -864,6 +877,7 @@ fn runNonInteractiveWithDeps(
                 .saved_directories_suppressed = global_args.modifiers.saved_directories_suppressed,
                 .model_override = acp_opts.model,
                 .log_file = acp_opts.log_file,
+                .project_instructions_enabled = global_args.modifiers.project_instructions_enabled,
             });
             return .handled_success;
         },
@@ -3014,6 +3028,13 @@ fn commandSupportsWorkspaceModifiers(command: Command) bool {
     };
 }
 
+fn commandSupportsProjectInstructionModifier(command: Command) bool {
+    return switch (command) {
+        .interactive, .acp, .resume_session => true,
+        else => false,
+    };
+}
+
 fn writeWorkspaceModifierUsage(deps: RunDeps) !void {
     try writeStderr(
         deps,
@@ -3021,10 +3042,18 @@ fn writeWorkspaceModifierUsage(deps: RunDeps) !void {
     );
 }
 
+fn writeProjectInstructionModifierUsage(deps: RunDeps) !void {
+    try writeStderr(
+        deps,
+        "fx: --no-project-instructions is only supported for interactive, resume, and ACP launches\n",
+    );
+}
+
 fn globalLaunchErrorMessage(err: anyerror) ?[]const u8 {
     return switch (err) {
         error.MissingAddDirectoryValue => "--add-dir requires a directory path",
         error.DuplicateAdditionalDirectorySuppression => "--no-additional-dirs may only be specified once",
+        error.DuplicateProjectInstructionSuppression => "--no-project-instructions may only be specified once",
         else => null,
     };
 }
@@ -3590,6 +3619,7 @@ test "global launch modifiers own repeatable additional directories and suppress
         @constCast("--context-limit=skill_chunk_bytes=2048"),
         @constCast("--add-dir=/tmp/shared-two"),
         @constCast("--no-additional-dirs"),
+        @constCast("--no-project-instructions"),
         @constCast("ask"),
         @constCast("inspect"),
     });
@@ -3599,6 +3629,7 @@ test "global launch modifiers own repeatable additional directories and suppress
     try std.testing.expectEqualStrings("/tmp/shared one", parsed.modifiers.additional_directories[0]);
     try std.testing.expectEqualStrings("/tmp/shared-two", parsed.modifiers.additional_directories[1]);
     try std.testing.expect(parsed.modifiers.saved_directories_suppressed);
+    try std.testing.expect(!parsed.modifiers.project_instructions_enabled);
     try std.testing.expectEqualStrings("ask", parsed.remaining[0]);
 }
 
@@ -3614,6 +3645,10 @@ test "additional directory flags fail closed when malformed" {
     try std.testing.expectError(
         error.DuplicateAdditionalDirectorySuppression,
         parseGlobalLaunchArgs(std.testing.allocator, &.{ @constCast("--no-additional-dirs"), @constCast("--no-additional-dirs") }),
+    );
+    try std.testing.expectError(
+        error.DuplicateProjectInstructionSuppression,
+        parseGlobalLaunchArgs(std.testing.allocator, &.{ @constCast("--no-project-instructions"), @constCast("--no-project-instructions") }),
     );
 }
 
@@ -3687,7 +3722,8 @@ test "ACP command routes parsed options and launch config through the injected r
                 std.mem.eql(u8, cfg.additional_directories[0], "/tmp/acp-extra") and
                 cfg.saved_directories_suppressed and
                 std.mem.eql(u8, cfg.model_override.?, "model-override") and
-                std.mem.eql(u8, cfg.log_file.?, "/tmp/acp.log");
+                std.mem.eql(u8, cfg.log_file.?, "/tmp/acp.log") and
+                !cfg.project_instructions_enabled;
         }
     };
 
@@ -3703,6 +3739,7 @@ test "ACP command routes parsed options and launch config through the injected r
             @constCast("--add-dir"),
             @constCast("/tmp/acp-extra"),
             @constCast("--no-additional-dirs"),
+            @constCast("--no-project-instructions"),
             @constCast("acp"),
             @constCast("--model"),
             @constCast("model-override"),

@@ -1991,6 +1991,7 @@ fn commitSelectedContext(
 fn candidateHasApplicableContextDelta(
     arena: Allocator,
     context_registry: context_contract.Registry,
+    project_instructions_enabled: bool,
     config: Config,
     context_delivery_state: *const context_contract.DeliveryState,
     candidate: tool_preparation.Candidate,
@@ -2003,6 +2004,7 @@ fn candidateHasApplicableContextDelta(
     var selected = try context_registry.selectDefaultApplicableContext(arena, .{
         .workspace_root = config.workspace_root,
         .access_scope = config.access_scope,
+        .project_instructions_enabled = project_instructions_enabled,
         .targets = candidate.applicable_targets,
         .delivered_sources = context_delivery_state.delivered_sources.items,
         .evaluated_endpoints = context_delivery_state.evaluated_endpoints.items,
@@ -6245,6 +6247,7 @@ fn processQueuedPromptLoop(
             var selected = context_registry.selectDefaultApplicableContext(arena, .{
                 .workspace_root = config.workspace_root,
                 .access_scope = config.access_scope,
+                .project_instructions_enabled = deps.project_instructions_enabled,
                 .targets = preparation_batch.applicable_targets.items,
                 .delivered_sources = context_delivery_state.delivered_sources.items,
                 .evaluated_endpoints = context_delivery_state.evaluated_endpoints.items,
@@ -6288,6 +6291,7 @@ fn processQueuedPromptLoop(
                         context_deferred_calls[index] = candidateHasApplicableContextDelta(
                             arena,
                             context_registry,
+                            deps.project_instructions_enabled,
                             config,
                             &context_delivery_state,
                             candidate,
