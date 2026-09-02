@@ -1082,6 +1082,7 @@ pub const Persistence = struct {
     js_host_store: JsHostSessionStore = .{},
     js_host_session: ?JsHostSessionOwner = null,
     process_model_override: ?[]u8 = null,
+    process_effort_override: ?types.ReasoningEffort = null,
     session_picker: SessionPicker = .{},
     session_picker_load: SessionPickerLoad = .{},
     session_picker_current_cache: SessionPickerPageCache = .{},
@@ -1097,7 +1098,7 @@ pub const Persistence = struct {
     /// in a static release-binary template.
     pub fn initInto(storage: *Persistence) void {
         comptime {
-            if (std.meta.fields(Persistence).len != 20) {
+            if (std.meta.fields(Persistence).len != 21) {
                 @compileError("update Persistence.initInto for the changed field set");
             }
         }
@@ -1112,6 +1113,7 @@ pub const Persistence = struct {
         storage.js_host_store = .{};
         storage.js_host_session = null;
         storage.process_model_override = null;
+        storage.process_effort_override = null;
         storage.session_picker = .{};
         storage.session_picker_load = .{};
         storage.session_picker_current_cache = .{};
@@ -1162,6 +1164,7 @@ test "persistence in-place initialization preserves empty ownership" {
     try std.testing.expect(persistence.writable == null);
     try std.testing.expect(persistence.subagent_host == null);
     try std.testing.expect(!persistence.fast_mode_model_bound);
+    try std.testing.expect(persistence.process_effort_override == null);
     try std.testing.expect(!persistence.session_picker.active);
     try std.testing.expect(persistence.session_picker_load.task == null);
     try std.testing.expect(!persistence.session_picker_current_cache.ready);
@@ -1339,6 +1342,8 @@ pub fn Runtime(comptime App: type) type {
             configured_model: []const u8,
             model_source: config_runtime.ModelSource,
             selected_model: []const u8,
+            configured_effort: types.ReasoningEffort,
+            effort_source: config_runtime.ConfigSource,
             effort: types.ReasoningEffort,
             fast_mode: bool,
             fast_mode_model_bound: bool,
@@ -1349,7 +1354,7 @@ pub fn Runtime(comptime App: type) type {
                 .{
                     .provider = provider,
                     .model = @constCast(configured_model),
-                    .effort = effort,
+                    .effort = configured_effort,
                     .fast_mode = fast_mode,
                 },
             );
@@ -1367,6 +1372,8 @@ pub fn Runtime(comptime App: type) type {
                 app.session_persistence.process_model_override =
                     try app.alloc.dupe(u8, selected_model);
             }
+            app.session_persistence.process_effort_override =
+                if (effort_source == .process_override) effort else null;
         }
 
         pub fn initializePersistence(
@@ -4833,10 +4840,10 @@ pub fn Runtime(comptime App: type) type {
                 std.heap.c_allocator,
                 provider_runtime.model(app),
             );
-            app.effort = preferences.effort;
+            app.effort = app.session_persistence.process_effort_override orelse preferences.effort;
             app.fast_mode = preferences.fast_mode;
             app.session_persistence.fast_mode_model_bound = fast_mode_model_bound;
-            app.worker.syncQueuedPromptEffort(preferences.effort);
+            app.worker.syncQueuedPromptEffort(app.effort);
             app.worker.syncQueuedPromptFastMode(preferences.fast_mode);
         }
 
@@ -5574,6 +5581,8 @@ test "js-host resume restores transcript context preferences usage and revision"
         .user_global,
         "startup/model",
         .auto,
+        .compiled_default,
+        .auto,
         false,
         true,
     );
@@ -5632,6 +5641,8 @@ test "js-host resume store failures and missing records fall back to fresh sessi
             .user_global,
             "fresh/model",
             .auto,
+            .compiled_default,
+            .auto,
             false,
             true,
         );
@@ -5662,6 +5673,8 @@ test "js-host picker request stays unsupported and starts fresh" {
         .user_global,
         "fresh/model",
         .auto,
+        .compiled_default,
+        .auto,
         false,
         true,
     );
@@ -5687,6 +5700,8 @@ test "js-host completed and interrupted turns propagate revisions preserve owner
         "fresh/model",
         .user_global,
         "fresh/model",
+        .auto,
+        .compiled_default,
         .auto,
         false,
         true,
@@ -5755,6 +5770,8 @@ test "js-host preference changes snapshot the updated session preferences" {
         "fresh/model",
         .user_global,
         "fresh/model",
+        .auto,
+        .compiled_default,
         .auto,
         false,
         true,
@@ -5851,6 +5868,8 @@ fn configureTestPreferences(app: *TestApp) !void {
         "configured/model",
         .user_workspace,
         "configured/model",
+        types.ReasoningEffort.literal("high"),
+        .compiled_default,
         types.ReasoningEffort.literal("high"),
         true,
         true,
@@ -7477,10 +7496,14 @@ test "upgrade resume restores active session with the installed version notice" 
         "configured/model",
         .process_override,
         "env/model",
+        types.ReasoningEffort.literal("low"),
+        .process_override,
         types.ReasoningEffort.literal("high"),
         true,
         false,
     );
+    try std.testing.expect(app.session_persistence.workspace_preferences.?.effort.eql(types.ReasoningEffort.literal("low")));
+    try std.testing.expect(app.session_persistence.process_effort_override.?.eql(types.ReasoningEffort.literal("high")));
     try Runtime(TestApp).initializePersistence(&app, true);
     var calls = [_]types.ToolCall{.{
         .id = "call_read",
@@ -7587,7 +7610,11 @@ test "upgrade resume restores active session with the installed version notice" 
         "saved/model",
         app.session_persistence.session_preferences.?.model,
     );
-    try std.testing.expectEqual(types.ReasoningEffort.literal("medium"), app.effort);
+    try std.testing.expectEqual(types.ReasoningEffort.literal("high"), app.effort);
+    try std.testing.expectEqual(
+        types.ReasoningEffort.literal("medium"),
+        app.session_persistence.session_preferences.?.effort,
+    );
     try std.testing.expect(!app.fast_mode);
 }
 
@@ -8922,6 +8949,8 @@ test "fresh interactive session retains one writable schema-v3 handle" {
         "configured/model",
         .user_workspace,
         "configured/model",
+        types.ReasoningEffort.literal("high"),
+        .compiled_default,
         types.ReasoningEffort.literal("high"),
         true,
         true,
