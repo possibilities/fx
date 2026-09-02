@@ -4,16 +4,22 @@ const acp_server = @import("acp/server.zig");
 const jsonrpc = @import("acp/jsonrpc.zig");
 const gateway_provider = @import("core/gateway/gateway_provider.zig");
 const provider_set = @import("core/gateway/provider_set.zig");
+const model_provider = @import("core/config/model_provider.zig");
+const chatgpt_session = @import("core/auth/chatgpt_session.zig");
+const js_host_auth = @import("core/auth/js_host_auth.zig");
+const secret = @import("core/auth/secret.zig");
 const host = @import("core/hosts/host.zig");
 const debug_trace = @import("core/shared/debug_trace.zig");
 const io_mod = @import("core/shared/io.zig");
 const fetch_state = @import("napi_fetch_state.zig");
+const session_store_bridge = @import("napi_session_store.zig");
 const streamable_http = @import("core/mcp/streamable_http.zig");
 const host_stream_provider = @import("gateway/host_stream_provider.zig");
 const oauth_transport = @import("core/auth/oauth_transport.zig");
 const builtin_context = @import("builtins/context.zig");
 const builtin_gateway = @import("builtins/gateway.zig");
 const builtin_modes = @import("builtins/modes.zig");
+const builtin_providers = @import("builtins/providers.zig");
 
 const c = @cImport({
     @cInclude("node_api.h");
@@ -404,10 +410,15 @@ const FetchOperationResult = enum(u8) {
 const Runtime = struct {
     alloc: Allocator,
     fetch: FetchBridge = .{},
+    codex_sessions: session_store_bridge.Bridge = .{},
     stream_context: host_stream_provider.ProviderContext = undefined,
     input: InputQueue = .{},
     output: OutputQueue = .{},
     credential: []u8,
+    initial_provider: model_provider.ProviderId,
+    allowed_providers: std.EnumSet(model_provider.ProviderId),
+    codex_profile_home: ?[]u8,
+    uses_host_codex_store: bool,
     model: ?[]u8,
     home: []u8,
     workspace_root: []u8,
@@ -432,13 +443,22 @@ const Runtime = struct {
 
     fn run(self: *Runtime) void {
         const provider = gateway_provider.Provider{
-            .oauth_transport = oauth_transport.unavailable_provider,
+            .oauth_transport = builtin_gateway.oauth_transport_provider,
             .chat_url = builtin_gateway.provider.chat_url,
         };
         var gateway = builtin_gateway.provider_bundle;
         gateway.agent_stream = host_stream_provider.provider(&self.stream_context);
         gateway.permission_reviewer = null;
-        const providers = provider_set.gateway_only(gateway);
+        var providers = provider_set.gateway_only(gateway);
+        if (self.allowed_providers.contains(.codex)) {
+            providers.codex = builtin_providers.native.codex;
+        }
+        const codex_store: chatgpt_session.Store = if (self.codex_profile_home) |home|
+            .{ .profile = home }
+        else if (self.uses_host_codex_store)
+            .{ .host = self.codex_sessions.provider() }
+        else
+            .{ .profile = "" };
         acp_server.runWithTransport(
             self.alloc,
             .{
@@ -461,7 +481,10 @@ const Runtime = struct {
                 .max_history_turns = 100,
                 .context_registry = .{ .default_provider = builtin_context.provider },
                 .mode_registry = builtin_modes.registry,
-                .credential_override = self.credential,
+                .credential_override = if (self.credential.len > 0) self.credential else null,
+                .provider_override = self.initial_provider,
+                .allowed_providers = self.allowed_providers,
+                .chatgpt_session_store = codex_store,
                 .model_override = self.model,
                 .home_override = self.home,
                 .workspace_root_override = self.workspace_root,
@@ -483,16 +506,20 @@ const Runtime = struct {
 
     fn abortHostEffects(self: *Runtime) void {
         self.fetch.abort();
+        self.codex_sessions.abortCurrent();
     }
 
     fn deinit(self: *Runtime) void {
         self.closeInput();
         self.fetch.shutdown();
+        self.codex_sessions.shutdown();
         self.thread.join();
         self.fetch.deinit();
+        self.codex_sessions.deinit();
         self.input.deinit(self.alloc);
         self.output.deinit(self.alloc);
-        self.alloc.free(self.credential);
+        secret.zeroAndFree(self.alloc, self.credential);
+        if (self.codex_profile_home) |home| self.alloc.free(home);
         if (self.model) |model| self.alloc.free(model);
         self.alloc.free(self.home);
         self.alloc.free(self.workspace_root);
@@ -573,7 +600,7 @@ fn stringArg(env: c.napi_env, value: c.napi_value, alloc: Allocator, max_len: us
     if (c.napi_get_value_string_utf8(env, value, null, 0, &len) != c.napi_ok) return error.InvalidArgument;
     if (len > max_len) return error.ArgumentTooLong;
     const bytes = try alloc.alloc(u8, len + 1);
-    errdefer alloc.free(bytes);
+    errdefer secret.zeroAndFree(alloc, bytes);
     var written: usize = 0;
     if (c.napi_get_value_string_utf8(env, value, bytes.ptr, bytes.len, &written) != c.napi_ok) return error.InvalidArgument;
     return bytes[0..written];
@@ -595,9 +622,22 @@ fn getNamedString(
     return try stringArg(env, value, alloc, max_len);
 }
 
+fn getNamedBool(env: c.napi_env, object: c.napi_value, name: [*:0]const u8) !?bool {
+    var present = false;
+    if (c.napi_has_named_property(env, object, name, &present) != c.napi_ok or !present) return null;
+    var value: c.napi_value = undefined;
+    if (c.napi_get_named_property(env, object, name, &value) != c.napi_ok) return error.InvalidArgument;
+    var value_type: c.napi_valuetype = undefined;
+    if (c.napi_typeof(env, value, &value_type) != c.napi_ok or value_type != c.napi_boolean) return error.InvalidArgument;
+    var result = false;
+    if (c.napi_get_value_bool(env, value, &result) != c.napi_ok) return error.InvalidArgument;
+    return result;
+}
+
 const CreateError = error{
     TooManyRuntimes,
     InvalidApiKey,
+    InvalidAuth,
     InvalidModel,
     InvalidHome,
     InvalidWorkspaceRoot,
@@ -614,8 +654,33 @@ fn createRuntime(env: c.napi_env, options: c.napi_value) CreateError!*Runtime {
         error.OutOfMemory => return error.OutOfMemory,
         else => return error.InvalidApiKey,
     };
-    const api_key = credential orelse return error.InvalidApiKey;
-    errdefer alloc.free(api_key);
+    const api_key = credential orelse (alloc.dupe(u8, "") catch return error.OutOfMemory);
+    errdefer secret.zeroAndFree(alloc, api_key);
+    const provider_name = getNamedString(env, options, "provider", alloc, 16) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.InvalidAuth,
+    };
+    defer if (provider_name) |value| alloc.free(value);
+    const initial_provider = if (provider_name) |name|
+        model_provider.parse(name) orelse return error.InvalidAuth
+    else
+        model_provider.ProviderId.gateway;
+    if (initial_provider == .grok) return error.InvalidAuth;
+    const allow_gateway = (getNamedBool(env, options, "allowGateway") catch return error.InvalidAuth) orelse (initial_provider == .gateway);
+    const allow_codex = (getNamedBool(env, options, "allowCodex") catch return error.InvalidAuth) orelse false;
+    var allowed_providers = std.EnumSet(model_provider.ProviderId).initEmpty();
+    if (allow_gateway) allowed_providers.insert(.gateway);
+    if (allow_codex) allowed_providers.insert(.codex);
+    if (!allowed_providers.contains(initial_provider)) return error.InvalidAuth;
+    if (allow_gateway and api_key.len == 0) return error.InvalidApiKey;
+    const codex_profile_home = getNamedString(env, options, "codexProfileHome", alloc, max_path_bytes) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.InvalidAuth,
+    };
+    errdefer if (codex_profile_home) |value| alloc.free(value);
+    const uses_host_codex_store = (getNamedBool(env, options, "codexSessionStore") catch return error.InvalidAuth) orelse false;
+    if (allow_codex and (codex_profile_home != null) == uses_host_codex_store) return error.InvalidAuth;
+    if (!allow_codex and (codex_profile_home != null or uses_host_codex_store)) return error.InvalidAuth;
     const model = getNamedString(env, options, "model", alloc, max_model_bytes) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         else => return error.InvalidModel,
@@ -647,6 +712,10 @@ fn createRuntime(env: c.napi_env, options: c.napi_value) CreateError!*Runtime {
     runtime.* = .{
         .alloc = alloc,
         .credential = api_key,
+        .initial_provider = initial_provider,
+        .allowed_providers = allowed_providers,
+        .codex_profile_home = codex_profile_home,
+        .uses_host_codex_store = uses_host_codex_store,
         .model = model,
         .home = home,
         .workspace_root = workspace_root,
@@ -667,7 +736,8 @@ fn createRuntime(env: c.napi_env, options: c.napi_value) CreateError!*Runtime {
 fn throwCreateError(env: c.napi_env, err: CreateError) c.napi_value {
     return switch (err) {
         error.TooManyRuntimes => throw(env, "LIBFX_NATIVE_LIMIT", "too many active native runtimes"),
-        error.InvalidApiKey => throw(env, "LIBFX_INVALID_ARGUMENT", "apiKey is required and must be a bounded string"),
+        error.InvalidApiKey => throw(env, "LIBFX_INVALID_ARGUMENT", "apiKey must be a bounded string when provided"),
+        error.InvalidAuth => throw(env, "LIBFX_INVALID_ARGUMENT", "provider authorization is invalid or incomplete"),
         error.InvalidModel => throw(env, "LIBFX_INVALID_ARGUMENT", "model must be a bounded string"),
         error.InvalidHome => throw(env, "LIBFX_INVALID_ARGUMENT", "home is required and must be a bounded string"),
         error.InvalidWorkspaceRoot => throw(env, "LIBFX_INVALID_ARGUMENT", "workspaceRoot is required and must be a bounded string"),
@@ -758,6 +828,20 @@ fn fetch_handle_arg(env: c.napi_env, value: c.napi_value) ?fetch_state.Handle {
     return @intFromFloat(number);
 }
 
+fn session_handle_arg(env: c.napi_env, value: c.napi_value) ?session_store_bridge.Handle {
+    var number: f64 = 0;
+    if (c.napi_get_value_double(env, value, &number) != c.napi_ok or
+        !std.math.isFinite(number) or
+        number < 1 or
+        number > @as(f64, @floatFromInt(std.math.maxInt(session_store_bridge.Handle))) or
+        @floor(number) != number)
+    {
+        _ = c.napi_throw_type_error(env, "LIBFX_INVALID_ARGUMENT", "session operation handle must be a positive uint32");
+        return null;
+    }
+    return @intFromFloat(number);
+}
+
 fn fetch_operation_value(env: c.napi_env, result: FetchOperationResult) c.napi_value {
     var value: c.napi_value = undefined;
     if (!statusOk(env, c.napi_create_uint32(env, @intFromEnum(result), &value), "could not create fetch operation result")) return null;
@@ -830,6 +914,81 @@ fn takeCoreFetch(env: c.napi_env, info: c.napi_callback_info) callconv(.c) c.nap
     if (len > 0) @memcpy(@as([*]u8, @ptrCast(data.?))[0..len], runtime.fetch.request.items);
     runtime.fetch.request.clearRetainingCapacity();
     runtime.fetch.phase = decision.phase;
+    return value;
+}
+
+fn takeCoreCodexSessionOperation(env: c.napi_env, info: c.napi_callback_info) callconv(.c) c.napi_value {
+    var argv: [1]c.napi_value = undefined;
+    const handle = runtimeHandleArg(env, info, &argv) orelse return null;
+    const runtime = lockRuntime(env, handle) orelse return null;
+    defer unlockRuntime(handle);
+    var request = runtime.codex_sessions.takeRequest(runtime.alloc) catch
+        return throw(env, "LIBFX_NATIVE_OOM", "could not copy Codex session operation");
+    if (request == null) {
+        var value: c.napi_value = undefined;
+        _ = c.napi_get_null(env, &value);
+        return value;
+    }
+    defer request.?.deinit(runtime.alloc);
+
+    var value: c.napi_value = undefined;
+    if (!statusOk(env, c.napi_create_object(env, &value), "could not create Codex session operation")) return null;
+
+    var handle_value: c.napi_value = undefined;
+    if (!statusOk(env, c.napi_create_uint32(env, request.?.handle, &handle_value), "could not create Codex session operation handle")) return null;
+    if (!statusOk(env, c.napi_set_named_property(env, value, "handle", handle_value), "could not set Codex session operation handle")) return null;
+
+    const kind = @tagName(request.?.kind);
+    var kind_value: c.napi_value = undefined;
+    if (!statusOk(env, c.napi_create_string_utf8(env, kind.ptr, kind.len, &kind_value), "could not create Codex session operation kind")) return null;
+    if (!statusOk(env, c.napi_set_named_property(env, value, "kind", kind_value), "could not set Codex session operation kind")) return null;
+
+    var bytes_value: c.napi_value = undefined;
+    var data: ?*anyopaque = null;
+    if (!statusOk(env, c.napi_create_buffer(env, request.?.bytes.len, &data, &bytes_value), "could not allocate Codex session operation Buffer")) return null;
+    if (request.?.bytes.len > 0) @memcpy(@as([*]u8, @ptrCast(data.?))[0..request.?.bytes.len], request.?.bytes);
+    if (!statusOk(env, c.napi_set_named_property(env, value, "bytes", bytes_value), "could not set Codex session operation bytes")) return null;
+
+    var revision_value: c.napi_value = undefined;
+    if (request.?.expected_revision) |revision| {
+        if (!statusOk(env, c.napi_create_string_utf8(env, revision.ptr, revision.len, &revision_value), "could not create Codex session operation revision")) return null;
+    } else {
+        _ = c.napi_get_null(env, &revision_value);
+    }
+    if (!statusOk(env, c.napi_set_named_property(env, value, "expectedRevision", revision_value), "could not set Codex session operation revision")) return null;
+    return value;
+}
+
+fn finishCoreCodexSessionOperation(env: c.napi_env, info: c.napi_callback_info) callconv(.c) c.napi_value {
+    var argv: [5]c.napi_value = undefined;
+    const runtime_handle = runtimeHandleArg(env, info, &argv) orelse return null;
+    const operation_handle = session_handle_arg(env, argv[1]) orelse return null;
+    var status_number: u32 = 0;
+    if (c.napi_get_value_uint32(env, argv[2], &status_number) != c.napi_ok or
+        status_number > @intFromEnum(session_store_bridge.Status.failure))
+    {
+        return throw(env, "LIBFX_INVALID_ARGUMENT", "Codex session operation status is invalid");
+    }
+    var data: ?*anyopaque = null;
+    var len: usize = 0;
+    if (!statusOk(env, c.napi_get_buffer_info(env, argv[3], &data, &len), "Codex session operation bytes require a Buffer")) return null;
+    const bytes = if (len == 0) &.{} else @as([*]const u8, @ptrCast(data.?))[0..len];
+    const revision = stringArg(env, argv[4], std.heap.c_allocator, js_host_auth.max_revision_bytes) catch
+        return throw(env, "LIBFX_INVALID_ARGUMENT", "Codex session operation revision must be bounded text");
+    defer std.heap.c_allocator.free(revision);
+    const runtime = lockRuntime(env, runtime_handle) orelse return null;
+    defer unlockRuntime(runtime_handle);
+    const result = runtime.codex_sessions.finish(
+        operation_handle,
+        @enumFromInt(status_number),
+        bytes,
+        revision,
+    ) catch |err| return switch (err) {
+        error.OAuthSessionTooLarge => throw(env, "LIBFX_INVALID_ARGUMENT", "Codex session operation response is too large"),
+        else => throw(env, "LIBFX_NATIVE_OOM", "could not queue Codex session operation response"),
+    };
+    var value: c.napi_value = undefined;
+    if (!statusOk(env, c.napi_create_uint32(env, @intFromEnum(result), &value), "could not create Codex session operation result")) return null;
     return value;
 }
 
@@ -938,13 +1097,15 @@ fn exportFunction(env: c.napi_env, exports: c.napi_value, name: [*:0]const u8, c
 export fn napi_register_module_v1(env: c.napi_env, exports: c.napi_value) callconv(.c) c.napi_value {
     ensureThreadedIo();
     var api_version: c.napi_value = undefined;
-    if (!statusOk(env, c.napi_create_uint32(env, 2, &api_version), "could not create API version")) return null;
+    if (!statusOk(env, c.napi_create_uint32(env, 3, &api_version), "could not create API version")) return null;
     if (!statusOk(env, c.napi_set_named_property(env, exports, "libfxApiVersion", api_version), "could not export API version")) return null;
     if (!exportFunction(env, exports, "createCore", createCore)) return null;
     if (!exportFunction(env, exports, "writeCore", writeCore)) return null;
     if (!exportFunction(env, exports, "closeCore", closeCore)) return null;
     if (!exportFunction(env, exports, "drainCore", drainCore)) return null;
     if (!exportFunction(env, exports, "takeCoreFetch", takeCoreFetch)) return null;
+    if (!exportFunction(env, exports, "takeCoreCodexSessionOperation", takeCoreCodexSessionOperation)) return null;
+    if (!exportFunction(env, exports, "finishCoreCodexSessionOperation", finishCoreCodexSessionOperation)) return null;
     if (!exportFunction(env, exports, "coreFetchActive", coreFetchActive)) return null;
     if (!exportFunction(env, exports, "startCoreFetchResponse", startCoreFetchResponse)) return null;
     if (!exportFunction(env, exports, "pushCoreFetchResponse", pushCoreFetchResponse)) return null;

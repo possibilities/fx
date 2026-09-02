@@ -1,6 +1,8 @@
 const std = @import("std");
+const chatgpt_session = @import("../auth/chatgpt_session.zig");
 const config_runtime = @import("../config/config_runtime.zig");
 const process_provider = @import("../execution/process_provider.zig");
+const model_provider = @import("../config/model_provider.zig");
 const gateway_provider = @import("../gateway/gateway_provider.zig");
 const provider_set = @import("../gateway/provider_set.zig");
 const host = @import("../hosts/host.zig");
@@ -32,7 +34,10 @@ pub const Config = struct {
     context_registry: context_contract.Registry,
     mode_registry: mode_registry.Registry,
     model_override: ?[]const u8 = null,
+    provider_override: ?model_provider.ProviderId = null,
+    allowed_providers: std.EnumSet(model_provider.ProviderId) = .initFull(),
     credential_override: ?[]const u8 = null,
+    chatgpt_session_store: chatgpt_session.Store = chatgpt_session.default_store,
     home_override: ?[]const u8 = null,
     workspace_root_override: ?[]const u8 = null,
     log_file: ?[]const u8 = null,

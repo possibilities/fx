@@ -41,6 +41,8 @@ for (const [name, args] of [
   ["closeCore", []],
   ["drainCore", []],
   ["takeCoreFetch", []],
+  ["takeCoreCodexSessionOperation", []],
+  ["finishCoreCodexSessionOperation", []],
   ["coreFetchActive", []],
   ["startCoreFetchResponse", []],
   ["pushCoreFetchResponse", []],

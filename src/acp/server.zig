@@ -335,6 +335,7 @@ pub fn selectCredentialForProvider(
     state: *ServerState,
     provider: model_provider.ProviderId,
 ) !bool {
+    if (!state.cfg.allowed_providers.contains(provider)) return false;
     if (state.active_session) |active| {
         if (credentialMatchesProvider(active.credential_source, provider)) return true;
     }
@@ -346,13 +347,14 @@ pub fn selectCredentialForProvider(
             .source = .ai_gateway_api_key,
         }
     else blk: {
-        const resolution = try credentials.resolveForProvider(
+        const resolution = try credentials.resolveForProviderWithStore(
             state.alloc,
             state.cfg.gateway_provider.oauth_transport,
             state.cfg.secret_store,
             .refresh_if_needed,
             provider,
             state.credential_source,
+            state.cfg.chatgpt_session_store,
         );
         break :blk resolution.credential orelse return false;
     };
@@ -383,12 +385,13 @@ pub fn refreshModelCredential(
     expected_account_id: ?[]const u8,
 ) !?[]u8 {
     const state: *ServerState = @ptrCast(@alignCast(raw));
-    const refreshed = try auth_runtime.refreshCredentialTokenForAccount(
+    const refreshed = try auth_runtime.refreshCredentialTokenForAccountWithStore(
         state.cfg.gateway_provider.oauth_transport,
         alloc,
         source,
         mode,
         expected_account_id,
+        state.cfg.chatgpt_session_store,
     ) orelse return null;
     errdefer secret.zeroAndFree(alloc, refreshed);
     if (source == .chatgpt_subscription or source == .grok_subscription) {
@@ -1336,7 +1339,13 @@ fn handleInitialize(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message
         state.selected_model = startup.takeSelectedModel();
         state.process_model_override = startup.model_source == .process_override;
     }
-    state.provider = startup.provider;
+    state.provider = state.cfg.provider_override orelse startup.provider;
+    if (!state.cfg.allowed_providers.contains(state.provider)) {
+        return state.writer.writeError(alloc, msg.id, .{
+            .code = ErrorCode.invalid_request,
+            .message = "Selected provider was not authorized by this host",
+        });
+    }
     state.configured_model = try alloc.dupe(u8, startup.configured_model);
 
     var startup_credential = startup.takeCredential();
@@ -1357,13 +1366,14 @@ fn handleInitialize(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message
         &startup_credential.?
     else routed: {
         const preferred = if (startup_credential) |value| value.source else null;
-        const resolution = try credentials.resolveForProvider(
+        const resolution = try credentials.resolveForProviderWithStore(
             alloc,
             state.cfg.gateway_provider.oauth_transport,
             state.cfg.secret_store,
             .refresh_if_needed,
             state.provider,
             preferred,
+            state.cfg.chatgpt_session_store,
         );
         routed_credential = resolution.credential;
         if (routed_credential == null) {
@@ -1398,7 +1408,7 @@ fn handleInitialize(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message
     state.max_tool_result_bytes = startup.max_tool_result_bytes;
     state.context_limits = startup.context_limits;
     state.context_limits.applyCommandLine(state.cfg.context_limit_overrides);
-    state.fast_mode = startup.fast_mode and
+    state.fast_mode = startup.fast_mode and state.provider == startup.provider and
         (state.cfg.model_override == null or startup.fast_mode_source != .compiled_default);
     state.effort = startup.effort;
     state.first_call_tool_choice = startup.first_call_tool_choice;
@@ -1434,6 +1444,41 @@ fn handleInitialize(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message
         state.selected_model,
         state.cfg.provider_set.select(state.provider).fallbackModelCapabilities(state.selected_model),
     );
+    if (state.cfg.provider_override == .codex) {
+        const entries = state.capability_resolver.catalogEntries() orelse
+            return state.writer.writeError(alloc, msg.id, .{
+                .code = ErrorCode.invalid_request,
+                .message = "Failed to load Codex model catalog",
+            });
+        if (entries.len == 0) {
+            return state.writer.writeError(alloc, msg.id, .{
+                .code = ErrorCode.invalid_request,
+                .message = "Codex provider returned no supported models",
+            });
+        }
+        var selected_available = false;
+        for (entries) |entry| {
+            if (std.mem.eql(u8, entry.id, state.selected_model)) {
+                selected_available = true;
+                break;
+            }
+        }
+        if (!selected_available and state.cfg.model_override != null) {
+            return state.writer.writeError(alloc, msg.id, .{
+                .code = ErrorCode.invalid_request,
+                .message = "Model is not available for the selected provider",
+            });
+        }
+        if (!selected_available) {
+            const selected = try alloc.dupe(u8, entries[0].id);
+            errdefer alloc.free(selected);
+            const configured = try alloc.dupe(u8, selected);
+            alloc.free(state.selected_model);
+            state.selected_model = selected;
+            alloc.free(state.configured_model);
+            state.configured_model = configured;
+        }
+    }
 
     state.client_fs_read = request.client_fs_read;
     state.client_fs_write = request.client_fs_write;
@@ -1623,6 +1668,12 @@ fn handleSetConfigOption(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Me
                 .code = ErrorCode.invalid_params,
                 .message = "Invalid provider",
             });
+        if (!state.cfg.allowed_providers.contains(target)) {
+            return state.writer.writeError(alloc, msg.id, .{
+                .code = ErrorCode.invalid_request,
+                .message = "Provider was not supplied by this host",
+            });
+        }
         const session = if (state.active_session) |*active| active else return state.writer.writeError(alloc, msg.id, .{
             .code = ErrorCode.invalid_request,
             .message = "No active session",
@@ -1640,13 +1691,14 @@ fn handleSetConfigOption(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Me
                     .source = .ai_gateway_api_key,
                 }
             else credential: {
-                const resolution = try credentials.resolveForProvider(
+                const resolution = try credentials.resolveForProviderWithStore(
                     alloc,
                     state.cfg.gateway_provider.oauth_transport,
                     state.cfg.secret_store,
                     .refresh_if_needed,
                     target,
                     null,
+                    state.cfg.chatgpt_session_store,
                 );
                 break :credential resolution.credential orelse
                     return state.writer.writeError(alloc, msg.id, .{
@@ -1748,6 +1800,7 @@ fn handleSetConfigOption(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Me
         try sessions.writeProviderConfigOption(
             &out.writer,
             if (state.active_session) |session| session.provider else state.provider,
+            state.cfg.allowed_providers,
         );
         try out.writer.writeAll(",");
     }
