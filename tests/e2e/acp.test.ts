@@ -7470,16 +7470,20 @@ describe("acp: model-independent", () => {
         }),
       );
       const gateway = startFakeGateway([
-        fakeGatewayToolCall("launch_allow_command", "terminal", {
-          action: "exec",
-          command: `touch '${allowedMarker}'`,
-          timeout_ms: 5_000,
+        fakeGatewayToolCall("launch_allow_command", "shell", {
+          request: {
+            action: "run",
+            command: `touch '${allowedMarker}'`,
+            timeout_ms: 5_000,
+          },
         }),
         fileToolCall("launch_deny_write", deniedTarget, "blocked\n"),
-        fakeGatewayToolCall("launch_compound_command", "terminal", {
-          action: "exec",
-          command: `touch '${compoundMarker}' && touch '${compoundBypass}'`,
-          timeout_ms: 5_000,
+        fakeGatewayToolCall("launch_compound_command", "shell", {
+          request: {
+            action: "run",
+            command: `touch '${compoundMarker}' && touch '${compoundBypass}'`,
+            timeout_ms: 5_000,
+          },
         }),
         finalText("launch permission policy complete"),
       ]);
