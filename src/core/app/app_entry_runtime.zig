@@ -5,6 +5,7 @@ const app_session_runtime = @import("app_session_runtime.zig");
 const auto_upgrade = @import("../upgrade/auto_upgrade.zig");
 const acp_runner = @import("../cli/acp_runner.zig");
 const cli_surface = @import("../cli/cli_surface.zig");
+const credentials = @import("../auth/credentials.zig");
 const process_provider = @import("../execution/process_provider.zig");
 const gateway_provider = @import("../gateway/gateway_provider.zig");
 const provider_set = @import("../gateway/provider_set.zig");
@@ -67,6 +68,7 @@ pub const Config = struct {
     version: []const u8 = "",
     revision: []const u8 = "",
     build_channel: update_target.Channel = .stable,
+    auth_mode: credentials.AuthMode = .local,
     command_catalog: command_specs.TopLevelRegistry,
     default_model: []const u8,
     default_agent_step_limit: usize,
@@ -162,7 +164,7 @@ fn runWithDeps(comptime App: type, alloc: Allocator, args: []const [:0]const u8,
         .exit => |code| return .{ .exit = code },
     }
 
-    return runInteractiveWithDeps(App, false, alloc, &launch, deps);
+    return runInteractiveWithDeps(App, false, alloc, &launch, cfg.auth_mode, deps);
 }
 
 pub fn runBeforeInteractive(alloc: Allocator, args: []const [:0]const u8, cfg: Config) !BeforeInteractiveResult {
@@ -221,25 +223,23 @@ fn benchEnabled() bool {
     return io_mod.getenv("FX_BENCH") != null;
 }
 
-pub fn runInteractive(comptime App: type, alloc: Allocator, launch: *cli_surface.InteractiveLaunch) !RunOutcome {
-    return runInteractiveWithDeps(App, false, alloc, launch, .{});
+pub fn runInteractive(comptime App: type, alloc: Allocator, launch: *cli_surface.InteractiveLaunch, auth_mode: credentials.AuthMode) !RunOutcome {
+    return runInteractiveWithDeps(App, false, alloc, launch, auth_mode, .{});
 }
 
 /// Runs the interactive product without native CLI dispatch, process replacement,
 /// or a worker thread. Single-threaded hosts must arrange cooperative prompt work.
-pub fn runInteractiveCooperative(comptime App: type, alloc: Allocator, launch: *cli_surface.InteractiveLaunch) !RunOutcome {
-    return runInteractiveWithDeps(App, true, alloc, launch, .{});
+pub fn runInteractiveCooperative(comptime App: type, alloc: Allocator, launch: *cli_surface.InteractiveLaunch, auth_mode: credentials.AuthMode) !RunOutcome {
+    return runInteractiveWithDeps(App, true, alloc, launch, auth_mode, .{});
 }
 
 fn unavailableCliDispatch(_: ?*anyopaque, _: Allocator, _: []const [:0]const u8, _: cli_surface.Config) anyerror!cli_surface.RunResult {
     return error.UnknownCliCommand;
 }
 
-fn runInteractiveWithDeps(comptime App: type, comptime cooperative: bool, alloc: Allocator, launch: *cli_surface.InteractiveLaunch, deps: RunDeps) !RunOutcome {
+fn runInteractiveWithDeps(comptime App: type, comptime cooperative: bool, alloc: Allocator, launch: *cli_surface.InteractiveLaunch, auth_mode: credentials.AuthMode, deps: RunDeps) !RunOutcome {
     const resume_requested = launch.requested_resume != null;
-    const allow_native_tools = launch.modifiers.allow_native_tools;
-    const selected_native_tools = launch.modifiers.selected_native_tools;
-    var app = App.init(alloc, launch) catch |err| {
+    var app = App.init(alloc, launch, auth_mode) catch |err| {
         switch (err) {
             error.NotATerminal => {
                 writeStderr(deps, "fx requires an interactive terminal (TTY).\n");
@@ -349,45 +349,20 @@ fn runInteractiveWithDeps(comptime App: type, comptime cooperative: bool, alloc:
         if (handoff_value) |value| {
             var handoff = value;
             defer handoff.deinit(alloc);
-            const modifier_arg_count: usize = if (!allow_native_tools)
-                1
-            else
-                selected_native_tools.len * 2;
-            const argv_buffer = try alloc.alloc([]const u8, 4 + modifier_arg_count);
-            defer alloc.free(argv_buffer);
-            var argv_len: usize = 0;
-            argv_buffer[argv_len] = request.executablePath();
-            argv_len += 1;
-            if (!allow_native_tools) {
-                argv_buffer[argv_len] = "--no-native-tools";
-                argv_len += 1;
-            } else {
-                for (selected_native_tools) |name| {
-                    argv_buffer[argv_len] = "--tool";
-                    argv_len += 1;
-                    argv_buffer[argv_len] = name;
-                    argv_len += 1;
-                }
-            }
-            argv_buffer[argv_len] = "resume";
-            argv_len += 1;
-            argv_buffer[argv_len] = handoff.session_id;
-            argv_len += 1;
-            argv_buffer[argv_len] = cli_surface.upgrade_relaunch_arg;
-            argv_len += 1;
+            var argv = [_][]const u8{
+                request.executablePath(),
+                "resume",
+                handoff.session_id,
+                cli_surface.upgrade_relaunch_arg,
+                request.previousRevision() orelse "",
+            };
+            const argv_slice = if (request.previousRevision() == null) argv[0..4] else argv[0..5];
             const replace_err = deps.replace_process(
                 deps.replace_ctx,
                 io_mod.getIo(),
-                .{ .argv = argv_buffer[0..argv_len] },
+                .{ .argv = argv_slice },
             );
-            writeUpgradeRelaunchFailure(
-                alloc,
-                deps,
-                replace_err,
-                handoff.session_id,
-                allow_native_tools,
-                selected_native_tools,
-            );
+            writeUpgradeRelaunchFailure(deps, replace_err, handoff.session_id);
         } else {
             writeStderr(
                 deps,
@@ -422,52 +397,17 @@ fn replaceProcessDefault(
 }
 
 fn writeUpgradeRelaunchFailure(
-    alloc: Allocator,
     deps: RunDeps,
     err: std.process.ReplaceError,
     session_id: []const u8,
-    allow_native_tools: bool,
-    selected_native_tools: []const []const u8,
 ) void {
-    const rendered = formatUpgradeRelaunchFailure(
-        alloc,
-        err,
-        session_id,
-        allow_native_tools,
-        selected_native_tools,
-    ) catch {
-        writeStderr(
-            deps,
-            "fx: upgrade installed, but relaunch failed; run `fx doctor`.\n",
-        );
-        return;
-    };
-    defer alloc.free(rendered);
-    writeStderr(deps, rendered);
-}
-
-fn formatUpgradeRelaunchFailure(
-    alloc: Allocator,
-    err: std.process.ReplaceError,
-    session_id: []const u8,
-    allow_native_tools: bool,
-    selected_native_tools: []const []const u8,
-) ![]u8 {
-    var writer: std.Io.Writer.Allocating = .init(alloc);
-    errdefer writer.deinit();
-    try writer.writer.print(
-        "fx: upgrade installed, but relaunch failed: {s}\nContinue session with: fx",
-        .{@errorName(err)},
-    );
-    if (!allow_native_tools) {
-        try writer.writer.writeAll(" --no-native-tools");
-    } else {
-        for (selected_native_tools) |name| {
-            try writer.writer.print(" --tool {s}", .{name});
-        }
-    }
-    try writer.writer.print(" --resume {s}\n", .{session_id});
-    return writer.toOwnedSlice();
+    var buffer: [768]u8 = undefined;
+    const message = std.fmt.bufPrint(
+        &buffer,
+        "fx: upgrade installed, but relaunch failed: {s}\nContinue session with: fx --resume {s}\n",
+        .{ @errorName(err), session_id },
+    ) catch "fx: upgrade installed, but relaunch failed; run `fx doctor`.\n";
+    writeStderr(deps, message);
 }
 
 fn cliSurfaceConfig(cfg: Config) cli_surface.Config {
@@ -475,6 +415,7 @@ fn cliSurfaceConfig(cfg: Config) cli_surface.Config {
         .version = cfg.version,
         .revision = cfg.revision,
         .build_channel = cfg.build_channel,
+        .auth_mode = cfg.auth_mode,
         .command_catalog = cfg.command_catalog,
         .default_model = cfg.default_model,
         .default_agent_step_limit = cfg.default_agent_step_limit,
@@ -687,11 +628,12 @@ const TestCapture = struct {
     resume_handoff_id: ?[]const u8 = null,
     raise_sigint_during_deinit: bool = false,
     upgrade_relaunch_path: ?[]const u8 = null,
+    upgrade_previous_revision: ?[]const u8 = null,
     replace_error: std.process.ReplaceError = error.InvalidExe,
     replace_calls: usize = 0,
     replace_arg_count: usize = 0,
-    replace_arg_bufs: [16][128]u8 = undefined,
-    replace_arg_lens: [16]usize = [_]usize{0} ** 16,
+    replace_arg_bufs: [5][128]u8 = undefined,
+    replace_arg_lens: [5]usize = .{ 0, 0, 0, 0, 0 },
     fail_unexpected_format: bool = false,
 
     fn init(run_result: cli_surface.RunResult) TestCapture {
@@ -798,7 +740,7 @@ const TestApp = struct {
     requested_resume: ?cli_surface.ResumeTarget = null,
     terminal_released: bool = false,
 
-    fn init(_: Allocator, launch: *cli_surface.InteractiveLaunch) !TestApp {
+    fn init(_: Allocator, launch: *cli_surface.InteractiveLaunch, _: credentials.AuthMode) !TestApp {
         appendInitEvent(launch);
         if (active_capture.?.init_error) |err| return err;
 
@@ -838,6 +780,10 @@ const TestApp = struct {
             .executable_path_len = path.len,
         };
         @memcpy(request.executable_path_buf[0..path.len], path);
+        if (active_capture.?.upgrade_previous_revision) |revision| {
+            @memcpy(request.previous_revision_buf[0..revision.len], revision);
+            request.previous_revision_len = @intCast(revision.len);
+        }
         return request;
     }
 
@@ -1077,16 +1023,15 @@ test "app entry relaunches only after teardown with the validated handoff" {
     });
 }
 
-test "app entry preserves native tool suppression across upgrade relaunch" {
+test "app entry carries the previous revision through upgrade relaunch" {
     const alloc = std.testing.allocator;
-    var capture = TestCapture.init(.{ .interactive = .{
-        .modifiers = .{ .allow_native_tools = false },
-    } });
+    var capture = TestCapture.init(.{ .interactive = .{} });
     defer capture.deinit();
     capture.resume_handoff_id = "session-123";
     capture.upgrade_relaunch_path = "/tmp/fx-upgraded";
+    capture.upgrade_previous_revision = "1111111111111111111111111111111111111111";
 
-    const outcome = try runWithDeps(
+    _ = try runWithDeps(
         TestApp,
         alloc,
         &.{},
@@ -1094,19 +1039,12 @@ test "app entry preserves native tool suppression across upgrade relaunch" {
         capture.deps(),
     );
 
-    try std.testing.expectEqual(@as(u8, 1), outcome.exit);
-    try std.testing.expectEqual(@as(usize, 1), capture.replace_calls);
     try std.testing.expectEqual(@as(usize, 5), capture.replace_arg_count);
-    try std.testing.expectEqualStrings("/tmp/fx-upgraded", capture.replaceArg(0));
-    try std.testing.expectEqualStrings("--no-native-tools", capture.replaceArg(1));
-    try std.testing.expectEqualStrings("resume", capture.replaceArg(2));
-    try std.testing.expectEqualStrings("session-123", capture.replaceArg(3));
-    try std.testing.expectEqualStrings("--upgrade-relaunch", capture.replaceArg(4));
-    try std.testing.expect(std.mem.find(
-        u8,
-        capture.stderr.written(),
-        "fx --no-native-tools --resume session-123",
-    ) != null);
+    try std.testing.expectEqualStrings("--upgrade-relaunch", capture.replaceArg(3));
+    try std.testing.expectEqualStrings(
+        "1111111111111111111111111111111111111111",
+        capture.replaceArg(4),
+    );
 }
 
 test "app entry preserves ordered native tool selection across upgrade relaunch" {

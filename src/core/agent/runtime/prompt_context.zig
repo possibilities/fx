@@ -1,26 +1,213 @@
 const std = @import("std");
 const model_capabilities = @import("../../config/model_capabilities.zig");
+const token_estimate = @import("../../shared/token_estimate.zig");
 const types = @import("../../shared/types.zig");
 const session_runtime = @import("../../session/session.zig");
-
-const runtime_config = @import("config.zig");
 
 const Allocator = std.mem.Allocator;
 const ChatMessage = types.ChatMessage;
 const HistoryTurn = types.HistoryTurn;
 
-pub fn historyContextBudgetTokensForCapabilities(capabilities: model_capabilities.Capabilities) usize {
-    const context_window = capabilities.context_window orelse
-        return runtime_config.default_history_context_budget_tokens;
-    const context_tokens: usize = @intCast(context_window);
-    const available_input_tokens = if (capabilities.max_output_tokens) |max_output_tokens|
-        context_tokens -| @as(usize, @intCast(max_output_tokens))
+const compaction_high_water_numerator: usize = 4;
+const compaction_ratio_denominator: usize = 5;
+const compaction_target_denominator: usize = 10;
+const compaction_source_reduction_denominator: usize = 8;
+const compaction_generation_multiplier: usize = 4;
+
+pub const CompactionTrigger = enum {
+    automatic,
+    manual,
+};
+
+pub const CompactionDecision = enum {
+    no_op,
+    compact,
+};
+
+pub const CompactionPlanInput = struct {
+    trigger: CompactionTrigger,
+    capabilities: model_capabilities.Capabilities,
+    request_tokens: usize,
+    source_tokens: usize,
+    protected_tokens: usize = 0,
+};
+
+pub const CompactionPlan = struct {
+    decision: CompactionDecision,
+    usable_input_tokens: ?usize,
+    high_water_tokens: ?usize,
+    session_target_tokens: ?usize,
+    accepted_handoff_tokens: ?usize,
+    generation_tokens: ?usize,
+};
+
+pub fn planCompaction(input: CompactionPlanInput) CompactionPlan {
+    const usable = usableInputTokens(input.capabilities);
+    const high_water = if (usable) |tokens|
+        tokens * compaction_high_water_numerator / compaction_ratio_denominator
     else
-        context_tokens;
-    return @max(
+        null;
+    const session_target = if (usable) |tokens|
+        tokens / compaction_target_denominator
+    else
+        null;
+    const should_compact = input.source_tokens > 0 and switch (input.trigger) {
+        .manual => true,
+        .automatic => if (high_water) |tokens| input.request_tokens >= tokens else false,
+    };
+    if (!should_compact) return .{
+        .decision = .no_op,
+        .usable_input_tokens = usable,
+        .high_water_tokens = high_water,
+        .session_target_tokens = session_target,
+        .accepted_handoff_tokens = null,
+        .generation_tokens = null,
+    };
+
+    const source_target = @max(
         @as(usize, 1),
-        available_input_tokens / runtime_config.history_context_budget_window_divisor,
+        (input.source_tokens +| (compaction_source_reduction_denominator - 1)) /
+            compaction_source_reduction_denominator,
     );
+    const total_target = if (session_target) |target|
+        @max(@as(usize, 1), target)
+    else
+        source_target;
+    if (input.protected_tokens >= total_target) return .{
+        .decision = .no_op,
+        .usable_input_tokens = usable,
+        .high_water_tokens = high_water,
+        .session_target_tokens = session_target,
+        .accepted_handoff_tokens = null,
+        .generation_tokens = null,
+    };
+    const accepted = total_target - input.protected_tokens;
+    const requested_generation = accepted *| compaction_generation_multiplier;
+    const generation = if (input.capabilities.max_output_tokens) |limit|
+        @min(requested_generation, @as(usize, @intCast(limit)))
+    else
+        requested_generation;
+    return .{
+        .decision = .compact,
+        .usable_input_tokens = usable,
+        .high_water_tokens = high_water,
+        .session_target_tokens = session_target,
+        .accepted_handoff_tokens = accepted,
+        .generation_tokens = generation,
+    };
+}
+
+pub const CompactionHandoffError = error{
+    EmptyCompactionHandoff,
+    InvalidCompactionHandoff,
+    CompactionHandoffTooLarge,
+};
+
+pub fn validateCompactionHandoff(
+    text: []const u8,
+    accepted_tokens: usize,
+) CompactionHandoffError!void {
+    if (!std.unicode.utf8ValidateSlice(text)) return error.InvalidCompactionHandoff;
+    if (std.mem.trim(u8, text, " \t\r\n").len == 0) {
+        return error.EmptyCompactionHandoff;
+    }
+    var estimator = token_estimate.StreamingEstimator{};
+    estimator.consume(text);
+    if (estimator.estimate() > accepted_tokens) {
+        return error.CompactionHandoffTooLarge;
+    }
+}
+
+pub const RequestCost = struct {
+    serialized_bytes: usize,
+    estimated_input_tokens: usize,
+};
+
+pub const RequestTokenCalibration = struct {
+    serialized_bytes: usize,
+    exact_input_tokens: usize,
+};
+
+pub fn measureProviderRequest(body: []const u8) RequestCost {
+    var estimator = token_estimate.StreamingEstimator{};
+    estimator.consume(body);
+    return .{
+        .serialized_bytes = body.len,
+        .estimated_input_tokens = @intCast(@min(
+            estimator.estimate(),
+            std.math.maxInt(usize),
+        )),
+    };
+}
+
+pub fn calibrateProviderRequest(
+    cost: RequestCost,
+    calibration: RequestTokenCalibration,
+) RequestCost {
+    if (calibration.serialized_bytes == 0 or calibration.exact_input_tokens == 0) {
+        return cost;
+    }
+    const calibrated_tokens = multiplyDivideCeilSaturating(
+        cost.serialized_bytes,
+        calibration.exact_input_tokens,
+        calibration.serialized_bytes,
+    );
+    return .{
+        .serialized_bytes = cost.serialized_bytes,
+        .estimated_input_tokens = @max(
+            cost.estimated_input_tokens,
+            calibrated_tokens,
+        ),
+    };
+}
+
+fn multiplyDivideCeilSaturating(
+    value: usize,
+    numerator: usize,
+    denominator: usize,
+) usize {
+    std.debug.assert(denominator != 0);
+    const whole = std.math.mul(
+        usize,
+        value / denominator,
+        numerator,
+    ) catch return std.math.maxInt(usize);
+    const remainder_product = std.math.mul(
+        usize,
+        value % denominator,
+        numerator,
+    ) catch return std.math.maxInt(usize);
+    const partial = remainder_product / denominator +
+        @intFromBool(remainder_product % denominator != 0);
+    return std.math.add(usize, whole, partial) catch std.math.maxInt(usize);
+}
+
+pub fn estimateCompactionSourceTokens(messages: []const ChatMessage) usize {
+    var estimator = token_estimate.StreamingEstimator{};
+    for (messages) |message| {
+        estimator.consume(@tagName(message.role));
+        if (message.content) |content| estimator.consume(content);
+        if (message.tool_call_id) |id| estimator.consume(id);
+        if (message.tool_name) |name| estimator.consume(name);
+        for (message.tool_calls) |call| {
+            estimator.consume(call.id);
+            estimator.consume(call.name);
+            estimator.consume(call.arguments_json);
+        }
+    }
+    return @intCast(@min(estimator.estimate(), std.math.maxInt(usize)));
+}
+
+pub fn usableInputTokens(
+    capabilities: model_capabilities.Capabilities,
+) ?usize {
+    const context_window = capabilities.context_window orelse return null;
+    const context_tokens: usize = @intCast(context_window);
+    if (capabilities.max_output_tokens) |output| {
+        const output_tokens: usize = @intCast(output);
+        if (output_tokens < context_tokens) return context_tokens - output_tokens;
+    }
+    return context_tokens;
 }
 
 pub fn buildGatewayMessages(
@@ -48,83 +235,6 @@ fn appendEphemeralOverlayMessages(alloc: Allocator, messages: *std.ArrayList(Cha
         copy.cache_policy = .no_cache;
         try messages.append(alloc, copy);
     }
-}
-
-test "history context budget reserves known output capacity from one capability snapshot" {
-    const cases = [_]struct {
-        capabilities: model_capabilities.Capabilities,
-        expected: usize,
-    }{
-        .{ .capabilities = .{ .context_window = 128_000, .max_output_tokens = 32_000 }, .expected = 24_000 },
-        .{ .capabilities = .{ .context_window = 256_000, .max_output_tokens = 64_000 }, .expected = 48_000 },
-        .{ .capabilities = .{ .context_window = 1_000_000, .max_output_tokens = 128_000 }, .expected = 218_000 },
-        .{ .capabilities = .{ .context_window = 512_000 }, .expected = 128_000 },
-        .{ .capabilities = .{ .max_output_tokens = 32_000 }, .expected = runtime_config.default_history_context_budget_tokens },
-        .{ .capabilities = .{ .context_window = 32_000, .max_output_tokens = 32_000 }, .expected = 1 },
-        .{ .capabilities = .{ .context_window = 32_000, .max_output_tokens = 64_000 }, .expected = 1 },
-        .{ .capabilities = .{}, .expected = runtime_config.default_history_context_budget_tokens },
-    };
-
-    for (cases) |case| {
-        try std.testing.expectEqual(
-            case.expected,
-            historyContextBudgetTokensForCapabilities(case.capabilities),
-        );
-    }
-}
-
-test "budgeted history projection uses a million-token capability while remaining bounded" {
-    const alloc = std.testing.allocator;
-    var arena_state = std.heap.ArenaAllocator.init(alloc);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-
-    const large_user = try arena.alloc(u8, 120_000);
-    @memset(large_user, 'u');
-    const large_assistant = try arena.alloc(u8, 120_000);
-    @memset(large_assistant, 'a');
-
-    var history: [5]HistoryTurn = undefined;
-    for (&history) |*turn| {
-        turn.* = try session_runtime.makeAssistantTurn(arena, large_user, large_assistant);
-    }
-
-    const exact_budget = historyContextBudgetTokensForCapabilities(
-        .{ .context_window = 1_000_000 },
-    );
-    try std.testing.expectEqual(@as(usize, 250_000), exact_budget);
-
-    var below_new_budget: std.ArrayList(ChatMessage) = .empty;
-    try session_runtime.appendHistoryChatMessagesBudgeted(
-        arena,
-        &below_new_budget,
-        history[0..4],
-        .{ .max_tokens = exact_budget },
-    );
-    try std.testing.expectEqual(@as(usize, 8), below_new_budget.items.len);
-    try std.testing.expectEqualStrings(large_assistant, below_new_budget.items[below_new_budget.items.len - 1].content.?);
-
-    var above_new_budget: std.ArrayList(ChatMessage) = .empty;
-    try session_runtime.appendHistoryChatMessagesBudgeted(
-        arena,
-        &above_new_budget,
-        &history,
-        .{ .max_tokens = exact_budget },
-    );
-    try std.testing.expectEqual(types.ChatRole.system, above_new_budget.items[0].role);
-    try std.testing.expectEqual(@as(usize, 9), above_new_budget.items.len);
-    try std.testing.expectEqualStrings(large_assistant, above_new_budget.items[above_new_budget.items.len - 1].content.?);
-
-    var older_model_projection: std.ArrayList(ChatMessage) = .empty;
-    try session_runtime.appendHistoryChatMessagesBudgeted(
-        arena,
-        &older_model_projection,
-        history[0..4],
-        .{ .max_tokens = historyContextBudgetTokensForCapabilities(.{ .context_window = 200_000 }) },
-    );
-    try std.testing.expectEqual(types.ChatRole.system, older_model_projection.items[0].role);
-    try std.testing.expectEqual(@as(usize, 3), older_model_projection.items.len);
-    try std.testing.expectEqualStrings(large_assistant, older_model_projection.items[older_model_projection.items.len - 1].content.?);
 }
 
 test "buildGatewayMessages orders transient overlay before history and current prompt" {
@@ -275,4 +385,112 @@ test "buildGatewayMessages preserves one system prefix for projected session his
     try std.testing.expectEqual(@as(usize, 1), interruption_count);
     try std.testing.expectEqualStrings("current portable prompt", messages.items[messages.items.len - 2].content.?);
     try std.testing.expectEqualStrings("within-turn suffix", messages.items[messages.items.len - 1].content.?);
+}
+
+test "provider request measurement includes serialized structure" {
+    const compact = measureProviderRequest("{\"prompt\":[{\"role\":\"user\",\"content\":\"same\"}]}");
+    const fragmented = measureProviderRequest(
+        "{\"prompt\":[{\"role\":\"user\",\"content\":\"s\"},{\"role\":\"user\",\"content\":\"a\"},{\"role\":\"user\",\"content\":\"m\"},{\"role\":\"user\",\"content\":\"e\"}]}",
+    );
+    try std.testing.expect(fragmented.serialized_bytes > compact.serialized_bytes);
+    try std.testing.expect(fragmented.estimated_input_tokens > compact.estimated_input_tokens);
+}
+
+test "provider request measurement learns the prior exact token density" {
+    const current = RequestCost{
+        .serialized_bytes = 1_456_988,
+        .estimated_input_tokens = 365_113,
+    };
+    const calibrated = calibrateProviderRequest(current, .{
+        .serialized_bytes = 767_736,
+        .exact_input_tokens = 398_710,
+    });
+
+    try std.testing.expect(calibrated.estimated_input_tokens > 695_142);
+    try std.testing.expect(calibrated.estimated_input_tokens >= current.estimated_input_tokens);
+}
+
+test "compaction v2 triggers automatic work at eighty percent and targets ten percent" {
+    try std.testing.expectEqual(
+        @as(usize, 2),
+        std.meta.tags(CompactionDecision).len,
+    );
+
+    const capabilities = model_capabilities.Capabilities{
+        .context_window = 1_000,
+        .max_output_tokens = 200,
+    };
+    const below = planCompaction(.{
+        .trigger = .automatic,
+        .capabilities = capabilities,
+        .request_tokens = 639,
+        .source_tokens = 640,
+    });
+    try std.testing.expectEqual(CompactionDecision.no_op, below.decision);
+
+    const at_boundary = planCompaction(.{
+        .trigger = .automatic,
+        .capabilities = capabilities,
+        .request_tokens = 640,
+        .source_tokens = 640,
+    });
+    try std.testing.expectEqual(CompactionDecision.compact, at_boundary.decision);
+    try std.testing.expectEqual(@as(?usize, 800), at_boundary.usable_input_tokens);
+    try std.testing.expectEqual(@as(?usize, 640), at_boundary.high_water_tokens);
+    try std.testing.expectEqual(@as(?usize, 80), at_boundary.session_target_tokens);
+    try std.testing.expectEqual(@as(?usize, 80), at_boundary.accepted_handoff_tokens);
+    try std.testing.expectEqual(@as(?usize, 200), at_boundary.generation_tokens);
+
+    const protected_prompt = planCompaction(.{
+        .trigger = .automatic,
+        .capabilities = capabilities,
+        .request_tokens = 640,
+        .source_tokens = 640,
+        .protected_tokens = 20,
+    });
+    try std.testing.expectEqual(@as(?usize, 60), protected_prompt.accepted_handoff_tokens);
+
+    const oversized_protected_prompt = planCompaction(.{
+        .trigger = .automatic,
+        .capabilities = capabilities,
+        .request_tokens = 640,
+        .source_tokens = 640,
+        .protected_tokens = 80,
+    });
+    try std.testing.expectEqual(CompactionDecision.no_op, oversized_protected_prompt.decision);
+}
+
+test "manual compaction shares the budget and stops after a smaller source" {
+    const plan = planCompaction(.{
+        .trigger = .manual,
+        .capabilities = .{
+            .context_window = 1_000,
+            .max_output_tokens = 200,
+        },
+        .request_tokens = 100,
+        .source_tokens = 400,
+    });
+    try std.testing.expectEqual(CompactionDecision.compact, plan.decision);
+    try std.testing.expectEqual(@as(?usize, 80), plan.accepted_handoff_tokens);
+    try std.testing.expectEqual(@as(?usize, 200), plan.generation_tokens);
+
+    const empty = planCompaction(.{
+        .trigger = .manual,
+        .capabilities = .{ .context_window = 1_000 },
+        .request_tokens = 0,
+        .source_tokens = 0,
+    });
+    try std.testing.expectEqual(CompactionDecision.no_op, empty.decision);
+}
+
+test "handoff acceptance is structural and bounded" {
+    try std.testing.expectError(
+        error.EmptyCompactionHandoff,
+        validateCompactionHandoff(" \n\t", 10),
+    );
+    try std.testing.expectError(
+        error.CompactionHandoffTooLarge,
+        validateCompactionHandoff("one two three four five six seven eight nine ten eleven", 4),
+    );
+    try validateCompactionHandoff("# Objective\nContinue safely.", 16);
 }

@@ -1,6 +1,8 @@
 const std = @import("std");
 const agent_runtime = @import("../agent/agent_runtime.zig");
 const agent_stream_provider = @import("../agent/stream_provider.zig");
+const runtime_context_compaction = @import("../agent/runtime/context_compaction.zig");
+const runtime_prompt_context = @import("../agent/runtime/prompt_context.zig");
 const command_admission = @import("../permissions/command_admission.zig");
 const permission_auto_classifier = @import("../permissions/auto_classifier.zig");
 const app_callbacks = @import("app_callbacks.zig");
@@ -217,6 +219,15 @@ pub fn Runtime(comptime App: type) type {
                     app.agentStreamProvider()
                 else
                     agent_stream_provider.unavailable_provider,
+                .compaction_route = if (comptime @hasDecl(App, "providerSet"))
+                    app.providerSet().compactionRoute(
+                        selected_provider,
+                        app.auth.credentialSource(),
+                    )
+                else if (comptime @hasDecl(App, "compactionRoute"))
+                    app.compactionRoute()
+                else
+                    .{ .unavailable = .missing_policy },
                 .gateway_team = app.auth.gatewayTeam(),
                 .credential_source = app.auth.credentialSource(),
                 .account_id = app.auth.accountId(),
@@ -605,6 +616,7 @@ pub fn Runtime(comptime App: type) type {
             gateway_chat_url: []const u8,
         ) !command_admission.PermissionOutcome {
             var ctx = tool_runtime.withAdvertisedDynamicToolNames(toolContext(app, ignored_list_entries, max_list_entries, max_read_file_bytes, max_read_file_lines, max_read_file_line_len, max_command_output_bytes, gateway_retry_count, gateway_chat_url), advertised_dynamic_tool_names);
+            applyCredentialLease(app, &ctx, review_turn.credential, gateway_retry_count, gateway_chat_url);
             ctx.permission_review_turn = review_turn;
             const admission = ctx.admissionInputWithLiveAuthority(live_authority);
             return if (revalidation) |request| switch (request) {
@@ -659,6 +671,7 @@ pub fn Runtime(comptime App: type) type {
                 ),
                 advertised_dynamic_tool_names,
             );
+            applyCredentialLease(app, &ctx, review_turn.credential, gateway_retry_count, gateway_chat_url);
             ctx.permission_review_turn = review_turn;
             const admission = ctx.admissionInputWithLiveAuthority(live_authority);
             return tool_admission.requestPreparedFileMutationPermissionOutcome(
@@ -734,6 +747,7 @@ pub fn Runtime(comptime App: type) type {
             gateway_chat_url: []const u8,
         ) !agent_runtime.ToolExecutionResult {
             var ctx = toolContext(app, ignored_list_entries, max_list_entries, max_read_file_bytes, max_read_file_lines, max_read_file_line_len, max_command_output_bytes, gateway_retry_count, gateway_chat_url);
+            applyCredentialLease(app, &ctx, request.credential, gateway_retry_count, gateway_chat_url);
             ctx.root_user_intent_context = request.root_user_intent_context;
             ctx.root_user_messages = request.root_user_messages;
             ctx.root_user_evidence_complete = request.root_user_evidence_complete;
@@ -741,6 +755,36 @@ pub fn Runtime(comptime App: type) type {
             ctx.advertised_dynamic_tool_names = request.advertised_dynamic_tool_names;
             ctx.max_tool_result_bytes = request.max_tool_result_bytes;
             return tool_runtime.executeToolCallAuthorized(ctx, request);
+        }
+
+        fn applyCredentialLease(
+            app: *App,
+            ctx: *tool_runtime.Context,
+            credential: types.CredentialLease,
+            gateway_retry_count: usize,
+            gateway_chat_url: []const u8,
+        ) void {
+            const credential_secret = credential.secret() orelse return;
+            const credential_source = credential.credentialSource();
+            ctx.api_key = credential_secret;
+            ctx.credential_source = credential_source;
+            ctx.account_id = credential.accountId();
+            ctx.gateway_team = credential.tenant();
+            if (comptime @hasField(App, "web_search_runtime") and @hasField(App, "session")) {
+                if (ctx.provider_capabilities.fx_search) {
+                    app.web_search_runtime.configure(.{
+                        .api_key = credential_secret,
+                        .credential_source = credential_source,
+                        .gateway_team = credential.tenant(),
+                        .worker_model = provider_runtime.model(app),
+                        .gateway_retry_count = gateway_retry_count,
+                        .gateway_chat_url = gateway_chat_url,
+                        .usage = &app.session.usage,
+                        .usage_allocator = app.alloc,
+                    });
+                    ctx.web_search_backend = app.web_search_runtime.dispatchBackend();
+                }
+            }
         }
 
         pub fn appendStaticContextMessage(
@@ -1001,7 +1045,7 @@ pub fn Runtime(comptime App: type) type {
                 &tool_projection,
                 session_child_capability,
             );
-            const process_result = agent_runtime.processQueuedPrompt(&deps, semantic_presentation, lifecycleContext(app), config, job);
+            const process_result = agent_runtime.processAgentPrompt(&app.session.agent, &deps, semantic_presentation, lifecycleContext(app), config, job);
             if (postflight_context_notices.written().len > 0) {
                 try app_worker_runtime.Runtime(App).pushSemanticNotice(app, .{
                     .topic = "context",
@@ -1011,6 +1055,110 @@ pub fn Runtime(comptime App: type) type {
                 });
             }
             try process_result;
+        }
+
+        pub fn processContextCompaction(
+            app: *App,
+            job: worker_runtime.ContextCompactionTask,
+            gateway_retry_count: usize,
+        ) !void {
+            var arena_state = std.heap.ArenaAllocator.init(std.heap.c_allocator);
+            defer arena_state.deinit();
+            const arena = arena_state.allocator();
+
+            const result_storage: runtime_context_compaction.ResultStorage =
+                if (app_session_runtime.Runtime(App).childCapability(app)) |capability|
+                    .{ .managed = capability }
+                else
+                    .unavailable;
+            var messages: std.ArrayList(ChatMessage) = .empty;
+            defer messages.deinit(arena);
+            const uncertain_history_count = @min(
+                @max(
+                    job.unversioned_history_count,
+                    job.context_history_start,
+                ),
+                job.history.len,
+            );
+            try session_runtime.appendCompactionHistoryChatMessages(
+                arena,
+                &messages,
+                job.history[0..uncertain_history_count],
+            );
+            const uncertain_message_count = messages.items.len;
+            try session_runtime.appendCompactionHistoryChatMessages(
+                arena,
+                &messages,
+                job.history[uncertain_history_count..],
+            );
+            const source_tokens = runtime_prompt_context.estimateCompactionSourceTokens(
+                messages.items,
+            );
+            const retained_tail = try session_runtime.retainedHistoryTailForMessageCount(
+                arena,
+                job.history,
+                2,
+            );
+            const retained_message_count = retained_tail.message_count;
+            const retained_tokens = runtime_prompt_context.estimateCompactionSourceTokens(
+                messages.items[messages.items.len - retained_message_count ..],
+            );
+            const deps = app_callbacks.Bindings(App).agentRuntimeDeps(app);
+            const capabilities = deps.available_model_capabilities(deps.ctx, job.model);
+            const raw_turn_count = session_runtime.rawHistoryTurnCount(job.history);
+            const retained_turn_count = retained_tail.turn_count;
+            if (retained_turn_count > raw_turn_count) {
+                return error.InvalidContextHistoryStart;
+            }
+            var compaction_count: usize = 0;
+            for (job.history) |turn| switch (turn) {
+                .compacted_summary => |summary| {
+                    compaction_count = @max(
+                        compaction_count,
+                        summary.compaction_count,
+                    );
+                },
+                else => {},
+            };
+            const transaction = agent_runtime.compactContextTransaction(arena, &deps, .{
+                .trigger = .manual,
+                .provider = job.provider,
+                .working_capabilities = capabilities,
+                .request_tokens = source_tokens,
+                .source_tokens = source_tokens,
+                .protected_tokens = retained_tokens,
+                .source_messages = messages.items[0 .. messages.items.len - retained_message_count],
+                .uncertain_source_message_count = @min(
+                    uncertain_message_count,
+                    messages.items.len - retained_message_count,
+                ),
+                .result_storage = result_storage,
+                .api_key = job.api_key,
+                .credential_source = job.credential_source,
+                .account_id = job.account_id,
+                .gateway_team = job.gateway_team,
+                .session_id = app_session_runtime.Runtime(App).activeSessionId(app),
+                .retry_count = gateway_retry_count,
+                .cancel_flag = &app.worker.worker_cancel_requested,
+                .trace_ctx = .{ .turn_id = job.turn_id },
+                .removed_turn_count = raw_turn_count - retained_turn_count,
+                .compaction_count = compaction_count + 1,
+            }) catch |err| {
+                if (err == error.Cancelled and
+                    app.worker.worker_cancel_requested.load(.seq_cst))
+                {
+                    return;
+                }
+                return err;
+            };
+            _ = transaction orelse {
+                try app_worker_runtime.Runtime(App).pushSemanticNotice(app, .{
+                    .topic = "context",
+                    .tone = .neutral,
+                    .body = "No context to compact.",
+                });
+                return;
+            };
         }
 
         fn lifecycleContext(app: *App) agent_runtime.LifecycleContext {
@@ -1550,6 +1698,10 @@ const FakeApp = struct {
 
     pub fn agentStreamProvider(self: *const FakeApp) agent_stream_provider.Provider {
         return self.agent_stream_provider;
+    }
+
+    pub fn compactionRoute(_: *const FakeApp) provider_set.CompactionRouteDecision {
+        return .{ .ready = .{ .provider = .gateway, .model = "openai/gpt-5.6-luna" } };
     }
 
     fn deinit(self: *FakeApp) void {
@@ -2446,6 +2598,76 @@ fn makeQueuedPrompt(alloc: Allocator) !worker_runtime.QueuedPrompt {
         .history = try alloc.alloc(types.HistoryTurn, 0),
         .grants = try alloc.alloc(types.PermissionGrant, 0),
     };
+}
+
+test "manual compaction worker call commits a checkpoint without a continuation" {
+    const Gateway = struct {
+        request_count: usize = 0,
+        saw_no_tools: bool = false,
+        observed_model: ?[]const u8 = null,
+
+        fn stream(
+            raw: ?*anyopaque,
+            _: Allocator,
+            request: agent_stream_provider.ModelRequest,
+        ) !agent_stream_provider.Result {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.request_count += 1;
+            self.observed_model = request.model;
+            self.saw_no_tools = request.tools.advertised_names.len == 0 and
+                request.tools.advertised_functions.len == 0 and
+                request.tools.additional_functions.len == 0 and
+                request.tools.selected_dynamic.len == 0 and
+                request.tool_choice == .none;
+            try request.admission.admit();
+            request.delivery.markPossiblySent();
+            const response = "Continue after manual compaction with the user's constraints intact.";
+            request.events.emit(.{ .content_delta = response });
+            return .{ .completed = .{ .completion = .{
+                .content = response,
+                .finish_reason = .stop,
+            } } };
+        }
+    };
+
+    const alloc = std.testing.allocator;
+    var app = try FakeApp.init(alloc);
+    defer app.deinit();
+    var gateway = Gateway{};
+    var provider = testAgentStreamProvider(Gateway.stream);
+    provider.context = &gateway;
+    app.agent_stream_provider = provider;
+
+    var job = worker_runtime.ContextCompactionTask{
+        .model = try alloc.dupe(u8, "test-model"),
+        .api_key = try alloc.dupe(u8, "api-key"),
+        .history = try alloc.alloc(types.HistoryTurn, 2),
+    };
+    defer worker_runtime.freeContextCompactionTask(alloc, job);
+    job.history[0] = try types.dupeHistoryTurn(alloc, .{ .assistant = .{
+        .user = .{ .text = @constCast("exact user request") },
+        .assistant = @constCast("exact completed response\n" ++ ("evidence " ** 1_000)),
+    } });
+    job.history[1] = try types.dupeHistoryTurn(alloc, .{ .assistant = .{
+        .user = .{ .text = @constCast("second user request") },
+        .assistant = @constCast("second response"),
+    } });
+
+    try Runtime(FakeApp).processContextCompaction(&app, job, 1);
+
+    try std.testing.expectEqual(@as(usize, 1), gateway.request_count);
+    try std.testing.expect(gateway.saw_no_tools);
+    try std.testing.expectEqualStrings("openai/gpt-5.6-luna", gateway.observed_model.?);
+    var events = app.worker.takeEvents();
+    defer events.deinit(std.heap.c_allocator);
+    defer for (events.items) |event| worker_runtime.freeWorkerEvent(std.heap.c_allocator, event);
+    try std.testing.expectEqual(@as(usize, 3), events.items.len);
+    try std.testing.expect(events.items[0] == .semantic_notice);
+    try std.testing.expectEqualStrings("Compacting context…", events.items[0].semantic_notice.body);
+    try std.testing.expect(events.items[1] == .context_compaction);
+    try std.testing.expect(events.items[1].context_compaction == .compacted_summary);
+    try std.testing.expect(events.items[2] == .semantic_notice);
+    try std.testing.expectEqualStrings("Context compacted.", events.items[2].semantic_notice.body);
 }
 
 test "app agent runtime processes a cancelled queued prompt" {
