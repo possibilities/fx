@@ -4196,6 +4196,7 @@ fn buildReviewTurnContext(
     pending_assistant: ChatMessage,
     credential: types.CredentialLease,
     target_call_id: []const u8,
+    review_attempt_available: bool,
 ) permission_auto_classifier.ReviewTurnContext {
     const trusted_root_context = auto_classifier_context.rootUserRequestContext(
         root_user_intent_context,
@@ -4205,12 +4206,35 @@ fn buildReviewTurnContext(
         .pending_assistant = pending_assistant,
         .credential = credential,
         .target_call_id = target_call_id,
+        .review_attempt_available = review_attempt_available,
         .origin = switch (config.origin) {
             .root => .root,
             .subagent => .subagent,
         },
         .trusted_root_context = trusted_root_context,
         .current_turn_untrusted_messages = current_turn_messages,
+    };
+}
+
+fn permissionDeniedModelOutput(
+    alloc: Allocator,
+    tool_name: []const u8,
+    reason: types.ToolPermissionDenialReason,
+    outcome: command_admission.PermissionOutcome,
+) ![]u8 {
+    return switch (reason) {
+        .review_caution, .review_evidence_incomplete, .review_unavailable => tool_result_errors.toolReviewHeldJson(
+            alloc,
+            tool_name,
+            reason,
+            if (outcome.auto_review_result) |result| result.rationale else null,
+            outcome.auto_review_failure,
+        ),
+        .user_denied, .auto_denied, .policy_denied, .permission_required => tool_result_errors.toolPermissionDeniedJson(
+            alloc,
+            tool_name,
+            reason,
+        ),
     };
 }
 
@@ -7702,6 +7726,12 @@ fn processQueuedPromptLoop(
                         parallel_status_started[group_index] = try runtime_tool_presentation.startToolVisibleLifecycle(deps, arena, turn_id, stream_ctx.provisional_statuses.presentation_group_id, parallel_call, null, advertised_dynamic_tool_names);
                     }
 
+                    const parallel_preserved_review_hold = if (root_action_permission_mode == .auto)
+                        turn_review_cache.cached(parallel_call)
+                    else
+                        null;
+                    const parallel_review_attempt_available = root_action_permission_mode != .auto or
+                        turn_review_cache.reviewAttemptAvailable(parallel_call);
                     const parallel_review_context = buildReviewTurnContext(
                         config,
                         successful_gateway_model,
@@ -7710,11 +7740,24 @@ fn processQueuedPromptLoop(
                         pending_assistant,
                         activeCredentialLease(active_api_key, job),
                         parallel_call.id,
+                        parallel_review_attempt_available,
                     );
-                    const maybe_parallel_permission: ?command_admission.PermissionOutcome = runtime_tool_admission.requestToolPermissionTraced(deps, arena, parallel_call, parallel_review_context, root_action_permission_mode, local_grants.items, null, null, advertised_dynamic_tool_names, config.workspace_root, step_ctx) catch |err| blk: {
-                        if (err != error.Cancelled or !config.cancel_flag.load(.seq_cst)) return err;
-                        break :blk null;
-                    };
+                    if (parallel_preserved_review_hold != null) {
+                        debug_trace.eventf(
+                            "permission",
+                            "turn_permission_denial_preserved",
+                            step_ctx,
+                            "call_id={s} tool_name={s}",
+                            .{ parallel_call.id, parallel_call.name },
+                        );
+                    }
+                    const maybe_parallel_permission: ?command_admission.PermissionOutcome = if (parallel_preserved_review_hold) |outcome|
+                        outcome
+                    else
+                        runtime_tool_admission.requestToolPermissionTraced(deps, arena, parallel_call, parallel_review_context, root_action_permission_mode, local_grants.items, null, null, advertised_dynamic_tool_names, config.workspace_root, step_ctx) catch |err| blk: {
+                            if (err != error.Cancelled or !config.cancel_flag.load(.seq_cst)) return err;
+                            break :blk null;
+                        };
                     if (maybe_parallel_permission == null or config.cancel_flag.load(.seq_cst)) {
                         runtime_telemetry.traceCancelObserved(step_ctx, true);
                         try finishPendingParallelCancelled(
@@ -7749,7 +7792,17 @@ fn processQueuedPromptLoop(
                     if (decision.isDenied()) {
                         const reason = permission_outcome.denial_reason orelse
                             decision.denialReason() orelse .user_denied;
-                        const denied_output = try tool_result_errors.toolPermissionDeniedJson(arena, parallel_call.name, reason);
+                        try turn_review_cache.remember(
+                            arena,
+                            parallel_call,
+                            permission_outcome,
+                        );
+                        const denied_output = try permissionDeniedModelOutput(
+                            arena,
+                            parallel_call.name,
+                            reason,
+                            permission_outcome,
+                        );
                         parallel_status_terminalized[group_index] = try stream_ctx.provisional_statuses.finishDeniedCall(
                             deps,
                             stream_ctx.alloc,
@@ -8640,6 +8693,8 @@ fn processQueuedPromptLoop(
                 try types.dupeToolCall(call_allocator, tool_call)
             else
                 tool_call;
+            const review_attempt_available = action_permission_mode != .auto or
+                turn_review_cache.reviewAttemptAvailable(execution_call);
             const review_context = buildReviewTurnContext(
                 config,
                 successful_gateway_model,
@@ -8648,6 +8703,7 @@ fn processQueuedPromptLoop(
                 pending_assistant,
                 activeCredentialLease(active_api_key, job),
                 execution_call.id,
+                review_attempt_available,
             );
             const tool_execution_root_user_context = try buildToolExecutionRootUserContext(
                 call_allocator,
@@ -8924,23 +8980,12 @@ fn processQueuedPromptLoop(
                     tool_call,
                     permission_outcome,
                 );
-                const denied_output = switch (reason) {
-                    .review_caution, .review_evidence_incomplete, .review_unavailable => try tool_result_errors.toolReviewHeldJson(
-                        arena,
-                        tool_call.name,
-                        reason,
-                        if (permission_outcome.auto_review_result) |result|
-                            result.rationale
-                        else
-                            null,
-                        permission_outcome.auto_review_failure,
-                    ),
-                    .user_denied, .auto_denied, .policy_denied, .permission_required => try tool_result_errors.toolPermissionDeniedJson(
-                        arena,
-                        tool_call.name,
-                        reason,
-                    ),
-                };
+                const denied_output = try permissionDeniedModelOutput(
+                    arena,
+                    tool_call.name,
+                    reason,
+                    permission_outcome,
+                );
                 if (!status_started and (is_file_mutation or defer_auto_command_lifecycle)) {
                     status_started = try runtime_tool_presentation.startToolVisibleLifecycle(
                         deps,
