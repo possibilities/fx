@@ -1211,7 +1211,7 @@ pub fn Runtime(comptime App: type) type {
                 &queued_cards,
             );
             var footer_ctx = main_footer_ctx;
-            const render_reconciliation = switch (try reconcileBeforeFrameRender(app, render_input.queuedBannerRows(footer_ctx))) {
+            const render_reconciliation = switch (try reconcileBeforeFrameRender(app, render_input.queuedBannerRows(footer_ctx, app.shell.layout.cols))) {
                 .inline_render => |inline_render| inline_render,
                 .file_approval_screen => return renderApprovalScreen(app),
                 .frame_result => |result| return result,
