@@ -34,6 +34,7 @@ const help_menu_presentation = @import("../../ui/footer/help_menu_presentation.z
 const settings_menu_presentation = @import("../../ui/footer/settings_menu_presentation.zig");
 const surface_frame = @import("../../ui/footer/surface_frame.zig");
 const footer_paint_plan = @import("../../ui/footer/paint_plan.zig");
+const render_request = @import("../../ui/render_request.zig");
 
 const ModelPickerStage = picker_state.ModelPickerStage;
 
@@ -90,8 +91,8 @@ pub fn CompletionRuntime(comptime App: type) type {
         fn slashCompletionQueryActive(app: *App) bool {
             if (app.input_runtime.picker.isInlinePickerSuppressed(.slash)) return false;
             if (app.input_runtime.picker.inlinePickerTriggerKind(&app.input_runtime.edit_state) != .slash) return false;
-            // Model query always owns this slot. Mid-turn bare `/model` does too
-            // (list stays hidden); idle bare `/model` still surfaces slash rows.
+            // Model query always owns this slot. Mid-turn bare `/model` does too;
+            // idle bare `/model` still surfaces slash rows.
             if (comptime @hasField(App, "stream")) {
                 if (app.stream.active and picker_state.isBareModelCommandAtCursor(&app.input_runtime.edit_state)) return false;
             }
@@ -139,11 +140,13 @@ pub fn CompletionRuntime(comptime App: type) type {
             if (comptime @hasField(App, "approval_prompt")) {
                 if (app.approval_prompt.isActive()) return null;
             }
+            if (queue_rt.ownsComposer(app)) {
+                return if (hasFileQuery(app)) .file else null;
+            }
             if (comptime @hasField(App, "stream")) {
                 if (app.stream.active) {
-                    if (queueReviewOwnsComposer(app)) {
-                        return if (hasFileQuery(app)) .file else null;
-                    }
+                    if (hasModelQuery(app)) return .model;
+                    if (hasFileQuery(app)) return .file;
                     if (visibleInlineSlashCompletion(app) != null) return .slash;
                     if (visibleSlashCompletionCount(app) > 0) return .slash;
                     return null;
@@ -376,13 +379,13 @@ pub fn CompletionRuntime(comptime App: type) type {
             if (comptime runtime_profile.allows(App, .durable_sessions)) {
                 if (try routeSessionPickerMove(app, delta)) return true;
             }
-            const stream_suppresses_file_picker = app.stream.active and !queueReviewOwnsComposer(app);
-            if (!stream_suppresses_file_picker and hasFileQuery(app)) {
+            if (hasFileQuery(app)) {
                 navigateFilePicker(app, delta);
                 return true;
             }
             if (hasModelQuery(app)) {
-                if (!app.stream.active) navigateModelPicker(app, delta);
+                if (queue_rt.ownsComposer(app)) return false;
+                navigateModelPicker(app, delta);
                 return true;
             }
             if (provider_picker_runtime.Runtime(App).hasQuery(app)) {
@@ -712,14 +715,7 @@ pub fn CompletionRuntime(comptime App: type) type {
                 if (app.approval_prompt.isActive()) return false;
             }
             if (catalogMenuOwnsSurface(app)) return false;
-            return !queueReviewOwnsComposer(app);
-        }
-
-        fn queueReviewOwnsComposer(app: *App) bool {
-            if (comptime @hasField(App, "queued_prompt_review")) {
-                return app.queued_prompt_review.visible;
-            }
-            return false;
+            return !queue_rt.ownsComposer(app);
         }
 
         fn catalogMenuOwnsSurface(app: *App) bool {
@@ -892,6 +888,7 @@ pub fn CompletionRuntime(comptime App: type) type {
         }
 
         pub fn navigateModelPicker(app: *App, delta: i32) void {
+            if (queue_rt.ownsComposer(app)) return;
             const query = app.input_runtime.picker.activeModelPickerQuery(&app.input_runtime.edit_state) orelse return;
             switch (query.stage) {
                 .model => navigateModelCompletion(app, query.query, delta),
@@ -975,6 +972,7 @@ pub fn CompletionRuntime(comptime App: type) type {
         }
 
         pub fn autocompleteModelPickerSelection(app: *App) !void {
+            if (queue_rt.ownsComposer(app)) return;
             const query = app.input_runtime.picker.activeModelPickerQuery(&app.input_runtime.edit_state) orelse return;
             switch (query.stage) {
                 .model => {
@@ -1011,6 +1009,7 @@ pub fn CompletionRuntime(comptime App: type) type {
         }
 
         pub fn advanceModelPickerOnSpace(app: *App) !bool {
+            if (queue_rt.ownsComposer(app)) return false;
             const query = app.input_runtime.picker.activeModelPickerQuery(&app.input_runtime.edit_state) orelse return false;
             if (app.input_runtime.edit_state.cursor != app.input_runtime.edit_state.input.items.len) return false;
 
@@ -1049,6 +1048,7 @@ pub fn CompletionRuntime(comptime App: type) type {
         }
 
         pub fn submitModelPicker(app: *App) !bool {
+            if (queue_rt.ownsComposer(app)) return false;
             switch (app.input_runtime.picker.model_picker_stage) {
                 .model => {
                     if (app.isModelCacheLoading()) {
@@ -1109,6 +1109,7 @@ pub fn CompletionRuntime(comptime App: type) type {
         }
 
         pub fn openCurrentModelPicker(app: *App) !void {
+            if (queue_rt.ownsComposer(app)) return;
             try app.input_runtime.textReplacementState().replace(app.alloc, "/model ");
             app.input_runtime.picker.model_completion_anchor_current = true;
             app.shell.render_requests.request(.footer);
@@ -1127,7 +1128,11 @@ pub fn CompletionRuntime(comptime App: type) type {
             }
 
             const stage: ModelPickerStage = if (supports_effort) .effort else .fast;
-            try setModelComposerText(app, "/model {s} ", .{model});
+            if (supports_effort) {
+                try setModelComposerText(app, "/model {s} ", .{model});
+            } else {
+                try setModelComposerText(app, "/model {s} auto ", .{model});
+            }
             // Preselect the product effort default and enable Fast mode when supported.
             try app.input_runtime.picker.beginModelPickerFlow(
                 app.alloc,
@@ -1144,6 +1149,7 @@ pub fn CompletionRuntime(comptime App: type) type {
         }
 
         pub fn stepBackModelPicker(app: *App) !bool {
+            if (queue_rt.ownsComposer(app)) return false;
             const query = app.input_runtime.picker.activeModelPickerQuery(&app.input_runtime.edit_state) orelse return false;
             if (query.stage == .model) return false;
             if (!app.input_runtime.picker.hasPendingModelPickerSelection()) return false;
@@ -1200,11 +1206,13 @@ pub fn CompletionRuntime(comptime App: type) type {
         }
 
         pub fn shouldPreserveModelPickerInsert(app: *App) bool {
+            if (queue_rt.ownsComposer(app)) return false;
             const query = app.input_runtime.picker.activeModelPickerQuery(&app.input_runtime.edit_state) orelse return false;
             return query.stage != .model and app.input_runtime.edit_state.cursor == app.input_runtime.edit_state.input.items.len;
         }
 
         pub fn shouldPreserveModelPickerBackspace(app: *App) bool {
+            if (queue_rt.ownsComposer(app)) return false;
             const query = app.input_runtime.picker.activeModelPickerQuery(&app.input_runtime.edit_state) orelse return false;
             return query.stage != .model and query.query.len > 0 and app.input_runtime.edit_state.cursor == app.input_runtime.edit_state.input.items.len;
         }
@@ -1406,6 +1414,7 @@ const InlineCompletionTestApp = struct {
         layout: struct {
             cols: u16 = 80,
         } = .{},
+        render_requests: render_request.RenderRequestState = .{},
     } = .{},
 
     pub fn slashRegistry(_: *const InlineCompletionTestApp) command_specs.SlashRegistry {
@@ -1418,6 +1427,32 @@ const InlineCompletionTestApp = struct {
         self.pending_images.deinit(self.alloc);
     }
 };
+
+test "queue review prevents the model picker from opening over its draft" {
+    const alloc = std.testing.allocator;
+    const rt = CompletionRuntime(InlineCompletionTestApp);
+    var app = InlineCompletionTestApp{ .alloc = alloc };
+    defer app.deinit();
+    app.queued_prompt_review.visible = true;
+    try app.input_runtime.textReplacementState().replace(alloc, "/model");
+
+    try rt.openCurrentModelPicker(&app);
+
+    try std.testing.expectEqualStrings("/model", app.input_runtime.edit_state.input.items);
+    try std.testing.expect(!app.shell.render_requests.hasReason(.footer));
+}
+
+test "queue review excludes an existing model query from picker ownership" {
+    const alloc = std.testing.allocator;
+    const rt = CompletionRuntime(InlineCompletionTestApp);
+    var app = InlineCompletionTestApp{ .alloc = alloc };
+    defer app.deinit();
+    app.queued_prompt_review.visible = true;
+    try app.input_runtime.textReplacementState().replace(alloc, "/model provider/model");
+
+    try std.testing.expect(!rt.dismissVisibleInlinePicker(&app));
+    try std.testing.expect(!app.input_runtime.picker.isInlinePickerSuppressed(.model));
+}
 
 const SkillsNavigationTestWorker = struct {
     fn queuePreview(_: *SkillsNavigationTestWorker) @import("../agent/worker_runtime.zig").QueuePreview {
@@ -1761,7 +1796,7 @@ fn expectInlineSkillCompletionInactive(app: *InlineCompletionTestApp) !void {
     );
 }
 
-test "streaming suppresses file selection until queued review owns the composer" {
+test "streaming file selection does not require queued review" {
     const alloc = std.testing.allocator;
     const rt = CompletionRuntime(FilePickerTestApp);
     var app = FilePickerTestApp{
@@ -1773,18 +1808,11 @@ test "streaming suppresses file selection until queued review owns the composer"
     app.stream.active = true;
 
     try std.testing.expectEqual(
-        @as(?edit_contract.InsertResult, null),
-        try rt.submitFilePickerOnEnter(&app, 4096),
-    );
-    try std.testing.expectEqualStrings("review @src/mai", app.input_runtime.edit_state.input.items);
-
-    app.queued_prompt_review.visible = true;
-    try std.testing.expectEqual(
         edit_contract.InsertResult.inserted,
         (try rt.submitFilePickerOnEnter(&app, 4096)).?,
     );
     try std.testing.expectEqualStrings("review @src/main.zig ", app.input_runtime.edit_state.input.items);
-    try std.testing.expect(app.queued_prompt_review.selected_dirty);
+    try std.testing.expect(!app.queued_prompt_review.selected_dirty);
 }
 
 test "file picker rejects paths that would reopen quote grammar" {
