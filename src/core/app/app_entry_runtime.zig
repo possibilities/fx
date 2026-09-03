@@ -5,13 +5,13 @@ const app_session_runtime = @import("app_session_runtime.zig");
 const auto_upgrade = @import("../upgrade/auto_upgrade.zig");
 const acp_runner = @import("../cli/acp_runner.zig");
 const cli_surface = @import("../cli/cli_surface.zig");
+const credentials = @import("../auth/credentials.zig");
 const process_provider = @import("../execution/process_provider.zig");
 const gateway_provider = @import("../gateway/gateway_provider.zig");
 const provider_set = @import("../gateway/provider_set.zig");
 const host = @import("../hosts/host.zig");
 const host_target = @import("../hosts/target.zig");
 const io_mod = @import("../shared/io.zig");
-const config_runtime = @import("../config/config_runtime.zig");
 const prompt_policy = @import("../config/prompt_policy.zig");
 const skill_contract = @import("../skills/skill_contract.zig");
 const command_specs = @import("../slash_commands/command_specs.zig");
@@ -67,6 +67,7 @@ pub const Config = struct {
     version: []const u8 = "",
     revision: []const u8 = "",
     build_channel: update_target.Channel = .stable,
+    auth_mode: credentials.AuthMode = .local,
     command_catalog: command_specs.TopLevelRegistry,
     default_model: []const u8,
     default_agent_step_limit: usize,
@@ -161,7 +162,7 @@ fn runWithDeps(comptime App: type, alloc: Allocator, args: []const [:0]const u8,
         .exit => |code| return .{ .exit = code },
     }
 
-    return runInteractiveWithDeps(App, false, alloc, &launch, deps);
+    return runInteractiveWithDeps(App, false, alloc, &launch, cfg.auth_mode, deps);
 }
 
 pub fn runBeforeInteractive(alloc: Allocator, args: []const [:0]const u8, cfg: Config) !BeforeInteractiveResult {
@@ -220,23 +221,23 @@ fn benchEnabled() bool {
     return io_mod.getenv("FX_BENCH") != null;
 }
 
-pub fn runInteractive(comptime App: type, alloc: Allocator, launch: *cli_surface.InteractiveLaunch) !RunOutcome {
-    return runInteractiveWithDeps(App, false, alloc, launch, .{});
+pub fn runInteractive(comptime App: type, alloc: Allocator, launch: *cli_surface.InteractiveLaunch, auth_mode: credentials.AuthMode) !RunOutcome {
+    return runInteractiveWithDeps(App, false, alloc, launch, auth_mode, .{});
 }
 
 /// Runs the interactive product without native CLI dispatch, process replacement,
 /// or a worker thread. Single-threaded hosts must arrange cooperative prompt work.
-pub fn runInteractiveCooperative(comptime App: type, alloc: Allocator, launch: *cli_surface.InteractiveLaunch) !RunOutcome {
-    return runInteractiveWithDeps(App, true, alloc, launch, .{});
+pub fn runInteractiveCooperative(comptime App: type, alloc: Allocator, launch: *cli_surface.InteractiveLaunch, auth_mode: credentials.AuthMode) !RunOutcome {
+    return runInteractiveWithDeps(App, true, alloc, launch, auth_mode, .{});
 }
 
 fn unavailableCliDispatch(_: ?*anyopaque, _: Allocator, _: []const [:0]const u8, _: cli_surface.Config) anyerror!cli_surface.RunResult {
     return error.UnknownCliCommand;
 }
 
-fn runInteractiveWithDeps(comptime App: type, comptime cooperative: bool, alloc: Allocator, launch: *cli_surface.InteractiveLaunch, deps: RunDeps) !RunOutcome {
+fn runInteractiveWithDeps(comptime App: type, comptime cooperative: bool, alloc: Allocator, launch: *cli_surface.InteractiveLaunch, auth_mode: credentials.AuthMode, deps: RunDeps) !RunOutcome {
     const resume_requested = launch.requested_resume != null;
-    var app = App.init(alloc, launch) catch |err| {
+    var app = App.init(alloc, launch, auth_mode) catch |err| {
         switch (err) {
             error.NotATerminal => {
                 writeStderr(deps, "fx requires an interactive terminal (TTY).\n");
@@ -346,60 +347,20 @@ fn runInteractiveWithDeps(comptime App: type, comptime cooperative: bool, alloc:
         if (handoff_value) |value| {
             var handoff = value;
             defer handoff.deinit(alloc);
-            var argv: std.ArrayList([]const u8) = .empty;
-            defer argv.deinit(alloc);
-            var owned_argv: std.ArrayList([]u8) = .empty;
-            defer {
-                for (owned_argv.items) |arg| alloc.free(arg);
-                owned_argv.deinit(alloc);
-            }
-            try argv.append(alloc, request.executablePath());
-            for (launch.modifiers.context_limit_overrides) |override| {
-                try argv.append(alloc, "--context-limit");
-                const rendered = switch (override.value) {
-                    .bytes => |bytes| try std.fmt.allocPrint(
-                        alloc,
-                        "{s}={d}",
-                        .{ @tagName(override.name), bytes },
-                    ),
-                    .off => try std.fmt.allocPrint(
-                        alloc,
-                        "{s}=off",
-                        .{@tagName(override.name)},
-                    ),
-                };
-                owned_argv.append(alloc, rendered) catch |err| {
-                    alloc.free(rendered);
-                    return err;
-                };
-                try argv.append(alloc, rendered);
-            }
-            for (launch.modifiers.additional_directories) |path| {
-                try argv.append(alloc, "--add-dir");
-                try argv.append(alloc, path);
-            }
-            if (launch.modifiers.saved_directories_suppressed) {
-                try argv.append(alloc, "--no-additional-dirs");
-            }
-            if (launch.modifiers.permission_policy) |policy| {
-                try argv.append(alloc, "--permissions-file");
-                try argv.append(alloc, policy.path);
-            }
-            try argv.append(alloc, "resume");
-            try argv.append(alloc, handoff.session_id);
-            try argv.append(alloc, cli_surface.upgrade_relaunch_arg);
-            if (launch.record_requested) try argv.append(alloc, "--record");
+            var argv = [_][]const u8{
+                request.executablePath(),
+                "resume",
+                handoff.session_id,
+                cli_surface.upgrade_relaunch_arg,
+                request.previousRevision() orelse "",
+            };
+            const argv_slice = if (request.previousRevision() == null) argv[0..4] else argv[0..5];
             const replace_err = deps.replace_process(
                 deps.replace_ctx,
                 io_mod.getIo(),
-                .{ .argv = argv.items },
+                .{ .argv = argv_slice },
             );
-            writeUpgradeRelaunchFailure(
-                deps,
-                replace_err,
-                handoff.session_id,
-                if (launch.modifiers.permission_policy) |policy| policy.path else null,
-            );
+            writeUpgradeRelaunchFailure(deps, replace_err, handoff.session_id);
         } else {
             writeStderr(
                 deps,
@@ -437,21 +398,13 @@ fn writeUpgradeRelaunchFailure(
     deps: RunDeps,
     err: std.process.ReplaceError,
     session_id: []const u8,
-    permission_file: ?[]const u8,
 ) void {
     var buffer: [768]u8 = undefined;
-    const message = if (permission_file) |path|
-        std.fmt.bufPrint(
-            &buffer,
-            "fx: upgrade installed, but relaunch failed: {s}\nContinue session with: fx --permissions-file {s} resume {s}\n",
-            .{ @errorName(err), path, session_id },
-        ) catch "fx: upgrade installed, but relaunch failed; run `fx doctor`.\n"
-    else
-        std.fmt.bufPrint(
-            &buffer,
-            "fx: upgrade installed, but relaunch failed: {s}\nContinue session with: fx --resume {s}\n",
-            .{ @errorName(err), session_id },
-        ) catch "fx: upgrade installed, but relaunch failed; run `fx doctor`.\n";
+    const message = std.fmt.bufPrint(
+        &buffer,
+        "fx: upgrade installed, but relaunch failed: {s}\nContinue session with: fx --resume {s}\n",
+        .{ @errorName(err), session_id },
+    ) catch "fx: upgrade installed, but relaunch failed; run `fx doctor`.\n";
     writeStderr(deps, message);
 }
 
@@ -460,6 +413,7 @@ fn cliSurfaceConfig(cfg: Config) cli_surface.Config {
         .version = cfg.version,
         .revision = cfg.revision,
         .build_channel = cfg.build_channel,
+        .auth_mode = cfg.auth_mode,
         .command_catalog = cfg.command_catalog,
         .default_model = cfg.default_model,
         .default_agent_step_limit = cfg.default_agent_step_limit,
@@ -671,11 +625,12 @@ const TestCapture = struct {
     resume_handoff_id: ?[]const u8 = null,
     raise_sigint_during_deinit: bool = false,
     upgrade_relaunch_path: ?[]const u8 = null,
+    upgrade_previous_revision: ?[]const u8 = null,
     replace_error: std.process.ReplaceError = error.InvalidExe,
     replace_calls: usize = 0,
     replace_arg_count: usize = 0,
-    replace_arg_bufs: [16][128]u8 = undefined,
-    replace_arg_lens: [16]usize = [_]usize{0} ** 16,
+    replace_arg_bufs: [5][128]u8 = undefined,
+    replace_arg_lens: [5]usize = .{ 0, 0, 0, 0, 0 },
     fail_unexpected_format: bool = false,
 
     fn init(run_result: cli_surface.RunResult) TestCapture {
@@ -782,7 +737,7 @@ const TestApp = struct {
     requested_resume: ?cli_surface.ResumeTarget = null,
     terminal_released: bool = false,
 
-    fn init(_: Allocator, launch: *cli_surface.InteractiveLaunch) !TestApp {
+    fn init(_: Allocator, launch: *cli_surface.InteractiveLaunch, _: credentials.AuthMode) !TestApp {
         appendInitEvent(launch);
         if (active_capture.?.init_error) |err| return err;
 
@@ -822,6 +777,10 @@ const TestApp = struct {
             .executable_path_len = path.len,
         };
         @memcpy(request.executable_path_buf[0..path.len], path);
+        if (active_capture.?.upgrade_previous_revision) |revision| {
+            @memcpy(request.previous_revision_buf[0..revision.len], revision);
+            request.previous_revision_len = @intCast(revision.len);
+        }
         return request;
     }
 
@@ -1061,35 +1020,15 @@ test "app entry relaunches only after teardown with the validated handoff" {
     });
 }
 
-test "app entry preserves permission policy and launch modifiers across upgrade relaunch" {
+test "app entry carries the previous revision through upgrade relaunch" {
     const alloc = std.testing.allocator;
-    const overrides = try alloc.dupe(
-        config_runtime.context_limits.Override,
-        &.{.{
-            .name = .skill_chunk_bytes,
-            .value = .{ .bytes = 4096 },
-        }},
-    );
-    const directories = try alloc.alloc([]u8, 1);
-    directories[0] = try alloc.dupe(u8, "/tmp/fx-extra");
-    const permission_path = try alloc.dupe(u8, "/tmp/fx-policy.json");
-    var capture = TestCapture.init(.{ .interactive = .{
-        .record_requested = true,
-        .modifiers = .{
-            .context_limit_overrides = overrides,
-            .additional_directories = directories,
-            .saved_directories_suppressed = true,
-            .permission_policy = .{
-                .path = permission_path,
-                .rules = .{},
-            },
-        },
-    } });
+    var capture = TestCapture.init(.{ .interactive = .{} });
     defer capture.deinit();
     capture.resume_handoff_id = "session-123";
     capture.upgrade_relaunch_path = "/tmp/fx-upgraded";
+    capture.upgrade_previous_revision = "1111111111111111111111111111111111111111";
 
-    const outcome = try runWithDeps(
+    _ = try runWithDeps(
         TestApp,
         alloc,
         &.{},
@@ -1097,30 +1036,12 @@ test "app entry preserves permission policy and launch modifiers across upgrade 
         capture.deps(),
     );
 
-    try std.testing.expectEqual(@as(u8, 1), outcome.exit);
-    const expected = [_][]const u8{
-        "/tmp/fx-upgraded",
-        "--context-limit",
-        "skill_chunk_bytes=4096",
-        "--add-dir",
-        "/tmp/fx-extra",
-        "--no-additional-dirs",
-        "--permissions-file",
-        "/tmp/fx-policy.json",
-        "resume",
-        "session-123",
-        "--upgrade-relaunch",
-        "--record",
-    };
-    try std.testing.expectEqual(expected.len, capture.replace_arg_count);
-    for (expected, 0..) |arg, index| {
-        try std.testing.expectEqualStrings(arg, capture.replaceArg(index));
-    }
-    try std.testing.expect(std.mem.find(
-        u8,
-        capture.stderr.written(),
-        "fx --permissions-file /tmp/fx-policy.json resume session-123",
-    ) != null);
+    try std.testing.expectEqual(@as(usize, 5), capture.replace_arg_count);
+    try std.testing.expectEqualStrings("--upgrade-relaunch", capture.replaceArg(3));
+    try std.testing.expectEqualStrings(
+        "1111111111111111111111111111111111111111",
+        capture.replaceArg(4),
+    );
 }
 
 test "app entry never relaunches without a validated handoff" {

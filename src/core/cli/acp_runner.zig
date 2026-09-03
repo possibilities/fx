@@ -4,6 +4,7 @@ const process_provider = @import("../execution/process_provider.zig");
 const gateway_provider = @import("../gateway/gateway_provider.zig");
 const provider_set = @import("../gateway/provider_set.zig");
 const host = @import("../hosts/host.zig");
+const credentials = @import("../auth/credentials.zig");
 const mode_registry = @import("../modes/mode_registry.zig");
 const prompt_policy = @import("../config/prompt_policy.zig");
 const types = @import("../shared/types.zig");
@@ -12,6 +13,7 @@ const context_contract = @import("../workspace/context_contract.zig");
 const Allocator = std.mem.Allocator;
 
 pub const Config = struct {
+    auth_mode: credentials.AuthMode = .local,
     default_model: []const u8,
     default_agent_step_limit: usize,
     gateway_retry_count: usize,
@@ -44,6 +46,7 @@ pub const Config = struct {
     permission_rules_override: ?types.PermissionRuleSet = null,
     allow_acp_mcp: bool = true,
     allow_native_tools: bool = true,
+    minimal_kernel: bool = false,
 };
 
 pub const RunFn = *const fn (?*anyopaque, Allocator, Config) anyerror!void;

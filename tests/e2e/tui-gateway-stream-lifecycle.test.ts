@@ -630,32 +630,6 @@ function splitHeldTextResponse(
   );
 }
 
-function duplicateKeyToolResponse(): Response {
-  return fakeGatewaySse([
-    { type: "tool-input-start", id: "queued_duplicate_list", toolName: "glob_files" },
-    { type: "tool-input-delta", id: "queued_duplicate_list", delta: '{"' },
-    { type: "tool-input-delta", id: "queued_duplicate_list", delta: "dept" },
-    { type: "tool-input-delta", id: "queued_duplicate_list", delta: 'h"' },
-    { type: "tool-input-delta", id: "queued_duplicate_list", delta: ":1" },
-    { type: "tool-input-delta", id: "queued_duplicate_list", delta: ', "' },
-    { type: "tool-input-delta", id: "queued_duplicate_list", delta: "dept" },
-    { type: "tool-input-delta", id: "queued_duplicate_list", delta: 'h"' },
-    { type: "tool-input-delta", id: "queued_duplicate_list", delta: ":2" },
-    { type: "tool-input-delta", id: "queued_duplicate_list", delta: "}" },
-    { type: "tool-input-end", id: "queued_duplicate_list" },
-    {
-      type: "tool-call",
-      toolCallId: "queued_duplicate_list",
-      toolName: "glob_files",
-      input: '{"depth":1, "depth":2}',
-    },
-    {
-      type: "finish",
-      finishReason: { unified: "tool-calls", raw: "tool-calls" },
-    },
-  ]);
-}
-
 async function waitForCondition(
   predicate: () => boolean,
   description: string,
@@ -667,33 +641,6 @@ async function waitForCondition(
     await Bun.sleep(25);
   }
   throw new Error(`timed out waiting for ${description}`);
-}
-
-async function waitForCursorRow(
-  session: TmuxSession,
-  text: string,
-  description: string,
-  timeoutMs = TIMEOUT,
-): Promise<{ cursor: { row: number; col: number }; grid: string[] }> {
-  const started = Date.now();
-  let cursor = session.cursorPosition();
-  let grid: string[] = [];
-  while (Date.now() - started < timeoutMs) {
-    const before = session.cursorPosition();
-    grid = await session.capturePaneGrid();
-    cursor = session.cursorPosition();
-    if (
-      before.row === cursor.row &&
-      before.col === cursor.col &&
-      grid[cursor.row]?.includes(text)
-    ) {
-      return { cursor, grid };
-    }
-    await Bun.sleep(25);
-  }
-  throw new Error(
-    `timed out waiting for ${description}; cursor=${JSON.stringify(cursor)}\n${grid.join("\n")}`,
-  );
 }
 
 async function waitForEscapedScrollback(
@@ -1444,6 +1391,43 @@ async function launchRouteRecoveryTui(
 }
 
 describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
+  test(
+    "clear response language mismatch never reaches TUI scrollback",
+    async () => {
+      const rejected = "我会先检查锁文件和依赖清单。";
+      const accepted = "I will inspect the lockfile next.";
+      const { queuedGateway, stderrPath } = await launchRouteRecoveryTui(
+        "fx-tui-response-language-retry-",
+        [
+          fakeGatewayFinalText(rejected),
+          fakeGatewayFinalText(accepted),
+        ],
+      );
+
+      await session!.sendText(
+        "The lockfile is broken again. Say what you will inspect next.",
+      );
+      await session!.waitForText(accepted, TIMEOUT);
+      await session!.waitForComposer(TIMEOUT);
+
+      const scrollback = await session!.captureFullScrollback();
+      expect(scrollback).toContain(accepted);
+      expect(scrollback).not.toContain(rejected);
+      expect(queuedGateway.requests).toHaveLength(2);
+      expect(queuedGateway.requests[1]!.body).toContain(
+        "The previous candidate used a different language",
+      );
+      expect(session!.isAlive()).toBe(true);
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+
+      await session!.sendText("/quit");
+      expect(await session!.waitForSessionEnd(TIMEOUT)).toBe(true);
+      await session!.kill();
+      session = null;
+    },
+    TIMEOUT * 2,
+  );
+
   test(
     "full-window output limit is omitted from the agent request",
     async () => {
@@ -2735,15 +2719,24 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
 
       await session.waitForComposer(TIMEOUT);
       await session.sendLiteral(submittedPrompt);
+      const preEnterGrid = await session.capturePaneGrid();
       session.sendKeysImmediate(["Enter"]);
       session.sendLiteralImmediate(newerDraft);
-      session.sendKeysImmediate(["Enter"]);
       await waitForCondition(
         () => heldGateway.requests.length === 1 && hold.started,
         "held idle submitted prompt stream",
       );
       await session.waitForText("Thinking", TIMEOUT);
       await Bun.sleep(250);
+      const thinkingGrid = await session.capturePaneGrid();
+      const rowContaining = (grid: string[], needle: string) => {
+        const row = grid.findIndex((line) => line.includes(needle));
+        expect(row).toBeGreaterThanOrEqual(0);
+        return row;
+      };
+      expect(rowContaining(thinkingGrid, submittedPrompt)).toBe(
+        rowContaining(preEnterGrid, submittedPrompt),
+      );
       await session.sendKeys("C-c");
       const cancelledPane = await session.waitForText("cancelled", TIMEOUT);
 
@@ -2848,7 +2841,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
   );
 
   test(
-    "complete assistant block precedes a queued user prompt in scrollback",
+    "visible assistant prefix precedes immediate steering in scrollback",
     async () => {
       root = realpathSync(mkdtempSync(join(tmpdir(), "fx-tui-prompt-boundary-")));
       const home = join(root, "home");
@@ -2913,11 +2906,30 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       await session.waitForText("SPLIT_OLD_TAIL_FINAL", TIMEOUT);
 
       await session.sendText(SPLIT_NEW_USER_PROMPT);
-      expect(splitGateway.requests).toHaveLength(1);
-      firstResponse.release?.();
+      const cutoffPane = await session.capturePane();
+      expect(cutoffPane).not.toContain(
+        `${SPLIT_NEW_USER_PROMPT} · Esc to steer now`,
+      );
+      expect(cutoffPane).toMatch(/Thinking|Generating/);
+      await waitForCondition(
+        () => firstResponse.cancelled,
+        "visible assistant steering cancellation",
+      );
       await waitForCondition(
         () => splitGateway.requests.length === 2 && secondResponse.started,
-        "held second Gateway stream",
+        "immediate steering Gateway stream",
+      );
+      const handoffScrollback = await waitForEscapedScrollback(
+        session,
+        (candidate) => {
+          const promptIndex = candidate.lastIndexOf(SPLIT_NEW_USER_PROMPT);
+          return promptIndex >= 0 && candidate.lastIndexOf("Thinking") > promptIndex;
+        },
+        "thinking activity after the steering user row",
+        3_000,
+      );
+      expect(handoffScrollback.lastIndexOf("Thinking")).toBeGreaterThan(
+        handoffScrollback.lastIndexOf(SPLIT_NEW_USER_PROMPT),
       );
 
       const rawScrollback = await waitForEscapedScrollback(
@@ -2940,6 +2952,10 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       expect(finalTailIndex).toBeLessThan(promptIndex);
       expect(countOccurrences(rawScrollback, SPLIT_NEW_USER_PROMPT)).toBe(1);
 
+      expect(splitGateway.requests[1]!.body).toContain("<user_steering>");
+      expect(splitGateway.requests[1]!.body).toContain(SPLIT_NEW_USER_PROMPT);
+      const trace = readFileSync(tracePath, "utf8");
+      expect(trace).not.toContain("event=queue_review_started");
       expect(scrollback).toContain("SPLIT_OLD_TAIL_FINAL");
       expect(readFileSync(stderrPath, "utf8")).toBe("");
       expect(existsSync(tapePath)).toBe(true);
@@ -2956,134 +2972,610 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
   );
 
   test(
-    "confirmed post-cancel queued prompt recovers duplicate-key tool arguments",
+    "cancelled buffered assistant tail stays before steering and the next answer",
     async () => {
-      root = realpathSync(mkdtempSync(join(tmpdir(), "fx-tui-queued-cancel-integrity-")));
+      root = realpathSync(mkdtempSync(join(tmpdir(), "fx-tui-steering-late-tail-")));
       const home = join(root, "home");
       const workspacePath = join(root, "workspace");
-      const tracePath = join(root, "trace.log");
       const stderrPath = join(root, "stderr.log");
-      const tapePath = join(root, "session.fxtape");
+      const tracePath = join(root, "trace.log");
+      const firstResponse: HoldState = { started: false, cancelled: false };
+      const visiblePrefix = "CANCELLED_RESPONSE_VISIBLE_PREFIX";
+      const bufferedTail = "CANCELLED_RESPONSE_BUFFERED_TAIL";
+      const steering = "Replace the cancelled response with the short corrected answer.";
+      const finalText = "STEERED_RESPONSE_FRESH";
       mkdirSync(join(home, ".fx"), { recursive: true });
       mkdirSync(workspacePath, { recursive: true });
       writeFileSync(join(home, ".fx", "settings.json"), "{}");
       const workspace = realpathSync(workspacePath);
-      const hold: HoldState = { started: false, cancelled: false };
-      const duplicateArguments = '{"depth":1, "depth":2}';
-      const finalText = "Queued recovery completed after sanitized history.";
-      const queuedGateway = startFakeGateway([
-        fakeGatewaySerializedToolCall(
-          "first_turn_command",
-          "terminal",
-          '{"action":"exec","command":"printf preflight-failed > preflight.txt","timeout_ms":600000}',
-        ),
-        () => heldGatewayResponse(hold),
-        fakeGatewaySerializedToolCall(
-          "queued_grep_command",
-          "terminal",
-          '{"action":"exec","command":"grep -R \\"preflight\\" -n . | head","timeout_ms":600000}',
-        ),
-        duplicateKeyToolResponse(),
+
+      const lateTailGateway = startFakeGateway([
+        () =>
+          heldGatewayResponse(firstResponse, [{
+            type: "text-delta",
+            id: "cancelled_response",
+            delta: `${visiblePrefix}\n\n${bufferedTail}`,
+          }]),
         fakeGatewayFinalText(finalText),
       ]);
-      gateway = queuedGateway;
-
+      gateway = lateTailGateway;
       session = await TmuxSession.create({
         cwd: workspace,
+        width: 120,
+        height: 34,
+        minimumHistoryLines: 2_000,
         stderrPath,
         env: {
           HOME: home,
-          AI_GATEWAY_API_KEY: "fake-queued-cancel-integrity-key",
+          AI_GATEWAY_API_KEY: "fake-steering-late-tail-key",
           VERCEL_OIDC_TOKEN: undefined,
           FX_AUTO_UPGRADE: "0",
-          FX_PERMISSION_MODE: "auto",
-          FX_GATEWAY_BASE_URL: queuedGateway.baseUrl,
-          FX_GATEWAY_CHAT_URL: queuedGateway.chatUrl,
-          FX_E2E_GATEWAY_CHAT_URL: queuedGateway.chatUrl,
+          FX_SOUND: "0",
+          FX_GATEWAY_BASE_URL: lateTailGateway.baseUrl,
+          FX_GATEWAY_CHAT_URL: lateTailGateway.chatUrl,
+          FX_E2E_GATEWAY_CHAT_URL: lateTailGateway.chatUrl,
           FX_MODEL: MODEL,
-          FX_RECORD: tapePath,
-          FX_RECORD_INPUT: "1",
           FX_TRACE_LOG: tracePath,
-          FX_TRACE_SCOPES: "agent,core,gateway,stream,tool,sse,worker,input,prompt",
+          FX_TRACE_SCOPES: "agent,gateway,stream,worker,input,prompt",
         },
       });
 
       await session.waitForComposer(TIMEOUT);
-      await session.sendText(
-        "Create dogfood-notes.txt with three lines, then report its byte count.",
+      await session.sendText("Start the cancelled response fixture.");
+      await session.waitForText(visiblePrefix, TIMEOUT);
+      expect(await session.captureFullScrollback()).not.toContain(bufferedTail);
+
+      await session.sendText(steering);
+      await waitForScrollback(
+        session,
+        (candidate) => candidate.split("\n").some((line) => line.trim() === finalText),
+        "fresh steered assistant response",
       );
       await waitForCondition(
-        () => queuedGateway.requests.length >= 2 && hold.started,
-        "held second gateway request",
+        () => lateTailGateway.requests.length === 2,
+        "steered response request",
       );
 
-      await session.sendText(
-        "Why did preflight fail? Do not write anything; just explain briefly.",
-      );
-      await session.waitForText(queuedSummaryText(1), TIMEOUT);
-      await session.sendKeys("C-c");
-      await session.waitForPane(
-        (candidate) =>
-          candidate.includes("Why did preflight fail?") &&
-          candidate.includes("paused") &&
-          candidate.includes("enter to send"),
-        TIMEOUT,
-      );
-      expect(queuedGateway.requests).toHaveLength(2);
-      await session.sendKeys("Enter");
-      const pane = await session.waitForText(finalText, TIMEOUT);
-      await waitForCondition(
-        () => queuedGateway.requests.length === 5 && hold.cancelled,
-        "fifth gateway request after held request cancellation",
-      );
+      const scrollback = await session.captureFullScrollback();
+      const visibleIndex = scrollback.lastIndexOf(visiblePrefix);
+      const tailIndex = scrollback.lastIndexOf(bufferedTail);
+      const steeringIndex = scrollback.lastIndexOf(steering);
+      const finalIndex = scrollback.lastIndexOf(finalText);
+      expect(visibleIndex).toBeGreaterThanOrEqual(0);
+      expect(tailIndex).toBeGreaterThan(visibleIndex);
+      expect(steeringIndex).toBeGreaterThan(tailIndex);
+      expect(finalIndex).toBeGreaterThan(steeringIndex);
+      expect(scrollback.slice(steeringIndex)).not.toContain(bufferedTail);
 
-      const finalRequest = JSON.parse(queuedGateway.requests[4].body) as {
-        prompt: Array<{ content?: Array<Record<string, unknown>> }>;
-      };
-      const parts = finalRequest.prompt.flatMap((message) => message.content ?? []);
-      const repairedCalls = parts.filter((part) =>
-        part.type === "tool-call" &&
-        part.toolCallId === "queued_duplicate_list" &&
-        part.toolName === "glob_files"
+      const lines = scrollback.split("\n").map((line) => line.trimEnd());
+      const steeringLine = lines.findIndex((line) => line.includes(steering));
+      const finalLine = lines.findIndex((line, index) =>
+        index > steeringLine && line.includes(finalText)
       );
-      const repairedResults = parts.filter((part) =>
-        part.type === "tool-result" &&
-        part.toolCallId === "queued_duplicate_list" &&
-        part.toolName === "glob_files"
-      );
-      const trace = readFileSync(tracePath, "utf8");
-      const stderr = readFileSync(stderrPath, "utf8");
-
-      expect(repairedCalls).toEqual([
-        expect.objectContaining({ input: {} }),
-      ]);
-      expect(repairedResults).toEqual([
-        expect.objectContaining({
-          output: expect.objectContaining({
-            type: "error-text",
-            value: expect.stringContaining("tool_execution_failed"),
-          }),
-        }),
-      ]);
-      expect(queuedGateway.requests[4].body).not.toContain(duplicateArguments);
-      expect(trace).toContain("event=tool_argument_integrity");
-      expect(trace).toContain("failure=malformed_json");
-      expect(trace).toContain("event=queue_review_started");
-      expect(trace).toContain("reason=post_cancel");
-      expect(trace).toContain("event=queue_review_committed");
-      expect(trace).toContain("event=queue_review_resumed");
-      expect(trace).not.toContain(duplicateArguments);
-      expect(pane).not.toContain("InvalidGatewayHistory");
-      expect(stderr).toBe("");
+      expect(steeringLine).toBeGreaterThanOrEqual(0);
+      expect(finalLine).toBeGreaterThan(steeringLine);
+      expect(
+        lines.slice(steeringLine + 1, finalLine).some((line) => line.trim() === ""),
+      ).toBe(true);
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
       expect(session.isAlive()).toBe(true);
       expect(session.isPaneAlive()).toBe(true);
-      expect(existsSync(tapePath)).toBe(true);
     },
-    TIMEOUT,
+    TIMEOUT * 2,
   );
 
   test(
-    "queued prompt stays pending until active assistant text completes",
+    "steering waits across streamed tool handoff before authoritative start",
+    async () => {
+      root = realpathSync(mkdtempSync(join(tmpdir(), "fx-tui-steering-tool-handoff-")));
+      const home = join(root, "home");
+      const workspacePath = join(root, "workspace");
+      const stderrPath = join(root, "stderr.log");
+      const tracePath = join(root, "trace.log");
+      const tapePath = join(root, "session.fxtape");
+      const toolHandoff: HoldState = { started: false, cancelled: false };
+      const toolOutput = "TOOL_HANDOFF_EXECUTED";
+      const steering = "Respond exactly TOOL_HANDOFF_STEERING_COMPLETE.";
+      const finalText = "TOOL_HANDOFF_STEERING_COMPLETE";
+      mkdirSync(join(home, ".fx"), { recursive: true });
+      mkdirSync(workspacePath, { recursive: true });
+      writeFileSync(join(home, ".fx", "settings.json"), "{}");
+      const workspace = realpathSync(workspacePath);
+
+      const handoffGateway = startFakeGateway([
+        () => heldGatewayResponse(
+          toolHandoff,
+          [
+            { type: "tool-input-start", id: "handoff_tool", toolName: "shell" },
+            { type: "text-start", id: "handoff_text" },
+            {
+              type: "text-delta",
+              id: "handoff_text",
+              delta: "Preparing the tool handoff.",
+            },
+          ],
+          [
+            { type: "text-end", id: "handoff_text" },
+            { type: "tool-input-end", id: "handoff_tool" },
+            {
+              type: "tool-call",
+              toolCallId: "handoff_tool",
+              toolName: "shell",
+              input: {
+                request: {
+                  action: "run",
+                  yield_time_ms: 30_000,
+                  timeout_ms: 30_000,
+                  command: `printf ${toolOutput}`,
+                },
+              },
+            },
+            {
+              type: "finish",
+              finishReason: { unified: "tool-calls", raw: "tool-calls" },
+              usage: {
+                inputTokens: { total: 11 },
+                outputTokens: { total: 17 },
+              },
+            },
+          ],
+        ),
+        fakeGatewayFinalText(finalText),
+      ]);
+      gateway = handoffGateway;
+
+      session = await TmuxSession.create({
+        cwd: workspace,
+        width: 120,
+        height: 34,
+        minimumHistoryLines: 500,
+        stderrPath,
+        env: {
+          HOME: home,
+          AI_GATEWAY_API_KEY: "fake-steering-tool-handoff-key",
+          VERCEL_OIDC_TOKEN: undefined,
+          FX_AUTO_UPGRADE: "0",
+          FX_SOUND: "0",
+          FX_PERMISSION_MODE: "yolo",
+          FX_GATEWAY_BASE_URL: handoffGateway.baseUrl,
+          FX_GATEWAY_CHAT_URL: handoffGateway.chatUrl,
+          FX_E2E_GATEWAY_CHAT_URL: handoffGateway.chatUrl,
+          FX_MODEL: MODEL,
+          FX_TRACE_LOG: tracePath,
+          FX_TRACE_SCOPES: "agent,worker,input,tool,interrupt",
+          FX_RECORD: tapePath,
+          FX_RECORD_INPUT: "1",
+        },
+      });
+
+      await session.waitForComposer(TIMEOUT);
+      await session.sendText("Run the streamed tool handoff fixture.");
+      await waitForCondition(
+        () => handoffGateway.requests.length === 1 && toolHandoff.started,
+        "held tool handoff response",
+      );
+      await session.waitForText("Generating", TIMEOUT);
+
+      await session.sendText(steering);
+      await Bun.sleep(150);
+      const pendingPane = await session.capturePane();
+      expect(toolHandoff.cancelled).toBe(false);
+      expect(pendingPane).toContain(`${steering} · Esc to steer now`);
+      expect(handoffGateway.requests).toHaveLength(1);
+
+      toolHandoff.release?.();
+      await session.waitForText(finalText, TIMEOUT);
+      await waitForCondition(
+        () => handoffGateway.requests.length === 2,
+        "steering request after tool handoff",
+      );
+
+      const continuedBody = handoffGateway.requests[1]!.body;
+      expect(continuedBody.indexOf(toolOutput)).toBeGreaterThanOrEqual(0);
+      expect(continuedBody.indexOf(steering)).toBeGreaterThan(
+        continuedBody.indexOf(toolOutput),
+      );
+      expect(continuedBody).toContain("<user_steering>");
+      expect(await session.captureFullScrollback()).not.toContain("Cancelled");
+      expect(readFileSync(tracePath, "utf8")).toContain(
+        "event=prompt_steering_consumed",
+      );
+      const replay = execFileSync(FX_BIN, ["replay", tapePath, "--frames"], {
+        encoding: "utf8",
+      });
+      expect(replay).toContain(finalText);
+      expect(replay).not.toContain("Cancelled");
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+    },
+    TIMEOUT * 2,
+  );
+
+  test(
+    "ordinary Enter keeps pending steering visible through narrow resize",
+    async () => {
+      root = realpathSync(mkdtempSync(join(tmpdir(), "fx-tui-cooperative-steering-")));
+      const home = join(root, "home");
+      const workspace = join(root, "workspace");
+      const tracePath = join(root, "trace.log");
+      const stderrPath = join(root, "stderr.log");
+      const releasePath = join(workspace, ".release-steering-tool");
+      mkdirSync(join(home, ".fx"), { recursive: true });
+      mkdirSync(workspace, { recursive: true });
+      writeFileSync(join(home, ".fx", "settings.json"), "{}");
+      const command =
+        `while [ ! -f ${JSON.stringify(releasePath)} ]; do sleep 0.05; done; ` +
+        "printf COOPERATIVE_TOOL_DONE";
+      const firstSteering = "FIRST_BEGIN use COOPERATIVE_STEERING_SENTINEL in the answer FIRST_END";
+      const secondSteering = "SECOND_BEGIN keep the answer concise while preserving its result SECOND_END";
+      const thirdSteering = "THIRD_BEGIN mention the completed command before the conclusion THIRD_END";
+      const finalText = "COOPERATIVE_STEERING_COMPLETE";
+      const steeringGateway = startFakeGateway([
+        fakeGatewayToolCall("cooperative_steering_tool", "shell", {
+          request: {
+            action: "run",
+            yield_time_ms: 30_000,
+            timeout_ms: 600_000,
+            command,
+          },
+        }),
+        fakeGatewayFinalText(finalText),
+      ]);
+      gateway = steeringGateway;
+
+      session = await TmuxSession.create({
+        cwd: workspace,
+        stderrPath,
+        width: 120,
+        height: 40,
+        env: {
+          HOME: home,
+          AI_GATEWAY_API_KEY: "fake-cooperative-steering-key",
+          VERCEL_OIDC_TOKEN: undefined,
+          FX_AUTO_UPGRADE: "0",
+          FX_SOUND: "0",
+          FX_PERMISSION_MODE: "yolo",
+          FX_GATEWAY_BASE_URL: steeringGateway.baseUrl,
+          FX_GATEWAY_CHAT_URL: steeringGateway.chatUrl,
+          FX_E2E_GATEWAY_CHAT_URL: steeringGateway.chatUrl,
+          FX_MODEL: MODEL,
+          FX_TRACE_LOG: tracePath,
+          FX_TRACE_SCOPES: "agent,worker,input,tool,interrupt",
+        },
+      });
+
+      await session.waitForComposer(TIMEOUT);
+      await session.sendText("Run the cooperative steering fixture.");
+      await session.waitForText("Running while", TIMEOUT);
+      await session.sendText(firstSteering);
+      await session.sendText(secondSteering);
+      await session.sendText(thirdSteering);
+      await Bun.sleep(150);
+      const pendingPane = await session.capturePane();
+      expect(pendingPane).toContain(firstSteering);
+      expect(pendingPane).toContain(secondSteering);
+      expect(pendingPane).toContain(`${thirdSteering} · Esc to steer now`);
+      expect(pendingPane.indexOf(firstSteering)).toBeLessThan(
+        pendingPane.indexOf(secondSteering),
+      );
+      expect(pendingPane.indexOf(secondSteering)).toBeLessThan(
+        pendingPane.indexOf(thirdSteering),
+      );
+      expect(countOccurrences(pendingPane, "Esc to steer now")).toBe(1);
+      expect(pendingPane).not.toContain("Waiting for tool");
+      expect(pendingPane).not.toContain("pending message");
+      expect(pendingPane).not.toContain("queued 1");
+      expect(steeringGateway.requests).toHaveLength(1);
+
+      await session.resizeWindow(60, 16);
+      const narrowPane = await session.capturePane();
+      for (const marker of [
+        "FIRST_BEGIN",
+        "FIRST_END",
+        "SECOND_BEGIN",
+        "SECOND_END",
+        "THIRD_BEGIN",
+        "THIRD_END",
+      ]) {
+        expect(narrowPane).toContain(marker);
+      }
+      expect(countOccurrences(narrowPane, "Esc to steer now")).toBe(1);
+      expect(narrowPane).not.toContain("queued message");
+      await session.resizeWindow(120, 40);
+
+      writeFileSync(releasePath, "release\n");
+      await session.waitForText(finalText, TIMEOUT);
+      await waitForCondition(
+        () => steeringGateway.requests.length === 2,
+        "cooperative steering request",
+      );
+
+      const continuedBody = steeringGateway.requests[1]!.body;
+      const trace = readFileSync(tracePath, "utf8");
+      expect(continuedBody.indexOf("COOPERATIVE_TOOL_DONE")).toBeGreaterThanOrEqual(0);
+      expect(continuedBody.indexOf(firstSteering)).toBeGreaterThan(
+        continuedBody.indexOf("COOPERATIVE_TOOL_DONE"),
+      );
+      expect(continuedBody.indexOf(secondSteering)).toBeGreaterThan(
+        continuedBody.indexOf(firstSteering),
+      );
+      expect(continuedBody.indexOf(thirdSteering)).toBeGreaterThan(
+        continuedBody.indexOf(secondSteering),
+      );
+      expect(continuedBody).toContain("live user update");
+      expect(trace).toContain("event=prompt_steering_consumed");
+      expect(trace).not.toContain("event=queue_review_started");
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+      expect(session.isAlive()).toBe(true);
+      expect(session.isPaneAlive()).toBe(true);
+    },
+    TIMEOUT * 2,
+  );
+
+  test(
+    "rich steering waits for the running tool and hands off without queue UI",
+    async () => {
+      root = realpathSync(mkdtempSync(join(tmpdir(), "fx-tui-rich-steering-tool-")));
+      const home = join(root, "home");
+      const workspace = join(root, "workspace");
+      const tracePath = join(root, "trace.log");
+      const stderrPath = join(root, "stderr.log");
+      const releasePath = join(workspace, ".release-rich-steering-tool");
+      const imagePath = join(workspace, "steering-image.png");
+      mkdirSync(join(home, ".fx"), { recursive: true });
+      mkdirSync(workspace, { recursive: true });
+      writeFileSync(join(home, ".fx", "settings.json"), "{}");
+      copyFileSync(join(REPO_ROOT, "tests/e2e/fixtures/favicon.png"), imagePath);
+      const expectedImageData = readFileSync(imagePath).toString("base64");
+      const command =
+        `while [ ! -f ${JSON.stringify(releasePath)} ]; do sleep 0.05; done; ` +
+        "printf RICH_STEERING_TOOL_DONE";
+      const steering = "Use the attached image after this command finishes.";
+      const finalText = "RICH_STEERING_HANDOFF_COMPLETE";
+      const steeringGateway = startFakeGateway([
+        fakeGatewayToolCall("rich_steering_tool", "shell", {
+          request: {
+            action: "run",
+            yield_time_ms: 30_000,
+            timeout_ms: 600_000,
+            command,
+          },
+        }),
+        fakeGatewayFinalText(finalText),
+      ], {
+        models: [{ id: MODEL, type: "language", tags: ["vision", "file-input", "tool-use"] }],
+      });
+      gateway = steeringGateway;
+
+      session = await TmuxSession.create({
+        cwd: workspace,
+        stderrPath,
+        width: 120,
+        height: 40,
+        env: {
+          HOME: home,
+          AI_GATEWAY_API_KEY: "fake-rich-steering-tool-key",
+          VERCEL_OIDC_TOKEN: undefined,
+          FX_AUTO_UPGRADE: "0",
+          FX_SOUND: "0",
+          FX_PERMISSION_MODE: "yolo",
+          FX_GATEWAY_BASE_URL: steeringGateway.baseUrl,
+          FX_GATEWAY_CHAT_URL: steeringGateway.chatUrl,
+          FX_E2E_GATEWAY_CHAT_URL: steeringGateway.chatUrl,
+          FX_E2E_GATEWAY_MODELS_URL: `${steeringGateway.baseUrl}/coding-agent/v1/models`,
+          FX_MODEL: MODEL,
+          FX_TRACE_LOG: tracePath,
+          FX_TRACE_SCOPES: "agent,worker,input,tool,interrupt",
+        },
+      });
+
+      await session.waitForComposer(TIMEOUT);
+      await session.sendText("Run the rich steering tool fixture.");
+      await session.waitForText("Running while", TIMEOUT);
+      await session.sendText(`/image ${imagePath}`);
+      await session.waitForText("attached image: steering-image.png", TIMEOUT);
+      await session.sendText(steering);
+      await session.waitForText(`${steering} · Esc to steer now`, TIMEOUT);
+      expect(steeringGateway.requests).toHaveLength(1);
+
+      writeFileSync(releasePath, "release\n");
+      await session.waitForText(finalText, TIMEOUT);
+      await waitForCondition(
+        () => steeringGateway.requests.length === 2,
+        "rich steering handoff request",
+      );
+
+      const continuedBody = steeringGateway.requests[1]!.body;
+      const continuedRequest = JSON.parse(continuedBody) as {
+        prompt: Array<{ role?: string; content?: unknown }>;
+      };
+      const continuedUser = continuedRequest.prompt.filter((message) =>
+        message.role === "user"
+      ).at(-1);
+      expect(continuedUser).toBeDefined();
+      expect(Array.isArray(continuedUser!.content)).toBe(true);
+      const continuedParts = continuedUser!.content as Array<Record<string, unknown>>;
+      expect(continuedParts.filter((part) => part.type === "file")).toEqual([{
+        type: "file",
+        mediaType: "image/png",
+        data: expectedImageData,
+      }]);
+      expect(continuedBody).toContain("RICH_STEERING_TOOL_DONE");
+      expect(continuedBody).toContain("<user_steering>");
+      expect(continuedBody).toContain(steering);
+      expect(continuedBody).not.toContain("<turn_aborted>");
+      expect(continuedBody).not.toContain(
+        "The previous response ended before completion.",
+      );
+      expect(continuedBody).not.toContain("Interrupted by user after completing");
+      const trace = readFileSync(tracePath, "utf8");
+      expect(trace).toContain("outcome_kind=steering_handoff");
+      expect(trace).not.toContain("event=queue_review_started");
+      const scrollback = await session.captureFullScrollback();
+      expect(scrollback).not.toContain(queuedSummaryText(1));
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+      expect(session.isAlive()).toBe(true);
+      expect(session.isPaneAlive()).toBe(true);
+    },
+    TIMEOUT * 2,
+  );
+
+  test(
+    "failed tool result precedes pending steering",
+    async () => {
+      root = realpathSync(mkdtempSync(join(tmpdir(), "fx-tui-failed-tool-steering-")));
+      const home = join(root, "home");
+      const workspace = join(root, "workspace");
+      const tracePath = join(root, "trace.log");
+      const stderrPath = join(root, "stderr.log");
+      const releasePath = join(workspace, ".release-failed-steering-tool");
+      mkdirSync(join(home, ".fx"), { recursive: true });
+      mkdirSync(workspace, { recursive: true });
+      writeFileSync(join(home, ".fx", "settings.json"), "{}");
+      const command =
+        `while [ ! -f ${JSON.stringify(releasePath)} ]; do sleep 0.05; done; ` +
+        "printf FAILED_TOOL_STEERING_RESULT; exit 7";
+      const steering = "Respond exactly FAILED_TOOL_STEERING_COMPLETE.";
+      const steeringGateway = startFakeGateway([
+        fakeGatewayToolCall("failed_steering_tool", "shell", {
+          request: {
+            action: "run",
+            yield_time_ms: 30_000,
+            timeout_ms: 600_000,
+            command,
+          },
+        }),
+        fakeGatewayFinalText("FAILED_TOOL_STEERING_COMPLETE"),
+      ]);
+      gateway = steeringGateway;
+
+      session = await TmuxSession.create({
+        cwd: workspace,
+        stderrPath,
+        width: 120,
+        height: 40,
+        env: {
+          HOME: home,
+          AI_GATEWAY_API_KEY: "fake-failed-tool-steering-key",
+          VERCEL_OIDC_TOKEN: undefined,
+          FX_AUTO_UPGRADE: "0",
+          FX_SOUND: "0",
+          FX_PERMISSION_MODE: "yolo",
+          FX_GATEWAY_BASE_URL: steeringGateway.baseUrl,
+          FX_GATEWAY_CHAT_URL: steeringGateway.chatUrl,
+          FX_E2E_GATEWAY_CHAT_URL: steeringGateway.chatUrl,
+          FX_MODEL: MODEL,
+          FX_TRACE_LOG: tracePath,
+          FX_TRACE_SCOPES: "agent,worker,input,tool,interrupt",
+        },
+      });
+
+      await session.waitForComposer(TIMEOUT);
+      await session.sendText("Run the failed steering tool fixture.");
+      await session.waitForText("Running while", TIMEOUT);
+      await session.sendText(steering);
+      await session.waitForText(`${steering} · Esc to steer now`, TIMEOUT);
+      expect(steeringGateway.requests).toHaveLength(1);
+
+      writeFileSync(releasePath, "release\n");
+      await session.waitForText("FAILED_TOOL_STEERING_COMPLETE", TIMEOUT);
+      await waitForCondition(
+        () => steeringGateway.requests.length === 2,
+        "failed tool steering request",
+      );
+
+      const continuedBody = steeringGateway.requests[1]!.body;
+      expect(continuedBody.indexOf("FAILED_TOOL_STEERING_RESULT")).toBeGreaterThanOrEqual(0);
+      expect(continuedBody.indexOf(steering)).toBeGreaterThan(
+        continuedBody.indexOf("FAILED_TOOL_STEERING_RESULT"),
+      );
+      expect(continuedBody).toContain("<user_steering>");
+      const trace = readFileSync(tracePath, "utf8");
+      expect(trace).toContain("event=prompt_steering_consumed");
+      expect(trace).not.toContain("event=queue_review_started");
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+      expect(session.isAlive()).toBe(true);
+      expect(session.isPaneAlive()).toBe(true);
+    },
+    TIMEOUT * 2,
+  );
+
+  test(
+    "Escape interrupts a running tool and starts pending steering without review",
+    async () => {
+      root = realpathSync(mkdtempSync(join(tmpdir(), "fx-tui-immediate-steering-")));
+      const home = join(root, "home");
+      const workspace = join(root, "workspace");
+      const tracePath = join(root, "trace.log");
+      const stderrPath = join(root, "stderr.log");
+      mkdirSync(join(home, ".fx"), { recursive: true });
+      mkdirSync(workspace, { recursive: true });
+      writeFileSync(join(home, ".fx", "settings.json"), "{}");
+      const steering = "Apply IMMEDIATE_STEERING_SENTINEL now.";
+      const finalText = "IMMEDIATE_STEERING_COMPLETE";
+      const steeringGateway = startFakeGateway([
+        fakeGatewayToolCall("immediate_steering_tool", "shell", {
+          request: {
+            action: "run",
+            yield_time_ms: 30_000,
+            timeout_ms: 600_000,
+            command: "sleep 30",
+          },
+        }),
+        fakeGatewayFinalText(finalText),
+      ]);
+      gateway = steeringGateway;
+
+      session = await TmuxSession.create({
+        cwd: workspace,
+        stderrPath,
+        width: 120,
+        height: 40,
+        env: {
+          HOME: home,
+          AI_GATEWAY_API_KEY: "fake-immediate-steering-key",
+          VERCEL_OIDC_TOKEN: undefined,
+          FX_AUTO_UPGRADE: "0",
+          FX_SOUND: "0",
+          FX_PERMISSION_MODE: "yolo",
+          FX_GATEWAY_BASE_URL: steeringGateway.baseUrl,
+          FX_GATEWAY_CHAT_URL: steeringGateway.chatUrl,
+          FX_E2E_GATEWAY_CHAT_URL: steeringGateway.chatUrl,
+          FX_MODEL: MODEL,
+          FX_TRACE_LOG: tracePath,
+          FX_TRACE_SCOPES: "agent,worker,input,tool,interrupt,history",
+        },
+      });
+
+      await session.waitForComposer(TIMEOUT);
+      await session.sendText("Run the immediate steering fixture.");
+      await session.waitForText("Running sleep 30", TIMEOUT);
+      await session.sendText(steering);
+      await session.waitForText(`${steering} · Esc to steer now`, TIMEOUT);
+      expect(steeringGateway.requests).toHaveLength(1);
+
+      await session.sendKeys("Escape");
+      await session.waitForText(finalText, TIMEOUT);
+      await waitForCondition(
+        () => steeringGateway.requests.length === 2,
+        "immediate steering request",
+      );
+
+      const continuedBody = steeringGateway.requests[1]!.body;
+      const trace = readFileSync(tracePath, "utf8");
+      expect(continuedBody).toContain("Run the immediate steering fixture.");
+      expect(continuedBody).toContain(steering);
+      expect(trace).toContain("steering_pending=true");
+      expect(trace).toContain("outcome_kind=interrupted");
+      expect(trace).not.toContain("event=queue_review_started");
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+      expect(session.isAlive()).toBe(true);
+      expect(session.isPaneAlive()).toBe(true);
+    },
+    TIMEOUT * 2,
+  );
+
+  test(
+    "rich steering interrupts tool-free generation without queue UI",
     async () => {
       root = realpathSync(mkdtempSync(join(tmpdir(), "fx-tui-queued-order-")));
       const home = join(root, "home");
@@ -3100,37 +3592,37 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       const sibling = join(workspace, "sibling");
       mkdirSync(nested, { recursive: true });
       mkdirSync(sibling, { recursive: true });
-      const imagePath = join(nested, "queued-snapshot.png");
+      const imagePath = join(nested, "steering-snapshot.png");
       copyFileSync(
         join(REPO_ROOT, "tests/e2e/fixtures/favicon.png"),
         imagePath,
       );
       const image = realpathSync(imagePath);
       const expectedImageData = readFileSync(image).toString("base64");
-      const oldGlobalRule = "QUEUED_SNAPSHOT_OLD_GLOBAL_RULE";
-      const oldAncestorRule = "QUEUED_SNAPSHOT_OLD_ANCESTOR_RULE";
-      const oldRootRule = "QUEUED_SNAPSHOT_OLD_ROOT_RULE";
-      const oldNestedRule = "QUEUED_SNAPSHOT_OLD_NESTED_RULE";
-      const oldSiblingRule = "QUEUED_SNAPSHOT_OLD_SIBLING_MUST_BE_ABSENT";
-      const newGlobalRule = "QUEUED_SNAPSHOT_NEW_GLOBAL_MUST_BE_ABSENT";
-      const newAncestorRule = "QUEUED_SNAPSHOT_NEW_ANCESTOR_MUST_BE_ABSENT";
-      const newRootRule = "QUEUED_SNAPSHOT_NEW_ROOT_MUST_BE_ABSENT";
-      const newNestedRule = "QUEUED_SNAPSHOT_NEW_NESTED_MUST_BE_ABSENT";
-      const newSiblingRule = "QUEUED_SNAPSHOT_NEW_SIBLING_MUST_BE_ABSENT";
+      const oldGlobalRule = "STEERING_SNAPSHOT_OLD_GLOBAL_RULE";
+      const oldAncestorRule = "STEERING_SNAPSHOT_OLD_ANCESTOR_RULE";
+      const oldRootRule = "STEERING_SNAPSHOT_OLD_ROOT_RULE";
+      const oldNestedRule = "STEERING_SNAPSHOT_OLD_NESTED_RULE";
+      const oldSiblingRule = "STEERING_SNAPSHOT_OLD_SIBLING_MUST_BE_ABSENT";
+      const newGlobalRule = "STEERING_SNAPSHOT_NEW_GLOBAL_MUST_BE_ABSENT";
+      const newAncestorRule = "STEERING_SNAPSHOT_NEW_ANCESTOR_MUST_BE_ABSENT";
+      const newRootRule = "STEERING_SNAPSHOT_NEW_ROOT_MUST_BE_ABSENT";
+      const newNestedRule = "STEERING_SNAPSHOT_NEW_NESTED_MUST_BE_ABSENT";
+      const newSiblingRule = "STEERING_SNAPSHOT_NEW_SIBLING_MUST_BE_ABSENT";
       writeFileSync(join(home, ".fx", "AGENTS.md"), `${oldGlobalRule}\n`);
       writeFileSync(join(launchAncestor, "AGENTS.md"), `${oldAncestorRule}\n`);
       writeFileSync(join(workspace, "AGENTS.md"), `${oldRootRule}\n`);
       writeFileSync(join(nested, "AGENTS.md"), `${oldNestedRule}\n`);
       writeFileSync(join(sibling, "AGENTS.md"), `${oldSiblingRule}\n`);
       const hold: HoldState = { started: false, cancelled: false };
-      const activeBefore = "ACTIVE_ASSISTANT_BEFORE_QUEUE_SENTINEL\n";
-      const activeAfter = "ACTIVE_ASSISTANT_AFTER_QUEUE_SENTINEL\n";
-      const queuedPrompt = "QUEUED_PROMPT_CANONICAL_ORDER_SENTINEL";
-      const queuedDone = "QUEUED_PROMPT_CANONICAL_ORDER_DONE";
-      const queuedGateway = startFakeGateway(
+      const activeBefore = "ACTIVE_ASSISTANT_BEFORE_STEERING_SENTINEL\n";
+      const activeAfter = "ACTIVE_ASSISTANT_AFTER_STEERING_MUST_BE_ABSENT\n";
+      const steeringPrompt = "RICH_STEERING_CANONICAL_ORDER_SENTINEL";
+      const steeringDone = "RICH_STEERING_CANONICAL_ORDER_DONE";
+      const steeringGateway = startFakeGateway(
         [
           () => splitHeldTextResponse(hold, activeBefore, activeAfter),
-          fakeGatewayFinalText(queuedDone),
+          fakeGatewayFinalText(steeringDone),
         ],
         {
           models: [{
@@ -3140,7 +3632,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
           }],
         },
       );
-      gateway = queuedGateway;
+      gateway = steeringGateway;
 
       session = await TmuxSession.create({
         cwd: workspace,
@@ -3150,13 +3642,13 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
         minimumHistoryLines: 2_000,
         env: {
           HOME: home,
-          AI_GATEWAY_API_KEY: "fake-queued-transcript-key",
+          AI_GATEWAY_API_KEY: "fake-rich-steering-key",
           VERCEL_OIDC_TOKEN: undefined,
           FX_AUTO_UPGRADE: "0",
-          FX_GATEWAY_BASE_URL: queuedGateway.baseUrl,
-          FX_GATEWAY_CHAT_URL: queuedGateway.chatUrl,
-          FX_E2E_GATEWAY_CHAT_URL: queuedGateway.chatUrl,
-          FX_E2E_GATEWAY_MODELS_URL: `${queuedGateway.baseUrl}/coding-agent/v1/models`,
+          FX_GATEWAY_BASE_URL: steeringGateway.baseUrl,
+          FX_GATEWAY_CHAT_URL: steeringGateway.chatUrl,
+          FX_E2E_GATEWAY_CHAT_URL: steeringGateway.chatUrl,
+          FX_E2E_GATEWAY_MODELS_URL: `${steeringGateway.baseUrl}/coding-agent/v1/models`,
           FX_MODEL: MODEL,
           FX_RECORD: tapePath,
           FX_RECORD_INPUT: "1",
@@ -3168,30 +3660,14 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       await session.waitForComposer(TIMEOUT);
       await session.sendText("Hold the active turn open.");
       await waitForCondition(
-        () => queuedGateway.requests.length === 1 && hold.started,
+        () => steeringGateway.requests.length === 1 && hold.started,
         "held active Gateway request",
       );
       await session.waitForText("Generating", TIMEOUT);
 
       await session.sendText(`/image ${image}`);
-      await session.waitForText("attached image: queued-snapshot.png", TIMEOUT);
-      await session.sendText(queuedPrompt);
-      const heldScrollback = await waitForEscapedScrollback(
-        session,
-        (candidate) =>
-          queuedGateway.requests.length === 1 &&
-          hold.started &&
-          candidate.includes(queuedSummaryText(1)) &&
-          !candidate.includes(queuedPrompt),
-        "queued prompt count shown before active turn releases",
-      );
-
-      expect(heldScrollback).not.toContain(queuedPrompt);
-      expect(heldScrollback).not.toContain("next:");
-      expect(countOccurrences(heldScrollback, queuedPrompt)).toBe(0);
-      expect(heldScrollback).not.toContain(activeBefore.trim());
-      expect(heldScrollback).not.toContain(activeAfter.trim());
-      expect(queuedGateway.requests).toHaveLength(1);
+      await session.waitForText("attached image: steering-snapshot.png", TIMEOUT);
+      await session.sendText(steeringPrompt);
 
       writeFileSync(join(home, ".fx", "AGENTS.md"), `${newGlobalRule}\n`);
       writeFileSync(join(launchAncestor, "AGENTS.md"), `${newAncestorRule}\n`);
@@ -3199,67 +3675,62 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       writeFileSync(join(nested, "AGENTS.md"), `${newNestedRule}\n`);
       writeFileSync(join(sibling, "AGENTS.md"), `${newSiblingRule}\n`);
 
-      hold.release?.();
-      await session.waitForText(queuedDone, TIMEOUT);
+      await waitForCondition(() => hold.cancelled, "rich steering cancellation");
+      await session.waitForText(steeringDone, TIMEOUT);
       await waitForCondition(
-        () => queuedGateway.requests.length === 2,
-        "queued prompt drained",
+        () => steeringGateway.requests.length === 2,
+        "rich steering request",
       );
 
-      const queuedBody = queuedGateway.requests[1]!.body;
-      const queuedRequest = JSON.parse(queuedBody) as {
+      const steeringBody = steeringGateway.requests[1]!.body;
+      const steeringRequest = JSON.parse(steeringBody) as {
         prompt: Array<{ role?: string; content?: unknown }>;
       };
-      const queuedUser = queuedRequest.prompt.filter((message) =>
+      const steeringUser = steeringRequest.prompt.filter((message) =>
         message.role === "user"
       ).at(-1);
-      expect(queuedUser).toBeDefined();
-      expect(Array.isArray(queuedUser!.content)).toBe(true);
-      const queuedParts = queuedUser!.content as Array<Record<string, unknown>>;
-      expect(queuedParts.filter((part) => part.type === "file")).toEqual([{
+      expect(steeringUser).toBeDefined();
+      expect(Array.isArray(steeringUser!.content)).toBe(true);
+      const steeringParts = steeringUser!.content as Array<Record<string, unknown>>;
+      expect(steeringParts.filter((part) => part.type === "file")).toEqual([{
         type: "file",
         mediaType: "image/png",
         data: expectedImageData,
       }]);
-      expect(countOccurrences(queuedBody, oldGlobalRule)).toBe(1);
-      expect(countOccurrences(queuedBody, oldAncestorRule)).toBe(1);
-      expect(countOccurrences(queuedBody, oldRootRule)).toBe(1);
-      expect(countOccurrences(queuedBody, oldNestedRule)).toBe(1);
-      expect(queuedBody.indexOf(oldGlobalRule)).toBeLessThan(
-        queuedBody.indexOf(oldAncestorRule),
+      expect(steeringBody).toContain("<user_steering>");
+      expect(steeringBody).not.toContain("<turn_aborted>");
+      expect(steeringBody).not.toContain(
+        "The previous response ended before completion.",
       );
-      expect(queuedBody.indexOf(oldAncestorRule)).toBeLessThan(
-        queuedBody.indexOf(oldRootRule),
+      expect(countOccurrences(steeringBody, oldGlobalRule)).toBe(1);
+      expect(countOccurrences(steeringBody, oldAncestorRule)).toBe(1);
+      expect(countOccurrences(steeringBody, oldRootRule)).toBe(1);
+      expect(countOccurrences(steeringBody, oldNestedRule)).toBe(1);
+      expect(steeringBody.indexOf(oldGlobalRule)).toBeLessThan(
+        steeringBody.indexOf(oldAncestorRule),
       );
-      expect(queuedBody.indexOf(oldRootRule)).toBeLessThan(
-        queuedBody.indexOf(oldNestedRule),
+      expect(steeringBody.indexOf(oldAncestorRule)).toBeLessThan(
+        steeringBody.indexOf(oldRootRule),
       );
-      expect(queuedBody).not.toContain(oldSiblingRule);
-      expect(queuedBody).not.toContain(newGlobalRule);
-      expect(queuedBody).not.toContain(newAncestorRule);
-      expect(queuedBody).not.toContain(newRootRule);
-      expect(queuedBody).not.toContain(newNestedRule);
-      expect(queuedBody).not.toContain(newSiblingRule);
+      expect(steeringBody.indexOf(oldRootRule)).toBeLessThan(
+        steeringBody.indexOf(oldNestedRule),
+      );
+      expect(steeringBody).not.toContain(oldSiblingRule);
+      expect(steeringBody).not.toContain(newGlobalRule);
+      expect(steeringBody).not.toContain(newAncestorRule);
+      expect(steeringBody).not.toContain(newRootRule);
+      expect(steeringBody).not.toContain(newNestedRule);
+      expect(steeringBody).not.toContain(newSiblingRule);
 
       const finalScrollback = await session.captureFullScrollbackEscapes();
-      const beforeIndex = finalScrollback.indexOf(activeBefore.trim());
-      const afterIndex = finalScrollback.indexOf(activeAfter.trim());
-      const queuedPromptIndex = finalScrollback.indexOf(queuedPrompt);
-      const queuedDoneIndex = finalScrollback.indexOf(queuedDone);
-      const summaryOffset = finalScrollback
-        .slice(afterIndex)
-        .search(
-          / {2}(?:\d+s|\d+m \d+s|\d+h \d{2}m) \(↑\d+(?:\.\d)?k? ↓\d+(?:\.\d)?k?\)/,
-        );
-      const firstSummaryAfterActiveIndex =
-        summaryOffset < 0 ? -1 : afterIndex + summaryOffset;
-      expect(beforeIndex).toBeGreaterThanOrEqual(0);
-      expect(afterIndex).toBeGreaterThan(beforeIndex);
-      expect(firstSummaryAfterActiveIndex).toBeGreaterThan(afterIndex);
-      expect(firstSummaryAfterActiveIndex).toBeLessThan(queuedPromptIndex);
-      expect(queuedPromptIndex).toBeGreaterThan(afterIndex);
-      expect(queuedDoneIndex).toBeGreaterThan(queuedPromptIndex);
-      expect(countOccurrences(finalScrollback, queuedPrompt)).toBe(1);
+      const steeringPromptIndex = finalScrollback.indexOf(steeringPrompt);
+      const steeringDoneIndex = finalScrollback.indexOf(steeringDone);
+      expect(finalScrollback).not.toContain(activeBefore.trim());
+      expect(finalScrollback).not.toContain(activeAfter.trim());
+      expect(steeringPromptIndex).toBeGreaterThanOrEqual(0);
+      expect(steeringDoneIndex).toBeGreaterThan(steeringPromptIndex);
+      expect(countOccurrences(finalScrollback, steeringPrompt)).toBe(1);
+      expect(finalScrollback).not.toContain(queuedSummaryText(1));
       expect(readFileSync(stderrPath, "utf8")).toBe("");
       expect(existsSync(tapePath)).toBe(true);
       expect(session.isAlive()).toBe(true);
@@ -3374,1538 +3845,6 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       expect(heldGateway.requests).toHaveLength(3);
       expect(session.paneStatus()).toEqual({ dead: false, status: null });
       expect(readFileSync(stderrPath, "utf8")).toBe("");
-    },
-    TIMEOUT * 2,
-  );
-
-  test(
-    "Up pauses queued admission and commits every edited prompt in FIFO order",
-    async () => {
-      root = realpathSync(mkdtempSync(join(tmpdir(), "fx-tui-queued-review-")));
-      const home = join(root, "home");
-      const workspacePath = join(root, "workspace");
-      const tracePath = join(root, "trace.log");
-      const stderrPath = join(root, "stderr.log");
-      mkdirSync(join(home, ".fx"), { recursive: true });
-      mkdirSync(workspacePath, { recursive: true });
-      writeFileSync(join(home, ".fx", "settings.json"), "{}");
-      const workspace = realpathSync(workspacePath);
-      const hold: SplitHoldState = { started: false, cancelled: false };
-      const activeAfter = "ACTIVE_FINISHED_WHILE_QUEUE_PAUSED";
-      const firstQueued = "Continue with QUEUE_REVIEW_FIRST_SENTINEL.";
-      const firstEdited = " QUEUE_REVIEW_EDITED_SENTINEL";
-      const secondQueued = "Continue with QUEUE_REVIEW_SECOND_SENTINEL.";
-      const secondEdited = " QUEUE_REVIEW_SECOND_EDITED_SENTINEL";
-      const firstDone = "QUEUE_REVIEW_FIRST_DONE";
-      const secondDone = "QUEUE_REVIEW_SECOND_DONE";
-      const queuedGateway = startFakeGateway([
-        () => splitHeldTextResponse(hold, "ACTIVE_QUEUE_REVIEW_STARTED\n", activeAfter),
-        fakeGatewayFinalText(firstDone),
-        fakeGatewayFinalText(secondDone),
-      ]);
-      gateway = queuedGateway;
-
-      session = await TmuxSession.create({
-        cwd: workspace,
-        stderrPath,
-        width: 120,
-        height: 40,
-        env: {
-          HOME: home,
-          AI_GATEWAY_API_KEY: "fake-queued-review-key",
-          VERCEL_OIDC_TOKEN: undefined,
-          FX_AUTO_UPGRADE: "0",
-          FX_GATEWAY_BASE_URL: queuedGateway.baseUrl,
-          FX_GATEWAY_CHAT_URL: queuedGateway.chatUrl,
-          FX_E2E_GATEWAY_CHAT_URL: queuedGateway.chatUrl,
-          FX_MODEL: MODEL,
-          FX_TRACE_LOG: tracePath,
-          FX_TRACE_SCOPES: "agent,gateway,stream,worker,input,prompt,interrupt",
-        },
-      });
-
-      await session.waitForComposer(TIMEOUT);
-      await session.sendText("Hold the active queue review turn open.");
-      await waitForCondition(
-        () => queuedGateway.requests.length === 1 && hold.started,
-        "held active request for manual queue review",
-      );
-      await session.sendText(firstQueued);
-      await session.sendText(secondQueued);
-      await session.waitForPane(
-        (pane) =>
-          pane.includes(queuedSummaryText(2)) &&
-          !pane.includes(firstQueued) &&
-          !pane.includes(secondQueued),
-        TIMEOUT,
-      );
-
-      await session.sendKeys("Up");
-      await session.waitForPane(
-        (pane) =>
-          pane.includes(secondQueued) &&
-          pane.includes("paused") &&
-          pane.includes("enter to send"),
-        TIMEOUT,
-      );
-      const queuedCardLine = (await session.capturePaneEscapes())
-        .split("\n")
-        .find((line) => line.includes(firstQueued));
-      expect(queuedCardLine).toBeDefined();
-      expect(queuedCardLine).toContain("┃");
-      expect(queuedCardLine).not.toContain("\x1b[48;");
-      await session.sendLiteral(secondEdited);
-      await session.waitForPane(
-        (pane) => pane.includes(secondQueued + secondEdited),
-        TIMEOUT,
-      );
-      await session.sendKeys("Up");
-      await session.waitForPane(
-        (pane) =>
-          pane.includes(firstQueued) &&
-          pane.includes("paused") &&
-          pane.includes("enter to send"),
-        TIMEOUT,
-      );
-
-      hold.release?.();
-      await session.waitForText(activeAfter, TIMEOUT);
-      await waitForCondition(
-        () =>
-          existsSync(tracePath) &&
-          readFileSync(tracePath, "utf8").includes("event=stream_complete"),
-        "active stream completion while queue review is paused",
-      );
-      await Bun.sleep(250);
-      expect(queuedGateway.requests).toHaveLength(1);
-      expect(hold.cancelled).toBe(false);
-
-      await session.pasteText(firstEdited);
-      await session.sendKeys("Enter");
-      await session.waitForText(secondDone, TIMEOUT);
-      await waitForCondition(
-        () => queuedGateway.requests.length === 3,
-        "edited and remaining queued prompts in FIFO order",
-      );
-
-      const firstQueuedBody = queuedGateway.requests[1].body;
-      const secondQueuedBody = queuedGateway.requests[2].body;
-      const trace = readFileSync(tracePath, "utf8");
-      expect(firstQueuedBody).toContain(firstQueued);
-      expect(firstQueuedBody).toContain(firstEdited.trim());
-      expect(firstQueuedBody).not.toContain(secondQueued);
-      expect(secondQueuedBody).toContain(secondQueued);
-      expect(secondQueuedBody).toContain(secondEdited.trim());
-      expect(trace).toContain("event=queue_review_started");
-      expect(trace).toContain("reason=manual");
-      expect(trace).toContain("event=queue_review_committed");
-      expect(trace).toContain("event=queue_review_batch_committed");
-      expect(trace).toContain("event=queue_review_resumed");
-      expect(readFileSync(stderrPath, "utf8")).toBe("");
-      expect(session.isAlive()).toBe(true);
-      expect(session.isPaneAlive()).toBe(true);
-    },
-    TIMEOUT * 2,
-  );
-
-  test(
-    "Escape hides a focused queue editor without cancelling the active stream",
-    async () => {
-      root = realpathSync(mkdtempSync(join(tmpdir(), "fx-tui-queued-review-escape-")));
-      const home = join(root, "home");
-      const workspacePath = join(root, "workspace");
-      const tracePath = join(root, "trace.log");
-      const stderrPath = join(root, "stderr.log");
-      mkdirSync(join(home, ".fx"), { recursive: true });
-      mkdirSync(workspacePath, { recursive: true });
-      writeFileSync(join(home, ".fx", "settings.json"), "{}");
-      const workspace = realpathSync(workspacePath);
-      const hold: SplitHoldState = { started: false, cancelled: false };
-      const queuedPrompt = "Keep QUEUE_ESCAPE_FOCUS_SENTINEL pending.";
-      const editorSuffix = " QUEUE_ESCAPE_EDITOR_SUFFIX";
-      const composerText = "NEW_COMPOSER_OWNER";
-      const queuedGateway = startFakeGateway([
-        () =>
-          splitHeldTextResponse(
-            hold,
-            "ACTIVE_QUEUE_ESCAPE_STARTED\n",
-            "ACTIVE_QUEUE_ESCAPE_FINISHED",
-          ),
-      ]);
-      gateway = queuedGateway;
-
-      session = await TmuxSession.create({
-        cwd: workspace,
-        stderrPath,
-        width: 120,
-        height: 40,
-        env: {
-          HOME: home,
-          AI_GATEWAY_API_KEY: "fake-queued-review-escape-key",
-          VERCEL_OIDC_TOKEN: undefined,
-          FX_AUTO_UPGRADE: "0",
-          FX_GATEWAY_BASE_URL: queuedGateway.baseUrl,
-          FX_GATEWAY_CHAT_URL: queuedGateway.chatUrl,
-          FX_E2E_GATEWAY_CHAT_URL: queuedGateway.chatUrl,
-          FX_MODEL: MODEL,
-          FX_TRACE_LOG: tracePath,
-          FX_TRACE_SCOPES: "agent,gateway,stream,worker,input,prompt,interrupt",
-        },
-      });
-
-      await session.waitForComposer(TIMEOUT);
-      await session.sendText("Hold the queue Escape ownership turn open.");
-      await waitForCondition(
-        () => queuedGateway.requests.length === 1 && hold.started,
-        "held active request for queue Escape ownership",
-      );
-      await session.sendText(queuedPrompt);
-      await session.sendKeys("Up");
-      await session.waitForPane(
-        (pane) =>
-          pane.includes(queuedPrompt) &&
-          pane.includes("paused") &&
-          pane.includes("enter to send"),
-        TIMEOUT,
-      );
-      await session.sendLiteralText(editorSuffix);
-      await session.waitForText(queuedPrompt + editorSuffix, TIMEOUT);
-
-      await session.sendKeys("Escape");
-      await waitForCondition(
-        () =>
-          existsSync(tracePath) &&
-          readFileSync(tracePath, "utf8").includes("event=queue_review_hidden"),
-        "hidden queue review before stream cancellation",
-      );
-      await session.waitForPane(
-        (pane) => pane.includes("Generating"),
-        TIMEOUT,
-      );
-      expect(hold.cancelled).toBe(false);
-
-      await session.sendLiteralText(composerText);
-      await session.waitForPane(
-        (pane) =>
-          pane.includes(composerText) &&
-          !pane.includes(queuedPrompt + editorSuffix + composerText),
-        TIMEOUT,
-      );
-
-      const trace = readFileSync(tracePath, "utf8");
-      expect(trace).toContain("event=queue_review_hidden");
-      expect(trace).not.toContain("event=cancel_requested");
-      expect(queuedGateway.requests).toHaveLength(1);
-      expect(readFileSync(stderrPath, "utf8")).toBe("");
-      expect(session.isAlive()).toBe(true);
-      expect(session.isPaneAlive()).toBe(true);
-    },
-    TIMEOUT * 2,
-  );
-
-  test(
-    "queued review preserves pasted backing and follows a long draft cursor",
-    async () => {
-      root = realpathSync(mkdtempSync(join(tmpdir(), "fx-tui-queued-semantic-drafts-")));
-      const home = join(root, "home");
-      const workspacePath = join(root, "workspace");
-      const tracePath = join(root, "trace.log");
-      const stderrPath = join(root, "stderr.log");
-      mkdirSync(join(home, ".fx"), { recursive: true });
-      mkdirSync(workspacePath, { recursive: true });
-      writeFileSync(join(home, ".fx", "settings.json"), "{}");
-      const workspace = realpathSync(workspacePath);
-      const hold: SplitHoldState = { started: false, cancelled: false };
-      const pastedPrompt =
-        `QUEUE_PASTE_START_${"q".repeat(5000)}_QUEUE_PASTE_END`;
-      const pastedEdit = "Z";
-      const longPrompt =
-        `QUEUE_CURSOR_HEAD_${"e".repeat(1800)}_QUEUE_CURSOR_TAIL`;
-      const longEdit = "_EDITED_AT_TAIL";
-      const pastedDone = "QUEUE_PASTE_DONE";
-      const longDone = "QUEUE_CURSOR_DONE";
-      const queuedGateway = startFakeGateway([
-        () =>
-          splitHeldTextResponse(
-            hold,
-            "ACTIVE_SEMANTIC_QUEUE_STARTED\n",
-            "ACTIVE_SEMANTIC_QUEUE_FINISHED",
-          ),
-        fakeGatewayFinalText(pastedDone),
-        fakeGatewayFinalText(longDone),
-      ]);
-      gateway = queuedGateway;
-
-      session = await TmuxSession.create({
-        cwd: workspace,
-        stderrPath,
-        width: 80,
-        height: 24,
-        env: {
-          HOME: home,
-          AI_GATEWAY_API_KEY: "fake-queued-semantic-draft-key",
-          VERCEL_OIDC_TOKEN: undefined,
-          FX_AUTO_UPGRADE: "0",
-          FX_GATEWAY_BASE_URL: queuedGateway.baseUrl,
-          FX_GATEWAY_CHAT_URL: queuedGateway.chatUrl,
-          FX_E2E_GATEWAY_CHAT_URL: queuedGateway.chatUrl,
-          FX_MODEL: MODEL,
-          FX_TRACE_LOG: tracePath,
-          FX_TRACE_SCOPES: "agent,gateway,stream,worker,input,prompt,interrupt",
-        },
-      });
-
-      await session.waitForComposer(TIMEOUT);
-      await session.sendText("Hold the semantic queue review turn open.");
-      await waitForCondition(
-        () => queuedGateway.requests.length === 1 && hold.started,
-        "held active request for semantic queue review",
-      );
-
-      await session.pasteText(pastedPrompt);
-      await session.waitForPane(
-        (pane) => pane.includes("[Pasted text #"),
-        TIMEOUT,
-      );
-      await session.sendKeys("Enter");
-      await session.sendLiteralText(longPrompt);
-      await session.sendKeys("Enter");
-      await session.waitForPane(
-        (pane) => pane.includes(queuedSummaryText(2)),
-        TIMEOUT,
-      );
-
-      await session.sendKeys("Up");
-      await session.waitForPane(
-        (pane) =>
-          pane.includes("QUEUE_CURSOR_TAIL") &&
-          pane.includes("paused") &&
-          pane.includes("enter to send"),
-        TIMEOUT,
-      );
-      let { cursor, grid } = await waitForCursorRow(
-        session,
-        "QUEUE_CURSOR_TAIL",
-        "long queued draft cursor row",
-      );
-      expect(grid[cursor.row]).toContain("QUEUE_CURSOR_TAIL");
-      await session.sendLiteral(longEdit);
-      await session.waitForPane((pane) => pane.includes(longEdit), TIMEOUT);
-
-      await session.sendKeys("Up");
-      await session.waitForPane(
-        (pane) => pane.includes("[Pasted text #") && pane.includes("paused"),
-        TIMEOUT,
-      );
-      ({ cursor, grid } = await waitForCursorRow(
-        session,
-        "[Pasted text #",
-        "pasted queued draft cursor row",
-      ));
-      expect(grid[cursor.row]).toContain("[Pasted text #");
-      await session.sendLiteral(pastedEdit);
-      await session.waitForPane((pane) => pane.includes("]Z"), TIMEOUT);
-
-      await session.sendKeys("Enter");
-      hold.release?.();
-      await session.waitForText(longDone, TIMEOUT);
-      await waitForCondition(
-        () => queuedGateway.requests.length === 3,
-        "semantic queued prompts after active turn",
-      );
-
-      expect(queuedGateway.requests[1].body).toContain(
-        pastedPrompt + pastedEdit,
-      );
-      expect(queuedGateway.requests[2].body).toContain(longPrompt + longEdit);
-      expect(readFileSync(tracePath, "utf8")).toContain(
-        "event=queue_review_batch_committed",
-      );
-      expect(readFileSync(stderrPath, "utf8")).toBe("");
-      expect(session.isAlive()).toBe(true);
-      expect(session.isPaneAlive()).toBe(true);
-    },
-    TIMEOUT * 3,
-  );
-
-  test(
-    "queued review shows file completions and preserves the accepted path",
-    async () => {
-      root = realpathSync(mkdtempSync(join(tmpdir(), "fx-tui-queued-file-picker-")));
-      const home = join(root, "home");
-      const workspacePath = join(root, "workspace");
-      const tracePath = join(root, "trace.log");
-      const stderrPath = join(root, "stderr.log");
-      mkdirSync(join(home, ".fx"), { recursive: true });
-      mkdirSync(join(workspacePath, "src"), { recursive: true });
-      writeFileSync(join(home, ".fx", "settings.json"), "{}");
-      writeFileSync(
-        join(workspacePath, "src", "main.zig"),
-        "pub fn main() void {}\n",
-      );
-      const workspace = realpathSync(workspacePath);
-      const hold: SplitHoldState = { started: false, cancelled: false };
-      const olderPrompt = "OLDER_QUEUE_DRAFT";
-      const completedPrompt = "Review @src/main.zig";
-      const queuedDone = "QUEUE_FILE_PICKER_DONE";
-      const queuedGateway = startFakeGateway([
-        () =>
-          splitHeldTextResponse(
-            hold,
-            "ACTIVE_FILE_PICKER_QUEUE_STARTED\n",
-            "ACTIVE_FILE_PICKER_QUEUE_FINISHED",
-          ),
-        fakeGatewayFinalText(olderPrompt),
-        fakeGatewayFinalText(queuedDone),
-      ]);
-      gateway = queuedGateway;
-
-      session = await TmuxSession.create({
-        cwd: workspace,
-        stderrPath,
-        width: 80,
-        height: 24,
-        env: {
-          HOME: home,
-          AI_GATEWAY_API_KEY: "fake-queued-file-picker-key",
-          VERCEL_OIDC_TOKEN: undefined,
-          FX_AUTO_UPGRADE: "0",
-          FX_GATEWAY_BASE_URL: queuedGateway.baseUrl,
-          FX_GATEWAY_CHAT_URL: queuedGateway.chatUrl,
-          FX_E2E_GATEWAY_CHAT_URL: queuedGateway.chatUrl,
-          FX_MODEL: MODEL,
-          FX_TRACE_LOG: tracePath,
-          FX_TRACE_SCOPES: "agent,gateway,stream,worker,input,prompt,interrupt",
-        },
-      });
-
-      await session.waitForComposer(TIMEOUT);
-      await session.sendText("Hold the queued file picker turn open.");
-      await waitForCondition(
-        () => queuedGateway.requests.length === 1 && hold.started,
-        "held active request for queued file picker",
-      );
-      await session.sendText(olderPrompt);
-      await session.sendText(completedPrompt);
-      await session.waitForPane(
-        (pane) => pane.includes(queuedSummaryText(2)),
-        TIMEOUT,
-      );
-
-      await session.sendKeys("Up");
-      await session.waitForText("paused", TIMEOUT);
-      await session.sendKeys("BSpace BSpace BSpace BSpace");
-      await session.waitForPane(
-        (pane) =>
-          pane.includes("Review @src/main") &&
-          pane.includes("src/main.zig"),
-        TIMEOUT,
-      );
-      await session.sendKeys("Up");
-      await session.waitForText(olderPrompt, TIMEOUT);
-      await session.sendKeys("Down");
-      await session.waitForPane(
-        (pane) =>
-          pane.includes("Review @src/main") &&
-          pane.includes("src/main.zig"),
-        TIMEOUT,
-      );
-
-      await session.sendKeys("Enter");
-      await session.waitForText(completedPrompt, TIMEOUT);
-      await session.sendKeys("Up");
-      await session.waitForText(olderPrompt, TIMEOUT);
-      await session.sendKeys("Down");
-      await session.waitForText(completedPrompt, TIMEOUT);
-      await session.sendKeys("Enter");
-
-      hold.release?.();
-      await session.waitForText(queuedDone, TIMEOUT);
-      await waitForCondition(
-        () => queuedGateway.requests.length === 3,
-        "queued prompts after file picker review",
-      );
-
-      expect(queuedGateway.requests[2].body).toContain(completedPrompt);
-      expect(readFileSync(tracePath, "utf8")).toContain(
-        "file picker Enter consumed selected=true",
-      );
-      expect(readFileSync(stderrPath, "utf8")).toBe("");
-      expect(session.isAlive()).toBe(true);
-      expect(session.isPaneAlive()).toBe(true);
-    },
-    TIMEOUT * 3,
-  );
-
-  test(
-    "streaming model selection applies to the next turn without changing the active request",
-    async () => {
-      root = realpathSync(mkdtempSync(join(tmpdir(), "fx-tui-next-turn-model-")));
-      const home = join(root, "home");
-      const workspacePath = join(root, "workspace");
-      const stderrPath = join(root, "stderr.log");
-      mkdirSync(join(home, ".fx"), { recursive: true });
-      mkdirSync(workspacePath, { recursive: true });
-      writeFileSync(
-        join(home, ".fx", "settings.json"),
-        JSON.stringify({
-          model: GLM_MODEL,
-          effort: "auto",
-          fast_mode: false,
-        }),
-      );
-      const workspace = realpathSync(workspacePath);
-      const hold: SplitHoldState = { started: false, cancelled: false };
-      const nextModel = "openai/gpt-5";
-      const nextTurnDone = "NEXT_TURN_MODEL_SELECTION_DONE";
-      const queuedGateway = startFakeGateway(
-        [
-          () =>
-            splitHeldTextResponse(
-              hold,
-              "ACTIVE_ORIGINAL_MODEL_STARTED\n",
-              "ACTIVE_ORIGINAL_MODEL_FINISHED",
-            ),
-          fakeGatewayFinalText(nextTurnDone),
-        ],
-        {
-          models: [
-            { id: GLM_MODEL, type: "language", tags: ["tool-use"] },
-            {
-              id: nextModel,
-              type: "language",
-              tags: ["reasoning", "tool-use"],
-              reasoning_options: [{ type: "effort", values: ["low", "high"] }],
-            },
-          ],
-        },
-      );
-      gateway = queuedGateway;
-
-      session = await TmuxSession.create({
-        cwd: workspace,
-        stderrPath,
-        width: 80,
-        height: 24,
-        env: {
-          HOME: home,
-          AI_GATEWAY_API_KEY: "fake-next-turn-model-key",
-          VERCEL_OIDC_TOKEN: undefined,
-          FX_AUTO_UPGRADE: "0",
-          FX_GATEWAY_BASE_URL: queuedGateway.baseUrl,
-          FX_GATEWAY_CHAT_URL: queuedGateway.chatUrl,
-          FX_E2E_GATEWAY_CHAT_URL: queuedGateway.chatUrl,
-          FX_E2E_GATEWAY_MODELS_URL: `${queuedGateway.baseUrl}/coding-agent/v1/models`,
-        },
-      });
-
-      await session.waitForComposer(TIMEOUT);
-      await session.sendText("Hold the original model turn open.");
-      await waitForCondition(
-        () => queuedGateway.requests.length === 1 && hold.started,
-        "held original-model request",
-      );
-      await waitForCondition(
-        () => queuedGateway.modelRequests.length > 0,
-        "next-turn model catalog warmup",
-      );
-
-      await session.sendLiteralText(`/model ${nextModel}`);
-      await session.sendKeys("Space");
-      await session.sendLiteralText("auto");
-      await session.waitForPane(
-        (pane) => composerContains(pane, `/model ${nextModel} auto`),
-        TIMEOUT,
-      );
-      await session.sendKeys("Enter");
-      await session.waitForText(`Next turn will use ${nextModel}`, TIMEOUT);
-
-      expect(queuedGateway.requests).toHaveLength(1);
-      expect(
-        queuedGateway.requests[0]!.headers.get("ai-language-model-id"),
-      ).toBe(GLM_MODEL);
-      expect(hold.cancelled).toBe(false);
-      expect(hasEmptyComposer(await session.capturePane())).toBe(true);
-
-      hold.release?.();
-      await session.waitForText("ACTIVE_ORIGINAL_MODEL_FINISHED", TIMEOUT);
-      await session.sendText("Use the selected model now.");
-      await session.waitForText(nextTurnDone, TIMEOUT);
-      await waitForCondition(
-        () => queuedGateway.requests.length === 2,
-        "next-turn selected-model request",
-      );
-
-      expect(
-        queuedGateway.requests[1]!.headers.get("ai-language-model-id"),
-      ).toBe(nextModel);
-      expect(JSON.parse(readFileSync(join(home, ".fx", "settings.json"), "utf8")))
-        .toMatchObject({ models: { gateway: nextModel }, effort: "auto" });
-      expect(readFileSync(stderrPath, "utf8")).toBe("");
-      expect(session.isAlive()).toBe(true);
-      expect(session.isPaneAlive()).toBe(true);
-    },
-    TIMEOUT * 3,
-  );
-
-  test(
-    "queued review keeps the disabled model picker hidden",
-    async () => {
-      root = realpathSync(mkdtempSync(join(tmpdir(), "fx-tui-queued-model-picker-")));
-      const home = join(root, "home");
-      const workspacePath = join(root, "workspace");
-      const stderrPath = join(root, "stderr.log");
-      mkdirSync(join(home, ".fx"), { recursive: true });
-      mkdirSync(workspacePath, { recursive: true });
-      writeFileSync(join(home, ".fx", "settings.json"), "{}");
-      const workspace = realpathSync(workspacePath);
-      const hold: SplitHoldState = { started: false, cancelled: false };
-      const hiddenModel = "provider/queued-hidden-model";
-      const queuedGateway = startFakeGateway(
-        [
-          () =>
-            splitHeldTextResponse(
-              hold,
-              "ACTIVE_MODEL_PICKER_QUEUE_STARTED\n",
-              "ACTIVE_MODEL_PICKER_QUEUE_FINISHED",
-            ),
-        ],
-        {
-          models: [
-            { id: MODEL, type: "language", tags: ["tool-use"] },
-            { id: hiddenModel, type: "language", tags: ["tool-use"] },
-          ],
-        },
-      );
-      gateway = queuedGateway;
-
-      session = await TmuxSession.create({
-        cwd: workspace,
-        stderrPath,
-        width: 80,
-        height: 24,
-        env: {
-          HOME: home,
-          AI_GATEWAY_API_KEY: "fake-queued-model-picker-key",
-          VERCEL_OIDC_TOKEN: undefined,
-          FX_AUTO_UPGRADE: "0",
-          FX_GATEWAY_BASE_URL: queuedGateway.baseUrl,
-          FX_GATEWAY_CHAT_URL: queuedGateway.chatUrl,
-          FX_E2E_GATEWAY_CHAT_URL: queuedGateway.chatUrl,
-          FX_E2E_GATEWAY_MODELS_URL: `${queuedGateway.baseUrl}/coding-agent/v1/models`,
-          FX_MODEL: MODEL,
-        },
-      });
-
-      await session.waitForComposer(TIMEOUT);
-      await session.sendText("Hold the queued model picker turn open.");
-      await waitForCondition(
-        () => queuedGateway.requests.length === 1 && hold.started,
-        "held active request for queued model picker",
-      );
-      await waitForCondition(
-        () => queuedGateway.modelRequests.length > 0,
-        "queued model picker catalog warmup",
-      );
-      await session.sendText("QUEUED_MODEL_PICKER_DRAFT");
-      await session.waitForPane(
-        (pane) => pane.includes(queuedSummaryText(1)),
-        TIMEOUT,
-      );
-
-      await session.sendKeys("Up");
-      await session.waitForText("paused", TIMEOUT);
-      await session.sendKeys("C-u");
-      await session.sendLiteralText("/model provider/queued-hidden");
-      await session.waitForPane(
-        (pane) => pane.includes("/model provider/queued-hidden"),
-        TIMEOUT,
-      );
-      await Bun.sleep(200);
-
-      let pane = await session.capturePane();
-      expect(pane).not.toContain(hiddenModel);
-      await session.sendKeys("Tab");
-      pane = await session.capturePane();
-      expect(pane).toContain("/model provider/queued-hidden");
-      expect(pane).not.toContain(hiddenModel);
-      await session.sendKeys("Enter");
-      pane = await session.capturePane();
-      expect(pane).toContain("/model provider/queued-hidden");
-      expect(pane).not.toContain(hiddenModel);
-      expect(queuedGateway.requests).toHaveLength(1);
-      expect(readFileSync(stderrPath, "utf8")).toBe("");
-      expect(session.isAlive()).toBe(true);
-      expect(session.isPaneAlive()).toBe(true);
-    },
-    TIMEOUT * 2,
-  );
-
-  test(
-    "empty Enter resumes a hidden paused queue without editing it",
-    async () => {
-      root = realpathSync(mkdtempSync(join(tmpdir(), "fx-tui-queued-empty-enter-")));
-      const home = join(root, "home");
-      const workspacePath = join(root, "workspace");
-      const tracePath = join(root, "trace.log");
-      const stderrPath = join(root, "stderr.log");
-      mkdirSync(join(home, ".fx"), { recursive: true });
-      mkdirSync(workspacePath, { recursive: true });
-      writeFileSync(join(home, ".fx", "settings.json"), "{}");
-      const workspace = realpathSync(workspacePath);
-      const hold: SplitHoldState = { started: false, cancelled: false };
-      const queuedPrompt = "Continue with EMPTY_ENTER_QUEUE_SENTINEL.";
-      const queuedDone = "EMPTY_ENTER_QUEUE_DONE";
-      const queuedGateway = startFakeGateway([
-        () =>
-          splitHeldTextResponse(
-            hold,
-            "ACTIVE_EMPTY_ENTER_STARTED\n",
-            "ACTIVE_EMPTY_ENTER_FINISHED",
-          ),
-        fakeGatewayFinalText(queuedDone),
-      ]);
-      gateway = queuedGateway;
-
-      session = await TmuxSession.create({
-        cwd: workspace,
-        stderrPath,
-        width: 120,
-        height: 40,
-        env: {
-          HOME: home,
-          AI_GATEWAY_API_KEY: "fake-queued-empty-enter-key",
-          VERCEL_OIDC_TOKEN: undefined,
-          FX_AUTO_UPGRADE: "0",
-          FX_GATEWAY_BASE_URL: queuedGateway.baseUrl,
-          FX_GATEWAY_CHAT_URL: queuedGateway.chatUrl,
-          FX_E2E_GATEWAY_CHAT_URL: queuedGateway.chatUrl,
-          FX_MODEL: MODEL,
-          FX_TRACE_LOG: tracePath,
-          FX_TRACE_SCOPES: "agent,gateway,stream,worker,input,prompt,interrupt",
-        },
-      });
-
-      await session.waitForComposer(TIMEOUT);
-      await session.sendText("Hold the empty Enter queue turn open.");
-      await waitForCondition(
-        () => queuedGateway.requests.length === 1 && hold.started,
-        "held active request for empty Enter queue review",
-      );
-      await session.sendText(queuedPrompt);
-      await session.waitForPane(
-        (pane) =>
-          pane.includes(queuedSummaryText(1)) &&
-          !pane.includes(queuedPrompt),
-        TIMEOUT,
-      );
-      await session.sendKeys("Up");
-      await session.waitForPane(
-        (pane) =>
-          pane.includes(queuedPrompt) &&
-          pane.includes("paused") &&
-          pane.includes("enter to send"),
-        TIMEOUT,
-      );
-      await session.sendKeys("Down");
-      await waitForCondition(
-        () =>
-          existsSync(tracePath) &&
-          readFileSync(tracePath, "utf8").includes("event=queue_review_hidden"),
-        "hidden queue review after Down before empty Enter",
-      );
-
-      await session.sendKeys("Enter");
-      await waitForCondition(
-        () =>
-          readFileSync(tracePath, "utf8").includes(
-            "event=queue_review_finished source=unchanged_queue",
-          ),
-        "unchanged queue submission from empty composer",
-      );
-      expect(queuedGateway.requests).toHaveLength(1);
-
-      hold.release?.();
-      await session.waitForText(queuedDone, TIMEOUT);
-      await waitForCondition(
-        () => queuedGateway.requests.length === 2,
-        "unchanged queued prompt after active turn",
-      );
-
-      const trace = readFileSync(tracePath, "utf8");
-      expect(queuedGateway.requests[1].body).toContain(queuedPrompt);
-      expect(trace).toContain("event=queue_review_resumed");
-      expect(readFileSync(stderrPath, "utf8")).toBe("");
-      expect(session.isAlive()).toBe(true);
-      expect(session.isPaneAlive()).toBe(true);
-    },
-    TIMEOUT * 2,
-  );
-
-  test(
-    "Up edits a queued card in place and repeated Ctrl+U deletes only the empty draft",
-    async () => {
-      root = realpathSync(mkdtempSync(join(tmpdir(), "fx-tui-queued-inline-delete-")));
-      const home = join(root, "home");
-      const workspacePath = join(root, "workspace");
-      const tracePath = join(root, "trace.log");
-      const stderrPath = join(root, "stderr.log");
-      mkdirSync(join(home, ".fx"), { recursive: true });
-      mkdirSync(workspacePath, { recursive: true });
-      writeFileSync(join(home, ".fx", "settings.json"), "{}");
-      const workspace = realpathSync(workspacePath);
-      const hold: SplitHoldState = { started: false, cancelled: false };
-      const firstQueued = "Keep QUEUE_INLINE_FIRST_SENTINEL.";
-      const firstQueuedEdit = " this";
-      const secondQueued = "Delete QUEUE_INLINE_SECOND_SENTINEL.";
-      const firstDone = "QUEUE_INLINE_FIRST_DONE";
-      const queuedGateway = startFakeGateway([
-        () =>
-          splitHeldTextResponse(
-            hold,
-            "ACTIVE_QUEUE_INLINE_STARTED\n",
-            "ACTIVE_QUEUE_INLINE_FINISHED",
-          ),
-        fakeGatewayFinalText(firstDone),
-      ]);
-      gateway = queuedGateway;
-
-      session = await TmuxSession.create({
-        cwd: workspace,
-        stderrPath,
-        width: 120,
-        height: 40,
-        env: {
-          HOME: home,
-          AI_GATEWAY_API_KEY: "fake-queued-inline-delete-key",
-          VERCEL_OIDC_TOKEN: undefined,
-          FX_AUTO_UPGRADE: "0",
-          FX_GATEWAY_BASE_URL: queuedGateway.baseUrl,
-          FX_GATEWAY_CHAT_URL: queuedGateway.chatUrl,
-          FX_E2E_GATEWAY_CHAT_URL: queuedGateway.chatUrl,
-          FX_MODEL: MODEL,
-          FX_TRACE_LOG: tracePath,
-          FX_TRACE_SCOPES: "agent,gateway,stream,worker,input,prompt,interrupt",
-        },
-      });
-
-      await session.waitForComposer(TIMEOUT);
-      await session.sendText("Hold the inline queue editor turn open.");
-      await waitForCondition(
-        () => queuedGateway.requests.length === 1 && hold.started,
-        "held active request for inline queue editing",
-      );
-      await session.sendText(firstQueued);
-      await session.sendText(secondQueued);
-      await session.waitForPane(
-        (pane) =>
-          pane.includes(queuedSummaryText(2)) &&
-          !pane.includes(firstQueued) &&
-          !pane.includes(secondQueued),
-        TIMEOUT,
-      );
-
-      await session.sendKeys("Up");
-      await session.waitForPane(
-        (pane) =>
-          pane.includes(secondQueued) &&
-          pane.includes("paused") &&
-          pane.includes("enter to send"),
-        TIMEOUT,
-      );
-      let { cursor, grid } = await waitForCursorRow(
-        session,
-        secondQueued,
-        "second queued draft cursor row",
-      );
-      expect(grid[cursor.row]).toContain(secondQueued);
-      const pausedRow = grid.findIndex((line) => line.includes("paused"));
-      const emptyComposerRow = grid.findIndex(
-        (line, index) => index > pausedRow && isEmptyComposerLine(line),
-      );
-      expect(pausedRow).toBeGreaterThanOrEqual(0);
-      expect(emptyComposerRow).toBeGreaterThan(pausedRow);
-      expect(cursor.row).not.toBe(emptyComposerRow);
-
-      await session.sendKeys("Up");
-      await session.waitForPane((pane) => pane.includes(firstQueued), TIMEOUT);
-      await session.sendKeys("Left");
-      await session.sendKeys("Right");
-      await session.sendLiteral(firstQueuedEdit);
-      await session.waitForPane(
-        (pane) => pane.includes(firstQueued + firstQueuedEdit),
-        TIMEOUT,
-      );
-      await session.sendKeys("Down");
-      await waitForCondition(
-        () =>
-          existsSync(tracePath) &&
-          readFileSync(tracePath, "utf8").includes(
-            "event=queue_review_navigate direction=newer index=1",
-          ),
-        "edited draft followed by newer queue navigation",
-      );
-      ({ cursor, grid } = await waitForCursorRow(
-        session,
-        secondQueued,
-        "newer queued draft cursor row",
-      ));
-      expect(grid[cursor.row]).toContain(secondQueued);
-      await session.waitForPane(
-        (pane) => pane.includes(firstQueued + firstQueuedEdit),
-        TIMEOUT,
-      );
-
-      await session.sendKeys("C-u");
-      await session.waitForPane(
-        (pane) =>
-          pane.includes(firstQueued) &&
-          !pane.includes(secondQueued) &&
-          pane.includes("delete again to remove queued prompt") &&
-          pane.includes("enter to send unchanged"),
-        TIMEOUT,
-      );
-      await session.sendKeys("C-u");
-      await waitForCondition(
-        () =>
-          existsSync(tracePath) &&
-          readFileSync(tracePath, "utf8").includes(
-            "event=queue_review_draft_deleted",
-          ),
-        "selected empty queued draft deletion",
-      );
-      await session.waitForPane(
-        (pane) =>
-          pane.includes(firstQueued) &&
-          !pane.includes(secondQueued) &&
-          pane.includes("queued 1"),
-        TIMEOUT,
-      );
-      ({ cursor, grid } = await waitForCursorRow(
-        session,
-        firstQueued,
-        "remaining queued draft cursor row",
-      ));
-      expect(grid[cursor.row]).toContain(firstQueued);
-      expect(queuedGateway.requests).toHaveLength(1);
-
-      await session.sendKeys("Enter");
-      hold.release?.();
-      await session.waitForText(firstDone, TIMEOUT);
-      await waitForCondition(
-        () => queuedGateway.requests.length === 2,
-        "remaining queued prompt after inline deletion",
-      );
-
-      const trace = readFileSync(tracePath, "utf8");
-      expect(queuedGateway.requests[1].body).toContain(
-        firstQueued + firstQueuedEdit,
-      );
-      expect(queuedGateway.requests[1].body).not.toContain(secondQueued);
-      expect(trace).toContain("event=queue_review_deleted");
-      expect(trace).toContain("event=queue_review_draft_deleted");
-      expect(readFileSync(stderrPath, "utf8")).toBe("");
-      expect(session.isAlive()).toBe(true);
-      expect(session.isPaneAlive()).toBe(true);
-    },
-    TIMEOUT * 2,
-  );
-
-  test(
-    "queued image yank survives deleting its queue card",
-    async () => {
-      root = realpathSync(mkdtempSync(join(tmpdir(), "fx-tui-queued-image-yank-")));
-      const home = join(root, "home");
-      const workspacePath = join(root, "workspace");
-      const tracePath = join(root, "trace.log");
-      const stderrPath = join(root, "stderr.log");
-      const imagePath = join(workspacePath, "queued-image.png");
-      mkdirSync(join(home, ".fx"), { recursive: true });
-      mkdirSync(workspacePath, { recursive: true });
-      writeFileSync(join(home, ".fx", "settings.json"), "{}");
-      copyFileSync(
-        join(REPO_ROOT, "tests/e2e/fixtures/favicon.png"),
-        imagePath,
-      );
-      const workspace = realpathSync(workspacePath);
-      const image = realpathSync(imagePath);
-      const expectedImageData = readFileSync(image).toString("base64");
-      const hold: HoldState = { started: false, cancelled: false };
-      const queuedPrompt = "Describe FXC141_QUEUED_IMAGE_YANK.";
-      const done = "FXC141_QUEUED_IMAGE_YANK_DONE";
-      const queuedGateway = startFakeGateway(
-        [
-          () =>
-            heldGatewayResponse(hold, [
-              { type: "text-start", id: "answer_1" },
-              {
-                type: "text-delta",
-                id: "answer_1",
-                delta: "ACTIVE_QUEUED_IMAGE_YANK_STARTED\n",
-              },
-            ]),
-          fakeGatewayFinalText(done),
-        ],
-        {
-          models: [{
-            id: MODEL,
-            type: "language",
-            tags: ["vision", "file-input", "tool-use"],
-          }],
-        },
-      );
-      gateway = queuedGateway;
-
-      session = await TmuxSession.create({
-        cwd: workspace,
-        stderrPath,
-        width: 100,
-        height: 30,
-        env: {
-          HOME: home,
-          AI_GATEWAY_API_KEY: "fake-queued-image-yank-key",
-          VERCEL_OIDC_TOKEN: undefined,
-          FX_AUTO_UPGRADE: "0",
-          FX_GATEWAY_BASE_URL: queuedGateway.baseUrl,
-          FX_GATEWAY_CHAT_URL: queuedGateway.chatUrl,
-          FX_E2E_GATEWAY_CHAT_URL: queuedGateway.chatUrl,
-          FX_E2E_GATEWAY_MODELS_URL: `${queuedGateway.baseUrl}/coding-agent/v1/models`,
-          FX_MODEL: MODEL,
-          FX_TRACE_LOG: tracePath,
-          FX_TRACE_SCOPES: "agent,gateway,stream,worker,input,prompt,interrupt",
-        },
-      });
-
-      await session.waitForComposer(TIMEOUT);
-      await session.sendText("Hold the queued image yank turn open.");
-      await waitForCondition(
-        () => queuedGateway.requests.length === 1 && hold.started,
-        "held active request for queued image yank",
-      );
-      await session.sendText(`/image ${image}`);
-      await session.waitForText("attached image: queued-image.png", TIMEOUT);
-      await session.sendText(queuedPrompt);
-      await session.waitForPane(
-        (pane) =>
-          pane.includes(queuedSummaryText(1)) &&
-          !pane.includes(queuedPrompt),
-        TIMEOUT,
-      );
-      rmSync(image);
-
-      await session.sendKeys("C-c");
-      await waitForCondition(() => hold.cancelled, "queued image active request cancellation");
-      await session.waitForPane(
-        (pane) =>
-          pane.includes(queuedPrompt) &&
-          pane.includes("paused") &&
-          pane.includes("enter to send"),
-        TIMEOUT,
-      );
-
-      await session.sendKeys("End");
-      await session.sendKeys("C-u");
-      await session.waitForPane(
-        (pane) =>
-          !pane.includes(queuedPrompt) &&
-          pane.includes("delete again to remove queued prompt"),
-        TIMEOUT,
-      );
-      await session.sendKeys("C-k");
-      await waitForCondition(
-        () =>
-          existsSync(tracePath) &&
-          readFileSync(tracePath, "utf8").includes(
-            "event=queue_review_draft_deleted",
-          ),
-        "empty queued image card deletion",
-      );
-
-      await session.sendKeys("C-y");
-      await session.waitForPane(
-        (pane) =>
-          pane.includes("[Image 2]") &&
-          pane.includes("FXC141_QUEUED_IMAGE_YANK"),
-        TIMEOUT,
-      );
-      expect(readFileSync(stderrPath, "utf8")).toBe("");
-      expect(session.isAlive()).toBe(true);
-      expect(session.isPaneAlive()).toBe(true);
-
-      await session.sendKeys("Enter");
-      await session.waitForText(done, TIMEOUT);
-      await waitForCondition(
-        () => queuedGateway.requests.length === 2,
-        "yanked image Gateway request",
-      );
-
-      const yankedBody = queuedGateway.requests[1]!.body;
-      const trace = readFileSync(tracePath, "utf8");
-      expect(yankedBody.match(/"type":"file"/g) ?? []).toHaveLength(1);
-      expect(yankedBody).toContain(expectedImageData);
-      expect(yankedBody).toContain("[Image #2]" + queuedPrompt);
-      expect(yankedBody).not.toContain(image);
-      expect(trace).toContain("event=queue_review_started");
-      expect(trace).toContain("reason=post_cancel");
-      expect(trace).toContain("event=queue_review_deleted");
-      expect(trace).toContain("event=queue_review_draft_deleted");
-      expect(readFileSync(stderrPath, "utf8")).toBe("");
-      expect(session.isAlive()).toBe(true);
-      expect(session.isPaneAlive()).toBe(true);
-    },
-    TIMEOUT * 2,
-  );
-
-  test(
-    "Ctrl+C pauses two queued prompts until the visible draft is confirmed",
-    async () => {
-      root = realpathSync(mkdtempSync(join(tmpdir(), "fx-tui-queued-post-cancel-")));
-      const home = join(root, "home");
-      const workspacePath = join(root, "workspace");
-      const tracePath = join(root, "trace.log");
-      const stderrPath = join(root, "stderr.log");
-      mkdirSync(join(home, ".fx"), { recursive: true });
-      mkdirSync(workspacePath, { recursive: true });
-      writeFileSync(join(home, ".fx", "settings.json"), "{}");
-      const workspace = realpathSync(workspacePath);
-      const hold: HoldState = { started: false, cancelled: false };
-      const firstQueued = "Continue with FOLLOWUP_FIRST_SENTINEL.";
-      const firstEdited = " FOLLOWUP_EDITED_SENTINEL";
-      const secondQueued = "Continue with FOLLOWUP_SECOND_SENTINEL.";
-      const firstDone = "FOLLOWUP_FIRST_DONE";
-      const secondDone = "FOLLOWUP_SECOND_DONE";
-      const queuedGateway = startFakeGateway([
-        () =>
-          heldGatewayResponse(hold, [
-            { type: "text-start", id: "answer_1" },
-            {
-              type: "text-delta",
-              id: "answer_1",
-              delta: "ACTIVE_POST_CANCEL_REVIEW_STARTED\n",
-            },
-          ]),
-        fakeGatewayFinalText(firstDone),
-        fakeGatewayFinalText(secondDone),
-      ]);
-      gateway = queuedGateway;
-
-      session = await TmuxSession.create({
-        cwd: workspace,
-        stderrPath,
-        width: 120,
-        height: 40,
-        env: {
-          HOME: home,
-          AI_GATEWAY_API_KEY: "fake-queued-post-cancel-key",
-          VERCEL_OIDC_TOKEN: undefined,
-          FX_AUTO_UPGRADE: "0",
-          FX_GATEWAY_BASE_URL: queuedGateway.baseUrl,
-          FX_GATEWAY_CHAT_URL: queuedGateway.chatUrl,
-          FX_E2E_GATEWAY_CHAT_URL: queuedGateway.chatUrl,
-          FX_MODEL: MODEL,
-          FX_TRACE_LOG: tracePath,
-          FX_TRACE_SCOPES: "agent,gateway,stream,worker,input,prompt,interrupt",
-        },
-      });
-
-      await session.waitForComposer(TIMEOUT);
-      await session.sendText("Hold the active post-cancel turn open.");
-      await waitForCondition(
-        () => queuedGateway.requests.length === 1 && hold.started,
-        "held active request for post-cancel queue review",
-      );
-      await session.sendText(firstQueued);
-      await session.sendText(secondQueued);
-      await session.waitForPane(
-        (pane) =>
-          pane.includes(queuedSummaryText(2)) &&
-          !pane.includes(firstQueued) &&
-          !pane.includes(secondQueued),
-        TIMEOUT,
-      );
-      expect(queuedGateway.requests).toHaveLength(1);
-      await session.sendKeys("C-c");
-      await waitForCondition(() => hold.cancelled, "active request cancellation");
-      await session.waitForPane(
-        (pane) =>
-          pane.includes(secondQueued) &&
-          pane.includes("paused") &&
-          pane.includes("enter to send"),
-        TIMEOUT,
-      );
-      await Bun.sleep(250);
-      expect(queuedGateway.requests).toHaveLength(1);
-
-      await session.sendKeys("Escape");
-      await waitForCondition(
-        () =>
-          existsSync(tracePath) &&
-          readFileSync(tracePath, "utf8").includes("event=queue_review_hidden"),
-        "hidden post-cancel queue draft",
-      );
-      await Bun.sleep(250);
-      expect(queuedGateway.requests).toHaveLength(1);
-
-      await session.sendText("/status");
-      await Bun.sleep(250);
-      expect(queuedGateway.requests).toHaveLength(1);
-      expect(readFileSync(tracePath, "utf8")).not.toContain(
-        "event=queue_review_resumed",
-      );
-
-      await session.sendKeys("Up");
-      await session.waitForPane(
-        (pane) =>
-          pane.includes(secondQueued) &&
-          pane.includes("paused") &&
-          pane.includes("enter to send"),
-        TIMEOUT,
-      );
-      await session.sendKeys("Up");
-      await session.waitForPane(
-        (pane) =>
-          pane.includes(firstQueued) &&
-          pane.includes("paused") &&
-          pane.includes("enter to send"),
-        TIMEOUT,
-      );
-      await session.pasteText(firstEdited);
-      await session.sendKeys("Enter");
-      await session.waitForText(secondDone, TIMEOUT);
-      await waitForCondition(
-        () => queuedGateway.requests.length === 3,
-        "post-cancel edited and remaining queued prompts",
-      );
-
-      const firstQueuedBody = queuedGateway.requests[1].body;
-      const secondQueuedBody = queuedGateway.requests[2].body;
-      const trace = readFileSync(tracePath, "utf8");
-      expect(firstQueuedBody).toContain(firstQueued);
-      expect(firstQueuedBody).toContain(firstEdited.trim());
-      expect(firstQueuedBody).not.toContain(secondQueued);
-      expect(secondQueuedBody).toContain(secondQueued);
-      expect(trace).toContain("event=queue_review_started");
-      expect(trace).toContain("reason=post_cancel");
-      expect(trace).toContain("event=queue_review_hidden");
-      expect(trace).toContain("event=queue_review_committed");
-      expect(trace).toContain("event=queue_review_resumed");
-      expect(readFileSync(stderrPath, "utf8")).toBe("");
-      expect(session.isAlive()).toBe(true);
-      expect(session.isPaneAlive()).toBe(true);
-    },
-    TIMEOUT * 2,
-  );
-
-  for (const scenario of [
-    { name: "at stable geometry", slug: "stable", resize: null },
-    {
-      name: "after a settled resize",
-      slug: "resized",
-      resize: { width: 68, height: 18 },
-    },
-  ]) {
-    test(
-      `queue resume preserves streamed scrollback ${scenario.name}`,
-      async () => {
-        const artifactBase = createArtifactRoot();
-        const artifacts = join(artifactBase, scenario.slug);
-        const home = join(artifacts, "home");
-        const workspace = join(artifacts, "workspace");
-        const tracePath = join(artifacts, "trace.log");
-        const stderrPath = join(artifacts, "stderr.log");
-        const tapePath = join(artifacts, "session.fxtape");
-        mkdirSync(join(home, ".fx"), { recursive: true });
-        mkdirSync(workspace, { recursive: true });
-        writeFileSync(
-          join(home, ".fx", "settings.json"),
-          JSON.stringify({
-            sandbox: "none",
-            permission_mode: "auto",
-            permission: {},
-          }),
-        );
-
-        const numberedLines = Array.from(
-          { length: 24 },
-          (_, index) => `QUEUE_SCROLLBACK_LINE_${String(index + 1).padStart(2, "0")}`,
-        );
-        const firstQueued = "QUEUE_SCROLLBACK_FIRST_PROMPT";
-        const secondQueued = "QUEUE_SCROLLBACK_SECOND_PROMPT";
-        const draft = "QUEUE_SCROLLBACK_DRAFT_PROMPT";
-        const firstDone = "QUEUE_SCROLLBACK_FIRST_DONE";
-        const secondDone = "QUEUE_SCROLLBACK_SECOND_DONE";
-        const draftDone = "QUEUE_SCROLLBACK_DRAFT_DONE";
-        const queuedGateway = startFakeGateway([
-          fakeGatewaySse([
-            { type: "text-start", id: "answer_1" },
-            ...numberedLines.map((line) => ({
-              type: "text-delta",
-              id: "answer_1",
-              delta: `${line}\n`,
-            })),
-            { type: "text-end", id: "answer_1" },
-            {
-              type: "tool-call",
-              toolCallId: "queue_scrollback_command",
-              toolName: "shell",
-              input: {
-                request: {
-                  action: "run",
-                  yield_time_ms: 30_000,
-                  timeout_ms: 600_000,
-                  command: "sleep 30",
-                },
-              },
-            },
-            {
-              type: "finish",
-              finishReason: { unified: "tool-calls", raw: "tool-calls" },
-            },
-          ]),
-          fakeGatewayFinalText(firstDone),
-          fakeGatewayFinalText(secondDone),
-          fakeGatewayFinalText(draftDone),
-        ]);
-        gateway = queuedGateway;
-
-        session = await TmuxSession.create({
-          cwd: realpathSync(workspace),
-          stderrPath,
-          width: 124,
-          height: 36,
-          minimumHistoryLines: 2_000,
-          env: {
-            HOME: home,
-            AI_GATEWAY_API_KEY: "fake-queue-scrollback-key",
-            VERCEL_OIDC_TOKEN: undefined,
-            FX_AUTO_UPGRADE: "0",
-            FX_PERMISSION_MODE: "auto",
-            FX_GATEWAY_BASE_URL: queuedGateway.baseUrl,
-            FX_GATEWAY_CHAT_URL: queuedGateway.chatUrl,
-            FX_E2E_GATEWAY_CHAT_URL: queuedGateway.chatUrl,
-            FX_MODEL: MODEL,
-            FX_RECORD: tapePath,
-            FX_RECORD_INPUT: "1",
-            FX_TRACE_LOG: tracePath,
-            FX_TRACE_SCOPES: "agent,gateway,stream,worker,input,prompt,interrupt,scroll",
-          },
-        });
-
-        await session.waitForComposer(TIMEOUT);
-        await session.sendText("Start the queue scrollback stream.");
-        await session.waitForText("Running sleep 30", TIMEOUT);
-        await session.waitForText(numberedLines.at(-1)!, TIMEOUT);
-
-        await session.sendText(firstQueued);
-        await session.sendText(secondQueued);
-        await session.waitForPane(
-          (pane) =>
-            pane.includes(queuedSummaryText(2)) &&
-            !pane.includes(firstQueued) &&
-            !pane.includes(secondQueued),
-          TIMEOUT,
-        );
-        await session.sendLiteral(draft);
-        await session.waitForText(draft, TIMEOUT);
-
-        await session.sendKeys("C-o");
-        await Bun.sleep(250);
-        await session.sendKeys("C-o");
-        await session.waitForText(draft, TIMEOUT);
-        if (scenario.resize) {
-          await session.resizeWindow(scenario.resize.width, scenario.resize.height);
-          await session.waitForText(draft, TIMEOUT);
-        }
-
-        await session.sendKeys("C-c");
-        await session.waitForPane(
-          (pane) =>
-            pane.includes("Cancelled sleep 30") &&
-            pane.includes("paused") &&
-            pane.includes("enter to send"),
-          TIMEOUT,
-        );
-        expect(queuedGateway.requests).toHaveLength(1);
-
-        await session.sendKeys("Enter");
-        await session.waitForText(draftDone, TIMEOUT);
-        await waitForCondition(
-          () => queuedGateway.requests.length === 4,
-          "resumed queued prompts and submitted draft",
-        );
-
-        const scrollback = await session.captureFullScrollback();
-        for (const line of numberedLines) {
-          expect(countOccurrences(scrollback, line)).toBe(1);
-        }
-        for (const text of [
-          firstQueued,
-          firstDone,
-          secondQueued,
-          secondDone,
-          draft,
-          draftDone,
-        ]) {
-          expect(countOccurrences(scrollback, text)).toBe(1);
-        }
-        const orderedMarkers = [
-          numberedLines[0]!,
-          numberedLines.at(-1)!,
-          firstQueued,
-          firstDone,
-          secondQueued,
-          secondDone,
-          draft,
-          draftDone,
-        ];
-        for (let index = 1; index < orderedMarkers.length; index += 1) {
-          expect(scrollback.indexOf(orderedMarkers[index - 1]!)).toBeLessThan(
-            scrollback.indexOf(orderedMarkers[index]!),
-          );
-        }
-
-        expect(queuedGateway.requests[1]!.body).toContain(firstQueued);
-        expect(queuedGateway.requests[2]!.body).toContain(secondQueued);
-        expect(queuedGateway.requests[3]!.body).toContain(draft);
-
-        const sessionsRoot = join(home, ".fx", "sessions");
-        let eventsPath = "";
-        await waitForCondition(() => {
-          if (!existsSync(sessionsRoot)) return false;
-          const sessionId = readdirSync(sessionsRoot).find((entry) =>
-            existsSync(join(sessionsRoot, entry, "events.jsonl"))
-          );
-          if (!sessionId) return false;
-          eventsPath = join(sessionsRoot, sessionId, "events.jsonl");
-          return readFileSync(eventsPath, "utf8").includes(draftDone);
-        }, "complete queue scrollback session history");
-        const events = readFileSync(eventsPath, "utf8");
-        for (const marker of [...numberedLines, firstQueued, secondQueued, draft]) {
-          expect(events).toContain(marker);
-        }
-
-        const trace = readFileSync(tracePath, "utf8");
-        expect(
-          trace.split("\n").some((line) =>
-            line.includes("transcript_anchor_invalidate") &&
-            line.includes("atomic_user_prompt_append")
-          ),
-        ).toBe(false);
-        expect(readFileSync(stderrPath, "utf8")).toBe("");
-        expect(existsSync(tapePath)).toBe(true);
-        expect(
-          execFileSync(FX_BIN, ["replay", tapePath, "--json"], {
-            encoding: "utf8",
-          }),
-        ).not.toBe("");
-        expect(session.isAlive()).toBe(true);
-        expect(session.isPaneAlive()).toBe(true);
-      },
-      TIMEOUT * 3,
-    );
-  }
-
-  test(
-    "post-cancel hidden queue offers Escape to cancel every queued prompt",
-    async () => {
-      root = realpathSync(mkdtempSync(join(tmpdir(), "fx-tui-queued-cancel-all-")));
-      const home = join(root, "home");
-      const workspacePath = join(root, "workspace");
-      const tracePath = join(root, "trace.log");
-      const stderrPath = join(root, "stderr.log");
-      mkdirSync(join(home, ".fx"), { recursive: true });
-      mkdirSync(workspacePath, { recursive: true });
-      writeFileSync(join(home, ".fx", "settings.json"), "{}");
-      const workspace = realpathSync(workspacePath);
-      const hold: HoldState = { started: false, cancelled: false };
-      const firstQueued = "Keep ESC_QUEUE_FIRST_SENTINEL pending.";
-      const secondQueued = "Keep ESC_QUEUE_SECOND_SENTINEL pending.";
-      const queuedGateway = startFakeGateway([
-        () =>
-          heldGatewayResponse(hold, [
-            { type: "text-start", id: "answer_1" },
-            {
-              type: "text-delta",
-              id: "answer_1",
-              delta: "ACTIVE_ESC_QUEUE_CANCEL_ALL_STARTED\n",
-            },
-          ]),
-      ]);
-      gateway = queuedGateway;
-
-      session = await TmuxSession.create({
-        cwd: workspace,
-        stderrPath,
-        width: 120,
-        height: 40,
-        env: {
-          HOME: home,
-          AI_GATEWAY_API_KEY: "fake-queued-cancel-all-key",
-          VERCEL_OIDC_TOKEN: undefined,
-          FX_AUTO_UPGRADE: "0",
-          FX_GATEWAY_BASE_URL: queuedGateway.baseUrl,
-          FX_GATEWAY_CHAT_URL: queuedGateway.chatUrl,
-          FX_E2E_GATEWAY_CHAT_URL: queuedGateway.chatUrl,
-          FX_MODEL: MODEL,
-          FX_TRACE_LOG: tracePath,
-          FX_TRACE_SCOPES: "agent,gateway,stream,worker,input,prompt,interrupt",
-        },
-      });
-
-      await session.waitForComposer(TIMEOUT);
-      await session.sendText("Hold the Escape cancel-all turn open.");
-      await waitForCondition(
-        () => queuedGateway.requests.length === 1 && hold.started,
-        "held active request before Escape queue cancellation",
-      );
-      await session.sendText(firstQueued);
-      await session.sendText(secondQueued);
-      await session.waitForPane(
-        (pane) =>
-          pane.includes(queuedSummaryText(2)) &&
-          !pane.includes(firstQueued) &&
-          !pane.includes(secondQueued),
-        TIMEOUT,
-      );
-
-      await session.sendKeys("C-c");
-      await waitForCondition(() => hold.cancelled, "active request cancellation before queue cancel-all");
-      await session.waitForPane(
-        (pane) => pane.includes(secondQueued) && pane.includes("paused"),
-        TIMEOUT,
-      );
-
-      await session.sendKeys("Escape");
-      await session.waitForPane(
-        (pane) => pane.includes("press esc to cancel all queued"),
-        TIMEOUT,
-      );
-      expect(queuedGateway.requests).toHaveLength(1);
-
-      await session.sendKeys("Escape");
-      await waitForCondition(
-        () =>
-          existsSync(tracePath) &&
-          readFileSync(tracePath, "utf8").includes(
-            "event=queue_review_cancelled_all",
-          ),
-        "all queued prompts cancelled by Escape",
-      );
-      await session.waitForPane(
-        (pane) =>
-          !pane.includes(firstQueued) &&
-          !pane.includes(secondQueued) &&
-          !pane.includes("press esc to cancel all queued"),
-        TIMEOUT,
-      );
-      await Bun.sleep(250);
-
-      const trace = readFileSync(tracePath, "utf8");
-      expect(trace).toContain("event=queued_prompts_cleared");
-      expect(queuedGateway.requests).toHaveLength(1);
-      expect(readFileSync(stderrPath, "utf8")).toBe("");
-      expect(session.isAlive()).toBe(true);
-      expect(session.isPaneAlive()).toBe(true);
     },
     TIMEOUT * 2,
   );

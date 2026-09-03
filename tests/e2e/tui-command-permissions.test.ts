@@ -25,7 +25,6 @@ import {
   fakeGatewayPermissionDecision,
   heldFakeGatewayFinalText,
   isVolatileTokenStatusRow,
-  POST_TOOL_DECISION_PROMPT,
   startDynamicFakeGateway,
   TmuxSession,
   tmuxAvailable,
@@ -334,14 +333,9 @@ function currentUserText(body: string): string {
   const request = JSON.parse(body) as {
     prompt?: Array<{ role?: string; content?: unknown }>;
   };
-  const prompt = request.prompt ?? [];
-  for (let index = prompt.length - 1; index >= 0; index -= 1) {
-    const message = prompt[index];
-    if (message?.role !== "user") continue;
-    const text = contentText(message.content);
-    if (text !== POST_TOOL_DECISION_PROMPT) return text;
-  }
-  return "";
+  return contentText(
+    request.prompt?.findLast((message) => message.role === "user")?.content,
+  );
 }
 
 function occurrenceCount(text: string, needle: string): number {
@@ -1629,6 +1623,69 @@ describe("effect-aware command permissions", () => {
   );
 
   test.skipIf(!tmuxAvailable())(
+    "TUI trace distinguishes rejected edits from failed commands",
+    async () => {
+      const root = createIsolatedRoot();
+      const fixturePath = join(root.workspace, "duplicate.txt");
+      const stderrPath = join(root.root, "stderr.log");
+      writeFileSync(fixturePath, "same twice same\n");
+      writeFileSync(stderrPath, "");
+      installClipboardFixture(root, "#!/bin/sh\nexit 1\n");
+      const gateway = startFakeGateway([
+        gatewayToolCall("edit_file", {
+          path: "duplicate.txt",
+          old_string: "same",
+          new_string: "new",
+        }, "trace_edit_rejected"),
+        toolCall("exit 7", {}, "trace_command_failed"),
+        finalText("diagnostic fixture complete"),
+      ]);
+
+      activeSession = await TmuxSession.create({
+        cmd: FX_BIN,
+        cwd: root.workspace,
+        env: gatewayEnv(root, gateway, {
+          PATH: hostilePath(root),
+          TMPDIR: root.root,
+          FX_PERMISSION_MODE: "yolo",
+        }),
+        stderrPath,
+        width: 120,
+        height: 40,
+      });
+      await activeSession.waitForComposer(TIMEOUT);
+      await activeSession.sendText("Run the diagnostic outcome fixture.");
+      await activeSession.waitForText("diagnostic fixture complete", TIMEOUT);
+      expect(readFileSync(fixturePath, "utf8")).toBe("same twice same\n");
+
+      await activeSession.sendText("/trace");
+      await activeSession.waitForText(
+        process.platform === "darwin"
+          ? "Clipboard copy failed"
+          : "Trace saved at",
+        TIMEOUT,
+      );
+      const report = readFileSync(latestTraceReportPath(root), "utf8");
+
+      expect(gateway.requests).toHaveLength(3);
+      expect(report).toContain(
+        "last=2 succeeded=0 rejected=1 command_failed=1 tool_failed=0 runtime_failed=0",
+      );
+      expect(report).toContain("name=edit_file outcome=rejected");
+      expect(report).toContain("name=shell outcome=command_failed");
+      expect(report).not.toContain("name=edit_file outcome=runtime_failed");
+      expect(report).not.toContain("name=shell outcome=runtime_failed");
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+
+      await activeSession.sendText("/quit");
+      expect(await activeSession.waitForSessionEnd()).toBe(true);
+      await activeSession.kill();
+      activeSession = null;
+    },
+    TIMEOUT,
+  );
+
+  test.skipIf(!tmuxAvailable())(
     "TUI writes Gateway schema diagnostics to a trace after Gateway 400",
     async () => {
       const root = createIsolatedRoot();
@@ -2348,7 +2405,7 @@ describe("effect-aware command permissions", () => {
       expect(gateway.classifierRequests).toHaveLength(4);
       const trace = readFileSync(tracePath, "utf8");
       expect(
-        trace.match(/decision=unavailable fallback_reason=invalid_or_unavailable/g),
+        trace.match(/decision=unavailable fallback_reason=completion_text/g),
       ).toHaveLength(4);
       expect(trace).not.toContain("event=automatic_recovery_exhausted");
       expect(readFileSync(stderrPath, "utf8")).toBe("");
@@ -3118,6 +3175,7 @@ describe("effect-aware command permissions", () => {
           toolCall(command),
           (body) => {
             expect(body).toContain("review_unavailable");
+            expect(body).toContain('\\"review_cause\\":\\"completion_text\\"');
             return toolCall("pwd", "safe_after_malformed");
           },
           finalText("classifier recovery complete"),
@@ -3148,7 +3206,7 @@ describe("effect-aware command permissions", () => {
       expect(trace.match(/event=auto_review_transport_start/g)).toHaveLength(1);
       expect(trace.match(/event=auto_review_result/g)).toHaveLength(1);
       expect(trace).toContain("decision=unavailable");
-      expect(trace).toContain("fallback_reason=invalid_or_unavailable");
+      expect(trace).toContain("fallback_reason=completion_text");
       expect(result.stderr).not.toContain("Auto agent approved this request:");
     },
     TIMEOUT,
@@ -3165,6 +3223,7 @@ describe("effect-aware command permissions", () => {
           toolCall(command),
           (body) => {
             expect(body).toContain("review_unavailable");
+            expect(body).toContain('\\"review_cause\\":\\"completion_text\\"');
             return finalText("classifier fallback handled");
           },
         ],
@@ -3193,7 +3252,7 @@ describe("effect-aware command permissions", () => {
       expect(trace.match(/event=auto_review_transport_start/g)).toHaveLength(1);
       expect(trace.match(/event=auto_review_result/g)).toHaveLength(1);
       expect(trace).toContain("decision=unavailable");
-      expect(trace).toContain("fallback_reason=invalid_or_unavailable");
+      expect(trace).toContain("fallback_reason=completion_text");
       expect(result.stderr).not.toContain(COMMAND_APPROVAL_PROMPT);
     },
     TIMEOUT,
@@ -3210,6 +3269,7 @@ describe("effect-aware command permissions", () => {
           toolCall(command),
           (body) => {
             expect(body).toContain("review_unavailable");
+            expect(body).toContain('\\"review_cause\\":\\"transport_transient\\"');
             return finalText("provider failure handled");
           },
         ],
@@ -3243,7 +3303,10 @@ describe("effect-aware command permissions", () => {
       expect(trace.match(/event=auto_review_transport_start/g)).toHaveLength(1);
       expect(trace.match(/event=auto_review_result/g)).toHaveLength(1);
       expect(trace).toContain("decision=unavailable");
-      expect(trace).toContain("fallback_reason=invalid_or_unavailable");
+      expect(trace).toContain(
+        "event=auto_review_transport result=transient_failure http_status=502",
+      );
+      expect(trace).toContain("fallback_reason=transport_transient");
     },
     TIMEOUT,
   );
@@ -3741,6 +3804,7 @@ class AcpClient {
   private waiters: Array<(line: string) => void> = [];
   private closed = false;
   private stderrChunks: Buffer[] = [];
+  private activeSessionId: string | null = null;
 
   private constructor(private proc: ChildProcess) {
     proc.stdout!.on("data", (chunk: Buffer) => {
@@ -3773,7 +3837,23 @@ class AcpClient {
   }
 
   send(message: object) {
-    this.proc.stdin!.write(`${JSON.stringify(message)}\n`);
+    let outgoing = message as any;
+    if (
+      this.activeSessionId !== null &&
+      [
+        "session/prompt",
+        "session/cancel",
+        "session/set_mode",
+        "session/set_config_option",
+      ].includes(outgoing.method) &&
+      outgoing.params?.sessionId === undefined
+    ) {
+      outgoing = {
+        ...outgoing,
+        params: { ...(outgoing.params ?? {}), sessionId: this.activeSessionId },
+      };
+    }
+    this.proc.stdin!.write(`${JSON.stringify(outgoing)}\n`);
   }
 
   async readLine(timeoutMs = TIMEOUT): Promise<any> {
@@ -3802,7 +3882,18 @@ class AcpClient {
 
   async request(method: string, params: object, id: number) {
     this.send({ jsonrpc: "2.0", id, method, params });
-    return this.readLine();
+    let response: any;
+    do {
+      response = await this.readLine();
+    } while (response.id !== id);
+    if (
+      response.error === undefined &&
+      method === "session/new" &&
+      typeof response.result?.sessionId === "string"
+    ) {
+      this.activeSessionId = response.result.sessionId;
+    }
+    return response;
   }
 
   async close() {
