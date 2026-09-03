@@ -397,6 +397,7 @@ function startFakeOAuth(
     deviceError?: string;
     rejectAllDeviceClients?: boolean;
     tokenDelayMs?: number;
+    rejectRefreshGrant?: boolean;
     teams?: Array<{ id: string; slug: string; name: string }>;
   } = {},
 ) {
@@ -406,6 +407,7 @@ function startFakeOAuth(
     path: string;
     authorization: string | null;
     clientId?: string;
+    grantType?: string;
     revocation?: { tokenTypeHint: string; validForm: boolean };
   }> = [];
   let tokenResponseCount = 0;
@@ -457,8 +459,11 @@ function startFakeOAuth(
           const form = await request.formData();
           const clientId = form.get("client_id");
           recordedRequest.clientId = typeof clientId === "string" ? clientId : undefined;
+          const grantType = form.get("grant_type");
+          recordedRequest.grantType = typeof grantType === "string" ? grantType : undefined;
           tokenResponseCount += 1;
           if (
+            (options.rejectRefreshGrant && grantType === "refresh_token") ||
             accessToken === null ||
             tokenResponseCount > successfulTokenResponses
           ) {
@@ -4176,8 +4181,8 @@ tmuxTest(
     await session.sendKeys("Enter");
     const failed = await session.waitForPane(
       (pane) =>
-        pane.includes("fx login credential refresh failed.") &&
-        pane.includes("Run /login to repair this source.") &&
+        pane.includes("fx login sign-in expired.") &&
+        pane.includes("Press Enter to sign in again.") &&
         !pane.includes("Setup"),
       TIMEOUT,
     );
@@ -4205,6 +4210,151 @@ tmuxTest(
     for (const secret of [LOGIN_TOKEN, ENV_TOKEN, "seeded-refresh-token", "invalid_grant", "rejected"]) {
       expect(trace).not.toContain(secret);
     }
+    expect(readFileSync(stderrPath, "utf8")).toBe("");
+  },
+  60_000,
+);
+
+tmuxTest(
+  "permanent fx login failure enters repair without retrying or losing the prompt",
+  async () => {
+    home = mkdtempSync(join(tmpdir(), "fx-tui-auth-repair-"));
+    stderrPath = join(home, "stderr.log");
+    writeFileSync(stderrPath, "");
+    gateway = startFakeGateway([fakeGatewayFinalText(REFRESH_RECOVERY_RESPONSE)]);
+    oauth = startFakeOAuth(ACQUIRED_LOGIN_TOKEN, undefined, 3600, Number.POSITIVE_INFINITY, {
+      rejectRefreshGrant: true,
+      tokenDelayMs: 5_000,
+      teams: [{ id: "team_123", slug: "team-harness", name: "Team Harness" }],
+    });
+    writeSeededFxLogin(home, Date.now() - 60_000, oauth.issuerUrl);
+
+    session = await startFx(home, stderrPath, gateway, oauth.issuerUrl, undefined, {
+      AI_GATEWAY_API_KEY: undefined,
+    });
+    await session.waitForComposer(TIMEOUT);
+    const prompt = "PRESERVE_DURING_LOGIN_REPAIR";
+    await session.sendText(prompt);
+    await session.waitForText("fx login sign-in expired.", TIMEOUT);
+    expect(oauth.requests.filter((request) => request.grantType === "refresh_token")).toHaveLength(1);
+
+    await session.sendKeys("Enter");
+    await session.waitForText("Waiting for authorization", TIMEOUT);
+    expect(oauth.requests.filter((request) => request.grantType === "refresh_token")).toHaveLength(1);
+
+    await session.waitForText("Team Harness", TIMEOUT);
+    await session.sendKeys("Enter");
+    await session.waitForText(REFRESH_RECOVERY_RESPONSE, TIMEOUT);
+    const full = await session.captureFullScrollback();
+    expect(full.match(/fx login sign-in expired\./g)).toHaveLength(1);
+    expect(gateway.requests).toHaveLength(1);
+    expect(gateway.requests[0]!.body).toContain(prompt);
+    expect(readFileSync(stderrPath, "utf8")).toBe("");
+  },
+  60_000,
+);
+
+tmuxTest(
+  "cancelled fx login repair allows a later explicit login",
+  async () => {
+    home = mkdtempSync(join(tmpdir(), "fx-tui-auth-cancelled-repair-"));
+    stderrPath = join(home, "stderr.log");
+    writeFileSync(stderrPath, "");
+    gateway = startFakeGateway([fakeGatewayFinalText(REFRESH_RECOVERY_RESPONSE)]);
+    oauth = startFakeOAuth(ACQUIRED_LOGIN_TOKEN, undefined, 3600, Number.POSITIVE_INFINITY, {
+      rejectRefreshGrant: true,
+      tokenDelayMs: 5_000,
+      teams: [{ id: "team_123", slug: "team-harness", name: "Team Harness" }],
+    });
+    writeSeededFxLogin(home, Date.now() - 60_000, oauth.issuerUrl);
+    session = await startFx(home, stderrPath, gateway, oauth.issuerUrl, undefined, {
+      AI_GATEWAY_API_KEY: undefined,
+    });
+    await session.waitForComposer(TIMEOUT);
+    const prompt = "DO_NOT_REPLAY_AFTER_CANCELLED_REPAIR";
+    await session.sendText(prompt);
+    await session.waitForText("fx login sign-in expired.", TIMEOUT);
+    expect(oauth.requests.filter((request) => request.grantType === "refresh_token")).toHaveLength(1);
+
+    await session.sendKeys("Enter");
+    await session.waitForText("Waiting for authorization", TIMEOUT);
+    expect(oauth.requests.filter((request) => request.path === "/oauth/device")).toHaveLength(1);
+    await session.sendKeys("Escape");
+    await session.waitForPane(
+      (pane) => pane.includes(prompt) && !pane.includes("Waiting for authorization"),
+      TIMEOUT,
+    );
+    await session.sendKeys("C-u");
+    await session.sendKeys("C-k");
+    await session.sendText("/login");
+    await session.waitForPane(
+      (pane) => pane.includes("vercel") && pane.includes("codex") && pane.includes("grok"),
+      TIMEOUT,
+    );
+    await session.sendKeys("Enter");
+    await session.waitForPane(
+      (pane) => pane.includes("oauth") && pane.includes("api-key"),
+      TIMEOUT,
+    );
+    await session.sendKeys("Enter");
+    await session.waitForText("Waiting for authorization", TIMEOUT);
+
+    expect(oauth.requests.filter((request) => request.path === "/oauth/device")).toHaveLength(2);
+    expect(oauth.requests.filter((request) => request.grantType === "refresh_token")).toHaveLength(1);
+    await session.waitForText("Team Harness", TIMEOUT);
+    await session.sendKeys("Enter");
+    await session.waitForText("Changed Vercel team to Team Harness", TIMEOUT);
+    expect(gateway.requests).toHaveLength(0);
+
+    await session.sendText("use the repaired fx login");
+    await session.waitForText(REFRESH_RECOVERY_RESPONSE, TIMEOUT);
+    expect(gateway.requests).toHaveLength(1);
+    expect(gateway.requests[0]!.headers.get("authorization")).toBe(
+      `Bearer ${ACQUIRED_LOGIN_TOKEN}`,
+    );
+    expect(gateway.requests[0]!.body).not.toContain(prompt);
+    expect(savedCredentialSource(home)).toBe("fx_login");
+    expect(readFileSync(stderrPath, "utf8")).toBe("");
+  },
+  60_000,
+);
+
+tmuxTest(
+  "explicit login replaces a saved session rejected during team loading",
+  async () => {
+    home = mkdtempSync(join(tmpdir(), "fx-tui-auth-rejected-session-login-"));
+    stderrPath = join(home, "stderr.log");
+    writeFileSync(stderrPath, "");
+    gateway = startFakeGateway([]);
+    oauth = startFakeOAuth(ACQUIRED_LOGIN_TOKEN, undefined, 3600, Number.POSITIVE_INFINITY, {
+      rejectRefreshGrant: true,
+      tokenDelayMs: 1_000,
+      teams: [{ id: "team_123", slug: "team-harness", name: "Team Harness" }],
+    });
+    writeSeededFxLogin(home, Date.now() - 60_000, oauth.issuerUrl);
+
+    session = await startFx(home, stderrPath, gateway, oauth.issuerUrl);
+    await session.waitForComposer(TIMEOUT);
+    await session.sendText("/login");
+    await session.waitForPane(
+      (pane) => pane.includes("vercel") && pane.includes("codex") && pane.includes("grok"),
+      TIMEOUT,
+    );
+    await session.sendKeys("Enter");
+    await session.waitForPane(
+      (pane) => pane.includes("oauth") && pane.includes("api-key"),
+      TIMEOUT,
+    );
+    await session.sendKeys("Enter");
+    await session.waitForText("Waiting for authorization", TIMEOUT);
+
+    expect(oauth.requests.filter((request) => request.grantType === "refresh_token")).toHaveLength(1);
+    expect(oauth.requests.filter((request) => request.path === "/oauth/device")).toHaveLength(1);
+    await session.waitForText("Team Harness", TIMEOUT);
+    await session.sendKeys("Enter");
+    await session.waitForText("Changed Vercel team to Team Harness", TIMEOUT);
+    expect(savedCredentialSource(home)).toBe("fx_login");
+    expect(gateway.requests).toHaveLength(0);
     expect(readFileSync(stderrPath, "utf8")).toBe("");
   },
   60_000,
@@ -4405,8 +4555,8 @@ tmuxTest(
     await session.waitForPane(
       (pane) =>
         pane.includes(blockedPrompt) &&
-        pane.includes("fx login credential refresh failed.") &&
-        pane.includes("Run /login to repair this source.") &&
+        pane.includes("fx login sign-in expired.") &&
+        pane.includes("Press Enter to sign in again.") &&
         !pane.includes("Model provider"),
       TIMEOUT,
     );
@@ -4474,7 +4624,7 @@ tmuxTest(
       (pane) =>
         pane.includes(firstPrompt) &&
         pane.includes("fx login credential refresh failed.") &&
-        pane.includes("Run /login to repair this source.") &&
+        pane.includes("Check your connection and press Enter to retry.") &&
         !pane.includes("Model provider"),
       TIMEOUT,
     );
@@ -4505,7 +4655,7 @@ tmuxTest(
       (pane) =>
         pane.includes(secondPrompt) &&
         pane.includes("fx login credential refresh failed.") &&
-        pane.includes("Run /login to repair this source.") &&
+        pane.includes("Check your connection and press Enter to retry.") &&
         !pane.includes("Model provider"),
       TIMEOUT,
     );
@@ -4629,8 +4779,8 @@ tmuxTest(
     await session.sendText("/credits");
     const failed = await session.waitForPane(
       (pane) =>
-        pane.includes("fx login credential refresh failed.") &&
-        pane.includes("Run /login to repair this source.") &&
+        pane.includes("fx login sign-in expired.") &&
+        pane.includes("Press Enter to sign in again.") &&
         pane.includes("/credits"),
       TIMEOUT,
     );
