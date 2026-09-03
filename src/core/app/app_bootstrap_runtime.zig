@@ -213,6 +213,10 @@ pub fn Runtime(comptime App: type) type {
                     app.profile_home
                 else
                     null,
+                .auth_mode = if (comptime @hasDecl(@TypeOf(app.auth), "authMode"))
+                    app.auth.authMode()
+                else
+                    .local,
                 .resize_handler = resize_handler,
                 .fx_version = App.app_version,
             });
@@ -229,6 +233,7 @@ pub fn Runtime(comptime App: type) type {
             }
             app.auth.recordStartupStatus(
                 startup.stored_key_status,
+                startup.fx_login_status,
                 startup.credential_onboarding_skipped,
             );
             if (comptime @hasDecl(@TypeOf(app.auth), "refreshSourceInventory")) {
@@ -423,6 +428,13 @@ pub fn Runtime(comptime App: type) type {
                         .topic = "keychain",
                         .tone = .warning,
                         .body = "fx could not access " ++ credentials.stored_key_backend_label ++ ". Continuing without an API key.",
+                    }, true);
+                }
+                if (auth_view.active_source == null and auth_view.fx_login_status == .unavailable) {
+                    try app.writeDomainNotice(.{
+                        .topic = "auth",
+                        .tone = .warning,
+                        .body = "The saved fx login could not be loaded. No other credential was selected; run /login to repair this source.",
                     }, true);
                 }
             }
