@@ -8,6 +8,7 @@ pub const version = "0.0.7";
 const app_lifecycle = @import("core/app/app_lifecycle.zig");
 const provider_runtime = @import("core/app/provider_runtime.zig");
 const auth_runtime = @import("core/auth/auth_runtime.zig");
+const codex_credential_broker = @import("core/auth/codex_credential_broker.zig");
 const api_key_validator = @import("core/auth/api_key_validator.zig");
 const oauth_transport = @import("core/auth/oauth_transport.zig");
 const js_host_auth = @import("core/auth/js_host_auth.zig");
@@ -570,6 +571,7 @@ const App = struct {
     managed_executions: managed_execution.Runtime = managed_execution.Runtime.init(std.heap.c_allocator),
     legacy_process_provider: process_provider.Provider = process_provider.unavailable_provider,
     upgrader: auto_upgrade.AutoUpgrade = .{},
+    codex_credential_broker: codex_credential_broker.Runtime = .{},
     change_tracker: change_tracker_mod.ChangeTracker = .{},
     mcp: app_mcp_runtime.State = .{},
     skills: skill_runtime.Runtime = .{},
@@ -703,6 +705,28 @@ const App = struct {
         try HostConfigAppRuntime.restore(&app, builtin_modes.registry);
         SessionAppRuntime.syncTerminalTitle(&app);
         return app;
+    }
+
+    pub const CodexCredentialBrokerActivation = codex_credential_broker.Activation;
+
+    /// Validates and adopts the inherited credential channel before anything
+    /// the app bootstrap can spawn exists. Without the launch control this is
+    /// inert, and nothing about the channel is exposed.
+    pub fn prepareCodexCredentialBrokerActivation(
+        launch: *const cli_surface.InteractiveLaunch,
+    ) !CodexCredentialBrokerActivation {
+        return codex_credential_broker.Activation.prepare(launch.modifiers.codex_credential_fd);
+    }
+
+    pub fn startCodexCredentialBroker(
+        self: *App,
+        activation: *CodexCredentialBrokerActivation,
+    ) !void {
+        _ = try self.codex_credential_broker.start(std.heap.c_allocator, activation, .{
+            .transport = self.auth.oauthTransport(),
+            .secret_store = self.auth.secretStore(),
+            .auth_mode = self.auth.authMode(),
+        });
     }
 
     pub fn persistAcceptedModel(self: *App, model: []const u8) !void {
@@ -849,6 +873,7 @@ const App = struct {
 
         self.worker.requestShutdown();
         self.managed_executions.shutdown();
+        self.codex_credential_broker.deinit();
         self.upgrader.stop();
         self.file_index.requestStop();
 

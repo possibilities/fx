@@ -123,6 +123,10 @@ pub const LaunchModifiers = struct {
     context_limit_overrides: []config_runtime.context_limits.Override = &.{},
     additional_directories: [][]u8 = &.{},
     saved_directories_suppressed: bool = false,
+    /// The inherited Codex credential channel. The descriptor number is the
+    /// only capability this control carries: nothing about the channel appears
+    /// in the environment, logs, telemetry, or crash output.
+    codex_credential_fd: ?u8 = null,
 
     pub fn deinit(self: *LaunchModifiers, alloc: Allocator) void {
         if (self.context_limit_overrides.len > 0) alloc.free(self.context_limit_overrides);
@@ -133,6 +137,10 @@ pub const LaunchModifiers = struct {
 
     pub fn hasWorkspaceModifiers(self: LaunchModifiers) bool {
         return self.additional_directories.len > 0 or self.saved_directories_suppressed;
+    }
+
+    pub fn hasCodexCredentialBrokerActivation(self: LaunchModifiers) bool {
+        return self.codex_credential_fd != null;
     }
 };
 
@@ -362,6 +370,7 @@ fn parseGlobalLaunchArgs(
         directories.deinit(alloc);
     }
     var suppress_saved = false;
+    var codex_credential_fd: ?u8 = null;
 
     var index: usize = 0;
     while (index < args.len) {
@@ -383,6 +392,16 @@ fn parseGlobalLaunchArgs(
         } else if (std.mem.eql(u8, arg, "--no-additional-dirs")) {
             if (suppress_saved) return error.DuplicateAdditionalDirectorySuppression;
             suppress_saved = true;
+        } else if (std.mem.eql(u8, arg, "--codex-credential-fd")) {
+            if (codex_credential_fd != null) return error.DuplicateCodexCredentialFd;
+            index += 1;
+            if (index >= args.len) return error.MissingCodexCredentialFd;
+            codex_credential_fd = parseCodexCredentialFd(args[index]) catch
+                return error.InvalidCodexCredentialFd;
+        } else if (std.mem.startsWith(u8, arg, "--codex-credential-fd=")) {
+            if (codex_credential_fd != null) return error.DuplicateCodexCredentialFd;
+            codex_credential_fd = parseCodexCredentialFd(arg["--codex-credential-fd=".len..]) catch
+                return error.InvalidCodexCredentialFd;
         } else {
             break;
         }
@@ -398,8 +417,17 @@ fn parseGlobalLaunchArgs(
             .context_limit_overrides = override_slice,
             .additional_directories = directory_slice,
             .saved_directories_suppressed = suppress_saved,
+            .codex_credential_fd = codex_credential_fd,
         },
     };
+}
+
+/// Standard input, output, and error are never a credential channel, and the
+/// number must stay inside the range the launch modifier can carry.
+fn parseCodexCredentialFd(value: []const u8) !u8 {
+    const parsed = try std.fmt.parseUnsigned(u8, value, 10);
+    if (parsed < 3) return error.InvalidCodexCredentialFd;
+    return parsed;
 }
 
 /// Returns the command that follows the supported global launch modifiers.
@@ -414,11 +442,14 @@ pub fn argsAfterGlobalLaunchArgs(args: []const [:0]const u8) []const [:0]const u
     var index: usize = 0;
     while (index < args.len) {
         const arg = args[index];
-        if (std.mem.eql(u8, arg, "--context-limit") or std.mem.eql(u8, arg, "--add-dir")) {
+        if (std.mem.eql(u8, arg, "--context-limit") or std.mem.eql(u8, arg, "--add-dir") or
+            std.mem.eql(u8, arg, "--codex-credential-fd"))
+        {
             index += 1;
             if (index >= args.len) return &.{};
         } else if (!std.mem.startsWith(u8, arg, "--context-limit=") and
             !std.mem.startsWith(u8, arg, "--add-dir=") and
+            !std.mem.startsWith(u8, arg, "--codex-credential-fd=") and
             !std.mem.eql(u8, arg, "--no-additional-dirs"))
         {
             return args[index..];
@@ -535,6 +566,14 @@ pub fn parseInteractiveLaunch(
     }
 
     const command = parse(command_catalog, effective_args);
+    if (global_args.modifiers.hasCodexCredentialBrokerActivation()) {
+        // The broker leases the process's own Codex authority, so it exists
+        // only on the launches that host an agent for the caller.
+        switch (command) {
+            .interactive, .resume_session, .acp => {},
+            else => return error.CodexCredentialBrokerRequiresAgentLaunch,
+        }
+    }
     if (topLevelHelpRequest(command_catalog, effective_args) != null) {
         return .{ .noninteractive = .{
             .global_args = global_args,
@@ -953,6 +992,7 @@ fn runNonInteractiveWithDeps(
                 .saved_directories_suppressed = global_args.modifiers.saved_directories_suppressed,
                 .model_override = acp_opts.model,
                 .log_file = acp_opts.log_file,
+                .codex_credential_fd = global_args.modifiers.codex_credential_fd,
             });
             return .handled_success;
         },
@@ -3214,6 +3254,10 @@ fn globalLaunchErrorMessage(err: anyerror) ?[]const u8 {
     return switch (err) {
         error.MissingAddDirectoryValue => "--add-dir requires a directory path",
         error.DuplicateAdditionalDirectorySuppression => "--no-additional-dirs may only be specified once",
+        error.MissingCodexCredentialFd => "--codex-credential-fd requires an inherited descriptor number",
+        error.InvalidCodexCredentialFd => "--codex-credential-fd requires an inherited descriptor number of 3 or more",
+        error.DuplicateCodexCredentialFd => "--codex-credential-fd may only be specified once",
+        error.CodexCredentialBrokerRequiresAgentLaunch => "--codex-credential-fd is supported only on interactive, resume, and acp launches",
         else => null,
     };
 }
@@ -5750,4 +5794,77 @@ const CreditsProviderProbe = struct {
 
 fn ownedCreditsErrorSnapshot(alloc: Allocator, message: []const u8) output_contracts.CreditsSnapshot {
     return .{ .err_message = alloc.dupe(u8, message) catch null };
+}
+
+test "hidden Codex credential activation stays all-or-none on agent-hosting launches" {
+    const alloc = std.testing.allocator;
+    const command_catalog = testCommandCatalog();
+
+    const parsed = try parseInteractiveLaunch(alloc, &.{
+        @constCast("--codex-credential-fd"),
+        @constCast("3"),
+    }, command_catalog);
+    var launch = switch (parsed) {
+        .interactive => |value| value,
+        .noninteractive => return error.TestExpectedInteractiveLaunch,
+    };
+    defer launch.deinit(alloc);
+    try std.testing.expectEqual(@as(?u8, 3), launch.modifiers.codex_credential_fd);
+    try std.testing.expect(launch.modifiers.hasCodexCredentialBrokerActivation());
+
+    // The control stays a global launch modifier, so the command behind it is
+    // still discovered without allocating.
+    try std.testing.expectEqualStrings("acp", commandAfterGlobalLaunchArgs(&.{
+        @constCast("--codex-credential-fd"),
+        @constCast("3"),
+        @constCast("acp"),
+    }).?);
+    try std.testing.expectEqualStrings("resume", commandAfterGlobalLaunchArgs(&.{
+        @constCast("--codex-credential-fd=7"),
+        @constCast("resume"),
+    }).?);
+
+    var resumed = try parseGlobalLaunchArgs(alloc, &.{
+        @constCast("--codex-credential-fd=7"),
+        @constCast("resume"),
+    });
+    defer resumed.deinit(alloc);
+    try std.testing.expectEqual(@as(?u8, 7), resumed.modifiers.codex_credential_fd);
+
+    // Standard descriptors are never a credential channel, and the number is
+    // the only value this control accepts.
+    try std.testing.expectError(
+        error.MissingCodexCredentialFd,
+        parseGlobalLaunchArgs(alloc, &.{@constCast("--codex-credential-fd")}),
+    );
+    try std.testing.expectError(
+        error.InvalidCodexCredentialFd,
+        parseGlobalLaunchArgs(alloc, &.{ @constCast("--codex-credential-fd"), @constCast("2") }),
+    );
+    try std.testing.expectError(
+        error.InvalidCodexCredentialFd,
+        parseGlobalLaunchArgs(alloc, &.{ @constCast("--codex-credential-fd"), @constCast("nine") }),
+    );
+    try std.testing.expectError(
+        error.DuplicateCodexCredentialFd,
+        parseGlobalLaunchArgs(alloc, &.{
+            @constCast("--codex-credential-fd"),
+            @constCast("3"),
+            @constCast("--codex-credential-fd=4"),
+        }),
+    );
+
+    // Only the launches that host an agent for the caller may serve a lease.
+    try std.testing.expectError(
+        error.CodexCredentialBrokerRequiresAgentLaunch,
+        parseInteractiveLaunch(alloc, &.{
+            @constCast("--codex-credential-fd"),
+            @constCast("3"),
+            @constCast("ask"),
+            @constCast("hello"),
+        }, command_catalog),
+    );
+    try std.testing.expect(globalLaunchErrorMessage(
+        error.CodexCredentialBrokerRequiresAgentLaunch,
+    ) != null);
 }

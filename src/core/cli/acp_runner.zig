@@ -47,6 +47,8 @@ pub const Config = struct {
     additional_directories: []const []const u8 = &.{},
     saved_directories_suppressed: bool = false,
     allow_acp_mcp: bool = true,
+    /// The inherited Codex credential channel, when the launch selected one.
+    codex_credential_fd: ?u8 = null,
     allow_native_tools: bool = true,
     minimal_kernel: bool = false,
 };
