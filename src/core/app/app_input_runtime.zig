@@ -296,12 +296,16 @@ pub fn Runtime(comptime App: type) type {
                         .character_left => {
                             app.input_runtime.vertical_navigation.reset();
                             if (!intent.extend_selection and
-                                app.input_runtime.edit_state.selectionRange() == null and
-                                !app.stream.active and
-                                (try provider_picker_rt.stepBack(app) or try completion_rt.stepBackModelPicker(app)))
+                                app.input_runtime.edit_state.selectionRange() == null)
                             {
-                                app.shell.render_requests.request(.footer);
-                                return;
+                                if (!app.stream.active and try provider_picker_rt.stepBack(app)) {
+                                    app.shell.render_requests.request(.footer);
+                                    return;
+                                }
+                                if (try completion_rt.stepBackModelPicker(app)) {
+                                    app.shell.render_requests.request(.footer);
+                                    return;
+                                }
                             }
                             _ = app.input_runtime.moveInputCursor(intent);
                         },
@@ -1440,7 +1444,7 @@ pub fn Runtime(comptime App: type) type {
                         app.shell.render_requests.request(.footer);
                     } else if (cycleModelMenuProvider(app, 1) or cycleSkillsMenuSource(app, 1)) {
                         app.shell.render_requests.request(.footer);
-                    } else if (!app.stream.active and picker_state.isBareModelCommandAtCursor(&app.input_runtime.edit_state)) {
+                    } else if (picker_state.isBareModelCommandAtCursor(&app.input_runtime.edit_state)) {
                         try completion_rt.openCurrentModelPicker(app);
                     } else if (completion_rt.hasFileQuery(app)) {
                         if ((try completion_rt.autocompleteFilePickerSelection(app, max_input_len)) == .limit_exceeded) {
@@ -1450,10 +1454,7 @@ pub fn Runtime(comptime App: type) type {
                     } else if (!commandSkillsMenuActive(app) and provider_picker_rt.hasQuery(app)) {
                         if (!app.stream.active) try provider_picker_rt.autocomplete(app);
                     } else if (!commandSkillsMenuActive(app) and completion_rt.hasModelQuery(app)) {
-                        // Mid-turn: list is hidden — do not autocomplete a hidden index.
-                        if (!app.stream.active) {
-                            try completion_rt.autocompleteModelPickerSelection(app);
-                        }
+                        try completion_rt.autocompleteModelPickerSelection(app);
                     } else if (completion_rt.visibleInlineCompletion(app) != null) {
                         if ((try completion_rt.autocompleteInlineCompletion(app, max_input_len)) == .limit_exceeded) {
                             try input_limit_feedback.report(App, app, .composer, 1);
@@ -1485,7 +1486,8 @@ pub fn Runtime(comptime App: type) type {
                 },
                 ' ' => {
                     dismissMentionSkillsMenuForSpace(app);
-                    if (app.input_runtime.edit_state.selectionRange() == null and
+                    if (!queue_rt.ownsComposer(app) and
+                        app.input_runtime.edit_state.selectionRange() == null and
                         !commandSkillsMenuActive(app) and
                         completion_rt.hasModelQuery(app))
                     {
@@ -1517,12 +1519,13 @@ pub fn Runtime(comptime App: type) type {
                     return;
                 },
                 '\r' => {
+                    const queue_review_owns_composer = queue_rt.ownsComposer(app);
                     if (try submitSettingsMenuSelection(app)) return;
                     if (try submitHelpMenuSelection(app, max_input_len, max_prompt_history)) return;
                     if (try submitAuthPickerSelection(app)) return;
-                    if (try submitModelMenuSelection(app)) return;
+                    if (!queue_review_owns_composer and try submitModelMenuSelection(app)) return;
                     if (try submitSkillsMenuSelection(app, max_input_len)) return;
-                    if (try submitSlashPickerSelection(app)) return;
+                    if (!queue_review_owns_composer and try submitSlashPickerSelection(app)) return;
                     if (comptime runtime_profile.allows(App, .durable_sessions)) {
                         if (try submitSessionPickerSelection(app)) return;
                     }
@@ -1533,11 +1536,13 @@ pub fn Runtime(comptime App: type) type {
                         app.shell.render_requests.request(.footer);
                         return;
                     }
-                    if (picker_state.isBareModelCommandAtCursor(&app.input_runtime.edit_state)) {
+                    if (!queue_review_owns_composer and
+                        picker_state.isBareModelCommandAtCursor(&app.input_runtime.edit_state))
+                    {
                         try openModelBrowseCatalog(app);
                         return;
                     }
-                    if (provider_picker_rt.hasQuery(app)) {
+                    if (!queue_review_owns_composer and provider_picker_rt.hasQuery(app)) {
                         if (app.stream.active) {
                             try app.writeDomainNotice(.{
                                 .topic = "provider",
@@ -1549,23 +1554,10 @@ pub fn Runtime(comptime App: type) type {
                         }
                         if (try provider_picker_rt.submit(app)) return;
                     }
-                    if (completion_rt.hasModelQuery(app)) {
-                        if (app.stream.active) {
-                            if (try submitExplicitModelSelection(
-                                app,
-                                resolveExplicitModelSelection(app, app.input_runtime.edit_state.input.items),
-                            )) return;
-                            try app.writeDomainNotice(.{
-                                .topic = "model",
-                                .tone = .neutral,
-                                .body = "Complete the model selection for the next turn: /model <id> <effort> [normal|fast].",
-                            }, true);
-                            app.shell.render_requests.request(.footer);
-                            return;
-                        }
+                    if (!queue_review_owns_composer and completion_rt.hasModelQuery(app)) {
                         if (try completion_rt.submitModelPicker(app)) return;
                     }
-                    if (try submitExplicitModelSelection(
+                    if (!queue_review_owns_composer and try submitExplicitModelSelection(
                         app,
                         resolveExplicitModelSelection(app, app.input_runtime.edit_state.input.items),
                     )) return;
@@ -2665,6 +2657,7 @@ pub fn Runtime(comptime App: type) type {
 
         fn submitSlashPickerSelection(app: *App) !bool {
             if (comptime !@hasField(App, "skills")) return false;
+            if (queue_rt.ownsComposer(app)) return false;
             if (nonSlashPickerOwnsEnter(app)) return false;
             const items = app.input_runtime.edit_state.input.items;
             const prefix = command_specs.slashCompletionPrefix(
@@ -2724,6 +2717,7 @@ pub fn Runtime(comptime App: type) type {
             app: *App,
             parsed: ExplicitModelSelectionParse,
         ) !bool {
+            if (queue_rt.ownsComposer(app)) return false;
             switch (parsed) {
                 .none => return false,
                 .invalid => {
@@ -3409,9 +3403,15 @@ const RoutingWorker = struct {
     queued_count: usize = 0,
     synced_permission_mode: ?types.PermissionMode = null,
     permission_mode_sync_count: usize = 0,
+    queue_review_reason: ?worker_runtime.QueueReviewReason = null,
+    replaced_queue_prompt: [128]u8 = undefined,
+    replaced_queue_prompt_len: usize = 0,
 
-    pub fn queuePreview(_: *RoutingWorker, _: []u8) @import("../agent/worker_runtime.zig").QueuePreview {
-        return .{};
+    pub fn queuePreview(self: *RoutingWorker) @import("../agent/worker_runtime.zig").QueuePreview {
+        return .{
+            .count = self.queued_count,
+            .paused = self.queue_review_reason != null,
+        };
     }
 
     pub fn queuedPromptCount(self: *const RoutingWorker) usize {
@@ -3428,6 +3428,17 @@ const RoutingWorker = struct {
 
     pub fn requestCancel(self: *RoutingWorker) void {
         self.cancel_requested = true;
+    }
+
+    pub fn requestInteractiveCancel(self: *RoutingWorker) bool {
+        self.cancel_requested = true;
+        return self.beginQueueReview(.post_cancel);
+    }
+
+    pub fn beginQueueReview(self: *RoutingWorker, reason: worker_runtime.QueueReviewReason) bool {
+        if (self.queued_count == 0 and self.queue_review_reason == null) return false;
+        self.queue_review_reason = reason;
+        return true;
     }
 
     pub fn interactiveAdmissionSnapshot(self: *RoutingWorker) worker_runtime.InteractiveAdmissionSnapshot {
@@ -3506,6 +3517,59 @@ const RoutingWorker = struct {
     pub fn syncQueuedPromptFastMode(_: *RoutingWorker, _: bool) void {}
 
     pub fn syncQueuedPromptEffort(_: *RoutingWorker, _: types.ReasoningEffort) void {}
+
+    pub fn snapshotQueuedPromptDrafts(
+        _: *RoutingWorker,
+        _: std.mem.Allocator,
+    ) ![]worker_runtime.QueuedPromptDraft {
+        return &.{};
+    }
+
+    pub fn clearQueuedPrompts(
+        self: *RoutingWorker,
+        _: std.mem.Allocator,
+        _: []const types.ImageAttachment,
+    ) void {
+        self.queued_count = 0;
+    }
+
+    pub fn deleteQueuedPromptDraft(
+        self: *RoutingWorker,
+        _: std.mem.Allocator,
+        _: u64,
+        _: []const types.ImageAttachment,
+    ) bool {
+        if (self.queued_count == 0) return false;
+        self.queued_count -= 1;
+        return true;
+    }
+
+    pub fn queueReviewReason(self: *const RoutingWorker) ?worker_runtime.QueueReviewReason {
+        return self.queue_review_reason;
+    }
+
+    pub fn replaceQueuedPromptDrafts(
+        self: *RoutingWorker,
+        _: std.mem.Allocator,
+        drafts: []const worker_runtime.QueuedPromptDraft,
+    ) !bool {
+        if (drafts.len == 0) return true;
+        self.replaced_queue_prompt_len = @min(
+            drafts[0].prompt.len,
+            self.replaced_queue_prompt.len,
+        );
+        @memcpy(
+            self.replaced_queue_prompt[0..self.replaced_queue_prompt_len],
+            drafts[0].prompt[0..self.replaced_queue_prompt_len],
+        );
+        return true;
+    }
+
+    pub fn resumeQueueReview(self: *RoutingWorker) bool {
+        if (self.queue_review_reason == null) return false;
+        self.queue_review_reason = null;
+        return true;
+    }
 };
 
 const RoutingPacer = struct {
@@ -3615,6 +3679,7 @@ const RoutingFakeApp = struct {
     approval_screen: interaction_state.ApprovalScreenState = .{},
     question_prompt: question_prompt.QuestionPrompt = .{},
     input_runtime: core_input_runtime.Runtime = .{},
+    queued_prompt_review: input_queue_runtime.State = .{},
     terminal_input_runtime: test_ui_input.Runtime = .{},
     shell: transcript_runtime.TranscriptRuntime = .{},
     terminal: shell_runtime.TerminalState = .{},
@@ -3721,6 +3786,7 @@ const RoutingFakeApp = struct {
         self.auth.deinit(self.alloc);
         self.approval_prompt.deinit(self.alloc);
         self.question_prompt.deinit(self.alloc);
+        self.queued_prompt_review.deinit(self.alloc);
         self.input_runtime.deinit(self.alloc);
         self.terminal_input_runtime.deinit(self.alloc);
         self.subagents.deinit(self.alloc);
@@ -4052,6 +4118,31 @@ const RoutingFakeApp = struct {
         self.pending_images.clearRetainingCapacity();
     }
 };
+
+fn openRoutingQueueReview(app: *RoutingFakeApp, input: []const u8) !void {
+    const entries = try app.alloc.alloc(input_queue_runtime.ReviewEntry, 1);
+    var entries_owned = true;
+    errdefer if (entries_owned) app.alloc.free(entries);
+    const prompt = try app.alloc.dupe(u8, input);
+    var prompt_owned = true;
+    errdefer if (prompt_owned) app.alloc.free(prompt);
+    entries[0] = .{ .draft = .{
+        .turn_id = 1,
+        .prompt = prompt,
+        .images = &.{},
+        .skill_display_spans = &.{},
+    } };
+    app.queued_prompt_review = .{
+        .entries = entries,
+        .selected_index = 0,
+        .reason = .manual,
+        .visible = true,
+    };
+    entries_owned = false;
+    prompt_owned = false;
+    app.worker.queue_review_reason = .manual;
+    try app.input_runtime.textReplacementState().replace(app.alloc, input);
+}
 
 fn routingOpenUrl(
     _: ?*anyopaque,
@@ -6397,21 +6488,24 @@ test "active stream Enter commits a complete model choice for the next turn" {
     );
 }
 
-test "active stream Enter explains an incomplete hidden model choice" {
+test "active stream Enter selects the visible model choice" {
     const alloc = std.testing.allocator;
     var app = try RoutingFakeApp.init(alloc);
     defer app.deinit();
+    const model = "provider/plain-model";
+    app.model_completion_values = &.{model};
 
-    try app.input_runtime.textReplacementState().replace(alloc, "/model openai/gpt");
+    try app.input_runtime.textReplacementState().replace(alloc, "/model provider/plain");
     app.stream.active = true;
 
     try Runtime(RoutingFakeApp).handleByte(&app, '\r', 4096, 100);
 
     try std.testing.expect(app.stream.active);
-    try std.testing.expectEqual(@as(usize, 0), app.preference_commit_count);
-    try std.testing.expectEqualStrings("/model openai/gpt", app.input_runtime.edit_state.input.items);
+    try std.testing.expectEqual(@as(usize, 1), app.preference_commit_count);
+    try std.testing.expectEqualStrings(model, app.selected_model.items);
+    try std.testing.expectEqualStrings("", app.input_runtime.edit_state.input.items);
     try std.testing.expectEqualStrings(
-        "Complete the model selection for the next turn: /model <id> <effort> [normal|fast].",
+        "Next turn will use " ++ model,
         app.notice_body.items,
     );
     try std.testing.expectEqual(@as(usize, 0), app.submitted_prompt_count);
@@ -6485,6 +6579,46 @@ test "app_input_runtime Enter on selected model slash completion opens browse on
     try std.testing.expect(app.model_cache.menu.active);
     try std.testing.expectEqualStrings("", app.input_runtime.edit_state.input.items);
     try std.testing.expectEqual(@as(usize, 0), app.transcript.items.len);
+}
+
+test "queue review keeps model-shaped Space in the queued draft" {
+    const alloc = std.testing.allocator;
+    var app = try RoutingFakeApp.init(alloc);
+    defer app.deinit();
+    try openRoutingQueueReview(&app, "/model openai/gpt-5");
+
+    try Runtime(RoutingFakeApp).handleByte(&app, ' ', 4096, 100);
+
+    try std.testing.expectEqualStrings("/model openai/gpt-5 ", app.input_runtime.edit_state.input.items);
+    try std.testing.expect(app.queued_prompt_review.visible);
+    try std.testing.expectEqual(@as(usize, 0), app.preference_commit_count);
+    try std.testing.expect(!app.model_cache.menu.active);
+}
+
+test "queue review Enter submits model-shaped text as the queued draft" {
+    const cases = [_][]const u8{
+        "/model",
+        "/mode",
+        "/model openai/gpt-5 auto normal",
+    };
+    for (cases) |input| {
+        const alloc = std.testing.allocator;
+        var app = try RoutingFakeApp.init(alloc);
+        defer app.deinit();
+        try openRoutingQueueReview(&app, input);
+
+        try Runtime(RoutingFakeApp).handleByte(&app, '\r', 4096, 100);
+
+        try std.testing.expectEqualStrings(
+            input,
+            app.worker.replaced_queue_prompt[0..app.worker.replaced_queue_prompt_len],
+        );
+        try std.testing.expect(!app.queued_prompt_review.active());
+        try std.testing.expectEqual(@as(usize, 0), app.preference_commit_count);
+        try std.testing.expect(!app.model_cache.menu.active);
+        try std.testing.expect(app.last_command == null);
+        try std.testing.expectEqualStrings("test/model", app.selected_model.items);
+    }
 }
 
 test "app_input_runtime bare model Tab opens on current scrolled selection before staging effort" {
@@ -6590,46 +6724,53 @@ test "app_input_runtime bare model Tab keeps current selection beyond completion
     try std.testing.expectEqual(@as(usize, 0), app.preference_commit_count);
 }
 
-test "app_input_runtime stream model-shaped keys stay model-owned" {
+test "app_input_runtime stream model picker opens navigates and selects" {
     const alloc = std.testing.allocator;
-    const skills = [_]skill_runtime.Skill{.{
-        .name = "model-helper",
-        .description = "model helper",
-        .path = "/tmp/model-helper/SKILL.md",
-        .source = .global_fx,
-    }};
-    const completions = [_][]const u8{"xai/grok-build-1"};
-    const cases = [_]struct {
-        input: []const u8,
-        byte: u8,
-        expect_input: []const u8,
-        expect_catalog: bool = false,
-    }{
-        .{ .input = "/model ", .byte = '\r', .expect_input = "/model " },
-        .{ .input = "/model", .byte = '\r', .expect_input = "", .expect_catalog = true },
-        .{ .input = "/model", .byte = '\t', .expect_input = "/model" },
-        .{ .input = "/model ", .byte = '\t', .expect_input = "/model " },
+    const models = [_][]const u8{
+        "provider/first-model",
+        "provider/second-model",
     };
+    var app = try RoutingFakeApp.init(alloc);
+    defer app.deinit();
+    app.model_completion_values = &models;
+    app.stream.active = true;
+    try app.input_runtime.textReplacementState().replace(alloc, "/model");
 
-    for (cases) |case| {
-        var app = try RoutingFakeApp.init(alloc);
-        defer app.deinit();
-        app.skills.items = @constCast(&skills);
-        app.model_completion_values = &completions;
-        app.selected_model.clearRetainingCapacity();
-        try app.selected_model.appendSlice(alloc, "anthropic/claude-opus-4.7");
-        app.stream.active = true;
-        try app.input_runtime.textReplacementState().replace(alloc, case.input);
+    try Runtime(RoutingFakeApp).handleByte(&app, '\t', 4096, 100);
+    try Runtime(RoutingFakeApp).routePlainVertical(&app, .down, 1);
+    try Runtime(RoutingFakeApp).handleByte(&app, '\t', 4096, 100);
+    try Runtime(RoutingFakeApp).handleByte(&app, '\r', 4096, 100);
 
-        try Runtime(RoutingFakeApp).handleByte(&app, case.byte, 4096, 100);
+    try std.testing.expect(app.stream.active);
+    try std.testing.expectEqual(@as(usize, 1), app.preference_commit_count);
+    try std.testing.expectEqualStrings(models[1], app.selected_model.items);
+    try std.testing.expectEqualStrings("", app.input_runtime.edit_state.input.items);
+    try std.testing.expectEqual(@as(usize, 0), app.submitted_prompt_count);
+}
 
-        try std.testing.expectEqualStrings(case.expect_input, app.input_runtime.edit_state.input.items);
-        try std.testing.expectEqual(@as(usize, 0), app.preference_commit_count);
-        try std.testing.expectEqual(@as(usize, 0), app.input_runtime.entities.skill_tokens.items.len);
-        try std.testing.expectEqualStrings("anthropic/claude-opus-4.7", app.selected_model.items);
-        try std.testing.expectEqual(@as(usize, 0), app.submitted_prompt_count);
-        try std.testing.expectEqual(case.expect_catalog, app.model_cache.menu.active);
-    }
+test "app_input_runtime fast-only model opens the Fast stage while streaming" {
+    const alloc = std.testing.allocator;
+    const model = "provider/fast-only-model";
+    var app = try RoutingFakeApp.init(alloc);
+    defer app.deinit();
+    app.setGatewayControls(model, &.{}, true);
+    app.model_completion_values = &.{model};
+    app.stream.active = true;
+    try app.input_runtime.textReplacementState().replace(alloc, "/model provider/fast");
+
+    try Runtime(RoutingFakeApp).handleByte(&app, '\r', 4096, 100);
+
+    const query = app.input_runtime.picker.activeModelPickerQuery(&app.input_runtime.edit_state) orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(ModelPickerStage.fast, query.stage);
+    try std.testing.expectEqualStrings("", query.query);
+
+    try Runtime(RoutingFakeApp).handleByte(&app, '\r', 4096, 100);
+
+    try std.testing.expect(app.stream.active);
+    try std.testing.expectEqualStrings(model, app.selected_model.items);
+    try std.testing.expect(app.fast_mode);
+    try std.testing.expectEqual(@as(usize, 1), app.preference_commit_count);
+    try std.testing.expectEqualStrings("Next turn will use " ++ model, app.notice_body.items);
 }
 
 test "app_input_runtime Enter submits a dismissed slash skill query as text" {
@@ -7007,7 +7148,27 @@ test "app_input_runtime stale Tab selection requests a footer repaint" {
     try std.testing.expect(app.shell.render_requests.hasReason(.footer));
 }
 
-test "app_input_runtime terminated file tokens submit while streaming queries stay local" {
+test "app_input_runtime stream file picker navigates and selects without submitting" {
+    const alloc = std.testing.allocator;
+    const completions = [_]file_index.Candidate{
+        .{ .path = "first.txt", .kind = .file },
+        .{ .path = "second.txt", .kind = .file },
+    };
+    var app = try RoutingFakeApp.init(alloc);
+    defer app.deinit();
+    app.file_completion_values = &completions;
+    app.stream.active = true;
+    try app.input_runtime.textReplacementState().replace(alloc, "@file");
+
+    try Runtime(RoutingFakeApp).routePlainVertical(&app, .down, 1);
+    try Runtime(RoutingFakeApp).handleByte(&app, '\r', 4096, 100);
+
+    try std.testing.expect(app.stream.active);
+    try std.testing.expectEqualStrings("@second.txt ", app.input_runtime.edit_state.input.items);
+    try std.testing.expectEqual(@as(usize, 0), app.submitted_prompt_count);
+}
+
+test "app_input_runtime terminated and unmatched file tokens submit as prompt text" {
     const alloc = std.testing.allocator;
 
     {
@@ -7024,7 +7185,7 @@ test "app_input_runtime terminated file tokens submit while streaming queries st
         defer app.deinit();
         app.stream.active = true;
         try app.input_runtime.textReplacementState().replace(alloc, "@queued");
-        try std.testing.expect(!Runtime(RoutingFakeApp).nonSlashPickerOwnsEnter(&app));
+        try std.testing.expect(Runtime(RoutingFakeApp).nonSlashPickerOwnsEnter(&app));
         try Runtime(RoutingFakeApp).handleByte(&app, '\r', 4096, 100);
         try std.testing.expectEqualStrings("", app.input_runtime.edit_state.input.items);
         try std.testing.expectEqual(@as(usize, 1), app.submitted_prompt_count);
