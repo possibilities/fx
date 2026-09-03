@@ -170,6 +170,43 @@ test "processQueuedPrompt persists partial-text cancellation as interrupted once
     try std.testing.expect(hooks.history_turns.items[0].interrupted.tool_call == null);
 }
 
+test "automatic text steering resumes the same turn without interrupted history" {
+    const alloc = std.testing.allocator;
+    const chunks = [_][]const u8{"Partial answer"};
+    const completions = [_]FakeCompletion{
+        .{ .chunks = &chunks, .cancel_after_chunks = true },
+        .{ .content = "Updated answer" },
+    };
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    const steering = [_][]const u8{ "first update", "second update" };
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    var fixture = PromptFixture{};
+    hooks.immediate_steering_messages = &steering;
+    hooks.immediate_steering_cancel_flag = &fixture.cancel_flag;
+
+    try runFakePrompt(&gateway, &hooks, fixture.config(), fixture.job());
+
+    try std.testing.expectEqual(@as(usize, 2), gateway.request_bodies.items.len);
+    try expectBodyContainsInOrder(&gateway, 1, &.{
+        "Partial answer",
+        "user_steering",
+        "first update",
+        "user_steering",
+        "second update",
+    });
+    try std.testing.expectEqual(@as(usize, 0), hooks.interrupted_history_count);
+    try std.testing.expectEqual(@as(usize, 0), hooks.interrupted_event_count);
+    try std.testing.expectEqual(@as(usize, 1), hooks.history_turns.items.len);
+    try std.testing.expect(hooks.history_turns.items[0] == .assistant);
+    try std.testing.expectEqualStrings("Updated answer", hooks.finish_assistant_text.?);
+    const execution = hooks.history_turns.items[0].assistant.execution;
+    try std.testing.expectEqual(@as(usize, 2), execution.steering.len);
+    try std.testing.expectEqualStrings("first update", execution.steering[0].text);
+    try std.testing.expectEqualStrings("second update", execution.steering[1].text);
+}
+
 test "streamed presentation preserves raw partial through cancellation" {
     const alloc = std.testing.allocator;
     const invisible_chunks = [_][]const u8{" \t\r\n"};
@@ -223,6 +260,30 @@ test "streamed presentation preserves raw partial through cancellation" {
             try std.testing.expectEqual(@as(usize, 0), hooks.texts.items.len);
         }
     }
+}
+
+test "clear language mismatch is absent from cancelled history" {
+    const alloc = std.testing.allocator;
+    const chunks = [_][]const u8{"我会先检查锁文件和依赖清单。"};
+    const completions = [_]FakeCompletion{.{
+        .chunks = &chunks,
+        .cancel_after_chunks = true,
+    }};
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    var fixture = PromptFixture{};
+    var job = fixture.job();
+    job.prompt = @constCast("The lockfile is broken again.");
+
+    try runFakePrompt(&gateway, &hooks, fixture.config(), job);
+
+    try std.testing.expectEqual(@as(usize, 1), hooks.history_turns.items.len);
+    try std.testing.expect(hooks.history_turns.items[0] == .interrupted);
+    try std.testing.expect(hooks.history_turns.items[0].interrupted.assistant == null);
+    try std.testing.expectEqual(@as(usize, 0), hooks.assistant_sources.items.len);
+    try std.testing.expectEqual(@as(usize, 0), hooks.texts.items.len);
 }
 
 test "processQueuedPrompt cancellation after valid tool finish settles streamed calls" {
