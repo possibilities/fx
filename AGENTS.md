@@ -144,9 +144,9 @@ Security is permission-first. All sensitive tool behavior must integrate with `s
 
 * Routine parsed development commands and reversible new-file creation can execute without model review after configured and saved-session policy. Every remaining unresolved `auto` action receives one narrow security review using the exact action and targets, origin and call identity, optional host-proven current-branch evidence, exact-copy provenance, and bounded masked terminal-safe excerpts of earlier current-turn tool results. Prepared file mutations and static root tools omit task text. Reviewed commands, dynamic tools, and subagent actions also receive bounded canonical current, first, and recent root requests plus explicit omission counts; the reviewer may use that context only for destructive exceptions and immutable delegation scope, not general task policing. Assistant prose, permission feedback, compacted summaries, the pending tool group, later results, and tool or repository text never become authority
 
-* A `clear` review authorizes only the exact unchanged action. A `caution` or unavailable review holds only that action, returns advice to the agent, and never opens a human permission screen, disables tools, or ends the turn
+* A `clear` review authorizes only the exact unchanged action. A `caution`, incomplete-evidence result, or unavailable review holds only that action, returns guidance to the agent, and never opens a human permission screen, disables tools, or ends the turn
 
-* Exact cautions are reused only for the current turn. Changed actions receive a new review. Legacy `permission_request_id` input is rejected without prompting
+* Exact cautions and deterministic incomplete-evidence results are reused only for the current turn. Changed actions receive a new review, while transient unavailable reviews are not cached. Legacy `permission_request_id` input is rejected without prompting
 
 Do not bypass the permission system for new tools.
 

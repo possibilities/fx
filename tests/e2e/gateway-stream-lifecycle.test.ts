@@ -36,8 +36,8 @@ import {
   fakeGatewaySerializedToolCall,
   fakeGatewayToolCall,
   hasEmptyComposer,
+  heldFakeGatewayFinalText,
   paneExitMatches,
-  POST_TOOL_DECISION_PROMPT,
   startDynamicFakeGateway,
   TmuxSession,
   tmuxAvailable,
@@ -215,6 +215,38 @@ function providerErrorResponse(detail = "route temporarily unavailable"): Respon
   );
 }
 
+function gatewayStreamTimeoutResponse(): Response {
+  return sse(
+    `data: ${JSON.stringify({
+      type: "error",
+      error: {
+        code: "gateway_stream_timeout",
+        message: "stream exceeded maximum duration",
+      },
+    })}\n\n`,
+  );
+}
+
+function gatewayStreamTimeoutWithFinishResponse(): Response {
+  return sse(
+    `data: ${JSON.stringify({
+      type: "error",
+      error: {
+        code: "gateway_stream_timeout",
+        message: "stream exceeded maximum duration",
+      },
+    })}\n\n` +
+      'data: {"type":"finish","finishReason":{"unified":"error","raw":"gateway_stream_timeout"}}\n\n' +
+      "data: [DONE]\n\n",
+  );
+}
+
+function finishOnlyGatewayStreamTimeoutResponse(): Response {
+  return sse(
+    'data: {"type":"finish","finishReason":{"unified":"error","raw":"gateway_stream_timeout"}}\n\n',
+  );
+}
+
 function contentFilterResponse(): Response {
   return sse(
     'data: {"type":"finish","finishReason":{"unified":"content-filter","raw":"content_filter"}}\n\n' +
@@ -374,7 +406,7 @@ function toolResultOutput(body: string, callId: string): string {
   const parts = gatewayRequest(body).prompt.flatMap((message) =>
     Array.isArray(message.content) ? message.content : []
   ) as Array<Record<string, unknown>>;
-  const result = parts.findLast((part) =>
+  const result = parts.find((part) =>
     part.type === "tool-result" && part.toolCallId === callId
   );
   if (!result) throw new Error(`Missing tool result for ${callId}`);
@@ -399,14 +431,7 @@ function shellResult(body: string, callId: string): ShellResult {
 
 function hasCurrentToolResult(body: string, callId: string): boolean {
   const prompt = gatewayRequest(body).prompt;
-  let lastUserIndex = -1;
-  for (let index = prompt.length - 1; index >= 0; index -= 1) {
-    const message = prompt[index];
-    if (message?.role !== "user") continue;
-    if (contentText(message.content) === POST_TOOL_DECISION_PROMPT) continue;
-    lastUserIndex = index;
-    break;
-  }
+  const lastUserIndex = prompt.findLastIndex((message) => message.role === "user");
   return prompt.slice(lastUserIndex + 1).some((message) =>
     Array.isArray(message.content) &&
     (message.content as Array<Record<string, unknown>>).some((part) =>
@@ -2744,6 +2769,96 @@ describe("gateway stream lifecycle", () => {
     }
   });
 
+  test("saved ask retries a clear response language mismatch without persisting it", async () => {
+    const root = createFixtureRoot("response-language-retry");
+    const firstTracePath = join(root.root, "first-trace.log");
+    const resumeTracePath = join(root.root, "resume-trace.log");
+    const rejected = "我会先检查锁文件和依赖清单。";
+    const accepted = "I will inspect the lockfile next.";
+    const resumedText = "The saved session contains only accepted English output.";
+    const responses = [
+      fakeGatewayFinalText(rejected),
+      fakeGatewayFinalText(accepted),
+      fakeGatewayFinalText(resumedText),
+    ];
+    const gateway = startGateway(() =>
+      responses.shift() ?? new Response("unexpected request", { status: 500 })
+    );
+
+    try {
+      const first = await runFx(
+        [
+          "ask",
+          "--json",
+          "--auto",
+          "The lockfile is broken again. Say what you will inspect next.",
+        ],
+        {
+          cwd: root.workspace,
+          env: fixtureEnv(root, gateway, firstTracePath),
+          timeoutMs: 15_000,
+        },
+      );
+      const firstJson = parseAskJson(first.stdout) as ReturnType<typeof parseAskJson> & {
+        session_id: string;
+      };
+      const sessionPath = join(
+        root.home,
+        ".fx",
+        "sessions",
+        firstJson.session_id,
+        "session.json",
+      );
+      const eventsPath = join(
+        root.home,
+        ".fx",
+        "sessions",
+        firstJson.session_id,
+        "events.jsonl",
+      );
+
+      expect(first.code).toBe(0);
+      expect(first.stderr).toBe("");
+      expect(firstJson.output).toContain(accepted);
+      expect(firstJson.output).not.toContain(rejected);
+      expect(gateway.requestCount()).toBe(2);
+      expect(gateway.requests[0]!.body).toContain(
+        "Use the response language requested by the current external human.",
+      );
+      expect(gateway.requests[1]!.body).toContain(
+        "The previous candidate used a different language",
+      );
+      expect(readFileSync(sessionPath, "utf8")).not.toContain(rejected);
+      expect(readFileSync(eventsPath, "utf8")).not.toContain(rejected);
+
+      const resumed = await runFx(
+        [
+          "ask",
+          "--json",
+          "--auto",
+          "--resume-id",
+          firstJson.session_id,
+          "Confirm what the saved session contains.",
+        ],
+        {
+          cwd: root.workspace,
+          env: fixtureEnv(root, gateway, resumeTracePath),
+          timeoutMs: 15_000,
+        },
+      );
+
+      expect(resumed.code).toBe(0);
+      expect(resumed.stderr).toBe("");
+      expect(parseAskJson(resumed.stdout).output).toContain(resumedText);
+      expect(gateway.requestCount()).toBe(3);
+      expect(gateway.requests[2]!.body).toContain(accepted);
+      expect(gateway.requests[2]!.body).not.toContain(rejected);
+    } finally {
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  });
+
   test("saved malformed recovery resumes without re-executing the historical call", async () => {
     const root = createFixtureRoot("malformed-arguments-resume");
     const firstTracePath = join(root.root, "first-trace.log");
@@ -2965,6 +3080,8 @@ describe("gateway stream lifecycle", () => {
         tool_calls: Array<{
           name: string;
           status: string;
+          action?: string;
+          error?: { category?: string; code?: string };
           command_result?: { termination_indeterminate?: boolean };
         }>;
       };
@@ -2984,6 +3101,11 @@ describe("gateway stream lifecycle", () => {
       expect(json.tool_calls[0]).toMatchObject({
         name: "shell",
         status: "error",
+        action: "run",
+        error: {
+          category: "command_failed",
+          code: "termination_indeterminate",
+        },
         command_result: { termination_indeterminate: true },
       });
       expect(readFileSync(tracePath, "utf8")).toContain(
@@ -2997,11 +3119,147 @@ describe("gateway stream lifecycle", () => {
     }
   });
 
+  test("incomplete shell output preserves process status without replaying effects", async () => {
+    const root = createFixtureRoot("shell-incomplete-output");
+    const tracePath = join(root.root, "trace.log");
+    const effectPath = join(root.workspace, "command-effect.txt");
+    const callId = "shell_incomplete_output_1";
+    let observedFailure = "";
+    let step = 0;
+    const gateway = startGateway((body) => {
+      switch (step++) {
+        case 0:
+          return fakeShellRun(
+            callId,
+            "printf 'effect\\n' >> command-effect.txt; printf 'partial output\\n'",
+            { timeout_ms: 30_000 },
+          );
+        case 1:
+          observedFailure = toolResultOutput(body, callId);
+          return fakeGatewayFinalText("Incomplete output acknowledged without retry.");
+        default:
+          return new Response("unexpected request", { status: 500 });
+      }
+    });
+
+    try {
+      const result = await runFx(
+        ["ask", "--json", "--yolo", "--no-save", "Run the mutation exactly once."],
+        {
+          cwd: root.workspace,
+          env: {
+            ...fixtureEnv(root, gateway, tracePath),
+            FX_COMMAND_TEST_OUTPUT_INCOMPLETE_AFTER_EXIT: "1",
+          },
+          timeoutMs: 15_000,
+        },
+      );
+      const json = JSON.parse(result.stdout) as {
+        exit_code: number;
+        output: string;
+        tool_calls: Array<{
+          name: string;
+          status: string;
+          command_result?: {
+            exit_code?: number;
+            output_incomplete?: boolean;
+          };
+        }>;
+      };
+
+      expect(result.code).toBe(0);
+      expect(json.exit_code).toBe(0);
+      expect(json.output).toContain("acknowledged without retry");
+      expect(gateway.requestCount()).toBe(2);
+      expect(readFileSync(effectPath, "utf8")).toBe("effect\n");
+      expect(JSON.parse(observedFailure)).toMatchObject({
+        state: "completed",
+        exit_code: 0,
+        output_incomplete: true,
+      });
+      expect(observedFailure).toContain("partial output");
+      expect(observedFailure).toContain("do not blindly rerun");
+      expect(observedFailure).not.toContain("Unexpected");
+      expect(json.tool_calls).toHaveLength(1);
+      expect(json.tool_calls[0]).toMatchObject({
+        name: "shell",
+        status: "error",
+        command_result: {
+          exit_code: 0,
+          output_incomplete: true,
+        },
+      });
+      expect(readFileSync(tracePath, "utf8")).toContain(
+        "command output drain incomplete reason=injected_after_exit",
+      );
+      expect(result.stderr).not.toContain("Unexpected");
+      expect(result.stderr).not.toContain("error.Unexpected");
+    } finally {
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  });
+
+  test("shell runtime failure keeps action and typed JSON diagnostics", async () => {
+    const root = createFixtureRoot("shell-runtime-diagnostic");
+    const tracePath = join(root.root, "trace.log");
+    const callId = "shell_runtime_diagnostic_1";
+    let step = 0;
+    const gateway = startGateway(() => {
+      switch (step++) {
+        case 0:
+          return fakeGatewayToolCall(callId, "shell", {
+            request: {
+              action: "interact",
+              session_id: "shell-missing",
+            },
+          });
+        case 1:
+          return fakeGatewayFinalText("Shell failure recorded.");
+        default:
+          return new Response("unexpected request", { status: 500 });
+      }
+    });
+
+    try {
+      const result = await runFx(
+        ["ask", "--json", "--yolo", "--no-save", "Observe the missing shell handle."],
+        {
+          cwd: root.workspace,
+          env: fixtureEnv(root, gateway, tracePath),
+          timeoutMs: 15_000,
+        },
+      );
+      const json = JSON.parse(result.stdout) as {
+        tool_calls: Array<Record<string, unknown>>;
+      };
+
+      expect(result.code).toBe(0);
+      expect(gateway.requestCount()).toBe(2);
+      expect(json.tool_calls).toHaveLength(1);
+      expect(json.tool_calls[0]).toMatchObject({
+        name: "shell",
+        status: "error",
+        action: "interact",
+        error: {
+          category: "tool_failed",
+          code: "ExecutionNotFound",
+        },
+      });
+      expect(result.stderr).not.toContain("Unexpected");
+      expect(result.stderr).not.toContain("error.Unexpected");
+    } finally {
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  });
+
   test("suffixless stored result handle remains readable", async () => {
     const root = createFixtureRoot("suffixless-tool-result-handle");
     const tracePath = join(root.root, "trace.log");
     const readFileCallId = "suffixless_handle_read_file_1";
     const readResultCallId = "suffixless_handle_read_result_1";
+    const readRangeCallId = "suffixless_handle_read_range_1";
     const needle = "E2E_SUFFIX_NEEDLE";
     const lines = Array.from(
       { length: 500 },
@@ -3013,6 +3271,8 @@ describe("gateway stream lifecycle", () => {
     let step = 0;
     let canonicalHandle = "";
     let suffixlessHandle = "";
+    let projectedQueryInput: unknown = null;
+    let projectedRangeInput: unknown = null;
     const gateway = startGateway((body) => {
       switch (step++) {
         case 0:
@@ -3028,8 +3288,10 @@ describe("gateway stream lifecycle", () => {
           expect(canonicalHandle.endsWith(".txt")).toBe(true);
           suffixlessHandle = canonicalHandle.slice(0, -4);
           return fakeGatewayToolCall(readResultCallId, "read_tool_result", {
-            handle: suffixlessHandle,
-            query: needle,
+            request: {
+              handle: suffixlessHandle,
+              query: needle,
+            },
           });
         }
         case 2: {
@@ -3038,6 +3300,35 @@ describe("gateway stream lifecycle", () => {
           expect(output).toContain(
             `<tool_result_query handle="${canonicalHandle}">`,
           );
+          const request = JSON.parse(body) as {
+            prompt: Array<{ content?: Array<Record<string, unknown>> }>;
+          };
+          const parts = request.prompt.flatMap((message) => message.content ?? []);
+          projectedQueryInput = parts.find((part) =>
+            part.type === "tool-call" &&
+            part.toolCallId === readResultCallId &&
+            part.toolName === "read_tool_result"
+          )?.input;
+          return fakeGatewayToolCall(readRangeCallId, "read_tool_result", {
+            request: {
+              handle: suffixlessHandle,
+              start_byte: 1,
+              byte_count: 512,
+            },
+          });
+        }
+        case 3: {
+          const output = toolResultOutput(body, readRangeCallId);
+          expect(output).toContain("fixture line 000");
+          const request = JSON.parse(body) as {
+            prompt: Array<{ content?: Array<Record<string, unknown>> }>;
+          };
+          const parts = request.prompt.flatMap((message) => message.content ?? []);
+          projectedRangeInput = parts.find((part) =>
+            part.type === "tool-call" &&
+            part.toolCallId === readRangeCallId &&
+            part.toolName === "read_tool_result"
+          )?.input;
           return fakeGatewayFinalText("Suffixless result handle inspected.");
         }
         default:
@@ -3060,17 +3351,31 @@ describe("gateway stream lifecycle", () => {
       expect(result.code).toBe(0);
       expect(json.error).toBeUndefined();
       expect(json.output).toContain("Suffixless result handle inspected.");
-      expect(gateway.requestCount()).toBe(3);
+      expect(gateway.requestCount()).toBe(4);
       expect(json.tool_calls).toContainEqual({ name: "read_file", status: "success" });
       expect(json.tool_calls).toContainEqual({
         name: "read_tool_result",
         status: "success",
       });
+      expect(json.tool_calls.filter((call) => call.name === "read_tool_result")).toHaveLength(2);
       expect(existsSync(join(sessionRoot, "tool-results", canonicalHandle))).toBe(true);
       const sessionEvents = readFileSync(join(sessionRoot, "events.jsonl"), "utf8");
       expect(sessionEvents).toContain(suffixlessHandle);
       expect(sessionEvents).toContain(canonicalHandle);
       expect(sessionEvents).toContain(needle);
+      expect(projectedQueryInput).toEqual({
+        request: {
+          handle: suffixlessHandle,
+          query: needle,
+        },
+      });
+      expect(projectedRangeInput).toEqual({
+        request: {
+          handle: suffixlessHandle,
+          start_byte: 1,
+          byte_count: 512,
+        },
+      });
       expect(result.stderr).not.toContain("ResultHandleNotFound");
     } finally {
       gateway.stop();
@@ -3949,7 +4254,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
   }, 30_000);
 
   test(
-    "nine saved turns stay canonical while the next request uses bounded context",
+    "nine small saved turns stay visible until provider pressure requires compaction",
     async () => {
       const root = createFixtureRoot("canonical-history-projection");
       const tracePath = join(root.root, "trace.log");
@@ -4053,7 +4358,15 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
         const userTexts = request.prompt
           .filter((message) => message.role === "user")
           .map((message) => contentText(message.content));
-        expect(userTexts).toEqual([
+        const canonicalUserTexts = userTexts.filter((text) =>
+          text.startsWith("canonical ")
+        );
+        expect(canonicalUserTexts).toEqual([
+          "canonical turn 1",
+          "canonical turn 2",
+          "canonical turn 3",
+          "canonical turn 4",
+          "canonical turn 5",
           "canonical turn 6",
           "canonical turn 7",
           "canonical turn 8",
@@ -4064,14 +4377,13 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
           .filter((message) => message.role === "system")
           .map((message) => contentText(message.content))
           .join("\n");
-        expect(systemText).toContain("Conversation summary:");
-        expect(systemText).toContain("read_file success");
+        expect(systemText).not.toContain("Conversation summary:");
         const structuredParts = request.prompt.flatMap((message) =>
           Array.isArray(message.content) ? message.content : []
         ) as Array<Record<string, unknown>>;
         expect(structuredParts.some((part) =>
           part.type === "tool-call" && part.toolCallId === callId
-        )).toBe(false);
+        )).toBe(true);
 
         const finalDetailResult = await runFx(
           ["session", "--id", sessionId, "--json"],
@@ -4099,10 +4411,32 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       const root = createFixtureRoot("manual-compaction-restart");
       const tracePath = join(root.root, "trace.log");
       const stderrPath = join(root.root, "stderr.log");
+      const callId = "manual_compaction_large_result";
+      const inlineCallId = "manual_compaction_inline_result";
+      const bodySentinel = "MANUAL_COMPACTION_BODY_SENTINEL";
+      writeFileSync(
+        join(root.workspace, "manual-compaction-large.txt"),
+        `${bodySentinel}\n${"x".repeat(20 * 1024)}\n`,
+      );
+      writeFileSync(
+        join(root.workspace, ".fx.json"),
+        JSON.stringify({ max_tool_result_bytes: 1024 }),
+      );
+      writeFileSync(join(root.workspace, "manual-compaction-inline.txt"), "inline result\n");
       const responses = [
+        fakeGatewayToolCall(callId, "read_file", {
+          path: "manual-compaction-large.txt",
+        }),
+        fakeGatewayToolCall(inlineCallId, "read_file", {
+          path: "manual-compaction-inline.txt",
+        }),
         fakeGatewayFinalText("FIRST_REPLY_COMPACTION_SENTINEL"),
         fakeGatewayFinalText("SECOND_REPLY_COMPACTION_SENTINEL"),
+        fakeGatewayFinalText(
+          "Continue the compacted session. Preserve FIRST_PROMPT_COMPACTION_SENTINEL and SECOND_PROMPT_COMPACTION_SENTINEL.",
+        ),
         fakeGatewayFinalText("compaction restart complete"),
+        fakeGatewayFinalText("Second compaction preserved the restored session."),
       ];
       const gateway = startGateway(() =>
         responses.shift() ?? new Response("unexpected request", { status: 500 })
@@ -4127,8 +4461,6 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
             hasEmptyComposer(pane),
           15_000,
         );
-        await tui.sendText("/compact");
-        await tui.waitForText("Context compacted.", 15_000);
         await tui.sendText("/quit");
         await tui.waitForSessionEnd(15_000);
         tui = null;
@@ -4140,6 +4472,21 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
         expect(latest.code).toBe(0);
         const sessionId = JSON.parse(latest.stdout).id as string;
 
+        const compactionStderrPath = join(root.root, "compaction-stderr.log");
+        tui = await TmuxSession.create({
+          cmd: `${FX_BIN} --resume ${sessionId}`,
+          cwd: root.workspace,
+          env: fixtureEnv(root, gateway, tracePath),
+          stderrPath: compactionStderrPath,
+        });
+        await tui.waitForComposer(15_000);
+        await tui.sendText("/compact");
+        await tui.waitForText("Context compacted.", 15_000);
+        await tui.sendText("/quit");
+        await tui.waitForSessionEnd(15_000);
+        tui = null;
+        expect(readFileSync(compactionStderrPath, "utf8")).toBe("");
+
         const beforeResume = await runFx(
           ["session", "--id", sessionId, "--json"],
           {
@@ -4150,13 +4497,40 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
         expect(beforeResume.code).toBe(0);
         const canonical = JSON.parse(beforeResume.stdout) as {
           history_len: number;
-          history: Array<{ user: { text: string } }>;
+          history: Array<{
+            kind: string;
+            user?: { text: string };
+            summary?: string;
+          }>;
         };
-        expect(canonical.history_len).toBe(2);
-        expect(canonical.history.map((turn) => turn.user.text)).toEqual([
+        expect(canonical.history_len).toBe(3);
+        expect(canonical.history.filter((turn) => turn.user).map((turn) => turn.user!.text)).toEqual([
           "FIRST_PROMPT_COMPACTION_SENTINEL",
           "SECOND_PROMPT_COMPACTION_SENTINEL",
         ]);
+        expect(canonical.history.at(-1)).toEqual(
+          expect.objectContaining({
+            kind: "compacted_summary",
+          }),
+        );
+        expect(canonical.history.at(-1)?.summary).toContain(
+          "Continue the compacted session.",
+        );
+        const inlineSummary = canonical.history.at(-1)?.summary
+          ?.split("\n")
+          .find((line) => line.includes(`call_id="${inlineCallId}"`));
+        expect(inlineSummary).toContain("result_handle=");
+        expect(inlineSummary).toContain("truncated=true");
+
+        expect(gateway.requests).toHaveLength(5);
+        const compactRequest = JSON.parse(gateway.requests[4].body) as {
+          tools?: unknown[];
+          toolChoice?: { type?: string };
+          responseFormat?: unknown;
+        };
+        expect(compactRequest.tools).toEqual([]);
+        expect(compactRequest.toolChoice).toEqual({ type: "none" });
+        expect(compactRequest.responseFormat).toBeUndefined();
 
         const resumed = await runFx(
           [
@@ -4175,25 +4549,22 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
         );
         expect(resumed.code).toBe(0);
         expect(resumed.stderr).toBe("");
-        expect(gateway.requests).toHaveLength(3);
+        expect(gateway.requests).toHaveLength(6);
 
-        const request = JSON.parse(gateway.requests[2].body) as {
+        const request = JSON.parse(gateway.requests[5].body) as {
           prompt: Array<{ role: string; content: unknown }>;
         };
         const userTexts = request.prompt
           .filter((message) => message.role === "user")
           .map((message) => contentText(message.content));
-        expect(userTexts).toEqual([
-          "SECOND_PROMPT_COMPACTION_SENTINEL",
-          "compaction restart probe",
-        ]);
-        const systemText = request.prompt
-          .filter((message) => message.role === "system")
-          .map((message) => contentText(message.content))
-          .join("\n");
-        expect(systemText).toContain("Conversation summary:");
-        expect(systemText).toContain("FIRST_PROMPT_COMPACTION_SENTINEL");
-        expect(systemText).toContain("FIRST_REPLY_COMPACTION_SENTINEL");
+        expect(userTexts.at(-1)).toBe("compaction restart probe");
+        expect(userTexts.some((text) => text.includes("context_handoff"))).toBe(
+          true,
+        );
+        const requestText = JSON.stringify(request);
+        expect(requestText).toContain("context_handoff");
+        expect(requestText).toContain("manual-compaction-large.txt");
+        expect(requestText).not.toContain(bodySentinel);
         expect(readFileSync(stderrPath, "utf8")).toBe("");
 
         const afterResume = await runFx(
@@ -4206,14 +4577,59 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
         expect(afterResume.code).toBe(0);
         const resumedCanonical = JSON.parse(afterResume.stdout) as {
           history_len: number;
-          history: Array<{ user: { text: string } }>;
+          history: Array<{ kind: string; user?: { text: string } }>;
         };
-        expect(resumedCanonical.history_len).toBe(3);
-        expect(resumedCanonical.history.map((turn) => turn.user.text)).toEqual([
+        expect(resumedCanonical.history_len).toBe(4);
+        expect(
+          resumedCanonical.history.filter((turn) => turn.user).map((turn) => turn.user!.text),
+        ).toEqual([
           "FIRST_PROMPT_COMPACTION_SENTINEL",
           "SECOND_PROMPT_COMPACTION_SENTINEL",
           "compaction restart probe",
         ]);
+
+        const resumedStderrPath = join(root.root, "resumed-stderr.log");
+        tui = await TmuxSession.create({
+          cmd: `${FX_BIN} --resume ${sessionId}`,
+          cwd: root.workspace,
+          env: fixtureEnv(root, gateway, tracePath),
+          stderrPath: resumedStderrPath,
+        });
+        await tui.waitForComposer(15_000);
+        await tui.sendText("/compact");
+        await tui.waitForText("Context compacted.", 15_000);
+        await tui.sendText("/quit");
+        await tui.waitForSessionEnd(15_000);
+        tui = null;
+
+        expect(gateway.requests).toHaveLength(7);
+        const secondCompactRequest = JSON.parse(gateway.requests[6].body) as {
+          tools?: unknown[];
+          prompt?: Array<{ role: string; content: unknown }>;
+        };
+        expect(secondCompactRequest.tools).toEqual([]);
+        const secondCompactText = JSON.stringify(secondCompactRequest.prompt);
+        expect(secondCompactText).toContain("FIRST_PROMPT_COMPACTION_SENTINEL");
+        expect(secondCompactText).toContain("SECOND_PROMPT_COMPACTION_SENTINEL");
+        expect(secondCompactText).not.toContain("context_handoff");
+        expect(readFileSync(resumedStderrPath, "utf8")).toBe("");
+
+        const afterSecondCompact = await runFx(
+          ["session", "--id", sessionId, "--json"],
+          { cwd: root.workspace, env: { HOME: root.home } },
+        );
+        expect(afterSecondCompact.code).toBe(0);
+        const secondCanonical = JSON.parse(afterSecondCompact.stdout) as {
+          history: Array<{ kind: string; summary?: string }>;
+        };
+        const secondSummary = secondCanonical.history.at(-1)?.summary ?? "";
+        expect(secondSummary).toContain(callId);
+        expect(secondSummary).toContain(inlineCallId);
+        const secondInlineSummary = secondSummary
+          .split("\n")
+          .find((line) => line.includes(`call_id="${inlineCallId}"`));
+        expect(secondInlineSummary).toContain("result_handle=");
+        expect(secondInlineSummary).toContain("truncated=true");
       } finally {
         if (tui) await tui.kill();
         gateway.stop();
@@ -4224,7 +4640,106 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
   );
 
   test.skipIf(!tmuxAvailable())(
-    "explicit skill reads remain repeatable after manual compaction",
+    "manual context compaction cancellation leaves no checkpoint and accepts a follow-up",
+    async () => {
+      const root = createFixtureRoot("manual-compaction-cancel");
+      const tracePath = join(root.root, "trace.log");
+      const stderrPath = join(root.root, "stderr.log");
+      const held = heldFakeGatewayFinalText();
+      const responses = [
+        fakeGatewayFinalText("MANUAL_CANCEL_FIRST_READY"),
+        fakeGatewayFinalText("MANUAL_CANCEL_SECOND_READY"),
+        () => held.response,
+        fakeGatewayFinalText("MANUAL_CANCEL_RECOVERY_OK"),
+      ];
+      const gateway = startGateway(() => {
+        const response = responses.shift();
+        return response
+          ? typeof response === "function" ? response() : response
+          : new Response("unexpected request", { status: 500 });
+      });
+      let tui: TmuxSession | null = null;
+      try {
+        tui = await TmuxSession.create({
+          cwd: root.workspace,
+          env: {
+            ...fixtureEnv(root, gateway, tracePath),
+            FX_AUTO_UPGRADE: "0",
+            FX_TRACE_SCOPES:
+              "agent,core,gateway,stream,context_compaction,input,interrupt,worker,session",
+          },
+          stderrPath,
+        });
+        await tui.waitForComposer(15_000);
+        await tui.sendText("Create the first manual compaction cancellation turn.");
+        await tui.waitForPane(
+          (pane) => pane.includes("MANUAL_CANCEL_FIRST_READY") && hasEmptyComposer(pane),
+          15_000,
+        );
+        await tui.sendText("Create the second manual compaction cancellation turn.");
+        await tui.waitForPane(
+          (pane) => pane.includes("MANUAL_CANCEL_SECOND_READY") && hasEmptyComposer(pane),
+          15_000,
+        );
+
+        await tui.sendText("/compact");
+        const requestDeadline = Date.now() + 15_000;
+        while (gateway.requests.length < 3) {
+          if (Date.now() >= requestDeadline) throw new Error("compactor request did not start");
+          await Bun.sleep(10);
+        }
+        while (!readFileSync(tracePath, "utf8").includes(
+          "[context_compaction] event=provider_start",
+        )) {
+          if (Date.now() >= requestDeadline) throw new Error("compactor provider did not start");
+          await Bun.sleep(10);
+        }
+        tui.sendKeysImmediate(["Escape"]);
+        await tui.waitForPane(
+          (pane) => pane.includes("Context compaction cancelled.") && hasEmptyComposer(pane),
+          5_000,
+        );
+
+        const latest = await runFx(["session", "last", "--json"], {
+          cwd: root.workspace,
+          env: { HOME: root.home },
+        });
+        expect(latest.code).toBe(0);
+        const sessionId = JSON.parse(latest.stdout).id as string;
+        const beforeFollowUp = await runFx(
+          ["session", "--id", sessionId, "--json"],
+          {
+            cwd: root.workspace,
+            env: { HOME: root.home },
+          },
+        );
+        expect(beforeFollowUp.code).toBe(0);
+        const history = JSON.parse(beforeFollowUp.stdout).history as Array<{ kind: string }>;
+        expect(history).toHaveLength(2);
+        expect(history.some((turn) => turn.kind === "compacted_summary")).toBe(false);
+
+        await tui.sendText("Continue after the cancelled manual compaction.");
+        await tui.waitForPane(
+          (pane) => pane.includes("MANUAL_CANCEL_RECOVERY_OK") && hasEmptyComposer(pane),
+          15_000,
+        );
+        expect(gateway.requests).toHaveLength(4);
+        expect(readFileSync(tracePath, "utf8")).not.toContain(
+          "[context_compaction] event=installed",
+        );
+        expect(readFileSync(stderrPath, "utf8")).toBe("");
+      } finally {
+        held.dispose();
+        if (tui) await tui.kill();
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    60_000,
+  );
+
+  test.skipIf(!tmuxAvailable())(
+    "explicit skill reads remain repeatable after semantic compaction",
     async () => {
       const root = createFixtureRoot("skill-manual-compaction");
       const tracePath = join(root.root, "trace.log");
@@ -4235,7 +4750,11 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       mkdirSync(skillDirectory, { recursive: true });
       writeFileSync(
         join(skillDirectory, "SKILL.md"),
-        `---\nname: ${skillName}\ndescription: compaction explicit fixture\n---\n\n${bodySentinel}\n`,
+        `---\nname: ${skillName}\ndescription: compaction explicit fixture\n---\n\n${bodySentinel}\n${"x".repeat(20 * 1024)}\n`,
+      );
+      writeFileSync(
+        join(root.workspace, ".fx.json"),
+        JSON.stringify({ max_tool_result_bytes: 1024 }),
       );
 
       const beforeCallId = "skill_before_compaction";
@@ -4244,6 +4763,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
         fakeGatewayToolCall(beforeCallId, "skill", { name: skillName }),
         fakeGatewayFinalText("SKILL_BEFORE_COMPACTION_COMPLETE"),
         fakeGatewayFinalText("SECOND_COMPACTION_TURN_COMPLETE"),
+        fakeGatewayFinalText("Continue the explicit skill workflow when the user asks."),
         fakeGatewayToolCall(afterCallId, "skill", { name: skillName }),
         fakeGatewayFinalText("SKILL_AFTER_COMPACTION_COMPLETE"),
       ];
@@ -4288,17 +4808,23 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
         await tui.waitForSessionEnd(15_000);
         tui = null;
 
-        expect(gateway.requests).toHaveLength(5);
+        expect(gateway.requests).toHaveLength(6);
         const before = toolResultOutput(gateway.requests[1]!.body, beforeCallId);
-        const postCompactionRequest = promptText(gateway.requests[3]!.body);
-        const after = toolResultOutput(gateway.requests[4]!.body, afterCallId);
+        const compactionRequest = gateway.requests[3]!.body;
+        const postCompactionRequest = gateway.requests[4]!.body;
+        const after = toolResultOutput(gateway.requests[5]!.body, afterCallId);
 
         expect(before).toContain(bodySentinel);
-        expect(after).toBe(before);
-        expect(postCompactionRequest).toContain("Conversation summary:");
-        expect(postCompactionRequest).toContain("skill success");
+        expect(after).toContain(bodySentinel);
+        expect(before).not.toContain("tool_result_handle");
+        expect(after).not.toContain("tool_result_handle");
+        expect(compactionRequest).toContain("Read the explicit skill before compaction.");
+        expect(compactionRequest).not.toContain(bodySentinel);
+        expect(compactionRequest).not.toContain("<skill_content");
+        expect(compactionRequest).not.toContain("tool_result_handle");
+        expect(postCompactionRequest).toContain("context_handoff");
+        expect(postCompactionRequest).toContain("result_handle=");
         expect(postCompactionRequest).not.toContain(bodySentinel);
-        expect(postCompactionRequest).not.toContain("<loaded_skill_context>");
         expect(readFileSync(stderrPath, "utf8")).toBe("");
       } finally {
         if (tui) await tui.kill();
@@ -5865,6 +6391,51 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
     }
   });
 
+  test("no-save capped tool result succeeds without publishing a phantom handle", async () => {
+    const root = createFixtureRoot("no-save-capped-result");
+    const tracePath = join(root.root, "trace.log");
+    const callId = "no_save_capped_read";
+    writeFileSync(
+      join(root.workspace, "no-save-large.txt"),
+      `NO_SAVE_RESULT_SENTINEL\n${"x".repeat(8 * 1024)}\n`,
+    );
+    writeFileSync(
+      join(root.workspace, ".fx.json"),
+      JSON.stringify({ max_tool_result_bytes: 1024 }),
+    );
+    const responses = [
+      fakeGatewayToolCall(callId, "read_file", { path: "no-save-large.txt" }),
+      fakeGatewayFinalText("No-save capped result completed."),
+    ];
+    const gateway = startGateway(() =>
+      responses.shift() ?? new Response("unexpected request", { status: 500 })
+    );
+    try {
+      const result = await runFx(
+        ["ask", "--json", "--auto", "--no-save", "Read the large fixture once."],
+        {
+          cwd: root.workspace,
+          env: fixtureEnv(root, gateway, tracePath),
+          timeoutMs: 15_000,
+        },
+      );
+      const json = parseAskJson(result.stdout);
+      const output = toolResultOutput(gateway.requests[1]!.body, callId);
+
+      expect(result.code).toBe(0);
+      expect(json.output).toBe("No-save capped result completed.");
+      expect(gateway.requestCount()).toBe(2);
+      expect(output).toContain("NO_SAVE_RESULT_SENTINEL");
+      expect(output).toContain("tool result truncated");
+      expect(output).not.toContain("tool_result_handle");
+      expect(result.stderr).not.toContain("Tool execution failed");
+      expect(result.stderr).not.toContain("ContextCapacityExceeded");
+    } finally {
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  });
+
   test("provider error without output retries same route before success", async () => {
     const root = createFixtureRoot("provider-error-retry");
     const tracePath = join(root.root, "trace.log");
@@ -5917,6 +6488,145 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       rmSync(root.root, { recursive: true, force: true });
     }
   }, 30_000);
+
+  test("gateway stream timeout pauses without automatic retry", async () => {
+    const root = createFixtureRoot("gateway-stream-timeout");
+    const tracePath = join(root.root, "trace.log");
+    const gateway = startGateway(() => gatewayStreamTimeoutResponse());
+    try {
+      const result = await runFx(
+        ["ask", "--json", "--auto", "--no-save", "Return the fixture response."],
+        {
+          cwd: root.workspace,
+          env: fixtureEnv(root, gateway, tracePath),
+          timeoutMs: 15_000,
+        },
+      );
+      const json = parseAskJson(result.stdout);
+      const trace = readFileSync(tracePath, "utf8");
+
+      expect(result.code).toBe(1);
+      expect(json.exit_code).toBe(1);
+      expect(gateway.requestCount()).toBe(1);
+      expect(json.recovery?.state).toBe("paused");
+      expect(json.recovery?.cause).toBe("provider_stream_timeout");
+      expect(json.recovery?.attempt).toBe(1);
+      expect(json.recovery?.attempt_limit).toBe(10);
+      expect(json.recovery?.required_action).toBe("continue_later");
+      expect(result.stderr).toContain("Gateway stream timed out");
+      expect(result.stderr).toContain("gateway_stream_timeout: stream exceeded maximum duration");
+      expect(result.stderr).toContain("automatic retry paused · attempt 1/10");
+      expect(result.stderr).not.toContain("retrying request");
+      expect(trace).toContain("event=route_failure");
+      expect(trace).toContain("retry=false");
+      expect(trace).toContain("detail=gateway_stream_timeout: stream exceeded maximum duration");
+    } finally {
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  });
+
+  test("finish-only gateway stream timeout pauses without automatic retry", async () => {
+    const root = createFixtureRoot("finish-only-gateway-stream-timeout");
+    const tracePath = join(root.root, "trace.log");
+    const gateway = startGateway(() => finishOnlyGatewayStreamTimeoutResponse());
+    try {
+      const result = await runFx(
+        ["ask", "--json", "--auto", "--no-save", "Return the fixture response."],
+        {
+          cwd: root.workspace,
+          env: fixtureEnv(root, gateway, tracePath),
+          timeoutMs: 15_000,
+        },
+      );
+      const json = parseAskJson(result.stdout);
+      const trace = readFileSync(tracePath, "utf8");
+
+      expect(result.code).toBe(1);
+      expect(json.exit_code).toBe(1);
+      expect(gateway.requestCount()).toBe(1);
+      expect(json.recovery?.state).toBe("paused");
+      expect(json.recovery?.cause).toBe("provider_stream_timeout");
+      expect(json.recovery?.required_action).toBe("continue_later");
+      expect(result.stderr).toContain("Gateway stream timed out");
+      expect(result.stderr).toContain("gateway_stream_timeout");
+      expect(result.stderr).toContain("automatic retry paused · attempt 1/10");
+      expect(result.stderr).not.toContain("retrying request");
+      expect(trace).toContain("event=route_failure");
+      expect(trace).toContain("http_status=200");
+      expect(trace).toContain("retry=false");
+    } finally {
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  });
+
+  test("saved gateway stream timeout reloads and continues explicitly", async () => {
+    const root = createFixtureRoot("saved-gateway-stream-timeout");
+    const tracePath = join(root.root, "trace.log");
+    let continued = false;
+    const gateway = startGateway(() =>
+      continued
+        ? fakeGatewayFinalText("Recovered after explicit timeout continuation.")
+        : gatewayStreamTimeoutWithFinishResponse()
+    );
+    try {
+      const first = await runFx(
+        ["ask", "--json", "--auto", "Pause on the fixture timeout."],
+        {
+          cwd: root.workspace,
+          env: fixtureEnv(root, gateway, tracePath),
+          timeoutMs: 15_000,
+        },
+      );
+      const paused = parseAskJson(first.stdout);
+
+      expect(first.code).toBe(1);
+      expect(gateway.requestCount()).toBe(1);
+      expect(paused.recovery?.state).toBe("paused");
+      expect(paused.recovery?.cause).toBe("provider_stream_timeout");
+      expect(paused.recovery?.required_action).toBe("continue_later");
+      expect(paused.recovery?.durable).toBe(true);
+      expect(paused.recovery?.message).toContain(
+        "gateway_stream_timeout: stream exceeded maximum duration",
+      );
+
+      const detail = await runFx(
+        ["session", "--id", paused.session_id, "--json"],
+        { cwd: root.workspace, env: { HOME: root.home } },
+      );
+      expect(detail.code).toBe(0);
+      expect(gateway.requestCount()).toBe(1);
+
+      continued = true;
+      const resumed = await runFx(
+        [
+          "ask",
+          "--json",
+          "--auto",
+          "--resume-id",
+          paused.session_id,
+          "--continue-recovery",
+        ],
+        {
+          cwd: root.workspace,
+          env: fixtureEnv(root, gateway, tracePath),
+          timeoutMs: 15_000,
+        },
+      );
+      const recovered = parseAskJson(resumed.stdout);
+
+      expect(resumed.code).toBe(0);
+      expect(recovered.output).toContain(
+        "Recovered after explicit timeout continuation.",
+      );
+      expect(gateway.requestCount()).toBe(2);
+      expect(gateway.requests[1]!.body).toContain("Pause on the fixture timeout.");
+    } finally {
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  });
 
   test("model response budget stops at ten real requests", async () => {
     const root = createFixtureRoot("provider-attempt-budget");
@@ -6409,8 +7119,10 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       expect(json.output).toBe(recoveredText);
       expect(json.tool_calls).toEqual([{ name: "read_file", status: "success" }]);
       expect(gateway.requestCount()).toBe(3);
-      expect(retryPrompt.at(-2)?.role).toBe("user");
-      expect(contentText(retryPrompt.at(-2)?.content)).toBe(POST_TOOL_DECISION_PROMPT);
+      expect(retryPrompt.at(-2)?.role).toBe("tool");
+      expect(toolResultOutput(gateway.requests[2]!.body, "read_retry_order")).toContain(
+        "deterministic fixture",
+      );
       expect(retryPrompt.at(-1)?.role).toBe("system");
       expect(contentText(retryPrompt.at(-1)?.content)).toContain("<network_recovery>");
       expect(result.stderr).not.toContain("HTTP 400");
