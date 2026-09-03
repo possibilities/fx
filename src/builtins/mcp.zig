@@ -1100,6 +1100,11 @@ fn renderConfigJson(alloc: Allocator, configs: []const McpServerConfig) ![]u8 {
                 }
                 try out.writer.writeByte(']');
             }
+            if (auth.callback_port) |port| {
+                if (!first_auth) try out.writer.writeByte(',');
+                first_auth = false;
+                try out.writer.print("\"callback_port\":{d}", .{port});
+            }
             try out.writer.writeByte('}');
         }
         if (config.env.len > 0) {
@@ -2212,6 +2217,40 @@ test "remote config keeps credential references and OAuth policy without secrets
     try std.testing.expectEqualStrings("fx-client", auth.client_id.?);
     try std.testing.expectEqualStrings("MCP_CLIENT_SECRET", auth.client_secret_env.?);
     try std.testing.expectEqual(@as(usize, 2), auth.scopes.len);
+    try std.testing.expectEqual(@as(?u16, null), auth.callback_port);
+}
+
+test "remote config keeps a pinned OAuth callback port" {
+    const alloc = std.testing.allocator;
+    const json =
+        \\{"mcp":{"slack":{"type":"http","url":"https://mcp.slack.com/mcp","oauth":{"client_id":"fx-client","callback_port":3118}}}}
+    ;
+    var configs = try loadConfigFromJson(alloc, json);
+    defer freeConfigs(alloc, &configs);
+
+    try std.testing.expectEqual(@as(usize, 1), configs.items.len);
+    const auth = configs.items[0].auth.?;
+    try std.testing.expectEqualStrings("fx-client", auth.client_id.?);
+    try std.testing.expectEqual(@as(?u16, 3118), auth.callback_port);
+}
+
+test "profile config rejects out-of-range OAuth callback ports" {
+    const cases = [_][]const u8{
+        \\{"mcp":{"api":{"type":"http","url":"https://api.example.com/mcp","oauth":{"callback_port":null}}}}
+        ,
+        \\{"mcp":{"api":{"type":"http","url":"https://api.example.com/mcp","oauth":{"callback_port":0}}}}
+        ,
+        \\{"mcp":{"api":{"type":"http","url":"https://api.example.com/mcp","oauth":{"callback_port":65536}}}}
+        ,
+        \\{"mcp":{"api":{"type":"http","url":"https://api.example.com/mcp","oauth":{"callback_port":"3118"}}}}
+        ,
+    };
+    for (cases) |json| {
+        try std.testing.expectError(
+            error.McpConfigInvalidOAuth,
+            loadConfigFromJson(std.testing.allocator, json),
+        );
+    }
 }
 
 test "profile config rejects a mixed set containing invalid client metadata URLs" {
