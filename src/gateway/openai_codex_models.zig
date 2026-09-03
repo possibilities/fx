@@ -16,7 +16,7 @@ const default_models_endpoint = "https://chatgpt.com/backend-api/codex/models";
 const e2e_models_endpoint_env = "FX_E2E_OPENAI_CODEX_MODELS_URL";
 
 pub const protocol_client_version = "0.148.0";
-pub const reviewer_model = "gpt-5.4-mini";
+pub const reviewer_model = "gpt-5.6-luna";
 
 pub const model_catalog_provider = model_catalog.Provider{
     .fetch_fn = fetchCatalogForProvider,
