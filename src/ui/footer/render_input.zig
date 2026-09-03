@@ -16,6 +16,7 @@ const command_specs = @import("../../core/slash_commands/command_specs.zig");
 const settings_catalog = @import("../../core/config/settings_catalog.zig");
 const skill_runtime = @import("../../core/skills/skill_runtime.zig");
 const display_width = @import("../../core/shared/display_width.zig");
+const text_utils = @import("../../core/shared/text_utils.zig");
 const types = @import("../../core/shared/types.zig");
 const workspace_access = @import("../../core/workspace/workspace_access.zig");
 const file_index = @import("../../core/workspace/file_index.zig");
@@ -494,6 +495,7 @@ pub fn activeCompactCommandMenu(ctx: RenderContext) ?CompactCommandMenuProjectio
 
 // Trailing blank row that keeps the collapsed summary off the composer.
 pub const collapsed_queue_banner_gap_rows: u16 = 1;
+pub const max_steering_message_rows: u16 = 2;
 
 // Expanded cards plus one blank row between adjacent prompts, so queued drafts
 // read as separate items instead of a single connected block.
@@ -537,16 +539,30 @@ pub fn queuedBannerRowsForFacts(facts: QueuedBannerFacts) u16 {
     return 1 +| paused_hint_rows +| collapsed_queue_banner_gap_rows;
 }
 
-pub fn queuedBannerRows(ctx: RenderContext) u16 {
+pub fn steeringMessageRows(message: []const u8, width: u16) u16 {
+    const content_width = width -| 2;
+    if (content_width == 0) return 1;
+    return if (text_utils.terminalSafeVisibleWidth(message) <= content_width) 1 else max_steering_message_rows;
+}
+
+fn steeringRows(ctx: RenderContext, width: u16) u16 {
+    if (!ctx.steering_waits_for_tool) {
+        return @intCast(@min(ctx.steering_messages.len, std.math.maxInt(u16)));
+    }
+    var rows: u16 = 0;
+    for (ctx.steering_messages) |message| {
+        rows +|= steeringMessageRows(message, width);
+    }
+    return rows;
+}
+
+pub fn queuedBannerRows(ctx: RenderContext, width: u16) u16 {
     return queuedBannerRowsForFacts(.{
         .queued_count = ctx.queued_count,
         .paused = ctx.queued_paused,
         .card_count = ctx.queued_prompt_cards.len,
         .card_rows = ctx.queued_prompt_card_rows,
-        .steering_rows = @intCast(@min(
-            ctx.steering_messages.len,
-            @as(usize, std.math.maxInt(u16)),
-        )),
+        .steering_rows = steeringRows(ctx, width),
     });
 }
 
