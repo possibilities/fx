@@ -583,28 +583,65 @@ fn pushQueuedPromptBannerRows(
     if (ctx.queued_prompt_cards.len == 0) {
         var painted: u16 = 0;
         if (ctx.steering_messages.len > 0) {
-            const visible_count = @min(
-                ctx.steering_messages.len,
-                @as(usize, plan.footer.banner_rows),
-            );
-            const visible_start = ctx.steering_messages.len - visible_count;
+            const gap_rows: u16 = @intFromBool(plan.footer.banner_rows > 1);
+            const steering_row_budget = plan.footer.banner_rows -| gap_rows;
+            var visible_start = ctx.steering_messages.len;
+            var remaining_rows = steering_row_budget;
+            var oldest_row_limit: u16 = 0;
+            while (visible_start > 0 and remaining_rows > 0) {
+                const candidate = visible_start - 1;
+                const candidate_rows = if (ctx.steering_waits_for_tool)
+                    render_input.steeringMessageRows(
+                        ctx.steering_messages[candidate],
+                        width,
+                    )
+                else
+                    1;
+                visible_start = candidate;
+                oldest_row_limit = @min(candidate_rows, remaining_rows);
+                if (candidate_rows >= remaining_rows) break;
+                remaining_rows -= candidate_rows;
+            }
             for (ctx.steering_messages[visible_start..], visible_start..) |message, index| {
                 if (painted >= plan.footer.banner_rows) break;
-                var row = try input_presentation.composeSteeringMessageRow(
-                    alloc,
-                    message,
-                    ctx.steering_waits_for_tool and
-                        index + 1 == ctx.steering_messages.len,
-                    width,
-                );
-                try pushFooterBandRow(
-                    alloc,
-                    frame,
-                    plan,
-                    plan.footer.banner +| painted,
-                    &row,
-                );
-                painted +|= 1;
+                if (ctx.steering_waits_for_tool) {
+                    const row_limit = if (index == visible_start)
+                        oldest_row_limit
+                    else
+                        render_input.max_steering_message_rows;
+                    var rows = try input_presentation.composeSteeringMessageRows(
+                        alloc,
+                        message,
+                        width,
+                        row_limit,
+                    );
+                    defer rows.deinit(alloc);
+                    for (rows.rows.items) |*row| {
+                        if (painted >= steering_row_budget) break;
+                        try pushFooterBandRow(
+                            alloc,
+                            frame,
+                            plan,
+                            plan.footer.banner +| painted,
+                            row,
+                        );
+                        painted +|= 1;
+                    }
+                } else {
+                    var row = try input_presentation.composeImmediateSteeringMessageRow(
+                        alloc,
+                        message,
+                        width,
+                    );
+                    try pushFooterBandRow(
+                        alloc,
+                        frame,
+                        plan,
+                        plan.footer.banner +| painted,
+                        &row,
+                    );
+                    painted +|= 1;
+                }
             }
         } else {
             var summary = try input_presentation.composeQueuedSummaryRow(
@@ -1373,6 +1410,23 @@ fn expectFrameRowTextTrimmed(frame: *const footer_viewport.ComposedFooterFrame, 
     return error.TestUnexpectedResult;
 }
 
+fn expectFrameRowContains(frame: *const footer_viewport.ComposedFooterFrame, row_number: u16, width: u16, expected: []const u8) !void {
+    for (frame.rows.items) |row| {
+        if (row.row == row_number) {
+            var grid = try vt_emulator.Grid.init(std.testing.allocator, width, 1);
+            defer grid.deinit();
+            try grid.feed(row.text.items);
+
+            var text: std.ArrayList(u8) = .empty;
+            defer text.deinit(std.testing.allocator);
+            try grid.rowTextTrimmed(1, &text);
+            try std.testing.expect(std.mem.find(u8, text.items, expected) != null);
+            return;
+        }
+    }
+    return error.TestUnexpectedResult;
+}
+
 fn expectFrameCellForeground(frame: *const footer_viewport.ComposedFooterFrame, row_number: u16, width: u16, col: u16, expected: vt_emulator.Color) !void {
     for (frame.rows.items) |row| {
         if (row.row == row_number) {
@@ -1566,7 +1620,7 @@ test "queued prompts collapse to a single summary row until the review opens" {
 
     var ctx = testContext(&input);
     ctx.queued_count = 2;
-    const banner_rows = render_input.queuedBannerRows(ctx);
+    const banner_rows = render_input.queuedBannerRows(ctx, shell.layout.cols);
     const planner_input: FooterPlannerInput = .{
         .active_label = null,
         .ctx = ctx,
@@ -1592,7 +1646,7 @@ test "queued prompts collapse to a single summary row until the review opens" {
     try std.testing.expect(frame_plan.paint.footer.input_base >= banner + 2);
 }
 
-test "clamped steering banner keeps newest messages and escape hint" {
+test "steering banner wraps one message onto dotted rails above a blank composer gap" {
     const alloc = std.testing.allocator;
 
     var input = InputRuntime{};
@@ -1615,7 +1669,7 @@ test "clamped steering banner keeps newest messages and escape hint" {
     };
     defer shell.deinit(alloc);
 
-    const messages = [_][]const u8{ "first hidden", "second hidden", "third visible", "fourth visible" };
+    const messages = [_][]const u8{"FOURTH_BEGIN change the implementation direction while keeping this distinguishing FOURTH_END"};
     var ctx = testContext(&input);
     ctx.queued_count = messages.len;
     ctx.steering_messages = &messages;
@@ -1628,9 +1682,9 @@ test "clamped steering banner keeps newest messages and escape hint" {
         .input_visible = true,
         .composer_top_chrome_rows = composerTopChromeRows(),
         .picker_rows = 0,
-        .footer_extra_rows = 2,
+        .footer_extra_rows = 3,
         .banner_active = true,
-        .banner_rows = 2,
+        .banner_rows = 3,
     };
 
     const frame_plan = planFooterPaint(&shell, planner_input);
@@ -1638,13 +1692,10 @@ test "clamped steering banner keeps newest messages and escape hint" {
     defer frame.deinit(alloc);
 
     const banner = frame_plan.paint.footer.banner;
-    try expectFrameRowTextTrimmed(&frame, banner, shell.layout.cols, "third visible");
-    try expectFrameRowTextTrimmed(
-        &frame,
-        banner + 1,
-        shell.layout.cols,
-        "fourth visible · Esc to steer now",
-    );
+    try expectFrameRowContains(&frame, banner, shell.layout.cols, "┋ FOURTH_BEGIN");
+    try expectFrameRowContains(&frame, banner + 1, shell.layout.cols, "FOURTH_END");
+    try expectFrameRowTextTrimmed(&frame, banner + 2, shell.layout.cols, "");
+    try expectFrameCellForeground(&frame, banner, shell.layout.cols, 1, .{ .indexed = 245 });
 }
 
 test "a hidden paused review keeps the summary row above its hint" {
@@ -1674,7 +1725,7 @@ test "a hidden paused review keeps the summary row above its hint" {
     ctx.queued_count = 1;
     ctx.queued_paused = true;
     ctx.queued_cancel_all_available = true;
-    const banner_rows = render_input.queuedBannerRows(ctx);
+    const banner_rows = render_input.queuedBannerRows(ctx, shell.layout.cols);
     const planner_input: FooterPlannerInput = .{
         .active_label = null,
         .ctx = ctx,
