@@ -21,6 +21,9 @@ import { createFxAgent } from "libfx";
 const agent = await createFxAgent({
   apiKey: process.env.AI_GATEWAY_API_KEY,
   model: "google/gemini-2.5-flash-lite",
+  onEvent(event) {
+    if (event.type === "transport.response") console.log(event.elapsedMs);
+  },
 });
 
 const turn = agent.prompt("Explain this project.");
@@ -37,6 +40,16 @@ await agent.close();
 `apiKey` is required. `model` is optional and defaults to fx's built-in model.
 Agent configuration uses named options; `env` is reserved for
 `createFxTerminal()`.
+
+The host selects the model. Agent creation and prompting do not fetch the
+Gateway model catalog.
+
+`onEvent` receives runtime diagnostics separately from model output. Transport
+events report request start, response status and elapsed time, safe Gateway
+request metadata, and failures. Credentials and raw headers are never included.
+
+libfx makes at most one automatic retry after a retryable transport failure and
+only before model output or tool effects escape. Cancellation prevents a retry.
 
 `prompt(input, { signal? })` accepts a string or text/resource blocks. It
 returns an async iterable of normalized events:
@@ -57,6 +70,23 @@ const restored = await createFxAgent({ apiKey, model, checkpoint });
 The checkpoint contains conversation history and usage only. The host owns
 durable storage and must resupply models, credentials, instructions, tools,
 MCP clients, and skill records.
+
+## Models
+
+Model discovery is explicit and does not create an Agent or load native or Wasm
+artifacts:
+
+```js
+import { listModels } from "libfx";
+
+const models = await listModels({
+  apiKey: process.env.AI_GATEWAY_API_KEY,
+});
+```
+
+`listModels()` performs one bounded Gateway request and returns sorted, unique
+language-model IDs. It accepts the same optional `fetch` override as the Agent
+API.
 
 ## JavaScript tools and instructions
 
@@ -83,7 +113,9 @@ const agent = await createFxAgent({
 The JavaScript host is the authority for tool effects. The same descriptors,
 schemas, cancellation, results, and events are used by N-API and WebAssembly.
 Instructions are limited to 64 KiB of UTF-8 text, including text assembled by
-the MCP and skills adapters.
+the MCP and skills adapters. They are the complete host-owned system context:
+libfx adds no hidden base prompt, and omitting `instructions` sends no system
+message.
 
 ## MCP
 
