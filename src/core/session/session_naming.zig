@@ -298,8 +298,11 @@ pub const Runtime = struct {
         const alloc = self.alloc orelse return null;
         const provider_config = self.config.provider(input.provider_id);
         const model = provider_config.model orelse return null;
-        if (input.session_id.len == 0 or input.prompt.len == 0 or input.credential.secret.len == 0) return null;
-        if (!model_provider.authorizesCredential(input.provider_id, input.credential.source)) return null;
+        if (input.session_id.len == 0 or input.prompt.len == 0) return null;
+        const credential_secret = input.credential.secret() orelse "";
+        if (input.credential != .host_managed and credential_secret.len == 0) return null;
+        const credential_source = input.credential.credentialSource();
+        if (!model_provider.authorizesCredential(input.provider_id, credential_source)) return null;
         for (self.attempted_session_ids.items) |attempted| {
             if (std.mem.eql(u8, attempted, input.session_id)) return null;
         }
@@ -310,7 +313,7 @@ pub const Runtime = struct {
             .timeout_ms = self.config.timeout_ms,
             .provider = input.provider,
             .effort = provider_config.effort,
-            .credential_source = input.credential.source,
+            .credential_source = credential_source orelse return null,
         };
         errdefer prepared.deinit();
         prepared.session_id = try alloc.dupe(u8, input.session_id);
@@ -318,9 +321,9 @@ pub const Runtime = struct {
         prepared.workspace_root = try alloc.dupe(u8, input.workspace_root);
         prepared.home_dir = if (input.home_dir) |value| try alloc.dupe(u8, value) else null;
         prepared.model = try alloc.dupe(u8, model);
-        prepared.api_key = try alloc.dupe(u8, input.credential.secret);
-        prepared.account_id = if (input.credential.account_id) |value| try alloc.dupe(u8, value) else null;
-        prepared.team = if (input.credential.tenant) |value| try alloc.dupe(u8, value) else null;
+        prepared.api_key = try alloc.dupe(u8, credential_secret);
+        prepared.account_id = if (input.credential.accountId()) |value| try alloc.dupe(u8, value) else null;
+        prepared.team = if (input.credential.tenant()) |value| try alloc.dupe(u8, value) else null;
         return prepared;
     }
 
@@ -473,12 +476,15 @@ fn requestTitle(task: *Task, excerpt: []const u8, timeout_ms: u64) !?[]u8 {
     task.attempt_cancel.store(task.cancel_flag.load(.seq_cst), .seq_cst);
     var capture = TitleCapture{ .task = task };
     var result = task.provider.stream(task.alloc, .{
-        .credential = .{
-            .secret = task.api_key,
-            .source = task.credential_source,
-            .account_id = task.account_id,
-            .tenant = task.team,
-        },
+        .credential = if (task.credential_source == .host_managed)
+            .host_managed
+        else
+            .{ .direct = .{
+                .secret_bytes = task.api_key,
+                .source = task.credential_source,
+                .account_id = task.account_id,
+                .tenant_context = task.team,
+            } },
         .session_id = null,
         .model = task.model,
         .retry_count = 1,
@@ -1006,11 +1012,11 @@ fn testAdmission(provider: agent_stream_provider.Provider, session_id: []const u
         .home_dir = "/tmp/home",
         .provider_id = .codex,
         .provider = provider,
-        .credential = .{
-            .secret = "test-secret",
+        .credential = .{ .direct = .{
+            .secret_bytes = "test-secret",
             .source = .chatgpt_subscription,
             .account_id = "account",
-        },
+        } },
     };
 }
 
@@ -1024,7 +1030,7 @@ test "session naming rejects a credential from a different active provider" {
     defer runtime.deinit();
 
     var input = testAdmission(agent_stream_provider.unavailable_provider, "session-a");
-    input.credential.source = .ai_gateway_api_key;
+    input.credential.direct.source = .ai_gateway_api_key;
     try std.testing.expect((try runtime.prepareAdmission(input)) == null);
 }
 

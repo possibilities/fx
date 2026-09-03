@@ -1,5 +1,6 @@
 const std = @import("std");
 const api_key_validator = @import("api_key_validator.zig");
+const auth_transition = @import("auth_transition.zig");
 const credentials = @import("credentials.zig");
 const chatgpt_oauth = @import("chatgpt_oauth.zig");
 const grok_oauth = @import("grok_oauth.zig");
@@ -9,11 +10,13 @@ const login_flow = @import("login_flow.zig");
 const oauth = @import("oauth.zig");
 const model_provider = @import("../config/model_provider.zig");
 const provider_catalog = @import("provider_catalog.zig");
+const provider_picker_catalog = @import("provider_picker_catalog.zig");
 const oauth_transport = @import("oauth_transport.zig");
 const secret = @import("secret.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const io_mod = @import("../shared/io.zig");
 const text_utils = @import("../shared/text_utils.zig");
+const types = @import("../shared/types.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -43,7 +46,7 @@ const UnavailableSourcePolicy = enum {
 };
 
 const max_api_key_entry_bytes: usize = 8 * 1024;
-const max_api_key_mask_glyphs: usize = 32;
+const max_api_key_mask_glyphs = provider_picker_catalog.max_key_mask_glyphs;
 const max_manual_code_mask_glyphs: usize = 32;
 const max_team_query_bytes: usize = 256;
 
@@ -109,50 +112,202 @@ pub const FailureSnapshot = struct {
     }
 };
 
-/// Returns an owned token when the selected provider credential can refresh.
-/// The caller must release it with `secret.zeroAndFree`.
-pub fn refreshCredentialToken(
-    transport: oauth_transport.Provider,
-    alloc: Allocator,
-    source: credentials.Source,
-    mode: CredentialRefreshMode,
-) !?[]u8 {
-    return refreshCredentialTokenForAccount(transport, alloc, source, mode, null);
-}
-
-pub fn refreshCredentialTokenForAccount(
+/// Returns one complete owned credential after a provider-specific refresh.
+/// The caller owns every field and must call `Credential.deinit`.
+pub fn refreshCredentialForAccount(
     transport: oauth_transport.Provider,
     alloc: Allocator,
     source: credentials.Source,
     mode: CredentialRefreshMode,
     expected_account_id: ?[]const u8,
-) !?[]u8 {
+) !?credentials.Credential {
     if (!credentials.sourceRefreshable(source)) return null;
 
-    var credential = switch (source) {
+    var credential = (loadCredentialForRefresh(alloc, transport, source, mode) catch |err| {
+        debug_trace.logf(
+            "auth",
+            "credential refresh provider failed source={t} mode={t} err={s}",
+            .{ source, mode, @errorName(err) },
+        );
+        return err;
+    }) orelse return null;
+    errdefer credential.deinit(alloc);
+    if (expected_account_id) |expected| {
+        const actual = credential.accountId() orelse {
+            debug_trace.logf("auth", "credential refresh rejected stage=account_missing source={t}", .{source});
+            return error.ChatGptAccountChanged;
+        };
+        if (!std.mem.eql(u8, expected, actual)) {
+            debug_trace.logf("auth", "credential refresh rejected stage=account_changed source={t}", .{source});
+            return error.ChatGptAccountChanged;
+        }
+    }
+    return credential;
+}
+
+fn loadCredentialForRefresh(
+    alloc: Allocator,
+    transport: oauth_transport.Provider,
+    source: credentials.Source,
+    mode: CredentialRefreshMode,
+) !?credentials.Credential {
+    return switch (source) {
         .fx_login => switch (mode) {
-            .if_needed => (try credentials.loadFxLoginCredential(alloc, transport)) orelse return null,
-            .force => (try credentials.refreshFxLoginCredential(alloc, transport)) orelse return null,
+            .if_needed => credentials.loadFxLoginCredential(alloc, transport),
+            .force => credentials.refreshFxLoginCredential(alloc, transport),
         },
         .chatgpt_subscription => switch (mode) {
-            .if_needed => (try credentials.loadSource(alloc, transport, host.unavailable_secret_store, source)) orelse return null,
-            .force => (try credentials.refreshChatGptCredential(alloc, transport)) orelse return null,
+            .if_needed => credentials.loadSource(alloc, transport, host.unavailable_secret_store, source),
+            .force => credentials.refreshChatGptCredential(alloc, transport),
         },
         .grok_subscription => switch (mode) {
-            .if_needed => (try credentials.loadSource(alloc, transport, host.unavailable_secret_store, source)) orelse return null,
-            .force => (try credentials.refreshGrokCredential(alloc, transport)) orelse return null,
+            .if_needed => credentials.loadSource(alloc, transport, host.unavailable_secret_store, source),
+            .force => credentials.refreshGrokCredential(alloc, transport),
         },
-        else => unreachable,
+        else => null,
     };
-    defer credential.deinit(alloc);
-    if (expected_account_id) |expected| {
-        const actual = credential.accountId() orelse return error.ChatGptAccountChanged;
-        if (!std.mem.eql(u8, expected, actual)) return error.ChatGptAccountChanged;
-    }
+}
 
-    const token = credential.token;
-    credential.token = &.{};
-    return token;
+/// Resolves and refreshes one provider credential. The returned value is owned
+/// by the caller and must be released with `Credential.deinit`.
+/// Non-null `preferred` is exact; only null permits Gateway precedence.
+pub fn prepareCredential(
+    alloc: Allocator,
+    transport: oauth_transport.Provider,
+    secret_store: host.SecretStore,
+    provider: model_provider.ProviderId,
+    preferred: ?credentials.Source,
+) Allocator.Error!?credentials.Credential {
+    var resolution = credentials.resolveForProvider(
+        alloc,
+        transport,
+        secret_store,
+        .refresh_if_needed,
+        provider,
+        preferred,
+    ) catch |err| {
+        if (err == error.OutOfMemory) return error.OutOfMemory;
+        debug_trace.logf(
+            "auth",
+            "credential preparation failed provider={t} source={s} err={s}",
+            .{
+                provider,
+                if (requestedSource(provider, preferred)) |source| @tagName(source) else "automatic",
+                @errorName(err),
+            },
+        );
+        return null;
+    };
+    return prepareResolvedCredential(
+        alloc,
+        provider,
+        io_mod.milliTimestamp(),
+        &resolution,
+    );
+}
+
+fn prepareResolvedCredential(
+    alloc: Allocator,
+    provider: model_provider.ProviderId,
+    now_ms: i64,
+    resolution: *credentials.Resolution,
+) ?credentials.Credential {
+    var credential = resolution.credential orelse return null;
+    resolution.credential = null;
+
+    const blocked = credential.token.len == 0 or
+        !model_provider.authorizesCredential(provider, credential.source) or
+        credential.needsRefreshAt(now_ms) or
+        (credential.source == .fx_login and
+            (credential.gatewayTeam() == null or
+                !types.validGatewayTeam(credential.gatewayTeam().?))) or
+        ((provider == .codex or provider == .grok) and
+            (credential.accountId() == null or
+                !types.validCredentialAccountId(credential.accountId().?)));
+
+    if (blocked) {
+        credential.deinit(alloc);
+        return null;
+    }
+    return credential;
+}
+
+fn requestedSource(
+    provider: model_provider.ProviderId,
+    preferred: ?credentials.Source,
+) ?credentials.Source {
+    return switch (provider) {
+        .gateway => preferred,
+        .codex => .chatgpt_subscription,
+        .grok => .grok_subscription,
+    };
+}
+
+test "credential preparation blocks an unavailable explicit source" {
+    var resolution = credentials.Resolution{ .fx_login_status = .unavailable };
+    const prepared = prepareResolvedCredential(
+        std.testing.allocator,
+        .gateway,
+        100,
+        &resolution,
+    );
+    try std.testing.expect(prepared == null);
+}
+
+test "credential preparation moves one fresh provider-authorized credential" {
+    var resolution = credentials.Resolution{ .credential = .{
+        .token = try std.testing.allocator.dupe(u8, "fresh-token"),
+        .source = .fx_login,
+        .team_id = try std.testing.allocator.dupe(u8, "team_123"),
+        .refresh_after_ms = 200,
+    } };
+    var credential = prepareResolvedCredential(
+        std.testing.allocator,
+        .gateway,
+        100,
+        &resolution,
+    ) orelse return error.TestExpectedPreparedCredential;
+    defer credential.deinit(std.testing.allocator);
+
+    try std.testing.expect(resolution.credential == null);
+    try std.testing.expectEqual(credentials.Source.fx_login, credential.source);
+    try std.testing.expectEqualStrings("fresh-token", credential.token);
+    try std.testing.expectEqualStrings("team_123", credential.gatewayTeam().?);
+}
+
+test "credential preparation rejects refresh-due and provider-mismatched credentials" {
+    const cases = [_]struct {
+        provider: model_provider.ProviderId,
+        credential: credentials.Credential,
+    }{
+        .{
+            .provider = .gateway,
+            .credential = .{
+                .token = try std.testing.allocator.dupe(u8, "expired-token"),
+                .source = .fx_login,
+                .team_id = try std.testing.allocator.dupe(u8, "team_123"),
+                .refresh_after_ms = 100,
+            },
+        },
+        .{
+            .provider = .codex,
+            .credential = .{
+                .token = try std.testing.allocator.dupe(u8, "gateway-token"),
+                .source = .ai_gateway_api_key,
+            },
+        },
+    };
+    for (cases) |case| {
+        var resolution = credentials.Resolution{ .credential = case.credential };
+        var prepared = prepareResolvedCredential(
+            std.testing.allocator,
+            case.provider,
+            100,
+            &resolution,
+        );
+        defer if (prepared) |*credential| credential.deinit(std.testing.allocator);
+        try std.testing.expect(prepared == null);
+    }
 }
 
 pub const AcquisitionAction = enum {
@@ -338,8 +493,15 @@ const ApiKeySaveRuntime = struct {
     }
 };
 
+pub const InventoryRefreshDestination = enum {
+    auth_picker,
+    provider_picker_login,
+    provider_picker_command,
+};
+
 pub const InventoryRefreshAction = struct {
     provider: model_provider.ProviderId,
+    destination: InventoryRefreshDestination = .auth_picker,
 };
 
 pub const InventoryRefreshStart = enum {
@@ -476,6 +638,7 @@ pub const PickerView = struct {
     sign_in_code_visible: bool = false,
     sign_in_code_mask_count: usize = 0,
     api_key_mask_count: usize = 0,
+    api_key_inline: bool = false,
 
     pub fn activeSourceLabel(self: PickerView) []const u8 {
         return sourceLabelOrMissing(self.active_source);
@@ -663,6 +826,7 @@ pub const StatusSnapshot = struct {
     team: ?[]const u8 = null,
     owned_team: ?[]u8 = null,
     stored_key_status: credentials.StoredKeyReadStatus = .not_attempted,
+    fx_login_status: credentials.FxLoginReadStatus = .not_attempted,
     gateway_connected: bool = false,
     chatgpt_connected: bool = false,
     grok_connected: bool = false,
@@ -687,6 +851,12 @@ pub const StatusSnapshot = struct {
     pub fn missingHelp(self: StatusSnapshot, surface: MissingHelpSurface) ?[]const u8 {
         if (self.active_source != null) return null;
         if (self.stored_key_status == .unavailable) return credentials.unreadable_store_message;
+        if (self.required_source == .fx_login) {
+            return if (self.fx_login_status == .unavailable)
+                "The saved fx login could not be loaded. Run fx login to repair this source; no other credential was selected."
+            else
+                "fx login is selected but unavailable. Run fx login to reconnect; no other credential was selected.";
+        }
         if (self.required_source == .chatgpt_subscription) {
             return switch (surface) {
                 .cli => credentials.missing_chatgpt_credential_message,
@@ -802,6 +972,7 @@ pub fn loadStatusSnapshotForProvider(
             .team = owned_team,
             .owned_team = owned_team,
             .stored_key_status = resolution.stored_key_status,
+            .fx_login_status = resolution.fx_login_status,
             .gateway_connected = gateway_connected,
             .chatgpt_connected = chatgpt_connected,
             .grok_connected = grok_connected,
@@ -814,8 +985,9 @@ pub fn loadStatusSnapshotForProvider(
         else if (provider == .grok)
             .grok_subscription
         else
-            null,
+            preferred,
         .stored_key_status = resolution.stored_key_status,
+        .fx_login_status = resolution.fx_login_status,
         .gateway_connected = gateway_connected,
         .chatgpt_connected = chatgpt_connected,
         .grok_connected = grok_connected,
@@ -828,6 +1000,7 @@ pub const View = struct {
     selected_team: ?[]const u8,
     refreshable: bool,
     stored_key_status: credentials.StoredKeyReadStatus,
+    fx_login_status: credentials.FxLoginReadStatus,
     onboarding_skipped: bool,
 
     pub fn activeSourceLabel(self: View) []const u8 {
@@ -841,7 +1014,7 @@ pub const View = struct {
 };
 
 pub const GatewayCredential = struct {
-    api_key: []const u8,
+    api_key: ?[]const u8,
     gateway_team: ?[]const u8,
     source: credentials.Source,
 };
@@ -852,10 +1025,12 @@ pub const Runtime = struct {
     api_key_validator: api_key_validator.Provider = api_key_validator.unavailable_provider,
     oauth_transport: oauth_transport.Provider = oauth_transport.unavailable_provider,
     secret_store: host.SecretStore = host.unavailable_secret_store,
+    auth_mode: credentials.AuthMode = .local,
     selected_credential: ?credentials.Credential = null,
     credential_refresh_failure_source: ?credentials.Source = null,
     source_inventory: SourceSet = .empty,
     stored_key_status: credentials.StoredKeyReadStatus = .not_attempted,
+    fx_login_status: credentials.FxLoginReadStatus = .not_attempted,
     onboarding_skipped: bool = false,
     picker_active: bool = false,
     picker_selection: ?Choice = null,
@@ -871,6 +1046,9 @@ pub const Runtime = struct {
     sign_in_code_visible: bool = false,
     sign_in_code_input: std.ArrayList(u8) = .empty,
     api_key_input: std.ArrayList(u8) = .empty,
+    /// The key field is rendered as a `/provider` column instead of the staged
+    /// panel, so the composer keeps showing which path the user walked.
+    api_key_inline: bool = false,
     api_key_returns_to_root: bool = false,
     api_key_save: ApiKeySaveRuntime = .{},
     inventory_refresh_task: ?*InventoryRefreshTask = null,
@@ -880,10 +1058,20 @@ pub const Runtime = struct {
         transport: oauth_transport.Provider,
         secret_store: host.SecretStore,
     ) Self {
+        return initWithMode(validator, transport, secret_store, .local);
+    }
+
+    pub fn initWithMode(
+        validator: api_key_validator.Provider,
+        transport: oauth_transport.Provider,
+        secret_store: host.SecretStore,
+        auth_mode: credentials.AuthMode,
+    ) Self {
         return .{
             .api_key_validator = validator,
             .oauth_transport = transport,
             .secret_store = secret_store,
+            .auth_mode = auth_mode,
         };
     }
 
@@ -895,8 +1083,18 @@ pub const Runtime = struct {
         transport: oauth_transport.Provider,
         secret_store: host.SecretStore,
     ) void {
+        initIntoWithMode(storage, validator, transport, secret_store, .local);
+    }
+
+    pub fn initIntoWithMode(
+        storage: *Self,
+        validator: api_key_validator.Provider,
+        transport: oauth_transport.Provider,
+        secret_store: host.SecretStore,
+        auth_mode: credentials.AuthMode,
+    ) void {
         comptime {
-            if (std.meta.fields(Self).len != 25) {
+            if (std.meta.fields(Self).len != 28) {
                 @compileError("update Runtime.initInto for the changed field set");
             }
         }
@@ -904,10 +1102,12 @@ pub const Runtime = struct {
         storage.api_key_validator = validator;
         storage.oauth_transport = transport;
         storage.secret_store = secret_store;
+        storage.auth_mode = auth_mode;
         storage.selected_credential = null;
         storage.credential_refresh_failure_source = null;
         storage.source_inventory = .empty;
         storage.stored_key_status = .not_attempted;
+        storage.fx_login_status = .not_attempted;
         storage.onboarding_skipped = false;
         storage.picker_active = false;
         storage.picker_selection = null;
@@ -923,6 +1123,7 @@ pub const Runtime = struct {
         storage.sign_in_code_visible = false;
         storage.sign_in_code_input = .empty;
         storage.api_key_input = .empty;
+        storage.api_key_inline = false;
         storage.api_key_returns_to_root = false;
         storage.api_key_save = .{};
         storage.inventory_refresh_task = null;
@@ -947,8 +1148,17 @@ pub const Runtime = struct {
     }
 
     fn gatewayCredentialAt(self: *const Self, now_ms: i64) ?GatewayCredential {
+        if (self.auth_mode == .host_managed) return .{
+            .api_key = null,
+            .gateway_team = null,
+            .source = .host_managed,
+        };
         const credential = self.selected_credential orelse return null;
         if (credential.needsRefreshAt(now_ms)) return null;
+        if (credential.source == .fx_login) {
+            const team = credential.gatewayTeam() orelse return null;
+            if (!types.validGatewayTeam(team)) return null;
+        }
         return .{
             .api_key = credential.token,
             .gateway_team = credential.gatewayTeam(),
@@ -961,6 +1171,14 @@ pub const Runtime = struct {
         return credential.api_key;
     }
 
+    pub fn isHostManaged(self: *const Self) bool {
+        return self.auth_mode == .host_managed;
+    }
+
+    pub fn authMode(self: *const Self) credentials.AuthMode {
+        return self.auth_mode;
+    }
+
     pub fn oauthTransport(self: *const Self) oauth_transport.Provider {
         return self.oauth_transport;
     }
@@ -970,6 +1188,7 @@ pub const Runtime = struct {
     }
 
     pub fn modelCatalogAccess(self: *const Self) credentials.CatalogAccess {
+        if (self.auth_mode == .host_managed) return .host_managed;
         if (self.credential_refresh_failure_source) |source| {
             return credentials.catalogAccessAfterRefreshFailure(source);
         }
@@ -982,11 +1201,13 @@ pub const Runtime = struct {
     }
 
     pub fn credentialSource(self: *const Self) ?credentials.Source {
+        if (self.auth_mode == .host_managed) return .host_managed;
         const credential = self.selected_credential orelse return null;
         return credential.source;
     }
 
     pub fn accountId(self: *const Self) ?[]const u8 {
+        if (self.auth_mode == .host_managed) return null;
         const credential = self.selected_credential orelse return null;
         return credential.accountId();
     }
@@ -1010,6 +1231,12 @@ pub const Runtime = struct {
     }
 
     fn statusSnapshotAt(self: *const Self, now_ms: i64) StatusSnapshot {
+        if (self.auth_mode == .host_managed) return .{
+            .active_source = .host_managed,
+            .gateway_connected = true,
+            .chatgpt_connected = true,
+            .grok_connected = true,
+        };
         const gateway_connected = self.source_inventory.contains(.vercel_oidc_token) or
             self.source_inventory.contains(.ai_gateway_api_key) or
             self.source_inventory.contains(.fx_login) or
@@ -1042,6 +1269,7 @@ pub const Runtime = struct {
             .selected_team = if (self.selected_credential) |credential| credential.gatewayTeam() else null,
             .refreshable = if (active_source) |source| credentials.sourceRefreshable(source) else false,
             .stored_key_status = self.stored_key_status,
+            .fx_login_status = self.fx_login_status,
             .onboarding_skipped = self.onboarding_skipped,
         };
     }
@@ -1049,9 +1277,11 @@ pub const Runtime = struct {
     pub fn recordStartupStatus(
         self: *Self,
         stored_key_status: credentials.StoredKeyReadStatus,
+        fx_login_status: credentials.FxLoginReadStatus,
         onboarding_skipped: bool,
     ) void {
         self.stored_key_status = stored_key_status;
+        self.fx_login_status = fx_login_status;
         self.onboarding_skipped = onboarding_skipped;
     }
 
@@ -1060,6 +1290,10 @@ pub const Runtime = struct {
     }
 
     pub fn refreshSourceInventory(self: *Self, alloc: Allocator) !void {
+        if (self.auth_mode == .host_managed) {
+            self.source_inventory = .empty;
+            return;
+        }
         try self.refreshSourceInventoryWithProbe(alloc, self, probeCredentialSource);
     }
 
@@ -1119,6 +1353,7 @@ pub const Runtime = struct {
     }
 
     pub fn refreshChatGptSourceInventory(self: *Self, alloc: Allocator) !void {
+        if (self.auth_mode == .host_managed) return;
         if (try credentials.sourceExists(alloc, self.secret_store, .chatgpt_subscription)) {
             self.source_inventory.insert(.chatgpt_subscription);
         } else if (self.credentialSource() != .chatgpt_subscription) {
@@ -1127,6 +1362,7 @@ pub const Runtime = struct {
     }
 
     pub fn refreshGrokSourceInventory(self: *Self, alloc: Allocator) !void {
+        if (self.auth_mode == .host_managed) return;
         if (try credentials.sourceExists(alloc, self.secret_store, .grok_subscription)) {
             self.source_inventory.insert(.grok_subscription);
         } else if (self.credentialSource() != .grok_subscription) {
@@ -1198,7 +1434,8 @@ pub const Runtime = struct {
             .sign_in_source = self.sign_in_source,
             .sign_in_code_visible = self.sign_in_code_visible,
             .sign_in_code_mask_count = @min(self.sign_in_code_input.items.len, max_manual_code_mask_glyphs),
-            .api_key_mask_count = @min(self.api_key_input.items.len, max_api_key_mask_glyphs),
+            .api_key_mask_count = self.apiKeyMaskCount(),
+            .api_key_inline = self.api_key_inline,
         };
     }
 
@@ -1221,6 +1458,21 @@ pub const Runtime = struct {
             return true;
         }
         return false;
+    }
+
+    /// Frees a team list adopted for the inline `/provider` picker. The staged
+    /// picker owns its list through its stages, so an active staged picker is
+    /// left alone.
+    pub fn releaseLoadedTeamSelection(self: *Self, alloc: Allocator) void {
+        if (self.picker_active) return;
+        self.clearTeamSelection(alloc);
+    }
+
+    /// Takes ownership of a loaded team list without opening the staged picker
+    /// band, so the inline `/provider` picker can render the teams as a column.
+    pub fn adoptTeamSelection(self: *Self, alloc: Allocator, selection: *login_flow.TeamSelection) void {
+        self.clearTeamSelection(alloc);
+        self.team_selection = selection.take();
     }
 
     pub fn openTeamPicker(self: *Self, alloc: Allocator, selection: *login_flow.TeamSelection) void {
@@ -1314,6 +1566,30 @@ pub const Runtime = struct {
         self.picker_stage = .api_key;
         self.picker_selection = null;
         self.api_key_returns_to_root = returns_to_root;
+    }
+
+    /// Opens the key field for the inline `/provider` picker. The stage is the
+    /// same one the staged panel uses, so entry, saving, and cancelling all
+    /// keep working; only the rendering differs.
+    pub fn openApiKeyPickerInline(self: *Self, alloc: Allocator) void {
+        self.openApiKeyPickerWithParent(alloc, false);
+        self.api_key_inline = true;
+    }
+
+    pub fn apiKeyInlineActive(self: *const Self) bool {
+        return self.apiKeyEntryActive() and self.api_key_inline;
+    }
+
+    pub fn apiKeyMaskCount(self: *const Self) usize {
+        return @min(self.api_key_input.items.len, max_api_key_mask_glyphs);
+    }
+
+    /// Leaves the key field without saving, zeroing whatever was typed.
+    pub fn cancelInlineApiKeyEntry(self: *Self, alloc: Allocator) void {
+        if (!self.apiKeyInlineActive()) return;
+        self.exitApiKeyStage(alloc, .screen_replacement);
+        self.picker_active = false;
+        self.picker_stage = .root;
     }
 
     pub fn openSignInPicker(self: *Self, alloc: Allocator) !bool {
@@ -1691,22 +1967,29 @@ pub const Runtime = struct {
         }
     }
 
-    pub fn teamSelection(self: *Self) ?*login_flow.TeamSelection {
-        if (!self.picker_active or self.picker_stage != .change_team) return null;
+    /// The loaded team list regardless of which picker is presenting it: the
+    /// staged picker only shows it during its team stage, while the inline
+    /// `/provider` picker renders it as a column without opening a stage.
+    pub fn loadedTeamSelection(self: *Self) ?*login_flow.TeamSelection {
         return if (self.team_selection) |*selection| selection else null;
     }
 
-    /// Moves the credential into this session and returns whether its source,
-    /// token, effective Gateway team, or readiness changed.
+    /// Moves the credential into this session and returns whether any observed
+    /// credential field changed. Callers that distinguish secret rotation from
+    /// authority replacement should use `adoptPreparedCredential`.
     pub fn adoptCredential(self: *Self, alloc: Allocator, credential: *credentials.Credential) bool {
-        const changed = if (self.selected_credential) |selected|
-            selected.source != credential.source or
-                !std.mem.eql(u8, selected.token, credential.token) or
-                !optionalBytesEqual(selected.accountId(), credential.accountId()) or
-                !optionalBytesEqual(selected.gatewayTeam(), credential.gatewayTeam()) or
-                selected.refresh_after_ms != credential.refresh_after_ms
-        else
-            true;
+        return self.adoptPreparedCredential(alloc, credential) != .none;
+    }
+
+    /// Moves one complete prepared credential into this runtime. The result
+    /// separates token/refresh-deadline rotation from provider, source,
+    /// account, or team authority changes so callers can preserve valid caches.
+    pub fn adoptPreparedCredential(
+        self: *Self,
+        alloc: Allocator,
+        credential: *credentials.Credential,
+    ) auth_transition.CredentialChange {
+        const change = self.preparedCredentialChange(credential.*);
         const source = credential.source;
         if (self.selected_credential) |*selected| selected.deinit(alloc);
 
@@ -1719,7 +2002,22 @@ pub const Runtime = struct {
         self.source_inventory.insert(source);
         if (source == .fx_login) self.fx_login_session_available = true;
         if (source == .stored_key) self.stored_key_status = .not_attempted;
-        return changed;
+        return change;
+    }
+
+    pub fn preparedCredentialChange(
+        self: *const Self,
+        credential: credentials.Credential,
+    ) auth_transition.CredentialChange {
+        return if (self.selected_credential) |selected|
+            auth_transition.decideCredentialChange(
+                credentialAuthorityFacts(selected),
+                credentialAuthorityFacts(credential),
+                !std.mem.eql(u8, selected.token, credential.token) or
+                    selected.refresh_after_ms != credential.refresh_after_ms,
+            )
+        else
+            .authority;
     }
 
     pub fn adoptSelectedTeam(self: *Self, alloc: Allocator, selected_team: *login_flow.SelectedTeam) bool {
@@ -1759,6 +2057,7 @@ pub const Runtime = struct {
         alloc: Allocator,
         provider: model_provider.ProviderId,
     ) !?bool {
+        if (self.auth_mode == .host_managed) return false;
         return switch (provider) {
             .codex => if (self.credentialSource() == .chatgpt_subscription)
                 false
@@ -1790,17 +2089,20 @@ pub const Runtime = struct {
         };
     }
 
-    pub fn refreshFxLoginIfNeeded(self: *Self, alloc: Allocator) !bool {
-        const source = self.credentialSource() orelse return false;
-        if (!credentials.sourceRefreshable(source)) return false;
+    pub fn refreshSelectedCredentialIfNeeded(
+        self: *Self,
+        alloc: Allocator,
+    ) !auth_transition.CredentialChange {
+        const source = self.credentialSource() orelse return .none;
+        if (!credentials.sourceRefreshable(source)) return .none;
 
         const loaded = (try credentials.loadSource(alloc, self.oauth_transport, self.secret_store, source)) orelse {
             if (self.credentialNeedsRefresh()) return error.CredentialRefreshUnavailable;
-            return false;
+            return .none;
         };
         var credential = loaded;
         defer credential.deinit(alloc);
-        return self.adoptCredential(alloc, &credential);
+        return self.adoptPreparedCredential(alloc, &credential);
     }
 
     /// Drops the current selection and re-runs precedence after the user clears
@@ -1917,6 +2219,7 @@ pub const Runtime = struct {
     }
 
     fn exitApiKeyStage(self: *Self, alloc: Allocator, reason: ApiKeyExitReason) void {
+        self.api_key_inline = false;
         const byte_count = self.api_key_input.items.len;
         if (self.api_key_input.capacity > 0) {
             const allocated = self.api_key_input.allocatedSlice();
@@ -1958,6 +2261,33 @@ test "auth in-place initialization preserves empty runtime state" {
     try std.testing.expect(runtime.api_key_input.items.len == 0);
 }
 
+test "host-managed runtime exposes authority without local credential state" {
+    var runtime = Runtime.initWithMode(
+        api_key_validator.unavailable_provider,
+        oauth_transport.unavailable_provider,
+        host.unavailable_secret_store,
+        .host_managed,
+    );
+    defer runtime.deinit(std.testing.allocator);
+
+    try std.testing.expect(runtime.isHostManaged());
+    try std.testing.expect(runtime.apiKey() == null);
+    try std.testing.expect(runtime.accountId() == null);
+    try std.testing.expect(runtime.gatewayTeam() == null);
+    try std.testing.expectEqual(credentials.Source.host_managed, runtime.credentialSource().?);
+    try std.testing.expectEqual(credentials.Source.host_managed, runtime.gatewayCredential().?.source);
+    try std.testing.expect(runtime.gatewayCredential().?.api_key == null);
+    try std.testing.expectEqual(credentials.CatalogAccess.host_managed, runtime.modelCatalogAccess());
+    const status = runtime.statusSnapshot();
+    try std.testing.expectEqual(credentials.Source.host_managed, status.active_source.?);
+    try std.testing.expect(status.gateway_connected);
+    try std.testing.expect(status.chatgpt_connected);
+    try std.testing.expect(status.grok_connected);
+    try std.testing.expect(!status.refreshable());
+    try runtime.refreshSourceInventory(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 0), runtime.source_inventory.count());
+}
+
 fn probeCredentialSource(raw_context: ?*anyopaque, _: Allocator, source: credentials.Source) !bool {
     const self: *Runtime = @ptrCast(@alignCast(raw_context.?));
     return sourcePresenceAvailable(credentials.sourcePresence(self.secret_store, source), .fail);
@@ -1997,7 +2327,17 @@ fn loadCredentialSource(_: ?*anyopaque, alloc: Allocator, source: credentials.So
 
 fn loadRuntimeCredentialSource(raw: ?*anyopaque, alloc: Allocator, source: credentials.Source) !?credentials.Credential {
     const self: *Runtime = @ptrCast(@alignCast(raw.?));
-    return credentials.loadSource(alloc, self.oauth_transport, self.secret_store, source);
+    // Interactive selection paths run on keypresses; a source whose refresh
+    // the issuer rejects must read as "unavailable" (the callers all explain
+    // that), not ride a `try` chain out of the event loop. `resolve()` keeps
+    // its own error handling for startup status reporting.
+    return credentials.loadSource(alloc, self.oauth_transport, self.secret_store, source) catch |err| switch (err) {
+        error.OutOfMemory => err,
+        else => {
+            debug_trace.logf("auth", "credential load failed source={t} err={s}", .{ source, @errorName(err) });
+            return null;
+        },
+    };
 }
 
 fn storeRuntimeSecret(raw: ?*anyopaque, alloc: Allocator, value: []const u8) !void {
@@ -2048,6 +2388,19 @@ fn optionalBytesEqual(a: ?[]const u8, b: ?[]const u8) bool {
     if (a == null and b == null) return true;
     if (a == null or b == null) return false;
     return std.mem.eql(u8, a.?, b.?);
+}
+
+fn credentialAuthorityFacts(credential: credentials.Credential) auth_transition.CredentialAuthorityFacts {
+    return .{
+        .provider = switch (credential.source) {
+            .chatgpt_subscription => .codex,
+            .grok_subscription => .grok,
+            else => .gateway,
+        },
+        .source = credential.source,
+        .account_id = credential.accountId(),
+        .team = credential.gatewayTeam(),
+    };
 }
 
 fn makeTestCredential(
@@ -2187,13 +2540,14 @@ fn expectApiKeyAllocationCleared(
     try std.testing.expect(std.mem.indexOf(u8, backing, sentinel) == null);
 }
 
-test "auth runtime token refresher ignores non-refreshable credential sources" {
+test "auth runtime complete credential refresher ignores non-refreshable sources" {
     for ([_]credentials.Source{ .vercel_oidc_token, .ai_gateway_api_key, .stored_key }) |source| {
-        try std.testing.expect((try refreshCredentialToken(
+        try std.testing.expect((try refreshCredentialForAccount(
             oauth_transport.unavailable_provider,
             std.testing.allocator,
             source,
             .force,
+            null,
         )) == null);
     }
 }
@@ -2297,6 +2651,33 @@ test "auth runtime adopts credential ownership and prefers team id" {
     try std.testing.expect(!runtime.adoptCredential(alloc, &unchanged));
 }
 
+test "auth runtime adoption distinguishes secret rotation from authority change" {
+    const alloc = std.testing.allocator;
+    var runtime: Runtime = .{};
+    defer runtime.deinit(alloc);
+
+    var initial = try makeTestCredential(alloc, "token-a", .fx_login, "team_123", "vercel-labs");
+    defer initial.deinit(alloc);
+    try std.testing.expectEqual(
+        auth_transition.CredentialChange.authority,
+        runtime.adoptPreparedCredential(alloc, &initial),
+    );
+
+    var refreshed = try makeTestCredential(alloc, "token-b", .fx_login, "team_123", "vercel-labs");
+    defer refreshed.deinit(alloc);
+    try std.testing.expectEqual(
+        auth_transition.CredentialChange.secret_only,
+        runtime.adoptPreparedCredential(alloc, &refreshed),
+    );
+
+    var moved_team = try makeTestCredential(alloc, "token-c", .fx_login, "team_456", "other-team");
+    defer moved_team.deinit(alloc);
+    try std.testing.expectEqual(
+        auth_transition.CredentialChange.authority,
+        runtime.adoptPreparedCredential(alloc, &moved_team),
+    );
+}
+
 test "auth runtime exposes one current Gateway credential for prompt admission" {
     const alloc = std.testing.allocator;
     var runtime: Runtime = .{};
@@ -2309,9 +2690,20 @@ test "auth runtime exposes one current Gateway credential for prompt admission" 
     _ = runtime.adoptCredential(alloc, &credential);
 
     const gateway_credential = runtime.gatewayCredential().?;
-    try std.testing.expectEqualStrings("token-a", gateway_credential.api_key);
+    try std.testing.expectEqualStrings("token-a", gateway_credential.api_key.?);
     try std.testing.expectEqualStrings("team_123", gateway_credential.gateway_team.?);
     try std.testing.expectEqual(credentials.Source.fx_login, gateway_credential.source);
+}
+
+test "auth runtime never admits a teamless fx login credential" {
+    const alloc = std.testing.allocator;
+    var runtime: Runtime = .{};
+    defer runtime.deinit(alloc);
+    var credential = try makeTestCredential(alloc, "token-a", .fx_login, null, null);
+    defer credential.deinit(alloc);
+    _ = runtime.adoptCredential(alloc, &credential);
+
+    try std.testing.expect(runtime.gatewayCredential() == null);
 }
 
 test "auth runtime withholds an fx credential across its expiry boundary" {
@@ -2342,7 +2734,7 @@ test "auth runtime withholds an fx credential across its expiry boundary" {
     refreshed.refresh_after_ms = 140_000;
     try std.testing.expect(runtime.adoptCredential(alloc, &refreshed));
     try std.testing.expect(!runtime.credentialNeedsRefreshAt(40_000));
-    try std.testing.expectEqualStrings("stale-token", runtime.gatewayCredentialAt(40_000).?.api_key);
+    try std.testing.expectEqualStrings("stale-token", runtime.gatewayCredentialAt(40_000).?.api_key.?);
 }
 
 test "auth runtime view preserves missing and loaded states" {
@@ -2350,12 +2742,13 @@ test "auth runtime view preserves missing and loaded states" {
     var runtime: Runtime = .{};
     defer runtime.deinit(alloc);
 
-    runtime.recordStartupStatus(.unavailable, true);
+    runtime.recordStartupStatus(.unavailable, .unavailable, true);
     const missing = runtime.view();
     try std.testing.expect(missing.active_source == null);
     try std.testing.expect(missing.selected_team == null);
     try std.testing.expect(!missing.refreshable);
     try std.testing.expectEqual(credentials.StoredKeyReadStatus.unavailable, missing.stored_key_status);
+    try std.testing.expectEqual(credentials.FxLoginReadStatus.unavailable, missing.fx_login_status);
     try std.testing.expect(missing.onboarding_skipped);
     try std.testing.expectEqual(GatewayTeamStatus.unknown, missing.gatewayTeamStatus());
     try std.testing.expectEqual(@as(usize, 0), missing.available_inactive_sources.count());
@@ -2432,6 +2825,16 @@ test "auth status snapshot distinguishes an absent store from an unreadable one"
 
     const resolved = StatusSnapshot{ .active_source = .fx_login, .stored_key_status = .unavailable };
     try std.testing.expect(resolved.missingHelp(.cli) == null);
+}
+
+test "auth status keeps an unavailable explicit fx login distinct from automatic absence" {
+    const status = StatusSnapshot{
+        .required_source = .fx_login,
+        .fx_login_status = .unavailable,
+    };
+    const help = status.missingHelp(.cli).?;
+    try std.testing.expect(std.mem.find(u8, help, "Run fx login") != null);
+    try std.testing.expect(std.mem.find(u8, help, "no other credential was selected") != null);
 }
 
 test "auth status snapshot reports an expired session without claiming it is unrefreshable" {
@@ -2582,7 +2985,13 @@ test "auth runtime pins every supported credential source to the session" {
         .stored_key,
     };
     for (sources) |source| {
-        var credential = try makeTestCredential(alloc, @tagName(source), source, null, null);
+        var credential = try makeTestCredential(
+            alloc,
+            @tagName(source),
+            source,
+            if (source == .fx_login) "team_1" else null,
+            null,
+        );
         defer credential.deinit(alloc);
         _ = runtime.adoptCredential(alloc, &credential);
 
@@ -2594,7 +3003,13 @@ test "auth runtime pins every supported credential source to the session" {
 test "auth runtime explicitly selects the requested credential source" {
     const Loader = struct {
         fn load(_: ?*anyopaque, alloc: Allocator, source: credentials.Source) !?credentials.Credential {
-            return try makeTestCredential(alloc, @tagName(source), source, null, null);
+            return try makeTestCredential(
+                alloc,
+                @tagName(source),
+                source,
+                if (source == .fx_login) "team_1" else null,
+                null,
+            );
         }
     };
 
@@ -2657,7 +3072,13 @@ const LogoutFixture = struct {
         const self: *@This() = @ptrCast(@alignCast(ctx.?));
         self.load_count += 1;
         if (!self.existing.contains(source)) return null;
-        return try makeTestCredential(alloc, @tagName(source), source, null, null);
+        return try makeTestCredential(
+            alloc,
+            @tagName(source),
+            source,
+            if (source == .fx_login) "team_1" else null,
+            null,
+        );
     }
 };
 
@@ -2740,7 +3161,7 @@ test "logout reconciliation adopts a newer concurrent fx login" {
     var runtime: Runtime = .{};
     defer runtime.deinit(alloc);
 
-    var active = try makeTestCredential(alloc, "old-fx-token", .fx_login, null, null);
+    var active = try makeTestCredential(alloc, "old-fx-token", .fx_login, "team_1", null);
     defer active.deinit(alloc);
     _ = runtime.adoptCredential(alloc, &active);
 
@@ -2834,7 +3255,7 @@ test "auth picker navigation skips disabled hub actions" {
     ));
 }
 
-test "setup picker projects the active Vercel team" {
+test "provider picker projects the active Vercel team" {
     const alloc = std.testing.allocator;
     var runtime: Runtime = .{};
     defer runtime.deinit(alloc);

@@ -29,12 +29,15 @@ pub fn Runtime(comptime App: type) type {
                 .home_dir = io_mod.getenv("HOME"),
                 .provider_id = provider_runtime.provider(app),
                 .provider = app.agentStreamProvider(),
-                .credential = .{
-                    .secret = credential.api_key,
-                    .source = credential.source,
-                    .account_id = app.auth.accountId(),
-                    .tenant = credential.gateway_team,
-                },
+                .credential = if (credential.source == .host_managed)
+                    .host_managed
+                else
+                    .{ .direct = .{
+                        .secret_bytes = credential.api_key orelse "",
+                        .source = credential.source,
+                        .account_id = app.auth.accountId(),
+                        .tenant_context = credential.gateway_team,
+                    } },
             }) catch |err| {
                 debug_trace.logf(
                     "session_naming",
