@@ -59,6 +59,7 @@ pub const Boundary = enum {
     before_recovery_prior_validation,
     after_recovery_latest_snapshot,
     before_recovery_latest_publication,
+    before_read_boundary_validation,
     latest_barrier_contended,
     latest_barrier_completed,
 };
@@ -456,6 +457,23 @@ pub const CommitLifecycle = struct {
                 else => err,
             };
         }
+    }
+
+    fn prepareRequired(
+        self: *CommitLifecycle,
+        alloc: Allocator,
+        session_id: []const u8,
+        workspace_root: []const u8,
+        commit_lock_deadline_ms: u64,
+    ) !bool {
+        try self.prepare(
+            alloc,
+            session_id,
+            workspace_root,
+            workspace_root,
+            commit_lock_deadline_ms,
+        );
+        return false;
     }
 
     fn prepareOpportunistic(
@@ -1184,14 +1202,23 @@ pub const Root = struct {
         };
         var writable_owned = true;
         errdefer if (writable_owned) writable.deinit(alloc);
+        var cache_deferred = false;
         if (lifecycle_value) |*value| {
-            value.prepare(
-                alloc,
-                initial_state.id,
-                initial_state.workspace_root,
-                initial_state.workspace_root,
-                options.commit_lock_deadline_ms,
-            ) catch |err| {
+            const preparation = if (initial_state.history.len == 0)
+                value.prepareOpportunistic(
+                    alloc,
+                    initial_state.id,
+                    initial_state.workspace_root,
+                    options.commit_lock_deadline_ms,
+                )
+            else
+                value.prepareRequired(
+                    alloc,
+                    initial_state.id,
+                    initial_state.workspace_root,
+                    options.commit_lock_deadline_ms,
+                );
+            cache_deferred = preparation catch |err| {
                 writable.deinit(alloc);
                 writable_owned = false;
                 sessions.dir.deleteTree(io_mod.getIo(), initial_state.id) catch |cleanup_err| {
@@ -1220,11 +1247,38 @@ pub const Root = struct {
             options,
         );
         writable_owned = false;
-        errdefer created.deinit(alloc);
+        var created_owned = true;
+        errdefer if (created_owned) created.deinit(alloc);
         if (lifecycle_value) |value| {
             try created.installCommitLifecycle(value);
             lifecycle_value = null;
-            if (!created.publishCommitLifecycle(alloc)) {
+            if (cache_deferred) {
+                created.writeDeferredCommitLifecycle(
+                    alloc,
+                    created.position,
+                ) catch |err| {
+                    created.deinit(alloc);
+                    created_owned = false;
+                    sessions.dir.deleteTree(io_mod.getIo(), initial_state.id) catch |cleanup_err| {
+                        debug_trace.logf(
+                            "session",
+                            "event=deferred_session_cleanup_failed err={s}",
+                            .{@errorName(cleanup_err)},
+                        );
+                        return cleanup_err;
+                    };
+                    io_mod.syncVerifiedDir(sessions.dir) catch |cleanup_err| {
+                        debug_trace.logf(
+                            "session",
+                            "event=deferred_session_cleanup_sync_failed err={s}",
+                            .{@errorName(cleanup_err)},
+                        );
+                        return cleanup_err;
+                    };
+                    return err;
+                };
+                created.state_replacement_pending = true;
+            } else if (!created.publishCommitLifecycle(alloc)) {
                 created.state_replacement_pending = true;
             }
         }
@@ -1280,7 +1334,8 @@ pub const Root = struct {
             },
             else => return err,
         };
-        defer lock.release();
+        var lock_held = true;
+        defer if (lock_held) lock.release();
         try requireIntentAbsent(alloc, &session_dir, authority_intent_file);
         var marker = try loadAuthority(alloc, &session_dir, session_id);
         defer marker.deinit(alloc);
@@ -1288,17 +1343,24 @@ pub const Root = struct {
         var log_file = try openManagedFile(&session_dir, events_file, .read_only);
         errdefer log_file.close(io_mod.getIo());
         const generation = try session_replay.readFirstGeneration(alloc, log_file);
-        const position = try loadAndValidateWatermark(
+        const position = try loadWatermarkPosition(
             alloc,
             &session_dir,
             session_id,
             generation,
-            log_file,
         );
-        const usage_sidecar = try session_usage_sidecar.capture(
+        var usage_sidecar = try session_usage_sidecar.capture(
             alloc,
             &session_dir,
         );
+        errdefer usage_sidecar.deinit(alloc);
+        // The watermark and open handle preserve the committed prefix across
+        // later appends or a generation rename. Validate it without blocking writers.
+        lock.release();
+        lock_held = false;
+
+        try options.test_controls.boundary(.before_read_boundary_validation);
+        _ = try session_replay.scanCommitPosition(alloc, log_file, position);
         return .{
             .log_file = log_file,
             .position = position,
@@ -7401,6 +7463,111 @@ test "lock ordering is session before commit and read boundary uses commit only"
     boundary.deinit();
     try std.testing.expectEqual(@as(usize, 1), read_trace.len);
     try std.testing.expectEqual(LockKind.commit, read_trace.items[0]);
+}
+
+test "read boundary validation does not block a concurrent append" {
+    const alloc = std.testing.allocator;
+    var temp = try TempRoot.init(alloc);
+    defer temp.deinit(alloc);
+    var initial = try testState(alloc, "read-boundary-concurrent-append", 10);
+    defer initial.deinit(alloc);
+    var loaded = try temp.root.startWritableSession(alloc, initial, .{});
+    defer loaded.deinit(alloc);
+    const captured_position = loaded.position;
+
+    const AppendDuringValidation = struct {
+        loaded: *LoadedWritableSession,
+        alloc: Allocator,
+        attempted: bool = false,
+        failure: ?anyerror = null,
+
+        fn hit(raw: ?*anyopaque, point: Boundary) !void {
+            if (point != .before_read_boundary_validation) return;
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.attempted = true;
+            _ = self.loaded.appendEvent(
+                self.alloc,
+                .{ .preferences_changed = .{ .fast_mode = true } },
+                20,
+                .retry_expected_tail,
+                .{ .commit_lock_deadline_ms = 0 },
+            ) catch |err| {
+                self.failure = err;
+                return;
+            };
+        }
+    };
+    var append = AppendDuringValidation{
+        .loaded = &loaded,
+        .alloc = alloc,
+    };
+
+    var boundary = try temp.root.captureReadBoundary(
+        alloc,
+        initial.id,
+        .{ .test_controls = .{
+            .context = &append,
+            .boundary_fn = AppendDuringValidation.hit,
+        } },
+    );
+    defer boundary.deinit();
+
+    try std.testing.expect(append.attempted);
+    try std.testing.expectEqual(@as(?anyerror, null), append.failure);
+    try std.testing.expect(std.meta.eql(captured_position, boundary.position));
+    try std.testing.expect(loaded.state.preferences.fast_mode);
+    var captured = try session_replay.replayBoundary(
+        alloc,
+        boundary.log_file,
+        boundary.position,
+    );
+    defer captured.deinit(alloc);
+    try std.testing.expect(!captured.preferences.fast_mode);
+}
+
+test "read boundary validation still rejects a corrupt committed prefix" {
+    const alloc = std.testing.allocator;
+    var temp = try TempRoot.init(alloc);
+    defer temp.deinit(alloc);
+    var initial = try testState(alloc, "read-boundary-corrupt-prefix", 10);
+    defer initial.deinit(alloc);
+    var loaded = try temp.root.startWritableSession(alloc, initial, .{});
+    defer loaded.deinit(alloc);
+    var usage = session_usage.Usage.initFresh();
+    defer usage.deinit(alloc);
+    var usage_snapshot = try usage.snapshot(alloc);
+    defer usage_snapshot.deinit(alloc);
+    _ = try loaded.appendEvent(
+        alloc,
+        .{ .usage_checkpointed = .{ .usage = usage_snapshot } },
+        20,
+        .retry_expected_tail,
+        .{},
+    );
+    const corrupt_frame_start = loaded.position.through_event_log_bytes;
+    _ = try loaded.appendEvent(
+        alloc,
+        .{ .preferences_changed = .{ .fast_mode = true } },
+        21,
+        .retry_expected_tail,
+        .{},
+    );
+
+    var log = try openManagedFile(&loaded.log.dir, events_file, .read_write);
+    defer log.close(io_mod.getIo());
+    try replaceFrameByteForTest(
+        alloc,
+        log,
+        corrupt_frame_start,
+        loaded.position.through_event_log_bytes,
+        "preferences_changed",
+        'X',
+    );
+
+    try std.testing.expectError(
+        error.InvalidSessionFormat,
+        temp.root.captureReadBoundary(alloc, initial.id, .{}),
+    );
 }
 
 test "writable resume can fail immediately at a contended commit boundary" {

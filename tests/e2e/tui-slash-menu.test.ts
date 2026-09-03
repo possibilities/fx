@@ -3464,7 +3464,12 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
 
       expect(gateway.requests).toHaveLength(1);
       const firstPrompt = gatewayPromptText(gateway.requests[0]!.body);
-      expect(firstPrompt).toContain("Explicitly invoked skill content for this query");
+      expect(firstPrompt).toContain(
+        "Every skill below is already loaded and must be used for this query.",
+      );
+      expect(firstPrompt).toContain(
+        "If a skill cannot be followed, state the blocker instead of silently substituting another workflow.",
+      );
       expect(firstPrompt).toContain('<skill_content name="exact-picker"');
       expect(firstPrompt).toContain(fixture.workspaceDescription);
       expect(firstPrompt).toContain(fixture.bodyB);

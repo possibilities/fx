@@ -5,6 +5,7 @@ const command_admission = @import("../permissions/command_admission.zig");
 const permission_auto_classifier = @import("../permissions/auto_classifier.zig");
 const auth_runtime = @import("../auth/auth_runtime.zig");
 const credentials = @import("../auth/credentials.zig");
+const secret = @import("../auth/secret.zig");
 const model_capabilities = @import("../config/model_capabilities.zig");
 const input_completion_runtime = @import("input_completion_runtime.zig");
 const app_permission_runtime = @import("app_permission_runtime.zig");
@@ -271,6 +272,15 @@ pub fn Bindings(comptime App: type) type {
                     app.agentStreamProvider()
                 else
                     agent_stream_provider.unavailable_provider,
+                .compaction_route = if (comptime @hasDecl(App, "compactionRoute"))
+                    app.compactionRoute()
+                else if (comptime @hasDecl(App, "providerSet") and @hasField(App, "auth"))
+                    app.providerSet().compactionRoute(
+                        provider_runtime.provider(app),
+                        app.auth.credentialSource(),
+                    )
+                else
+                    .{ .unavailable = .missing_policy },
                 .cooperative_transport_pulse = if (comptime @hasDecl(App, "cooperativeTransportPulse")) .{
                     .ctx = @ptrCast(app),
                     .run = cooperativeTransportPulse,
@@ -283,7 +293,7 @@ pub fn Bindings(comptime App: type) type {
                 else
                     null,
                 .finalize_turn = agentFinalizeTurn,
-                .take_steering = if (comptime @hasDecl(@TypeOf(app.worker), "takeSteering")) agentTakeSteering else null,
+                .take_steering_boundary = if (comptime @hasDecl(@TypeOf(app.worker), "takeSteeringBoundary")) agentTakeSteeringBoundary else null,
                 .append_runtime_context = agentAppendRuntimeContext,
                 .append_static_context = agentAppendStaticContext,
                 .validate_tool_call = agentValidateToolCall,
@@ -301,6 +311,7 @@ pub fn Bindings(comptime App: type) type {
                 .execute_tool_call = agentExecuteToolCall,
                 .publish_committed_file_handoff = agentPublishCommittedFileHandoff,
                 .propagate_history_turn = agentPropagateHistoryTurn,
+                .commit_context_compaction = .{ .commit = agentCommitContextCompaction },
                 .recovery_checkpoint = if (comptime @hasField(App, "session_persistence"))
                     if (app.session_persistence.writable != null)
                         .{
@@ -377,25 +388,40 @@ pub fn Bindings(comptime App: type) type {
             expected_account_id: ?[]const u8,
         ) !?[]u8 {
             const app: *App = @ptrCast(@alignCast(raw_ctx));
-            if (comptime @hasField(App, "profile_home")) {
-                if (app.profile_home) |home_dir| {
-                    return auth_runtime.refreshCredentialTokenForAccountFromHome(
-                        app.auth.oauthTransport(),
-                        alloc,
-                        source,
-                        mode,
-                        expected_account_id,
-                        home_dir,
-                    );
-                }
+            const isolated_home: ?[]const u8 = if (comptime @hasField(App, "profile_home"))
+                app.profile_home
+            else
+                null;
+            var refreshed = (if (isolated_home) |home_dir|
+                try auth_runtime.refreshCredentialForAccountFromHome(
+                    app.auth.oauthTransport(),
+                    std.heap.c_allocator,
+                    source,
+                    mode,
+                    expected_account_id,
+                    home_dir,
+                )
+            else
+                try auth_runtime.refreshCredentialForAccount(
+                    app.auth.oauthTransport(),
+                    std.heap.c_allocator,
+                    source,
+                    mode,
+                    expected_account_id,
+                )) orelse return null;
+            var owns_refreshed = true;
+            defer if (owns_refreshed) refreshed.deinit(std.heap.c_allocator);
+            if (app.auth.preparedCredentialChange(refreshed) == .authority) {
+                return error.CredentialAuthorityChanged;
             }
-            return auth_runtime.refreshCredentialTokenForAccount(
-                app.auth.oauthTransport(),
-                alloc,
-                source,
-                mode,
-                expected_account_id,
-            );
+
+            const worker_token = try alloc.dupe(u8, refreshed.token);
+            errdefer secret.zeroAndFree(alloc, worker_token);
+            try app_worker_runtime.Runtime(App).pushOwnedEvent(app, .{
+                .credential_refreshed = refreshed,
+            });
+            owns_refreshed = false;
+            return worker_token;
         }
 
         pub fn modelCapabilityResolver(app: *App) model_capabilities.Resolver {
@@ -427,9 +453,11 @@ pub fn Bindings(comptime App: type) type {
                 .drain_assistant_text = workerBridgeDrainAssistantText,
                 .open_model_picker = workerBridgeOpenModelPicker,
                 .semantic_notice = workerBridgeSemanticNotice,
+                .credential_refreshed = workerBridgeCredentialRefreshed,
                 .command_output = workerBridgeCommandOutput,
                 .command_output_complete = workerBridgeCommandOutputComplete,
                 .diff_block = workerBridgeDiffBlock,
+                .context_compaction = workerBridgeContextCompaction,
                 .append_history_turn = workerBridgeAppendHistoryTurn,
                 .session_grant = workerBridgeSessionGrant,
                 .error_text = workerBridgeErrorText,
@@ -559,15 +587,35 @@ pub fn Bindings(comptime App: type) type {
             });
         }
 
-        fn agentTakeSteering(ctx: *anyopaque, arena: std.mem.Allocator, turn_id: u64) ![]const []const u8 {
+        fn agentTakeSteeringBoundary(
+            ctx: *anyopaque,
+            arena: std.mem.Allocator,
+            turn_id: u64,
+            kind: worker_runtime.SteeringBoundaryKind,
+        ) !worker_runtime.SteeringBoundaryResult {
             const app: *App = @ptrCast(@alignCast(ctx));
-            const owned = try app.worker.takeSteering(std.heap.c_allocator, turn_id);
+            const result = try app.worker.takeSteeringBoundary(
+                std.heap.c_allocator,
+                turn_id,
+                kind,
+            );
+            return switch (result) {
+                .continue_turn => |owned| .{
+                    .continue_turn = try copyOwnedSteering(arena, owned),
+                },
+                .none => .none,
+                .handoff => .handoff,
+                .interrupt => .interrupt,
+            };
+        }
+
+        fn copyOwnedSteering(arena: std.mem.Allocator, owned: [][]u8) ![][]u8 {
             if (owned.len == 0) return &.{};
             defer {
                 for (owned) |text| std.heap.c_allocator.free(text);
                 std.heap.c_allocator.free(owned);
             }
-            const result = try arena.alloc([]const u8, owned.len);
+            const result = try arena.alloc([]u8, owned.len);
             for (owned, result) |text, *dest| dest.* = try arena.dupe(u8, text);
             return result;
         }
@@ -674,7 +722,7 @@ pub fn Bindings(comptime App: type) type {
                 .name = call.name,
                 .arguments_json = call.arguments_json,
                 .model_output = model_output,
-                .ok = false,
+                .outcome = .rejected,
                 .started_at_ms = io_mod.milliTimestamp(),
             });
         }
@@ -767,6 +815,19 @@ pub fn Bindings(comptime App: type) type {
         fn agentPropagateHistoryTurn(ctx: *anyopaque, turn: HistoryTurn) !void {
             const app: *App = @ptrCast(@alignCast(ctx));
             try app_worker_runtime.Runtime(App).propagateHistoryTurn(app, turn, app.session.max_history_turns);
+        }
+
+        fn agentCommitContextCompaction(
+            ctx: *anyopaque,
+            summary: types.CompactedSummaryHistoryTurn,
+        ) !void {
+            const app: *App = @ptrCast(@alignCast(ctx));
+            const turn = types.HistoryTurn{ .compacted_summary = summary };
+            try app_worker_runtime.Runtime(App).commitContextCompaction(
+                app,
+                turn,
+                app.session.max_history_turns,
+            );
         }
 
         fn agentSetRecoveryCheckpoint(
@@ -894,11 +955,20 @@ pub fn Bindings(comptime App: type) type {
             else
                 try gateway_error_format.formatHttpErrorMessage(std.heap.c_allocator, status, detail);
             defer std.heap.c_allocator.free(message);
-            const label = if (auth_failure != null)
+            const label = if (auth_failure) |failure|
                 try std.fmt.allocPrint(
                     std.heap.c_allocator,
-                    "⚠ {s} · Run /setup to choose another source.",
-                    .{message},
+                    "⚠ {s} · {s}",
+                    .{
+                        message,
+                        switch (failure.source) {
+                            .fx_login => "Run /login to repair this source.",
+                            .chatgpt_subscription => "Reconnect Codex through /login to repair this source.",
+                            .grok_subscription => "Reconnect Grok through /login to repair this source.",
+                            .vercel_oidc_token, .ai_gateway_api_key, .stored_key => "Run /provider to repair this source.",
+                            .host_managed => credentials.host_managed_auth_message,
+                        },
+                    },
                 )
             else
                 try std.fmt.allocPrint(std.heap.c_allocator, "⚠ {s}", .{message});
@@ -1068,6 +1138,20 @@ pub fn Bindings(comptime App: type) type {
             try app.writeDomainNotice(notice, true);
         }
 
+        fn workerBridgeCredentialRefreshed(
+            ctx: *anyopaque,
+            credential: credentials.Credential,
+        ) !void {
+            if (comptime !@hasField(App, "auth")) return;
+            const app: *App = @ptrCast(@alignCast(ctx));
+            var owned = try credential.clone(app.alloc);
+            defer owned.deinit(app.alloc);
+            if (app.auth.preparedCredentialChange(owned) == .authority) {
+                return error.CredentialAuthorityChanged;
+            }
+            _ = app.auth.adoptPreparedCredential(app.alloc, &owned);
+        }
+
         fn workerBridgeCommandOutput(
             ctx: *anyopaque,
             lifecycle_id: ?types.ToolLifecycleId,
@@ -1094,6 +1178,11 @@ pub fn Bindings(comptime App: type) type {
         fn workerBridgeDiffBlock(ctx: *anyopaque, payload: diff_mod.DiffEntryPayload) !void {
             const app: *App = @ptrCast(@alignCast(ctx));
             try app.registerAndEmitDiffBlock(payload);
+        }
+
+        fn workerBridgeContextCompaction(ctx: *anyopaque, turn: types.HistoryTurn) !void {
+            const app: *App = @ptrCast(@alignCast(ctx));
+            try app_session_runtime.Runtime(App).appendHistoryTurn(app, turn);
         }
 
         fn workerBridgeAppendHistoryTurn(ctx: *anyopaque, finished: types.FinishedPrompt) !void {
@@ -1705,6 +1794,41 @@ const NoOverridePersistentApp = struct {
     }
 };
 
+const CredentialRefreshApp = struct {
+    alloc: std.mem.Allocator = std.testing.allocator,
+    auth: auth_runtime.Runtime = .{},
+
+    fn deinit(self: *CredentialRefreshApp) void {
+        self.auth.deinit(self.alloc);
+    }
+};
+
+test "worker credential publication adopts secret rotation on the app owner" {
+    const alloc = std.testing.allocator;
+    var app: CredentialRefreshApp = .{};
+    defer app.deinit();
+    var initial = credentials.Credential{
+        .token = try alloc.dupe(u8, "stale-token"),
+        .source = .fx_login,
+        .team_id = try alloc.dupe(u8, "team_123"),
+        .refresh_after_ms = 10,
+    };
+    defer initial.deinit(alloc);
+    _ = app.auth.adoptCredential(alloc, &initial);
+
+    var refreshed = credentials.Credential{
+        .token = try alloc.dupe(u8, "fresh-token"),
+        .source = .fx_login,
+        .team_id = try alloc.dupe(u8, "team_123"),
+        .refresh_after_ms = std.math.maxInt(i64),
+    };
+    defer refreshed.deinit(alloc);
+    try Bindings(CredentialRefreshApp).workerBridgeCredentialRefreshed(&app, refreshed);
+
+    try std.testing.expectEqualStrings("fresh-token", app.auth.apiKey().?);
+    try std.testing.expectEqualStrings("team_123", app.auth.gatewayTeam().?);
+}
+
 test "agent deps forward app callbacks through core types" {
     var app = FakeApp.init(std.testing.allocator);
     defer app.deinit();
@@ -1789,7 +1913,7 @@ test "agent deps record rejected tool calls in feedback diagnostics" {
     var buf: [1]diagnostics.ToolCallMetric = undefined;
     const n = diagnostics.snapshotToolCalls(&buf);
     try std.testing.expectEqual(@as(usize, 1), n);
-    try std.testing.expect(!buf[0].ok);
+    try std.testing.expectEqual(diagnostics.ToolCallOutcome.rejected, buf[0].outcome);
     try std.testing.expectEqualStrings("run_command", buf[0].name());
     try std.testing.expect(std.mem.find(u8, buf[0].args(), "touch /tmp/denied") != null);
     try std.testing.expect(std.mem.find(u8, buf[0].result(), "tool_permission_denied") != null);
@@ -2264,10 +2388,10 @@ test "worker bridge history append fallback updates runtime history" {
     try std.testing.expectEqual(@as(usize, 1), app.session.historyLen());
     try std.testing.expectEqualStrings(
         "persist me",
-        app.session.history.items[0].assistant.user.text,
+        app.session.agent.history.items[0].assistant.user.text,
     );
     try std.testing.expectEqualStrings(
         "saved",
-        app.session.history.items[0].assistant.assistant,
+        app.session.agent.history.items[0].assistant.assistant,
     );
 }

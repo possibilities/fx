@@ -3,6 +3,7 @@ const agent_runtime = @import("../agent/agent_runtime.zig");
 const worker_runtime = @import("../agent/worker_runtime.zig");
 const auth_runtime = @import("../auth/auth_runtime.zig");
 const credentials = @import("../auth/credentials.zig");
+const secret = @import("../auth/secret.zig");
 const model_provider = @import("../config/model_provider.zig");
 const model_capabilities = @import("../config/model_capabilities.zig");
 const provider_set = @import("../gateway/provider_set.zig");
@@ -65,6 +66,7 @@ const Context = struct {
     input_tokens: u64 = 0,
     output_tokens: u64 = 0,
     turn_outcome: ?types.TurnPresentationOutcome = null,
+    refreshed_credential: ?credentials.Credential = null,
 
     fn toolContext(self: *Context) tool_runtime.Context {
         var result = self.config.tool_context;
@@ -146,21 +148,19 @@ pub fn run(
         admission.provider,
         config.tool_context.credential_source,
     )) {
-        const resolution = (if (config.tool_context.profile_home) |home|
-            credentials.resolveForProviderFromHome(
+        routed_credential = (if (config.tool_context.profile_home) |home|
+            auth_runtime.prepareCredentialFromHome(
                 turn.alloc,
                 config.tool_context.oauth_transport,
-                .refresh_if_needed,
                 admission.provider,
                 config.tool_context.credential_source,
                 home,
             )
         else
-            credentials.resolveForProvider(
+            auth_runtime.prepareCredential(
                 turn.alloc,
                 config.tool_context.oauth_transport,
                 config.tool_context.secret_store,
-                .refresh_if_needed,
                 admission.provider,
                 config.tool_context.credential_source,
             )) catch |err| {
@@ -169,7 +169,6 @@ pub fn run(
                 return error.OutOfMemory;
             return error.ProviderFailed;
         };
-        routed_credential = resolution.credential;
         const credential = if (routed_credential) |*value| value else {
             turn.setFailureDiagnostic("model_credential_missing", admission.model) catch
                 return error.OutOfMemory;
@@ -202,6 +201,7 @@ pub fn run(
         .cancel = cancel,
         .subagent_id = trace_context.subagent_id,
     };
+    defer if (context.refreshed_credential) |*credential| credential.deinit(turn.alloc);
     const history = turn.sessionRuntime().snapshotHistory(arena) catch return error.OutOfMemory;
     const recovery_checkpoint = turn.snapshotRecoveryCheckpoint(arena) catch
         return error.OutOfMemory;
@@ -223,6 +223,8 @@ pub fn run(
             null,
         .permission_mode = admission.permission_mode,
         .history = history,
+        .context_history_start = turn.sessionRuntime().contextHistoryStart(),
+        .unversioned_history_count = turn.sessionRuntime().unversionedHistoryEnd(),
         .root_user_intent_context = if (message.root_user_intent_context.len > 0)
             arena.dupe(u8, message.root_user_intent_context) catch return error.OutOfMemory
         else
@@ -266,6 +268,7 @@ pub fn run(
     );
     const deps = runtimeDeps(&context);
     execution.runNormalAgentTurn(
+        &turn.sessionRuntime().agent,
         &deps,
         null,
         .{
@@ -361,6 +364,7 @@ fn runtimeDeps(context: *Context) agent_runtime.AgentRuntimeDeps {
     return .{
         .ctx = context,
         .agent_stream_provider = context.config.tool_context.agent_stream_provider,
+        .compaction_route = context.config.tool_context.compaction_route,
         .tool_registry = context.config.tool_context.tool_registry,
         .context_registry = context.config.context_registry,
         .context_enabled = context.config.context_enabled,
@@ -415,23 +419,56 @@ fn refreshGatewayCredential(
     expected_account_id: ?[]const u8,
 ) !?[]u8 {
     const context: *Context = @ptrCast(@alignCast(raw));
-    if (context.config.tool_context.profile_home) |home| {
-        return auth_runtime.refreshCredentialTokenForAccountFromHome(
+    var refreshed = (if (context.config.tool_context.profile_home) |home|
+        try auth_runtime.refreshCredentialForAccountFromHome(
             context.config.tool_context.oauth_transport,
-            alloc,
+            context.turn.alloc,
             source,
             mode,
             expected_account_id,
             home,
-        );
+        )
+    else
+        try auth_runtime.refreshCredentialForAccount(
+            context.config.tool_context.oauth_transport,
+            context.turn.alloc,
+            source,
+            mode,
+            expected_account_id,
+        )) orelse return null;
+    defer refreshed.deinit(context.turn.alloc);
+    if (context.config.tool_context.credential_source != refreshed.source or
+        !optionalCredentialFieldEqual(
+            context.config.tool_context.account_id,
+            refreshed.accountId(),
+        ) or
+        !optionalCredentialFieldEqual(
+            context.config.tool_context.gateway_team,
+            refreshed.gatewayTeam(),
+        ))
+    {
+        return error.CredentialAuthorityChanged;
     }
-    return auth_runtime.refreshCredentialTokenForAccount(
-        context.config.tool_context.oauth_transport,
-        alloc,
-        source,
-        mode,
-        expected_account_id,
-    );
+
+    const worker_token = try alloc.dupe(u8, refreshed.token);
+    errdefer secret.zeroAndFree(alloc, worker_token);
+    if (context.refreshed_credential) |*current| current.deinit(context.turn.alloc);
+    context.refreshed_credential = refreshed;
+    refreshed.token = &.{};
+    refreshed.account_id = null;
+    refreshed.team_id = null;
+    refreshed.team_slug = null;
+    const current = &context.refreshed_credential.?;
+    context.config.tool_context.api_key = current.token;
+    context.config.tool_context.credential_source = current.source;
+    context.config.tool_context.account_id = current.accountId();
+    context.config.tool_context.gateway_team = current.gatewayTeam();
+    return worker_token;
+}
+
+fn optionalCredentialFieldEqual(left: ?[]const u8, right: ?[]const u8) bool {
+    if (left == null or right == null) return left == null and right == null;
+    return std.mem.eql(u8, left.?, right.?);
 }
 
 fn finalizeTurn(

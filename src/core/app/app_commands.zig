@@ -365,7 +365,7 @@ pub fn Handlers(comptime App: type) type {
                 .show_help = commandShowHelp,
                 .login = commandLogin,
                 .logout = commandLogout,
-                .setup = commandSetup,
+                .provider = commandProvider,
                 .show_status = commandShowStatus,
                 .attach_image = commandAttachImage,
                 .manage_images = commandManageImages,
@@ -723,15 +723,15 @@ pub fn Handlers(comptime App: type) type {
             }
         }
 
-        fn commandSetup(ctx: *anyopaque) !void {
+        fn commandProvider(ctx: *anyopaque) !void {
             const app: *App = @ptrCast(@alignCast(ctx));
-            if (comptime @hasDecl(App, "openSetupHub")) {
-                try app.openSetupHub();
+            if (comptime @hasDecl(App, "runProviderCommand")) {
+                try app.runProviderCommand();
             } else {
                 try app.writeDomainNotice(.{
-                    .topic = "setup",
+                    .topic = "provider",
                     .tone = .@"error",
-                    .body = "setup is not available in this runtime",
+                    .body = "provider selection is not available in this runtime",
                 }, true);
             }
         }
@@ -1955,11 +1955,34 @@ pub fn Handlers(comptime App: type) type {
 
         fn commandCompactHistory(ctx: *anyopaque) !void {
             const app: *App = @ptrCast(@alignCast(ctx));
-            try app_session_runtime.Runtime(App).compactHistory(app);
+            if (comptime @hasDecl(App, "enqueueContextCompaction")) {
+                if (!app.hasContextToCompact()) {
+                    try app.writeDomainNotice(.{
+                        .topic = "context",
+                        .tone = .neutral,
+                        .body = "No context to compact.",
+                    }, true);
+                    return;
+                }
+                if (try app.enqueueContextCompaction()) {
+                    try app.writeDomainNotice(.{
+                        .topic = "context",
+                        .tone = .neutral,
+                        .body = "Compaction queued.",
+                    }, true);
+                } else {
+                    try app.writeDomainNotice(.{
+                        .topic = "context",
+                        .tone = .warning,
+                        .body = "Wait for the active work to finish before compacting context.",
+                    }, true);
+                }
+                return;
+            }
             try app.writeDomainNotice(.{
                 .topic = "context",
                 .tone = .neutral,
-                .body = "Context compacted.",
+                .body = "No context to compact.",
             }, true);
         }
 
@@ -2198,9 +2221,9 @@ fn buildTraceReport(app: anytype) ![]u8 {
 
     try writeCurrentStateSummary(&out.writer, app, app.alloc);
     try writeProblemsSummary(&out.writer, app, app.alloc);
-    try writeLastInterruptedDetail(&out.writer, app.session.history.items, app.alloc);
+    try writeLastInterruptedDetail(&out.writer, app.session.agent.history.items, app.alloc);
     try writeNetworkCallsSummary(&out.writer);
-    try writeToolCallsSummary(&out.writer, app.alloc, app.session.history.items);
+    try writeToolCallsSummary(&out.writer, app.alloc, app.session.agent.history.items);
     try writePermissionsSummary(&out.writer, app.permission_engine.grants.items);
     try writeRuntimeContextSummary(&out.writer, app, app.alloc);
     try writeRendererState(&out.writer, app, app.alloc);
@@ -2480,7 +2503,7 @@ fn writeProblemsSummary(writer: *std.Io.Writer, app: anytype, alloc: std.mem.All
         }
     }
 
-    if (lastInterruptedTurn(app.session.history.items)) |entry| {
+    if (lastInterruptedTurn(app.session.agent.history.items)) |entry| {
         count += 1;
         try writer.writeAll("- interrupted turn");
         if (entry.tool_call) |call| try writer.print(" in_flight_tool={s}", .{traceToolDisplayName(call.name)});
@@ -2509,7 +2532,7 @@ fn writeProblemsSummary(writer: *std.Io.Writer, app: anytype, alloc: std.mem.All
     while (ti > 0 and tool_reported < 5) {
         ti -= 1;
         const call = tool_buf[ti];
-        if (call.ok) continue;
+        if (call.outcome == .succeeded) continue;
         count += 1;
         tool_reported += 1;
         try writer.writeAll("- tool ");
@@ -2725,7 +2748,7 @@ fn writePermissionsSummary(writer: *std.Io.Writer, grants: []const types.Permiss
 
 fn writeToolCallCompact(writer: *std.Io.Writer, call: diagnostics.ToolCallMetric) !void {
     try writeTraceTimestampUtc(writer, call.started_at_ms);
-    try writer.print(" name={s} status={s} duration={d}ms", .{ traceToolDisplayName(call.name()), if (call.ok) "ok" else "err", call.duration_ms });
+    try writer.print(" name={s} outcome={s} duration={d}ms", .{ traceToolDisplayName(call.name()), @tagName(call.outcome), call.duration_ms });
     if (call.subagent_id != 0) try writer.print(" source=subagent#{d}", .{call.subagent_id}) else try writer.writeAll(" source=parent");
     try writer.writeByte('\n');
 }
@@ -2818,19 +2841,31 @@ noinline fn writeToolCallsSummary(
     if (n == 0) {
         try writer.writeAll("(none locally executed)\n");
     } else {
-        var ok_count: u32 = 0;
-        var error_count: u32 = 0;
+        var succeeded_count: u32 = 0;
+        var rejected_count: u32 = 0;
+        var command_failed_count: u32 = 0;
+        var tool_failed_count: u32 = 0;
+        var runtime_failed_count: u32 = 0;
         var total_ms: u64 = 0;
         for (buf[0..n]) |call| {
-            if (call.ok) ok_count += 1 else error_count += 1;
+            switch (call.outcome) {
+                .succeeded => succeeded_count += 1,
+                .rejected => rejected_count += 1,
+                .command_failed => command_failed_count += 1,
+                .tool_failed => tool_failed_count += 1,
+                .runtime_failed => runtime_failed_count += 1,
+            }
             total_ms += call.duration_ms;
         }
 
-        try writer.print("last={d} ok={d} errors={d} total={d}ms\n", .{ n, ok_count, error_count, total_ms });
-        if (error_count > 0) {
-            try writer.writeAll("errors first:\n");
+        try writer.print(
+            "last={d} succeeded={d} rejected={d} command_failed={d} tool_failed={d} runtime_failed={d} total={d}ms\n",
+            .{ n, succeeded_count, rejected_count, command_failed_count, tool_failed_count, runtime_failed_count, total_ms },
+        );
+        if (succeeded_count != n) {
+            try writer.writeAll("non-successes first:\n");
             for (buf[0..n]) |call| {
-                if (call.ok) continue;
+                if (call.outcome == .succeeded) continue;
                 try writeToolCallCompact(writer, call);
                 try writeToolFieldBlock(writer, alloc, "args", call.args(), call.args_len, call.args_total_bytes);
                 try writeToolFieldBlock(writer, alloc, "result", call.result(), call.result_len, call.result_total_bytes);
@@ -2840,7 +2875,7 @@ noinline fn writeToolCallsSummary(
             try writer.writeAll("recent successes (compact):\n");
         }
         for (buf[0..n]) |call| {
-            if (!call.ok) continue;
+            if (call.outcome != .succeeded) continue;
             try writeToolCallCompact(writer, call);
             try writeToolFieldBlock(writer, alloc, "args", call.args(), call.args_len, call.args_total_bytes);
             try writeToolResultPreview(writer, alloc, call.result(), call.result_total_bytes);
@@ -4227,31 +4262,50 @@ test "trace auth summary preserves missing and loaded status text" {
     );
 }
 
-test "trace tool calls print errors first and mask obvious secrets" {
+test "trace tool calls preserve outcomes and mask obvious secrets" {
     const alloc = std.testing.allocator;
     diagnostics.resetForTest();
     defer diagnostics.resetForTest();
 
-    var ok: diagnostics.ToolCallMetric = .{ .started_at_ms = 1000, .duration_ms = 7, .ok = true };
-    ok.setName("read_file");
-    ok.setArgs("{\"path\":\"README.md\"}");
-    ok.setResult("read ok");
-    diagnostics.recordToolCall(ok);
-
-    var failed: diagnostics.ToolCallMetric = .{ .started_at_ms = 2000, .duration_ms = 9, .ok = false, .subagent_id = 3 };
-    failed.setName("run_command");
-    failed.setArgs("{\"command\":\"AI_GATEWAY_API_KEY=abcdefghijklmnop zig build\"}");
-    failed.setResult("failed with PASSWORD=abcdefghijklmnop");
-    diagnostics.recordToolCall(failed);
+    const fixtures = [_]struct {
+        name: []const u8,
+        outcome: diagnostics.ToolCallOutcome,
+        args: []const u8,
+        result: []const u8,
+        subagent_id: u64 = 0,
+    }{
+        .{ .name = "read_file", .outcome = .succeeded, .args = "{\"path\":\"README.md\"}", .result = "read ok" },
+        .{ .name = "edit_file", .outcome = .rejected, .args = "{}", .result = "not unique" },
+        .{ .name = "shell", .outcome = .command_failed, .args = "{}", .result = "exit 7" },
+        .{ .name = "read_file", .outcome = .tool_failed, .args = "{}", .result = "missing" },
+        .{ .name = "run_command", .outcome = .runtime_failed, .args = "{\"command\":\"AI_GATEWAY_API_KEY=abcdefghijklmnop zig build\"}", .result = "failed with PASSWORD=abcdefghijklmnop", .subagent_id = 3 },
+    };
+    for (fixtures, 0..) |fixture, index| {
+        var call: diagnostics.ToolCallMetric = .{
+            .started_at_ms = @intCast(1000 + index),
+            .duration_ms = 1,
+            .outcome = fixture.outcome,
+            .subagent_id = fixture.subagent_id,
+        };
+        call.setName(fixture.name);
+        call.setArgs(fixture.args);
+        call.setResult(fixture.result);
+        diagnostics.recordToolCall(call);
+    }
 
     var out: std.Io.Writer.Allocating = .init(alloc);
     defer out.deinit();
     try writeToolCallsSummary(&out.writer, alloc, &.{});
     const text = out.written();
 
-    const error_pos = std.mem.find(u8, text, "name=run_command") orelse return error.TestExpectedEqual;
-    const success_pos = std.mem.find(u8, text, "name=read_file") orelse return error.TestExpectedEqual;
-    try std.testing.expect(error_pos < success_pos);
+    try std.testing.expect(std.mem.find(u8, text, "last=5 succeeded=1 rejected=1 command_failed=1 tool_failed=1 runtime_failed=1") != null);
+    try std.testing.expect(std.mem.find(u8, text, "name=edit_file outcome=rejected") != null);
+    try std.testing.expect(std.mem.find(u8, text, "name=shell outcome=command_failed") != null);
+    try std.testing.expect(std.mem.find(u8, text, "name=read_file outcome=tool_failed") != null);
+    try std.testing.expect(std.mem.find(u8, text, "name=run_command outcome=runtime_failed") != null);
+    const non_success_pos = std.mem.find(u8, text, "name=run_command") orelse return error.TestExpectedEqual;
+    const success_pos = std.mem.find(u8, text, "name=read_file outcome=succeeded") orelse return error.TestExpectedEqual;
+    try std.testing.expect(non_success_pos < success_pos);
     try std.testing.expect(std.mem.find(u8, text, "source=subagent#3") != null);
     try std.testing.expect(std.mem.find(u8, text, "abcdefghijklmnop") == null);
     try std.testing.expect(std.mem.find(u8, text, "AI_GATEWAY_API_KEY=[redacted]") != null);
@@ -4263,7 +4317,7 @@ test "trace successful tool calls use compact result previews" {
     diagnostics.resetForTest();
     defer diagnostics.resetForTest();
 
-    var call: diagnostics.ToolCallMetric = .{ .started_at_ms = 3000, .duration_ms = 1, .ok = true };
+    var call: diagnostics.ToolCallMetric = .{ .started_at_ms = 3000, .duration_ms = 1, .outcome = .succeeded };
     call.setName("read_file");
     call.setArgs("{\"path\":\"README.md\"}");
     call.setResult("<path>README.md</path>\n<content>\n# fx\n\nlong body line\n</content>");
@@ -4285,7 +4339,7 @@ test "trace omits web_fetch URL and result bodies from tool-call diagnostics" {
     diagnostics.resetForTest();
     defer diagnostics.resetForTest();
 
-    var call: diagnostics.ToolCallMetric = .{ .started_at_ms = 4000, .duration_ms = 3, .ok = true };
+    var call: diagnostics.ToolCallMetric = .{ .started_at_ms = 4000, .duration_ms = 3, .outcome = .succeeded };
     call.setName("web_fetch");
     call.setArgs("{\"url\":\"https://example.com/docs\"}");
     call.setResult("<content>\nFETCHED_PAGE_SECRET_RAW\nEXTRACTED_RESULT_SECRET\n</content>");

@@ -111,6 +111,28 @@ pub fn latestVisibleWorkspaceSummary(
     );
 }
 
+pub fn loadVisibleReadOnlyDetail(
+    store: session_store.Store,
+    alloc: Allocator,
+    session_id: []const u8,
+    options: session_store.ResumeOptions,
+) !session_store.ReadOnlyDetail {
+    const managed = child_state.hasManagedChildMarker(
+        store,
+        alloc,
+        session_id,
+    ) catch |err| switch (err) {
+        error.OutOfMemory, error.InvalidSessionId => return err,
+        else => return error.SessionNotFound,
+    };
+    if (managed) return error.SessionNotFound;
+
+    var detail = try store.loadReadOnlyDetail(alloc, session_id, options);
+    errdefer detail.deinit(alloc);
+    if (detail.state.subagent_child) return error.SessionNotFound;
+    return detail;
+}
+
 pub fn listActionablePage(
     store: session_store.Store,
     alloc: Allocator,
@@ -366,7 +388,7 @@ fn ensureLoadedExternalPromptAllowed(
     if (loaded.state.subagent_child) return error.OneOffSessionNotResumable;
 }
 
-test "managed child marker is hidden from external resume" {
+test "managed child marker is hidden from external access" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -399,8 +421,15 @@ test "managed child marker is hidden from external resume" {
     var writable = try store.startWritableSession(alloc, durable);
     writable.deinit(alloc);
 
+    var visible = try loadVisibleReadOnlyDetail(store, alloc, "child", .{});
+    visible.deinit(alloc);
+
     const state_store = child_state.Store{ .sessions = &store, .parent_id = "parent" };
     try state_store.markChildSession(alloc, "child");
+    try std.testing.expectError(
+        error.SessionNotFound,
+        loadVisibleReadOnlyDetail(store, alloc, "child", .{}),
+    );
     try std.testing.expectError(
         error.OneOffSessionNotResumable,
         resumeForExternalPrompt(store, alloc, .{ .id = "child" }, workspace, .{}),
@@ -442,6 +471,10 @@ test "subagent work identity hides a partial child without owner sidecar" {
     var writable = try store.startWritableSession(alloc, durable);
     writable.deinit(alloc);
 
+    try std.testing.expectError(
+        error.SessionNotFound,
+        loadVisibleReadOnlyDetail(store, alloc, "partial-child", .{}),
+    );
     try std.testing.expectError(
         error.OneOffSessionNotResumable,
         resumeForExternalPrompt(

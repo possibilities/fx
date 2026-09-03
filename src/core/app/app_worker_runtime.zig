@@ -1,4 +1,5 @@
 const std = @import("std");
+const credentials = @import("../auth/credentials.zig");
 const activity_status = @import("../output/activity_status.zig");
 const app_session_runtime = @import("app_session_runtime.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
@@ -55,6 +56,8 @@ fn discardCodeBlock(_: *anyopaque, block: assistant_presentation.CodeBlockPayloa
 }
 
 fn discardThematicRule(_: *anyopaque) !void {}
+fn discardContextCompaction(_: *anyopaque, _: types.HistoryTurn) !void {}
+fn discardCredentialRefresh(_: *anyopaque, _: credentials.Credential) !void {}
 
 pub const WorkerEventHandlers = struct {
     ctx: *anyopaque,
@@ -68,9 +71,11 @@ pub const WorkerEventHandlers = struct {
     drain_assistant_text: *const fn (*anyopaque) anyerror!AssistantTextDrainResult,
     open_model_picker: *const fn (*anyopaque) anyerror!void,
     semantic_notice: *const fn (*anyopaque, types.SemanticNotice) anyerror!void,
+    credential_refreshed: *const fn (*anyopaque, credentials.Credential) anyerror!void = discardCredentialRefresh,
     command_output: *const fn (*anyopaque, ?types.ToolLifecycleId, command_output_content.Stream, []const u8) anyerror!void,
     command_output_complete: *const fn (*anyopaque, ?types.ToolLifecycleId) anyerror!void,
     diff_block: *const fn (*anyopaque, diff_mod.DiffEntryPayload) anyerror!void,
+    context_compaction: *const fn (*anyopaque, types.HistoryTurn) anyerror!void = discardContextCompaction,
     append_history_turn: *const fn (*anyopaque, types.FinishedPrompt) anyerror!void,
     session_grant: *const fn (*anyopaque, types.PermissionGrant) anyerror!void,
     error_text: *const fn (*anyopaque, types.SemanticNotice) anyerror!void,
@@ -215,6 +220,8 @@ pub fn Runtime(comptime App: type) type {
                 .question_requested,
                 .clear_route_recovery_status,
                 .api_status_text,
+                .context_compaction,
+                .credential_refreshed,
                 .finish_prompt,
                 .session_grant,
                 .error_text,
@@ -276,6 +283,23 @@ pub fn Runtime(comptime App: type) type {
                 return;
             }
             try app.worker.propagateHistoryTurn(std.heap.c_allocator, turn, max_history_turns);
+        }
+
+        pub fn commitContextCompaction(
+            app: *App,
+            turn: types.HistoryTurn,
+            max_history_turns: usize,
+        ) !void {
+            if (comptime @hasDecl(@TypeOf(app.worker), "commitContextCompaction")) {
+                try app.worker.commitContextCompaction(
+                    std.heap.c_allocator,
+                    turn,
+                    max_history_turns,
+                );
+                return;
+            }
+            try propagateHistoryTurn(app, turn, max_history_turns);
+            try pushEvent(app, .{ .context_compaction = turn });
         }
 
         pub fn propagateGrant(app: *App, tool_name: []const u8, target_path: []const u8) !void {
@@ -491,8 +515,10 @@ pub fn Runtime(comptime App: type) type {
                 snapshot.pending_event_count > 0
             else
                 false;
+            const cancellation_stops_turn = snapshot.cancel_requested and
+                !snapshot.cancel_continues_turn;
             const visible_worker_active = app.stream.active and
-                !snapshot.cancel_requested and
+                !cancellation_stops_turn and
                 (snapshot.processing or
                     worker_events_pending or
                     (snapshot.queued_count > 0 and !queue_review_active));
@@ -707,7 +733,16 @@ pub fn Runtime(comptime App: type) type {
                         }
                     },
                     .append_user_feedback => |text| {
+                        if (!try requireAssistantTextDrain(handlers)) {
+                            try retainClaimedEventAndSuffix(app, &batch, "assistant_text_drain_blocked");
+                            drain_owns_current = false;
+                            break :events;
+                        }
                         try handlers.write_user_prompt(handlers.ctx, .{ .text = text });
+                        if (app.stream.active and app.stream.phase != .thinking) {
+                            app.stream.phase = .thinking;
+                            app.shell.render_requests.request(.footer);
+                        }
                     },
                     .assistant_presentation => |presentation| {
                         if (presentation.requiresTextDrain() and !try requireAssistantTextDrain(handlers)) {
@@ -814,6 +849,9 @@ pub fn Runtime(comptime App: type) type {
                         app.shell.worker_status_state().set_api(text, .danger);
                         app.shell.render_requests.request(.footer);
                     },
+                    .credential_refreshed => |credential| {
+                        try handlers.credential_refreshed(handlers.ctx, credential);
+                    },
                     .command_output => |chunk| {
                         try handlers.command_output(handlers.ctx, chunk.lifecycle_id, chunk.stream, chunk.text);
                     },
@@ -829,6 +867,9 @@ pub fn Runtime(comptime App: type) type {
                     .diff_block => |payload| {
                         drain_owns_current = false;
                         try handlers.diff_block(handlers.ctx, payload);
+                    },
+                    .context_compaction => |turn| {
+                        try handlers.context_compaction(handlers.ctx, turn);
                     },
                     .tool_lifecycle => |lifecycle| {
                         switch (lifecycle) {
@@ -1072,6 +1113,7 @@ const FakeSnapshot = struct {
     queued_count: usize = 0,
     pending_event_count: usize = 0,
     cancel_requested: bool = false,
+    cancel_continues_turn: bool = false,
     pending_permission_request: ?permission_request.OwnedPermissionRequest = null,
     pending_permission_review: ?worker_runtime.PendingPermissionReview = null,
 
@@ -1098,6 +1140,7 @@ const FakeWorker = struct {
     events: std.ArrayList(WorkerEvent) = .empty,
     queued_count: usize = 0,
     processing: bool = false,
+    cancel_continues_turn: bool = false,
     pending_permission_request: ?permission_request.PermissionRequest = null,
     pending_permission_review: ?*const diff_mod.FileReview = null,
     pending_question: bool = false,
@@ -1161,6 +1204,7 @@ const FakeWorker = struct {
             .queued_count = self.queued_count,
             .pending_event_count = self.events.items.len,
             .cancel_requested = self.worker_cancel_requested.load(.seq_cst),
+            .cancel_continues_turn = self.cancel_continues_turn,
             .pending_permission_request = if (self.pending_permission_request) |request|
                 try permission_request.OwnedPermissionRequest.dupe(alloc, request)
             else
@@ -1708,6 +1752,7 @@ const PacedTranscriptBridge = struct {
     drain_count: usize = 0,
     user_prompt_count: usize = 0,
     pacer_pending_when_user_prompt_written: bool = false,
+    assistant_present_when_user_prompt_written: bool = false,
     notice_count: usize = 0,
     history_count: usize = 0,
     finish_count: usize = 0,
@@ -1767,6 +1812,9 @@ const PacedTranscriptBridge = struct {
         self.user_prompt_count += 1;
         self.record('U');
         self.pacer_pending_when_user_prompt_written = self.pacer.hasPending();
+        self.assistant_present_when_user_prompt_written =
+            self.app.shell.lifecycle.entries.items.len > 0 and
+            self.app.shell.lifecycle.entries.items[self.app.shell.lifecycle.entries.items.len - 1] == .assistant_turn;
     }
 
     fn drainAssistantText(raw: *anyopaque) !AssistantTextDrainResult {
@@ -2505,6 +2553,26 @@ test "core.app_worker_runtime syncState preserves already visible processing act
     try std.testing.expectEqual(@as(u64, 8), app.stream.token_progress.input_tokens);
     try std.testing.expectEqual(@as(u64, 13), app.stream.token_progress.output_tokens);
     try std.testing.expect(!app.shell.render_requests.hasReason(.footer));
+}
+
+test "core.app_worker_runtime syncState preserves activity when cancellation continues the turn" {
+    var app = FakeApp.init(std.testing.allocator);
+    defer app.deinit();
+
+    app.worker.processing = true;
+    app.worker.worker_cancel_requested.store(true, .seq_cst);
+    app.worker.cancel_continues_turn = true;
+    app.stream = .{
+        .active = true,
+        .phase = .generating,
+        .token_progress = .{ .input_tokens = 8, .output_tokens = 13 },
+    };
+
+    Runtime(FakeApp).syncState(&app, NoopBridge.lifecyclePresenter(&app));
+
+    try std.testing.expect(app.stream.active);
+    try std.testing.expectEqual(types.TurnPhase.generating, app.stream.phase);
+    try std.testing.expectEqual(@as(u64, 13), app.stream.token_progress.output_tokens);
 }
 
 test "core.app_worker_runtime syncState preserves footer until cancelled tool terminal" {
@@ -3266,6 +3334,39 @@ test "core.app_worker_runtime prompt boundary drains paced text before writing t
     );
 }
 
+test "core.app_worker_runtime feedback boundary drains paced text before writing the user card" {
+    var app = FakeApp.init(std.testing.allocator);
+    defer app.deinit();
+    app.worker.processing = true;
+    app.stream = .{ .active = true, .phase = .generating };
+    app.shell.render_requests.clearReason(.footer);
+
+    var bridge = PacedTranscriptBridge.init(&app);
+    defer bridge.deinit();
+
+    try app.worker.pushEvent(std.heap.c_allocator, .{
+        .assistant_presentation = .{ .text = @constCast("cancelled response tail") },
+    });
+    try app.worker.pushEvent(std.heap.c_allocator, .{
+        .append_user_feedback = @constCast("steer now"),
+    });
+
+    try Runtime(FakeApp).tick(&app, bridge.handlers());
+
+    try std.testing.expectEqual(@as(usize, 1), bridge.drain_count);
+    try std.testing.expectEqual(@as(usize, 1), bridge.user_prompt_count);
+    try std.testing.expect(!bridge.pacer_pending_when_user_prompt_written);
+    try std.testing.expect(bridge.assistant_present_when_user_prompt_written);
+    try std.testing.expect(!bridge.pacer.hasPending());
+    try std.testing.expectEqual(types.TurnPhase.thinking, app.stream.phase);
+    try std.testing.expect(app.shell.render_requests.hasReason(.footer));
+    try std.testing.expectEqual(@as(usize, 1), app.shell.lifecycle.entries.items.len);
+    try std.testing.expectEqualStrings(
+        "cancelled response tail",
+        app.shell.lifecycle.entries.items[0].assistant_turn.segments.text.items,
+    );
+}
+
 test "core.app_worker_runtime blocked prompt drain retains the prompt before reset or write" {
     var app = FakeApp.init(std.testing.allocator);
     defer app.deinit();
@@ -3876,6 +3977,7 @@ test "core.app_worker_runtime blocked error drain retains the error and suffix i
             const self: *@This() = @ptrCast(@alignCast(raw));
             self.feedback_count += 1;
             try std.testing.expectEqual(@as(usize, 1), self.error_count);
+            try std.testing.expectEqual(@as(usize, 3), self.drain_count);
         }
     };
 
@@ -3913,7 +4015,7 @@ test "core.app_worker_runtime blocked error drain retains the error and suffix i
 
     try Runtime(FakeApp).tick(&app, handlers);
 
-    try std.testing.expectEqual(@as(usize, 2), capture.drain_count);
+    try std.testing.expectEqual(@as(usize, 3), capture.drain_count);
     try std.testing.expectEqual(@as(usize, 1), capture.error_count);
     try std.testing.expectEqual(@as(usize, 1), capture.feedback_count);
     try std.testing.expect(!app.stream.active);
