@@ -2,6 +2,7 @@
 import { strict as assert } from "node:assert";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
+import { benchmarkInstructionsBytes } from "../../benchmarks/libfx/workload.mjs";
 
 const repoRoot = fileURLToPath(new URL("../..", import.meta.url));
 const benchmark = fileURLToPath(new URL("../../benchmarks/libfx/bench-fx.mjs", import.meta.url));
@@ -27,6 +28,10 @@ for (const backend of ["native", "wasm"]) {
   assert.ok(sample.prompt_to_fetch_ms >= 0);
   assert.ok(sample.first_body_to_first_text_ms >= 0);
   assert.ok(sample.total_ms >= sample.spawn_to_first_stdout_ms);
+  assert.equal(sample.non_prompt_fetches, 0);
+  assert.ok(sample.request_bytes > 0);
+  assert.equal(sample.system_context_bytes, benchmarkInstructionsBytes);
+  assert.equal(sample.system_context_overhead_bytes, 0);
 }
 
 console.log(`${runtime} libfx benchmark integration passed`);
