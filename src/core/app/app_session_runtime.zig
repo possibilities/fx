@@ -33,6 +33,7 @@ const legacy_background_migration = @import("../session/legacy_background_migrat
 const result_store = @import("../session/result_store.zig");
 const command_replay_store = @import("../session/command_replay_store.zig");
 const command_output_content = @import("../tooling/command_output_content.zig");
+const tooling_presentation = @import("../tooling/tool_presentation.zig");
 const captured_command = @import("../tooling/captured_command.zig");
 const tool_result_errors = @import("../tooling/tool_result_errors.zig");
 const session_display_metadata = @import("../session/session_display_metadata.zig");
@@ -1996,9 +1997,18 @@ pub fn Runtime(comptime App: type) type {
                 const projection_started_ns = io_mod.nanoTimestamp();
                 var projection = try app.beginResumeProjection();
                 defer projection.deinit();
+                const projection_workspace_root = if (std.mem.eql(
+                    u8,
+                    state.origin_workspace_root,
+                    state.workspace_root,
+                ))
+                    state.workspace_root
+                else
+                    "";
                 var sink = DetachedHistorySink(@TypeOf(projection)){
                     .app = app,
                     .projection = &projection,
+                    .workspace_root = projection_workspace_root,
                 };
                 try writeResumeNotice(app, &sink, display_title, notice);
                 try replayHistoryToSink(app, &sink, state.history);
@@ -3413,11 +3423,74 @@ pub fn Runtime(comptime App: type) type {
             return struct {
                 app: *App,
                 projection: *Projection,
+                workspace_root: []const u8,
 
                 const Self = @This();
 
                 fn activityKind(self: *Self, call: types.ToolCall) types.ToolActivityKind {
                     return self.app.historicalToolActivityKind(call);
+                }
+
+                fn attachCommandDisplay(self: *Self, entry_id: u32, call: types.ToolCall) !void {
+                    var parsed = std.json.parseFromSlice(std.json.Value, self.projection.alloc, call.arguments_json, .{}) catch |err| {
+                        debug_trace.logf(
+                            "session",
+                            "historical command metadata parse failed entry_id={d} err={s}",
+                            .{ entry_id, @errorName(err) },
+                        );
+                        return;
+                    };
+                    defer parsed.deinit();
+                    if (parsed.value != .object) return;
+                    const command_value = parsed.value.object.get("command") orelse return;
+                    if (command_value != .string) return;
+                    const display = (tooling_presentation.formatRunCommandDetailBounded(
+                        self.projection.alloc,
+                        command_value.string,
+                        self.workspace_root,
+                        tooling_presentation.max_run_command_reflow_bytes,
+                    ) catch |err| blk: {
+                        debug_trace.logf(
+                            "session",
+                            "historical command display unavailable entry_id={d} err={s}",
+                            .{ entry_id, @errorName(err) },
+                        );
+                        break :blk null;
+                    }) orelse {
+                        debug_trace.logf(
+                            "session",
+                            "historical command display withheld entry_id={d}",
+                            .{entry_id},
+                        );
+                        return;
+                    };
+                    defer self.projection.alloc.free(display);
+                    const label = tooling_presentation.runCommandCompletedActionLabel(
+                        self.projection.alloc,
+                        self.app.toolRegistry(),
+                        call,
+                    ) catch |err| blk: {
+                        debug_trace.logf(
+                            "session",
+                            "historical command action label unavailable entry_id={d} err={s}",
+                            .{ entry_id, @errorName(err) },
+                        );
+                        break :blk null;
+                    };
+                    if (label == null) debug_trace.logf(
+                        "session",
+                        "historical command action label withheld entry_id={d}",
+                        .{entry_id},
+                    );
+                    if (label) |value| self.projection.setHistoricalToolCommandMetadata(
+                        entry_id,
+                        display,
+                        value,
+                    ) catch |err| debug_trace.logf(
+                        "session",
+                        "historical command metadata unavailable entry_id={d} err={s}",
+                        .{ entry_id, @errorName(err) },
+                    );
                 }
 
                 fn appendNotice(self: *Self, notice: types.SemanticNotice) !void {
@@ -3476,6 +3549,7 @@ pub fn Runtime(comptime App: type) type {
                         self.activityKind(call),
                         result,
                     );
+                    try self.attachCommandDisplay(entry_id, call);
                 }
 
                 fn attachHistoricalToolDetailWithLifecycle(
@@ -3492,6 +3566,7 @@ pub fn Runtime(comptime App: type) type {
                         result,
                         lifecycle_id,
                     );
+                    try self.attachCommandDisplay(entry_id, call);
                 }
 
                 fn attachHistoricalToolDetailAfterCommandOutput(
@@ -3506,6 +3581,7 @@ pub fn Runtime(comptime App: type) type {
                         self.activityKind(call),
                         result,
                     );
+                    try self.attachCommandDisplay(entry_id, call);
                 }
 
                 fn attachHistoricalToolCallWithoutResult(
@@ -3755,6 +3831,7 @@ pub fn Runtime(comptime App: type) type {
             var sink = DetachedHistorySink(@TypeOf(projection.*)){
                 .app = app,
                 .projection = projection,
+                .workspace_root = app.workspace_root,
             };
             return replayHistoryToSinkIncremental(
                 app,
