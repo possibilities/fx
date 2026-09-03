@@ -11,6 +11,7 @@ const vercel_protocol = @import("../../gateway/vercel_protocol.zig");
 const Allocator = std.mem.Allocator;
 
 const single_transport_attempt: usize = 1;
+const reviewer_model = "openai/gpt-5.6-luna";
 
 const StreamFn = *const fn (
     *anyopaque,
@@ -65,7 +66,7 @@ fn reviewGatewayConfig(
     request: permission_auto_classifier.ReviewRequest,
 ) !permission_auto_classifier.ParseOutcome {
     var local = config;
-    return permission_auto_classifier.Reviewer.withTransport(
+    return permission_auto_classifier.Reviewer.withTransportModel(
         .{
             .context = @ptrCast(&local),
             .send_fn = sendGatewayReview,
@@ -73,6 +74,7 @@ fn reviewGatewayConfig(
         },
         local.cancel_flag,
         permission_auto_classifier.Reviewer.default_timeout_ms,
+        reviewer_model,
     ).review(alloc, request);
 }
 
@@ -366,7 +368,7 @@ const FakeStream = struct {
         const self: *FakeStream = @ptrCast(@alignCast(raw_ctx));
         if (self.calls < self.deadlines.len) self.deadlines[self.calls] = deadline;
         self.saw_single_attempt_only = self.saw_single_attempt_only and retry_count == 1;
-        self.saw_expected_model_only = self.saw_expected_model_only and std.mem.eql(u8, model, "moonshotai/kimi-k3");
+        self.saw_expected_model_only = self.saw_expected_model_only and std.mem.eql(u8, model, reviewer_model);
         self.saw_required_tool_payload = self.saw_required_tool_payload and
             std.mem.find(u8, payload, "permission_decision") != null;
         const outcome = self.outcomes[@min(self.calls, self.outcomes.len - 1)];
