@@ -201,6 +201,8 @@ const e2e_gateway_models_url_env = "FX_E2E_GATEWAY_MODELS_URL";
 const e2e_gateway_credits_url_env = "FX_E2E_GATEWAY_CREDITS_URL";
 const default_gateway_base_url = "https://ai-gateway.vercel.sh";
 pub const vercel_ai_gateway_team_header = "x-vercel-ai-gateway-team";
+pub const vercel_gateway_extended_time_header = "x-vercel-gateway-extended-time";
+pub const vercel_gateway_extended_time_value = "true";
 /// Identifies fx on every AI Gateway request; the zig std.http default
 /// (`zig/<version> (std.http)`) is never sent to the gateway.
 pub const user_agent = "fx/" ++ build_options.app_version;
@@ -262,7 +264,7 @@ pub fn fetchGatewayGetResult(alloc: std.mem.Allocator, api_key: ?[]const u8, pat
 
 pub fn fetchGatewayGenerationResult(
     alloc: std.mem.Allocator,
-    api_key: []const u8,
+    api_key: ?[]const u8,
     gateway_team: ?[]const u8,
     gateway_origin: []const u8,
     generation_id: []const u8,
@@ -290,7 +292,7 @@ pub fn fetchGatewayGenerationResult(
 
 const GenerationLookupOperation = struct {
     alloc: std.mem.Allocator,
-    api_key: []const u8,
+    api_key: ?[]const u8,
     gateway_team: ?[]const u8,
     gateway_origin: []const u8,
     generation_id: []const u8,
@@ -315,23 +317,23 @@ const GenerationLookupOperation = struct {
             .io = io_mod.getIo(),
         };
         defer client.deinit();
-        const auth_header = try std.fmt.allocPrint(
-            self.alloc,
-            "Bearer {s}",
-            .{self.api_key},
-        );
-        defer secret.zeroAndFree(self.alloc, auth_header);
+        var auth_header: ?[]u8 = null;
+        defer if (auth_header) |value| secret.zeroAndFree(self.alloc, value);
+        var headers: std.http.Client.Request.Headers = .{
+            .accept_encoding = .omit,
+            .user_agent = .{ .override = user_agent },
+        };
+        if (self.api_key) |api_key| {
+            auth_header = try std.fmt.allocPrint(self.alloc, "Bearer {s}", .{api_key});
+            headers.authorization = .{ .override = auth_header.? };
+        }
         var extra_headers_buf: [1]std.http.Header = undefined;
         const extra_headers = gatewayModelCatalogExtraHeaders(
             &extra_headers_buf,
             self.gateway_team,
         );
         var req = try client.request(.GET, uri, .{
-            .headers = .{
-                .authorization = .{ .override = auth_header },
-                .accept_encoding = .omit,
-                .user_agent = .{ .override = user_agent },
-            },
+            .headers = headers,
             .extra_headers = extra_headers,
             .redirect_behavior = .unhandled,
         });
@@ -639,6 +641,7 @@ pub fn postGatewayCompletion(
             .{ .name = "HTTP-Referer", .value = "https://github.com/vercel-labs/fx" },
             .{ .name = "X-Title", .value = "fx" },
             .{ .name = "Accept", .value = "application/json" },
+            .{ .name = vercel_gateway_extended_time_header, .value = vercel_gateway_extended_time_value },
             .{ .name = "ai-gateway-protocol-version", .value = "0.0.1" },
             .{ .name = "ai-language-model-specification-version", .value = "4" },
             .{ .name = "ai-language-model-id", .value = model },
@@ -1137,7 +1140,7 @@ test "connection setup policy bounds retry by deadline attempts and delivery" {
 }
 
 pub const StreamRequest = struct {
-    api_key: []const u8,
+    api_key: ?[]const u8,
     model: []const u8,
     retry_count: usize,
     chat_url: []const u8,
@@ -1174,6 +1177,29 @@ pub fn streamGatewayCompletion(
         expected_provider_tool_name,
         true,
     );
+}
+
+pub fn streamGatewayCompletionBounded(
+    alloc: std.mem.Allocator,
+    request: StreamRequest,
+    callback_ctx: *anyopaque,
+    on_content_chunk: StreamCallback,
+    on_tool_start: ?ToolStartCallback,
+    deadline: std.Io.Clock.Timestamp,
+    cancel_flag: *std.atomic.Value(bool),
+) !StreamResult {
+    if (cancel_flag.load(.seq_cst)) return error.Cancelled;
+    const expected_provider_tool_name = try expectedProviderToolName(alloc, request.payload);
+    var operation = BoundedStreamingGatewayOperation{
+        .alloc = alloc,
+        .request = request,
+        .callback_ctx = callback_ctx,
+        .on_content_chunk = on_content_chunk,
+        .on_tool_start = on_tool_start,
+        .expected_provider_tool_name = expected_provider_tool_name,
+        .cancel_flag = cancel_flag,
+    };
+    return runBoundedStreamOperation(alloc, cancel_flag, deadline, &operation);
 }
 
 fn expectedProviderToolName(alloc: std.mem.Allocator, payload: []const u8) !?[]const u8 {
@@ -1297,6 +1323,29 @@ const BoundedGatewayOperation = struct {
     }
 };
 
+const BoundedStreamingGatewayOperation = struct {
+    alloc: std.mem.Allocator,
+    request: StreamRequest,
+    callback_ctx: *anyopaque,
+    on_content_chunk: StreamCallback,
+    on_tool_start: ?ToolStartCallback,
+    expected_provider_tool_name: ?[]const u8,
+    cancel_flag: *std.atomic.Value(bool),
+
+    fn run(self: *@This()) !StreamResult {
+        return streamGatewayCompletionCore(
+            self.alloc,
+            self.request,
+            self.callback_ctx,
+            self.on_content_chunk,
+            self.on_tool_start,
+            self.cancel_flag,
+            self.expected_provider_tool_name,
+            true,
+        );
+    }
+};
+
 var bounded_stream_discard_ctx: u8 = 0;
 
 fn discardBoundedContent(_: *anyopaque, _: []const u8) void {}
@@ -1345,10 +1394,19 @@ fn streamGatewayCompletionCoreWithOptions(
     const request_url = try resolveE2eGatewayUrl(e2e_gateway_chat_url_env, request.chat_url);
     const uri = try std.Uri.parse(request_url);
 
-    const auth_header = try std.fmt.allocPrint(alloc, "Bearer {s}", .{request.api_key});
-    defer alloc.free(auth_header);
+    var auth_header: ?[]u8 = null;
+    defer if (auth_header) |value| secret.zeroAndFree(alloc, value);
+    var request_headers: std.http.Client.Request.Headers = .{
+        .content_type = .{ .override = "application/json" },
+        .accept_encoding = .omit,
+        .user_agent = .{ .override = user_agent },
+    };
+    if (request.api_key) |api_key| {
+        auth_header = try std.fmt.allocPrint(alloc, "Bearer {s}", .{api_key});
+        request_headers.authorization = .{ .override = auth_header.? };
+    }
 
-    var extra_headers_buf: [9]std.http.Header = undefined;
+    var extra_headers_buf: [10]std.http.Header = undefined;
     const extra_headers = gatewayExtraHeaders(
         &extra_headers_buf,
         model,
@@ -1380,12 +1438,7 @@ fn streamGatewayCompletionCoreWithOptions(
         debug_trace.eventf("gateway", "before_http_open_connect", trace_ctx, "attempt={d} attempt_limit={d} retries_used={d}", .{ attempt + 1, retry_count, attempt });
         debug_trace.eventf("gateway", "before_request_open", trace_ctx, "attempt={d} attempt_limit={d} retries_used={d} payload_bytes={d}", .{ attempt + 1, retry_count, attempt, payload.len });
         var req = openGatewayRequestBounded(&client, uri, .{
-            .headers = .{
-                .content_type = .{ .override = "application/json" },
-                .authorization = .{ .override = auth_header },
-                .accept_encoding = .omit,
-                .user_agent = .{ .override = user_agent },
-            },
+            .headers = request_headers,
             .extra_headers = extra_headers,
             .keep_alive = false,
             .redirect_behavior = .unhandled,
@@ -1657,11 +1710,13 @@ fn gatewayExtraHeaders(
     team: ?[]const u8,
     session_id: ?[]const u8,
 ) []const std.http.Header {
-    std.debug.assert(buf.len >= 9);
+    std.debug.assert(buf.len >= 10);
     var len: usize = 0;
     buf[len] = .{ .name = "HTTP-Referer", .value = "https://github.com/vercel-labs/fx" };
     len += 1;
     buf[len] = .{ .name = "X-Title", .value = "fx" };
+    len += 1;
+    buf[len] = .{ .name = vercel_gateway_extended_time_header, .value = vercel_gateway_extended_time_value };
     len += 1;
     buf[len] = .{ .name = "ai-gateway-protocol-version", .value = "0.0.1" };
     len += 1;
@@ -1700,8 +1755,17 @@ fn gatewayModelCatalogExtraHeaders(buf: []std.http.Header, team: ?[]const u8) []
     return buf[0..len];
 }
 
+test "gateway extra headers request extended execution time" {
+    var buf: [10]std.http.Header = undefined;
+    const headers = gatewayExtraHeaders(&buf, "test/model", null, null);
+    try std.testing.expectEqualStrings(
+        vercel_gateway_extended_time_value,
+        headerValue(headers, vercel_gateway_extended_time_header).?,
+    );
+}
+
 test "gateway extra headers include selected team" {
-    var buf: [9]std.http.Header = undefined;
+    var buf: [10]std.http.Header = undefined;
     const headers = gatewayExtraHeaders(&buf, "test/model", "team_123", null);
     try std.testing.expectEqualStrings("team_123", headerValue(headers, vercel_ai_gateway_team_header).?);
     try std.testing.expectEqualStrings("test/model", headerValue(headers, "ai-language-model-id").?);
@@ -1711,7 +1775,7 @@ test "gateway extra headers include selected team" {
 }
 
 test "gateway extra headers derive session identity and affinity together" {
-    var buf: [9]std.http.Header = undefined;
+    var buf: [10]std.http.Header = undefined;
     const cases = [_]struct {
         session_id: ?[]const u8,
         expected: ?[]const u8,
@@ -2536,6 +2600,43 @@ fn jsonValueString(value: std.json.Value) ?[]const u8 {
     return if (value == .string and value.string.len > 0) value.string else null;
 }
 
+fn isGatewayStreamTimeoutCode(value: std.json.Value) bool {
+    const text = jsonValueString(value) orelse return false;
+    return std.mem.eql(u8, text, "gateway_stream_timeout");
+}
+
+fn objectHasGatewayStreamTimeout(object: std.json.ObjectMap) bool {
+    if (object.get("code")) |value| {
+        if (isGatewayStreamTimeoutCode(value)) return true;
+    }
+    if (object.get("type")) |value| {
+        if (isGatewayStreamTimeoutCode(value)) return true;
+    }
+    return false;
+}
+
+fn providerFailureCause(root: std.json.Value) ?types.ProviderFailureCause {
+    if (root != .object) return null;
+    const object = root.object;
+    if (objectHasGatewayStreamTimeout(object)) return .gateway_stream_timeout;
+
+    inline for (.{ "error", "providerError" }) |key| {
+        if (object.get(key)) |value| {
+            if (value == .object and objectHasGatewayStreamTimeout(value.object)) {
+                return .gateway_stream_timeout;
+            }
+        }
+    }
+    if (object.get("finishReason")) |value| {
+        if (value == .object) {
+            if (value.object.get("raw")) |raw| {
+                if (isGatewayStreamTimeoutCode(raw)) return .gateway_stream_timeout;
+            }
+        }
+    }
+    return null;
+}
+
 fn captureProviderFailureObject(
     alloc: std.mem.Allocator,
     current: *?[]u8,
@@ -3056,6 +3157,7 @@ fn consumeSseStreamTraced(
     var response_timestamp_invalid = false;
     var generation_metadata_invalid = false;
     var provider_result_identity_failure: ?types.ProviderResultIdentityFailure = null;
+    var provider_failure_cause: ?types.ProviderFailureCause = null;
     var provider_failure_detail: ?[]u8 = null;
     defer if (provider_failure_detail) |detail| alloc.free(detail);
     var data_event_count: usize = 0;
@@ -3160,6 +3262,7 @@ fn consumeSseStreamTraced(
                 }
             }
         } else if (std.mem.eql(u8, event_type, "error")) {
+            provider_failure_cause = provider_failure_cause orelse providerFailureCause(root);
             try captureProviderFailureDetail(alloc, &provider_failure_detail, root);
         } else if (std.mem.eql(u8, event_type, "text-delta")) {
             if (root.object.get("delta")) |delta_val| {
@@ -3467,6 +3570,7 @@ fn consumeSseStreamTraced(
             acc.provider_result = owned_result;
             acc.provider_result_state = if (preliminary) .preliminary else .final;
         } else if (std.mem.eql(u8, event_type, "finish")) {
+            provider_failure_cause = provider_failure_cause orelse providerFailureCause(root);
             const finish_event = parseSseFinishEvent(alloc, root, &provider_failure_detail) catch |err| {
                 switch (err) {
                     error.UnknownProviderFinishReason => {
@@ -3509,6 +3613,7 @@ fn consumeSseStreamTraced(
     completion.tool_calls = try materializeToolCalls(alloc, tool_accumulators.items);
 
     completion.provider_result_identity_failure = provider_result_identity_failure;
+    completion.provider_failure_cause = provider_failure_cause;
     completion.provider_failure_detail = provider_failure_detail;
     provider_failure_detail = null;
     completion.generation_id = generation_id;
@@ -3715,6 +3820,60 @@ test "consumeSseStream preserves provider error detail" {
     try std.testing.expectEqualStrings("provider_down: wafer route unavailable", completion.provider_failure_detail.?);
     try std.testing.expectEqual(@as(u64, 1), completion.usage.input_tokens.?);
     try std.testing.expectEqual(@as(u64, 1), completion.usage.output_tokens.?);
+}
+
+test "consumeSseStream classifies gateway stream timeout by structured code" {
+    const payload =
+        "data: {\"type\":\"error\",\"error\":{\"code\":\"gateway_stream_timeout\",\"message\":\"stream exceeded maximum duration\"}}\n" ++
+        "\n";
+
+    var reader = std.Io.Reader.fixed(payload);
+    var cancel_flag = std.atomic.Value(bool).init(false);
+
+    const Noop = struct {
+        fn chunk(_: *anyopaque, _: []const u8) void {}
+    };
+
+    var completion = try consumeSseStream(std.testing.allocator, &reader, undefined, Noop.chunk, null, &cancel_flag);
+    defer deinitGatewayCompletion(std.testing.allocator, &completion);
+
+    try std.testing.expectEqual(types.ProviderFailureCause.gateway_stream_timeout, completion.provider_failure_cause.?);
+    try std.testing.expectEqualStrings(
+        "gateway_stream_timeout: stream exceeded maximum duration",
+        completion.provider_failure_detail.?,
+    );
+}
+
+test "consumeSseStream classifies finish-only gateway stream timeout" {
+    const payload =
+        "data: {\"type\":\"finish\",\"finishReason\":{\"unified\":\"error\",\"raw\":\"gateway_stream_timeout\"}}\n" ++
+        "\n";
+
+    var reader = std.Io.Reader.fixed(payload);
+    var cancel_flag = std.atomic.Value(bool).init(false);
+
+    const Noop = struct {
+        fn chunk(_: *anyopaque, _: []const u8) void {}
+    };
+
+    var completion = try consumeSseStream(std.testing.allocator, &reader, undefined, Noop.chunk, null, &cancel_flag);
+    defer deinitGatewayCompletion(std.testing.allocator, &completion);
+
+    try std.testing.expectEqual(types.ProviderFinishReason.provider_error, completion.finish_reason.?);
+    try std.testing.expectEqual(types.ProviderFailureCause.gateway_stream_timeout, completion.provider_failure_cause.?);
+}
+
+test "providerFailureCause ignores matching prose without the structured code" {
+    const alloc = std.testing.allocator;
+    var parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        alloc,
+        "{\"type\":\"error\",\"error\":{\"code\":\"provider_error\",\"message\":\"gateway_stream_timeout\"}}",
+        .{},
+    );
+    defer parsed.deinit();
+
+    try std.testing.expectEqual(@as(?types.ProviderFailureCause, null), providerFailureCause(parsed.value));
 }
 
 test "consumeSseStream assigns a fallback identity to message-only provider errors" {
@@ -7687,7 +7846,34 @@ test "direct gateway core callbacks stay on the invoking thread" {
     try std.testing.expectEqual(capture.expected_thread, capture.observed_thread.?);
 }
 
-test "gateway chat request sends fx user agent and attribution headers" {
+test "non-streaming gateway request sends extended time header" {
+    var fixture = try LoopbackGatewayFixture.init(.success_capture, 0);
+    defer fixture.deinit();
+    try fixture.start();
+    try std.testing.expect(fixture.waitForAcceptStart(5000));
+
+    const url = try std.fmt.allocPrint(std.testing.allocator, "http://127.0.0.1:{d}/chat", .{fixture.port()});
+    defer std.testing.allocator.free(url);
+
+    var result = try postGatewayCompletion(
+        std.testing.allocator,
+        "test-key",
+        "test/model",
+        1,
+        url,
+        "{}",
+    );
+    defer result.deinit(std.testing.allocator);
+    fixture.deinit();
+
+    if (fixture.failure) |err| return err;
+    try std.testing.expectEqualStrings(
+        vercel_gateway_extended_time_value,
+        fixture.capturedHeaderValue(vercel_gateway_extended_time_header).?,
+    );
+}
+
+test "gateway chat request sends extended time and attribution headers" {
     var fixture = try LoopbackGatewayFixture.init(.success_capture, 0);
     defer fixture.deinit();
     try fixture.start();
@@ -7725,7 +7911,51 @@ test "gateway chat request sends fx user agent and attribution headers" {
     try std.testing.expectEqualStrings(user_agent, fixture.capturedHeaderValue("user-agent").?);
     try std.testing.expectEqualStrings("https://github.com/vercel-labs/fx", fixture.capturedHeaderValue("http-referer").?);
     try std.testing.expectEqualStrings("fx", fixture.capturedHeaderValue("x-title").?);
+    try std.testing.expectEqualStrings(
+        vercel_gateway_extended_time_value,
+        fixture.capturedHeaderValue(vercel_gateway_extended_time_header).?,
+    );
     try std.testing.expectEqualStrings("session_wire_123", fixture.capturedHeaderValue("x-session-id").?);
     try std.testing.expectEqualStrings("session_wire_123", fixture.capturedHeaderValue("x-session-affinity").?);
     try std.testing.expect(std.mem.find(u8, fixture.capturedHeaderValue("user-agent").?, "zig") == null);
+}
+
+test "host-managed Gateway chat omits authentication-owned headers" {
+    var fixture = try LoopbackGatewayFixture.init(.success_capture, 0);
+    defer fixture.deinit();
+    try fixture.start();
+    try std.testing.expect(fixture.waitForAcceptStart(5000));
+
+    const url = try std.fmt.allocPrint(std.testing.allocator, "http://127.0.0.1:{d}/chat", .{fixture.port()});
+    defer std.testing.allocator.free(url);
+
+    const Noop = struct {
+        fn onChunk(_: *anyopaque, _: []const u8) void {}
+    };
+    var callback_ctx: u8 = 0;
+    var cancel_flag = std.atomic.Value(bool).init(false);
+    var result = try streamGatewayCompletionCore(
+        std.testing.allocator,
+        .{
+            .api_key = null,
+            .model = "test/model",
+            .retry_count = 1,
+            .chat_url = url,
+            .payload = "{}",
+            .team = null,
+        },
+        @ptrCast(&callback_ctx),
+        Noop.onChunk,
+        null,
+        &cancel_flag,
+        null,
+        false,
+    );
+    defer result.deinit(std.testing.allocator);
+    fixture.deinit();
+
+    if (fixture.failure) |err| return err;
+    try std.testing.expect(fixture.capturedHeaderValue("authorization") == null);
+    try std.testing.expect(fixture.capturedHeaderValue(vercel_ai_gateway_team_header) == null);
+    try std.testing.expectEqualStrings(user_agent, fixture.capturedHeaderValue("user-agent").?);
 }

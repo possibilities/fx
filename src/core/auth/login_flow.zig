@@ -88,6 +88,31 @@ pub const TeamSelection = struct {
         return session.team_id orelse session.team_slug;
     }
 
+    /// Returns an owned candidate for authenticated Gateway validation without
+    /// changing the durable session. The caller must deinitialize the result.
+    pub fn validationCredential(
+        self: *const TeamSelection,
+        alloc: Allocator,
+        selected_index: usize,
+    ) !credentials.Credential {
+        const session = self.session orelse return LoginError.NoSession;
+        if (selected_index >= self.teams.items.len) return LoginError.InvalidTeamSelection;
+        const selected = self.teams.items[selected_index];
+
+        const token = try alloc.dupe(u8, session.access_token);
+        errdefer secret.zeroAndFree(alloc, token);
+        const team_id = try alloc.dupe(u8, selected.id);
+        errdefer alloc.free(team_id);
+        const team_slug = try alloc.dupe(u8, selected.slug);
+        errdefer alloc.free(team_slug);
+        return .{
+            .token = token,
+            .source = .fx_login,
+            .team_id = team_id,
+            .team_slug = team_slug,
+        };
+    }
+
     pub fn select(self: *const TeamSelection, alloc: Allocator, selected_index: usize) !SelectedTeam {
         const session = self.session orelse return LoginError.NoSession;
         if (selected_index >= self.teams.items.len) return LoginError.InvalidTeamSelection;
@@ -118,6 +143,42 @@ pub const TeamSelection = struct {
         };
     }
 };
+
+pub const TeamValidationResult = enum {
+    accepted,
+    rejected,
+};
+
+pub const TeamValidator = struct {
+    context: ?*anyopaque = null,
+    validate_fn: *const fn (
+        ?*anyopaque,
+        credentials.Credential,
+    ) std.mem.Allocator.Error!TeamValidationResult,
+
+    pub fn validate(
+        self: TeamValidator,
+        credential: credentials.Credential,
+    ) std.mem.Allocator.Error!TeamValidationResult {
+        return self.validate_fn(self.context, credential);
+    }
+};
+
+/// Validates the proposed token/team authority before the existing selection
+/// mutation acquires its lock and commits durable state.
+pub fn validateAndSelectTeam(
+    alloc: Allocator,
+    selection: *const TeamSelection,
+    selected_index: usize,
+    validator: TeamValidator,
+) !SelectedTeam {
+    var candidate = try selection.validationCredential(alloc, selected_index);
+    defer candidate.deinit(alloc);
+    if (try validator.validate(candidate) != .accepted) {
+        return error.TeamValidationFailed;
+    }
+    return selection.select(alloc, selected_index);
+}
 
 pub const SignInState = enum {
     idle,
@@ -596,8 +657,6 @@ pub fn runLogin(
     defer session.deinit(alloc);
 
     try oauth_session.saveNewSession(alloc, session);
-    try writeStdout("Signed in to Vercel.\n");
-    try writeStdout("AI Gateway access may still require billing or API setup for the selected account.\n");
 }
 
 fn take_login_session(
@@ -647,6 +706,7 @@ fn take_login_session(
 pub fn runTeams(
     alloc: Allocator,
     transport: oauth_transport.Provider,
+    validator: TeamValidator,
 ) !void {
     var selection = try loadTeamSelection(alloc, transport);
     defer selection.deinit(alloc);
@@ -654,7 +714,7 @@ pub fn runTeams(
     const selected_index = (try selectTeam(alloc, selection.teams.items, selection.currentTeam())) orelse
         return LoginError.NoTeams;
     const selected = selection.teams.items[selected_index];
-    var changed_team = try selection.select(alloc, selected_index);
+    var changed_team = try validateAndSelectTeam(alloc, &selection, selected_index, validator);
     defer changed_team.deinit(alloc);
     try writeStdoutFmt("Selected Vercel team: {s} ({s}).\n", .{ selected.name, selected.slug });
 }
@@ -1414,6 +1474,71 @@ test "single team selection does not allocate" {
     var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
 
     try std.testing.expect((try selectTeam(failing.allocator(), &teams, null)) != null);
+}
+
+test "team selection stages an owned validation credential before commit" {
+    const alloc = std.testing.allocator;
+    var selection = TeamSelection{ .session = .{
+        .issuer = try alloc.dupe(u8, "https://vercel.com"),
+        .client_id = try alloc.dupe(u8, "client"),
+        .access_token = try alloc.dupe(u8, "access-token"),
+        .refresh_token = try alloc.dupe(u8, "refresh-token"),
+        .expires_at_ms = 100_000,
+        .scope = try alloc.dupe(u8, "openid offline_access"),
+        .token_type = try alloc.dupe(u8, "Bearer"),
+        .team_id = try alloc.dupe(u8, "team_old"),
+        .team_slug = try alloc.dupe(u8, "old-team"),
+    } };
+    defer selection.deinit(alloc);
+    try selection.teams.append(alloc, .{
+        .id = try alloc.dupe(u8, "team_new"),
+        .slug = try alloc.dupe(u8, "new-team"),
+        .name = try alloc.dupe(u8, "New Team"),
+    });
+
+    var candidate = try selection.validationCredential(alloc, 0);
+    defer candidate.deinit(alloc);
+
+    try std.testing.expectEqual(credentials.Source.fx_login, candidate.source);
+    try std.testing.expectEqualStrings("access-token", candidate.token);
+    try std.testing.expectEqualStrings("team_new", candidate.team_id.?);
+    try std.testing.expectEqualStrings("new-team", candidate.team_slug.?);
+    try std.testing.expectEqualStrings("team_old", selection.currentTeam().?);
+}
+
+test "team validation failure prevents the durable selection commit" {
+    const alloc = std.testing.allocator;
+    var selection = TeamSelection{ .session = .{
+        .issuer = try alloc.dupe(u8, "https://vercel.com"),
+        .client_id = try alloc.dupe(u8, "client"),
+        .access_token = try alloc.dupe(u8, "access-token"),
+        .refresh_token = try alloc.dupe(u8, "refresh-token"),
+        .expires_at_ms = 100_000,
+        .scope = try alloc.dupe(u8, "openid offline_access"),
+        .token_type = try alloc.dupe(u8, "Bearer"),
+        .team_id = try alloc.dupe(u8, "team_old"),
+        .team_slug = try alloc.dupe(u8, "old-team"),
+    } };
+    defer selection.deinit(alloc);
+    try selection.teams.append(alloc, .{
+        .id = try alloc.dupe(u8, "team_new"),
+        .slug = try alloc.dupe(u8, "new-team"),
+        .name = try alloc.dupe(u8, "New Team"),
+    });
+
+    const Reject = struct {
+        fn validate(
+            _: ?*anyopaque,
+            _: credentials.Credential,
+        ) std.mem.Allocator.Error!TeamValidationResult {
+            return .rejected;
+        }
+    };
+    try std.testing.expectError(
+        error.TeamValidationFailed,
+        validateAndSelectTeam(alloc, &selection, 0, .{ .validate_fn = Reject.validate }),
+    );
+    try std.testing.expectEqualStrings("team_old", selection.currentTeam().?);
 }
 
 test "login session transfer cleans up allocation failures" {
