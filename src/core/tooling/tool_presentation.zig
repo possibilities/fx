@@ -18,6 +18,7 @@ const Allocator = std.mem.Allocator;
 const ToolCall = types.ToolCall;
 const max_run_command_activity_bytes = 120;
 const max_run_command_activity_source_bytes = max_run_command_activity_bytes * max_run_command_activity_bytes;
+pub const max_run_command_reflow_bytes = max_run_command_activity_source_bytes;
 pub const max_auto_permission_reason_presentation_bytes: usize = 160;
 
 pub const ToolActionInput = struct {
@@ -42,7 +43,7 @@ pub fn isProviderSearchAlias(name: []const u8) bool {
 fn projectRunCommandActivitySource(
     command: []const u8,
     workspace_root_input: []const u8,
-    storage: *[max_run_command_activity_bytes + 1]u8,
+    storage: []u8,
 ) []const u8 {
     const display_command = stripNoopCurrentDirectoryPrefix(command);
     var workspace_root_end = workspace_root_input.len;
@@ -114,6 +115,20 @@ fn workspaceRootMatchesAt(command: []const u8, workspace_root: []const u8, index
     return command[next_index] == '/' or !isPathTokenByte(command[next_index]);
 }
 
+fn containsUnresolvedAbsolutePath(command: []const u8) bool {
+    for (command, 0..) |byte, index| {
+        if (byte != '/' or (index > 0 and isPathTokenByte(command[index - 1]))) continue;
+        const suffix = command[index..];
+        if (std.mem.startsWith(u8, suffix, "/dev/null") and
+            (suffix.len == "/dev/null".len or !isPathTokenByte(suffix["/dev/null".len])))
+        {
+            continue;
+        }
+        return true;
+    }
+    return false;
+}
+
 fn isPathTokenByte(byte: u8) bool {
     return std.ascii.isAlphanumeric(byte) or switch (byte) {
         '/', '-', '.', '_', '~' => true,
@@ -146,7 +161,22 @@ pub fn isAdvertisedDynamicMcpName(registry: tool_dispatch.Registry, name: []cons
     return false;
 }
 
-/// The caller owns `detail` and must free it with `alloc`.
+/// Returns a borrowed static label when the call is a captured command.
+pub fn runCommandCompletedActionLabel(
+    alloc: Allocator,
+    registry: tool_dispatch.Registry,
+    call: ToolCall,
+) !?[]const u8 {
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, call.arguments_json, .{});
+    defer parsed.deinit();
+    if (parsed.value != .object or !isCapturedCommandCall(registry, call, parsed.value.object)) return null;
+    const command = tool_args.optionalStringArg(parsed.value.object, "command") orelse return null;
+    return if (try tool_dispatch.matchRunCommandCompatibility(registry, command)) |matched|
+        matched.tool.completed_action_label
+    else
+        "Ran";
+}
+
 pub fn formatRunCommandActivity(
     alloc: Allocator,
     registry: tool_dispatch.Registry,
@@ -160,13 +190,33 @@ pub fn formatRunCommandActivity(
     const args = tool_args.parseToolArgsObject(scratch, call.arguments_json) catch return null;
     if (!isCapturedCommandCall(registry, call, args)) return null;
     const command = tool_args.optionalStringArg(args, "command") orelse return null;
-    var projected_storage: [max_run_command_activity_bytes + 1]u8 = undefined;
-    const projected = projectRunCommandActivitySource(command, workspace_root, &projected_storage);
-    const encoded = try text_utils.encodeTerminalSafe(scratch, projected, max_run_command_activity_bytes);
+    const detail = (try formatRunCommandDetailBounded(
+        alloc,
+        command,
+        workspace_root,
+        max_run_command_activity_bytes,
+    )) orelse return null;
     return .{
-        .detail = try alloc.dupe(u8, encoded.bytes),
+        .detail = detail,
         .compatibility_tool = if (try tool_dispatch.matchRunCommandCompatibility(registry, command)) |matched| matched.tool else null,
     };
+}
+
+pub fn formatRunCommandDetailBounded(
+    alloc: Allocator,
+    command: []const u8,
+    workspace_root: []const u8,
+    max_encoded_bytes: usize,
+) !?[]u8 {
+    if (max_encoded_bytes == 0) return try alloc.dupe(u8, "");
+    if (workspace_root.len == 0 and containsUnresolvedAbsolutePath(command)) return null;
+
+    const effective_max = @min(max_encoded_bytes, max_run_command_activity_source_bytes - 1);
+    const projected_storage = try alloc.alloc(u8, effective_max + 1);
+    defer alloc.free(projected_storage);
+    const projected = projectRunCommandActivitySource(command, workspace_root, projected_storage);
+    const encoded = try text_utils.encodeTerminalSafe(alloc, projected, effective_max);
+    return encoded.bytes;
 }
 
 /// The caller owns the returned allocation and must free it with `alloc`.
@@ -664,6 +714,52 @@ test "run command activity projects line boundaries without changing other bytes
 
         try std.testing.expectEqualStrings(case.expected, activity.detail);
     }
+}
+
+test "run command detail uses the caller bound without changing activity labels" {
+    const alloc = std.testing.allocator;
+    const command = "printf " ++ ("alpha-beta-gamma-delta-" ** 8);
+    const arguments_json = try std.fmt.allocPrint(
+        alloc,
+        "{{\"command\":{f}}}",
+        .{std.json.fmt(command, .{})},
+    );
+    defer alloc.free(arguments_json);
+
+    const detail = (try formatRunCommandDetailBounded(
+        alloc,
+        command,
+        "",
+        max_run_command_reflow_bytes,
+    )) orelse return error.TestExpectedEqual;
+    defer alloc.free(detail);
+    try std.testing.expectEqualStrings(command, detail);
+
+    const bounded = (try formatRunCommandDetailBounded(alloc, command, "", 80)) orelse
+        return error.TestExpectedEqual;
+    defer alloc.free(bounded);
+    try std.testing.expect(bounded.len <= 80);
+    try std.testing.expect(std.mem.endsWith(u8, bounded, "..."));
+
+    const activity = (try formatRunCommandActivity(alloc, test_tool_registry, "", .{
+        .id = "bounded_activity",
+        .name = "run_command",
+        .arguments_json = arguments_json,
+    })) orelse return error.TestExpectedEqual;
+    defer alloc.free(activity.detail);
+    try std.testing.expect(activity.detail.len <= max_run_command_activity_bytes);
+    try std.testing.expect(std.mem.endsWith(u8, activity.detail, "..."));
+
+    const hidden_workspace_path = "printf " ++ ("prefix-" ** 20) ++ " /Users/example/workspace/file";
+    try std.testing.expectEqual(
+        @as(?[]u8, null),
+        try formatRunCommandDetailBounded(
+            alloc,
+            hidden_workspace_path,
+            "",
+            max_run_command_reflow_bytes,
+        ),
+    );
 }
 
 test "run command activity abbreviates only active workspace paths" {
