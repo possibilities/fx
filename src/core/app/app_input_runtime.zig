@@ -1765,6 +1765,7 @@ pub fn Runtime(comptime App: type) type {
         fn dismissAuthPickerForComposerEdit(app: *App) bool {
             if (comptime !@hasField(App, "auth")) return false;
             if (!app.auth.pickerView().active) return false;
+            cancelPromptRetryAfterAuth(app);
             app.auth.closePicker(app.alloc);
             return true;
         }
@@ -1773,8 +1774,15 @@ pub fn Runtime(comptime App: type) type {
             if (comptime !@hasField(App, "auth")) return false;
             const picker = app.auth.pickerView();
             if (!picker.active) return false;
+            cancelPromptRetryAfterAuth(app);
             if (picker.stage == .root and picker.include_skip) app.auth.skipOnboarding();
             return app.auth.popPickerStage(app.alloc);
+        }
+
+        fn cancelPromptRetryAfterAuth(app: *App) void {
+            if (comptime @hasDecl(App, "cancelPromptRetryAfterAuth")) {
+                app.cancelPromptRetryAfterAuth();
+            }
         }
 
         fn commandSkillsMenuActive(app: *App) bool {
@@ -3690,6 +3698,7 @@ const RoutingFakeApp = struct {
     selected_credential_source: ?types.CredentialSource = null,
     selected_auth_action: ?auth_runtime.AcquisitionAction = null,
     selected_auth_team: ?usize = null,
+    prompt_retry_after_auth: bool = false,
     upgrade_apply_count: usize = 0,
     upgrade_denied_count: usize = 0,
     suspend_count: usize = 0,
@@ -3766,6 +3775,10 @@ const RoutingFakeApp = struct {
     }
 
     pub fn flushBeforeBlockingExternalWork(_: *RoutingFakeApp) !void {}
+
+    pub fn cancelPromptRetryAfterAuth(self: *RoutingFakeApp) void {
+        self.prompt_retry_after_auth = false;
+    }
 
     pub fn suspendToJobControl(self: *RoutingFakeApp) !void {
         self.suspend_count += 1;
@@ -4483,10 +4496,12 @@ test "app_input_runtime Escape closes auth picker without arming composer clear"
     defer app.deinit();
     app.auth.source_inventory = auth_runtime.SourceSet.initOne(.ai_gateway_api_key);
     app.auth.openPicker(alloc);
+    app.prompt_retry_after_auth = true;
 
     try Runtime(RoutingFakeApp).resolveEscape(&app, false, 1);
 
     try std.testing.expect(!app.auth.pickerView().active);
+    try std.testing.expect(!app.prompt_retry_after_auth);
     try std.testing.expect(!app.input_runtime.gestures.escapeClearArmed());
 }
 
@@ -4703,10 +4718,12 @@ test "app_input_runtime composer editing dismisses auth picker before inserting"
     defer app.deinit();
     app.auth.source_inventory = auth_runtime.SourceSet.initOne(.ai_gateway_api_key);
     app.auth.openPicker(alloc);
+    app.prompt_retry_after_auth = true;
 
     try Runtime(RoutingFakeApp).handleByte(&app, 'x', 4096, 100);
 
     try std.testing.expect(!app.auth.pickerView().active);
+    try std.testing.expect(!app.prompt_retry_after_auth);
     try std.testing.expectEqualStrings("x", app.input_runtime.edit_state.input.items);
 }
 
