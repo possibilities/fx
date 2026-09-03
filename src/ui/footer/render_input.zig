@@ -421,7 +421,8 @@ pub const RenderContext = struct {
     composer_visible: bool = true,
     permission_mode: types.PermissionMode = .ask,
     queued_count: usize,
-    steering_count: usize = 0,
+    steering_messages: []const []const u8 = &.{},
+    steering_waits_for_tool: bool = false,
     queued_paused: bool = false,
     queued_cancel_all_available: bool = false,
     queued_prompt_cards: []const QueuedPromptCard = &.{},
@@ -441,6 +442,14 @@ pub const RenderContext = struct {
     model_completion_index: usize = 0,
     model_completion_window_start: usize = 0,
     model_completion_anchor: usize = 0,
+    provider_query_active: bool = false,
+    provider_picker_stage: picker_state.ProviderPickerStage = .provider,
+    provider_picker_completions: []const []const u8 = &.{},
+    /// Parallel to `provider_picker_completions`; an empty entry renders no annotation.
+    provider_picker_annotations: []const []const u8 = &.{},
+    provider_picker_completion_index: usize = 0,
+    provider_picker_completion_window_start: usize = 0,
+    provider_picker_completion_anchor: usize = 0,
     file_query_active: bool = false,
     file_completions: []const file_index.SearchResult = &.{},
     file_completion_index: usize = 0,
@@ -508,11 +517,15 @@ pub const QueuedBannerFacts = struct {
     paused: bool = false,
     card_count: usize = 0,
     card_rows: u16 = 0,
+    steering_rows: u16 = 0,
 };
 
 pub fn queuedBannerRowsForFacts(facts: QueuedBannerFacts) u16 {
     if (facts.queued_count == 0) return 0;
     const paused_hint_rows: u16 = @intFromBool(facts.paused);
+    if (facts.steering_rows > 0) {
+        return facts.steering_rows +| paused_hint_rows +| collapsed_queue_banner_gap_rows;
+    }
     if (facts.card_rows > 0) {
         const between_cards: u16 = @intCast(@min(
             facts.card_count -| 1,
@@ -530,6 +543,10 @@ pub fn queuedBannerRows(ctx: RenderContext) u16 {
         .paused = ctx.queued_paused,
         .card_count = ctx.queued_prompt_cards.len,
         .card_rows = ctx.queued_prompt_card_rows,
+        .steering_rows = @intCast(@min(
+            ctx.steering_messages.len,
+            @as(usize, std.math.maxInt(u16)),
+        )),
     });
 }
 
@@ -540,6 +557,10 @@ test "queued banner row policy consumes aggregate card facts" {
     try std.testing.expectEqual(@as(u16, 3), queuedBannerRowsForFacts(.{
         .queued_count = 2,
         .paused = true,
+    }));
+    try std.testing.expectEqual(@as(u16, 3), queuedBannerRowsForFacts(.{
+        .queued_count = 2,
+        .steering_rows = 2,
     }));
     try std.testing.expectEqual(@as(u16, 7), queuedBannerRowsForFacts(.{
         .queued_count = 2,

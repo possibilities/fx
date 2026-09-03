@@ -5,6 +5,7 @@ const app_session_runtime = @import("app_session_runtime.zig");
 const auto_upgrade = @import("../upgrade/auto_upgrade.zig");
 const acp_runner = @import("../cli/acp_runner.zig");
 const cli_surface = @import("../cli/cli_surface.zig");
+const credentials = @import("../auth/credentials.zig");
 const process_provider = @import("../execution/process_provider.zig");
 const gateway_provider = @import("../gateway/gateway_provider.zig");
 const provider_set = @import("../gateway/provider_set.zig");
@@ -66,6 +67,7 @@ pub const Config = struct {
     version: []const u8 = "",
     revision: []const u8 = "",
     build_channel: update_target.Channel = .stable,
+    auth_mode: credentials.AuthMode = .local,
     command_catalog: command_specs.TopLevelRegistry,
     default_model: []const u8,
     default_agent_step_limit: usize,
@@ -160,7 +162,7 @@ fn runWithDeps(comptime App: type, alloc: Allocator, args: []const [:0]const u8,
         .exit => |code| return .{ .exit = code },
     }
 
-    return runInteractiveWithDeps(App, false, alloc, &launch, deps);
+    return runInteractiveWithDeps(App, false, alloc, &launch, cfg.auth_mode, deps);
 }
 
 pub fn runBeforeInteractive(alloc: Allocator, args: []const [:0]const u8, cfg: Config) !BeforeInteractiveResult {
@@ -219,23 +221,23 @@ fn benchEnabled() bool {
     return io_mod.getenv("FX_BENCH") != null;
 }
 
-pub fn runInteractive(comptime App: type, alloc: Allocator, launch: *cli_surface.InteractiveLaunch) !RunOutcome {
-    return runInteractiveWithDeps(App, false, alloc, launch, .{});
+pub fn runInteractive(comptime App: type, alloc: Allocator, launch: *cli_surface.InteractiveLaunch, auth_mode: credentials.AuthMode) !RunOutcome {
+    return runInteractiveWithDeps(App, false, alloc, launch, auth_mode, .{});
 }
 
 /// Runs the interactive product without native CLI dispatch, process replacement,
 /// or a worker thread. Single-threaded hosts must arrange cooperative prompt work.
-pub fn runInteractiveCooperative(comptime App: type, alloc: Allocator, launch: *cli_surface.InteractiveLaunch) !RunOutcome {
-    return runInteractiveWithDeps(App, true, alloc, launch, .{});
+pub fn runInteractiveCooperative(comptime App: type, alloc: Allocator, launch: *cli_surface.InteractiveLaunch, auth_mode: credentials.AuthMode) !RunOutcome {
+    return runInteractiveWithDeps(App, true, alloc, launch, auth_mode, .{});
 }
 
 fn unavailableCliDispatch(_: ?*anyopaque, _: Allocator, _: []const [:0]const u8, _: cli_surface.Config) anyerror!cli_surface.RunResult {
     return error.UnknownCliCommand;
 }
 
-fn runInteractiveWithDeps(comptime App: type, comptime cooperative: bool, alloc: Allocator, launch: *cli_surface.InteractiveLaunch, deps: RunDeps) !RunOutcome {
+fn runInteractiveWithDeps(comptime App: type, comptime cooperative: bool, alloc: Allocator, launch: *cli_surface.InteractiveLaunch, auth_mode: credentials.AuthMode, deps: RunDeps) !RunOutcome {
     const resume_requested = launch.requested_resume != null;
-    var app = App.init(alloc, launch) catch |err| {
+    var app = App.init(alloc, launch, auth_mode) catch |err| {
         switch (err) {
             error.NotATerminal => {
                 writeStderr(deps, "fx requires an interactive terminal (TTY).\n");
@@ -345,23 +347,18 @@ fn runInteractiveWithDeps(comptime App: type, comptime cooperative: bool, alloc:
         if (handoff_value) |value| {
             var handoff = value;
             defer handoff.deinit(alloc);
-            var argv: std.ArrayList([]const u8) = .empty;
-            defer argv.deinit(alloc);
-            try argv.append(alloc, request.executablePath());
-            if (launch.modifiers.no_default_skills) {
-                try argv.append(alloc, "--no-default-skills");
-            }
-            for (launch.modifiers.skill_directories) |path| {
-                try argv.append(alloc, "--skills-dir");
-                try argv.append(alloc, path);
-            }
-            try argv.append(alloc, "resume");
-            try argv.append(alloc, handoff.session_id);
-            try argv.append(alloc, cli_surface.upgrade_relaunch_arg);
+            var argv = [_][]const u8{
+                request.executablePath(),
+                "resume",
+                handoff.session_id,
+                cli_surface.upgrade_relaunch_arg,
+                request.previousRevision() orelse "",
+            };
+            const argv_slice = if (request.previousRevision() == null) argv[0..4] else argv[0..5];
             const replace_err = deps.replace_process(
                 deps.replace_ctx,
                 io_mod.getIo(),
-                .{ .argv = argv.items },
+                .{ .argv = argv_slice },
             );
             writeUpgradeRelaunchFailure(deps, replace_err, handoff.session_id);
         } else {
@@ -416,6 +413,7 @@ fn cliSurfaceConfig(cfg: Config) cli_surface.Config {
         .version = cfg.version,
         .revision = cfg.revision,
         .build_channel = cfg.build_channel,
+        .auth_mode = cfg.auth_mode,
         .command_catalog = cfg.command_catalog,
         .default_model = cfg.default_model,
         .default_agent_step_limit = cfg.default_agent_step_limit,
@@ -627,11 +625,12 @@ const TestCapture = struct {
     resume_handoff_id: ?[]const u8 = null,
     raise_sigint_during_deinit: bool = false,
     upgrade_relaunch_path: ?[]const u8 = null,
+    upgrade_previous_revision: ?[]const u8 = null,
     replace_error: std.process.ReplaceError = error.InvalidExe,
     replace_calls: usize = 0,
     replace_arg_count: usize = 0,
-    replace_arg_bufs: [10][128]u8 = undefined,
-    replace_arg_lens: [10]usize = .{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
+    replace_arg_bufs: [5][128]u8 = undefined,
+    replace_arg_lens: [5]usize = .{ 0, 0, 0, 0, 0 },
     fail_unexpected_format: bool = false,
 
     fn init(run_result: cli_surface.RunResult) TestCapture {
@@ -738,7 +737,7 @@ const TestApp = struct {
     requested_resume: ?cli_surface.ResumeTarget = null,
     terminal_released: bool = false,
 
-    fn init(_: Allocator, launch: *cli_surface.InteractiveLaunch) !TestApp {
+    fn init(_: Allocator, launch: *cli_surface.InteractiveLaunch, _: credentials.AuthMode) !TestApp {
         appendInitEvent(launch);
         if (active_capture.?.init_error) |err| return err;
 
@@ -778,6 +777,10 @@ const TestApp = struct {
             .executable_path_len = path.len,
         };
         @memcpy(request.executable_path_buf[0..path.len], path);
+        if (active_capture.?.upgrade_previous_revision) |revision| {
+            @memcpy(request.previous_revision_buf[0..revision.len], revision);
+            request.previous_revision_len = @intCast(revision.len);
+        }
         return request;
     }
 
@@ -1017,21 +1020,15 @@ test "app entry relaunches only after teardown with the validated handoff" {
     });
 }
 
-test "app entry relaunch preserves exclusive skill roots" {
+test "app entry carries the previous revision through upgrade relaunch" {
     const alloc = std.testing.allocator;
     var capture = TestCapture.init(.{ .interactive = .{} });
     defer capture.deinit();
-    const skill_directories = try alloc.alloc([]u8, 2);
-    skill_directories[0] = try alloc.dupe(u8, "/tmp/first-skills");
-    skill_directories[1] = try alloc.dupe(u8, "/tmp/second-skills");
-    capture.run_result = .{ .interactive = .{ .modifiers = .{
-        .skill_directories = skill_directories,
-        .no_default_skills = true,
-    } } };
     capture.resume_handoff_id = "session-123";
     capture.upgrade_relaunch_path = "/tmp/fx-upgraded";
+    capture.upgrade_previous_revision = "1111111111111111111111111111111111111111";
 
-    const outcome = try runWithDeps(
+    _ = try runWithDeps(
         TestApp,
         alloc,
         &.{},
@@ -1039,17 +1036,12 @@ test "app entry relaunch preserves exclusive skill roots" {
         capture.deps(),
     );
 
-    try std.testing.expectEqual(@as(u8, 1), outcome.exit);
-    try std.testing.expectEqual(@as(usize, 9), capture.replace_arg_count);
-    try std.testing.expectEqualStrings("/tmp/fx-upgraded", capture.replaceArg(0));
-    try std.testing.expectEqualStrings("--no-default-skills", capture.replaceArg(1));
-    try std.testing.expectEqualStrings("--skills-dir", capture.replaceArg(2));
-    try std.testing.expectEqualStrings("/tmp/first-skills", capture.replaceArg(3));
-    try std.testing.expectEqualStrings("--skills-dir", capture.replaceArg(4));
-    try std.testing.expectEqualStrings("/tmp/second-skills", capture.replaceArg(5));
-    try std.testing.expectEqualStrings("resume", capture.replaceArg(6));
-    try std.testing.expectEqualStrings("session-123", capture.replaceArg(7));
-    try std.testing.expectEqualStrings("--upgrade-relaunch", capture.replaceArg(8));
+    try std.testing.expectEqual(@as(usize, 5), capture.replace_arg_count);
+    try std.testing.expectEqualStrings("--upgrade-relaunch", capture.replaceArg(3));
+    try std.testing.expectEqualStrings(
+        "1111111111111111111111111111111111111111",
+        capture.replaceArg(4),
+    );
 }
 
 test "app entry never relaunches without a validated handoff" {

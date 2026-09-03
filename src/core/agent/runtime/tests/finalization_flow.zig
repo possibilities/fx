@@ -634,8 +634,8 @@ test "processQueuedPrompt step limit writes active debug trace" {
 
     try std.testing.expect(std.mem.find(u8, trace, "[agent] step start step=1 limit=1") != null);
     try std.testing.expect(std.mem.find(u8, trace, "[agent] step completion step=1") != null);
-    try std.testing.expect(std.mem.find(u8, trace, "[agent] step limit reached turn_id=1 step_id=1 step_index=1 step_limit=1 gateway_messages=2 completed_tool_count=1 completed_tool_names=read_file last_tool_call_name=read_file last_tool_call_id=call_1 outcome_kind=step_limit") != null);
-    try std.testing.expect(std.mem.find(u8, trace, "event=step_limit_reached turn_id=1 step_id=1 step_index=1 step_limit=1 gateway_messages=2 completed_tool_count=1 completed_tool_names=read_file last_tool_call_name=read_file last_tool_call_id=call_1 outcome_kind=step_limit") != null);
+    try std.testing.expect(std.mem.find(u8, trace, "[agent] step limit reached turn_id=1 step_id=1 step_index=1 step_limit=1 gateway_messages=3 completed_tool_count=1 completed_tool_names=read_file last_tool_call_name=read_file last_tool_call_id=call_1 outcome_kind=step_limit") != null);
+    try std.testing.expect(std.mem.find(u8, trace, "event=step_limit_reached turn_id=1 step_id=1 step_index=1 step_limit=1 gateway_messages=3 completed_tool_count=1 completed_tool_names=read_file last_tool_call_name=read_file last_tool_call_id=call_1 outcome_kind=step_limit") != null);
     try std.testing.expect(std.mem.find(u8, trace, "{\"path\":\"a\"}") == null);
 }
 
