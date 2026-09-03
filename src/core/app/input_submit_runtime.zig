@@ -489,41 +489,43 @@ pub fn SubmitRuntime(comptime App: type) type {
             const expanded = try paste_blocks.expand(app.alloc, app.input_runtime.edit_state.input.items, app.input_runtime.entities.pasted_blocks.items);
             defer if (expanded.owned) app.alloc.free(expanded.text);
 
-            if (directCommand(expanded.text)) |command| {
-                if (comptime @hasDecl(App, "submitDirectTerminal")) {
-                    try App.submitDirectTerminal(app, command);
+            if (!queue_rt.ownsComposer(app)) {
+                if (directCommand(expanded.text)) |command| {
+                    if (comptime @hasDecl(App, "submitDirectTerminal")) {
+                        try App.submitDirectTerminal(app, command);
+                        return;
+                    }
+                }
+
+                const left_trimmed = std.mem.trimStart(u8, expanded.text, " \t\r\n");
+                const resolved_slash_submission = resolvedSlashSubmission(app, left_trimmed);
+                if (knownSlashCommand(app, resolved_slash_submission)) |command| {
+                    if (requiresPromptCredential(command, resolved_slash_submission) and !try preflightPrompt(app)) return;
+                    try submitSlashCommand(app, left_trimmed, null, max_prompt_history);
                     return;
                 }
-            }
-
-            const left_trimmed = std.mem.trimStart(u8, expanded.text, " \t\r\n");
-            const resolved_slash_submission = resolvedSlashSubmission(app, left_trimmed);
-            if (knownSlashCommand(app, resolved_slash_submission)) |command| {
-                if (requiresPromptCredential(command, resolved_slash_submission) and !try preflightPrompt(app)) return;
-                try submitSlashCommand(app, left_trimmed, null, max_prompt_history);
-                return;
-            }
-            if (shouldRouteUnknownSlashCommand(app, resolved_slash_submission)) {
-                try submitSlashCommand(app, left_trimmed, null, max_prompt_history);
-                return;
-            }
-            if (pendingImagesPrefixEnd(
-                app.input_runtime.edit_state.input.items,
-                expanded.text,
-                app.input_runtime.entities.pasted_blocks.items,
-                app.input_runtime.entities.image_tokens.items,
-                app.pending_images.items,
-            )) |command_start| {
-                const command_text = expanded.text[command_start..];
-                if (knownSlashCommand(app, command_text)) |command| {
-                    if (requiresPromptCredential(command, command_text) and !try preflightPrompt(app)) return;
-                    try submitSlashCommand(
-                        app,
-                        command_text,
-                        expanded.text[0..command_start],
-                        max_prompt_history,
-                    );
+                if (shouldRouteUnknownSlashCommand(app, resolved_slash_submission)) {
+                    try submitSlashCommand(app, left_trimmed, null, max_prompt_history);
                     return;
+                }
+                if (pendingImagesPrefixEnd(
+                    app.input_runtime.edit_state.input.items,
+                    expanded.text,
+                    app.input_runtime.entities.pasted_blocks.items,
+                    app.input_runtime.entities.image_tokens.items,
+                    app.pending_images.items,
+                )) |command_start| {
+                    const command_text = expanded.text[command_start..];
+                    if (knownSlashCommand(app, command_text)) |command| {
+                        if (requiresPromptCredential(command, command_text) and !try preflightPrompt(app)) return;
+                        try submitSlashCommand(
+                            app,
+                            command_text,
+                            expanded.text[0..command_start],
+                            max_prompt_history,
+                        );
+                        return;
+                    }
                 }
             }
 
