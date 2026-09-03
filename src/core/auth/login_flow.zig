@@ -765,9 +765,12 @@ pub fn logout(
             return LogoutError.SessionDeleteFailed;
         }) orelse return .{};
         defer mutation.deinit();
-        session = mutation.load(alloc) catch load: {
-            session_load_failed = true;
-            break :load null;
+        session = mutation.load(alloc) catch |err| switch (err) {
+            error.InvalidAuthSession => null,
+            else => load: {
+                session_load_failed = true;
+                break :load null;
+            },
         };
         break :blk mutation.delete(alloc) catch oauth_session.DeleteResult{
             .local_cleanup_failed = true,
