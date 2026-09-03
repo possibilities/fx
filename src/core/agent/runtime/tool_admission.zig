@@ -149,7 +149,7 @@ pub const TerminalValidationRetryState = struct {
         call: ToolCall,
         model_output: []const u8,
     ) Allocator.Error!void {
-        if (!std.mem.eql(u8, call.name, "terminal")) return;
+        if (!std.mem.eql(u8, call.name, "shell")) return;
         if (try tool_result_errors.inspectTerminalActionFieldCorrection(
             alloc,
             model_output,
@@ -167,6 +167,54 @@ pub const TerminalValidationRetryState = struct {
     }
 
     pub fn finishBatch(self: *TerminalValidationRetryState) bool {
+        if (self.stop_after_batch) return true;
+        const previous = self.previous;
+        self.previous = self.current;
+        self.current = previous;
+        self.current.clearRetainingCapacity();
+        return false;
+    }
+};
+
+pub const ShellExecutionFailureRetryState = struct {
+    previous: std.ArrayList(TerminalValidationDigest) = .empty,
+    current: std.ArrayList(TerminalValidationDigest) = .empty,
+    stop_after_batch: bool = false,
+
+    pub fn deinit(self: *ShellExecutionFailureRetryState, alloc: Allocator) void {
+        self.previous.deinit(alloc);
+        self.current.deinit(alloc);
+        self.* = .{};
+    }
+
+    pub fn beginBatch(self: *ShellExecutionFailureRetryState) void {
+        self.current.clearRetainingCapacity();
+        self.stop_after_batch = false;
+    }
+
+    pub fn observe(
+        self: *ShellExecutionFailureRetryState,
+        alloc: Allocator,
+        call: ToolCall,
+        execution: ToolExecutionResult,
+    ) Allocator.Error!void {
+        if (!std.mem.eql(u8, call.name, "shell") or execution.status != .failure) {
+            return;
+        }
+        var hash = std.crypto.hash.sha2.Sha256.init(.{});
+        hash.update("fx.shell-execution-failure.v1\x00");
+        hash.update(call.arguments_json);
+        const digest = hash.finalResult();
+        const decision = terminalValidationDigestDecision(
+            self.previous.items,
+            self.current.items,
+            digest,
+        );
+        if (decision.append_current) try self.current.append(alloc, digest);
+        self.stop_after_batch = self.stop_after_batch or decision.repeated;
+    }
+
+    pub fn finishBatch(self: *ShellExecutionFailureRetryState) bool {
         if (self.stop_after_batch) return true;
         const previous = self.previous;
         self.previous = self.current;
@@ -276,7 +324,7 @@ test "terminal validation retry state retains independent batch corrections" {
     defer alloc.free(correction_t);
     const call: ToolCall = .{
         .id = "terminal-call",
-        .name = "terminal",
+        .name = "shell",
         .arguments_json = "{}",
     };
 
@@ -297,24 +345,64 @@ test "terminal validation retry state retains independent batch corrections" {
     try std.testing.expect(state.finishBatch());
 }
 
+test "shell execution failures retain independent batch identities" {
+    const alloc = std.testing.allocator;
+    const first: ToolCall = .{
+        .id = "first",
+        .name = "shell",
+        .arguments_json = "{\"action\":\"run\",\"command\":\"first\"}",
+    };
+    const second: ToolCall = .{
+        .id = "second",
+        .name = "shell",
+        .arguments_json = "{\"action\":\"run\",\"command\":\"second\"}",
+    };
+    const failed = ToolExecutionResult{
+        .status = .failure,
+        .model_output = "session lost",
+    };
+    const succeeded = ToolExecutionResult{ .model_output = "ok" };
+    var state: ShellExecutionFailureRetryState = .{};
+    defer state.deinit(alloc);
+
+    state.beginBatch();
+    try state.observe(alloc, first, failed);
+    try state.observe(alloc, second, failed);
+    try std.testing.expect(!state.finishBatch());
+    state.beginBatch();
+    try state.observe(alloc, first, failed);
+    try state.observe(alloc, second, failed);
+    try std.testing.expect(state.finishBatch());
+
+    state.deinit(alloc);
+    state.beginBatch();
+    try state.observe(alloc, first, failed);
+    try state.observe(alloc, second, succeeded);
+    try std.testing.expect(!state.finishBatch());
+    state.beginBatch();
+    try state.observe(alloc, first, failed);
+    try state.observe(alloc, second, succeeded);
+    try std.testing.expect(state.finishBatch());
+}
+
 test "turn review cache reuses only exact valid caution" {
     const alloc = std.testing.allocator;
     var cache: TurnReviewCache = .{};
     defer cache.deinit(alloc);
     const first = ToolCall{
         .id = "first",
-        .name = "terminal",
-        .arguments_json = "{\"action\":\"exec\",\"command\":\"rm -rf frames\"}",
+        .name = "shell",
+        .arguments_json = "{\"action\":\"run\",\"command\":\"rm -rf frames\"}",
     };
     const same = ToolCall{
         .id = "same-new-call-id",
-        .name = "terminal",
+        .name = "shell",
         .arguments_json = first.arguments_json,
     };
     const wrapped = ToolCall{
         .id = "wrapped",
-        .name = "terminal",
-        .arguments_json = "{\"action\":\"exec\",\"command\":\"sh -c 'rm -rf frames'\"}",
+        .name = "shell",
+        .arguments_json = "{\"action\":\"run\",\"command\":\"sh -c 'rm -rf frames'\"}",
     };
     try cache.rememberCaution(alloc, first, .{
         .decision = .deny,
@@ -356,12 +444,12 @@ test "turn review cache reuses only exact valid caution" {
     for (1..65) |index| {
         const arguments = try std.fmt.bufPrint(
             &arguments_buffer,
-            "{{\"action\":\"exec\",\"command\":\"rm -rf generated-{d}\"}}",
+            "{{\"action\":\"run\",\"command\":\"rm -rf generated-{d}\"}}",
             .{index},
         );
         try cache.rememberCaution(alloc, .{
             .id = "bounded",
-            .name = "terminal",
+            .name = "shell",
             .arguments_json = arguments,
         }, .{
             .decision = .deny,
@@ -376,12 +464,12 @@ test "turn review cache reuses only exact valid caution" {
     try std.testing.expectEqual(max_turn_review_cautions, cache.cautions.items.len);
     const overflow_arguments = try std.fmt.bufPrint(
         &arguments_buffer,
-        "{{\"action\":\"exec\",\"command\":\"rm -rf generated-{d}\"}}",
+        "{{\"action\":\"run\",\"command\":\"rm -rf generated-{d}\"}}",
         .{@as(usize, 64)},
     );
     try std.testing.expect(cache.cachedCaution(.{
         .id = "overflow",
-        .name = "terminal",
+        .name = "shell",
         .arguments_json = overflow_arguments,
     }) == null);
 }
@@ -448,19 +536,19 @@ pub fn deferCapturedCommandLifecycleForAutoPermissionNotice(
         );
 }
 
-test "auto permission lifecycle deferral applies only to terminal exec" {
+test "auto permission lifecycle deferral applies only to shell run" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
     const exec = ToolCall{
         .id = "exec",
-        .name = "terminal",
-        .arguments_json = "{\"action\":\"exec\",\"command\":\"pwd\"}",
+        .name = "shell",
+        .arguments_json = "{\"action\":\"run\",\"command\":\"pwd\"}",
     };
     const start = ToolCall{
         .id = "start",
-        .name = "terminal",
-        .arguments_json = "{\"action\":\"start\"}",
+        .name = "shell",
+        .arguments_json = "{\"action\":\"list\"}",
     };
     try std.testing.expect(try deferCapturedCommandLifecycleForAutoPermissionNotice(
         test_builtin_tools.registry,

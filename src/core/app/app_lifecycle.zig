@@ -41,7 +41,6 @@ const normal_exit_restore = normal_exit_restore_prefix ++ "\x1b[<u\x1b[>4;0m";
 const tmux_normal_exit_restore = normal_exit_restore_prefix ++ "\x1b[>4;0m";
 const alternate_screen_enter = "\x1b[?1049h";
 const alternate_mouse_tracking_enter = "\x1b[?1000h\x1b[?1006h";
-const terminal_takeover_reset = "\x1b[?2026l\x1b[?1000l\x1b[?1002l\x1b[?1004l\x1b[?1006l\x1b[?1l\x1b>\x1b[?2004l\x1b[<u\x1b[>4;0m\x1b[4l\x1b[?6l\x1b[?7h\x1b[0m\x1b[?25h";
 
 /// Original handlers, written at bootstrap and restored at shutdown.
 /// Signal context never mutates them.
@@ -131,6 +130,7 @@ pub const StartupState = struct {
     context_limits: config_runtime.context_limits.Values = .{},
     context_enabled: bool = true,
     fast_mode: bool = false,
+    fast_mode_model_bound: bool = false,
     fast_mode_source: config_runtime.ConfigSource = .compiled_default,
     slash_menu_categories: bool = true,
     collapse_tool_calls: bool = false,
@@ -252,7 +252,6 @@ pub const BootstrapConfig = struct {
     secret_store: host.SecretStore,
     resize_handler: ResizeHandler,
     fx_version: []const u8 = "",
-    record_requested: bool = false,
 };
 
 pub fn loadStartupState(
@@ -423,8 +422,16 @@ fn loadStartupStateFromOwnedWorkspace(
     state.max_tool_result_bytes = tool_result_limits.resolveMaxToolResultBytes(settings.max_tool_result_bytes, tool_result_limits.default_max_tool_result_bytes);
     state.context_limits = config_runtime.resolveContextLimits(settings, &.{});
     state.context_enabled = settings.context orelse true;
-    state.fast_mode = settings.fast_mode orelse
-        (state.provider == .gateway and state.model_source == .compiled_default);
+    const fast_mode = resolveStartupFastMode(
+        state.provider,
+        state.model_source,
+        settings.fast_mode,
+        detailed.sources.fast_mode,
+        settings.fast_mode_model_bound,
+        detailed.sources.fast_mode_model_bound,
+    );
+    state.fast_mode = fast_mode.enabled;
+    state.fast_mode_model_bound = fast_mode.model_bound;
     state.fast_mode_source = detailed.sources.fast_mode;
     state.slash_menu_categories = settings.slash_menu_categories orelse true;
     state.collapse_tool_calls = settings.collapse_tool_calls orelse false;
@@ -444,6 +451,32 @@ fn loadStartupStateFromOwnedWorkspace(
     state.notification_max = max_override orelse settings.notification_max orelse false;
 
     return state;
+}
+
+const StartupFastMode = struct {
+    enabled: bool,
+    model_bound: bool,
+};
+
+fn resolveStartupFastMode(
+    provider: model_provider.ProviderId,
+    model_source: config_runtime.ModelSource,
+    configured_fast_mode: ?bool,
+    fast_mode_source: config_runtime.ConfigSource,
+    model_bound: ?bool,
+    binding_source: config_runtime.ConfigSource,
+) StartupFastMode {
+    if (configured_fast_mode) |enabled| {
+        return .{
+            .enabled = enabled,
+            .model_bound = enabled and
+                model_bound == true and
+                model_source == fast_mode_source and
+                fast_mode_source == binding_source,
+        };
+    }
+    const enabled = provider == .gateway and model_source == .compiled_default;
+    return .{ .enabled = enabled, .model_bound = enabled };
 }
 
 pub fn bootstrapInteractiveApp(cfg: BootstrapConfig) !StartupState {
@@ -479,11 +512,9 @@ pub fn bootstrapInteractiveApp(cfg: BootstrapConfig) !StartupState {
 
     record_tape.configureFromEnv(
         cfg.alloc,
-        state.workspace_root,
         cfg.shell.layout.cols,
         cfg.shell.layout.rows,
         cfg.fx_version,
-        cfg.record_requested,
     ) catch |err| {
         debug_trace.logf("record", "startup recording failed err={s}", .{@errorName(err)});
         return error.RecordingStartFailed;
@@ -627,8 +658,6 @@ fn leaveAlternateScreens(terminal: *TerminalState, shell: *TranscriptRuntime, me
         .file_approval => _ = leaveApprovalScreen(terminal, shell, metrics) catch {},
         .full_transcript => _ = leaveFullTranscriptScreen(terminal, shell, metrics) catch {},
         .catalog_menu => _ = leaveCatalogMenuScreen(terminal, shell, metrics) catch {},
-        .subagent_manager => _ = leaveSubagentManagerScreen(terminal, shell, metrics) catch {},
-        .terminal_session => _ = leaveTerminalSessionScreen(terminal, shell, metrics) catch {},
     }
 }
 
@@ -804,93 +833,6 @@ pub fn enterCatalogMenuScreen(terminal: *TerminalState, shell: *TranscriptRuntim
 
 pub fn leaveCatalogMenuScreen(terminal: *TerminalState, shell: *TranscriptRuntime, metrics: *Metrics) !void {
     try leaveAlternateScreen(terminal, shell, metrics, .catalog_menu);
-}
-
-pub fn handoffCatalogMenuToSubagentManager(terminal: *TerminalState) !void {
-    if (!terminal.catalogMenuScreenActive()) return error.CatalogMenuScreenNotActive;
-    terminal.alternate_screen_owner = .subagent_manager;
-    terminal.alternate_frame_layout = .{};
-}
-
-pub fn handoffApprovalToSubagentManager(
-    terminal: *TerminalState,
-    shell: *TranscriptRuntime,
-    metrics: *Metrics,
-) !void {
-    if (!terminal.fileApprovalScreenActive()) return error.ApprovalScreenNotActive;
-    try setAlternateScreenMouseTracking(
-        terminal,
-        shell,
-        metrics,
-        .file_approval,
-        false,
-    );
-    terminal.alternate_screen_owner = .subagent_manager;
-    terminal.alternate_frame_layout = .{};
-}
-
-pub fn enterSubagentManagerScreen(
-    terminal: *TerminalState,
-    shell: *TranscriptRuntime,
-    metrics: *Metrics,
-) !void {
-    try enterAlternateScreen(terminal, shell, metrics, .subagent_manager);
-}
-
-pub fn leaveSubagentManagerScreen(
-    terminal: *TerminalState,
-    shell: *TranscriptRuntime,
-    metrics: *Metrics,
-) !void {
-    try leaveAlternateScreen(terminal, shell, metrics, .subagent_manager);
-}
-
-pub fn enterTerminalSessionScreen(
-    terminal: *TerminalState,
-    shell: *TranscriptRuntime,
-    metrics: *Metrics,
-) !void {
-    try enterAlternateScreen(terminal, shell, metrics, .terminal_session);
-    try writeLifecycleTerminalBytes(shell, metrics, terminal_takeover_reset ++ "\x1b[2J\x1b[H");
-}
-
-pub fn leaveTerminalSessionScreen(
-    terminal: *TerminalState,
-    shell: *TranscriptRuntime,
-    metrics: *Metrics,
-) !void {
-    if (!terminal.terminalSessionScreenActive()) return;
-    try writeLifecycleTerminalBytes(
-        shell,
-        metrics,
-        terminal_takeover_reset ++ ui_terminal.alternate_screen_leave_sequence,
-    );
-    try enableInteractiveTerminalModes(shell, metrics);
-    terminal.alternate_mouse_tracking_active = false;
-    terminal.alternate_screen_owner = .none;
-    terminal.alternate_frame_layout = .{};
-}
-
-/// Transfer the existing alternate buffer directly back to the manager.
-/// The child modes are removed before ownership changes, so a failed write
-/// leaves terminal-session cleanup armed.
-pub fn handoffTerminalSessionToSubagentManager(
-    terminal: *TerminalState,
-    shell: *TranscriptRuntime,
-    metrics: *Metrics,
-) !void {
-    if (!terminal.terminalSessionScreenActive()) {
-        return error.TerminalSessionScreenNotActive;
-    }
-    try writeLifecycleTerminalBytes(
-        shell,
-        metrics,
-        terminal_takeover_reset ++ "\x1b[2J\x1b[H",
-    );
-    try enableInteractiveTerminalModes(shell, metrics);
-    terminal.alternate_mouse_tracking_active = false;
-    terminal.alternate_screen_owner = .subagent_manager;
-    terminal.alternate_frame_layout = .{};
 }
 
 pub fn openFullTranscript(
@@ -1404,71 +1346,6 @@ test "approval inline restore keeps ownership armed until frame commit" {
     );
 }
 
-test "approval hands its alternate screen to subagent manager without buffer swap" {
-    const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    const out_path = "approval-to-subagent-manager.out";
-    const out_file = try tmp.dir.createFile(io_mod.getIo(), out_path, .{ .truncate = true });
-    var shell = TranscriptRuntime{ .stdout_file = out_file };
-    defer shell.deinit(alloc);
-    var metrics = Metrics{};
-    var terminal = TerminalState{};
-    try std.testing.expectError(
-        error.ApprovalScreenNotActive,
-        handoffApprovalToSubagentManager(&terminal, &shell, &metrics),
-    );
-
-    terminal.alternate_screen_owner = .file_approval;
-    terminal.alternate_mouse_tracking_active = true;
-    terminal.alternate_frame_layout.layout_id = 52;
-    try handoffApprovalToSubagentManager(&terminal, &shell, &metrics);
-    shell.stdout_file.close(io_mod.getIo());
-
-    var read_file = try tmp.dir.openFile(io_mod.getIo(), out_path, .{});
-    defer read_file.close(io_mod.getIo());
-    const bytes = try io_mod.readFileToEnd(alloc, &read_file, 64);
-    defer alloc.free(bytes);
-
-    try std.testing.expectEqualStrings(
-        ui_terminal.alternate_mouse_tracking_leave_sequence,
-        bytes,
-    );
-    try std.testing.expect(std.mem.find(
-        u8,
-        bytes,
-        ui_terminal.alternate_screen_leave_sequence,
-    ) == null);
-    try std.testing.expect(terminal.subagentManagerScreenActive());
-    try std.testing.expect(!terminal.alternate_mouse_tracking_active);
-    try std.testing.expectEqual(@as(u64, 0), terminal.alternate_frame_layout.layout_id);
-
-    const failure_file = try tmp.dir.createFile(
-        io_mod.getIo(),
-        "approval-to-subagent-manager-failure.out",
-        .{ .truncate = true },
-    );
-    var failure_shell = TranscriptRuntime{ .stdout_file = failure_file };
-    defer failure_shell.deinit(alloc);
-    failure_shell.stdout_file.close(io_mod.getIo());
-    var failed_terminal = TerminalState{
-        .alternate_screen_owner = .file_approval,
-        .alternate_mouse_tracking_active = true,
-        .alternate_frame_layout = .{ .layout_id = 53 },
-    };
-    if (handoffApprovalToSubagentManager(
-        &failed_terminal,
-        &failure_shell,
-        &metrics,
-    )) |_| {
-        return error.TestExpectedApprovalHandoffFailure;
-    } else |_| {}
-    try std.testing.expect(failed_terminal.fileApprovalScreenActive());
-    try std.testing.expect(failed_terminal.alternate_mouse_tracking_active);
-    try std.testing.expectEqual(@as(u64, 53), failed_terminal.alternate_frame_layout.layout_id);
-}
-
 test "full transcript alternate screen preserves native selection and restores the shadow terminal once" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -1560,20 +1437,6 @@ test "skills menu alternate screen lifecycle restores the shadow terminal once" 
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, bytes, "\x1b[?1049l"));
     try std.testing.expect(!terminal.catalogMenuScreenActive());
     try std.testing.expectEqual(@as(u21, ' '), shell.shadow_vt.?.cellAt(1, 1).?.codepoint);
-}
-
-test "closed catalog hands its alternate screen directly to subagent manager" {
-    var terminal = TerminalState{};
-    try std.testing.expectError(
-        error.CatalogMenuScreenNotActive,
-        handoffCatalogMenuToSubagentManager(&terminal),
-    );
-
-    terminal.alternate_screen_owner = .catalog_menu;
-    terminal.alternate_frame_layout.layout_id = 73;
-    try handoffCatalogMenuToSubagentManager(&terminal);
-    try std.testing.expect(terminal.subagentManagerScreenActive());
-    try std.testing.expectEqual(@as(u64, 0), terminal.alternate_frame_layout.layout_id);
 }
 
 test "full transcript handoff to approval reuses the alternate screen" {
@@ -2016,7 +1879,7 @@ test "loadStartupState applies core env overrides" {
     try std.testing.expectEqual(@as(usize, 37), state.agent_step_limit);
 }
 
-test "loadStartupState defaults fast mode on only for the compiled Gateway default and preserves explicit preferences" {
+test "loadStartupState defaults fast mode on only for the compiled Gateway default and requires bound explicit preferences" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -2024,6 +1887,8 @@ test "loadStartupState defaults fast mode on only for the compiled Gateway defau
     try tmp.dir.createDirPath(io_mod.getIo(), "absent");
     try tmp.dir.createDirPath(io_mod.getIo(), "configured");
     try tmp.dir.createDirPath(io_mod.getIo(), "disabled");
+    try tmp.dir.createDirPath(io_mod.getIo(), "legacy-fast");
+    try tmp.dir.createDirPath(io_mod.getIo(), "bound-fast");
     try tmp.dir.createDirPath(io_mod.getIo(), "codex");
 
     const home_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "home");
@@ -2034,13 +1899,17 @@ test "loadStartupState defaults fast mode on only for the compiled Gateway defau
     defer std.testing.allocator.free(configured_root);
     const disabled_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "disabled");
     defer std.testing.allocator.free(disabled_root);
+    const legacy_fast_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "legacy-fast");
+    defer std.testing.allocator.free(legacy_fast_root);
+    const bound_fast_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "bound-fast");
+    defer std.testing.allocator.free(bound_fast_root);
     const codex_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "codex");
     defer std.testing.allocator.free(codex_root);
 
     const fixture = try std.fmt.allocPrint(
         std.testing.allocator,
-        "{{\"workspaces\":{{\"{s}\":{{\"model\":\"openai/gpt-5\"}},\"{s}\":{{\"fast_mode\":false}},\"{s}\":{{\"provider\":\"codex\",\"codex_model\":\"gpt-5.4-mini\"}}}}}}\n",
-        .{ configured_root, disabled_root, codex_root },
+        "{{\"workspaces\":{{\"{s}\":{{\"model\":\"openai/gpt-5\"}},\"{s}\":{{\"fast_mode\":false}},\"{s}\":{{\"model\":\"zai/glm-5.3\",\"fast_mode\":true}},\"{s}\":{{\"model\":\"provider/fast-toggle\",\"fast_mode\":true,\"fast_mode_model_bound\":true}},\"{s}\":{{\"provider\":\"codex\",\"codex_model\":\"gpt-5.4-mini\"}}}}}}\n",
+        .{ configured_root, disabled_root, legacy_fast_root, bound_fast_root, codex_root },
     );
     defer std.testing.allocator.free(fixture);
     try writeFixtureFile(tmp.dir, "home/.fx/settings.json", fixture);
@@ -2053,16 +1922,31 @@ test "loadStartupState defaults fast mode on only for the compiled Gateway defau
     try std.testing.expectEqualStrings("zai/glm-5.2", absent.selected_model);
     try std.testing.expectEqualStrings("zai/glm-5.2", absent.configured_model);
     try std.testing.expect(absent.fast_mode);
+    try std.testing.expect(absent.fast_mode_model_bound);
 
     var configured = try loadStartupStateForWorkspace(std.testing.allocator, configured_root, "zai/glm-5.2", 25);
     defer configured.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings("openai/gpt-5", configured.selected_model);
     try std.testing.expectEqualStrings("openai/gpt-5", configured.configured_model);
     try std.testing.expect(!configured.fast_mode);
+    try std.testing.expect(!configured.fast_mode_model_bound);
 
     var disabled = try loadStartupStateForWorkspace(std.testing.allocator, disabled_root, "zai/glm-5.2", 25);
     defer disabled.deinit(std.testing.allocator);
     try std.testing.expect(!disabled.fast_mode);
+    try std.testing.expect(!disabled.fast_mode_model_bound);
+
+    var legacy_fast = try loadStartupStateForWorkspace(std.testing.allocator, legacy_fast_root, "zai/glm-5.2", 25);
+    defer legacy_fast.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("zai/glm-5.3", legacy_fast.selected_model);
+    try std.testing.expect(legacy_fast.fast_mode);
+    try std.testing.expect(!legacy_fast.fast_mode_model_bound);
+
+    var bound_fast = try loadStartupStateForWorkspace(std.testing.allocator, bound_fast_root, "zai/glm-5.2", 25);
+    defer bound_fast.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("provider/fast-toggle", bound_fast.selected_model);
+    try std.testing.expect(bound_fast.fast_mode);
+    try std.testing.expect(bound_fast.fast_mode_model_bound);
 
     var codex = try loadStartupStateForWorkspace(std.testing.allocator, codex_root, "zai/glm-5.2", 25);
     defer codex.deinit(std.testing.allocator);
@@ -2245,159 +2129,4 @@ fn writeFixtureFile(dir: std.Io.Dir, sub_path: []const u8, text: []const u8) !vo
     var file = try dir.createFile(io_mod.getIo(), sub_path, .{ .truncate = true });
     defer file.close(io_mod.getIo());
     try file.writeStreamingAll(io_mod.getIo(), text);
-}
-
-test "subagent manager lifecycle restores exact normal screen and cursor across repeated cycles" {
-    const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    const out_path = "subagent-manager-screen.out";
-    const out_file = try tmp.dir.createFile(io_mod.getIo(), out_path, .{ .truncate = true });
-    var shell = TranscriptRuntime{
-        .stdout_file = out_file,
-        .layout = .{
-            .rows = 6,
-            .cols = 24,
-            .content_bottom = 3,
-            .divider_top_row = 3,
-            .input_row = 4,
-            .divider_bottom_row = 5,
-            .hint_row = 6,
-        },
-    };
-    defer shell.deinit(alloc);
-    try shell.enableShadowVt(alloc);
-
-    var metrics = Metrics{};
-    var terminal = TerminalState{};
-    try writeLifecycleTerminalBytes(&shell, &metrics, "main transcript\x1b[3;7H");
-    for (0..3) |_| {
-        try enterSubagentManagerScreen(&terminal, &shell, &metrics);
-        try enterSubagentManagerScreen(&terminal, &shell, &metrics);
-        try writeLifecycleTerminalBytes(&shell, &metrics, "\x1b[H\x1b[2JSubagent manager\x1b[6;20H");
-        try leaveSubagentManagerScreen(&terminal, &shell, &metrics);
-        try leaveSubagentManagerScreen(&terminal, &shell, &metrics);
-    }
-    try writeLifecycleTerminalBytes(&shell, &metrics, "X");
-    shell.stdout_file.close(io_mod.getIo());
-
-    var read_file = try tmp.dir.openFile(io_mod.getIo(), out_path, .{});
-    defer read_file.close(io_mod.getIo());
-    const bytes = try io_mod.readFileToEnd(alloc, &read_file, 1024);
-    defer alloc.free(bytes);
-    try std.testing.expectEqual(@as(usize, 3), std.mem.count(u8, bytes, "\x1b[?1049h"));
-    try std.testing.expectEqual(@as(usize, 3), std.mem.count(u8, bytes, "\x1b[?1049l"));
-    try std.testing.expect(!terminal.subagentManagerScreenActive());
-    try std.testing.expectEqual(@as(u21, 'm'), shell.shadow_vt.?.cellAt(1, 1).?.codepoint);
-    try std.testing.expectEqual(@as(u21, 'X'), shell.shadow_vt.?.cellAt(3, 7).?.codepoint);
-}
-
-test "terminal takeover leaves manager before entry and hands the alternate buffer back once" {
-    const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const out_file = try tmp.dir.createFile(
-        io_mod.getIo(),
-        "terminal-takeover-screen.out",
-        .{ .truncate = true },
-    );
-    var shell = TranscriptRuntime{ .stdout_file = out_file };
-    defer shell.deinit(alloc);
-    var metrics = Metrics{};
-    var terminal = TerminalState{};
-
-    try enterSubagentManagerScreen(&terminal, &shell, &metrics);
-    try leaveSubagentManagerScreen(&terminal, &shell, &metrics);
-    try enterTerminalSessionScreen(&terminal, &shell, &metrics);
-    try std.testing.expect(terminal.terminalSessionScreenActive());
-    try handoffTerminalSessionToSubagentManager(&terminal, &shell, &metrics);
-    try std.testing.expect(terminal.subagentManagerScreenActive());
-    try leaveSubagentManagerScreen(&terminal, &shell, &metrics);
-    shell.stdout_file.close(io_mod.getIo());
-
-    var read_file = try tmp.dir.openFile(
-        io_mod.getIo(),
-        "terminal-takeover-screen.out",
-        .{},
-    );
-    defer read_file.close(io_mod.getIo());
-    const bytes = try io_mod.readFileToEnd(alloc, &read_file, 4096);
-    defer alloc.free(bytes);
-    try std.testing.expectEqual(
-        @as(usize, 2),
-        std.mem.count(u8, bytes, alternate_screen_enter),
-    );
-    try std.testing.expectEqual(
-        @as(usize, 2),
-        std.mem.count(u8, bytes, ui_terminal.alternate_screen_leave_sequence),
-    );
-    try std.testing.expectEqual(
-        @as(usize, 2),
-        std.mem.count(u8, bytes, "\x1b[>4;0m"),
-    );
-    try std.testing.expectEqual(
-        @as(usize, 1),
-        std.mem.count(u8, bytes, "\x1b[>4;2m"),
-    );
-    try std.testing.expect(std.mem.find(u8, bytes, "\x1b[?1004l") != null);
-    try std.testing.expectEqualStrings(
-        "\x1b[?2026l\x1b[?1000l\x1b[?1002l\x1b[?1004l\x1b[?1006l\x1b[?1l\x1b>\x1b[?2004l\x1b[<u\x1b[>4;0m\x1b[4l\x1b[?6l\x1b[?7h\x1b[0m\x1b[?25h",
-        terminal_takeover_reset,
-    );
-    try std.testing.expect(std.mem.find(
-        u8,
-        bytes,
-        terminal_takeover_reset ++ "\x1b[2J\x1b[H",
-    ) != null);
-    try std.testing.expect(std.mem.find(
-        u8,
-        bytes,
-        ui_terminal.interactiveModeEnableSequence(io_mod.getenv("TMUX")),
-    ) != null);
-}
-
-test "failed terminal takeover leave and manager handoff keep physical ownership armed" {
-    const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var metrics = Metrics{};
-
-    const leave_file = try tmp.dir.createFile(
-        io_mod.getIo(),
-        "terminal-takeover-leave-failure.out",
-        .{},
-    );
-    var leave_shell = TranscriptRuntime{ .stdout_file = leave_file };
-    defer leave_shell.deinit(alloc);
-    leave_shell.stdout_file.close(io_mod.getIo());
-    var leave_terminal = TerminalState{
-        .alternate_screen_owner = .terminal_session,
-    };
-    try std.testing.expectError(
-        error.NotOpenForWriting,
-        leaveTerminalSessionScreen(&leave_terminal, &leave_shell, &metrics),
-    );
-    try std.testing.expect(leave_terminal.terminalSessionScreenActive());
-
-    const handoff_file = try tmp.dir.createFile(
-        io_mod.getIo(),
-        "terminal-takeover-handoff-failure.out",
-        .{},
-    );
-    var handoff_shell = TranscriptRuntime{ .stdout_file = handoff_file };
-    defer handoff_shell.deinit(alloc);
-    handoff_shell.stdout_file.close(io_mod.getIo());
-    var handoff_terminal = TerminalState{
-        .alternate_screen_owner = .terminal_session,
-    };
-    try std.testing.expectError(
-        error.NotOpenForWriting,
-        handoffTerminalSessionToSubagentManager(
-            &handoff_terminal,
-            &handoff_shell,
-            &metrics,
-        ),
-    );
-    try std.testing.expect(handoff_terminal.terminalSessionScreenActive());
 }

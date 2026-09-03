@@ -535,6 +535,11 @@ pub const State = struct {
         }
 
         replaceActiveComposer(alloc, active, &prepared);
+        if (restoring_draft) {
+            active.picker.resetInlinePickerEpisode();
+        } else {
+            active.picker.resetInlinePickerForHistoryRecall(active.edit);
+        }
         if (active.images) |images| {
             if (entering_history) {
                 for (images.items) |image| types.freeImageAttachment(alloc, image);
@@ -596,7 +601,6 @@ fn replaceActiveComposer(
     );
     previous_text.deinit(alloc);
 
-    active.picker.resetInlinePickerEpisode();
     active.picker.model_completion_index = 0;
     active.picker.model_completion_window_start = 0;
     active.picker.resetFilePickerIndex();
@@ -669,6 +673,50 @@ test "navigation recalls entries and restores the unsent draft" {
     try std.testing.expectEqualStrings("unsent draft", edit.input.items);
     try std.testing.expect(state.draftText() == null);
     try std.testing.expectEqual(@as(?usize, null), state.activeIndex());
+}
+
+test "history recall suppresses slash queries until edit and restores draft eligibility" {
+    const alloc = std.testing.allocator;
+    var state: State = .{};
+    defer state.deinit(alloc);
+    try state.installTextEntries(alloc, &.{"/hel"});
+
+    var edit: editor_state.State = .{};
+    defer edit.deinit(alloc);
+    try edit.setText(alloc, "/he");
+    var entities: registered_entities.State = .{};
+    defer entities.deinit(alloc);
+    var picker: picker_state.State = .{};
+    defer picker.deinit(alloc);
+    var vertical_intent: vertical_navigation.State = .{};
+    var limit_rejection: input_limit_rejection.State = .{};
+    const active = ActiveComposer{
+        .edit = &edit,
+        .entities = &entities,
+        .picker = &picker,
+        .vertical_navigation = &vertical_intent,
+        .input_limit_rejection = &limit_rejection,
+        .images = null,
+    };
+
+    try std.testing.expectEqual(
+        NavigationResult{ .moved = 0 },
+        try state.navigate(alloc, -1, active, 1, 4096),
+    );
+    try std.testing.expectEqualStrings("/hel", edit.input.items);
+    try std.testing.expect(picker.isInlinePickerSuppressed(.slash));
+    try std.testing.expect(!picker.isInlinePickerDismissed(.slash));
+
+    try edit.setText(alloc, "/he");
+    picker.reconcileInlinePickerAfterEdit(&edit);
+    try std.testing.expect(!picker.isInlinePickerSuppressed(.slash));
+
+    try std.testing.expectEqual(
+        NavigationResult{ .moved = 0 },
+        try state.navigate(alloc, 1, active, 1, 4096),
+    );
+    try std.testing.expectEqualStrings("/he", edit.input.items);
+    try std.testing.expect(!picker.isInlinePickerSuppressed(.slash));
 }
 
 test "oversized recall leaves active composer and history position unchanged" {

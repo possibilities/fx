@@ -20,27 +20,24 @@ pub const LoadedSkills = struct {
     }
 };
 
+pub fn resolveSkillsHome(alloc: Allocator) Allocator.Error!?[]u8 {
+    const configured_home = io_mod.getenv("HOME") orelse return null;
+    return io_mod.realpathAlloc(alloc, configured_home) catch |err| switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        else => try alloc.dupe(u8, configured_home),
+    };
+}
+
 pub fn loadSkills(
     alloc: Allocator,
     workspace_root: []const u8,
     invocation_skill_roots: []const []const u8,
     root_policy: skill_contract.RootPolicy,
 ) LoadSkillsError!LoadedSkills {
-    const configured_home = io_mod.getenv("HOME");
-    const canonical_home = if (configured_home) |path|
-        io_mod.realpathAlloc(alloc, path) catch |err| switch (err) {
-            error.OutOfMemory => return error.OutOfMemory,
-            else => null,
-        }
-    else
-        null;
-    defer if (canonical_home) |home| alloc.free(home);
-    const home: ?[]const u8 = if (canonical_home) |path| path else configured_home;
-    const dir: []u8 = if (home) |home_path|
-        try profile_paths.managedSkillsDir(alloc, home_path)
-    else
-        &.{};
-    errdefer if (dir.len > 0) alloc.free(dir);
+    const home = (try resolveSkillsHome(alloc)) orelse return .{};
+    defer alloc.free(home);
+    const dir = try profile_paths.managedSkillsDir(alloc, home);
+    errdefer alloc.free(dir);
     const discovery = try skill_runtime.loadVisibleSkillsWithInvocationRoots(
         alloc,
         workspace_root,

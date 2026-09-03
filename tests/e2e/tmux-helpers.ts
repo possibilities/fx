@@ -15,6 +15,8 @@ import { FX_BIN, REPO_ROOT } from "../evals/eval-helpers";
 let sessionCounter = 0;
 
 export const FAKE_GATEWAY_MODEL = "openai/gpt-5";
+export const POST_TOOL_DECISION_PROMPT =
+  "Continue the original task. If work remains and you can proceed, briefly tell the user what you are doing next, then perform that action with the appropriate tool. Do not end the turn with only a progress update. If the task is complete, respond with the result. If a genuine blocker prevents further action, explain the blocker and what is needed to continue.";
 const TMUX_CAPTURE_MAX_BUFFER = 32 * 1024 * 1024;
 const TMUX_HEX_CHUNK_BYTES = 256;
 const COMPOSER_LINE = /^[ \t]*(?:┃|❯|>)(?:[ \t]|$)/;
@@ -36,6 +38,11 @@ const MIRRORED_ENV_KEYS = [
   "FX_MAX_AGENT_STEPS",
   "FX_MODEL",
 ] as const;
+
+export function canonicalSubagentIdForStore(childId: string): string {
+  const match = /^(\d+)-(\d{6})-([0-9a-f]{16})$/.exec(childId);
+  return match ? `${match[1]}-${match[1]}${match[2]}-${match[3]}` : childId;
+}
 
 export function terminalFixtureShell(): string {
   for (const path of ["/bin/zsh", "/bin/bash"]) {
@@ -146,6 +153,21 @@ export function fakeGatewayToolCall(
       finishReason: { unified: "tool-calls", raw: "tool-calls" },
     },
   ]);
+}
+
+export function fakeShellRun(
+  id: string,
+  command: string,
+  options: Record<string, unknown> = {},
+) {
+  return fakeGatewayToolCall(id, "shell", {
+    request: {
+      yield_time_ms: 30_000,
+      ...options,
+      action: "run",
+      command,
+    },
+  });
 }
 
 export function fakeGatewayPermissionDecision(

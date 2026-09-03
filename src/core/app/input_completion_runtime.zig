@@ -87,7 +87,7 @@ pub fn CompletionRuntime(comptime App: type) type {
         }
 
         fn slashCompletionQueryActive(app: *App) bool {
-            if (app.input_runtime.picker.isInlinePickerDismissed(.slash)) return false;
+            if (app.input_runtime.picker.isInlinePickerSuppressed(.slash)) return false;
             if (app.input_runtime.picker.inlinePickerTriggerKind(&app.input_runtime.edit_state) != .slash) return false;
             // Model query always owns this slot. Mid-turn bare `/model` does too
             // (list stays hidden); idle bare `/model` still surfaces slash rows.
@@ -116,8 +116,7 @@ pub fn CompletionRuntime(comptime App: type) type {
             return slashCompletionQueryActive(app);
         }
 
-        /// Returns selectable completions projected by the footer. The active
-        /// query can remain visible at zero so dismissal still owns Escape.
+        /// Returns selectable completions projected by the footer.
         pub fn visibleSlashCompletionCount(app: *App) usize {
             if (!visibleSlashCompletionQueryActive(app)) return 0;
             return slashCompletionCandidateCount(app);
@@ -142,7 +141,7 @@ pub fn CompletionRuntime(comptime App: type) type {
                         return if (hasFileQuery(app)) .file else null;
                     }
                     if (visibleInlineSlashCompletion(app) != null) return .slash;
-                    if (visibleSlashCompletionQueryActive(app)) return .slash;
+                    if (visibleSlashCompletionCount(app) > 0) return .slash;
                     return null;
                 }
             }
@@ -154,7 +153,7 @@ pub fn CompletionRuntime(comptime App: type) type {
                     .slash => .slash,
                 };
             }
-            if (visibleSlashCompletionQueryActive(app)) return .slash;
+            if (visibleSlashCompletionCount(app) > 0) return .slash;
             return null;
         }
 
@@ -718,7 +717,7 @@ pub fn CompletionRuntime(comptime App: type) type {
             if (app.input_runtime.help_menu.active or app.input_runtime.settings_menu.active) return true;
             if (comptime @hasField(App, "skills")) {
                 if (comptime @hasField(@TypeOf(app.skills), "menu")) {
-                    if (app.skills.menu.active) return true;
+                    if (app.skills.menuVisible()) return true;
                 }
             }
             if (comptime @hasField(App, "model_cache")) {
@@ -1391,12 +1390,7 @@ const InlineCompletionTestApp = struct {
     input_runtime: core_input_runtime.Runtime = .{},
     pending_images: std.ArrayList(types.ImageAttachment) = .empty,
     queued_prompt_review: input_queue_runtime.State = .{},
-    skills: struct {
-        items: []const skill_runtime.Skill = &.{},
-        menu: struct {
-            active: bool = false,
-        } = .{},
-    } = .{},
+    skills: skill_runtime.Runtime = .{},
     model_cache: struct {
         menu: struct {
             active: bool = false,
@@ -1598,7 +1592,7 @@ test "inline slash completion stays inactive when its suffix cannot render" {
     );
 }
 
-test "root slash query remains dismissible with zero candidates" {
+test "root slash query is dismissible only while candidates are visible" {
     const alloc = std.testing.allocator;
     const rt = CompletionRuntime(InlineCompletionTestApp);
     var app = InlineCompletionTestApp{ .alloc = alloc };
@@ -1606,9 +1600,13 @@ test "root slash query remains dismissible with zero candidates" {
     try app.input_runtime.textReplacementState().replace(alloc, "/hezzzzz");
 
     try std.testing.expectEqual(@as(usize, 0), rt.visibleSlashCompletionCount(&app));
+    try std.testing.expect(!rt.dismissVisibleInlinePicker(&app));
+    try std.testing.expect(!app.input_runtime.picker.isInlinePickerDismissed(.slash));
+
+    try app.input_runtime.textReplacementState().replace(alloc, "/he");
+    try std.testing.expect(rt.visibleSlashCompletionCount(&app) > 0);
     try std.testing.expect(rt.dismissVisibleInlinePicker(&app));
     try std.testing.expect(app.input_runtime.picker.isInlinePickerDismissed(.slash));
-    try std.testing.expect(!rt.dismissVisibleInlinePicker(&app));
 }
 
 test "root slash completion follows multiline and command argument ownership" {
@@ -1622,7 +1620,7 @@ test "root slash completion follows multiline and command argument ownership" {
     }};
     var app = InlineCompletionTestApp{
         .alloc = alloc,
-        .skills = .{ .items = &skills },
+        .skills = .{ .items = @constCast(&skills) },
     };
     defer app.deinit();
 
@@ -1645,7 +1643,7 @@ test "inline skill completion stays inactive when its suffix cannot render" {
     }};
     var app = InlineCompletionTestApp{
         .alloc = alloc,
-        .skills = .{ .items = &skills },
+        .skills = .{ .items = @constCast(&skills) },
     };
     defer app.deinit();
     try app.input_runtime.textReplacementState().replace(alloc, "x $man");
@@ -1691,7 +1689,7 @@ test "model picker ownership suppresses inline skill completion" {
     }};
     var app = InlineCompletionTestApp{
         .alloc = alloc,
-        .skills = .{ .items = &skills },
+        .skills = .{ .items = @constCast(&skills) },
     };
     defer app.deinit();
     try app.input_runtime.textReplacementState().replace(alloc, "/model anything $man");
@@ -1719,7 +1717,7 @@ test "dedicated catalog ownership suppresses inline skill completion" {
     }};
     var app = InlineCompletionTestApp{
         .alloc = alloc,
-        .skills = .{ .items = &skills },
+        .skills = .{ .items = @constCast(&skills) },
     };
     defer app.deinit();
     try app.input_runtime.textReplacementState().replace(alloc, "x $man");

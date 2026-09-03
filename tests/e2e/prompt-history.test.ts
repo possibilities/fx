@@ -46,6 +46,12 @@ function currentComposerLine(pane: string): string {
   return pane.split("\n").filter(isComposerLine).at(-1) ?? "";
 }
 
+function slashMenuRows(pane: string): string[] {
+  return pane.split("\n").filter((line) =>
+    !isComposerLine(line) && line.trimStart().startsWith("/")
+  );
+}
+
 async function disablePromptHistory(
   session: TmuxSession,
   settingsPath: string,
@@ -111,7 +117,7 @@ describe.skipIf(!tmuxAvailable())("prompt history", () => {
         await session.sendText("PLAN10_PROMPT_HISTORY_SENTINEL");
         await session.waitForText("HTTP 401", TIMEOUT);
         await session.sendText("/help");
-        await session.waitForText("Commands 36", TIMEOUT);
+        await session.waitForText("Commands 35", TIMEOUT);
         await session.sendKeys("Escape");
         await session.waitForPane((pane) => !pane.includes("Enter Open"), TIMEOUT);
         await session.sendText("/quit");
@@ -129,26 +135,55 @@ describe.skipIf(!tmuxAvailable())("prompt history", () => {
           env: rejectedGatewayEnv(home, gateway),
         });
         await session.waitForText("Run /help", TIMEOUT);
+
+        await session.sendLiteral("/");
+        await session.waitForPane((current) => slashMenuRows(current).length > 0, TIMEOUT);
+        await session.sendKeys("C-u");
+        await session.waitForPane(hasEmptyComposer, TIMEOUT);
+
         await session.sendKeys("Up");
         let pane = await session.waitForPane(
           (current) => currentComposerLine(current).includes("/quit"),
           TIMEOUT,
         );
         expect(currentComposerLine(pane)).toContain("/quit");
+        expect(slashMenuRows(pane)).toEqual([]);
 
-        await session.sendKeys("C-p");
+        await session.sendKeys("Up");
+        await session.sendKeys("Up");
         pane = await session.waitForPane(
           (current) => currentComposerLine(current).includes("/help"),
           TIMEOUT,
         );
         expect(currentComposerLine(pane)).toContain("/help");
+        expect(slashMenuRows(pane)).toEqual([]);
 
-        await session.sendKeys("C-p");
+        await session.sendKeys("Up");
+        await session.sendKeys("Up");
         pane = await session.waitForPane(
           (current) => currentComposerLine(current).includes("PLAN10_PROMPT_HISTORY_SENTINEL"),
           TIMEOUT,
         );
         expect(currentComposerLine(pane)).toContain("PLAN10_PROMPT_HISTORY_SENTINEL");
+
+        await session.sendKeys("Down");
+        pane = await session.waitForPane(
+          (current) => currentComposerLine(current).includes("/help"),
+          TIMEOUT,
+        );
+        expect(slashMenuRows(pane)).toEqual([]);
+
+        await session.sendKeys("BSpace");
+        pane = await session.waitForPane(
+          (current) =>
+            currentComposerLine(current).includes("/hel") &&
+            slashMenuRows(current).length > 0,
+          TIMEOUT,
+        );
+        expect(currentComposerLine(pane)).toContain("/hel");
+        await session.sendKeys("C-u");
+        await session.waitForPane(hasEmptyComposer, TIMEOUT);
+        expect(session.isAlive()).toBe(true);
       } finally {
         rmSync(root, { recursive: true, force: true });
       }

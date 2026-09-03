@@ -126,6 +126,10 @@ pub const DurableSessionState = struct {
     /// Last ordinary history commit correlated to durable subagent work. This
     /// control-only marker is not included in model history.
     last_subagent_work_id: ?[]u8 = null,
+    /// True only for a parent-owned subagent session. This durable identity
+    /// keeps the session private even if owner sidecar publication is
+    /// interrupted immediately after creation.
+    subagent_child: bool = false,
     /// Null only for sessions written before durable usage accounting.
     usage: ?session_usage.Snapshot = null,
     /// Active control state. It is never projected into model history and a
@@ -192,6 +196,7 @@ pub const DurableSessionState = struct {
             .total_output_tokens = self.total_output_tokens,
             .permission_state = permission_state,
             .last_subagent_work_id = last_subagent_work_id,
+            .subagent_child = self.subagent_child,
             .usage = usage,
             .recovery_checkpoint = recovery_checkpoint,
         };
@@ -311,30 +316,6 @@ pub fn writeHistoryTurn(writer: *std.Io.Writer, turn: session.HistoryTurn) !void
             try writeExecutionMemory(writer, entry.execution);
             try writer.writeByte('}');
         },
-        .background_command => |entry| {
-            const extended = entry.assistant != null or hasDurableExecutionMemory(entry.execution);
-            try writer.writeAll("{\"kind\":\"background_command\",\"user\":");
-            try writeUserTurn(writer, entry.user);
-            try writer.writeAll(",\"log_path\":");
-            try writeDurableBytes(writer, entry.log_path);
-            try writer.print(",\"expect_url\":{s},\"url\":", .{
-                if (entry.expect_url) "true" else "false",
-            });
-            try writeOptionalDurableBytes(writer, entry.url);
-            try writer.writeAll(",\"background_record_id\":");
-            if (entry.background_record_id) |record_id| {
-                try writeHexString(writer, &record_id);
-            } else {
-                try writer.writeAll("null");
-            }
-            if (extended) {
-                try writer.writeAll(",\"assistant\":");
-                try writeOptionalDurableBytes(writer, entry.assistant);
-                try writer.writeAll(",\"execution\":");
-                try writeExecutionMemory(writer, entry.execution);
-            }
-            try writer.writeByte('}');
-        },
         .interrupted => |entry| {
             try writer.writeAll("{\"kind\":\"interrupted\",\"user\":");
             try writeUserTurn(writer, entry.user);
@@ -365,6 +346,29 @@ pub fn writeHistoryTurn(writer: *std.Io.Writer, turn: session.HistoryTurn) !void
             try writer.writeByte('}');
         },
     }
+}
+
+fn formatLegacyBackgroundAssistant(
+    alloc: Allocator,
+    assistant: ?[]const u8,
+    log_path: []const u8,
+    url: ?[]const u8,
+) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    errdefer out.deinit();
+    if (assistant) |text| {
+        if (text.len != 0) {
+            try out.writer.writeAll(text);
+            if (!std.mem.endsWith(u8, text, "\n")) try out.writer.writeByte('\n');
+        }
+    }
+    try out.writer.writeAll(
+        "[Historical command record: fx no longer owns or controls this process",
+    );
+    if (log_path.len != 0) try out.writer.print("; former log={s}", .{log_path});
+    if (url) |value| try out.writer.print("; recorded url={s}", .{value});
+    try out.writer.writeAll("]");
+    return out.toOwnedSlice();
 }
 
 pub fn parseHistoryTurn(alloc: Allocator, value: std.json.Value) !session.HistoryTurn {
@@ -444,29 +448,32 @@ pub fn parseHistoryTurn(alloc: Allocator, value: std.json.Value) !session.Histor
         const object = shape.object;
         const user = try parseUserTurn(alloc, object.get("user") orelse return error.InvalidSessionFormat);
         errdefer session.freeUserTurn(alloc, user);
-        const assistant = if (shape.extended)
+        const legacy_assistant = if (shape.extended)
             try parseOptionalDurableBytes(alloc, object.get("assistant") orelse return error.InvalidSessionFormat)
         else
             null;
-        errdefer if (assistant) |owned| alloc.free(owned);
+        defer if (legacy_assistant) |owned| alloc.free(owned);
         const execution = if (shape.extended)
             try parseExecutionMemory(alloc, object.get("execution") orelse return error.InvalidSessionFormat)
         else
             session.ExecutionMemory{};
         errdefer session.freeExecutionMemory(alloc, execution);
         const log_path = try parseRequiredDurableBytes(alloc, object, "log_path");
-        errdefer alloc.free(log_path);
+        defer alloc.free(log_path);
         const url = try parseOptionalDurableBytes(alloc, object.get("url") orelse return error.InvalidSessionFormat);
-        errdefer if (url) |owned| alloc.free(owned);
-        const background_record_id = try parseOptionalIdentifier(object.get("background_record_id") orelse return error.InvalidSessionFormat);
-        return .{ .background_command = .{
+        defer if (url) |owned| alloc.free(owned);
+        _ = try requireBool(object, "expect_url");
+        _ = try parseOptionalIdentifier(object.get("background_record_id") orelse return error.InvalidSessionFormat);
+        const assistant = try formatLegacyBackgroundAssistant(
+            alloc,
+            legacy_assistant,
+            log_path,
+            url,
+        );
+        return .{ .assistant = .{
             .user = user,
             .assistant = assistant,
             .execution = execution,
-            .log_path = log_path,
-            .expect_url = try requireBool(object, "expect_url"),
-            .url = url,
-            .background_record_id = background_record_id,
         } };
     }
     if (std.mem.eql(u8, kind, "interrupted")) {
@@ -645,6 +652,9 @@ fn writeState(writer: *std.Io.Writer, state: DurableSessionState) !void {
     if (state.last_subagent_work_id) |id| {
         try writer.writeAll(",\"last_subagent_work_id\":");
         try writeJsonString(writer, id);
+    }
+    if (state.subagent_child) {
+        try writer.writeAll(",\"subagent_child\":true");
     }
     if (state.recovery_checkpoint) |checkpoint| {
         try writer.writeAll(",\"recovery_checkpoint\":");
@@ -873,13 +883,15 @@ fn decodeStateImpl(alloc: Allocator, source: *std.Io.Reader, limits: DecodeLimit
     var usage_seen = false;
     var last_subagent_work_id: ?[]u8 = null;
     errdefer if (last_subagent_work_id) |work_id| alloc.free(work_id);
+    var subagent_child = false;
+    var subagent_child_seen = false;
     var recovery_checkpoint: ?RecoveryCheckpoint = null;
     errdefer if (recovery_checkpoint) |*checkpoint| checkpoint.deinit(alloc);
     while (try json_reader.peekNextTokenType() != .object_end) {
         const key = try readStringOwned(&json_reader, alloc, 64);
         defer alloc.free(key);
         if (std.mem.eql(u8, key, "context_history_start")) {
-            if (context_seen or permission_state_seen or usage_seen or last_subagent_work_id != null or recovery_checkpoint != null) {
+            if (context_seen or permission_state_seen or usage_seen or last_subagent_work_id != null or subagent_child_seen or recovery_checkpoint != null) {
                 return error.InvalidSessionFormat;
             }
             const raw = try readU64(&json_reader, alloc);
@@ -887,7 +899,7 @@ fn decodeStateImpl(alloc: Allocator, source: *std.Io.Reader, limits: DecodeLimit
                 return error.InvalidSessionFormat;
             context_seen = true;
         } else if (std.mem.eql(u8, key, "permission_state")) {
-            if (permission_state_seen or usage_seen or last_subagent_work_id != null or recovery_checkpoint != null) {
+            if (permission_state_seen or usage_seen or last_subagent_work_id != null or subagent_child_seen or recovery_checkpoint != null) {
                 return error.InvalidSessionFormat;
             }
             var arena = std.heap.ArenaAllocator.init(alloc);
@@ -900,7 +912,7 @@ fn decodeStateImpl(alloc: Allocator, source: *std.Io.Reader, limits: DecodeLimit
             permission_state = try parsePermissionState(alloc, value);
             permission_state_seen = true;
         } else if (std.mem.eql(u8, key, "usage")) {
-            if (usage_seen or last_subagent_work_id != null or recovery_checkpoint != null) return error.InvalidSessionFormat;
+            if (usage_seen or last_subagent_work_id != null or subagent_child_seen or recovery_checkpoint != null) return error.InvalidSessionFormat;
             const parse_limit = @min(
                 limits.max_value_bytes,
                 session_usage.max_snapshot_bytes,
@@ -916,8 +928,13 @@ fn decodeStateImpl(alloc: Allocator, source: *std.Io.Reader, limits: DecodeLimit
             usage = try session_usage.parseSnapshotValue(alloc, value);
             usage_seen = true;
         } else if (std.mem.eql(u8, key, "last_subagent_work_id")) {
-            if (last_subagent_work_id != null or recovery_checkpoint != null) return error.InvalidSessionFormat;
+            if (last_subagent_work_id != null or subagent_child_seen or recovery_checkpoint != null) return error.InvalidSessionFormat;
             last_subagent_work_id = try readStringOwned(&json_reader, alloc, 128);
+        } else if (std.mem.eql(u8, key, "subagent_child")) {
+            if (subagent_child_seen or recovery_checkpoint != null) return error.InvalidSessionFormat;
+            subagent_child = try readBool(&json_reader);
+            if (!subagent_child) return error.InvalidDurableField;
+            subagent_child_seen = true;
         } else if (std.mem.eql(u8, key, "recovery_checkpoint")) {
             if (recovery_checkpoint != null) return error.InvalidSessionFormat;
             var arena = std.heap.ArenaAllocator.init(alloc);
@@ -955,6 +972,7 @@ fn decodeStateImpl(alloc: Allocator, source: *std.Io.Reader, limits: DecodeLimit
         .total_output_tokens = total_output_tokens,
         .permission_state = permission_state,
         .last_subagent_work_id = last_subagent_work_id,
+        .subagent_child = subagent_child,
         .usage = usage,
         .recovery_checkpoint = recovery_checkpoint,
     };
@@ -2142,7 +2160,7 @@ noinline fn parseOptionalDurableBytes(alloc: Allocator, value: std.json.Value) !
     };
 }
 
-fn parseOptionalIdentifier(value: std.json.Value) !?types.StableBackgroundRecordId {
+fn parseOptionalIdentifier(value: std.json.Value) !?[16]u8 {
     return switch (value) {
         .null => null,
         .string => |hex| try parseHexIdentifier(hex),
@@ -2150,9 +2168,9 @@ fn parseOptionalIdentifier(value: std.json.Value) !?types.StableBackgroundRecord
     };
 }
 
-fn parseHexIdentifier(hex: []const u8) !types.StableBackgroundRecordId {
+fn parseHexIdentifier(hex: []const u8) ![16]u8 {
     if (hex.len != 32) return error.InvalidSessionFormat;
-    var result: types.StableBackgroundRecordId = undefined;
+    var result: [16]u8 = undefined;
     _ = std.fmt.hexToBytes(&result, hex) catch return error.InvalidSessionFormat;
     const canonical = std.fmt.bytesToHex(result, .lower);
     if (!std.mem.eql(u8, &canonical, hex)) return error.InvalidSessionFormat;
@@ -2485,11 +2503,6 @@ test "durable state round trips live history while discarding legacy authority" 
     const invalid_b = [_]u8{ 0xfe, 'b', 0x00 };
     const invalid_c = [_]u8{ 'c', 0xf8 };
     const exact_arguments = " \n{\"number\":1e+02}\t";
-    const record_id: types.StableBackgroundRecordId = .{
-        0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77,
-        0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff,
-    };
-
     var images = [_]session.ImageAttachment{.{
         .id = 7,
         .path = @constCast(invalid_a[0..]),
@@ -2548,7 +2561,7 @@ test "durable state round trips live history while discarding legacy authority" 
                 .files = files[0..],
             },
         } },
-        .{ .background_command = .{
+        .{ .assistant = .{
             .user = .{
                 .text = @constCast(invalid_b[0..]),
                 .work_id = @constCast("work-background"),
@@ -2558,10 +2571,6 @@ test "durable state round trips live history while discarding legacy authority" 
                 .tool_steps = tool_steps[0..],
                 .files = files[0..],
             },
-            .log_path = @constCast(invalid_c[0..]),
-            .expect_url = true,
-            .url = @constCast(invalid_a[0..]),
-            .background_record_id = record_id,
         } },
         .{ .interrupted = .{
             .user = .{
@@ -2614,6 +2623,7 @@ test "durable state round trips live history while discarding legacy authority" 
         .total_input_tokens = 1234,
         .total_output_tokens = 567,
         .last_subagent_work_id = @constCast("work-17"),
+        .subagent_child = true,
         .usage = usage,
     };
 
@@ -3008,7 +3018,7 @@ test "execution memory codec preserves feedback and reads v1 results without it"
     try std.testing.expect(v2_decoded.assistant.execution.tool_steps[0].tool_results[0].command_process_presentation == null);
 }
 
-test "private codec preserves summary-only specialized turns" {
+test "private codec preserves summary-only interrupted turns" {
     const alloc = std.testing.allocator;
     const summary = types.TurnSummary{
         .started_at_ms = 100,
@@ -3018,18 +3028,10 @@ test "private codec preserves summary-only specialized turns" {
         .token_progress = .{ .input_tokens = 12, .output_tokens = 34 },
     };
 
-    const turns = [_]session.HistoryTurn{
-        .{ .background_command = .{
-            .user = .{ .text = @constCast("start server") },
-            .execution = .{ .turn_summary = summary },
-            .log_path = @constCast("/tmp/server.log"),
-            .expect_url = false,
-        } },
-        .{ .interrupted = .{
-            .user = .{ .text = @constCast("inspect repository") },
-            .execution = .{ .turn_summary = summary },
-        } },
-    };
+    const turns = [_]session.HistoryTurn{.{ .interrupted = .{
+        .user = .{ .text = @constCast("inspect repository") },
+        .execution = .{ .turn_summary = summary },
+    } }};
 
     for (turns) |turn| {
         var encoded: std.Io.Writer.Allocating = .init(alloc);
@@ -3274,12 +3276,15 @@ test "durable specialized history accepts only legacy or complete extended shape
         defer session.freeHistoryTurn(alloc, turn);
         switch (case.expected) {
             .background_legacy => {
-                try std.testing.expect(turn.background_command.assistant == null);
-                try std.testing.expect(turn.background_command.execution.isEmpty());
+                try std.testing.expect(turn == .assistant);
+                try std.testing.expect(std.mem.find(u8, turn.assistant.assistant, "no longer owns") != null);
+                try std.testing.expect(turn.assistant.execution.isEmpty());
             },
             .background_extended => {
-                try std.testing.expectEqualStrings("candidate", turn.background_command.assistant.?);
-                try std.testing.expect(turn.background_command.execution.isEmpty());
+                try std.testing.expect(turn == .assistant);
+                try std.testing.expect(std.mem.find(u8, turn.assistant.assistant, "candidate") != null);
+                try std.testing.expect(std.mem.find(u8, turn.assistant.assistant, "no longer owns") != null);
+                try std.testing.expect(turn.assistant.execution.isEmpty());
             },
             .interrupted_legacy => try std.testing.expect(turn.interrupted.execution.isEmpty()),
             .interrupted_extended => {
@@ -3300,28 +3305,15 @@ test "durable specialized history accepts only legacy or complete extended shape
         try std.testing.expectError(error.InvalidSessionFormat, parseHistoryTurn(alloc, parsed.value));
     }
 
-    const legacy_background = session.HistoryTurn{ .background_command = .{
+    const migrated = session.HistoryTurn{ .assistant = .{
         .user = .{ .text = @constCast("run") },
-        .log_path = @constCast("/tmp/log"),
-        .expect_url = false,
+        .assistant = @constCast("historical command"),
     } };
     var legacy_encoded: std.Io.Writer.Allocating = .init(alloc);
     defer legacy_encoded.deinit();
-    try writeHistoryTurn(&legacy_encoded.writer, legacy_background);
-    try std.testing.expect(std.mem.find(u8, legacy_encoded.written(), "\"assistant\"") == null);
-    try std.testing.expect(std.mem.find(u8, legacy_encoded.written(), "\"execution\"") == null);
-
-    const extended_background = session.HistoryTurn{ .background_command = .{
-        .user = .{ .text = @constCast("run") },
-        .assistant = @constCast("candidate"),
-        .log_path = @constCast("/tmp/log"),
-        .expect_url = false,
-    } };
-    var extended_encoded: std.Io.Writer.Allocating = .init(alloc);
-    defer extended_encoded.deinit();
-    try writeHistoryTurn(&extended_encoded.writer, extended_background);
-    try std.testing.expect(std.mem.find(u8, extended_encoded.written(), "\"assistant\"") != null);
-    try std.testing.expect(std.mem.find(u8, extended_encoded.written(), "\"execution\"") != null);
+    try writeHistoryTurn(&legacy_encoded.writer, migrated);
+    try std.testing.expect(std.mem.find(u8, legacy_encoded.written(), "\"kind\":\"assistant\"") != null);
+    try std.testing.expect(std.mem.find(u8, legacy_encoded.written(), "background_command") == null);
 }
 
 test "interrupted command presentation is strict and round trips" {
@@ -3416,6 +3408,7 @@ fn expectStateEqual(expected: DurableSessionState, actual: DurableSessionState) 
     try std.testing.expectEqual(expected.context_history_start, actual.context_history_start);
     try std.testing.expectEqual(expected.total_input_tokens, actual.total_input_tokens);
     try std.testing.expectEqual(expected.total_output_tokens, actual.total_output_tokens);
+    try std.testing.expectEqual(expected.subagent_child, actual.subagent_child);
     try expectPermissionStateEqual(expected.permission_state, actual.permission_state);
     try std.testing.expectEqual(expected.last_subagent_work_id != null, actual.last_subagent_work_id != null);
     if (expected.last_subagent_work_id) |work_id| {
@@ -3478,19 +3471,6 @@ fn expectHistoryTurnEqual(expected: session.HistoryTurn, actual: session.History
             try expectUserTurnEqual(entry.user, got.user);
             try std.testing.expectEqualSlices(u8, entry.assistant, got.assistant);
             try expectExecutionMemoryEqual(entry.execution, got.execution);
-        },
-        .background_command => |entry| {
-            const got = actual.background_command;
-            try expectUserTurnEqual(entry.user, got.user);
-            try expectOptionalBytesEqual(entry.assistant, got.assistant);
-            try expectExecutionMemoryEqual(entry.execution, got.execution);
-            try std.testing.expectEqualSlices(u8, entry.log_path, got.log_path);
-            try std.testing.expectEqual(entry.expect_url, got.expect_url);
-            try expectOptionalBytesEqual(entry.url, got.url);
-            try std.testing.expectEqual(entry.background_record_id != null, got.background_record_id != null);
-            if (entry.background_record_id) |record_id| {
-                try std.testing.expectEqualSlices(u8, &record_id, &got.background_record_id.?);
-            }
         },
         .interrupted => |entry| {
             const got = actual.interrupted;
