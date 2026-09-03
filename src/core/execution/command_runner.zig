@@ -49,6 +49,7 @@ const command_artifact_stdout_suffix = ".stdout.log";
 const command_artifact_stderr_suffix = ".stderr.log";
 const pending_output_flush_bytes: usize = 4096;
 const command_output_poll_ms: i64 = 100;
+pub const termination_settle_timeout_ms: i64 = 5_000;
 const supports_foreground_session = builtin.link_libc and
     std.process.can_spawn and
     std.process.can_replace and
@@ -702,6 +703,7 @@ fn emitAcceptedOutputChunk(
 
 const CollectedProcess = struct {
     status: command_contract.CommandStatus,
+    output_incomplete: bool = false,
     stdout: []const u8,
     stderr: []const u8,
     stdout_bytes: usize,
@@ -954,6 +956,7 @@ const OutputCollector = struct {
     fn finish(
         self: *OutputCollector,
         status: command_contract.CommandStatus,
+        output_incomplete: bool,
     ) !CollectedProcess {
         if (self.artifact) |*artifact| {
             try artifact.sync();
@@ -961,6 +964,7 @@ const OutputCollector = struct {
             const truncated = self.totalBytes() > self.cfg.max_command_output_bytes;
             return .{
                 .status = status,
+                .output_incomplete = output_incomplete,
                 .stdout = "",
                 .stderr = "",
                 .stdout_bytes = self.stdout_bytes,
@@ -976,6 +980,7 @@ const OutputCollector = struct {
 
         return .{
             .status = status,
+            .output_incomplete = output_incomplete,
             .stdout = try self.stdout.toOwnedSlice(self.alloc),
             .stderr = try self.stderr.toOwnedSlice(self.alloc),
             .stdout_bytes = self.stdout_bytes,
@@ -1011,15 +1016,19 @@ const OutputCollector = struct {
 fn finishCollectedProcess(
     output: *OutputCollector,
     status: command_contract.CommandStatus,
+    output_incomplete: bool,
     duration_ms: u64,
     source: TerminationSource,
+    preserve_cancelled_status: bool,
 ) !CollectedProcess {
     switch (source) {
         .timed_out => return error.TimeoutExpired,
         .natural => {},
         .cancelled => {
-            if (output.totalBytes() == 0) return error.Cancelled;
-            if (output.artifact == null) {
+            if (!preserve_cancelled_status and output.totalBytes() == 0) {
+                return error.Cancelled;
+            }
+            if (output.totalBytes() != 0 and output.artifact == null) {
                 output.startArtifact() catch |err| {
                     debug_trace.logf("core", "cancelled command artifact promotion failed err={s}", .{@errorName(err)});
                     return error.Cancelled;
@@ -1028,7 +1037,7 @@ fn finishCollectedProcess(
         },
     }
 
-    var result = output.finish(status) catch |err| {
+    var result = output.finish(status, output_incomplete) catch |err| {
         if (source != .cancelled) return err;
         debug_trace.logf("core", "cancelled command artifact finalization failed err={s}", .{@errorName(err)});
         return error.Cancelled;
@@ -1108,8 +1117,10 @@ fn executeProcessWithInput(
     return finishCollectedProcess(
         &output,
         collected.status,
+        collected.output_incomplete,
         duration_ms,
         collected.source,
+        cfg.force_cancel_flag != null,
     );
 }
 
@@ -1239,8 +1250,10 @@ fn executeProcessWithDetachedSession(
     return finishCollectedProcess(
         &output,
         collected.status,
+        collected.output_incomplete,
         duration_ms,
         collected.source,
+        cfg.force_cancel_flag != null,
     );
 }
 
@@ -1386,8 +1399,10 @@ fn executeProcessWithScriptUnisolated(
     return finishCollectedProcess(
         &output,
         collected.status,
+        collected.output_incomplete,
         duration_ms,
         collected.source,
+        cfg.force_cancel_flag != null,
     );
 }
 
@@ -1781,6 +1796,7 @@ fn formatOutput(alloc: Allocator, command: []const u8, cwd: []const u8, term: st
         stdout_raw,
         stderr_raw,
         duration_ms,
+        false,
     );
 }
 
@@ -1792,6 +1808,7 @@ fn formatOutputWithStatus(
     stdout_raw: []const u8,
     stderr_raw: []const u8,
     duration_ms: ?u64,
+    output_incomplete: bool,
 ) !command_contract.RunCommandResult {
     return command_contract.formatCommandResult(alloc, .{
         .command = command,
@@ -1801,6 +1818,7 @@ fn formatOutputWithStatus(
         .stderr_display = stderr_raw,
         .stdout_bytes = stdout_raw.len,
         .stderr_bytes = stderr_raw.len,
+        .output_incomplete = output_incomplete,
         .duration_ms = duration_ms,
     });
 }
@@ -1809,7 +1827,7 @@ fn commandStatusFromTerm(term: std.process.Child.Term) command_contract.CommandS
     return switch (term) {
         .exited => |code| .{ .exit_code = @intCast(code) },
         .signal => |sig| .{ .signal = @intFromEnum(sig) },
-        else => .finished,
+        .stopped, .unknown => .indeterminate,
     };
 }
 
@@ -1830,6 +1848,7 @@ fn formatCollectedOutputValue(alloc: Allocator, command: []const u8, cwd: []cons
         result.stdout,
         result.stderr,
         result.duration_ms,
+        result.output_incomplete,
     );
 
     var out: std.Io.Writer.Allocating = .init(alloc);
@@ -1856,6 +1875,7 @@ fn formatCollectedOutputValue(alloc: Allocator, command: []const u8, cwd: []cons
             .exit_code = status.exit_code,
             .signal = status.signal,
             .termination_indeterminate = status.termination_indeterminate,
+            .output_incomplete = result.output_incomplete,
             .duration_ms = result.duration_ms,
             .stdout_bytes = result.stdout_bytes,
             .stderr_bytes = result.stderr_bytes,
@@ -1910,6 +1930,11 @@ const TerminationSource = enum {
     natural,
     cancelled,
     timed_out,
+};
+
+const CollectedOutput = struct {
+    source: TerminationSource,
+    output_incomplete: bool = false,
 };
 
 fn reconcileForegroundTerminationSource(
@@ -1978,6 +2003,7 @@ fn terminationSignalPlan(
 const OutputChunkEmitter = struct {
     stdout_pending: std.ArrayList(u8) = .empty,
     stderr_pending: std.ArrayList(u8) = .empty,
+    presentation_suppressed: bool = false,
 
     fn deinit(self: *@This(), arena: Allocator) void {
         self.stdout_pending.deinit(arena);
@@ -1994,12 +2020,12 @@ const OutputChunkEmitter = struct {
     ) !void {
         try output.append(stream, bytes);
         try emitAcceptedOutputChunk(cfg, stream, bytes);
-        try emitPending(arena, self.pendingFor(stream), stream, bytes, cfg, false);
+        self.emitPending(arena, self.pendingFor(stream), stream, bytes, cfg, false);
     }
 
-    fn flush(self: *@This(), arena: Allocator, cfg: Config) !void {
-        try emitPending(arena, &self.stdout_pending, .stdout, "", cfg, true);
-        try emitPending(arena, &self.stderr_pending, .stderr, "", cfg, true);
+    fn flush(self: *@This(), arena: Allocator, cfg: Config) void {
+        self.emitPending(arena, &self.stdout_pending, .stdout, "", cfg, true);
+        self.emitPending(arena, &self.stderr_pending, .stderr, "", cfg, true);
     }
 
     fn pendingFor(self: *@This(), stream: CommandOutputStream) *std.ArrayList(u8) {
@@ -2010,20 +2036,28 @@ const OutputChunkEmitter = struct {
     }
 
     fn emitPending(
+        self: *@This(),
         arena: Allocator,
         pending: *std.ArrayList(u8),
         stream: CommandOutputStream,
         new_bytes: []const u8,
         cfg: Config,
         flush_remainder: bool,
-    ) !void {
+    ) void {
+        if (self.presentation_suppressed) return;
         const ctx = cfg.output_chunk_ctx orelse return;
         const callback = cfg.on_output_chunk orelse return;
-        if (new_bytes.len > 0) try pending.appendSlice(arena, new_bytes);
+        if (new_bytes.len > 0) pending.appendSlice(arena, new_bytes) catch |err| {
+            self.suppressPresentation(err);
+            return;
+        };
 
         while (std.mem.findScalar(u8, pending.items, '\n')) |newline_index| {
             const line = pending.items[0 .. newline_index + 1];
-            try emitOutputChunk(ctx, callback, cfg.output_chunk_lifecycle_id, stream, line, cfg.callback_projection);
+            emitOutputChunk(ctx, callback, cfg.output_chunk_lifecycle_id, stream, line, cfg.callback_projection) catch |err| {
+                self.suppressPresentation(err);
+                return;
+            };
 
             const remaining = pending.items.len - (newline_index + 1);
             std.mem.copyForwards(u8, pending.items[0..remaining], pending.items[newline_index + 1 ..]);
@@ -2031,14 +2065,31 @@ const OutputChunkEmitter = struct {
         }
 
         if (!flush_remainder and pending.items.len >= pending_output_flush_bytes) {
-            try emitOutputChunk(ctx, callback, cfg.output_chunk_lifecycle_id, stream, pending.items, cfg.callback_projection);
+            emitOutputChunk(ctx, callback, cfg.output_chunk_lifecycle_id, stream, pending.items, cfg.callback_projection) catch |err| {
+                self.suppressPresentation(err);
+                return;
+            };
             pending.clearRetainingCapacity();
         }
 
         if (flush_remainder and pending.items.len > 0) {
-            try emitOutputChunk(ctx, callback, cfg.output_chunk_lifecycle_id, stream, pending.items, cfg.callback_projection);
+            emitOutputChunk(ctx, callback, cfg.output_chunk_lifecycle_id, stream, pending.items, cfg.callback_projection) catch |err| {
+                self.suppressPresentation(err);
+                return;
+            };
             pending.clearRetainingCapacity();
         }
+    }
+
+    fn suppressPresentation(self: *@This(), err: anyerror) void {
+        debug_trace.logf(
+            "core",
+            "command output presentation suppressed err={s}",
+            .{@errorName(err)},
+        );
+        self.presentation_suppressed = true;
+        self.stdout_pending.clearRetainingCapacity();
+        self.stderr_pending.clearRetainingCapacity();
     }
 };
 
@@ -2253,7 +2304,16 @@ const ProcessObserver = struct {
             );
             return .indeterminate;
         }
-        return commandStatusFromTerm(term);
+        const status = commandStatusFromTerm(term);
+        switch (status) {
+            .indeterminate => debug_trace.logf(
+                "core",
+                "command termination became indeterminate boundary=child_term term={s}",
+                .{@tagName(std.meta.activeTag(term))},
+            ),
+            .exit_code, .signal, .finished => {},
+        }
+        return status;
     }
 
     fn indeterminateStatus(
@@ -2261,7 +2321,7 @@ const ProcessObserver = struct {
     ) command_contract.CommandStatus {
         debug_trace.logf(
             "core",
-            "command termination became indeterminate err={s}",
+            "command termination became indeterminate boundary=process_wait err={s}",
             .{@errorName(err)},
         );
         return .indeterminate;
@@ -2306,6 +2366,17 @@ const ProcessObserver = struct {
     }
 };
 
+fn termination_settle_expired(
+    signal_started_ms: ?i64,
+    force_kill_sent: bool,
+    now_ms: i64,
+) bool {
+    const started_ms = signal_started_ms orelse return false;
+    return force_kill_sent and
+        now_ms >= started_ms and
+        now_ms - started_ms >= termination_settle_timeout_ms;
+}
+
 fn collectOutput(
     arena: Allocator,
     observer: *ProcessObserver,
@@ -2316,7 +2387,7 @@ fn collectOutput(
     process_group_id: ?std.posix.pid_t,
     termination_protocol: TerminationProtocol,
     leader_status: *?command_contract.CommandStatus,
-) !TerminationSource {
+) !CollectedOutput {
     const zio = io_mod.getIo();
     var multi_reader_buffer: std.Io.File.MultiReader.Buffer(2) = undefined;
     var multi_reader: std.Io.File.MultiReader = undefined;
@@ -2333,6 +2404,7 @@ fn collectOutput(
     var signal_started_ms: ?i64 = null;
     var force_kill_sent = false;
     var streams_finished = false;
+    var output_incomplete = false;
 
     while (true) {
         try updateTerminationSignal(
@@ -2367,6 +2439,28 @@ fn collectOutput(
             }
         }
 
+        const now_ms = io_mod.milliTimestamp();
+        if (termination_settle_expired(
+            signal_started_ms,
+            force_kill_sent,
+            now_ms,
+        )) {
+            debug_trace.logf(
+                "core",
+                "command termination settlement expired boundary=post_force source={s} wait_ready={s}",
+                .{
+                    @tagName(source.*),
+                    if (observer.waiter.isReady()) "true" else "false",
+                },
+            );
+            recordOutputDrainFailure(
+                &output_incomplete,
+                "termination_settle_deadline",
+                error.Timeout,
+            );
+            break;
+        }
+
         if (streams_finished) {
             if (source.* == .natural or
                 signal_started_ms == null or
@@ -2384,7 +2478,15 @@ fn collectOutput(
         else |err| switch (err) {
             error.EndOfStream => false,
             error.Timeout => true,
-            else => |e| return e,
+            else => |e| blk: {
+                if (source.* != .natural or cancelRequested(cfg.cancel_flag)) return e;
+                recordOutputDrainFailure(
+                    &output_incomplete,
+                    "reader_coordination",
+                    e,
+                );
+                break :blk false;
+            },
         };
 
         const stdout_buf = stdout_r.buffered();
@@ -2400,6 +2502,13 @@ fn collectOutput(
                 try emitter.append(arena, output, .stderr, stderr_buf, cfg);
             }
             stderr_r.tossBuffered();
+        }
+        if (emitter.presentation_suppressed and cancelRequested(cfg.cancel_flag)) {
+            return error.Cancelled;
+        }
+        if (source.* == .natural) {
+            recordMultiReaderFailure(&multi_reader, &output_incomplete);
+            if (output_incomplete) break;
         }
 
         if (!keep_reading) {
@@ -2417,8 +2526,37 @@ fn collectOutput(
     if (launch_failure_probe) |probe| {
         try probe.flush(arena, &emitter, output, cfg);
     }
-    try emitter.flush(arena, cfg);
-    return source.*;
+    emitter.flush(arena, cfg);
+    if (source.* == .natural) {
+        recordMultiReaderFailure(&multi_reader, &output_incomplete);
+    }
+    return .{
+        .source = source.*,
+        .output_incomplete = output_incomplete,
+    };
+}
+
+fn recordMultiReaderFailure(
+    multi_reader: *const std.Io.File.MultiReader,
+    output_incomplete: *bool,
+) void {
+    multi_reader.checkAnyError() catch |err| {
+        recordOutputDrainFailure(output_incomplete, "stream_read", err);
+    };
+}
+
+fn recordOutputDrainFailure(
+    output_incomplete: *bool,
+    reason: []const u8,
+    err: anyerror,
+) void {
+    if (output_incomplete.*) return;
+    output_incomplete.* = true;
+    debug_trace.logf(
+        "core",
+        "command output drain incomplete reason={s} err={s}",
+        .{ reason, @errorName(err) },
+    );
 }
 
 fn collectOutputForProcess(
@@ -2430,7 +2568,7 @@ fn collectOutputForProcess(
     process_group_id: ?std.posix.pid_t,
     termination_protocol: TerminationProtocol,
     leader_status: *?command_contract.CommandStatus,
-) !TerminationSource {
+) !CollectedOutput {
     var source: TerminationSource = .natural;
     return collectOutput(
         arena,
@@ -2468,6 +2606,7 @@ fn waitForCollectedProcess(
 const CollectedTermination = struct {
     source: TerminationSource,
     status: command_contract.CommandStatus,
+    output_incomplete: bool = false,
 };
 
 fn collectSpawnedProcess(
@@ -2501,7 +2640,7 @@ fn collectSpawnedProcess(
     defer if (wait_pending) observer.abort(process_group_id);
 
     var leader_status: ?command_contract.CommandStatus = null;
-    const source = try collectOutputForProcess(
+    const collected_output = try collectOutputForProcess(
         arena,
         &observer,
         output,
@@ -2511,14 +2650,40 @@ fn collectSpawnedProcess(
         termination_protocol,
         &leader_status,
     );
+    if (collected_output.output_incomplete and leader_status == null) {
+        debug_trace.logf(
+            "core",
+            "command output drain failed before process status; aborting command",
+            .{},
+        );
+        observer.abort(process_group_id);
+        wait_pending = false;
+        return .{
+            .source = collected_output.source,
+            .status = .indeterminate,
+            .output_incomplete = true,
+        };
+    }
     const status = try waitForCollectedProcess(
         &observer,
-        source,
+        collected_output.source,
         process_group_id,
         leader_status,
     );
     wait_pending = false;
-    return .{ .source = source, .status = status };
+    var output_incomplete = collected_output.output_incomplete;
+    if (io_mod.getenv("FX_COMMAND_TEST_OUTPUT_INCOMPLETE_AFTER_EXIT") != null) {
+        recordOutputDrainFailure(
+            &output_incomplete,
+            "injected_after_exit",
+            error.Unexpected,
+        );
+    }
+    return .{
+        .source = collected_output.source,
+        .status = status,
+        .output_incomplete = output_incomplete,
+    };
 }
 
 fn mapTerminationError(
@@ -2708,7 +2873,11 @@ test "format output covers stdout stderr empty signal and unknown statuses" {
 
     const none = try formatOutput(std.testing.allocator, "cmd", "/tmp", .{ .unknown = 9 }, "", "", null);
     defer std.testing.allocator.free(none.output);
-    try std.testing.expectEqualStrings("process finished\n(no output)\n", none.output);
+    try std.testing.expect(std.mem.find(
+        u8,
+        none.output,
+        "termination_indeterminate=true\n",
+    ) != null);
 
     const signaled = try formatOutput(std.testing.allocator, "cmd", "/tmp", .{ .signal = .TERM }, "", "", null);
     defer std.testing.allocator.free(signaled.output);
@@ -3560,6 +3729,65 @@ test "line buffered streaming preserves stderr stream and tail" {
     try std.testing.expect(capture.contains(.stderr, "tail"));
 }
 
+test "multi-reader stream failure marks output incomplete" {
+    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return;
+
+    const failed_pipe = try std.Io.Threaded.pipe2(.{});
+    const clean_pipe = try std.Io.Threaded.pipe2(.{});
+    var failed_read = std.Io.File{
+        .handle = failed_pipe[0],
+        .flags = .{ .nonblocking = false },
+    };
+    var failed_write = std.Io.File{
+        .handle = failed_pipe[1],
+        .flags = .{ .nonblocking = false },
+    };
+    var clean_read = std.Io.File{
+        .handle = clean_pipe[0],
+        .flags = .{ .nonblocking = false },
+    };
+    var clean_write = std.Io.File{
+        .handle = clean_pipe[1],
+        .flags = .{ .nonblocking = false },
+    };
+    failed_read.close(std.testing.io);
+    failed_write.close(std.testing.io);
+    clean_write.close(std.testing.io);
+    defer clean_read.close(std.testing.io);
+
+    var buffer: std.Io.File.MultiReader.Buffer(2) = undefined;
+    var multi_reader: std.Io.File.MultiReader = undefined;
+    multi_reader.init(
+        std.testing.allocator,
+        std.testing.io,
+        buffer.toStreams(),
+        &.{ failed_read, clean_read },
+    );
+    defer multi_reader.deinit();
+
+    var output_incomplete = false;
+    try multi_reader.fill(1, .none);
+    recordMultiReaderFailure(&multi_reader, &output_incomplete);
+    try std.testing.expect(output_incomplete);
+    try std.testing.expectError(error.EndOfStream, multi_reader.fill(1, .none));
+}
+
+test "presentation failure preserves the complete command result" {
+    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return;
+
+    var trigger = FailOutput{};
+    const result = try executeCommand(.{
+        .max_command_output_bytes = 4096,
+        .output_chunk_ctx = @ptrCast(&trigger),
+        .on_output_chunk = FailOutput.onChunk,
+    }, std.testing.allocator, "printf 'first\\nsecond\\n'", "/tmp");
+    defer std.testing.allocator.free(result.output);
+
+    try std.testing.expect(trigger.seen);
+    try std.testing.expectEqual(@as(?i64, 0), result.command_result.?.exit_code);
+    try std.testing.expect(std.mem.find(u8, result.output, "first\nsecond") != null);
+}
+
 test "raw callback projection preserves bytes without changing command result" {
     if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return;
 
@@ -3609,7 +3837,7 @@ test "accepted callbacks preserve repeated newline-free stream order" {
     try emitter.append(std.testing.allocator, &output, .stdout, "O1", cfg);
     try emitter.append(std.testing.allocator, &output, .stderr, "E2", cfg);
     try emitter.append(std.testing.allocator, &output, .stdout, "O2", cfg);
-    try emitter.flush(std.testing.allocator, cfg);
+    emitter.flush(std.testing.allocator, cfg);
 
     try std.testing.expectEqual(@as(usize, 4), capture.chunks.items.len);
     try std.testing.expectEqual(.stderr, capture.streams.items[0]);
@@ -4122,6 +4350,24 @@ test "termination result follows the delivered signal source" {
     try std.testing.expectEqual(
         TerminationSource.cancelled,
         reconcileForegroundTerminationSource(.cancelled, 1700, 2000),
+    );
+}
+
+test "forced termination settlement expires only after its deadline" {
+    try std.testing.expect(!termination_settle_expired(null, true, 10_000));
+    try std.testing.expect(!termination_settle_expired(5_000, false, 10_000));
+    try std.testing.expect(!termination_settle_expired(5_000, true, 9_999));
+    try std.testing.expect(termination_settle_expired(5_000, true, 10_000));
+}
+
+test "nonterminal child terms remain indeterminate" {
+    try std.testing.expectEqual(
+        command_contract.CommandStatus.indeterminate,
+        commandStatusFromTerm(.{ .unknown = 0 }),
+    );
+    try std.testing.expectEqual(
+        command_contract.CommandStatus.indeterminate,
+        commandStatusFromTerm(.{ .stopped = std.posix.SIG.STOP }),
     );
 }
 

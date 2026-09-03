@@ -66,6 +66,7 @@ const input_interrupt_runtime = @import("input_interrupt_runtime.zig");
 const input_queue_runtime = @import("input_queue_runtime.zig");
 const input_history_runtime = @import("input_history_runtime.zig");
 const input_completion_runtime = @import("input_completion_runtime.zig");
+const provider_picker_runtime = @import("provider_picker_runtime.zig");
 const input_paste_runtime = @import("input_paste_runtime.zig");
 const input_submit_runtime = @import("input_submit_runtime.zig");
 const input_approval_runtime = @import("input_approval_runtime.zig");
@@ -214,6 +215,7 @@ pub fn Runtime(comptime App: type) type {
     return struct {
         const history_rt = input_history_runtime.HistoryRuntime(App);
         const completion_rt = input_completion_runtime.CompletionRuntime(App);
+        const provider_picker_rt = provider_picker_runtime.Runtime(App);
         const paste_rt = input_paste_runtime.PasteEditRuntime(App);
         const submit_rt = input_submit_runtime.SubmitRuntime(App);
         const approval_rt = input_approval_runtime.ApprovalRuntime(App);
@@ -297,7 +299,7 @@ pub fn Runtime(comptime App: type) type {
                             if (!intent.extend_selection and
                                 app.input_runtime.edit_state.selectionRange() == null and
                                 !app.stream.active and
-                                try completion_rt.stepBackModelPicker(app))
+                                (try provider_picker_rt.stepBack(app) or try completion_rt.stepBackModelPicker(app)))
                             {
                                 app.shell.render_requests.request(.footer);
                                 return;
@@ -306,6 +308,20 @@ pub fn Runtime(comptime App: type) type {
                         },
                         .character_right => {
                             app.input_runtime.vertical_navigation.reset();
+                            // In the provider picker the arrows walk columns:
+                            // Left reopens the previous one, Right acts as
+                            // Enter on the highlighted row. Only from the end
+                            // of the text, so Right keeps moving the cursor
+                            // while editing.
+                            if (!intent.extend_selection and
+                                app.input_runtime.edit_state.selectionRange() == null and
+                                !app.stream.active and
+                                app.input_runtime.edit_state.cursor == app.input_runtime.edit_state.input.items.len and
+                                try provider_picker_rt.submit(app))
+                            {
+                                app.shell.render_requests.request(.footer);
+                                return;
+                            }
                             if (!intent.extend_selection and
                                 app.input_runtime.edit_state.selectionRange() == null)
                             {
@@ -562,7 +578,7 @@ pub fn Runtime(comptime App: type) type {
         }
 
         fn terminalDecodeContext(
-            app: *const App,
+            app: *App,
             paste_active: bool,
         ) input_action.TerminalDecodeContext {
             if (paste_active) {
@@ -576,7 +592,7 @@ pub fn Runtime(comptime App: type) type {
             return .{
                 .now_ms = io_mod.milliTimestamp(),
                 .paste_active = false,
-                .cancel_pending = app.stream.active,
+                .cancel_pending = interrupt_rt.hasActiveOperation(app),
                 .question_freeform_selected = app.question_prompt.isFreeformSelected(),
             };
         }
@@ -651,7 +667,6 @@ pub fn Runtime(comptime App: type) type {
                             decoded.question_action,
                             decoded.cancel_pending,
                             input_limits.composer_bytes,
-                            max_prompt_history,
                         )) {
                             .done => {},
                             .remapped_byte => |byte| {
@@ -961,7 +976,6 @@ pub fn Runtime(comptime App: type) type {
             question_action: ?question_prompt.Action,
             was_cancel_pending: bool,
             max_input_len: usize,
-            max_prompt_history: usize,
         ) !ResolvedEscapeRoute {
             switch (resolved) {
                 .remapped_byte, .paste_start, .paste_end, .ignore => {},
@@ -1107,7 +1121,6 @@ pub fn Runtime(comptime App: type) type {
                 .composer_shortcut,
                 .toggle_full_transcript,
                 => unreachable,
-                .steer_submit => try submit_rt.submitSteering(app, max_prompt_history),
                 .page_up,
                 .page_down,
                 .mouse_wheel,
@@ -1435,6 +1448,8 @@ pub fn Runtime(comptime App: type) type {
                             try input_limit_feedback.report(App, app, .composer, 1);
                         }
                         app.shell.render_requests.request(.footer);
+                    } else if (!commandSkillsMenuActive(app) and provider_picker_rt.hasQuery(app)) {
+                        if (!app.stream.active) try provider_picker_rt.autocomplete(app);
                     } else if (!commandSkillsMenuActive(app) and completion_rt.hasModelQuery(app)) {
                         // Mid-turn: list is hidden — do not autocomplete a hidden index.
                         if (!app.stream.active) {
@@ -1478,6 +1493,13 @@ pub fn Runtime(comptime App: type) type {
                         if (try completion_rt.advanceModelPickerOnSpace(app)) {
                             app.shell.render_requests.request(.footer);
                         }
+                    } else if (app.input_runtime.edit_state.selectionRange() == null and
+                        !app.stream.active and
+                        !commandSkillsMenuActive(app) and
+                        provider_picker_rt.hasQuery(app) and
+                        try provider_picker_rt.advanceOnSpace(app))
+                    {
+                        app.shell.render_requests.request(.footer);
                     } else {
                         switch (try insertComposerSliceBounded(app, " ", max_input_len, false)) {
                             .inserted => {
@@ -1515,6 +1537,18 @@ pub fn Runtime(comptime App: type) type {
                     if (picker_state.isBareModelCommandAtCursor(&app.input_runtime.edit_state)) {
                         try openModelBrowseCatalog(app);
                         return;
+                    }
+                    if (provider_picker_rt.hasQuery(app)) {
+                        if (app.stream.active) {
+                            try app.writeDomainNotice(.{
+                                .topic = "provider",
+                                .tone = .neutral,
+                                .body = "Provider switching is unavailable until active and queued work finishes.",
+                            }, true);
+                            app.shell.render_requests.request(.footer);
+                            return;
+                        }
+                        if (try provider_picker_rt.submit(app)) return;
                     }
                     if (completion_rt.hasModelQuery(app)) {
                         if (app.stream.active) {
@@ -1599,7 +1633,7 @@ pub fn Runtime(comptime App: type) type {
 
             debug_trace.logf("input", "ctrl_c_exit_hint_armed", .{});
 
-            if (app.stream.active) {
+            if (interrupt_rt.hasActiveOperation(app)) {
                 try interrupt_rt.cancelActiveOperation(app);
                 app.shell.render_requests.request(.footer);
                 return;
@@ -5506,7 +5540,6 @@ test "app_input_runtime ctrl-l preserves an active inline picker" {
         null,
         false,
         4096,
-        100,
     );
     try std.testing.expect(app.skills.menu.active);
     try std.testing.expectEqualStrings("$man", app.input_runtime.edit_state.input.items);
@@ -8827,7 +8860,6 @@ test "app_input_runtime active multiline history moves vertically before advanci
         null,
         false,
         4096,
-        100,
     );
     try std.testing.expectEqualStrings("older", app.input_runtime.edit_state.input.items);
 
@@ -11558,7 +11590,6 @@ const FakeSubmitApp = struct {
     transcript: std.ArrayList(u8) = .empty,
     last_command: ?[]u8 = null,
     last_prompt: ?[]u8 = null,
-    last_steering: ?[]u8 = null,
     last_images: []types.ImageAttachment = &.{},
     last_skill_tokens: std.ArrayList(registered_entities.SkillTokenSpan) = .empty,
     notice_topic: std.ArrayList(u8) = .empty,
@@ -11597,7 +11628,6 @@ const FakeSubmitApp = struct {
         self.notice_body.deinit(self.alloc);
         if (self.last_command) |text| self.alloc.free(text);
         if (self.last_prompt) |text| self.alloc.free(text);
-        if (self.last_steering) |text| self.alloc.free(text);
         types.freeImageAttachmentSlice(self.alloc, self.last_images);
         self.clearLastSkillTokens();
         self.last_skill_tokens.deinit(self.alloc);
@@ -11687,14 +11717,6 @@ const FakeSubmitApp = struct {
 
     pub fn enqueuePrompt(self: *FakeSubmitApp, text: []const u8) !bool {
         return self.enqueuePromptWithSkillBindings(text, &.{});
-    }
-
-    pub fn steerPrompt(self: *FakeSubmitApp, text: []const u8) !bool {
-        if (!self.queue_admitted) return false;
-        const copy = try self.alloc.dupe(u8, text);
-        if (self.last_steering) |old| self.alloc.free(old);
-        self.last_steering = copy;
-        return true;
     }
 
     pub fn enqueuePromptWithSkillBindings(
@@ -11893,7 +11915,6 @@ test "composer shortcut line delete handles decoded and raw mutations" {
             null,
             false,
             4096,
-            100,
         );
         try std.testing.expectEqualStrings("alpha\nright\ngamma", app.input_runtime.edit_state.input.items);
         try std.testing.expect(app.shell.render_requests.hasReason(.footer));
@@ -11973,7 +11994,6 @@ test "composer shortcut line delete preserves no-op picker redraw and metadata s
         null,
         false,
         4096,
-        100,
     );
     try std.testing.expect(app.shell.render_requests.hasReason(.footer));
     try std.testing.expectEqual(picker_state.ModelPickerStage.effort, app.input_runtime.picker.model_picker_stage);
@@ -11989,7 +12009,6 @@ test "composer shortcut line delete preserves no-op picker redraw and metadata s
         null,
         false,
         4096,
-        100,
     );
     try std.testing.expect(!app.shell.render_requests.hasReason(.footer));
     try std.testing.expectEqual(picker_state.ModelPickerStage.fast, app.input_runtime.picker.model_picker_stage);
@@ -14142,20 +14161,15 @@ test "app_input_runtime paste edit keeps the original history draft reachable" {
     try std.testing.expectEqualStrings("unsent draft", app.input_runtime.composer_history.draftText().?);
 }
 
-test "ctrl+enter submits steering while ordinary submit keeps queue semantics" {
+test "ordinary submit uses one interactive prompt path" {
     const alloc = std.testing.allocator;
     var app = FakeSubmitApp{ .alloc = alloc };
     defer app.deinit();
     app.stream.active = true;
 
     try app.input_runtime.edit_state.input.appendSlice(alloc, "steer now");
-    try input_submit_runtime.SubmitRuntime(FakeSubmitApp).submitSteering(&app, 100);
-    try std.testing.expectEqualStrings("steer now", app.last_steering.?);
-    try std.testing.expect(app.last_prompt == null);
-
-    try app.input_runtime.edit_state.input.appendSlice(alloc, "queue next");
     try input_submit_runtime.SubmitRuntime(FakeSubmitApp).submit(&app, 100);
-    try std.testing.expectEqualStrings("queue next", app.last_prompt.?);
+    try std.testing.expectEqualStrings("steer now", app.last_prompt.?);
 }
 
 test "app_input_runtime small paste opens skills menu for matching dollar token" {

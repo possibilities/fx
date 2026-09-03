@@ -158,6 +158,8 @@ function writeLogin(home: string, issuer: string, tokenSuffix: string): void {
       expires_at_ms: Date.now() - 60_000,
       scope: "openid offline_access",
       token_type: "Bearer",
+      team_id: "team_keychain_e2e",
+      team_slug: "example-team",
     }) + "\n",
     { mode: 0o600 },
   );

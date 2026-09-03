@@ -45,6 +45,8 @@ function writeFxLogin(
       expires_at_ms: expiresAtMs,
       scope: "openid offline_access use:ai-gateway",
       token_type: "Bearer",
+      team_id: "team_1",
+      team_slug: "example-team",
     }) + "\n",
     { mode: 0o600 },
   );
@@ -545,6 +547,7 @@ test(
     const home = mkdtempSync(join(tmpdir(), "fx-auth-saved-issuer-e2e-"));
     const issuerA = startFakeOAuth([ISSUER_A_ACCESS_TOKEN]);
     const issuerB = startFakeOAuth(["issuer-b-access-token"]);
+    const gateway = startFakeGateway([]);
     writeFxLogin(home, issuerA.issuerUrl);
 
     const env = {
@@ -553,6 +556,8 @@ test(
       VERCEL_OIDC_TOKEN: undefined,
       FX_DISABLE_KEYCHAIN: "1",
       FX_E2E_OAUTH_ISSUER_URL: issuerB.issuerUrl,
+      FX_GATEWAY_BASE_URL: gateway.baseUrl,
+      FX_MODEL: FAKE_GATEWAY_MODEL,
     };
 
     try {
@@ -617,6 +622,7 @@ test(
         expect(output).not.toContain("rotated-refresh-token");
       }
     } finally {
+      gateway.stop();
       issuerA.stop();
       issuerB.stop();
       rmSync(home, { recursive: true, force: true });
