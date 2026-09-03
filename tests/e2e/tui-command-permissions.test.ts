@@ -2354,7 +2354,7 @@ describe("effect-aware command permissions", () => {
   );
 
   test.skipIf(!tmuxAvailable())(
-    "TUI auto mode keeps tools active across unavailable reviews",
+    "TUI auto mode keeps tools active after one unavailable review",
     async () => {
       const root = createIsolatedRoot();
       const marker = join(root.workspace, "classifier-fallback-approved.txt");
@@ -2367,12 +2367,13 @@ describe("effect-aware command permissions", () => {
           (body) => {
             expect(body).not.toContain('"tools":[]');
             expect(body).not.toContain('"toolChoice":{"type":"none"}');
+            expect(body).toContain("turn_review_budget_exhausted");
             return toolCall(command, {}, "invalid_review_4");
           },
           finalText("Reviewer unavailable handled normally."),
         ],
         {
-          classifierResponses: Array.from({ length: 4 }, () => finalText("invalid")),
+          classifierResponses: [finalText("invalid")],
         },
       );
       const tracePath = join(root.root, "trace.log");
@@ -2402,11 +2403,13 @@ describe("effect-aware command permissions", () => {
       expect(pane).not.toContain(COMMAND_APPROVAL_PROMPT);
       expect(existsSync(marker)).toBe(false);
       expect(gateway.requests).toHaveLength(5);
-      expect(gateway.classifierRequests).toHaveLength(4);
+      expect(gateway.classifierRequests).toHaveLength(1);
       const trace = readFileSync(tracePath, "utf8");
       expect(
         trace.match(/decision=unavailable fallback_reason=completion_text/g),
-      ).toHaveLength(4);
+      ).toHaveLength(1);
+      expect(trace.match(/event=auto_review_budget_exhausted/g)).toHaveLength(3);
+      expect(trace).not.toContain("event=turn_permission_denial_preserved");
       expect(trace).not.toContain("event=automatic_recovery_exhausted");
       expect(readFileSync(stderrPath, "utf8")).toBe("");
 
@@ -3132,7 +3135,7 @@ describe("effect-aware command permissions", () => {
       expect(gateway.requests).toHaveLength(2);
       expect(gateway.classifierRequests).toHaveLength(1);
       expect(gateway.classifierRequests[0]!.headers.get("ai-language-model-id")).toBe(
-        "moonshotai/kimi-k3",
+        "openai/gpt-5.6-luna",
       );
       expect(JSON.parse(gateway.classifierRequests[0]!.body)).not.toHaveProperty(
         "providerOptions.gateway.speed",
