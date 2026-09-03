@@ -9,6 +9,7 @@ import {
   createFxTerminal,
   fxSdkApiVersion,
   libfxApiVersion,
+  listModels,
 } from "../node.js";
 import * as browser from "../browser.js";
 
@@ -17,6 +18,8 @@ assert.equal(fxSdkApiVersion, 2);
 assert.equal(browser.libfxApiVersion, 2);
 assert.equal(typeof browser.createFxAgent, "function");
 assert.equal(typeof browser.createFxTerminal, "function");
+assert.equal(typeof browser.listModels, "function");
+assert.equal(typeof listModels, "function");
 
 const scriptDir = fileURLToPath(new URL(".", import.meta.url));
 const realNativeAddon = resolve(scriptDir, "../../zig-out/lib/libfx.node");
