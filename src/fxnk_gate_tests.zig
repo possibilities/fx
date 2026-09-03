@@ -3,6 +3,7 @@
 // compiling and discovering the complete native test graph for every edit.
 test {
     _ = @import("acp/sessions.zig");
+    _ = @import("acp/voice.zig");
     _ = @import("builtins/hooks/ade_events.zig");
     _ = @import("builtins/hooks/ade_git_roots.zig");
     _ = @import("builtins/hooks/lifecycle_state.zig");

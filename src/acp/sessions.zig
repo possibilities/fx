@@ -1309,6 +1309,7 @@ fn sendAgentHistoryChunk(state: *server.ServerState, alloc: Allocator, session_i
         &out.writer,
         acp_types.generateMessageId(&message_id),
         text,
+        null,
     );
     try out.writer.writeAll("}");
     try state.writer.writeNotification(alloc, "session/update", out.writer.buffered());

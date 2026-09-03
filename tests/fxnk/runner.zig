@@ -3,6 +3,10 @@ const std = @import("std");
 
 const expected_names = [_][]const u8{
     "acp.sessions.test.ACP restore rejects MCP servers when host capability is disabled",
+    "acp.voice.test.ACP voice lifecycle records carry the envelope every consumer keys on",
+    "acp.voice.test.ACP voice blocked subagent record names the child and its attention",
+    "acp.voice.test.ACP voice route recovery keeps the ADE feed's attention spelling",
+    "acp.voice.test.ACP voice single question answer decodes only for a single-question batch",
     "builtins.hooks.ade_events.test.ADE feed serializes a main turn as one versioned JSON line",
     "builtins.hooks.ade_git_roots.test.ADE Git roots retain first discovery order and checkpoint without a socket",
     "builtins.hooks.ade_events.test.ADE feed resolves subagent attention with the child's own working snapshot",

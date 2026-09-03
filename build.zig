@@ -122,6 +122,10 @@ pub fn build(b: *std.Build) void {
         },
         .filters = &.{
             "ACP restore rejects MCP servers when host capability is disabled",
+            "ACP voice lifecycle records carry the envelope every consumer keys on",
+            "ACP voice blocked subagent record names the child and its attention",
+            "ACP voice route recovery keeps the ADE feed's attention spelling",
+            "ACP voice single question answer decodes only for a single-question batch",
             "global system prompt file modifiers preserve replacement and append order",
             "ACP command routes parsed options and launch config through the injected runner",
             "app entry preserves every launch control across an upgrade relaunch",

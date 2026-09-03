@@ -9,6 +9,7 @@ const acp_types = @import("types.zig");
 const sessions = @import("sessions.zig");
 const session_test_controls = @import("session_test_controls.zig");
 const prompt_handler = @import("prompt.zig");
+const voice = @import("voice.zig");
 const prompt_test_controls = @import("prompt_test_controls.zig");
 const app_lifecycle = @import("../core/app/app_lifecycle.zig");
 const app_runtime_setup = @import("../core/app/app_runtime_setup.zig");
@@ -65,6 +66,10 @@ const AcpMethod = enum {
     libfx_checkpoint,
     libfx_restore,
     libfx_new,
+    fx_steer,
+    fx_snapshot,
+    fx_question,
+    fx_status,
     unknown,
 
     fn parse(method: []const u8) AcpMethod {
@@ -83,6 +88,10 @@ const AcpMethod = enum {
         if (std.mem.eql(u8, method, "libfx/checkpoint")) return .libfx_checkpoint;
         if (std.mem.eql(u8, method, "libfx/restore")) return .libfx_restore;
         if (std.mem.eql(u8, method, "libfx/new")) return .libfx_new;
+        if (std.mem.eql(u8, method, "_fx/session/steer")) return .fx_steer;
+        if (std.mem.eql(u8, method, "_fx/session/snapshot")) return .fx_snapshot;
+        if (std.mem.eql(u8, method, "_fx/session/question")) return .fx_question;
+        if (std.mem.eql(u8, method, "_fx/status")) return .fx_status;
         return .unknown;
     }
 
@@ -97,6 +106,10 @@ const AcpMethod = enum {
             .session_resume,
             .session_close,
             .libfx_new,
+            .fx_steer,
+            .fx_snapshot,
+            .fx_question,
+            .fx_status,
             => false,
             .session_list,
             .session_remove,
@@ -137,6 +150,11 @@ pub const OutboundKind = enum {
     permission,
     elicitation,
     host_tool,
+    /// A question relayed to the client as an `_fx/lifecycle` update and
+    /// answered by an inbound `_fx/session/question` request. It borrows the
+    /// correlated outbound slot so cancellation releases it like a
+    /// permission, but it is never an outbound JSON-RPC request of its own.
+    question,
 };
 
 pub const OutboundResponse = struct {
@@ -237,6 +255,10 @@ const ActivePrompt = struct {
     /// Mid-turn mode changes apply to the next prompt, never the running one.
     mode: []const u8,
     permission_mode: types.PermissionMode,
+    /// False for a thread that exists only to run work steering admitted while
+    /// the session was idle. There is no client request to answer, so the
+    /// turn's outcome is published as lifecycle events and nothing else.
+    respond: bool = true,
     thread: if (host_target.is_wasm) void else std.Thread = if (host_target.is_wasm) {} else undefined,
     reapable: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 };
@@ -273,6 +295,12 @@ pub const ServerState = struct {
     context_enabled: bool = true,
     active_session: ?ActiveSessionState = null,
     active_prompt: ?*ActivePrompt = null,
+    /// True while some thread owns the admission-ordered work queue. It is
+    /// raised before that thread's first turn and lowered, under
+    /// `queue_mutex`, only once the queue is observed empty, so an admission
+    /// racing the end of a turn is always somebody's responsibility.
+    queue_runner: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    queue_mutex: std.Io.Mutex = .init,
     subagent_authority_mutex: std.Io.Mutex = .init,
     skills: skill_runtime.Runtime = .{},
     context_snapshot: context_contract.GatheredContextSnapshot = .{},
@@ -287,6 +315,7 @@ pub const ServerState = struct {
     web_search_runtime: web_search_runtime.Runtime = web_search_runtime.Runtime.init(.{}),
     lifecycle_runtime: hooks.Runtime = hooks.Runtime.init(std.heap.c_allocator),
     lifecycle_view: hooks.RuntimeView = hooks.RuntimeView.empty(),
+    voice: voice.Runtime = .{},
     host_tools: host_tool_runtime.Runtime = .{},
     host_instructions: []u8 = &.{},
     outbound_mutex: std.Io.Mutex = .init,
@@ -320,6 +349,7 @@ pub const ServerState = struct {
         self.worker.deinit(std.heap.c_allocator);
         self.web_fetch_runtime.deinit(self.alloc);
         self.web_search_runtime.deinit();
+        self.voice.deinit();
         self.lifecycle_runtime.deinit();
         self.host_tools.deinit();
         if (self.host_instructions.len > 0) self.alloc.free(self.host_instructions);
@@ -763,8 +793,6 @@ pub fn runWithTransport(
         try debug_trace.configure(.{ .file_path = path });
     }
 
-    var lifecycle_runtime = hooks.Runtime.init(alloc);
-    const lifecycle_view = lifecycle_runtime.freeze();
     var state = ServerState{
         .alloc = alloc,
         .cfg = cfg,
@@ -776,10 +804,14 @@ pub fn runWithTransport(
             cfg.process_provider,
         ),
         .managed_executions = managed_execution.Runtime.init(alloc),
-        .lifecycle_runtime = lifecycle_runtime,
-        .lifecycle_view = lifecycle_view,
+        .lifecycle_runtime = hooks.Runtime.init(alloc),
     };
     defer state.deinit();
+    state.voice.init(std.heap.c_allocator);
+    // Registration must precede the freeze: the frozen view is what every
+    // turn dispatches through, and a handler added later would never run.
+    try voice.registerLifecycleHooks(&state);
+    state.lifecycle_view = state.lifecycle_runtime.freeze();
 
     var reader = reader_value;
     while (!state.terminate_connection) {
@@ -830,6 +862,8 @@ pub fn runWithTransport(
     // Release any prompt thread parked on a pending approval before
     // state.deinit() joins it, or shutdown deadlocks.
     handleCancel(&state, false);
+    reapActivePrompt(&state, true);
+    voice.releaseSession(&state);
 }
 
 fn shouldRespondToMessage(msg: *const jsonrpc.Message) bool {
@@ -913,6 +947,52 @@ pub fn awaitOutboundResponse(state: *ServerState, id: u64, kind: OutboundKind) ?
     }
 }
 
+/// Non-blocking sibling of `awaitOutboundResponse` for callers that must keep
+/// polling other work while one correlated answer is outstanding. Returns null
+/// while the request is still pending.
+pub fn takeOutboundResponse(state: *ServerState, id: u64, kind: OutboundKind) ?OutboundResponse {
+    state.outbound_mutex.lockUncancelable(io_mod.getIo());
+    defer state.outbound_mutex.unlock(io_mod.getIo());
+    const pending = state.pending_outbound.getPtr(id) orelse return null;
+    if (pending.kind != kind) return null;
+    const response = pending.response orelse return null;
+    _ = state.pending_outbound.remove(id);
+    return response;
+}
+
+/// Fills one pending slot from an inbound request rather than a JSON-RPC
+/// response. The question relay is the only user: ACP has no native question
+/// request, so the client answers with a method call of its own.
+pub fn resolveOutboundRequest(
+    state: *ServerState,
+    id: u64,
+    kind: OutboundKind,
+    result_json: []const u8,
+) bool {
+    const copy = state.alloc.dupe(u8, result_json) catch return false;
+    var owned = true;
+    defer if (owned) state.alloc.free(copy);
+    state.outbound_mutex.lockUncancelable(io_mod.getIo());
+    defer state.outbound_mutex.unlock(io_mod.getIo());
+    const pending = state.pending_outbound.getPtr(id) orelse return false;
+    if (pending.kind != kind or pending.response != null) return false;
+    pending.response = .{ .result_json = copy };
+    owned = false;
+    state.outbound_cond.broadcast(io_mod.getIo());
+    return true;
+}
+
+pub fn permissionDecisionFromResponse(
+    state: *ServerState,
+    response: *const OutboundResponse,
+) types.ToolPermissionDecision {
+    if (response.cancelled or response.error_json != null) return .deny;
+    const raw = response.result_json orelse return .deny;
+    const parsed = std.json.parseFromSlice(std.json.Value, state.alloc, raw, .{}) catch return .deny;
+    defer parsed.deinit();
+    return parsePermissionDecision(parsed.value) orelse .deny;
+}
+
 pub fn cancelOutboundRequest(state: *ServerState, id: u64) void {
     state.outbound_mutex.lockUncancelable(io_mod.getIo());
     const changed = cancelOutboundRequestLocked(state, id);
@@ -936,6 +1016,9 @@ fn cancelPendingOutbound(state: *ServerState, notify_client: bool) void {
     while (pending.next()) |entry| {
         if (entry.value_ptr.response != null) continue;
         entry.value_ptr.response = .{ .cancelled = true };
+        // A question was never an outbound JSON-RPC request, so cancelling it
+        // must not name an id the client cannot recognize.
+        if (entry.value_ptr.kind == .question) continue;
         cancelled_ids[cancelled_count] = entry.key_ptr.*;
         cancelled_count += 1;
     }
@@ -1240,6 +1323,14 @@ fn dispatch(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message) !void 
         return state.writer.writeResponse(alloc, msg.id, "null");
     }
 
+    switch (method) {
+        .fx_status => return voice.handleStatus(state, alloc, msg),
+        .fx_steer => return voice.handleSteer(state, alloc, msg),
+        .fx_snapshot => return voice.handleSnapshot(state, alloc, msg),
+        .fx_question => return voice.handleQuestion(state, alloc, msg),
+        else => {},
+    }
+
     if (method.isLibfx() and !state.cfg.minimal_kernel) {
         return state.writer.writeError(alloc, msg.id, .{
             .code = ErrorCode.method_not_found,
@@ -1253,6 +1344,8 @@ fn dispatch(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message) !void 
             .message = "Prompt already in progress",
         });
     }
+
+    defer voice.syncSession(state);
 
     if (comptime host_target.is_wasm) {
         return switch (method) {
@@ -1289,6 +1382,10 @@ fn dispatch(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message) !void 
         .request_cancel,
         .session_cancel,
         .session_remove,
+        .fx_steer,
+        .fx_snapshot,
+        .fx_question,
+        .fx_status,
         .unknown,
         => state.writer.writeError(alloc, msg.id, .{
             .code = ErrorCode.method_not_found,
@@ -1461,7 +1558,11 @@ fn startPrompt(state: *ServerState, alloc: Allocator, msg: *const jsonrpc.Messag
         jsonrpc.freeMessage(active.alloc, &active.msg);
         active.alloc.destroy(active);
     } else {
-        active.thread = try std.Thread.spawn(.{}, promptWorkerMain, .{active});
+        state.queue_runner.store(true, .seq_cst);
+        active.thread = std.Thread.spawn(.{}, promptWorkerMain, .{active}) catch |err| {
+            state.queue_runner.store(false, .seq_cst);
+            return err;
+        };
         state.active_prompt = active;
     }
 }
@@ -1490,7 +1591,7 @@ fn writeSessionTargetError(
     });
 }
 
-fn requireParsedActiveSessionTarget(
+pub fn requireParsedActiveSessionTarget(
     state: *ServerState,
     alloc: Allocator,
     id: ?jsonrpc.RequestId,
@@ -1502,7 +1603,7 @@ fn requireParsedActiveSessionTarget(
     return false;
 }
 
-fn requireActiveSessionTarget(
+pub fn requireActiveSessionTarget(
     state: *ServerState,
     alloc: Allocator,
     msg: *const jsonrpc.Message,
@@ -1542,21 +1643,94 @@ fn notificationTargetsActiveSession(
 }
 
 fn promptWorkerMain(active: *ActivePrompt) void {
-    const outcome: prompt_handler.TerminalOutcome = prompt_handler.handlePrompt(
-        active.state,
-        active.alloc,
-        &active.msg,
-        active.mode,
-        active.permission_mode,
-    ) catch |err| .{
-        .rpc_error = .{
-            .code = ErrorCode.internal_error,
-            .message = @errorName(err),
-        },
-    };
+    const state = active.state;
+    voice.startChildPump(state);
+    const outcome: ?prompt_handler.TerminalOutcome = if (active.respond)
+        prompt_handler.handlePrompt(
+            state,
+            active.alloc,
+            &active.msg,
+            active.mode,
+            active.permission_mode,
+        ) catch |err| .{
+            .rpc_error = .{
+                .code = ErrorCode.internal_error,
+                .message = @errorName(err),
+            },
+        }
+    else
+        null;
+    // The terminal write is last, and the thread is reapable before it, so a
+    // client acting the instant it reads the response finds the prompt slot
+    // free rather than racing this thread's teardown.
+    drainQueuedWork(active);
+    voice.stopChildPump(state);
     active.reapable.store(true, .seq_cst);
-    publishPromptOutcome(active, outcome) catch {};
+    if (outcome) |terminal| publishPromptOutcome(active, terminal) catch {};
     prompt_test_controls.pauseAfterTerminalWrite();
+}
+
+/// Runs whatever steering admitted into the queue, in admission order, until
+/// the queue is empty. Ownership is released under `queue_mutex` in the same
+/// critical section that observes the empty queue.
+fn drainQueuedWork(active: *ActivePrompt) void {
+    if (comptime host_target.is_wasm) return;
+    const state = active.state;
+    const io = io_mod.getIo();
+    while (true) {
+        state.queue_mutex.lockUncancelable(io);
+        const taken = state.worker.tryTakeNextPrompt(std.heap.c_allocator) catch null;
+        const job = taken orelse {
+            state.queue_runner.store(false, .seq_cst);
+            state.queue_mutex.unlock(io);
+            return;
+        };
+        state.queue_mutex.unlock(io);
+        defer {
+            worker_runtime.freeQueuedPrompt(std.heap.c_allocator, job);
+            state.worker.finishProcessing();
+            state.worker.discardEvents(std.heap.c_allocator);
+        }
+        const session = if (state.active_session) |*value| value else continue;
+        session.cancel_flag.store(false, .seq_cst);
+        prompt_handler.handleQueuedPrompt(
+            state,
+            active.alloc,
+            job.prompt,
+            job.turn_id,
+            session.mode,
+            session.permission_mode,
+        ) catch |err| {
+            debug_trace.logf("acp", "queued work failed err={s}", .{@errorName(err)});
+        };
+    }
+}
+
+/// Starts a thread for work admitted while the session was idle. A live queue
+/// owner already covers it; otherwise the finishing prompt thread is reaped
+/// first, which is bounded because it is past its own turn by construction.
+pub fn startQueuedWork(state: *ServerState, alloc: Allocator) void {
+    if (comptime host_target.is_wasm) return;
+    if (state.queue_runner.load(.seq_cst)) return;
+    if (state.worker.queuedPromptCount() == 0) return;
+    reapActivePrompt(state, true);
+    const session = if (state.active_session) |*value| value else return;
+    const active = alloc.create(ActivePrompt) catch return;
+    active.* = .{
+        .state = state,
+        .alloc = alloc,
+        .msg = .{ .method = "" },
+        .mode = session.mode,
+        .permission_mode = session.permission_mode,
+        .respond = false,
+    };
+    state.queue_runner.store(true, .seq_cst);
+    active.thread = std.Thread.spawn(.{}, promptWorkerMain, .{active}) catch {
+        state.queue_runner.store(false, .seq_cst);
+        alloc.destroy(active);
+        return;
+    };
+    state.active_prompt = active;
 }
 
 fn publishPromptOutcome(active: *ActivePrompt, outcome: prompt_handler.TerminalOutcome) !void {
@@ -1587,7 +1761,7 @@ fn reapActivePrompt(state: *ServerState, wait: bool) void {
         if (!wait and !active.reapable.load(.seq_cst)) return;
         prompt_test_controls.noteReapBeforeJoin();
         active.thread.join();
-        jsonrpc.freeMessage(active.alloc, &active.msg);
+        if (active.respond) jsonrpc.freeMessage(active.alloc, &active.msg);
         active.alloc.destroy(active);
         state.active_prompt = null;
     }
@@ -1927,9 +2101,18 @@ fn handleInitialize(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message
     });
     state.initialized = true;
 
+    var identity: std.Io.Writer.Allocating = .init(alloc);
+    defer identity.deinit();
+    try voice.writeIdentity(state, &identity.writer);
+
     var out: std.Io.Writer.Allocating = .init(alloc);
     defer out.deinit();
-    try acp_types.writeInitializeResponse(&out.writer, !host_target.is_wasm);
+    try acp_types.writeInitializeResponse(
+        &out.writer,
+        !host_target.is_wasm,
+        .{ .lifecycle = voice.lifecycle_revision },
+        identity.written(),
+    );
     try state.writer.writeResponse(alloc, msg.id, out.writer.buffered());
 }
 
@@ -1938,6 +2121,9 @@ fn handleCancel(state: *ServerState, notify_client: bool) void {
         debug_trace.eventf("interrupt", "cancel_requested", .{}, "source=acp active_tool_known=false", .{});
         session.cancel_flag.store(true, .seq_cst);
     }
+    // Explicit cancellation clears steering ownership, so the boundary reads
+    // this as an interrupt rather than as text to fold into the turn.
+    state.worker.requestCancel();
     cancelPendingOutbound(state, notify_client);
     clearPendingLegacyUrls(state);
 }

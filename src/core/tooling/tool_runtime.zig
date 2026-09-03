@@ -165,6 +165,11 @@ pub const Context = struct {
     /// prompts: it resolves by rule, automatic review, or fail-closed denial
     /// (e.g. ACP hosts prompt over JSON-RPC by setting this).
     permission_prompter: ?permission_prompter.Prompter = null,
+    /// Sole question capability. When null, `ask_user_question` is answered
+    /// only by the interactive worker, and outside a TUI it reports that it
+    /// has no live user (e.g. ACP hosts relay it over JSON-RPC by setting
+    /// this).
+    question_prompter: ?QuestionPrompter = null,
     cancel_flag: ?*std.atomic.Value(bool) = null,
     session: *SessionRuntime,
     session_allocator: Allocator = std.heap.c_allocator,
@@ -1020,8 +1025,8 @@ fn typedDispatchContext(ctx: Context, arena: Allocator) tool_dispatch.DispatchCo
         .output_chunk_ctx = ctx.output_chunk_ctx,
         .on_output_chunk = ctx.on_output_chunk,
         .command_timeout_ms = ctx.command_timeout_ms,
-        .ask_question_ctx = if (ctx.interactive) ctx.worker else null,
-        .ask_question_batch = if (ctx.interactive) requestQuestionBatchWithWorker else null,
+        .ask_question_ctx = questionPrompterContext(ctx),
+        .ask_question_batch = questionPrompterFn(ctx),
         .web_fetch_runtime = ctx.web_fetch_runtime,
         .web_fetch_artifact_store = ctx.web_fetch_artifact_store,
         .web_fetch_artifact_error = ctx.web_fetch_artifact_error,
@@ -1062,6 +1067,25 @@ pub fn release_agent_terminal_lease(ctx: Context, session_id: []const u8) !void 
         terminal_lease_cleanup_dispatch_context(ctx, arena_state.allocator()),
         session_id,
     );
+}
+
+/// One host's way of answering `ask_user_question`. The interactive worker is
+/// the default; a host with no live user supplies its own relay.
+pub const QuestionPrompter = struct {
+    context: ?*anyopaque = null,
+    request_fn: tool_dispatch.AskQuestionBatchFn,
+};
+
+fn questionPrompterContext(ctx: Context) ?*anyopaque {
+    if (ctx.question_prompter) |prompter| return prompter.context;
+    if (ctx.interactive) return @ptrCast(ctx.worker);
+    return null;
+}
+
+fn questionPrompterFn(ctx: Context) ?tool_dispatch.AskQuestionBatchFn {
+    if (ctx.question_prompter) |prompter| return prompter.request_fn;
+    if (ctx.interactive) return requestQuestionBatchWithWorker;
+    return null;
 }
 
 fn requestQuestionBatchWithWorker(
