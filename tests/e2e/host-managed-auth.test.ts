@@ -56,6 +56,15 @@ describe("host-managed authentication", () => {
             additional_speed_tiers: [],
             input_modalities: ["text"],
             context_window: 272000,
+          }, {
+            slug: "gpt-5.6-luna",
+            visibility: "list",
+            supported_in_api: true,
+            priority: 2,
+            supported_reasoning_levels: [{ effort: "medium" }],
+            additional_speed_tiers: [],
+            input_modalities: ["text"],
+            context_window: 272000,
           }] });
         }
         if (path === "/codex/responses") {
