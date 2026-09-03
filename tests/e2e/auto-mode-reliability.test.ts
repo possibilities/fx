@@ -1522,6 +1522,59 @@ describe("lean auto mode reliability", () => {
   );
 
   test(
+    "repeated exact unavailable reviews are attempted once without blocking a safe replan",
+    async () => {
+      const root = createIsolatedRoot();
+      const marker = join(root.workspace, "repeated-unavailable-must-not-run");
+      const command = `printf unavailable > ${JSON.stringify(marker)}`;
+      const gateway = startGateway(
+        [
+          commandCall(command, "unavailable_first"),
+          (body) => {
+            expect(body).toContain("review_unavailable");
+            expect(body).toContain("transport_transient");
+            return commandCall(command, "unavailable_retry");
+          },
+          (body) => {
+            expect(body).toContain("review_unavailable");
+            expect(body).toContain("turn_review_budget_exhausted");
+            return cleanCommandCall("pwd", "safe_after_unavailable");
+          },
+          fakeGatewayFinalText("Unavailable review handled normally."),
+        ],
+        [
+          () => new Response("reviewer unavailable", { status: 502 }),
+          fakeGatewayPermissionDecision("clear", "must_not_retry_reviewer"),
+        ],
+      );
+      const tracePath = join(root.root, "trace.log");
+
+      const result = await runFx(
+        ["ask", "--quiet", "--json", "--no-save", "Use a safe alternative if review is unavailable."],
+        {
+          cwd: root.workspace,
+          env: {
+            ...gatewayEnv(root, gateway),
+            FX_TRACE_LOG: tracePath,
+            FX_TRACE_SCOPES: "permission",
+          },
+          timeoutMs: TIMEOUT,
+        },
+      );
+
+      expect(result.code, `stdout: ${result.stdout}\nstderr: ${result.stderr}`).toBe(0);
+      expect(existsSync(marker)).toBe(false);
+      expect(gateway.classifierRequests).toHaveLength(1);
+      expect(gateway.requests).toHaveLength(4);
+      expect(JSON.parse(result.stdout).output).toContain("Unavailable review handled normally.");
+      const trace = readFileSync(tracePath, "utf8");
+      expect(trace.match(/event=auto_review_start/g)).toHaveLength(1);
+      expect(trace).toContain("fallback_reason=transport_transient");
+    },
+    TIMEOUT,
+  );
+
+  test(
     "standalone quiet stays silent after repeated advisory cautions",
     async () => {
       const root = createIsolatedRoot();
