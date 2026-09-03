@@ -80,14 +80,33 @@ pub fn composeQueuedSummaryRow(
     return row;
 }
 
-pub fn composeSteeringMessageRow(
+fn appendSteeringMessageRow(
+    alloc: Allocator,
+    composed: *ComposedInputRows,
+    content: []const u8,
+    width: u16,
+) !void {
+    var row: std.ArrayList(u8) = .empty;
+    errdefer row.deinit(alloc);
+    try row.appendSlice(alloc, ui_render.dim_style);
+    try row_text.appendClipped(alloc, &row, "┋", width);
+    if (width > 1) try row_text.appendClipped(alloc, &row, " ", width - 1);
+    if (width > 2) try row_text.appendClipped(alloc, &row, content, width - 2);
+    try row.appendSlice(alloc, ui_render.reset_style);
+    try composed.rows.append(alloc, row);
+}
+
+pub fn composeSteeringMessageRows(
     alloc: Allocator,
     message: []const u8,
-    show_escape_hint: bool,
     width: u16,
-) !std.ArrayList(u8) {
-    var row: std.ArrayList(u8) = .empty;
-    try row.appendSlice(alloc, ui_render.hint_style);
+    row_limit: u16,
+) !ComposedInputRows {
+    var composed: ComposedInputRows = .{};
+    errdefer composed.deinit(alloc);
+    const max_rows = @min(row_limit, render_input.max_steering_message_rows);
+    if (max_rows == 0) return composed;
+
     var safe_message = try text_utils.encodeTerminalSafe(
         alloc,
         message,
@@ -95,20 +114,57 @@ pub fn composeSteeringMessageRow(
     );
     defer safe_message.deinit(alloc);
 
-    const escape_hint = " · Esc to steer now";
-    const width_usize: usize = width;
-    const escape_width = display_width.visibleWidth(escape_hint);
-    if (show_escape_hint and width_usize > escape_width) {
+    const content_width: usize = width -| 2;
+    const visible_width = display_width.visibleWidth(safe_message.bytes);
+    if (content_width == 0 or max_rows == 1 or visible_width <= content_width) {
+        var content: std.ArrayList(u8) = .empty;
+        defer content.deinit(alloc);
         try row_text.appendSingleLineMiddleEllipsized(
             alloc,
-            &row,
+            &content,
             safe_message.bytes,
-            width_usize - escape_width,
+            content_width,
         );
-        try row.appendSlice(alloc, escape_hint);
-    } else {
-        try row_text.appendSingleLineMiddleEllipsized(alloc, &row, safe_message.bytes, width_usize);
+        try appendSteeringMessageRow(alloc, &composed, content.items, width);
+        return composed;
     }
+
+    const first = text_utils.prefixTerminalSafeByWidth(safe_message.bytes, content_width);
+    try appendSteeringMessageRow(alloc, &composed, first, width);
+
+    const remaining = safe_message.bytes[first.len..];
+    var second: std.ArrayList(u8) = .empty;
+    defer second.deinit(alloc);
+    if (display_width.visibleWidth(remaining) <= content_width) {
+        try second.appendSlice(alloc, remaining);
+    } else {
+        try second.appendSlice(alloc, "…");
+        if (content_width > 1) {
+            try second.appendSlice(
+                alloc,
+                text_utils.suffixTerminalSafeByWidth(remaining, content_width - 1),
+            );
+        }
+    }
+    try appendSteeringMessageRow(alloc, &composed, second.items, width);
+    return composed;
+}
+
+pub fn composeImmediateSteeringMessageRow(
+    alloc: Allocator,
+    message: []const u8,
+    width: u16,
+) !std.ArrayList(u8) {
+    var row: std.ArrayList(u8) = .empty;
+    errdefer row.deinit(alloc);
+    try row.appendSlice(alloc, ui_render.hint_style);
+    var safe_message = try text_utils.encodeTerminalSafe(
+        alloc,
+        message,
+        std.math.maxInt(usize),
+    );
+    defer safe_message.deinit(alloc);
+    try row_text.appendSingleLineMiddleEllipsized(alloc, &row, safe_message.bytes, width);
     try row.appendSlice(alloc, ui_render.reset_style);
     return row;
 }
@@ -142,33 +198,51 @@ test "collapsed queue banner counts the waiting prompts and offers the review" {
     try std.testing.expect(std.mem.find(u8, many.items, "3 queued messages · ↑ to edit") != null);
 }
 
-test "steering rows show actual messages and only the final escape hint" {
-    var first = try composeSteeringMessageRow(std.testing.allocator, "First steer", false, 80);
+test "steering rows use the dotted rail without an escape hint" {
+    var first = try composeSteeringMessageRows(std.testing.allocator, "First steer", 80, 2);
     defer first.deinit(std.testing.allocator);
-    var final = try composeSteeringMessageRow(std.testing.allocator, "Second steer", true, 80);
-    defer final.deinit(std.testing.allocator);
+    var second = try composeSteeringMessageRows(std.testing.allocator, "Second steer", 80, 2);
+    defer second.deinit(std.testing.allocator);
 
-    try std.testing.expect(std.mem.find(u8, first.items, "First steer") != null);
-    try std.testing.expect(std.mem.find(u8, first.items, "Esc to steer now") == null);
-    try std.testing.expect(std.mem.find(u8, final.items, "Second steer · Esc to steer now") != null);
+    try std.testing.expectEqual(@as(usize, 1), first.rows.items.len);
+    try std.testing.expectEqual(@as(usize, 1), second.rows.items.len);
+    try std.testing.expect(std.mem.find(u8, first.rows.items[0].items, "┋ First steer") != null);
+    try std.testing.expect(std.mem.find(u8, second.rows.items[0].items, "┋ Second steer") != null);
+    try std.testing.expect(std.mem.find(u8, first.rows.items[0].items, "Esc to steer now") == null);
+    try std.testing.expect(std.mem.find(u8, second.rows.items[0].items, "Esc to steer now") == null);
 }
 
-test "narrow steering row preserves distinguishing message ends and the escape hint" {
+test "narrow steering row preserves distinguishing message ends without the escape hint" {
     const message = "BEGIN change the implementation direction and retain this unique END";
-    var row = try composeSteeringMessageRow(std.testing.allocator, message, true, 48);
-    defer row.deinit(std.testing.allocator);
+    var rows = try composeSteeringMessageRows(std.testing.allocator, message, 48, 2);
+    defer rows.deinit(std.testing.allocator);
 
-    try std.testing.expect(std.mem.find(u8, row.items, "BEGIN") != null);
-    try std.testing.expect(std.mem.find(u8, row.items, "END") != null);
-    try std.testing.expect(std.mem.find(u8, row.items, "Esc to steer now") != null);
-    try std.testing.expect(display_width.visibleWidthIgnoringAnsi(row.items) <= 48);
+    try std.testing.expectEqual(@as(usize, 2), rows.rows.items.len);
+    try std.testing.expect(std.mem.find(u8, rows.rows.items[0].items, "┋ BEGIN") != null);
+    try std.testing.expect(std.mem.find(u8, rows.rows.items[1].items, "┋ ") != null);
+    try std.testing.expect(std.mem.find(u8, rows.rows.items[1].items, "END") != null);
+    for (rows.rows.items) |row| {
+        try std.testing.expect(std.mem.find(u8, row.items, "Esc to steer now") == null);
+        try std.testing.expect(display_width.visibleWidthIgnoringAnsi(row.items) <= 48);
+    }
+}
+
+test "two steering rows preserve a wide glyph tail when cells do not pack evenly" {
+    var rows = try composeSteeringMessageRows(std.testing.allocator, "界海語", 5, 2);
+    defer rows.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 2), rows.rows.items.len);
+    try std.testing.expect(std.mem.find(u8, rows.rows.items[0].items, "┋ 界") != null);
+    try std.testing.expect(std.mem.find(u8, rows.rows.items[1].items, "┋ …語") != null);
 }
 
 test "steering rows visibly escape terminal control bytes" {
-    var unsafe = try composeSteeringMessageRow(std.testing.allocator, "before\x1b[2Jafter", true, 80);
+    var unsafe = try composeSteeringMessageRows(std.testing.allocator, "before\x1b[2Jafter", 80, 2);
     defer unsafe.deinit(std.testing.allocator);
-    try std.testing.expect(std.mem.find(u8, unsafe.items, "before\\x1b[2Jafter · Esc to steer now") != null);
-    try std.testing.expect(std.mem.find(u8, unsafe.items, "\x1b[2J") == null);
+    try std.testing.expectEqual(@as(usize, 1), unsafe.rows.items.len);
+    try std.testing.expect(std.mem.find(u8, unsafe.rows.items[0].items, "┋ before\\x1b[2Jafter") != null);
+    try std.testing.expect(std.mem.find(u8, unsafe.rows.items[0].items, "Esc to steer now") == null);
+    try std.testing.expect(std.mem.find(u8, unsafe.rows.items[0].items, "\x1b[2J") == null);
 }
 
 test "collapsed queue banner drops the affordance while the review is paused" {
@@ -283,7 +357,7 @@ pub fn cappedInputRows(total_rows: usize, content_bottom: u16, input_visible: bo
 pub fn slashCompletionPickerPrefix(ctx: RenderContext, modal_active: bool, show_model_query: bool, show_file_query: bool) ?[]const u8 {
     if (ctx.input.picker.isInlinePickerSuppressed(.slash) or modal_active or show_model_query or show_file_query) return null;
     if (ctx.input.picker.inlinePickerTriggerKind(&ctx.input.edit_state) != .slash) return null;
-    // Mid-turn model-shaped input owns the footer slot even while the model list is hidden.
+    // Mid-turn bare `/model` owns the footer slot before the staged picker opens.
     if (ctx.stream.active and ctx.input.picker.isModelShapedInput(&ctx.input.edit_state)) return null;
     const prefix = slashInputPrefix(ctx.slash_registry, ctx.input.edit_state.input.items);
     return if (prefix.len > 0) prefix else null;

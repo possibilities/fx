@@ -21,6 +21,7 @@ import {
   fakeGatewayFinalText,
   fakeGatewayToolCall,
   hasEmptyComposer,
+  heldFakeGatewayFinalText,
   isComposerLine,
   startFakeGateway,
   TmuxSession,
@@ -3026,6 +3027,101 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       await session.sendText("/quit");
       expect(await session.waitForSessionEnd(TIMEOUT)).toBe(true);
       session = null;
+    },
+    TEST_TIMEOUT,
+  );
+
+  test(
+    "model picker completes every stage while a turn is in flight",
+    async () => {
+      const fixture = createModelsMenuFixture();
+      const currentModel = "anthropic/claude-opus-4.8";
+      const fastOnlyModel = "provider/fast-only-model";
+      const held = heldFakeGatewayFinalText();
+      gateway = startFakeGateway([held.response], {
+        models: [
+          {
+            id: currentModel,
+            type: "language",
+            released: 100,
+            tags: ["reasoning", "tool-use"],
+            reasoning_options: [{ type: "effort", values: ["high", "xhigh"] }],
+            fast_options: [{ type: "toggle" }],
+            context_window: 1_000_000,
+            max_tokens: 32_000,
+          },
+          {
+            id: fastOnlyModel,
+            type: "language",
+            released: 90,
+            tags: ["tool-use"],
+            fast_options: [{ type: "toggle" }],
+            context_window: 128_000,
+          },
+        ],
+      });
+
+      try {
+        session = await TmuxSession.create({
+          cwd: fixture.workspace,
+          stderrPath: fixture.stderrPath,
+          env: {
+            HOME: fixture.home,
+            AI_GATEWAY_API_KEY: "fake-in-flight-model-picker-key",
+            VERCEL_OIDC_TOKEN: undefined,
+            FX_GATEWAY_BASE_URL: gateway.baseUrl,
+            FX_GATEWAY_CHAT_URL: gateway.chatUrl,
+            FX_E2E_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+            FX_MODEL: currentModel,
+            FX_AUTO_UPGRADE: "0",
+          },
+          width: 120,
+          height: 32,
+        });
+        await session.waitForComposer(10_000);
+        await session.sendText("Keep this model turn active.");
+        await session.waitForText("Thinking", 10_000);
+
+        await session.sendLiteralText("/model");
+        await session.sendKeys("Tab");
+        await session.waitForPane(
+          (pane) => pane.split("\n").some((line) =>
+            !isComposerLine(line) && line.includes(currentModel)
+          ),
+          5_000,
+        );
+        await session.sendKeys("Enter");
+        await session.waitForPane(
+          (pane) => pane.includes("default") && pane.includes("xhigh"),
+          5_000,
+        );
+        await session.sendKeys("Enter");
+        await session.waitForPane(
+          (pane) => pane.includes("normal") && pane.includes("fast"),
+          5_000,
+        );
+        await session.sendKeys("Enter");
+        await session.waitForText(`Next turn will use ${currentModel}`, 5_000);
+
+        await session.sendLiteralText(`/model ${fastOnlyModel}`);
+        await session.sendKeys("Enter");
+        await session.waitForPane(
+          (pane) => pane.includes("normal") && pane.includes("fast"),
+          5_000,
+        );
+        await session.sendKeys("Enter");
+        await session.waitForText(`Next turn will use ${fastOnlyModel}`, 5_000);
+
+        expect(gateway.requests).toHaveLength(1);
+        held.release("IN_FLIGHT_MODEL_PICKER_COMPLETE");
+        await session.waitForText("IN_FLIGHT_MODEL_PICKER_COMPLETE", 10_000);
+        expect(readFileSync(fixture.stderrPath, "utf8")).toBe("");
+        await session.sendText("/quit");
+        expect(await session.waitForSessionEnd(TIMEOUT)).toBe(true);
+        session = null;
+      } finally {
+        held.dispose();
+      }
     },
     TEST_TIMEOUT,
   );
