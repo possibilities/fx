@@ -180,7 +180,7 @@ if (!(streamStartedAt < secondRequestAt)) throw new Error("terminal started stee
 if (!(draftVisibleAt < steeringSubmittedAt)) throw new Error("terminal did not render the steering draft before submission");
 if (!(steeringSubmittedAt <= secondRequestAt)) throw new Error("terminal started steering before submission");
 if (!(secondRequestAt < streamFinishedAt)) throw new Error("terminal waited for the active response before steering");
-if (postSubmitText.includes(`${liveDraft} · Esc to steer now`)) throw new Error("terminal exposed tool-only pending UI during immediate steering");
+if (postSubmitText.includes(`┋ ${liveDraft}`)) throw new Error("terminal exposed tool-only pending UI during immediate steering");
 if (!postSubmitText.includes(liveDraft)) throw new Error("terminal did not commit the steering user row after cutoff");
 if (!postSubmitText.includes("Thinking")) throw new Error("terminal hid activity during immediate steering");
 const steeringUser = secondRequestBody.prompt?.filter((message) => message.role === "user").at(-1);
