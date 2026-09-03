@@ -344,6 +344,45 @@ async function runTerminalToolScenario(args: {
 
 describe("filesystem path handling", () => {
   test(
+    "empty optional search paths use the workspace root",
+    async () => {
+      const root = createIsolatedRoot();
+      try {
+        const fixture = join(root.workspace, "empty-root.txt");
+        writeFileSync(fixture, "EMPTY_ROOT_NEEDLE\n");
+        const cases = [
+          {
+            id: "glob_empty_root_1",
+            name: "glob_files",
+            input: { pattern: "empty-root.txt", path: "" },
+            expected: "empty-root.txt",
+          },
+          {
+            id: "grep_empty_root_1",
+            name: "grep_files",
+            input: { pattern: "EMPTY_ROOT_NEEDLE", path: "" },
+            expected: "EMPTY_ROOT_NEEDLE",
+          },
+        ];
+
+        for (const scenario of cases) {
+          await runFirstCallToolScenario({
+            root,
+            id: scenario.id,
+            name: scenario.name,
+            input: scenario.input,
+            expectedResultRequest: [root.workspace],
+            expectedResultOutput: [scenario.expected],
+          });
+        }
+      } finally {
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
     "active added roots reach read cwd and search admission without loading their instructions",
     async () => {
       const root = createIsolatedRoot();
