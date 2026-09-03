@@ -277,6 +277,22 @@ pub const Provider = struct {
     }
 };
 
+fn gather_empty_context(_: Allocator, _: InitialContextInput) ProviderError!ProviderContext {
+    return .{};
+}
+
+fn append_no_context(_: StaticContextInput, _: Allocator, _: *std.ArrayList(types.ChatMessage)) ProviderError!void {}
+
+fn append_no_transient_context(_: TransientContextInput, _: Allocator, _: *std.ArrayList(types.ChatMessage)) ProviderError!void {}
+
+pub const empty_provider = Provider{
+    .id = "core.empty_context",
+    .gather_project_context_fn = gather_empty_context,
+    .select_applicable_project_context_fn = selectNoApplicableProjectContext,
+    .append_static_fn = append_no_context,
+    .append_transient_fn = append_no_transient_context,
+};
+
 pub fn selectNoApplicableProjectContext(_: Allocator, _: LaterContextInput) ProviderError!ProviderContext {
     return .{};
 }

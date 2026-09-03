@@ -4,13 +4,13 @@ const acp_server = @import("acp/server.zig");
 const jsonrpc = @import("acp/jsonrpc.zig");
 const gateway_provider = @import("core/gateway/gateway_provider.zig");
 const provider_set = @import("core/gateway/provider_set.zig");
+const context_contract = @import("core/workspace/context_contract.zig");
 const host = @import("core/hosts/host.zig");
 const io_mod = @import("core/shared/io.zig");
 const fetch_state = @import("napi_fetch_state.zig");
 const streamable_http = @import("core/mcp/streamable_http.zig");
 const host_stream_provider = @import("gateway/host_stream_provider.zig");
 const oauth_transport = @import("core/auth/oauth_transport.zig");
-const builtin_context = @import("builtins/context.zig");
 const builtin_gateway = @import("builtins/gateway.zig");
 const builtin_modes = @import("builtins/modes.zig");
 
@@ -411,6 +411,7 @@ const Runtime = struct {
         };
         var gateway = builtin_gateway.provider_bundle;
         gateway.agent_stream = host_stream_provider.provider(&self.stream_context);
+        gateway.model_catalog = null;
         gateway.permission_reviewer = null;
         const providers = provider_set.gateway_only(gateway);
         acp_server.runWithTransport(
@@ -424,7 +425,7 @@ const Runtime = struct {
                 .gateway_provider = provider,
                 .provider_set = providers,
                 .secret_store = host.unavailable_secret_store,
-                .prompt_policy = builtin_context.prompt_policy,
+                .prompt_policy = .{ .system_prompt = "" },
                 .ignored_list_entries = &.{},
                 .max_list_entries = 0,
                 .max_read_file_bytes = 0,
@@ -433,7 +434,7 @@ const Runtime = struct {
                 .max_command_output_bytes = 0,
                 .max_tool_result_bytes = 64 * 1024,
                 .max_history_turns = 100,
-                .context_registry = .{ .default_provider = builtin_context.provider },
+                .context_registry = .{ .default_provider = context_contract.empty_provider },
                 .mode_registry = builtin_modes.registry,
                 .credential_override = self.credential,
                 .model_override = self.model,
