@@ -56,6 +56,54 @@ fn sourceLabelOrMissing(source: ?credentials.Source) []const u8 {
     return credentials.sourceLabel(source orelse return "missing");
 }
 
+pub const CredentialFailureReason = enum {
+    temporary_unavailable,
+    invalid_credential,
+    invalid_storage,
+    persistence_uncertain,
+    authority_changed,
+};
+
+pub const CredentialFailure = struct {
+    source: credentials.Source,
+    reason: CredentialFailureReason,
+
+    pub fn retryable(self: CredentialFailure) bool {
+        return self.reason == .temporary_unavailable;
+    }
+};
+
+pub fn classifyCredentialFailure(
+    source: credentials.Source,
+    err: anyerror,
+) CredentialFailure {
+    return .{
+        .source = source,
+        .reason = switch (err) {
+            error.InvalidGrant,
+            error.AccessDenied,
+            error.ExpiredToken,
+            error.InvalidClient,
+            error.CredentialRefreshUnavailable,
+            => .invalid_credential,
+            error.InvalidAuthSession,
+            error.InvalidOAuthKeychainSession,
+            error.InvalidOAuthStorageState,
+            error.KeychainItemNotFound,
+            => .invalid_storage,
+            error.KeychainWriteFailed,
+            error.OAuthSessionKeychainWriteMismatch,
+            error.OAuthSessionCleanupUncertain,
+            => .persistence_uncertain,
+            error.CredentialAuthorityChanged,
+            error.ChatGptAccountChanged,
+            error.GrokAccountChanged,
+            => .authority_changed,
+            else => .temporary_unavailable,
+        },
+    };
+}
+
 test "pinned ChatGPT account rejects a swapped host session before refresh side effects" {
     const Fixture = struct {
         load_calls: usize = 0,
@@ -1176,7 +1224,7 @@ pub const Runtime = struct {
     secret_store: host.SecretStore = host.unavailable_secret_store,
     auth_mode: credentials.AuthMode = .local,
     selected_credential: ?credentials.Credential = null,
-    credential_refresh_failure_source: ?credentials.Source = null,
+    credential_failure: ?CredentialFailure = null,
     source_inventory: SourceSet = .empty,
     stored_key_status: credentials.StoredKeyReadStatus = .not_attempted,
     fx_login_status: credentials.FxLoginReadStatus = .not_attempted,
@@ -1253,7 +1301,7 @@ pub const Runtime = struct {
         storage.secret_store = secret_store;
         storage.auth_mode = auth_mode;
         storage.selected_credential = null;
-        storage.credential_refresh_failure_source = null;
+        storage.credential_failure = null;
         storage.source_inventory = .empty;
         storage.stored_key_status = .not_attempted;
         storage.fx_login_status = .not_attempted;
@@ -1338,15 +1386,28 @@ pub const Runtime = struct {
 
     pub fn modelCatalogAccess(self: *const Self) credentials.CatalogAccess {
         if (self.auth_mode == .host_managed) return .host_managed;
-        if (self.credential_refresh_failure_source) |source| {
-            return credentials.catalogAccessAfterRefreshFailure(source);
+        if (self.credential_failure) |failure| {
+            return credentials.catalogAccessAfterRefreshFailure(failure.source);
         }
         return credentials.catalogAccessAt(self.selected_credential, io_mod.milliTimestamp());
     }
 
-    pub fn recordCredentialRefreshFailure(self: *Self, source: credentials.Source) void {
-        std.debug.assert(self.credentialSource() == source);
-        self.credential_refresh_failure_source = source;
+    /// Returns true only for the first observation of this failure episode.
+    pub fn recordCredentialFailure(self: *Self, failure: CredentialFailure) bool {
+        std.debug.assert(self.credentialSource() == failure.source);
+        if (self.credential_failure) |current| {
+            if (current.source == failure.source and
+                current.reason == failure.reason)
+            {
+                return false;
+            }
+        }
+        self.credential_failure = failure;
+        return true;
+    }
+
+    pub fn credentialFailure(self: *const Self) ?CredentialFailure {
+        return self.credential_failure;
     }
 
     pub fn credentialSource(self: *const Self) ?credentials.Source {
@@ -2143,7 +2204,7 @@ pub const Runtime = struct {
         if (self.selected_credential) |*selected| selected.deinit(alloc);
 
         self.selected_credential = credential.*;
-        self.credential_refresh_failure_source = null;
+        self.credential_failure = null;
         credential.token = &.{};
         credential.account_id = null;
         credential.team_id = null;
@@ -2167,21 +2228,6 @@ pub const Runtime = struct {
             )
         else
             .authority;
-    }
-
-    pub fn adoptSelectedTeam(self: *Self, alloc: Allocator, selected_team: *login_flow.SelectedTeam) bool {
-        const credential = if (self.selected_credential) |*selected| selected else return false;
-        if (credential.source != .fx_login) return false;
-
-        const changed = !optionalBytesEqual(credential.team_id, selected_team.id) or
-            !optionalBytesEqual(credential.team_slug, selected_team.slug);
-        if (credential.team_id) |team| alloc.free(team);
-        if (credential.team_slug) |team| alloc.free(team);
-        credential.team_id = selected_team.id;
-        credential.team_slug = selected_team.slug;
-        selected_team.id = &.{};
-        selected_team.slug = &.{};
-        return changed;
     }
 
     fn selectSourceWithLoader(
@@ -2270,7 +2316,7 @@ pub const Runtime = struct {
         const previous = self.credentialSource();
         if (self.selected_credential) |*credential| credential.deinit(alloc);
         self.selected_credential = null;
-        self.credential_refresh_failure_source = null;
+        self.credential_failure = null;
 
         try self.refreshSourceInventoryWithProbe(alloc, ctx, probe);
         for (credential_source_order) |source| {
@@ -2291,7 +2337,7 @@ pub const Runtime = struct {
         if (was_active) {
             if (self.selected_credential) |*credential| credential.deinit(alloc);
             self.selected_credential = null;
-            self.credential_refresh_failure_source = null;
+            self.credential_failure = null;
         }
         try self.refreshSourceInventory(alloc);
         return was_active or was_available;
@@ -2303,7 +2349,7 @@ pub const Runtime = struct {
         if (was_active) {
             if (self.selected_credential) |*credential| credential.deinit(alloc);
             self.selected_credential = null;
-            self.credential_refresh_failure_source = null;
+            self.credential_failure = null;
         }
         try self.refreshSourceInventory(alloc);
         return was_active or was_available;
@@ -2329,7 +2375,7 @@ pub const Runtime = struct {
         if (login_was_active) {
             if (self.selected_credential) |*credential| credential.deinit(alloc);
             self.selected_credential = null;
-            self.credential_refresh_failure_source = null;
+            self.credential_failure = null;
         }
 
         try self.refreshSourceInventoryWithProbe(alloc, ctx, probe);
@@ -2397,7 +2443,7 @@ test "auth in-place initialization preserves empty runtime state" {
     defer runtime.deinit(std.testing.allocator);
 
     try std.testing.expect(runtime.selected_credential == null);
-    try std.testing.expect(runtime.credential_refresh_failure_source == null);
+    try std.testing.expect(runtime.credential_failure == null);
     try std.testing.expect(runtime.source_inventory.count() == 0);
     try std.testing.expect(runtime.stored_key_status == .not_attempted);
     try std.testing.expect(!runtime.picker_active);
@@ -2752,6 +2798,27 @@ test "auth failure snapshot keeps refresh failures distinct from HTTP rejection"
     try std.testing.expect(FailureSnapshot.fromHttp(.unauthorized, null) == null);
 }
 
+test "credential refresh failures preserve repair and retry semantics" {
+    const cases = [_]struct {
+        err: anyerror,
+        expected_reason: CredentialFailureReason,
+        expected_retryable: bool,
+    }{
+        .{ .err = error.InvalidGrant, .expected_reason = .invalid_credential, .expected_retryable = false },
+        .{ .err = error.InvalidAuthSession, .expected_reason = .invalid_storage, .expected_retryable = false },
+        .{ .err = error.OAuthSessionKeychainWriteMismatch, .expected_reason = .persistence_uncertain, .expected_retryable = false },
+        .{ .err = error.CredentialAuthorityChanged, .expected_reason = .authority_changed, .expected_retryable = false },
+        .{ .err = error.ConnectionResetByPeer, .expected_reason = .temporary_unavailable, .expected_retryable = true },
+    };
+
+    for (cases) |case| {
+        const failure = classifyCredentialFailure(.fx_login, case.err);
+        try std.testing.expectEqual(credentials.Source.fx_login, failure.source);
+        try std.testing.expectEqual(case.expected_reason, failure.reason);
+        try std.testing.expectEqual(case.expected_retryable, failure.retryable());
+    }
+}
+
 test "catalog access records a refresh failure until another credential is adopted" {
     const alloc = std.testing.allocator;
     var runtime: Runtime = .{};
@@ -2760,7 +2827,10 @@ test "catalog access records a refresh failure until another credential is adopt
     var login = try makeTestCredential(alloc, "login-token", .fx_login, null, null);
     defer login.deinit(alloc);
     _ = runtime.adoptCredential(alloc, &login);
-    runtime.recordCredentialRefreshFailure(.fx_login);
+    _ = runtime.recordCredentialFailure(classifyCredentialFailure(
+        .fx_login,
+        error.OAuthRequestFailed,
+    ));
 
     const failed = runtime.modelCatalogAccess();
     try std.testing.expectEqual(credentials.CatalogPublicOnlyReason.credential_refresh_failed, failed.publicOnlyReason().?);
@@ -2771,6 +2841,28 @@ test "catalog access records a refresh failure until another credential is adopt
 
     const authenticated = runtime.modelCatalogAccess();
     try std.testing.expectEqualStrings("api-key", authenticated.authorizationCredential().?);
+}
+
+test "credential failure episodes deduplicate and clear on adoption" {
+    const alloc = std.testing.allocator;
+    var runtime: Runtime = .{};
+    defer runtime.deinit(alloc);
+
+    var login = try makeTestCredential(alloc, "login-token", .fx_login, null, null);
+    _ = runtime.adoptCredential(alloc, &login);
+
+    const failure = classifyCredentialFailure(.fx_login, error.InvalidGrant);
+    try std.testing.expect(runtime.recordCredentialFailure(failure));
+    try std.testing.expect(!runtime.recordCredentialFailure(failure));
+    try std.testing.expectEqual(failure, runtime.credentialFailure().?);
+    try std.testing.expectEqual(
+        credentials.CatalogPublicOnlyReason.credential_refresh_failed,
+        runtime.modelCatalogAccess().publicOnlyReason().?,
+    );
+
+    var refreshed = try makeTestCredential(alloc, "fresh-login-token", .fx_login, null, null);
+    _ = runtime.adoptCredential(alloc, &refreshed);
+    try std.testing.expect(runtime.credentialFailure() == null);
 }
 
 test "auth runtime adopts credential ownership and prefers team id" {
