@@ -8,6 +8,8 @@ const maxInstructionsBytes = 64 * 1024;
 const maxApiKeyBytes = 64 * 1024;
 const maxModelBytes = 1024;
 const maxUrlBytes = 16 * 1024;
+const maxModelCatalogBytes = 4 * 1024 * 1024;
+const maxModelCatalogEntries = 10_000;
 const streamReadsPerTaskYield = 32;
 
 function boundedString(value, name, maxBytes, required) {
@@ -56,6 +58,90 @@ function agentEnvironment(options) {
     ...(options.model === undefined ? {} : { FX_MODEL: options.model }),
     ...(options.gatewayChatUrl === undefined ? {} : { FX_GATEWAY_CHAT_URL: options.gatewayChatUrl }),
   };
+}
+
+async function cancelResponseBody(response) {
+  try {
+    await response.body?.cancel();
+  } catch {}
+}
+
+async function readBoundedResponseText(response, limit) {
+  const declared = Number(response.headers.get("content-length"));
+  if (Number.isFinite(declared) && declared > limit) {
+    await cancelResponseBody(response);
+    throw new RangeError(`model catalog exceeds the ${limit} byte libfx limit`);
+  }
+  if (!response.body) {
+    const bytes = new Uint8Array(await response.arrayBuffer());
+    if (bytes.length > limit) throw new RangeError(`model catalog exceeds the ${limit} byte libfx limit`);
+    return strictDecoder.decode(bytes);
+  }
+
+  const reader = response.body.getReader();
+  const chunks = [];
+  let total = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    if (!value?.length) continue;
+    total += value.length;
+    if (total > limit) {
+      try {
+        await reader.cancel();
+      } catch {}
+      throw new RangeError(`model catalog exceeds the ${limit} byte libfx limit`);
+    }
+    chunks.push(value);
+  }
+  const bytes = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    bytes.set(chunk, offset);
+    offset += chunk.length;
+  }
+  return strictDecoder.decode(bytes);
+}
+
+export async function listModels(options = {}) {
+  if (!options || typeof options !== "object" || Array.isArray(options)) {
+    throw new TypeError("listModels() options must be an object");
+  }
+  const apiKey = boundedString(options.apiKey, "apiKey", maxApiKeyBytes, true);
+  const fetchModels = options.fetch ?? globalThis.fetch?.bind(globalThis);
+  if (typeof fetchModels !== "function") throw new TypeError("fetch is unavailable");
+  const response = await fetchModels("https://ai-gateway.vercel.sh/coding-agent/v1/models", {
+    method: "GET",
+    headers: { authorization: `Bearer ${apiKey}` },
+  });
+  if (!response.ok) {
+    await cancelResponseBody(response);
+    throw new Error(`model catalog request failed with HTTP ${response.status}`);
+  }
+
+  let catalog;
+  try {
+    catalog = JSON.parse(await readBoundedResponseText(response, maxModelCatalogBytes));
+  } catch (error) {
+    if (error instanceof RangeError) throw error;
+    throw new TypeError("model catalog response is malformed");
+  }
+  if (!catalog || typeof catalog !== "object" || !Array.isArray(catalog.data)) {
+    throw new TypeError("model catalog response is malformed");
+  }
+  if (catalog.data.length > maxModelCatalogEntries) {
+    throw new RangeError(`model catalog exceeds the ${maxModelCatalogEntries} entry libfx limit`);
+  }
+
+  const ids = new Set();
+  for (const entry of catalog.data) {
+    if (!entry || typeof entry !== "object") continue;
+    if (typeof entry.type === "string" && entry.type.toLowerCase() !== "language") continue;
+    if (typeof entry.id !== "string" || entry.id.length === 0) continue;
+    if (encoder.encode(entry.id).length > maxModelBytes) continue;
+    ids.add(entry.id);
+  }
+  return [...ids].sort();
 }
 
 function validWorkspacePath(path) {
@@ -1077,6 +1163,49 @@ export async function createFxAgent(options = {}) {
   const emit = (type, detail = {}) => {
     try { options.onEvent?.({ type, timestamp: performance.now(), ...detail }); } catch {}
   };
+  const hostFetch = options.fetch ?? globalThis.fetch?.bind(globalThis);
+  const transportFetch = async (input, init = {}) => {
+    const method = String(init.method ?? input?.method ?? "GET").toUpperCase();
+    let endpoint = String(input?.url ?? input);
+    try {
+      const url = new URL(endpoint);
+      endpoint = `${url.origin}${url.pathname}`;
+    } catch {}
+    for (let attemptIndex = 0; attemptIndex < 2; attemptIndex++) {
+      const startedAt = performance.now();
+      const attempt = activeTurn ? ++activeTurn.transportAttempts : attemptIndex + 1;
+      emit("transport.start", { attempt, method, endpoint, model: options.model });
+      try {
+        if (!hostFetch) throw new TypeError("fetch is unavailable");
+        const response = await hostFetch(input, init);
+        const headers = response.headers;
+        emit("transport.response", {
+          attempt,
+          status: response.status,
+          elapsedMs: performance.now() - startedAt,
+          requestId: headers.get("x-vercel-id"),
+          generationId: headers.get("x-generation-id"),
+          model: headers.get("x-model-id") ?? options.model,
+          provider: headers.get("x-vercel-ai-gateway-provider") ?? headers.get("x-ai-gateway-provider"),
+        });
+        return response;
+      } catch (error) {
+        const errorName = error instanceof Error ? error.name : "Error";
+        const elapsedMs = performance.now() - startedAt;
+        emit("transport.error", { attempt, elapsedMs, error: errorName });
+        if (init.signal?.aborted) throw new DOMException("Aborted", "AbortError");
+        if (attemptIndex === 1) throw error;
+        emit("transport.retry", {
+          attempt,
+          nextAttempt: attempt + 1,
+          elapsedMs,
+          error: errorName,
+        });
+        if (init.signal?.aborted) throw new DOMException("Aborted", "AbortError");
+      }
+    }
+    throw new Error("transport retry exhausted");
+  };
   const executeHostTool = async (name, input, requestedSessionId) => {
     const execute = hostTools.executors.get(name);
     const turn = requestedSessionId === undefined || requestedSessionId === sessionId
@@ -1100,6 +1229,7 @@ export async function createFxAgent(options = {}) {
   emit("runtime.start");
   const runtimeOptions = {
     ...options,
+    fetch: transportFetch,
     args: ["acp"],
     env: agentEnvironment(options),
     hostToolExecutor: executeHostTool,
@@ -1275,6 +1405,7 @@ export async function createFxAgent(options = {}) {
     const turn = {
       push(update) { const waiter = waiters.shift(); if (waiter) waiter({ value: update, done: false }); else queue.push(update); },
       toolControllers,
+      transportAttempts: 0,
       cancel() {
         if (finished || cancelled) return;
         cancelled = true;
