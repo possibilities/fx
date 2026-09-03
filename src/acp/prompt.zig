@@ -1032,6 +1032,7 @@ fn buildAgentConfig(
                 current_prompt_is_external
         else
             false,
+        .enforce_response_language = !state.cfg.minimal_kernel,
         .context_limits = state.context_limits,
     };
 }
@@ -1515,6 +1516,7 @@ fn appendStaticContext(raw_ctx: *anyopaque, arena: Allocator, messages: *std.Arr
     try ctx.state.cfg.context_registry.appendDefaultStatic(.{
         .project_context = ctx.modelVisibleProjectContext(),
     }, arena, messages);
+    if (ctx.state.cfg.minimal_kernel) return;
     const active_session = if (ctx.state.active_session) |*session| session else null;
     var snapshot = if (active_session) |session|
         if (session.mcp) |mcp|
