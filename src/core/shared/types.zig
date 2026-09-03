@@ -94,17 +94,88 @@ pub const CredentialSource = enum {
     stored_key,
     chatgpt_subscription,
     grok_subscription,
+    host_managed,
 };
 
+pub const DirectCredentialLease = struct {
+    secret_bytes: []const u8 = "",
+    source: ?CredentialSource = null,
+    account_id: ?[]const u8 = null,
+    tenant_context: ?[]const u8 = null,
+};
+
+/// Borrowed authorization for one provider request. Host-managed requests
+/// cannot carry credential or account bytes into the embedded runtime.
+pub const CredentialLease = union(enum) {
+    direct: DirectCredentialLease,
+    host_managed,
+
+    pub fn secret(self: CredentialLease) ?[]const u8 {
+        return switch (self) {
+            .direct => |direct| if (direct.secret_bytes.len > 0) direct.secret_bytes else null,
+            .host_managed => null,
+        };
+    }
+
+    pub fn credentialSource(self: CredentialLease) ?CredentialSource {
+        return switch (self) {
+            .direct => |direct| direct.source,
+            .host_managed => .host_managed,
+        };
+    }
+
+    pub fn accountId(self: CredentialLease) ?[]const u8 {
+        return switch (self) {
+            .direct => |direct| direct.account_id,
+            .host_managed => null,
+        };
+    }
+
+    pub fn tenant(self: CredentialLease) ?[]const u8 {
+        return switch (self) {
+            .direct => |direct| direct.tenant_context,
+            .host_managed => null,
+        };
+    }
+};
+
+test "host-managed credential lease carries no local authority bytes" {
+    const lease: CredentialLease = .host_managed;
+    try std.testing.expect(lease.secret() == null);
+    try std.testing.expect(lease.accountId() == null);
+    try std.testing.expect(lease.tenant() == null);
+    try std.testing.expectEqual(CredentialSource.host_managed, lease.credentialSource().?);
+}
+
+test "empty direct credential lease preserves absent authority" {
+    const lease = CredentialLease{ .direct = .{} };
+    try std.testing.expect(lease.secret() == null);
+    try std.testing.expect(lease.credentialSource() == null);
+}
+
 pub fn parseCredentialSource(text: []const u8) ?CredentialSource {
+    const source = parseRuntimeCredentialSource(text) orelse return null;
+    return if (source == .host_managed) null else source;
+}
+
+pub fn parseRuntimeCredentialSource(text: []const u8) ?CredentialSource {
     return std.meta.stringToEnum(CredentialSource, text);
 }
 
 test "credential source round trips through its persisted name" {
     for (std.meta.tags(CredentialSource)) |source| {
+        if (source == .host_managed) continue;
         try std.testing.expectEqual(source, parseCredentialSource(@tagName(source)).?);
     }
     try std.testing.expect(parseCredentialSource("keychain") == null);
+}
+
+test "host-managed authority is runtime-only and cannot be persisted" {
+    try std.testing.expect(parseCredentialSource("host_managed") == null);
+    try std.testing.expectEqual(
+        CredentialSource.host_managed,
+        parseRuntimeCredentialSource("host_managed").?,
+    );
 }
 
 pub const TurnPresentationOutcome = enum {
@@ -221,6 +292,7 @@ pub const RouteRecoveryStatusTone = enum {
 pub const ModelRecoveryCause = enum {
     network_interrupted,
     response_interrupted,
+    provider_stream_timeout,
     provider_unavailable,
     rate_limited,
     system_resumed,
@@ -255,6 +327,7 @@ pub const ModelFailureDiagnostic = struct {
         return switch (cause) {
             .network_interrupted => "NetworkInterrupted",
             .response_interrupted => "StreamInterrupted",
+            .provider_stream_timeout => "gateway_stream_timeout",
             .provider_unavailable => "provider_error",
             .rate_limited => "HTTP 429",
             .system_resumed => "SystemResumed",
@@ -401,6 +474,7 @@ pub const RouteRecoveryStatus = struct {
         const cause = switch (self.cause orelse .provider_unavailable) {
             .network_interrupted => "Network interrupted",
             .response_interrupted => "Response ended early",
+            .provider_stream_timeout => "Gateway stream timed out",
             .provider_unavailable => "Provider unavailable",
             .rate_limited => "Rate limited",
             .system_resumed => "Mac woke from sleep",
@@ -474,6 +548,20 @@ pub const RouteRecoveryStatus = struct {
                 .{ self.failed_attempt, self.attempt_limit },
             ) catch "⚠ Connection unavailable · recovery paused";
         }
+        if (cause == .provider_stream_timeout) {
+            if (self.diagnostic) |diagnostic| {
+                return std.fmt.bufPrint(
+                    buf,
+                    "⚠ Gateway stream timed out · {s} · automatic retry paused · attempt {d}/{d}",
+                    .{ diagnostic.view(), self.failed_attempt, self.attempt_limit },
+                ) catch "⚠ Gateway stream timed out · automatic retry paused";
+            }
+            return std.fmt.bufPrint(
+                buf,
+                "⚠ Gateway stream timed out · automatic retry paused · attempt {d}/{d}",
+                .{ self.failed_attempt, self.attempt_limit },
+            ) catch "⚠ Gateway stream timed out · automatic retry paused";
+        }
         if (cause == .request_limit_reached) {
             if (self.diagnostic) |diagnostic| {
                 return std.fmt.bufPrint(
@@ -491,6 +579,7 @@ pub const RouteRecoveryStatus = struct {
         const name = switch (cause) {
             .network_interrupted => "Network interrupted",
             .response_interrupted => "Response ended early",
+            .provider_stream_timeout => "Gateway stream timed out",
             .provider_unavailable => "Provider unavailable",
             .rate_limited => "Rate limited",
             .system_resumed => "Mac woke from sleep",
@@ -839,7 +928,7 @@ pub const TerminalActionPresentation = union(enum) {
 
 pub const deferred_tool_result_output = "Not executed";
 pub const context_deferred_tool_result_output = "Scoped project instructions were added before execution. Review them and reissue this tool call if it is still appropriate.";
-pub const context_deferred_tool_status_label = "Context updated";
+pub const context_deferred_tool_status_label = "Not run — project instructions changed:";
 
 pub fn isContextDeferredToolResult(result: PersistedToolResult) bool {
     return result.status == .failure and
@@ -903,6 +992,12 @@ pub const ToolExecutionStep = struct {
     tool_results: []PersistedToolResult = &.{},
 };
 
+pub const PersistedSteering = struct {
+    text: []u8,
+    assistant_prefix: ?[]u8 = null,
+    after_tool_step_count: usize,
+};
+
 pub const FileEvidence = struct {
     path: []u8,
     new_path: ?[]u8 = null,
@@ -917,8 +1012,8 @@ pub const FileEvidence = struct {
 pub const ExecutionMemory = struct {
     tool_steps: []ToolExecutionStep = &.{},
     files: []FileEvidence = &.{},
-    /// User guidance consumed between model steps, in presentation order.
-    steering: [][]u8 = &.{},
+    /// User guidance consumed between model steps, with its chronological tool boundary.
+    steering: []PersistedSteering = &.{},
     turn_summary: ?TurnSummary = null,
 
     pub fn isEmpty(self: ExecutionMemory) bool {
@@ -1044,6 +1139,10 @@ pub const ProviderFinishReason = enum {
     }
 };
 
+pub const ProviderFailureCause = enum {
+    gateway_stream_timeout,
+};
+
 pub const ModelCompletion = struct {
     content: ?[]const u8 = null,
     /// The provider produced content beyond the caller's capture limit.
@@ -1056,6 +1155,7 @@ pub const ModelCompletion = struct {
     /// An earlier delivery may have billed outside this generation identity.
     delivery_ambiguous: bool = false,
     provider_result_identity_failure: ?ProviderResultIdentityFailure = null,
+    provider_failure_cause: ?ProviderFailureCause = null,
     provider_failure_detail: ?[]const u8 = null,
     /// Provider-owned opaque response items for the next stateless request in this turn.
     provider_state_json: ?[]const u8 = null,
@@ -1217,6 +1317,14 @@ pub fn validGatewayTeam(team: []const u8) bool {
         'a'...'z', 'A'...'Z', '0'...'9', '-', '_' => {},
         else => return false,
     };
+    return true;
+}
+
+pub fn validCredentialAccountId(account_id: []const u8) bool {
+    if (account_id.len == 0 or account_id.len > 1024) return false;
+    for (account_id) |byte| {
+        if (byte < 0x21 or byte > 0x7e) return false;
+    }
     return true;
 }
 
@@ -1533,6 +1641,9 @@ pub const InterruptedHistoryTurn = struct {
     terminal_reason: InterruptedTerminalReason = .cancelled,
 };
 
+pub const context_handoff_open = "<context_handoff>";
+pub const context_handoff_close = "</context_handoff>";
+
 pub const CompactedSummaryHistoryTurn = struct {
     summary: []u8,
     removed_turn_count: usize,
@@ -1727,6 +1838,7 @@ pub const ToolPermissionDenialReason = enum {
     user_denied,
     auto_denied,
     review_caution,
+    review_evidence_incomplete,
     review_unavailable,
     policy_denied,
     permission_required,
@@ -1995,7 +2107,7 @@ pub fn dupeExecutionMemory(alloc: std.mem.Allocator, memory: ExecutionMemory) !E
     errdefer freeToolExecutionSteps(alloc, tool_steps);
     const files = try dupeFileEvidenceSlice(alloc, memory.files);
     errdefer freeFileEvidenceSlice(alloc, files);
-    const steering = try dupePermissionFeedback(alloc, memory.steering);
+    const steering = try dupePersistedSteering(alloc, memory.steering);
     return .{
         .tool_steps = tool_steps,
         .files = files,
@@ -2007,7 +2119,45 @@ pub fn dupeExecutionMemory(alloc: std.mem.Allocator, memory: ExecutionMemory) !E
 pub fn freeExecutionMemory(alloc: std.mem.Allocator, memory: ExecutionMemory) void {
     freeToolExecutionSteps(alloc, memory.tool_steps);
     freeFileEvidenceSlice(alloc, memory.files);
-    freePermissionFeedback(alloc, memory.steering);
+    freePersistedSteering(alloc, memory.steering);
+}
+
+pub fn dupePersistedSteering(
+    alloc: std.mem.Allocator,
+    steering: []const PersistedSteering,
+) ![]PersistedSteering {
+    if (steering.len == 0) return &.{};
+    const copy = try alloc.alloc(PersistedSteering, steering.len);
+    errdefer alloc.free(copy);
+    var copied: usize = 0;
+    errdefer for (copy[0..copied]) |item| {
+        alloc.free(item.text);
+        if (item.assistant_prefix) |prefix| alloc.free(prefix);
+    };
+    for (steering, copy) |item, *dest| {
+        const text = try alloc.dupe(u8, item.text);
+        errdefer alloc.free(text);
+        const assistant_prefix = if (item.assistant_prefix) |prefix|
+            try alloc.dupe(u8, prefix)
+        else
+            null;
+        errdefer if (assistant_prefix) |prefix| alloc.free(prefix);
+        dest.* = .{
+            .text = text,
+            .assistant_prefix = assistant_prefix,
+            .after_tool_step_count = item.after_tool_step_count,
+        };
+        copied += 1;
+    }
+    return copy;
+}
+
+pub fn freePersistedSteering(alloc: std.mem.Allocator, steering: []PersistedSteering) void {
+    for (steering) |item| {
+        alloc.free(item.text);
+        if (item.assistant_prefix) |prefix| alloc.free(prefix);
+    }
+    if (steering.len > 0) alloc.free(steering);
 }
 
 pub fn dupeToolExecutionSteps(alloc: std.mem.Allocator, steps: []const ToolExecutionStep) ![]ToolExecutionStep {
