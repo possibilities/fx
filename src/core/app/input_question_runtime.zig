@@ -70,7 +70,7 @@ pub fn QuestionRuntime(comptime App: type) type {
                     if (comptime presentation == .open) {
                         _ = queue_rt.requestCancelAndOpen(app);
                     } else {
-                        _ = app.worker.requestCancelWithQueueReview();
+                        _ = app.worker.requestInteractiveCancel();
                     }
                 } else {
                     app.worker.requestCancel();

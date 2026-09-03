@@ -164,6 +164,7 @@ const ToolPermissionDecision = types.ToolPermissionDecision;
 const PermissionGrant = types.PermissionGrant;
 const PermissionEngine = permissions.PermissionEngine;
 const QueuedPrompt = worker_runtime.QueuedPrompt;
+const WorkItem = worker_runtime.WorkItem;
 const WorkerRuntime = worker_runtime.WorkerRuntime;
 const SessionRuntime = session_runtime.SessionRuntime;
 const PromptHistoryRuntime = prompt_history_runtime.PromptHistoryRuntime;
@@ -605,7 +606,11 @@ const App = struct {
         return null;
     }
 
-    pub fn init(alloc: Allocator, launch: *cli_surface.InteractiveLaunch) !Self {
+    pub fn init(
+        alloc: Allocator,
+        launch: *cli_surface.InteractiveLaunch,
+        auth_mode: credentials.AuthMode,
+    ) !Self {
         var app = Self{
             .alloc = alloc,
             .auth = undefined,
@@ -622,11 +627,12 @@ const App = struct {
             else
                 shell_process_provider.provider,
         };
-        auth_runtime.Runtime.initInto(
+        auth_runtime.Runtime.initIntoWithMode(
             &app.auth,
             app_api_key_validator,
             app_oauth_transport,
             app_secret_store,
+            auth_mode,
         );
         usage_dashboard_runtime.Runtime.initInto(&app.usage_dashboard, std.heap.c_allocator);
         app_session_runtime.Persistence.initInto(&app.session_persistence);
@@ -676,10 +682,13 @@ const App = struct {
         app.context_limits.applyCommandLine(launch.modifiers.context_limit_overrides);
         if (comptime host_profile.durable_sessions or host_profile.js_host_sessions) {
             if (app.requested_resume != null) {
-                if (launch.upgrade_relaunch) {
+                if (launch.upgrade_relaunch != null) {
                     try SessionAppRuntime.resumeRequestedSessionAfterUpgrade(
                         &app,
                         app_version,
+                        build_update_channel,
+                        launch.upgrade_relaunch.?.previous_revision orelse "",
+                        build_revision,
                     );
                 } else {
                     try SessionAppRuntime.resumeRequestedSession(&app);
@@ -966,8 +975,8 @@ const App = struct {
         return AuthAppRuntime.admitPromptCredential(self);
     }
 
-    pub fn openSetupHub(self: *App) !void {
-        try AuthAppRuntime.openSetupHub(self);
+    pub fn runProviderCommand(self: *App) !void {
+        try AuthAppRuntime.runProviderCommand(self);
     }
 
     pub fn runLoginCommand(self: *App) !void {
@@ -1077,12 +1086,7 @@ const App = struct {
             prompt,
             skill_tokens,
             null,
-            .queue,
         );
-    }
-
-    pub fn steerPrompt(self: *App, prompt: []const u8) !bool {
-        return self.enqueuePromptWithOptionalReview(prompt, &.{}, null, .steer);
     }
 
     pub fn enqueuePromptWithReviewDraft(
@@ -1111,7 +1115,6 @@ const App = struct {
                 .image_tokens = @constCast(review_image_tokens),
                 .skill_display_spans = review_skill_spans,
             },
-            .queue,
         );
     }
 
@@ -1122,7 +1125,6 @@ const App = struct {
         prompt: []const u8,
         skill_tokens: []const registered_entities.SkillTokenSpan,
         review_draft: ?worker_runtime.QueueReviewDraft,
-        intent: PromptSubmitIntent,
     ) !bool {
         const context_targets = if (self.context_enabled)
             try context_contract.applicableTargetsForImages(self.alloc, self.pending_images.items)
@@ -1143,11 +1145,10 @@ const App = struct {
                 debug_trace.preview(prompt, 120),
             },
         );
-        if (!try self.snapshotAndQueuePromptWithSkillBindings(
+        if (!try self.snapshotAndAdmitInteractivePromptWithSkillBindings(
             prompt,
             skill_tokens,
             review_draft,
-            intent,
         )) return false;
         WorkerAppRuntime.syncState(
             self,
@@ -1341,14 +1342,13 @@ const App = struct {
         try RenderAppRuntime.flushRequestedFrame(@as(*Self, self));
     }
 
-    pub fn snapshotAndQueuePromptWithSkillBindings(
+    fn snapshotAndAdmitInteractivePromptWithSkillBindings(
         self: *App,
         prompt: []const u8,
         skill_tokens: []const registered_entities.SkillTokenSpan,
         review_draft: ?worker_runtime.QueueReviewDraft,
-        intent: PromptSubmitIntent,
     ) !bool {
-        return self.snapshotAndQueuePrompt(
+        const queued = try self.snapshotPrompt(
             prompt,
             skill_tokens,
             review_draft,
@@ -1356,8 +1356,11 @@ const App = struct {
             null,
             0,
             false,
-            intent,
         );
+        errdefer worker_runtime.freeQueuedPrompt(std.heap.c_allocator, queued);
+        try self.worker.admitInteractivePrompt(std.heap.c_allocator, queued);
+        HerdrAppRuntime.reportWorking(self);
+        return true;
     }
 
     /// Applies host-supplied semantic work through the same snapshot and
@@ -1455,7 +1458,36 @@ const App = struct {
         intent: PromptSubmitIntent,
     ) !worker_runtime.PromptAdmissionResult {
         _ = try self.requestSkillsRefresh();
+        const queued = try self.snapshotPrompt(
+            prompt,
+            skill_tokens,
+            review_draft,
+            recovery_checkpoint,
+            prompt_images,
+            turn_id,
+            user_prompt_already_presented,
+        );
+        errdefer worker_runtime.freeQueuedPrompt(std.heap.c_allocator, queued);
+        const admission = try self.worker.admitPromptObserved(
+            std.heap.c_allocator,
+            queued,
+            recovery_checkpoint == null and intent == .steer,
+        );
+        HerdrAppRuntime.reportWorking(self);
+        return admission;
+    }
 
+    // Caller owns the returned prompt until worker admission succeeds.
+    fn snapshotPrompt(
+        self: *App,
+        prompt: []const u8,
+        skill_tokens: []const registered_entities.SkillTokenSpan,
+        review_draft: ?worker_runtime.QueueReviewDraft,
+        recovery_checkpoint: ?*const session_codec.RecoveryCheckpoint,
+        prompt_images: ?[]const types.ImageAttachment,
+        turn_id: u64,
+        user_prompt_already_presented: bool,
+    ) !worker_runtime.QueuedPrompt {
         const source_images = if (recovery_checkpoint) |checkpoint|
             checkpoint.user.images
         else if (prompt_images) |images|
@@ -1470,7 +1502,10 @@ const App = struct {
         errdefer std.heap.c_allocator.free(model_copy);
 
         const gateway_credential = self.auth.gatewayCredential() orelse return error.MissingApiKey;
-        const api_key_copy = try std.heap.c_allocator.dupe(u8, gateway_credential.api_key);
+        const api_key_copy = if (gateway_credential.api_key) |api_key|
+            try std.heap.c_allocator.dupe(u8, api_key)
+        else
+            @constCast(&[_]u8{});
         errdefer secret.zeroAndFree(std.heap.c_allocator, api_key_copy);
 
         const gateway_team_copy = if (gateway_credential.gateway_team) |team|
@@ -1490,12 +1525,12 @@ const App = struct {
         );
         errdefer types.freeImageAttachmentSlice(std.heap.c_allocator, authorized_image_catalog);
 
-        const history_copy = try self.session.snapshotContextHistory(std.heap.c_allocator);
+        const history_copy = try self.session.snapshotHistory(std.heap.c_allocator);
         errdefer types.freeHistoryTurnSlice(std.heap.c_allocator, history_copy);
         const root_user_intent_context = try auto_classifier_context.buildCanonicalRootUserContext(
             std.heap.c_allocator,
             prompt_copy,
-            self.session.history.items,
+            self.session.agent.history.items,
         );
         errdefer std.heap.c_allocator.free(root_user_intent_context);
 
@@ -1540,7 +1575,7 @@ const App = struct {
                 review,
             );
 
-        const admission = try self.worker.admitPromptObserved(std.heap.c_allocator, .{
+        return .{
             .turn_id = if (recovery_checkpoint) |checkpoint| checkpoint.turn_id else turn_id,
             .prompt = prompt_copy,
             .images = images_copy,
@@ -1553,6 +1588,8 @@ const App = struct {
             .account_id = account_id_copy,
             .permission_mode = self.permission_engine.mode,
             .history = history_copy,
+            .context_history_start = self.session.contextHistoryStart(),
+            .unversioned_history_count = self.session.unversionedHistoryEnd(),
             .root_user_intent_context = root_user_intent_context,
             .grants = grants_copy,
             .skill_bindings = skill_bindings,
@@ -1562,9 +1599,50 @@ const App = struct {
             .recovery_checkpoint = recovery_checkpoint_copy,
             .recovery_source_already_presented = recovery_checkpoint != null,
             .user_prompt_already_presented = user_prompt_already_presented,
-        }, recovery_checkpoint == null and intent == .steer);
+        };
+    }
+
+    pub fn enqueueContextCompaction(self: *App) !bool {
+        if (self.worker.isProcessing() or self.worker.queuedPromptCount() > 0) return false;
+        const selection = self.provider_selection.selection();
+        const model = try std.heap.c_allocator.dupe(u8, selection.model);
+        errdefer std.heap.c_allocator.free(model);
+        const credential = self.auth.gatewayCredential() orelse return error.MissingApiKey;
+        const api_key = if (credential.api_key) |value|
+            try std.heap.c_allocator.dupe(u8, value)
+        else
+            @constCast(&[_]u8{});
+        errdefer secret.zeroAndFree(std.heap.c_allocator, api_key);
+        const gateway_team = if (credential.gateway_team) |team|
+            try std.heap.c_allocator.dupe(u8, team)
+        else
+            null;
+        errdefer if (gateway_team) |team| std.heap.c_allocator.free(team);
+        const account_id = if (self.auth.accountId()) |id|
+            try std.heap.c_allocator.dupe(u8, id)
+        else
+            null;
+        errdefer if (account_id) |id| std.heap.c_allocator.free(id);
+        const history = try self.session.snapshotHistory(std.heap.c_allocator);
+        errdefer types.freeHistoryTurnSlice(std.heap.c_allocator, history);
+
+        try self.worker.enqueueContextCompaction(.{
+            .model = model,
+            .provider = selection.provider,
+            .api_key = api_key,
+            .gateway_team = gateway_team,
+            .credential_source = credential.source,
+            .account_id = account_id,
+            .history = history,
+            .context_history_start = self.session.contextHistoryStart(),
+            .unversioned_history_count = self.session.unversionedHistoryEnd(),
+        });
         HerdrAppRuntime.reportWorking(self);
-        return admission;
+        return true;
+    }
+
+    pub fn hasContextToCompact(self: *const App) bool {
+        return self.session.hasContextToCompact();
     }
 
     pub fn installInitialMcpRuntime(self: *App, runtime: ?*mcp_runtime_mod.McpRuntime) void {
@@ -2257,13 +2335,21 @@ const App = struct {
         }
     }
 
-    pub fn processQueuedPrompt(self: *App, job: QueuedPrompt) !void {
-        AgentAppRuntime.processQueuedPrompt(
-            self,
-            job,
-            builtin_gateway.retry_count,
-            builtin_gateway.defaultChatUrl(),
-        ) catch |err| {
+    pub fn processQueuedWork(self: *App, work: WorkItem) !void {
+        const result = switch (work) {
+            .prompt => |job| AgentAppRuntime.processQueuedPrompt(
+                self,
+                job,
+                builtin_gateway.retry_count,
+                builtin_gateway.defaultChatUrl(),
+            ),
+            .compact_context => |task| AgentAppRuntime.processContextCompaction(
+                self,
+                task,
+                builtin_gateway.retry_count,
+            ),
+        };
+        result catch |err| {
             if (err == error.TurnFinalizationDeliveryFailed) return;
             return err;
         };
@@ -3231,7 +3317,7 @@ pub fn runWasmTerminal(init: std.process.Init) !void {
         },
     };
     defer launch.deinit(alloc);
-    const outcome = try app_entry_runtime.runInteractiveCooperative(App, alloc, &launch);
+    const outcome = try app_entry_runtime.runInteractiveCooperative(App, alloc, &launch, .local);
     switch (outcome) {
         .returned => {},
         .exit => |code| if (code != 0) return error.WasmTerminalExited,
@@ -3368,12 +3454,16 @@ fn runNonBenchmark(raw_args: []const [*:0]const u8, raw_env: RawEnviron, cli_arg
     io_mod.setRawEnviron(raw_env);
 
     const alloc = processAllocator();
+    const auth_mode = credentials.parseAuthMode(rawEnvValue(raw_env, "FX_AUTH_MODE")) catch {
+        try writeStderrFast("fx: FX_AUTH_MODE must be local or host-managed\n");
+        exitFast(1);
+    };
     const cfg = if (cli_args.len == 0)
-        emptyEntryConfig()
+        emptyEntryConfig(auth_mode)
     else if (needsFullEntryConfig(cli_args))
-        fullEntryConfig()
+        fullEntryConfig(auth_mode)
     else
-        localEntryConfig();
+        localEntryConfig(auth_mode);
 
     var early_threaded: ?std.Io.Threaded = null;
     defer if (early_threaded) |*threaded| threaded.deinit();
@@ -3403,7 +3493,7 @@ fn runNonBenchmark(raw_args: []const [*:0]const u8, raw_env: RawEnviron, cli_arg
             defer owned_launch.deinit(alloc);
             defer debug_trace.shutdown();
 
-            const outcome = try app_entry_runtime.runInteractive(App, alloc, &owned_launch);
+            const outcome = try app_entry_runtime.runInteractive(App, alloc, &owned_launch, auth_mode);
             switch (outcome) {
                 .returned => return,
                 .exit => |code| std.process.exit(code),
@@ -3717,11 +3807,12 @@ test "native app preserves the built-in tool set without workspace metadata" {
     try std.testing.expectEqual(builtin_tools.advertisement_set.order.len, advertised.order.len);
 }
 
-fn fullEntryConfig() app_entry_runtime.Config {
+fn fullEntryConfig(auth_mode: credentials.AuthMode) app_entry_runtime.Config {
     return .{
         .version = version,
         .revision = build_options.git_commit,
         .build_channel = compiled_update_channel,
+        .auth_mode = auth_mode,
         .command_catalog = builtin_commands.top_level_registry,
         .default_model = builtin_gateway.default_model,
         .default_agent_step_limit = default_max_agent_steps,
@@ -3755,11 +3846,12 @@ fn fullEntryConfig() app_entry_runtime.Config {
     };
 }
 
-fn localEntryConfig() app_entry_runtime.Config {
+fn localEntryConfig(auth_mode: credentials.AuthMode) app_entry_runtime.Config {
     return .{
         .version = version,
         .revision = build_options.git_commit,
         .build_channel = compiled_update_channel,
+        .auth_mode = auth_mode,
         .command_catalog = builtin_commands.top_level_registry,
         .default_model = builtin_gateway.default_model,
         .default_agent_step_limit = default_max_agent_steps,
@@ -3793,11 +3885,12 @@ fn localEntryConfig() app_entry_runtime.Config {
     };
 }
 
-fn emptyEntryConfig() app_entry_runtime.Config {
+fn emptyEntryConfig(auth_mode: credentials.AuthMode) app_entry_runtime.Config {
     return .{
         .version = version,
         .revision = build_options.git_commit,
         .build_channel = compiled_update_channel,
+        .auth_mode = auth_mode,
         .command_catalog = builtin_commands.top_level_registry,
         .default_model = "",
         .default_agent_step_limit = 0,

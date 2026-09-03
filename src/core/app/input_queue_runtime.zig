@@ -107,7 +107,7 @@ pub const ReviewPresentation = enum { hidden, open };
 pub fn Runtime(comptime App: type) type {
     return struct {
         pub fn requestCancelAndOpen(app: *App) bool {
-            return openAfterPause(app, app.worker.requestCancelWithQueueReview());
+            return openAfterPause(app, app.worker.requestInteractiveCancel());
         }
 
         pub fn pauseAndOpenAfterModalCancel(app: *App) bool {
