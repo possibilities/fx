@@ -3753,6 +3753,9 @@ pub fn processAgentPrompt(
         effective_lifecycle,
     );
     defer finalization.deinit();
+    runtime_lifecycle.dispatchTurnStartedCheckpoint(lifecycle, .{
+        .turn_id = effective_job.turn_id,
+    });
 
     processQueuedPromptInner(deps, semantic_presentation, effective_lifecycle, effective_config, effective_job, &finalization, agent) catch |err| {
         if (finalization.state == .open) {

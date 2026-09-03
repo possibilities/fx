@@ -68,6 +68,28 @@ const ToolPermissionDecision = types.ToolPermissionDecision;
 
 pub fn Runtime(comptime App: type) type {
     return struct {
+        const McpAttentionResolutionObserver = struct {
+            app: *App,
+
+            fn interface(self: *@This()) worker_runtime.DecisionObserver {
+                return .{
+                    .context = self,
+                    .observe_fn = observe,
+                };
+            }
+
+            fn observe(raw: *anyopaque, turn_id: u64) void {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                if (comptime @hasDecl(App, "dispatchAttentionResolved")) {
+                    self.app.dispatchAttentionResolved(
+                        turn_id,
+                        .question,
+                        null,
+                    );
+                }
+            }
+        };
+
         const ToolAuthorityView = struct {
             mode: PermissionMode,
             grants: []const PermissionGrant,
@@ -419,10 +441,18 @@ pub fn Runtime(comptime App: type) type {
                         false;
                     const timed_out = currentAwakeMillis() >= self.deadline_ms;
                     if (cancelled or lifecycle_cancelled or timed_out) {
-                        if (timed_out and !cancelled and !lifecycle_cancelled) {
-                            self.timed_out.store(true, .release);
+                        const timeout_only = timed_out and
+                            !cancelled and
+                            !lifecycle_cancelled;
+                        var observation = McpAttentionResolutionObserver{
+                            .app = self.app,
+                        };
+                        if (self.app.worker.cancelPendingQuestionBatchObserved(
+                            observation.interface(),
+                        ) == .accepted) {
+                            if (timeout_only) self.timed_out.store(true, .release);
+                            return;
                         }
-                        if (self.app.worker.cancelPendingQuestionBatch()) return;
                     }
                     io_mod.sleep(20 * std.time.ns_per_ms);
                 }
@@ -1643,6 +1673,8 @@ const FakeApp = struct {
     mcp_name: []const u8 = "mcp_lookup",
     mcp_has_tool_calls: usize = 0,
     mcp_result: []const u8 = "{\"ok\":true}",
+    attention_resolved_count: std.atomic.Value(usize) = .init(0),
+    attention_resolved_turn_id: std.atomic.Value(u64) = .init(0),
     diff_blocks: usize = 0,
     web_fetch_runtime: web_fetch_runtime.Runtime = web_fetch_runtime.Runtime.init(.{}),
     web_search_runtime: web_search_runtime.Runtime = web_search_runtime.Runtime.init(.{
@@ -1865,11 +1897,319 @@ const FakeApp = struct {
         self.diff_blocks += 1;
     }
 
+    pub fn dispatchAttentionResolved(
+        self: *FakeApp,
+        turn_id: u64,
+        kind: hooks.AttentionKind,
+        child_session_id: ?[]const u8,
+    ) void {
+        std.debug.assert(kind == .question);
+        std.debug.assert(child_session_id == null);
+        self.attention_resolved_turn_id.store(turn_id, .release);
+        _ = self.attention_resolved_count.fetchAdd(1, .release);
+    }
+
     pub fn formatToolExecutionErrorForAgent(self: *FakeApp, arena: Allocator, tool_name: []const u8, err: anyerror) ![]const u8 {
         _ = self;
         return std.fmt.allocPrint(arena, "Tool {s} failed: {s}", .{ tool_name, @errorName(err) });
     }
 };
+
+const McpQuestionThreadState = struct {
+    completed: std.atomic.Value(bool) = .init(false),
+    answers: ?[][]u8 = null,
+    err: ?anyerror = null,
+
+    fn run(
+        self: *@This(),
+        worker: *worker_runtime.WorkerRuntime,
+        entries: []const types.QuestionBatchEntry,
+    ) void {
+        self.answers = worker.requestMcpElicitationAnswerBlocking(
+            std.heap.c_allocator,
+            entries,
+        ) catch |err| {
+            self.err = err;
+            self.completed.store(true, .release);
+            return;
+        };
+        self.completed.store(true, .release);
+    }
+
+    fn deinit(self: *@This()) void {
+        if (self.answers) |answers| {
+            for (answers) |answer| std.heap.c_allocator.free(answer);
+            std.heap.c_allocator.free(answers);
+        }
+    }
+};
+
+const McpPresentationObserver = struct {
+    barrier: ?*ProjectionBarrier = null,
+    count: std.atomic.Value(usize) = .init(0),
+    turn_id: std.atomic.Value(u64) = .init(0),
+
+    fn interface(self: *@This()) worker_runtime.QuestionPresentationObserver {
+        return .{
+            .context = self,
+            .observe_fn = observe,
+        };
+    }
+
+    fn observe(
+        raw: *anyopaque,
+        turn_id: u64,
+        source: worker_runtime.QuestionPromptSource,
+    ) void {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        std.debug.assert(source == .mcp_elicitation);
+        self.turn_id.store(turn_id, .release);
+        _ = self.count.fetchAdd(1, .release);
+        if (self.barrier) |barrier| barrier.wait();
+    }
+};
+
+const McpResolutionObserver = struct {
+    app: *FakeApp,
+
+    fn interface(self: *@This()) worker_runtime.DecisionObserver {
+        return .{
+            .context = self,
+            .observe_fn = observe,
+        };
+    }
+
+    fn observe(raw: *anyopaque, turn_id: u64) void {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        self.app.dispatchAttentionResolved(turn_id, .question, null);
+    }
+};
+
+fn waitForMcpQuestion(
+    worker: *worker_runtime.WorkerRuntime,
+) !worker_runtime.PendingQuestionBatchSnapshot {
+    var attempts: usize = 0;
+    while (attempts < 1000) : (attempts += 1) {
+        if (try worker.snapshotPendingQuestionBatch(std.testing.allocator)) |snapshot| {
+            try std.testing.expectEqual(
+                worker_runtime.QuestionPromptSource.mcp_elicitation,
+                snapshot.source,
+            );
+            return snapshot;
+        }
+        io_mod.sleep(std.time.ns_per_ms);
+    }
+    return error.TestExpectedMcpQuestion;
+}
+
+test "MCP deadline cancellation waits for surfaced attention projection" {
+    const alloc = std.testing.allocator;
+    var app = try FakeApp.init(alloc);
+    defer app.deinit();
+    app.worker.worker_processing = true;
+    app.worker.active_turn_id = 61;
+
+    const options = [_]types.QuestionOption{
+        .{ .label = "Continue", .description = null },
+    };
+    const entries = [_]types.QuestionBatchEntry{.{
+        .question = "Continue MCP input?",
+        .options = &options,
+    }};
+    var question = McpQuestionThreadState{};
+    defer question.deinit();
+    const question_thread = try std.Thread.spawn(
+        .{},
+        McpQuestionThreadState.run,
+        .{ &question, &app.worker, &entries },
+    );
+    var snapshot = try waitForMcpQuestion(&app.worker);
+    snapshot.deinit(alloc);
+
+    const Presenter = struct {
+        worker: *worker_runtime.WorkerRuntime,
+        observer: *McpPresentationObserver,
+        presented: bool = false,
+
+        fn run(self: *@This()) void {
+            self.presented = self.worker.presentPendingQuestionBatchObserved(
+                self.observer.interface(),
+            );
+        }
+    };
+    var barrier = ProjectionBarrier{};
+    var presentation = McpPresentationObserver{ .barrier = &barrier };
+    var presenter = Presenter{
+        .worker = &app.worker,
+        .observer = &presentation,
+    };
+    const presenter_thread = try std.Thread.spawn(.{}, Presenter.run, .{&presenter});
+    while (!barrier.entered.load(.acquire)) io_mod.sleep(std.time.ns_per_ms);
+
+    var lifecycle_cancelled = std.atomic.Value(bool).init(true);
+    var watch = Runtime(FakeApp).DeadlineWatch{
+        .app = &app,
+        .deadline_ms = std.math.maxInt(i64),
+        .lifecycle_cancel_flag = &lifecycle_cancelled,
+    };
+    const watcher_thread = try std.Thread.spawn(
+        .{},
+        Runtime(FakeApp).DeadlineWatch.run,
+        .{&watch},
+    );
+    io_mod.sleep(25 * std.time.ns_per_ms);
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        app.attention_resolved_count.load(.acquire),
+    );
+    try std.testing.expect(!question.completed.load(.acquire));
+
+    barrier.release.store(true, .release);
+    presenter_thread.join();
+    watcher_thread.join();
+    question_thread.join();
+
+    try std.testing.expect(presenter.presented);
+    try std.testing.expect(question.err == null);
+    try std.testing.expect(question.answers == null);
+    try std.testing.expectEqual(@as(usize, 1), presentation.count.load(.acquire));
+    try std.testing.expectEqual(@as(u64, 61), presentation.turn_id.load(.acquire));
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        app.attention_resolved_count.load(.acquire),
+    );
+    try std.testing.expectEqual(
+        @as(u64, 61),
+        app.attention_resolved_turn_id.load(.acquire),
+    );
+}
+
+test "surfaced MCP timeout and worker cancellation each resolve attention" {
+    const cases = [_]enum { timeout, worker_cancel }{
+        .timeout,
+        .worker_cancel,
+    };
+    const options = [_]types.QuestionOption{
+        .{ .label = "Continue", .description = null },
+    };
+    const entries = [_]types.QuestionBatchEntry{.{
+        .question = "Continue MCP input?",
+        .options = &options,
+    }};
+
+    for (cases, 0..) |case, index| {
+        var app = try FakeApp.init(std.testing.allocator);
+        defer app.deinit();
+        app.worker.worker_processing = true;
+        app.worker.active_turn_id = 70 + index;
+
+        var question = McpQuestionThreadState{};
+        defer question.deinit();
+        const question_thread = try std.Thread.spawn(
+            .{},
+            McpQuestionThreadState.run,
+            .{ &question, &app.worker, &entries },
+        );
+        var snapshot = try waitForMcpQuestion(&app.worker);
+        snapshot.deinit(std.testing.allocator);
+
+        var presentation = McpPresentationObserver{};
+        try std.testing.expect(app.worker.presentPendingQuestionBatchObserved(
+            presentation.interface(),
+        ));
+        if (case == .worker_cancel) app.worker.requestCancel();
+        var watch = Runtime(FakeApp).DeadlineWatch{
+            .app = &app,
+            .deadline_ms = if (case == .timeout)
+                std.math.minInt(i64)
+            else
+                std.math.maxInt(i64),
+            .lifecycle_cancel_flag = null,
+        };
+        const watcher_thread = try std.Thread.spawn(
+            .{},
+            Runtime(FakeApp).DeadlineWatch.run,
+            .{&watch},
+        );
+        watcher_thread.join();
+        question_thread.join();
+
+        try std.testing.expect(question.err == null);
+        try std.testing.expect(question.answers == null);
+        try std.testing.expectEqual(@as(usize, 1), presentation.count.load(.acquire));
+        try std.testing.expectEqual(
+            @as(usize, 1),
+            app.attention_resolved_count.load(.acquire),
+        );
+        try std.testing.expectEqual(
+            case == .timeout,
+            watch.timed_out.load(.acquire),
+        );
+    }
+}
+
+test "MCP UI and deadline cancellation race resolves attention once" {
+    var app = try FakeApp.init(std.testing.allocator);
+    defer app.deinit();
+    app.worker.worker_processing = true;
+    app.worker.active_turn_id = 81;
+
+    const options = [_]types.QuestionOption{
+        .{ .label = "Continue", .description = null },
+    };
+    const entries = [_]types.QuestionBatchEntry{.{
+        .question = "Cancel MCP input?",
+        .options = &options,
+    }};
+    var question = McpQuestionThreadState{};
+    defer question.deinit();
+    const question_thread = try std.Thread.spawn(
+        .{},
+        McpQuestionThreadState.run,
+        .{ &question, &app.worker, &entries },
+    );
+    var snapshot = try waitForMcpQuestion(&app.worker);
+    snapshot.deinit(std.testing.allocator);
+
+    var presentation = McpPresentationObserver{};
+    try std.testing.expect(app.worker.presentPendingQuestionBatchObserved(
+        presentation.interface(),
+    ));
+    app.worker.requestCancel();
+    var watch = Runtime(FakeApp).DeadlineWatch{
+        .app = &app,
+        .deadline_ms = std.math.maxInt(i64),
+        .lifecycle_cancel_flag = null,
+    };
+    const watcher_thread = try std.Thread.spawn(
+        .{},
+        Runtime(FakeApp).DeadlineWatch.run,
+        .{&watch},
+    );
+
+    var ui_observer = McpResolutionObserver{ .app = &app };
+    const ui_result = app.worker.cancelPendingQuestionBatchObserved(
+        ui_observer.interface(),
+    );
+    question_thread.join();
+    watch.done.store(true, .release);
+    watcher_thread.join();
+
+    try std.testing.expect(
+        ui_result == .accepted or ui_result == .no_pending,
+    );
+    try std.testing.expect(question.err == null);
+    try std.testing.expect(question.answers == null);
+    try std.testing.expectEqual(@as(usize, 1), presentation.count.load(.acquire));
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        app.attention_resolved_count.load(.acquire),
+    );
+    try std.testing.expectEqual(
+        @as(u64, 81),
+        app.attention_resolved_turn_id.load(.acquire),
+    );
+}
 
 fn testAgentStreamProvider(stream_fn: agent_stream_provider.StreamFn) agent_stream_provider.Provider {
     var provider = test_builtin_gateway.agent_stream_provider;

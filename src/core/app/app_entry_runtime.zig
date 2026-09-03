@@ -291,10 +291,6 @@ fn runInteractiveWithDeps(comptime App: type, comptime cooperative: bool, alloc:
             },
         }
     };
-    if (comptime !cooperative) {
-        if (@hasDecl(App, "startMcpDiscovery")) app.startMcpDiscovery();
-        if (@hasDecl(App, "rebindAfterInit")) app.rebindAfterInit();
-    }
     var app_needs_deinit = true;
     defer if (app_needs_deinit) app.deinit();
     if (comptime !cooperative and @hasField(App, "session") and
@@ -303,8 +299,10 @@ fn runInteractiveWithDeps(comptime App: type, comptime cooperative: bool, alloc:
         app.session.attachProfileUsagePublisher(app.alloc);
     }
     if (comptime !cooperative) {
-        if (resume_requested) app.startResumedSessionReconciliation();
         if (@hasDecl(App, "configureNotifications")) try app.configureNotifications();
+        if (@hasDecl(App, "rebindAfterInit")) app.rebindAfterInit();
+        if (resume_requested) app.startResumedSessionReconciliation();
+        if (@hasDecl(App, "startMcpDiscovery")) app.startMcpDiscovery();
         if (@hasDecl(App, "playStartupSound")) app.playStartupSound();
         if (@hasDecl(App, "startAutoUpgrade")) app.startAutoUpgrade();
         if (@hasDecl(App, "startFileIndex")) app.startFileIndex();
@@ -615,6 +613,7 @@ const TestCapture = struct {
     stdout: std.Io.Writer.Allocating,
     bench_value: ?[]const u8 = null,
     init_error: ?anyerror = null,
+    configure_error: ?anyerror = null,
     worker_error: ?anyerror = null,
     run_error: ?anyerror = null,
     stderr_error: ?anyerror = null,
@@ -807,6 +806,11 @@ const TestApp = struct {
         appendTestEvent("mcp-discovery");
     }
 
+    fn configureNotifications(_: *TestApp) !void {
+        appendTestEvent("configure-notifications");
+        if (active_capture.?.configure_error) |err| return err;
+    }
+
     fn rebindAfterInit(_: *TestApp) void {
         appendTestEvent("rebind-after-init");
     }
@@ -909,7 +913,7 @@ test "app entry runs interactive startup callbacks in active order" {
 
     try std.testing.expectEqual(RunOutcome.returned, outcome);
     try std.testing.expectEqual(@as(usize, 0), capture.stdout_calls);
-    try expectEvents(&.{ "init:none", "mcp-discovery", "rebind-after-init", "auto-upgrade", "file-index", "worker-thread", "model-cache", "run", "terminal-release", "deinit" });
+    try expectEvents(&.{ "init:none", "configure-notifications", "rebind-after-init", "mcp-discovery", "auto-upgrade", "file-index", "worker-thread", "model-cache", "run", "terminal-release", "deinit" });
 }
 
 test "app entry writes exact resume handoff after interactive teardown" {
@@ -930,8 +934,9 @@ test "app entry writes exact resume handoff after interactive teardown" {
     try std.testing.expectEqualStrings("", capture.stderr.written());
     try expectEvents(&.{
         "init:none",
-        "mcp-discovery",
+        "configure-notifications",
         "rebind-after-init",
+        "mcp-discovery",
         "auto-upgrade",
         "file-index",
         "worker-thread",
@@ -1008,8 +1013,9 @@ test "app entry relaunches only after teardown with the validated handoff" {
     ) != null);
     try expectEvents(&.{
         "init:none",
-        "mcp-discovery",
+        "configure-notifications",
         "rebind-after-init",
+        "mcp-discovery",
         "auto-upgrade",
         "file-index",
         "worker-thread",
@@ -1111,7 +1117,26 @@ test "app entry releases terminal before reporting worker start errors" {
     try std.testing.expectError(error.TestWorkerStartFailed, runWithDeps(TestApp, alloc, &.{}, testConfig(), capture.deps()));
     try std.testing.expectEqualStrings("fx: TestWorkerStartFailed\n", capture.stderr.written());
     try std.testing.expectEqual(@as(usize, 1), capture.stderr_calls);
-    try expectEvents(&.{ "init:none", "mcp-discovery", "rebind-after-init", "auto-upgrade", "file-index", "worker-thread", "terminal-release", "stderr-attempt", "deinit" });
+    try expectEvents(&.{ "init:none", "configure-notifications", "rebind-after-init", "mcp-discovery", "auto-upgrade", "file-index", "worker-thread", "terminal-release", "stderr-attempt", "deinit" });
+}
+
+test "app entry arms cleanup and configures lifecycle before recovered-child rebind" {
+    const alloc = std.testing.allocator;
+    var capture = TestCapture.init(.{ .interactive = .{} });
+    defer capture.deinit();
+    capture.configure_error = error.TestLifecycleConfigureFailed;
+    capture.record_stderr_event = true;
+
+    try std.testing.expectError(
+        error.TestLifecycleConfigureFailed,
+        runWithDeps(TestApp, alloc, &.{}, testConfig(), capture.deps()),
+    );
+    try expectEvents(&.{
+        "init:none",
+        "configure-notifications",
+        "terminal-release",
+        "deinit",
+    });
 }
 
 test "app entry releases terminal before reporting initial context failures exactly" {
@@ -1142,8 +1167,9 @@ test "app entry releases terminal before reporting initial context failures exac
         try std.testing.expectEqual(@as(usize, 1), capture.stderr_calls);
         try expectEvents(&.{
             "init:none",
-            "mcp-discovery",
+            "configure-notifications",
             "rebind-after-init",
+            "mcp-discovery",
             "auto-upgrade",
             "file-index",
             "worker-thread",
@@ -1167,7 +1193,7 @@ test "app entry reports run errors before deinit and outer cleanup" {
     try std.testing.expectEqualStrings("fx: TestRunFailed\n", capture.stderr.written());
     try std.testing.expectEqual(@as(usize, 1), capture.stderr_calls);
     try std.testing.expectEqual(@as(usize, 0), capture.stdout_calls);
-    try expectEvents(&.{ "init:none", "mcp-discovery", "rebind-after-init", "auto-upgrade", "file-index", "worker-thread", "model-cache", "run", "terminal-release", "stderr-attempt", "deinit", "outer-defer" });
+    try expectEvents(&.{ "init:none", "configure-notifications", "rebind-after-init", "mcp-discovery", "auto-upgrade", "file-index", "worker-thread", "model-cache", "run", "terminal-release", "stderr-attempt", "deinit", "outer-defer" });
 }
 
 test "app entry treats terminal input closure as abnormal cleanup without stderr" {
@@ -1192,8 +1218,9 @@ test "app entry treats terminal input closure as abnormal cleanup without stderr
     try std.testing.expectEqual(@as(usize, 0), capture.stdout_calls);
     try expectEvents(&.{
         "init:none",
-        "mcp-discovery",
+        "configure-notifications",
         "rebind-after-init",
+        "mcp-discovery",
         "auto-upgrade",
         "file-index",
         "worker-thread",
@@ -1214,7 +1241,7 @@ test "app entry preserves run errors when fatal formatting fails" {
     try std.testing.expectError(error.TestRunFailed, runWithDeps(TestApp, alloc, &.{}, testConfig(), capture.deps()));
     try std.testing.expectEqualStrings("", capture.stderr.written());
     try std.testing.expectEqual(@as(usize, 0), capture.stderr_calls);
-    try expectEvents(&.{ "init:none", "mcp-discovery", "rebind-after-init", "auto-upgrade", "file-index", "worker-thread", "model-cache", "run", "terminal-release", "deinit" });
+    try expectEvents(&.{ "init:none", "configure-notifications", "rebind-after-init", "mcp-discovery", "auto-upgrade", "file-index", "worker-thread", "model-cache", "run", "terminal-release", "deinit" });
 }
 
 test "app entry preserves run errors when fatal writer fails" {
@@ -1228,7 +1255,7 @@ test "app entry preserves run errors when fatal writer fails" {
     try std.testing.expectError(error.TestRunFailed, runWithDeps(TestApp, alloc, &.{}, testConfig(), capture.deps()));
     try std.testing.expectEqualStrings("", capture.stderr.written());
     try std.testing.expectEqual(@as(usize, 1), capture.stderr_calls);
-    try expectEvents(&.{ "init:none", "mcp-discovery", "rebind-after-init", "auto-upgrade", "file-index", "worker-thread", "model-cache", "run", "terminal-release", "stderr-attempt", "deinit" });
+    try expectEvents(&.{ "init:none", "configure-notifications", "rebind-after-init", "mcp-discovery", "auto-upgrade", "file-index", "worker-thread", "model-cache", "run", "terminal-release", "stderr-attempt", "deinit" });
 }
 
 test "app entry passes requested resume into app init" {
@@ -1239,7 +1266,7 @@ test "app entry passes requested resume into app init" {
     const outcome = try runWithDeps(TestApp, alloc, &.{ @constCast("resume"), @constCast("session-123") }, testConfig(), capture.deps());
 
     try std.testing.expectEqual(RunOutcome.returned, outcome);
-    try expectEvents(&.{ "init:session-123", "mcp-discovery", "rebind-after-init", "resume-reconciliation", "auto-upgrade", "file-index", "worker-thread", "model-cache", "run", "terminal-release", "deinit" });
+    try expectEvents(&.{ "init:session-123", "configure-notifications", "rebind-after-init", "resume-reconciliation", "mcp-discovery", "auto-upgrade", "file-index", "worker-thread", "model-cache", "run", "terminal-release", "deinit" });
 }
 
 test "app entry maps noninteractive terminal startup to exit one" {
