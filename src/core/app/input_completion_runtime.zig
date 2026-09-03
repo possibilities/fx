@@ -18,6 +18,7 @@ const app_workspace_runtime = @import("app_workspace_runtime.zig");
 const app_session_runtime = @import("app_session_runtime.zig");
 const app_commands = @import("app_commands.zig");
 const provider_runtime = @import("provider_runtime.zig");
+const provider_picker_runtime = @import("provider_picker_runtime.zig");
 const input_queue_runtime = @import("input_queue_runtime.zig");
 const input_limit_feedback = @import("input_limit_feedback.zig");
 const types = @import("../shared/types.zig");
@@ -124,6 +125,9 @@ pub fn CompletionRuntime(comptime App: type) type {
 
         pub fn dismissVisibleInlinePicker(app: *App) bool {
             const kind = visibleInlinePickerKind(app) orelse return false;
+            // Escaping the picker abandons the columns it had opened, so the
+            // next `/provider` starts from the provider column again.
+            if (kind == .provider) provider_picker_runtime.Runtime(App).abandon(app);
             app.input_runtime.picker.dismissInlinePicker(kind);
             return true;
         }
@@ -146,6 +150,7 @@ pub fn CompletionRuntime(comptime App: type) type {
                 }
             }
             if (hasModelQuery(app)) return .model;
+            if (provider_picker_runtime.Runtime(App).hasQuery(app)) return .provider;
             if (hasFileQuery(app)) return .file;
             if (visibleInlineCompletion(app)) |completion| {
                 return switch (completion) {
@@ -378,6 +383,10 @@ pub fn CompletionRuntime(comptime App: type) type {
             }
             if (hasModelQuery(app)) {
                 if (!app.stream.active) navigateModelPicker(app, delta);
+                return true;
+            }
+            if (provider_picker_runtime.Runtime(App).hasQuery(app)) {
+                if (!app.stream.active) provider_picker_runtime.Runtime(App).navigate(app, delta);
                 return true;
             }
             // Mid-turn bare `/model`: consume arrows without slash/skill navigation.
@@ -957,15 +966,7 @@ pub fn CompletionRuntime(comptime App: type) type {
             return null;
         }
 
-        fn navigatePickerOptions(index: *usize, window_start: *usize, count: usize, delta: i32) void {
-            if (count == 0) return;
-            const current: i32 = @intCast(index.* % count);
-            var next = current + delta;
-            if (next < 0) next = @as(i32, @intCast(count)) - 1;
-            if (next >= @as(i32, @intCast(count))) next = 0;
-            index.* = @intCast(next);
-            window_start.* = list_window.updateEdgeStart(window_start.*, count, index.*, list_window.default_max_picker_rows);
-        }
+        const navigatePickerOptions = list_window.advanceSelection;
 
         fn setModelComposerText(app: *App, comptime fmt: []const u8, args: anytype) !void {
             const text = try std.fmt.allocPrint(app.alloc, fmt, args);

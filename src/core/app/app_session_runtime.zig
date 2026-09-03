@@ -53,6 +53,8 @@ const shell_runtime = @import("../../ui/shell_runtime.zig");
 const transcript_runtime = @import("../../ui/transcript/runtime.zig");
 const ui_input = @import("../../ui/input/runtime.zig");
 const ui_render = @import("../../ui/render.zig");
+const update_notes = @import("../upgrade/update_notes.zig");
+const update_target = @import("../upgrade/update_target.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -239,10 +241,38 @@ pub const ResumeHandoffIntent = enum {
     upgrade_requested,
 };
 
+const UpgradeNotice = struct {
+    version: []const u8,
+    channel: update_target.Channel,
+    previous_revision: []const u8,
+    revision: []const u8,
+};
+
 const ResumeNotice = union(enum) {
     session,
-    upgrade: []const u8,
+    upgrade: UpgradeNotice,
 };
+
+fn writeUpgradeNoticeBody(writer: *std.Io.Writer, upgrade: UpgradeNotice) !void {
+    try writer.writeAll("fx has been updated to ");
+    if (upgrade.channel == .dev and update_target.isValidRevision(upgrade.revision)) {
+        try writer.print("dev {s} (v{s})", .{
+            upgrade.revision[0..@min(upgrade.revision.len, 12)],
+            update_target.normalizeVersion(upgrade.version),
+        });
+    } else {
+        try writer.print("v{s}", .{update_target.normalizeVersion(upgrade.version)});
+    }
+    if (update_notes.destination(
+        upgrade.channel,
+        upgrade.version,
+        upgrade.previous_revision,
+        upgrade.revision,
+    )) |notes| {
+        try writer.writeByte(' ');
+        try notes.writeHyperlinkLabel(writer);
+    }
+}
 
 pub const ResumeViewStage = union(enum) {
     none,
@@ -1650,8 +1680,16 @@ pub fn Runtime(comptime App: type) type {
         pub fn resumeRequestedSessionAfterUpgrade(
             app: *App,
             version: []const u8,
+            channel: update_target.Channel,
+            previous_revision: []const u8,
+            revision: []const u8,
         ) !void {
-            return resumeRequestedSessionWithNotice(app, .{ .upgrade = version });
+            return resumeRequestedSessionWithNotice(app, .{ .upgrade = .{
+                .version = version,
+                .channel = channel,
+                .previous_revision = previous_revision,
+                .revision = revision,
+            } });
         }
 
         fn resumeRequestedSessionWithNotice(
@@ -2751,23 +2789,6 @@ pub fn Runtime(comptime App: type) type {
             return .committed;
         }
 
-        pub fn compactHistory(app: *App) !void {
-            const previous_start = app.session.contextHistoryStart();
-            app.session.forceCompaction();
-            if (app.session.contextHistoryStart() == previous_start) return;
-
-            commitJsHostSnapshot(app, "compaction");
-
-            app.session_persistence.write_mutex.lockUncancelable(io_mod.getIo());
-            defer app.session_persistence.write_mutex.unlock(io_mod.getIo());
-            const loaded = if (app.session_persistence.writable) |*value|
-                value
-            else
-                return;
-            try convergeDegraded(app, loaded, .{});
-            try commitCurrentStateReplacement(app, loaded, .compaction, .{}, false);
-        }
-
         pub fn commitRuntimePreferences(
             app: *App,
             patch: SessionPreferencePatch,
@@ -2961,7 +2982,7 @@ pub fn Runtime(comptime App: type) type {
             if (app.session_title.items.len > 0) return;
             var display = session_display_metadata.deriveFromHistory(
                 app.alloc,
-                app.session.history.items,
+                app.session.agent.history.items,
             ) catch |err| switch (err) {
                 error.OutOfMemory => return error.OutOfMemory,
                 else => return,
@@ -3596,17 +3617,16 @@ pub fn Runtime(comptime App: type) type {
                     .tone = .neutral,
                     .body = display_title,
                 }),
-                .upgrade => |version| {
-                    const body = try std.fmt.allocPrint(
-                        app.alloc,
-                        "fx has been updated to v{s}",
-                        .{version},
-                    );
-                    defer app.alloc.free(body);
+                .upgrade => |upgrade| {
+                    var body: std.Io.Writer.Allocating = .init(app.alloc);
+                    defer body.deinit();
+                    try writeUpgradeNoticeBody(&body.writer, upgrade);
+                    const owned_body = try body.toOwnedSlice();
+                    defer app.alloc.free(owned_body);
                     try sink.appendNotice(.{
                         .topic = "",
                         .tone = .success,
-                        .body = body,
+                        .body = owned_body,
                     });
                 },
             }
@@ -3791,7 +3811,15 @@ pub fn Runtime(comptime App: type) type {
             sink: anytype,
             execution: types.ExecutionMemory,
         ) !void {
-            for (execution.tool_steps) |step| {
+            var steering_index: usize = 0;
+            for (execution.tool_steps, 0..) |step, step_index| {
+                try writePersistedSteeringAtBoundary(
+                    app,
+                    sink,
+                    execution.steering,
+                    &steering_index,
+                    step_index,
+                );
                 if (step.assistant) |assistant| {
                     if (assistant.len > 0) try writeAssistantHistoryMarkdownToSink(app, sink, assistant);
                 }
@@ -3812,7 +3840,35 @@ pub fn Runtime(comptime App: type) type {
                     }
                 }
             }
-            try writePermissionFeedback(sink, execution.steering);
+            while (steering_index < execution.steering.len) : (steering_index += 1) {
+                const steering = execution.steering[steering_index];
+                if (steering.assistant_prefix) |prefix| {
+                    if (prefix.len > 0) try writeAssistantHistoryMarkdownToSink(app, sink, prefix);
+                }
+                if (steering.text.len == 0) continue;
+                try sink.appendUserTurn(.{ .text = steering.text }, true);
+            }
+        }
+
+        fn writePersistedSteeringAtBoundary(
+            app: *App,
+            sink: anytype,
+            steering: []const types.PersistedSteering,
+            index: *usize,
+            tool_step_count: usize,
+        ) !void {
+            while (index.* < steering.len and
+                steering[index.*].after_tool_step_count == tool_step_count)
+            {
+                const item = steering[index.*];
+                if (item.assistant_prefix) |prefix| {
+                    if (prefix.len > 0) try writeAssistantHistoryMarkdownToSink(app, sink, prefix);
+                }
+                if (item.text.len > 0) {
+                    try sink.appendUserTurn(.{ .text = item.text }, true);
+                }
+                index.* += 1;
+            }
         }
 
         fn writePermissionFeedback(sink: anytype, feedback: []const []const u8) !void {
@@ -6538,6 +6594,7 @@ test "execution replay preserves permission denial reasons" {
         .policy_denied,
         .permission_required,
         .review_caution,
+        .review_evidence_incomplete,
         .review_unavailable,
     };
     const call_ids = [_][]const u8{
@@ -6546,6 +6603,7 @@ test "execution replay preserves permission denial reasons" {
         "call_policy_denied",
         "call_permission_required",
         "call_review_caution",
+        "call_review_evidence_incomplete",
         "call_review_unavailable",
     };
     var outputs: [reasons.len][]u8 = undefined;
@@ -6555,10 +6613,11 @@ test "execution replay preserves permission denial reasons" {
     var results: [reasons.len]types.PersistedToolResult = undefined;
     for (reasons, 0..) |reason, index| {
         outputs[index] = switch (reason) {
-            .review_caution, .review_unavailable => try tool_result_errors.toolReviewHeldJson(
+            .review_caution, .review_evidence_incomplete, .review_unavailable => try tool_result_errors.toolReviewHeldJson(
                 alloc,
                 "run_command",
                 reason,
+                null,
                 null,
             ),
             .user_denied, .auto_denied, .policy_denied, .permission_required => try tool_result_errors.toolPermissionDeniedJson(
@@ -6591,16 +6650,17 @@ test "execution replay preserves permission denial reasons" {
 
     try std.testing.expectEqualSlices(
         types.ToolOutcomeKind,
-        &.{ .denied, .denied, .denied, .denied, .denied, .denied },
+        &.{ .denied, .denied, .denied, .denied, .denied, .denied, .denied },
         app.completed_tool_outcomes.items,
     );
-    try std.testing.expectEqual(@as(usize, 6), app.completed_tool_statuses.items.len);
+    try std.testing.expectEqual(@as(usize, 7), app.completed_tool_statuses.items.len);
     try std.testing.expectEqualStrings("● Denied run_command\n", app.completed_tool_statuses.items[0]);
     try std.testing.expectEqualStrings("● Denied by auto agent run_command\n", app.completed_tool_statuses.items[1]);
     try std.testing.expectEqualStrings("● Denied run_command\n", app.completed_tool_statuses.items[2]);
     try std.testing.expectEqualStrings("● Permission required run_command\n", app.completed_tool_statuses.items[3]);
     try std.testing.expectEqualStrings("● Safety caution run_command\n", app.completed_tool_statuses.items[4]);
-    try std.testing.expectEqualStrings("● Review unavailable run_command\n", app.completed_tool_statuses.items[5]);
+    try std.testing.expectEqualStrings("● Review evidence incomplete run_command\n", app.completed_tool_statuses.items[5]);
+    try std.testing.expectEqualStrings("● Review unavailable run_command\n", app.completed_tool_statuses.items[6]);
     try std.testing.expectEqual(@as(usize, 0), app.transcript.items.len);
 }
 
@@ -7065,6 +7125,48 @@ test "execution replay releases action-formatting scratch allocations" {
     );
 }
 
+test "upgrade notice body identifies stable notes and dev changes" {
+    const cases = [_]struct {
+        upgrade: UpgradeNotice,
+        expected: []const u8,
+    }{
+        .{
+            .upgrade = .{
+                .version = "9.9.9",
+                .channel = .stable,
+                .previous_revision = "",
+                .revision = "",
+            },
+            .expected = "fx has been updated to v9.9.9 \x1b]8;;https://fx.sh/changelog#v9.9.9\x1b\\\x1b[4m(notes)\x1b[24m\x1b]8;;\x1b\\",
+        },
+        .{
+            .upgrade = .{
+                .version = "9.9.9",
+                .channel = .dev,
+                .previous_revision = "1111111111111111111111111111111111111111",
+                .revision = "abcdef0123456789abcdef0123456789abcdef01",
+            },
+            .expected = "fx has been updated to dev abcdef012345 (v9.9.9) \x1b]8;;https://github.com/vercel-labs/fx/compare/1111111111111111111111111111111111111111...abcdef0123456789abcdef0123456789abcdef01\x1b\\\x1b[4m(changes)\x1b[24m\x1b]8;;\x1b\\",
+        },
+        .{
+            .upgrade = .{
+                .version = "9.9.9",
+                .channel = .dev,
+                .previous_revision = "",
+                .revision = "abcdef0123456789abcdef0123456789abcdef01",
+            },
+            .expected = "fx has been updated to dev abcdef012345 (v9.9.9) \x1b]8;;https://github.com/vercel-labs/fx/commit/abcdef0123456789abcdef0123456789abcdef01\x1b\\\x1b[4m(changes)\x1b[24m\x1b]8;;\x1b\\",
+        },
+    };
+
+    for (cases) |case| {
+        var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
+        defer out.deinit();
+        try writeUpgradeNoticeBody(&out.writer, case.upgrade);
+        try std.testing.expectEqualStrings(case.expected, out.writer.buffered());
+    }
+}
+
 test "execution replay projects answered questions as a semantic card and retains detail" {
     const alloc = std.testing.allocator;
     var app = try TestApp.init(alloc, "/workspace");
@@ -7214,8 +7316,8 @@ test "execution replay preserves paired deferred tools without command output" {
         app.completed_tool_outcomes.items,
     );
     try std.testing.expectEqual(@as(usize, 3), app.completed_tool_statuses.items.len);
-    try std.testing.expectEqualStrings("● Context updated read_file\n", app.completed_tool_statuses.items[0]);
-    try std.testing.expectEqualStrings("● Context updated run_command\n", app.completed_tool_statuses.items[1]);
+    try std.testing.expectEqualStrings("● Not run — project instructions changed: read_file\n", app.completed_tool_statuses.items[0]);
+    try std.testing.expectEqualStrings("● Not run — project instructions changed: run_command\n", app.completed_tool_statuses.items[1]);
     try std.testing.expectEqualStrings("● Not executed read_file\n", app.completed_tool_statuses.items[2]);
     try std.testing.expectEqual(@as(usize, 3), app.historical_tool_detail_entry_ids.items.len);
     try std.testing.expectEqual(@as(usize, 0), app.transcript.items.len);
@@ -7561,7 +7663,13 @@ test "upgrade resume restores active session with the installed version notice" 
     app.requested_resume = .{ .id = try alloc.dupe(u8, "session-1") };
     app.total_web_search_requests = 99;
 
-    try Runtime(TestApp).resumeRequestedSessionAfterUpgrade(&app, "9.9.9");
+    try Runtime(TestApp).resumeRequestedSessionAfterUpgrade(
+        &app,
+        "9.9.9",
+        .stable,
+        "",
+        "",
+    );
 
     try std.testing.expect(app.requested_resume == null);
     try std.testing.expectEqual(@as(usize, 1), app.startup_resume_anchor_count);
@@ -7585,7 +7693,10 @@ test "upgrade resume restores active session with the installed version notice" 
     try std.testing.expectEqualStrings("inspect file", context[1].assistant.user.text);
     try std.testing.expectEqualStrings("run server", context[2].assistant.user.text);
     try std.testing.expectEqual(@as(usize, 2), app.notices.items.len);
-    try std.testing.expectEqualStrings("● fx has been updated to v9.9.9", app.notices.items[0]);
+    try std.testing.expectEqualStrings(
+        "● fx has been updated to v9.9.9 \x1b]8;;https://fx.sh/changelog#v9.9.9\x1b\\\x1b[4m(notes)\x1b[24m\x1b]8;;\x1b\\",
+        app.notices.items[0],
+    );
     try std.testing.expect(std.mem.find(u8, app.notices.items[1], "older context") != null);
     try std.testing.expectEqual(@as(usize, 2), app.completed_tool_statuses.items.len);
     try std.testing.expectEqualStrings("● Completed read_file\n", app.completed_tool_statuses.items[0]);
@@ -8835,7 +8946,7 @@ test "appendFinishedPrompt transfers snapshot ownership after history acceptance
             .turn_duration_ms = 150,
             .token_progress = .{ .input_tokens = 2, .output_tokens = 3 },
         }),
-        types.historyTurnSummary(app.session.history.items[0]),
+        types.historyTurnSummary(app.session.agent.history.items[0]),
     );
     try std.testing.expectEqual(@as(usize, 1), probe.transfers);
 }

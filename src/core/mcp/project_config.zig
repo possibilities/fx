@@ -1096,6 +1096,7 @@ fn parseProfileAuth(alloc: Allocator, object: std.json.ObjectMap) !?McpAuthConfi
     auth.client_secret_env = try parseOptionalOwnedString(alloc, auth_object, "client_secret_env");
     auth.client_metadata_url = try parseOptionalOwnedString(alloc, auth_object, "client_metadata_url");
     if (auth_object.get("scopes")) |field| auth.scopes = try parseStringArray(alloc, field);
+    auth.callback_port = try parseOptionalPort(auth_object, "callback_port");
     if (auth.client_secret_env) |field| {
         if (!isValidEnvName(field) or auth.client_id == null) return error.McpConfigInvalidOAuth;
     }
@@ -1105,6 +1106,13 @@ fn parseProfileAuth(alloc: Allocator, object: std.json.ObjectMap) !?McpAuthConfi
     }
     if (auth.client_metadata_url) |field| mcp_auth.validateClientMetadataUrl(field) catch return error.McpConfigInvalidOAuth;
     return auth;
+}
+
+fn parseOptionalPort(object: std.json.ObjectMap, key: []const u8) !?u16 {
+    const value = object.get(key) orelse return null;
+    if (value != .integer) return error.McpConfigInvalidOAuth;
+    if (value.integer < 1 or value.integer > 65535) return error.McpConfigInvalidOAuth;
+    return @intCast(value.integer);
 }
 
 fn parseOptionalOwnedString(alloc: Allocator, object: std.json.ObjectMap, key: []const u8) !?[]u8 {

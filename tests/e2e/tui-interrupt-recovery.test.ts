@@ -62,9 +62,9 @@ afterEach(async () => {
 
 describe.skipIf(SKIP)("tui: interrupt recovery", () => {
   test(
-    "submitted status text queues behind an active response",
+    "submitted text interrupts a tool-free response and continues immediately",
     async () => {
-      root = realpathSync(mkdtempSync(join(tmpdir(), "fx-text-queues-")));
+      root = realpathSync(mkdtempSync(join(tmpdir(), "fx-text-steering-")));
       const home = join(root, "home");
       const workspace = join(root, "workspace");
       const stderrPath = join(root, "stderr.log");
@@ -79,10 +79,10 @@ describe.skipIf(SKIP)("tui: interrupt recovery", () => {
         cancelCount: 0,
         released: false,
       };
-      const queuedText = "What are you doing right now?";
+      const steeringText = "What are you doing right now?";
       gateway = startFakeGateway([
         () => heldUntilReleasedResponse(held),
-        fakeGatewayFinalText("QUEUED_STATUS_PROMPT_COMPLETE"),
+        fakeGatewayFinalText("STEERING_STATUS_PROMPT_COMPLETE"),
       ]);
       session = await TmuxSession.create({
         cwd: realpathSync(workspace),
@@ -106,50 +106,59 @@ describe.skipIf(SKIP)("tui: interrupt recovery", () => {
 
       await session.sendText("Hold this response until the test releases it.");
       await waitForCondition(() => held.started, "held response start");
-      await session.sendText(queuedText);
-      await Bun.sleep(250);
-
-      expect(gateway.requests).toHaveLength(1);
-      expect(held.cancelled).toBe(false);
-      expect(held.cancelCount).toBe(0);
-      expect(readTrace(tracePath)).not.toContain("event=interrupt_persisted");
-
-      held.release!();
-      await session.waitForText("QUEUED_STATUS_PROMPT_COMPLETE", TIMEOUT);
+      await session.sendText(steeringText);
+      await waitForCondition(() => held.cancelled, "tool-free steering cancellation");
+      await session.waitForText("STEERING_STATUS_PROMPT_COMPLETE", TIMEOUT);
       await waitForCondition(
         () => countOccurrences(readTrace(tracePath), "finish processing queued=0") >= 1,
-        "both queued turns to finish",
+        "steering continuation to finish",
       );
 
-      expect(held.released).toBe(true);
-      expect(held.cancelCount).toBe(0);
+      expect(held.released).toBe(false);
+      expect(held.cancelCount).toBe(1);
       expect(gateway.requests).toHaveLength(2);
-      const queuedRequest = JSON.parse(gateway.requests[1]!.body) as {
+      const steeringRequest = JSON.parse(gateway.requests[1]!.body) as {
         prompt: unknown;
         tools: unknown[];
       };
-      const queuedPrompt = JSON.stringify(queuedRequest.prompt);
-      expect(queuedPrompt).toContain(queuedText);
-      expect(queuedRequest.tools.length).toBeGreaterThan(0);
+      const steeringPrompt = JSON.stringify(steeringRequest.prompt);
+      expect(steeringPrompt).toContain(steeringText);
+      expect(steeringRequest.tools.length).toBeGreaterThan(0);
       expect(gateway.requests[1]!.body).not.toContain(
         "Treat it as interrupting any previous tool plan.",
       );
       expect(gateway.requests[1]!.body).not.toContain(
         "Continue from the latest meaningful state",
       );
+      expect(gateway.requests[1]!.body).toContain("<user_steering>");
+      expect(gateway.requests[1]!.body).toContain(
+        "Apply this live user update to the current task.",
+      );
+      expect(gateway.requests[1]!.body).toContain("ACTIVE_RESPONSE_HELD");
+      expect(gateway.requests[1]!.body).not.toContain("<turn_aborted>");
+      expect(gateway.requests[1]!.body).not.toContain(
+        "The previous response ended before completion.",
+      );
       expect(readFileSync(stderrPath, "utf8")).toBe("");
       expect(session.isAlive()).toBe(true);
       expect(session.isPaneAlive()).toBe(true);
 
       const sessionRoot = join(home, ".fx", "sessions");
-      const eventsPath = readdirSync(sessionRoot, { withFileTypes: true })
-        .filter((entry) => entry.isDirectory())
-        .map((entry) => join(sessionRoot, entry.name, "events.jsonl"))
-        .find((path) => existsSync(path) && readFileSync(path, "utf8").includes(queuedText));
-      expect(eventsPath).toBeDefined();
+      let eventsPath: string | undefined;
+      await waitForCondition(() => {
+        eventsPath = readdirSync(sessionRoot, { withFileTypes: true })
+          .filter((entry) => entry.isDirectory())
+          .map((entry) => join(sessionRoot, entry.name, "events.jsonl"))
+          .find((path) => existsSync(path) && readFileSync(path, "utf8").includes(steeringText));
+        return eventsPath !== undefined;
+      }, "steering history persistence");
       const events = readFileSync(eventsPath!, "utf8");
       expect(events).not.toContain('"kind":"interrupted"');
-      expect(events).toContain(queuedText);
+      expect(events).toContain(steeringText);
+      const scrollback = await session.captureFullScrollback();
+      expect(countOccurrences(scrollback, steeringText)).toBe(1);
+      expect(countOccurrences(scrollback, "ACTIVE_RESPONSE_HELD")).toBe(1);
+      expect(scrollback).not.toContain("cancelled");
     },
     TIMEOUT * 2,
   );
