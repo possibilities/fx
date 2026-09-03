@@ -59,6 +59,8 @@ shared createFxAgent() logic in sdk/fx-sdk.js
 
 The adapter checks fetch control and drains ACP output on its existing timer. While no body pump exists it may call `takeCoreFetch()`; while a pump exists it calls only `coreFetchActive()` for that fetch handle. An inactive handle aborts its matching `AbortController` on the next callback that observes it. No exact callback latency is guaranteed. ACP output is accumulated to newline boundaries and parsed as JSON. Gateway requests are transferred to Node as bounded request records; Node runs the configured `fetch`, streams bounded response chunks back to Zig, and owns the `AbortController`. This matches the WebAssembly host-fetch boundary and ensures the N-API core never uses the native `std.http` Gateway transport.
 
+The shared JavaScript Agent wrapper emits bounded `transport.start`, `transport.response`, and `transport.error` diagnostics around that host-owned fetch. It allowlists request, generation, model, provider, status, attempt, endpoint, and elapsed-time fields rather than exposing credentials or arbitrary headers.
+
 ## Native module ABI
 
 `napi_register_module_v1` exports a deliberately small low-level interface:
@@ -128,6 +130,10 @@ The native core is intentionally more restricted than the native `fx` CLI. Its A
 - command output limits to zero.
 
 As a result, the model receives no native tool advertisement, cannot launch commands, cannot read workspace files through fx tools, cannot start ACP-provided MCP servers, and cannot access the native secret store. `home` and `workspaceRoot` still provide identity and session context to shared ACP code, but they do not grant a tool capability by themselves.
+
+The native core also performs no model-catalog lookup while creating or prompting an Agent. It uses the local fallback capability policy for the host-selected model. Initial model-visible system context comes only from the host's explicit `instructions`, including text assembled by the MCP and skills adapters.
+
+Host-stream requests do not opt into the Gateway extended-time header. Live paired testing showed that header caused a recurring multi-second pre-header tail for embedded requests. Session identity and affinity headers remain enabled. The shared JavaScript fetch edge retries a thrown host transport error at most once, before any response reaches the Agent. Cancellation prevents the retry, and a second failure keeps the existing rejection behavior.
 
 This restriction is a security boundary. New tools or host effects must not be enabled merely because the code is running natively. Every new capability needs a typed boundary, permission analysis, explicit configuration, and native security coverage.
 
