@@ -65,6 +65,7 @@ pub const PendingSkillRefresh = enum {
 
 pub const State = struct {
     pending: ?PendingSubmission = null,
+    retry_after_auth: bool = false,
 };
 
 fn buildQueuedPromptDraft(
@@ -118,6 +119,25 @@ fn buildQueuedPromptDraft(
 pub fn SubmitRuntime(comptime App: type) type {
     return struct {
         const queue_rt = input_queue_runtime.Runtime(App);
+
+        pub fn requestPromptRetryAfterAuth(app: *App) void {
+            app.submission.retry_after_auth = true;
+        }
+
+        pub fn cancelPromptRetryAfterAuth(app: *App) void {
+            app.submission.retry_after_auth = false;
+        }
+
+        fn takePromptRetryAfterAuth(app: *App) bool {
+            const pending = app.submission.retry_after_auth;
+            app.submission.retry_after_auth = false;
+            return pending;
+        }
+
+        pub fn resumePromptAfterAuth(app: *App, max_prompt_history: usize) !void {
+            if (!takePromptRetryAfterAuth(app)) return;
+            try submit(app, max_prompt_history);
+        }
         const completion_rt = input_completion_runtime.CompletionRuntime(App);
 
         const PromptAdmission = enum {
