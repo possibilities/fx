@@ -8106,13 +8106,13 @@ test "migration and recovery replacements keep latest cache contention strict" {
     }
 }
 
-test "session creation keeps latest cache contention strict" {
+test "empty session creation survives latest cache contention" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     var ctx = try initTempStore(alloc, &tmp);
     defer ctx.deinit(alloc);
-    var state = try testDurableState(alloc, "strict-creation-cache-lock", ctx.workspace);
+    var state = try testDurableState(alloc, "contended-empty-session", ctx.workspace);
     defer state.deinit(alloc);
 
     var sessions = ctx.store.canonical_root.sessions orelse return error.TestExpectedEqual;
@@ -8121,19 +8121,56 @@ test "session creation keeps latest cache contention strict" {
         latest_sessions_lock_file,
         2000,
     );
-    defer latest_lock.release();
+    var latest_lock_held = true;
+    defer if (latest_lock_held) latest_lock.release();
+
+    var loaded = try ctx.store.startWritableSessionWithOptions(
+        alloc,
+        state,
+        .{ .commit_lock_deadline_ms = 0 },
+    );
+    var loaded_open = true;
+    defer if (loaded_open) loaded.deinit(alloc);
+    if (!loaded.state_replacement_pending) return error.ExpectedDeferredCreation;
+    if (loaded.state.history.len != 0) return error.ExpectedEmptyCreatedSession;
+    var readable = try ctx.store.loadReadOnly(alloc, state.id);
+    defer readable.deinit(alloc);
+    if (readable.history.len != 0) return error.ExpectedReadableEmptySession;
     try std.testing.expectError(
-        error.SessionCommitBoundaryUnavailable,
-        ctx.store.startWritableSessionWithOptions(
-            alloc,
-            state,
-            .{ .commit_lock_deadline_ms = 0 },
-        ),
+        error.InvalidSessionIndex,
+        readLatestPointer(ctx.store, alloc, ctx.workspace),
     );
     try std.testing.expectError(
-        error.SessionNotFound,
-        ctx.store.openSessionDir(state.id),
+        error.InvalidSessionIndex,
+        readSessionIndex(alloc, &sessions),
     );
+    var initial_token = (try summary_codec.readDeferredCacheToken(
+        alloc,
+        &sessions,
+        state.id,
+    )) orelse return error.TestExpectedEqual;
+    if (!std.meta.eql(loaded.position, initial_token.position)) return error.ExpectedInitialDeferredPosition;
+    initial_token.deinit(alloc);
+
+    const committed = try loaded.appendEvent(
+        alloc,
+        .{ .preferences_changed = .{ .fast_mode = true } },
+        20,
+        .retry_expected_tail,
+        .{ .commit_lock_deadline_ms = 0 },
+    );
+    var token = (try summary_codec.readDeferredCacheToken(
+        alloc,
+        &sessions,
+        state.id,
+    )) orelse return error.TestExpectedEqual;
+    defer token.deinit(alloc);
+    if (!std.meta.eql(committed, token.position)) return error.ExpectedAdvancedDeferredPosition;
+
+    latest_lock.release();
+    latest_lock_held = false;
+    loaded.deinit(alloc);
+    loaded_open = false;
 }
 
 test "read-only session page replays canonical state for a deferred token" {
