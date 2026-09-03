@@ -39,14 +39,13 @@ const agent = await Promise.race([
   backend: "wasm",
     wasm: await readFile(wasmPath),
     fetch: stalledFetch,
-    env: { AI_GATEWAY_API_KEY: "sdk-test-key" },
+    apiKey: "sdk-test-key",
   }),
   timeout("fx-core initialize"),
 ]);
 
-const session = await agent.createSession();
 const controller = new AbortController();
-const turn = session.prompt("wait forever", { signal: controller.signal });
+const turn = agent.prompt("wait forever", { signal: controller.signal });
 await Promise.race([fetchStarted, timeout("stalled gateway fetch")]);
 controller.abort();
 const result = await Promise.race([turn.result, timeout("cancelled prompt")]);
