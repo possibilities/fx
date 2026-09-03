@@ -964,6 +964,18 @@ const App = struct {
         try AuthAppRuntime.runProviderCommand(self);
     }
 
+    pub fn requestPromptRetryAfterAuth(self: *App) void {
+        InputSubmitRuntime.requestPromptRetryAfterAuth(self);
+    }
+
+    pub fn cancelPromptRetryAfterAuth(self: *App) void {
+        InputSubmitRuntime.cancelPromptRetryAfterAuth(self);
+    }
+
+    pub fn resumePromptAfterAuth(self: *App) !void {
+        try InputSubmitRuntime.resumePromptAfterAuth(self, max_prompt_history);
+    }
+
     pub fn runLoginCommand(self: *App) !void {
         try AuthAppRuntime.runLoginCommand(self);
     }
