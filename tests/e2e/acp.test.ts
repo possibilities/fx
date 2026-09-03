@@ -7761,18 +7761,16 @@ describe("acp: model-independent", () => {
   );
 
   test(
-    "ACP cancellation interrupts terminal subagent waiting and keeps the server usable",
     "ACP selected native tools propagate to canonical subagents",
     async () => {
-      const root = createIsolatedRoot("fx-acp-subagent-cancel-");
-      const childPrompt = "Remain active until the parent ACP prompt is cancelled.";
-      const heldChild = deferred<Response>();
+      const root = createIsolatedRoot("fx-acp-subagent-tools-");
+      const childPrompt = "Inspect the workspace and report back.";
       const gateway = startFakeGateway([
-        fakeGatewayToolCall("acp_cancel_child", "subagent", {
+        fakeGatewayToolCall("acp_child_tools", "subagent", {
           request: { action: "run", task: childPrompt },
         }),
-        () => heldChild.promise,
-        finalText("ACP_SUBAGENT_CANCEL_FOLLOWUP_OK"),
+        finalText("ACP_SUBAGENT_TOOLS_CHILD_OK"),
+        finalText("ACP_SUBAGENT_TOOLS_PARENT_OK"),
       ]);
       try {
         client = await AcpClient.create({
@@ -7805,6 +7803,26 @@ describe("acp: model-independent", () => {
     },
     TIMEOUT,
   );
+
+  test(
+    "ACP cancellation interrupts terminal subagent waiting and keeps the server usable",
+    async () => {
+      const root = createIsolatedRoot("fx-acp-subagent-cancel-");
+      const childPrompt = "Remain active until the parent ACP prompt is cancelled.";
+      const heldChild = deferred<Response>();
+      const gateway = startFakeGateway([
+        fakeGatewayToolCall("acp_cancel_child", "subagent", {
+          request: { action: "run", task: childPrompt },
+        }),
+        () => heldChild.promise,
+        finalText("ACP_SUBAGENT_CANCEL_FOLLOWUP_OK"),
+      ]);
+      try {
+        client = await AcpClient.create({
+          cwd: root.workspace,
+          env: fakeGatewayEnv(root, gateway),
+        });
+        await startCodeSession(client);
 
         const promptId = 6810;
         const cancelId = 6811;
