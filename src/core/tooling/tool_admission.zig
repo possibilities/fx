@@ -1009,8 +1009,15 @@ fn automaticReviewOutcome(
     if (!input.auto_classifier.enabled()) {
         return reviewerUnavailableOutcome(call, .reviewer_unconfigured);
     }
-    if (input.permission_review_turn == null) {
+    const review_turn = input.permission_review_turn orelse
         return reviewerUnavailableOutcome(call, .invalid_context);
+    if (!review_turn.review_attempt_available) {
+        debug_trace.logf(
+            "permission",
+            "event=auto_review_budget_exhausted tool_name={s} call_id={s} execution_started=false",
+            .{ call.name, call.id },
+        );
+        return reviewerUnavailableOutcome(call, .turn_review_budget_exhausted);
     }
 
     const request = try reviewRequestForCall(
@@ -4058,11 +4065,11 @@ test "missing contextual review authority maps to unavailable without reviewer t
         ) anyerror!permission_auto_classifier.ParseOutcome {
             const self: *@This() = @ptrCast(@alignCast(raw_ctx));
             self.review_calls += 1;
-            return permission_auto_classifier.Reviewer.withTransport(.{
+            return permission_auto_classifier.Reviewer.withTransportModel(.{
                 .context = raw_ctx,
                 .send_fn = send,
                 .build_fn = build,
-            }, null, 1000).review(alloc, request);
+            }, null, 1000, "test/reviewer").review(alloc, request);
         }
     };
 
@@ -5046,6 +5053,61 @@ test "invalid automatic review returns a recoverable denial without a prompter" 
     try std.testing.expectEqual(types.ToolPermissionDenialReason.review_unavailable, outcome.denial_reason.?);
     try std.testing.expect(outcome.execution_authority == null);
     try std.testing.expect(outcome.auto_review_result == null);
+}
+
+test "exhausted review transport preserves deterministic auto lanes" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var worker: WorkerRuntime = .{};
+    defer worker.deinit(std.testing.allocator);
+    var fake = FakeAutoClassifier{};
+    var input = testInputWithClassifier(
+        &worker,
+        permission_auto_classifier.Classifier.withOverride(
+            @ptrCast(&fake),
+            FakeAutoClassifier.classify,
+        ),
+    );
+    input.permission_review_turn.?.review_attempt_available = false;
+
+    const safe = try requestPermissionOutcome(
+        input,
+        arena_state.allocator(),
+        .{
+            .id = "safe-after-budget",
+            .name = "shell",
+            .arguments_json = "{\"action\":\"run\",\"command\":\"git status --short --branch\"}",
+        },
+        .auto,
+        &.{},
+    );
+    try std.testing.expectEqual(ToolPermissionDecision.once, safe.decision);
+    try std.testing.expectEqual(
+        command_admission.ShellAuthorizationSource.auto_mode,
+        safe.execution_authority.?.run_command.shell_allowed.source,
+    );
+
+    const unresolved = try requestPermissionOutcome(
+        input,
+        arena_state.allocator(),
+        .{
+            .id = "unresolved-after-budget",
+            .name = "shell",
+            .arguments_json = "{\"action\":\"run\",\"command\":\"touch unresolved.txt\"}",
+        },
+        .auto,
+        &.{},
+    );
+    try std.testing.expectEqual(ToolPermissionDecision.deny, unresolved.decision);
+    try std.testing.expectEqual(
+        types.ToolPermissionDenialReason.review_unavailable,
+        unresolved.denial_reason.?,
+    );
+    try std.testing.expectEqual(
+        permission_auto_classifier.InvalidReason.turn_review_budget_exhausted,
+        unresolved.auto_review_failure.?,
+    );
+    try std.testing.expectEqual(@as(usize, 0), fake.calls);
 }
 
 test "configured command authority skips automatic review" {
