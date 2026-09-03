@@ -42,7 +42,6 @@ const skill_runtime = @import("../skills/skill_runtime.zig");
 const file_index = @import("../workspace/file_index.zig");
 const command_specs = @import("../slash_commands/command_specs.zig");
 const types = @import("../shared/types.zig");
-const subagent_input = @import("../subagent/input_action.zig");
 const worker_runtime = @import("../agent/worker_runtime.zig");
 const auto_upgrade = @import("../upgrade/auto_upgrade.zig");
 const upgrade_helpers = @import("../upgrade/upgrade_helpers.zig");
@@ -65,7 +64,6 @@ const transcript_runtime = @import("../../ui/transcript/runtime.zig");
 const input_interrupt_runtime = @import("input_interrupt_runtime.zig");
 const input_queue_runtime = @import("input_queue_runtime.zig");
 const input_history_runtime = @import("input_history_runtime.zig");
-const input_subagent_runtime = @import("input_subagent_runtime.zig");
 const input_completion_runtime = @import("input_completion_runtime.zig");
 const input_paste_runtime = @import("input_paste_runtime.zig");
 const input_submit_runtime = @import("input_submit_runtime.zig");
@@ -214,7 +212,6 @@ fn validateExplicitModelSelection(selection: ExplicitModelSelection, capabilitie
 pub fn Runtime(comptime App: type) type {
     return struct {
         const history_rt = input_history_runtime.HistoryRuntime(App);
-        const subagent_rt = input_subagent_runtime.SubagentRuntime(App);
         const completion_rt = input_completion_runtime.CompletionRuntime(App);
         const paste_rt = input_paste_runtime.PasteEditRuntime(App);
         const submit_rt = input_submit_runtime.SubmitRuntime(App);
@@ -238,12 +235,6 @@ pub fn Runtime(comptime App: type) type {
         const navigateModelPicker = completion_rt.navigateModelPicker;
         const cancelApprovalOperation = approval_rt.cancelApprovalOperation;
 
-        fn selectedChildRouteActive(app: *const App) bool {
-            if (comptime @hasDecl(@TypeOf(app.subagents), "childRouteId")) {
-                return app.subagents.childRouteId() != null;
-            }
-            return false;
-        }
         const routeApprovalEscapeAction = approval_rt.routeApprovalEscapeAction;
         const routeQuestionEscapeAction = question_rt.routeQuestionEscapeAction;
         const submitQuestionBatch = question_rt.submitQuestionBatch;
@@ -578,7 +569,6 @@ pub fn Runtime(comptime App: type) type {
                     .now_ms = 0,
                     .paste_active = true,
                     .cancel_pending = false,
-                    .child_route_active = false,
                     .question_freeform_selected = false,
                 };
             }
@@ -586,7 +576,6 @@ pub fn Runtime(comptime App: type) type {
                 .now_ms = io_mod.milliTimestamp(),
                 .paste_active = false,
                 .cancel_pending = app.stream.active,
-                .child_route_active = selectedChildRouteActive(app),
                 .question_freeform_selected = app.question_prompt.isFreeformSelected(),
             };
         }
@@ -604,6 +593,9 @@ pub fn Runtime(comptime App: type) type {
             max_prompt_history: usize,
         ) !?u8 {
             if (!ingress.has_routing_work()) return null;
+            if (terminalIngressCancelsPendingFullTranscriptOpen(ingress)) {
+                _ = full_transcript_rt.cancelPendingOpenForInput(app);
+            }
 
             const file_picker_was_active = app.input_runtime.picker.activeFilePickerQuery(&app.input_runtime.edit_state) != null;
             defer if (comptime runtime_profile.allows(App, .file_index))
@@ -656,7 +648,6 @@ pub fn Runtime(comptime App: type) type {
                             decoded.composer_shortcut,
                             decoded.approval_focused_edit,
                             decoded.question_action,
-                            decoded.subagent_action,
                             decoded.cancel_pending,
                             input_limits.composer_bytes,
                             max_prompt_history,
@@ -727,11 +718,17 @@ pub fn Runtime(comptime App: type) type {
         }
 
         pub fn terminalPasteActive(app: *const App) bool {
-            if (app.input_runtime.paste.active()) return true;
-            if (comptime @hasDecl(@TypeOf(app.subagents), "managerPasteActive")) {
-                return app.subagents.managerPasteActive();
-            }
-            return false;
+            return app.input_runtime.paste.active();
+        }
+
+        fn terminalIngressCancelsPendingFullTranscriptOpen(
+            ingress: input_action.TerminalInputIngress,
+        ) bool {
+            const event = ingress.event orelse return false;
+            return switch (event) {
+                .paste_byte, .raw => true,
+                .action => |decoded| decoded.action != .toggle_full_transcript,
+            };
         }
 
         pub fn routeActivePasteIngressByteWithLimits(
@@ -763,40 +760,6 @@ pub fn Runtime(comptime App: type) type {
                     io_mod.milliTimestamp(),
                 );
             };
-
-            if (comptime @hasDecl(@TypeOf(app.subagents), "settleManagerPasteDeliveryEpoch")) {
-                if (app.subagents.managerPasteActive()) {
-                    const failure_before = if (comptime @hasDecl(
-                        @TypeOf(app.subagents),
-                        "childPresentationView",
-                    ))
-                        if (app.subagents.childPresentationView()) |view|
-                            view.input_failure
-                        else
-                            null
-                    else
-                        null;
-                    const settled = app.subagents.settleManagerPasteDeliveryEpoch(app.alloc);
-                    if (!settled) return;
-                    if (comptime @hasDecl(
-                        @TypeOf(app.subagents),
-                        "invalidateChildConversationProjection",
-                    )) {
-                        const failure_after = if (app.subagents.childPresentationView()) |view|
-                            view.input_failure
-                        else
-                            null;
-                        if (!std.meta.eql(failure_before, failure_after)) {
-                            app.subagents.invalidateChildConversationProjection(app.alloc);
-                        }
-                    }
-                    app_render_runtime.Runtime(App).requestSubagentSurfaceFrame(
-                        app,
-                        .subagent_panel,
-                    );
-                    return;
-                }
-            }
 
             if (app.input_runtime.paste.active()) {
                 const settled = try paste_rt.settlePasteDeliveryEpoch(
@@ -839,38 +802,6 @@ pub fn Runtime(comptime App: type) type {
             app: *App,
             byte: u8,
         ) !bool {
-            if (comptime @hasDecl(@TypeOf(app.subagents), "managerPasteActive")) {
-                if (app.subagents.managerPasteActive()) {
-                    const failure_before = if (comptime @hasDecl(
-                        @TypeOf(app.subagents),
-                        "childPresentationView",
-                    ))
-                        if (app.subagents.childPresentationView()) |view|
-                            view.input_failure
-                        else
-                            null
-                    else
-                        null;
-                    _ = try app.subagents.consumeManagerPasteByte(app.alloc, byte);
-                    if (comptime @hasDecl(
-                        @TypeOf(app.subagents),
-                        "invalidateChildConversationProjection",
-                    )) {
-                        const failure_after = if (app.subagents.childPresentationView()) |view|
-                            view.input_failure
-                        else
-                            null;
-                        if (!std.meta.eql(failure_before, failure_after)) {
-                            app.subagents.invalidateChildConversationProjection(app.alloc);
-                        }
-                    }
-                    app_render_runtime.Runtime(App).requestSubagentSurfaceFrame(
-                        app,
-                        .subagent_panel,
-                    );
-                    return true;
-                }
-            }
             if (app.input_runtime.paste.active()) {
                 try paste_rt.handleActivePasteByte(app, byte);
                 return true;
@@ -880,10 +811,6 @@ pub fn Runtime(comptime App: type) type {
 
         fn projectMcpPromptOwnsInput(app: *App) bool {
             if (comptime !@hasDecl(App, "projectMcpPromptActive")) return false;
-            var subagent_active = false;
-            if (comptime runtime_profile.allows(App, .subagents)) {
-                subagent_active = app.subagents.isViewActive();
-            }
             const menu_active = activeCompactCommandMenu(app) != null or
                 settingsMenuActive(app) or
                 skillsMenuActive(app) or
@@ -898,7 +825,7 @@ pub fn Runtime(comptime App: type) type {
                 .active = app.projectMcpPromptActive(),
                 .question_active = app.question_prompt.isActive(),
                 .approval_active = app.approval_prompt.isActive(),
-                .subagent_active = subagent_active,
+                .subagent_active = false,
                 .menu_active = menu_active,
                 .authentication_active = authentication_active,
             });
@@ -1031,7 +958,6 @@ pub fn Runtime(comptime App: type) type {
             composer_shortcut: ?input_action.ShortcutAction,
             approval_focused_edit: ?approval_decision.DraftAction,
             question_action: ?question_prompt.Action,
-            subagent_action: ?subagent_input.Action,
             was_cancel_pending: bool,
             max_input_len: usize,
             max_prompt_history: usize,
@@ -1075,25 +1001,6 @@ pub fn Runtime(comptime App: type) type {
                         return .done;
                     }
                 }
-                if (comptime @hasDecl(@TypeOf(app.subagents), "beginManagerPaste")) {
-                    if (app.subagents.isViewActive()) {
-                        app.subagents.beginManagerPaste();
-                        app_render_runtime.Runtime(App).requestSubagentSurfaceFrame(
-                            app,
-                            .subagent_panel,
-                        );
-                        return .done;
-                    }
-                } else if (comptime @hasDecl(@TypeOf(app.subagents), "beginChildPaste")) {
-                    if (app.subagents.childRouteId() != null) {
-                        app.subagents.beginChildPaste();
-                        app_render_runtime.Runtime(App).requestSubagentSurfaceFrame(
-                            app,
-                            .subagent_panel,
-                        );
-                        return .done;
-                    }
-                }
                 dismissActiveMenusThenRedraw(app);
                 if (comptime @hasField(App, "queued_prompt_review")) {
                     queue_rt.markVisibleSelectionDirty(app);
@@ -1109,26 +1016,6 @@ pub fn Runtime(comptime App: type) type {
             switch (resolved) {
                 .remapped_byte => |byte| return .{ .remapped_byte = byte },
                 else => {},
-            }
-
-            if (comptime runtime_profile.allows(App, .subagents)) {
-                if (app.subagents.isViewActive()) {
-                    if (approvalOwnsCurrentSurface(app)) {
-                        try approval_rt.routeApprovalEscapeAction(
-                            app,
-                            resolved,
-                            approval_focused_edit,
-                        );
-                    } else {
-                        try subagent_rt.routeSubagentEscapeAction(
-                            app,
-                            resolved,
-                            composer_shortcut,
-                            subagent_action,
-                        );
-                    }
-                    return .done;
-                }
             }
 
             if (app.question_prompt.isActive()) {
@@ -1310,16 +1197,6 @@ pub fn Runtime(comptime App: type) type {
                 _ = try routeUpgradeShortcut(app, byte);
                 return true;
             }
-            // A presented child approval is resolvable from the main chat or
-            // the manager, so only that exact modal may delegate Ctrl-X.
-            if ((comptime runtime_profile.allows(App, .subagents)) and
-                app.approval_prompt.isActive() and
-                byte == ctrl_x_manager_byte and
-                presentedSubagentApproval(app))
-            {
-                try subagent_rt.toggleSubagentView(app);
-                return true;
-            }
             if (app.question_prompt.isActive()) {
                 if (byte >= 0x80) {
                     if (app.question_prompt.isFreeformSelected()) {
@@ -1448,51 +1325,16 @@ pub fn Runtime(comptime App: type) type {
                 }
                 return true;
             }
-            if (comptime runtime_profile.allows(App, .subagents)) {
-                if (app.subagents.isViewActive()) {
-                    try subagent_rt.handleSubagentRawInput(app, raw);
-                    return true;
-                }
-            }
             return false;
         }
 
         fn presentedSubagentApproval(app: *const App) bool {
-            if (comptime !@hasField(App, "subagents")) return false;
-            if (comptime !@hasDecl(@TypeOf(app.subagents), "mainApprovalPresented")) {
-                return false;
-            }
-            return app.subagents.mainApprovalPresented();
+            _ = app;
+            return false;
         }
 
         fn approvalOwnsCurrentSurface(app: *const App) bool {
-            if (!app.approval_prompt.isActive()) return false;
-            if (!app.subagents.isViewActive()) return true;
-            const request = app.approval_prompt.request orelse return false;
-            if (comptime !@hasDecl(@TypeOf(app.subagents), "childRouteId") or
-                !@hasDecl(@TypeOf(app.subagents), "mainApprovalBinding"))
-            {
-                return true;
-            }
-            const committed = if (comptime @hasField(App, "approval_screen"))
-                if (app.approval_screen.screen_commit) |commit|
-                    commit.request_id == request.id
-                else
-                    false
-            else
-                false;
-            var maybe_binding = app.subagents.mainApprovalBinding(request.id);
-            if (maybe_binding == null and committed) {
-                if (comptime @hasDecl(@TypeOf(app.subagents), "mainApprovalCardBinding")) {
-                    maybe_binding = app.subagents.mainApprovalCardBinding(request.id);
-                }
-            }
-            const binding = maybe_binding orelse return false;
-            // The current card remains resolvable while its presented flag and
-            // selected child route catch up with the committed approval screen.
-            if (committed) return true;
-            const child_id = app.subagents.childRouteId() orelse return false;
-            return std.mem.eql(u8, binding.child_id, child_id);
+            return app.approval_prompt.isActive();
         }
 
         fn handleTextByte(app: *App, owner: text_scalar.Owner, byte: u8, max_input_len: usize) !void {
@@ -1650,10 +1492,7 @@ pub fn Runtime(comptime App: type) type {
                     try image_commands.Commands(App).attachClipboard(app);
                 },
                 24 => {
-                    if (settingsMenuActive(app) or helpMenuActive(app) or skillsMenuActive(app) or modelMenuActive(app) or sessionMenuActive(app)) return;
-                    if (comptime runtime_profile.allows(App, .subagents)) {
-                        try subagent_rt.toggleSubagentView(app);
-                    }
+                    return;
                 },
                 '\r' => {
                     if (try submitSettingsMenuSelection(app)) return;
@@ -1713,11 +1552,12 @@ pub fn Runtime(comptime App: type) type {
                             selection.start
                         else
                             app.input_runtime.edit_state.cursor;
-                        if (byte == '$' and insertion_start == 0 and !helpMenuActive(app) and !commandSkillsMenuActive(app) and !modelMenuActive(app)) {
+                        if (byte == '$' and !helpMenuActive(app) and !commandSkillsMenuActive(app) and !modelMenuActive(app)) {
                             if ((try insertComposerSliceBounded(app, &.{byte}, max_input_len, false)) == .limit_exceeded) {
                                 try input_limit_feedback.report(App, app, .composer, 1);
                                 return;
                             }
+                            app.input_runtime.picker.resetInlinePickerEpisode();
                             if (comptime @hasField(App, "skills")) {
                                 app.skills.openMenuWithQuery(.dollar, .{ .start = insertion_start, .end = insertion_start + 1 }, "");
                             }
@@ -1909,7 +1749,7 @@ pub fn Runtime(comptime App: type) type {
 
         fn skillsMenuActive(app: *App) bool {
             if (comptime !@hasField(App, "skills")) return false;
-            return app.skills.menu.active;
+            return app.skills.menuVisible();
         }
 
         fn modelMenuActive(app: *App) bool {
@@ -2914,8 +2754,10 @@ pub fn Runtime(comptime App: type) type {
             if (comptime !@hasField(App, "skills")) return;
             if (!app.skills.menu.active) return;
             if (!app.skills.menu.origin.isMention()) {
-                app.skills.menu.setQuery(app.input_runtime.edit_state.input.items);
-                app.skills.menu.clamp(app.skills.items);
+                app.skills.setMenuQuery(
+                    app.alloc,
+                    app.input_runtime.edit_state.input.items,
+                );
                 return;
             }
             const target = app.skills.menu.target orelse return;
@@ -2926,8 +2768,7 @@ pub fn Runtime(comptime App: type) type {
             }
             const end = skillTokenEnd(items, target.start + 1);
             app.skills.menu.target = .{ .start = target.start, .end = end };
-            app.skills.menu.setQuery(items[target.start + 1 .. end]);
-            app.skills.menu.clamp(app.skills.items);
+            app.skills.setMenuQuery(app.alloc, items[target.start + 1 .. end]);
         }
 
         fn syncModelMenu(app: *App) void {
@@ -2954,7 +2795,7 @@ pub fn Runtime(comptime App: type) type {
 
         fn cycleSkillsMenuSource(app: *App, delta: i32) bool {
             if (comptime !@hasField(App, "skills")) return false;
-            if (!app.skills.menu.active) return false;
+            if (!app.skills.menuVisible()) return false;
             return app.skills.moveMenuSourceFilter(delta);
         }
 
@@ -3045,24 +2886,6 @@ pub fn Runtime(comptime App: type) type {
 
         fn resolveEscape(app: *App, was_cancel_pending: bool, now: i64) !void {
             if (try full_transcript_rt.routeAction(app, .escape)) return;
-            if (comptime runtime_profile.allows(App, .subagents)) {
-                if (app.subagents.isViewActive()) {
-                    _ = disarmEscapeClear(app);
-                    if (approvalOwnsCurrentSurface(app)) {
-                        if (was_cancel_pending) {
-                            try approval_rt.cancelApprovalOperation(app);
-                        }
-                        return;
-                    }
-                    try subagent_rt.routeSubagentEscapeAction(
-                        app,
-                        .escape,
-                        null,
-                        .escape,
-                    );
-                    return;
-                }
-            }
             if (was_cancel_pending) {
                 if (app.question_prompt.isActive()) {
                     // Freeform answers mirror the composer's Esc contract:
@@ -3117,18 +2940,6 @@ pub fn Runtime(comptime App: type) type {
                 _ = disarmEscapeClear(app);
                 return;
             }
-            if (comptime runtime_profile.allows(App, .subagents)) {
-                if (app.subagents.isViewActive()) {
-                    _ = disarmEscapeClear(app);
-                    try subagent_rt.routeSubagentEscapeAction(
-                        app,
-                        .escape,
-                        null,
-                        .escape,
-                    );
-                    return;
-                }
-            }
             if (cancelCompactCommandMenu(app) or cancelMcpMenu(app) or cancelSettingsMenu(app) or cancelHelpMenu(app) or cancelModelMenu(app) or cancelSkillsMenu(app) or cancelSessionMenu(app)) {
                 _ = disarmEscapeClear(app);
                 app.shell.render_requests.request(.footer);
@@ -3174,9 +2985,11 @@ pub fn Runtime(comptime App: type) type {
 
         fn cancelSkillsMenu(app: *App) bool {
             if (comptime !@hasField(App, "skills")) return false;
-            if (!app.skills.menu.active) return false;
-            const clear_query = !app.skills.menu.origin.isMention();
+            if (!app.skills.menuVisible()) return false;
+            const mention = app.skills.menu.origin.isMention();
+            const clear_query = !mention;
             app.skills.closeMenu();
+            if (mention) app.input_runtime.picker.dismissInlinePicker(.skill);
             if (clear_query) {
                 app.input_runtime.inputResetState().clearCurrent(app.alloc);
                 paste_blocks.clearBlocks(app.alloc, &app.input_runtime.entities.pasted_blocks);
@@ -3455,14 +3268,6 @@ const FakeApprovalCancelApp = struct {
     }
 };
 
-const RoutingSelectedSubagent = struct {
-    id: u64,
-    label: []const u8,
-    status: @import("../../ui/subagent/runtime.zig").Status,
-    tool_calls: usize,
-    current_activity: ?[]const u8,
-};
-
 const RoutingSubagents = struct {
     active: bool = false,
     main_approval_presented: bool = false,
@@ -3486,50 +3291,12 @@ const RoutingSubagents = struct {
         return self.main_approval_presented;
     }
 
-    pub fn selectedInfo(_: *const RoutingSubagents) ?RoutingSelectedSubagent {
-        return null;
-    }
-
     pub fn count(_: *const RoutingSubagents) usize {
         return 0;
     }
 
     pub fn panelText(_: *RoutingSubagents, alloc: std.mem.Allocator, _: u16, _: u16, _: transcript_runtime.Styles) ![]u8 {
         return alloc.dupe(u8, "");
-    }
-
-    pub fn handleKey(self: *RoutingSubagents, _: std.mem.Allocator, byte: u8) !subagent_input.Command {
-        self.handled_keys += 1;
-        self.handled_raw_keys += 1;
-        self.last_handled_key = byte;
-        return .none;
-    }
-
-    pub fn handleAction(self: *RoutingSubagents, _: std.mem.Allocator, action: subagent_input.Action) !subagent_input.Command {
-        self.handled_keys += 1;
-        self.handled_actions += 1;
-        self.last_handled_key = switch (action) {
-            .escape => 0x1b,
-            .up, .left => 25,
-            .down, .right => 9,
-            else => null,
-        };
-        return .none;
-    }
-
-    pub fn handleKeyWithMainApproval(self: *RoutingSubagents, alloc: std.mem.Allocator, byte: u8, main_approval_id: ?u64) !subagent_input.Command {
-        self.last_main_approval_id = main_approval_id;
-        return self.handleKey(alloc, byte);
-    }
-
-    pub fn handleActionWithMainApproval(self: *RoutingSubagents, alloc: std.mem.Allocator, action: subagent_input.Action, main_approval_id: ?u64) !subagent_input.Command {
-        self.last_main_approval_id = main_approval_id;
-        return self.handleAction(alloc, action);
-    }
-
-    pub fn toggleView(self: *RoutingSubagents) @import("../../ui/subagent/controller.zig").ToggleResult {
-        self.toggle_view_calls += 1;
-        return .changed;
     }
 
     pub fn managerPasteActive(self: *const RoutingSubagents) bool {
@@ -4746,6 +4513,20 @@ test "app_input_runtime Escape dismisses visible slash completions without armin
     try std.testing.expect(app.shell.render_requests.hasReason(.footer));
 }
 
+test "app_input_runtime Escape leaves unmatched slash input with the composer" {
+    const alloc = std.testing.allocator;
+    var app = try RoutingFakeApp.init(alloc);
+    defer app.deinit();
+    try app.input_runtime.textReplacementState().replace(alloc, "/hezzzzz");
+
+    try Runtime(RoutingFakeApp).resolveEscape(&app, false, 1);
+
+    try std.testing.expectEqualStrings("/hezzzzz", app.input_runtime.edit_state.input.items);
+    try std.testing.expect(!app.input_runtime.picker.isInlinePickerDismissed(.slash));
+    try std.testing.expectEqual(@as(?i64, 1), app.input_runtime.gestures.escapeClearArmedAt());
+    try std.testing.expect(app.shell.render_requests.hasReason(.footer));
+}
+
 test "app_input_runtime Escape dismisses slash matches with wrapped input" {
     const alloc = std.testing.allocator;
 
@@ -5534,9 +5315,19 @@ test "app_input_runtime dollar opens skills menu and Escape preserves raw text" 
     try Runtime(RoutingFakeApp).resolveEscape(&app, false, 102);
     try std.testing.expect(!app.skills.menu.active);
     try std.testing.expectEqualStrings("$s", app.input_runtime.edit_state.input.items);
+    try std.testing.expect(app.input_runtime.picker.isInlinePickerDismissed(.skill));
+
+    try Runtime(RoutingFakeApp).handleByte(&app, 'c', 4096, 103);
+    try std.testing.expect(!app.skills.menu.active);
+    try std.testing.expect(input_completion_runtime.CompletionRuntime(RoutingFakeApp).visibleInlineSkillCompletion(&app) == null);
+
+    try Runtime(RoutingFakeApp).handleByte(&app, '$', 4096, 104);
+    try std.testing.expect(app.skills.menu.active);
+    try std.testing.expect(!app.input_runtime.picker.isInlinePickerDismissed(.skill));
+    try std.testing.expectEqual(@as(usize, "$sc".len), app.skills.menu.target.?.start);
 }
 
-test "app_input_runtime non-leading dollar stays in the composer" {
+test "app_input_runtime typed dollar opens an anchored skills menu at every composer position" {
     const alloc = std.testing.allocator;
     const skills = [_]skill_runtime.Skill{.{
         .name = "scale",
@@ -5544,7 +5335,7 @@ test "app_input_runtime non-leading dollar stays in the composer" {
         .path = "/tmp/scale/SKILL.md",
         .source = .global_fx,
     }};
-    const inputs = [_][]const u8{ " $", "hello $" };
+    const inputs = [_][]const u8{ " $", "hello $", "price$" };
 
     for (inputs) |input| {
         var app = try RoutingFakeApp.init(alloc);
@@ -5554,7 +5345,11 @@ test "app_input_runtime non-leading dollar stays in the composer" {
         try feedRoutingBytes(&app, input);
 
         try std.testing.expectEqualStrings(input, app.input_runtime.edit_state.input.items);
-        try std.testing.expect(!app.skills.menu.active);
+        try std.testing.expect(app.skills.menu.active);
+        try std.testing.expectEqual(skill_runtime.SkillMenuOrigin.dollar, app.skills.menu.origin);
+        try std.testing.expectEqual(input.len - 1, app.skills.menu.target.?.start);
+        try std.testing.expectEqual(input.len, app.skills.menu.target.?.end);
+        try std.testing.expectEqualStrings("", app.skills.menu.query());
     }
 }
 
@@ -5571,7 +5366,7 @@ test "app_input_runtime Tab and Right Arrow accept visible inline skill completi
         var app = try RoutingFakeApp.init(alloc);
         defer app.deinit();
         app.skills.items = @constCast(&skills);
-        try feedRoutingBytes(&app, "explain $man");
+        try app.input_runtime.textReplacementState().replace(alloc, "explain $man");
 
         const completion = input_completion_runtime.CompletionRuntime(RoutingFakeApp).visibleInlineSkillCompletion(&app).?;
         try std.testing.expectEqualStrings("aged-menu", completion.suffix);
@@ -5636,7 +5431,7 @@ test "app_input_runtime Right Arrow collapses selection before inline completion
     var app = try RoutingFakeApp.init(alloc);
     defer app.deinit();
     app.skills.items = @constCast(&skills);
-    try feedRoutingBytes(&app, "explain $man");
+    try app.input_runtime.textReplacementState().replace(alloc, "explain $man");
     const end = app.input_runtime.edit_state.input.items.len;
     _ = app.input_runtime.selectionState().begin(end - 1);
     _ = app.input_runtime.selectionState().extend(end);
@@ -5675,7 +5470,6 @@ test "app_input_runtime ctrl-l preserves an active inline picker" {
         &app,
         .{ .composer_shortcut = .redraw },
         .redraw,
-        null,
         null,
         null,
         false,
@@ -5727,7 +5521,7 @@ test "app_input_runtime inline skill acceptance preserves input on limit rejecti
         .source = .global_fx,
     }};
     app.skills.items = @constCast(&skills);
-    try feedRoutingBytes(&app, "explain $man");
+    try app.input_runtime.textReplacementState().replace(alloc, "explain $man");
     const original_len = app.input_runtime.edit_state.input.items.len;
 
     try Runtime(RoutingFakeApp).handleByte(&app, '\t', original_len, 100);
@@ -5753,7 +5547,8 @@ test "app_input_runtime no-match dollar text keeps spaces and submits raw" {
     app.skills.items = @constCast(&skills);
 
     try feedRoutingBytes(&app, "Explain echo $HOME");
-    try std.testing.expect(!app.skills.menu.active);
+    try std.testing.expect(app.skills.menu.active);
+    try std.testing.expect(!app.skills.menuVisible());
     try std.testing.expectEqualStrings("Explain echo $HOME", app.input_runtime.edit_state.input.items);
 
     try feedRoutingBytes(&app, " please");
@@ -5883,16 +5678,43 @@ test "app_input_runtime zero-match dollar query recovers matches on backspace" {
 
     try feedRoutingBytes(&app, "$mzz");
     try std.testing.expect(app.skills.menu.active);
+    try std.testing.expect(!app.skills.menuVisible());
     try std.testing.expect(app.skills.selectedMenuSkill() == null);
 
     try feedRoutingBytes(&app, "\x7f\x7f");
     try std.testing.expect(app.skills.menu.active);
+    try std.testing.expect(app.skills.menuVisible());
     try std.testing.expectEqualStrings("m", app.skills.menu.query());
     try std.testing.expect(app.skills.selectedMenuSkill() != null);
 
     try feedRoutingBytes(&app, "\r");
     try std.testing.expectEqual(@as(usize, 1), app.input_runtime.entities.skill_tokens.items.len);
     try std.testing.expectEqualStrings("managed", app.input_runtime.entities.skill_tokens.items[0].name);
+}
+
+test "app_input_runtime hidden zero-match dollar menu yields navigation to the composer" {
+    const alloc = std.testing.allocator;
+    var app = try RoutingFakeApp.init(alloc);
+    defer app.deinit();
+    const skills = [_]skill_runtime.Skill{.{
+        .name = "managed",
+        .description = "",
+        .path = "/tmp/managed/SKILL.md",
+        .source = .global_fx,
+    }};
+    app.skills.items = @constCast(&skills);
+
+    try feedRoutingBytes(&app, "$missing");
+    try std.testing.expect(app.skills.menu.active);
+    try std.testing.expect(!app.skills.menuVisible());
+    try std.testing.expectEqual("$missing".len, app.input_runtime.edit_state.cursor);
+
+    try Runtime(RoutingFakeApp).routeModifiedHistory(&app, .up, 1);
+
+    try std.testing.expectEqualStrings("$missing", app.input_runtime.edit_state.input.items);
+    try std.testing.expectEqual(@as(usize, 0), app.input_runtime.edit_state.cursor);
+    try std.testing.expect(app.skills.menu.active);
+    try std.testing.expect(!app.skills.menuVisible());
 }
 
 test "app_input_runtime Escape cancels an idle session picker before empty-composer handling" {
@@ -6185,7 +6007,7 @@ test "app_input_runtime approval escape arrows move choices directly" {
     const alloc = std.testing.allocator;
     var app = try RoutingFakeApp.init(alloc);
     defer app.deinit();
-    try std.testing.expect(try app.approval_prompt.syncRequest(alloc, .{ .label = "terminal.exec npm test" }));
+    try std.testing.expect(try app.approval_prompt.syncRequest(alloc, .{ .label = "shell.run npm test" }));
 
     app.approval_prompt.decision.choice_index = 1;
     try Runtime(RoutingFakeApp).routeApprovalEscapeAction(&app, .history_up, null);
@@ -6218,7 +6040,7 @@ test "app_input_runtime approval amendment arrows edit the selected draft" {
     var app = try RoutingFakeApp.init(alloc);
     defer app.deinit();
     try std.testing.expect(try app.approval_prompt.syncRequest(alloc, .{
-        .label = "terminal.exec npm test",
+        .label = "shell.run npm test",
     }));
     try Runtime(RoutingFakeApp).handleByte(&app, '\t', 4096, 100);
     try Runtime(RoutingFakeApp).handleByte(&app, 'a', 4096, 100);
@@ -6238,7 +6060,7 @@ test "app_input_runtime routes approval amendment home end delete and word movem
     var app = try RoutingFakeApp.init(alloc);
     defer app.deinit();
     try std.testing.expect(try app.approval_prompt.syncRequest(alloc, .{
-        .label = "terminal.exec npm test",
+        .label = "shell.run npm test",
     }));
     try Runtime(RoutingFakeApp).handleByte(&app, '\t', 4096, 100);
     for ("alpha beta") |byte| try Runtime(RoutingFakeApp).handleByte(&app, byte, 4096, 100);
@@ -6260,7 +6082,7 @@ test "app_input_runtime routes focused editor aliases into approval amendment on
     try app.input_runtime.edit_state.input.appendSlice(alloc, "hidden composer");
     app.input_runtime.edit_state.cursor = app.input_runtime.edit_state.input.items.len;
     try std.testing.expect(try app.approval_prompt.syncRequest(alloc, .{
-        .label = "terminal.exec npm test",
+        .label = "shell.run npm test",
     }));
 
     try Runtime(RoutingFakeApp).handleByte(&app, '\t', 4096, 100);
@@ -6516,7 +6338,7 @@ test "active stream Enter commits a complete model choice for the next turn" {
     try std.testing.expectEqualStrings(model, app.last_preference_model.items);
     try std.testing.expectEqual(types.ReasoningEffort.auto, app.effort);
     try std.testing.expectEqual(types.ReasoningEffort.auto, app.last_preference_effort.?);
-    try std.testing.expect(app.last_preference_fast_mode == null);
+    try std.testing.expectEqual(false, app.last_preference_fast_mode.?);
     try std.testing.expectEqualStrings("", app.input_runtime.edit_state.input.items);
     try std.testing.expectEqual(@as(usize, 0), app.submitted_prompt_count);
     try std.testing.expectEqualStrings(
@@ -7396,7 +7218,7 @@ test "app_input_runtime model picker commits a model without options directly" {
     try std.testing.expectEqual(@as(usize, 1), app.preference_commit_count);
     try std.testing.expectEqualStrings("openai/gpt-4o", app.selected_model.items);
     try std.testing.expect(app.last_preference_effort == null);
-    try std.testing.expect(app.last_preference_fast_mode == null);
+    try std.testing.expectEqual(false, app.last_preference_fast_mode.?);
     try std.testing.expectEqualStrings("", app.input_runtime.edit_state.input.items);
 }
 
@@ -7423,7 +7245,7 @@ test "app_input_runtime model picker skips effort stage for reasoning model with
     try std.testing.expectEqual(ModelPickerStage.model, app.input_runtime.picker.model_picker_stage);
     try std.testing.expect(!app.input_runtime.picker.hasPendingModelPickerSelection());
     try std.testing.expect(app.last_preference_effort == null);
-    try std.testing.expect(app.last_preference_fast_mode == null);
+    try std.testing.expectEqual(false, app.last_preference_fast_mode.?);
     try std.testing.expectEqualStrings("", app.input_runtime.edit_state.input.items);
 }
 
@@ -7455,7 +7277,7 @@ test "app_input_runtime model picker exposes opaque Gateway reasoning effort" {
     try std.testing.expectEqual(types.ReasoningEffort.literal("future-tier"), app.effort);
     try std.testing.expect(!app.fast_mode);
     try std.testing.expectEqual(types.ReasoningEffort.literal("future-tier"), app.last_preference_effort.?);
-    try std.testing.expect(app.last_preference_fast_mode == null);
+    try std.testing.expectEqual(false, app.last_preference_fast_mode.?);
     try std.testing.expectEqualStrings("", app.input_runtime.edit_state.input.items);
 }
 
@@ -7715,7 +7537,7 @@ test "app_input_runtime approval modal ignores non-modal text" {
     const alloc = std.testing.allocator;
     var app = try RoutingFakeApp.init(alloc);
     defer app.deinit();
-    try std.testing.expect(try app.approval_prompt.syncRequest(alloc, .{ .label = "terminal.exec npm test" }));
+    try std.testing.expect(try app.approval_prompt.syncRequest(alloc, .{ .label = "shell.run npm test" }));
 
     try feedRoutingBytes(&app, "queue approval sentinel text");
 
@@ -7754,7 +7576,7 @@ test "app_input_runtime modal controls win before ordinary modal input" {
         var app = try RoutingFakeApp.init(alloc);
         defer app.deinit();
         try std.testing.expect(try app.approval_prompt.syncRequest(alloc, .{
-            .label = "terminal.exec npm test",
+            .label = "shell.run npm test",
             .amendment_allowed = true,
         }));
 
@@ -7770,7 +7592,7 @@ test "app_input_runtime modal controls win before ordinary modal input" {
     {
         var app = try RoutingFakeApp.init(alloc);
         defer app.deinit();
-        try std.testing.expect(try app.approval_prompt.syncRequest(alloc, .{ .label = "terminal.exec npm test" }));
+        try std.testing.expect(try app.approval_prompt.syncRequest(alloc, .{ .label = "shell.run npm test" }));
 
         try Runtime(RoutingFakeApp).handleByte(&app, '3', 4096, 100);
 
@@ -7789,7 +7611,7 @@ test "app_input_runtime raw CSI-u digits stay isolated from approval selection" 
     for (sequences) |sequence| {
         var app = try RoutingFakeApp.init(alloc);
         defer app.deinit();
-        try std.testing.expect(try app.approval_prompt.syncRequest(alloc, .{ .label = "terminal.exec npm test" }));
+        try std.testing.expect(try app.approval_prompt.syncRequest(alloc, .{ .label = "shell.run npm test" }));
         app.approval_prompt.decision.choice_index = 2;
 
         try feedRoutingBytes(&app, sequence);
@@ -7906,7 +7728,7 @@ test "app_input_runtime decoded kitty Escape follows the raw Escape policy" {
         var app = try RoutingFakeApp.init(alloc);
         defer app.deinit();
         app.stream.active = true;
-        try std.testing.expect(try app.approval_prompt.syncRequest(alloc, .{ .label = "terminal.exec npm test" }));
+        try std.testing.expect(try app.approval_prompt.syncRequest(alloc, .{ .label = "shell.run npm test" }));
 
         try feedRoutingBytes(&app, "\x1b[27u");
 
@@ -7938,6 +7760,35 @@ test "app_input_runtime decoded kitty Escape follows the raw Escape policy" {
         try feedRoutingBytes(&app, "\x1b[27u");
         try std.testing.expectEqualStrings("", app.input_runtime.edit_state.input.items);
         try std.testing.expect(!app.input_runtime.gestures.escapeClearArmed());
+    }
+}
+
+test "pending full transcript open cancels after complete escape input" {
+    const alloc = std.testing.allocator;
+    const sequences = [_][]const u8{
+        "\x1b[A",
+        "\x1b[B",
+        "\x1b[5~",
+        "\x1b[6~",
+    };
+
+    for (sequences) |sequence| {
+        var app = try RoutingFakeApp.init(alloc);
+        defer app.deinit();
+        _ = try app.shell.appendRawTranscriptEntryClassified(
+            alloc,
+            "pending transcript\n",
+            .unknown_raw,
+        );
+        try std.testing.expect(!app.shell.requestFullTranscriptOpen());
+
+        try feedRoutingBytes(&app, sequence);
+
+        try std.testing.expectEqualStrings(
+            "",
+            app.input_runtime.edit_state.input.items,
+        );
+        try std.testing.expect(!app.shell.cancelPendingFullTranscriptOpen());
     }
 }
 
@@ -8036,7 +7887,7 @@ test "app_input_runtime remapped ctrl+c reaches prompt cancellation" {
     {
         var app = try RoutingFakeApp.init(alloc);
         defer app.deinit();
-        try std.testing.expect(try app.approval_prompt.syncRequest(alloc, .{ .label = "terminal.exec npm test" }));
+        try std.testing.expect(try app.approval_prompt.syncRequest(alloc, .{ .label = "shell.run npm test" }));
 
         try feedRoutingBytes(&app, "\x1b[99;5u");
 
@@ -8155,14 +8006,15 @@ test "app_input_runtime immediate Ctrl-U follows slash completion Escape" {
     try std.testing.expectEqual(@as(u8, 0), app.terminal_input_runtime.terminal_action_decoder.stage);
 }
 
-test "app_input_runtime immediate Ctrl-X follows bare Escape" {
+test "app_input_runtime Ctrl-X is inert after bare Escape" {
     const alloc = std.testing.allocator;
     var app = try RoutingFakeApp.init(alloc);
     defer app.deinit();
 
     try feedRoutingBytes(&app, "\x1b\x18");
 
-    try std.testing.expectEqual(@as(usize, 1), app.subagents.toggle_view_calls);
+    try std.testing.expectEqual(@as(usize, 0), app.subagents.toggle_view_calls);
+    try std.testing.expectEqual(@as(usize, 0), app.input_runtime.edit_state.input.items.len);
     try std.testing.expectEqual(@as(u8, 0), app.terminal_input_runtime.terminal_action_decoder.stage);
 }
 
@@ -8246,7 +8098,7 @@ test "app_input_runtime ctrl+c drops an active approval amendment" {
     var app = try RoutingFakeApp.init(alloc);
     defer app.deinit();
     try std.testing.expect(try app.approval_prompt.syncRequest(alloc, .{
-        .label = "terminal.exec npm test",
+        .label = "shell.run npm test",
     }));
 
     try feedRoutingBytes(&app, "\tsummarize the result");
@@ -8463,7 +8315,7 @@ fn activateRoutingDecision(app: *RoutingFakeApp, kind: RoutingDecisionKind) !voi
             try app.question_prompt.syncFrom(app.alloc, &entries);
         },
         .approval => try std.testing.expect(try app.approval_prompt.syncRequest(app.alloc, .{
-            .label = "terminal.exec npm test",
+            .label = "shell.run npm test",
         })),
     }
 }
@@ -8559,6 +8411,38 @@ test "app_input_runtime ctrl+p and ctrl+n navigate prompt history directly" {
 
     try feedRoutingBytes(&app, "\x0e");
     try std.testing.expectEqualStrings("draft", app.input_runtime.edit_state.input.items);
+}
+
+test "app_input_runtime plain arrows keep history ownership across recalled slash commands" {
+    const alloc = std.testing.allocator;
+    var app = try RoutingFakeApp.init(alloc);
+    defer app.deinit();
+    try app.input_runtime.composer_history.installTextEntries(alloc, &.{ "older", "/help" });
+
+    try input_completion_runtime.CompletionRuntime(RoutingFakeApp).navigatePromptHistory(&app, -1);
+    try std.testing.expectEqualStrings("/help", app.input_runtime.edit_state.input.items);
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        input_completion_runtime.CompletionRuntime(RoutingFakeApp).visibleSlashCompletionCount(&app),
+    );
+
+    try feedRoutingBytes(&app, "\x1b[A");
+    try feedRoutingBytes(&app, "\x1b[A");
+    try std.testing.expectEqualStrings("older", app.input_runtime.edit_state.input.items);
+
+    try feedRoutingBytes(&app, "\x1b[B");
+    try std.testing.expectEqualStrings("/help", app.input_runtime.edit_state.input.items);
+    try feedRoutingBytes(&app, "\x7f");
+    try std.testing.expectEqualStrings("/hel", app.input_runtime.edit_state.input.items);
+    try std.testing.expect(
+        input_completion_runtime.CompletionRuntime(RoutingFakeApp).visibleSlashCompletionCount(&app) > 0,
+    );
+
+    app.input_runtime.inputResetState().clearCurrent(alloc);
+    try Runtime(RoutingFakeApp).handleByte(&app, '/', 4096, 100);
+    try std.testing.expect(
+        input_completion_runtime.CompletionRuntime(RoutingFakeApp).visibleSlashCompletionCount(&app) > 0,
+    );
 }
 
 test "app_input_runtime decoded history recall disarms pending Ctrl-C exit" {
@@ -8909,7 +8793,6 @@ test "app_input_runtime active multiline history moves vertically before advanci
         null,
         null,
         null,
-        null,
         false,
         4096,
         100,
@@ -9011,7 +8894,7 @@ test "app_input_runtime decision prompt owns and discards bracketed paste" {
 
     var app = try RoutingFakeApp.init(alloc);
     defer app.deinit();
-    try std.testing.expect(try app.approval_prompt.syncRequest(alloc, .{ .label = "terminal.exec npm test" }));
+    try std.testing.expect(try app.approval_prompt.syncRequest(alloc, .{ .label = "shell.run npm test" }));
 
     const payload = "typing\t\r\n" ++ "\x03" ++ "\x1b[99;5u" ++ "\x1b[A" ++ "\x1b[200~";
     try feedRoutingBytes(&app, "\x1b[200~");
@@ -9072,7 +8955,7 @@ test "app_input_runtime approval amendment accepts bracketed paste" {
     const alloc = std.testing.allocator;
     var app = try RoutingFakeApp.init(alloc);
     defer app.deinit();
-    try std.testing.expect(try app.approval_prompt.syncRequest(alloc, .{ .label = "terminal.exec npm test" }));
+    try std.testing.expect(try app.approval_prompt.syncRequest(alloc, .{ .label = "shell.run npm test" }));
 
     try feedRoutingBytes(&app, "\t");
     try std.testing.expect(app.approval_prompt.isAmending());
@@ -9109,7 +8992,7 @@ test "app_input_runtime approval amendment rejects oversized paste visibly" {
     var app = try RoutingFakeApp.init(alloc);
     defer app.deinit();
     try std.testing.expect(try app.approval_prompt.syncRequest(alloc, .{
-        .label = "terminal.exec npm test",
+        .label = "shell.run npm test",
     }));
     try Runtime(RoutingFakeApp).handleByte(&app, '\t', 2, 100);
 
@@ -9142,7 +9025,7 @@ test "app_input_runtime keeps composer and decision input limits independent" {
 
     try std.testing.expect(try app.approval_prompt.syncRequest(
         alloc,
-        .{ .label = "terminal.exec npm test" },
+        .{ .label = "shell.run npm test" },
     ));
     try Runtime(RoutingFakeApp).handleTerminalByteWithLimits(&app, '\t', limits, 100);
     for ("xyz") |byte| {
@@ -9162,7 +9045,7 @@ test "app_input_runtime approval amendment paste finalization resets state after
     const alloc = std.testing.allocator;
     var app = try RoutingFakeApp.init(alloc);
     defer app.deinit();
-    try std.testing.expect(try app.approval_prompt.syncRequest(alloc, .{ .label = "terminal.exec npm test" }));
+    try std.testing.expect(try app.approval_prompt.syncRequest(alloc, .{ .label = "shell.run npm test" }));
     try feedRoutingBytes(&app, "\t");
     try std.testing.expect(app.approval_prompt.isAmending());
     try app.input_runtime.paste.buffer.ensureTotalCapacity(alloc, 1);
@@ -9235,7 +9118,7 @@ test "app_input_runtime zero-content decision paste logs once" {
 
     var app = try RoutingFakeApp.init(alloc);
     defer app.deinit();
-    try std.testing.expect(try app.approval_prompt.syncRequest(alloc, .{ .label = "terminal.exec npm test" }));
+    try std.testing.expect(try app.approval_prompt.syncRequest(alloc, .{ .label = "shell.run npm test" }));
 
     try feedRoutingBytes(&app, "\x1b[200~\x1b[201~");
     try std.testing.expectEqual(paste_framing.Owner.none, app.input_runtime.paste.owner);
@@ -9251,7 +9134,7 @@ test "app_input_runtime decision paste start clears pending ctrl-c and esc gestu
     const alloc = std.testing.allocator;
     var app = try RoutingFakeApp.init(alloc);
     defer app.deinit();
-    try std.testing.expect(try app.approval_prompt.syncRequest(alloc, .{ .label = "terminal.exec npm test" }));
+    try std.testing.expect(try app.approval_prompt.syncRequest(alloc, .{ .label = "shell.run npm test" }));
     armCtrlCExitForTest(&app.input_runtime, io_mod.milliTimestamp());
     armEscapeClearForTest(&app.input_runtime, io_mod.milliTimestamp());
     app.shell.render_requests.clearReason(.footer);
@@ -9328,7 +9211,7 @@ test "app_input_runtime rejects unsafe suffixes for every root modal paste owner
         var app = try RoutingFakeApp.init(alloc);
         defer app.deinit();
         try std.testing.expect(try app.approval_prompt.syncRequest(alloc, .{
-            .label = "terminal.exec npm test",
+            .label = "shell.run npm test",
         }));
 
         try feedRoutingBytes(&app, "\x1b[200~\x1b[201~1\r");
@@ -9342,7 +9225,7 @@ test "app_input_runtime rejects unsafe suffixes for every root modal paste owner
         var app = try RoutingFakeApp.init(alloc);
         defer app.deinit();
         try std.testing.expect(try app.approval_prompt.syncRequest(alloc, .{
-            .label = "terminal.exec npm test",
+            .label = "shell.run npm test",
         }));
         try feedRoutingBytes(&app, "\tkeep");
 
@@ -9492,7 +9375,7 @@ test "app_input_runtime bounds typed question and approval drafts with visible f
         var app = try RoutingFakeApp.init(alloc);
         defer app.deinit();
         try std.testing.expect(try app.approval_prompt.syncRequest(alloc, .{
-            .label = "terminal.exec npm test",
+            .label = "shell.run npm test",
         }));
         try Runtime(RoutingFakeApp).handleByte(&app, '\t', 2, 100);
 
@@ -9562,7 +9445,7 @@ test "app_input_runtime routes typed utf8 scalars to modal editors" {
     {
         var app = try RoutingFakeApp.init(alloc);
         defer app.deinit();
-        try std.testing.expect(try app.approval_prompt.syncRequest(alloc, .{ .label = "terminal.exec npm test" }));
+        try std.testing.expect(try app.approval_prompt.syncRequest(alloc, .{ .label = "shell.run npm test" }));
         try Runtime(RoutingFakeApp).handleByte(&app, '\t', 4096, 100);
 
         try feedRoutingBytes(&app, "🙂");
@@ -9576,7 +9459,7 @@ test "app_input_runtime question prompt owns paste over an approval amendment" {
     const alloc = std.testing.allocator;
     var app = try RoutingFakeApp.init(alloc);
     defer app.deinit();
-    try std.testing.expect(try app.approval_prompt.syncRequest(alloc, .{ .label = "terminal.exec npm test" }));
+    try std.testing.expect(try app.approval_prompt.syncRequest(alloc, .{ .label = "shell.run npm test" }));
     try feedRoutingBytes(&app, "\tkeep");
     try std.testing.expect(app.approval_prompt.isAmending());
     try std.testing.expectEqualStrings("keep", app.approval_prompt.decision.selectedDraft());
@@ -9606,7 +9489,7 @@ test "app_input_runtime routes input to the innermost active modal" {
     const alloc = std.testing.allocator;
     var app = try RoutingFakeApp.init(alloc);
     defer app.deinit();
-    try std.testing.expect(try app.approval_prompt.syncRequest(alloc, .{ .label = "terminal.exec npm test" }));
+    try std.testing.expect(try app.approval_prompt.syncRequest(alloc, .{ .label = "shell.run npm test" }));
 
     const opts = [_]types.QuestionOption{
         .{ .label = "Alpha", .description = null },
@@ -9616,8 +9499,6 @@ test "app_input_runtime routes input to the innermost active modal" {
         .{ .question = "Continue?", .options = &opts },
     };
     try app.question_prompt.syncFrom(alloc, &entries);
-    app.subagents.active = true;
-
     try Runtime(RoutingFakeApp).handleByte(&app, '\t', 4096, 100);
     try std.testing.expect(app.question_prompt.isActive());
     try std.testing.expect(!app.approval_prompt.isAmending());
@@ -9631,44 +9512,14 @@ test "app_input_runtime routes input to the innermost active modal" {
 
     app.approval_prompt.clear(alloc);
     try Runtime(RoutingFakeApp).handleByte(&app, 'x', 4096, 100);
-    try std.testing.expectEqual(@as(usize, 1), app.subagents.handled_keys);
-    try std.testing.expectEqual(@as(usize, 0), app.input_runtime.edit_state.input.items.len);
-}
-
-test "app_input_runtime delegates only presented child approval ctrl-x" {
-    const alloc = std.testing.allocator;
-    var app = try RoutingFakeApp.init(alloc);
-    defer app.deinit();
-    try std.testing.expect(try app.approval_prompt.syncRequest(
-        alloc,
-        .{ .label = "terminal.exec npm test" },
-    ));
-
-    try Runtime(RoutingFakeApp).handleByte(&app, ctrl_x_manager_byte, 4096, 100);
-    try std.testing.expect(app.approval_prompt.isActive());
-    try std.testing.expectEqual(@as(usize, 0), app.subagents.toggle_view_calls);
-    try std.testing.expectEqual(@as(usize, 0), app.subagents.handled_keys);
-
-    app.subagents.main_approval_presented = true;
-    try Runtime(RoutingFakeApp).handleByte(&app, '3', 4096, 100);
-    try std.testing.expectEqual(ToolPermissionDecision.deny, app.worker.submitted_permission.?);
-    try std.testing.expectEqual(@as(usize, 0), app.subagents.toggle_view_calls);
-    try std.testing.expectEqual(@as(usize, 0), app.subagents.handled_keys);
-
-    try std.testing.expect(try app.approval_prompt.syncRequest(
-        alloc,
-        .{ .label = "terminal.exec cargo test" },
-    ));
-    try Runtime(RoutingFakeApp).handleByte(&app, ctrl_x_manager_byte, 4096, 100);
-    try std.testing.expectEqual(@as(usize, 1), app.subagents.toggle_view_calls);
-    try std.testing.expectEqual(@as(usize, 0), app.subagents.handled_keys);
+    try std.testing.expectEqualStrings("x", app.input_runtime.edit_state.input.items);
 }
 
 test "app_input_runtime active paste shields prompts from escape timeout cancellation" {
     const alloc = std.testing.allocator;
     var app = try RoutingFakeApp.init(alloc);
     defer app.deinit();
-    try std.testing.expect(try app.approval_prompt.syncRequest(alloc, .{ .label = "terminal.exec npm test" }));
+    try std.testing.expect(try app.approval_prompt.syncRequest(alloc, .{ .label = "shell.run npm test" }));
 
     try feedRoutingBytes(&app, "\x1b[200~");
     try std.testing.expectEqual(paste_framing.Owner.decision_prompt, app.input_runtime.paste.owner);
@@ -9730,7 +9581,7 @@ test "app_input_runtime false paste starts leave decision prompt controls usable
     const alloc = std.testing.allocator;
     var app = try RoutingFakeApp.init(alloc);
     defer app.deinit();
-    try std.testing.expect(try app.approval_prompt.syncRequest(alloc, .{ .label = "terminal.exec npm test" }));
+    try std.testing.expect(try app.approval_prompt.syncRequest(alloc, .{ .label = "shell.run npm test" }));
 
     try feedRoutingBytes(&app, "\x1b[0200~");
     try std.testing.expectEqual(paste_framing.Owner.none, app.input_runtime.paste.owner);
@@ -9755,7 +9606,7 @@ test "app_input_runtime false paste starts preserve stale paste and gestures" {
     const alloc = std.testing.allocator;
     var app = try RoutingFakeApp.init(alloc);
     defer app.deinit();
-    try std.testing.expect(try app.approval_prompt.syncRequest(alloc, .{ .label = "terminal.exec npm test" }));
+    try std.testing.expect(try app.approval_prompt.syncRequest(alloc, .{ .label = "shell.run npm test" }));
     app.input_runtime.paste.decision_bytes = 7;
     try app.input_runtime.paste.buffer.appendSlice(alloc, "old");
     armCtrlCExitForTest(&app.input_runtime, 123);
@@ -9778,149 +9629,6 @@ test "app_input_runtime false paste starts preserve stale paste and gestures" {
         app.input_runtime.gestures.escapeClearArmedAt(),
     );
     try std.testing.expect(!app.shell.render_requests.hasReason(.footer));
-}
-
-test "app_input_runtime manager root paste preserves all main composer and session state" {
-    const alloc = std.testing.allocator;
-    var app = try RoutingFakeApp.init(alloc);
-    defer app.deinit();
-    app.subagents.active = true;
-    try app.input_runtime.edit_state.input.appendSlice(alloc, "MAIN");
-    app.input_runtime.edit_state.cursor = 2;
-    try app.input_runtime.composer_history.record(alloc, 100, "history entry", &.{}, &.{}, &.{}, &.{});
-    const pasted_text = try alloc.dupe(u8, "preserved backing");
-    try app.input_runtime.entities.pasted_blocks.append(alloc, .{
-        .id = 7,
-        .text = pasted_text,
-        .line_count = 1,
-    });
-    app.input_runtime.entities.next_paste_id = 8;
-    app.session_persistence.degraded_warning_emitted = true;
-
-    try feedRoutingBytes(&app, "\x1b[0200~");
-    try feedRoutingBytes(&app, "\x1b[200;1~");
-    try std.testing.expectEqual(paste_framing.Owner.none, app.input_runtime.paste.owner);
-    try std.testing.expectEqual(@as(usize, 0), app.subagents.handled_keys);
-    try std.testing.expectEqualStrings("MAIN", app.input_runtime.edit_state.input.items);
-
-    try feedRoutingBytes(&app, "\x1b[200~");
-    try std.testing.expectEqual(paste_framing.Owner.none, app.input_runtime.paste.owner);
-    try std.testing.expect(app.subagents.managerPasteActive());
-    try feedRoutingBytes(&app, "ROOT_PASTE_LEAK" ++ "\x19" ++ "\x1b[A");
-    try std.testing.expectEqual(@as(usize, 0), app.subagents.handled_keys);
-    try feedRoutingBytes(&app, "\x1b[201~");
-
-    try std.testing.expectEqual(paste_framing.Owner.none, app.input_runtime.paste.owner);
-    try std.testing.expect(!app.subagents.managerPasteActive());
-    try std.testing.expectEqualStrings("MAIN", app.input_runtime.edit_state.input.items);
-    try std.testing.expectEqual(@as(usize, 2), app.input_runtime.edit_state.cursor);
-    try std.testing.expectEqual(@as(usize, 1), app.input_runtime.entities.pasted_blocks.items.len);
-    try std.testing.expectEqualStrings("preserved backing", app.input_runtime.entities.pasted_blocks.items[0].text);
-    try std.testing.expectEqual(@as(usize, 8), app.input_runtime.entities.next_paste_id);
-    try std.testing.expectEqual(@as(usize, 1), app.input_runtime.composer_history.count());
-    try std.testing.expectEqualStrings("history entry", app.input_runtime.composer_history.entryText(0).?);
-    try std.testing.expect(app.session_persistence.degraded_warning_emitted);
-    try std.testing.expect(app.subagents.isViewActive());
-}
-
-test "app_input_runtime manager paste pauses and resumes cursor probe at exact boundaries" {
-    const alloc = std.testing.allocator;
-    var app = try RoutingFakeApp.init(alloc);
-    defer app.deinit();
-    app.subagents.active = true;
-    try app.terminal_input_runtime.terminal_cursor_probe.begin(.ansi_tagged, 0);
-
-    for ("\x1b[200~") |byte| {
-        try Runtime(RoutingFakeApp).handleTerminalByte(&app, byte, 4096, 100);
-    }
-    try std.testing.expect(app.subagents.managerPasteActive());
-    switch (app.terminal_input_runtime.terminal_cursor_probe.poll(std.math.maxInt(i64))) {
-        .none => {},
-        else => return error.TestExpectedEqual,
-    }
-
-    for ("\x1b[201;1~") |byte| {
-        try Runtime(RoutingFakeApp).handleTerminalByte(&app, byte, 4096, 100);
-    }
-    try std.testing.expect(app.subagents.managerPasteActive());
-    switch (app.terminal_input_runtime.terminal_cursor_probe.poll(std.math.maxInt(i64))) {
-        .none => {},
-        else => return error.TestExpectedEqual,
-    }
-
-    for ("\x1b[201~") |byte| {
-        try Runtime(RoutingFakeApp).handleTerminalByte(&app, byte, 4096, 100);
-    }
-    try Runtime(RoutingFakeApp).settleTerminalPasteDeliveryEpochWithLimits(
-        &app,
-        paste_framing.InputLimits.single(4096),
-    );
-    try std.testing.expect(!app.subagents.managerPasteActive());
-    switch (app.terminal_input_runtime.terminal_cursor_probe.poll(std.math.maxInt(i64))) {
-        .probe_timed_out => {},
-        else => return error.TestExpectedEqual,
-    }
-}
-
-test "app_input_runtime routes keys to subagent view when no modal is active" {
-    const alloc = std.testing.allocator;
-    var app = try RoutingFakeApp.init(alloc);
-    defer app.deinit();
-    app.subagents.active = true;
-
-    try feedRoutingBytes(&app, "\x1b[A");
-    try std.testing.expectEqual(@as(usize, 1), app.subagents.handled_keys);
-    try std.testing.expectEqual(@as(usize, 1), app.subagents.handled_actions);
-    try std.testing.expectEqual(@as(usize, 0), app.subagents.handled_raw_keys);
-
-    try Runtime(RoutingFakeApp).handleByte(&app, 'x', 4096, 100);
-    try std.testing.expectEqual(@as(usize, 2), app.subagents.handled_keys);
-    try std.testing.expectEqual(@as(usize, 1), app.subagents.handled_actions);
-    try std.testing.expectEqual(@as(usize, 1), app.subagents.handled_raw_keys);
-    try std.testing.expectEqual(@as(usize, 0), app.input_runtime.edit_state.input.items.len);
-}
-
-test "app_input_runtime routes bare and decoded Kitty Escape to the active subagent view" {
-    const alloc = std.testing.allocator;
-    const cases = [_]struct {
-        bytes: []const u8,
-        flush_pending: bool = false,
-    }{
-        .{ .bytes = "\x1b", .flush_pending = true },
-        .{ .bytes = "\x1b[27u" },
-    };
-
-    for (cases) |case| {
-        var app = try RoutingFakeApp.init(alloc);
-        defer app.deinit();
-        app.subagents.active = true;
-
-        try feedRoutingBytes(&app, case.bytes);
-        if (case.flush_pending) {
-            try Runtime(RoutingFakeApp).flushPendingEscape(&app, 0);
-        }
-
-        try std.testing.expectEqual(@as(usize, 1), app.subagents.handled_keys);
-        try std.testing.expectEqual(@as(?u8, 0x1b), app.subagents.last_handled_key);
-        try std.testing.expect(!app.input_runtime.gestures.escapeClearArmed());
-    }
-}
-
-test "app_input_runtime active subagent manager owns stream Escape" {
-    const alloc = std.testing.allocator;
-    var app = try RoutingFakeApp.init(alloc);
-    defer app.deinit();
-    app.stream.active = true;
-    app.subagents.active = true;
-
-    try Runtime(RoutingFakeApp).handleByte(&app, 0x1b, 4096, 100);
-    try Runtime(RoutingFakeApp).flushPendingEscape(&app, 0);
-
-    try std.testing.expect(!app.worker.cancel_requested);
-    try std.testing.expect(app.stream.active);
-    try std.testing.expect(app.subagents.isViewActive());
-    try std.testing.expectEqual(@as(usize, 1), app.subagents.handled_keys);
-    try std.testing.expectEqual(@as(?u8, 0x1b), app.subagents.last_handled_key);
 }
 
 test "app_input_runtime inline scroll actions do not open the transcript viewer" {
@@ -10018,7 +9726,7 @@ test "app_input_runtime ctrl-o toggles full transcript while arrows preserve det
         try feedRoutingBytes(&app, "\x1b[120;5u");
         try std.testing.expectEqualStrings("ab", app.input_runtime.edit_state.input.items);
         try std.testing.expectEqual(@as(usize, 2), app.input_runtime.edit_state.cursor);
-        try std.testing.expectEqual(@as(usize, 2), app.subagents.toggle_view_calls);
+        try std.testing.expectEqual(@as(usize, 0), app.subagents.toggle_view_calls);
         try std.testing.expect(app.terminal.fullTranscriptScreenActive());
 
         app.shell.render_requests.clearReason(.modal);
@@ -10045,14 +9753,14 @@ test "app_input_runtime ctrl-o toggles full transcript while arrows preserve det
         try std.testing.expectEqualStrings("ab", app.input_runtime.edit_state.input.items);
         try std.testing.expectEqual(@as(usize, 2), app.input_runtime.edit_state.cursor);
         try std.testing.expect(!app.input_runtime.gestures.ctrlCExitArmed());
-        try std.testing.expectEqual(@as(usize, 2), app.subagents.toggle_view_calls);
+        try std.testing.expectEqual(@as(usize, 0), app.subagents.toggle_view_calls);
     }
 
     {
         var approval_app = try RoutingFakeApp.init(alloc);
         defer approval_app.deinit();
         approval_app.shell.stdout_file = sink;
-        try std.testing.expect(try approval_app.approval_prompt.syncRequest(alloc, .{ .label = "terminal.exec npm test" }));
+        try std.testing.expect(try approval_app.approval_prompt.syncRequest(alloc, .{ .label = "shell.run npm test" }));
 
         try Runtime(RoutingFakeApp).handleByte(&approval_app, 15, 4096, 100);
         try std.testing.expect(!approval_app.terminal.fullTranscriptScreenActive());
@@ -10096,7 +9804,7 @@ test "app_input_runtime skills catalog owns ctrl-o without opening another scree
     try std.testing.expect(!app.shell.fullTranscriptActive());
 }
 
-test "app_input_runtime skills catalog owns ctrl-x without activating subagents" {
+test "app_input_runtime skills catalog ignores ctrl-x" {
     const alloc = std.testing.allocator;
     var app = try RoutingFakeApp.init(alloc);
     defer app.deinit();
@@ -10122,7 +9830,7 @@ test "app_input_runtime skills catalog owns the all-sessions shortcut" {
     try std.testing.expectEqual(@as(usize, 0), app.notice_body.items.len);
 }
 
-test "app_input_runtime full transcript rejects ctrl-x manager entry without losing ownership" {
+test "app_input_runtime full transcript retains ownership while ctrl-x is inert" {
     const alloc = std.testing.allocator;
     var app = try RoutingFakeApp.init(alloc);
     defer app.deinit();
@@ -10147,7 +9855,7 @@ test "app_input_runtime full transcript rejects ctrl-x manager entry without los
     try feedRoutingBytes(&app, "\x1b[120;5u");
     try std.testing.expectEqualStrings("ab", app.input_runtime.edit_state.input.items);
     try std.testing.expectEqual(@as(usize, 2), app.input_runtime.edit_state.cursor);
-    try std.testing.expectEqual(@as(usize, 2), app.subagents.toggle_view_calls);
+    try std.testing.expectEqual(@as(usize, 0), app.subagents.toggle_view_calls);
     try std.testing.expect(!app.subagents.isViewActive());
     try std.testing.expect(app.terminal.fullTranscriptScreenActive());
 }
@@ -10343,7 +10051,7 @@ test "app_input_runtime approval prompt blocks full transcript key interception"
     var app = try RoutingFakeApp.init(alloc);
     defer app.deinit();
     activateFullTranscriptForRoutingTest(&app);
-    try std.testing.expect(try app.approval_prompt.syncRequest(alloc, .{ .label = "terminal.exec npm test" }));
+    try std.testing.expect(try app.approval_prompt.syncRequest(alloc, .{ .label = "shell.run npm test" }));
     app.shell.full_transcript.scroll_rows = 10;
 
     try feedRoutingBytes(&app, "\x1b[5~");
@@ -10412,7 +10120,7 @@ test "app_input_runtime new paste traces and clears stale inactive state" {
 
     var app = try RoutingFakeApp.init(alloc);
     defer app.deinit();
-    try std.testing.expect(try app.approval_prompt.syncRequest(alloc, .{ .label = "terminal.exec npm test" }));
+    try std.testing.expect(try app.approval_prompt.syncRequest(alloc, .{ .label = "shell.run npm test" }));
     app.input_runtime.paste.decision_bytes = 7;
     try app.input_runtime.paste.buffer.appendSlice(alloc, "old");
 
@@ -10437,7 +10145,7 @@ test "app_input_runtime composer paste stays composer owned when prompt appears"
     try feedRoutingBytes(&app, "\x1b[200~");
     try std.testing.expectEqual(paste_framing.Owner.composer, app.input_runtime.paste.owner);
     try feedRoutingBytes(&app, "hi");
-    try std.testing.expect(try app.approval_prompt.syncRequest(alloc, .{ .label = "terminal.exec npm test" }));
+    try std.testing.expect(try app.approval_prompt.syncRequest(alloc, .{ .label = "shell.run npm test" }));
     try feedRoutingBytes(&app, "\x1b[201~");
 
     try std.testing.expectEqual(paste_framing.Owner.none, app.input_runtime.paste.owner);
@@ -10480,7 +10188,7 @@ test "app_input_runtime modal disappearance keeps decision-owned paste pinned" {
 
     var app = try RoutingFakeApp.init(alloc);
     defer app.deinit();
-    try std.testing.expect(try app.approval_prompt.syncRequest(alloc, .{ .label = "terminal.exec npm test" }));
+    try std.testing.expect(try app.approval_prompt.syncRequest(alloc, .{ .label = "shell.run npm test" }));
 
     try feedRoutingBytes(&app, "\x1b[200~");
     app.approval_prompt.clear(app.alloc);
@@ -10658,7 +10366,7 @@ test "app_input_runtime expired incomplete control sequence preserves approval" 
     const alloc = std.testing.allocator;
     var app = try RoutingFakeApp.init(alloc);
     defer app.deinit();
-    try std.testing.expect(try app.approval_prompt.syncRequest(alloc, .{ .label = "terminal.exec npm test" }));
+    try std.testing.expect(try app.approval_prompt.syncRequest(alloc, .{ .label = "shell.run npm test" }));
     app.terminal_input_runtime.terminal_action_decoder.stage = 3;
     app.terminal_input_runtime.terminal_action_decoder.param = 20;
     app.terminal_input_runtime.terminal_action_decoder.param2 = 2;
@@ -10718,7 +10426,7 @@ test "app_input_runtime expired mouse prefixes discard their tails without cance
         var app = try RoutingFakeApp.init(alloc);
         defer app.deinit();
         app.stream.active = true;
-        try std.testing.expect(try app.approval_prompt.syncRequest(alloc, .{ .label = "terminal.exec npm test" }));
+        try std.testing.expect(try app.approval_prompt.syncRequest(alloc, .{ .label = "shell.run npm test" }));
 
         try feedRoutingBytes(&app, case.prefix);
         app.terminal_input_runtime.terminal_action_decoder.started_ms = 0;
@@ -10742,7 +10450,7 @@ test "app_input_runtime tail-less expired mouse recovery releases quietly" {
         var app = try RoutingFakeApp.init(alloc);
         defer app.deinit();
         app.stream.active = true;
-        try std.testing.expect(try app.approval_prompt.syncRequest(alloc, .{ .label = "terminal.exec npm test" }));
+        try std.testing.expect(try app.approval_prompt.syncRequest(alloc, .{ .label = "shell.run npm test" }));
 
         try feedRoutingBytes(&app, prefix);
         app.terminal_input_runtime.terminal_action_decoder.started_ms = 0;
@@ -10765,7 +10473,7 @@ test "app_input_runtime fresh Escape restarts expired mouse recovery before canc
         var app = try RoutingFakeApp.init(alloc);
         defer app.deinit();
         app.stream.active = true;
-        try std.testing.expect(try app.approval_prompt.syncRequest(alloc, .{ .label = "terminal.exec npm test" }));
+        try std.testing.expect(try app.approval_prompt.syncRequest(alloc, .{ .label = "shell.run npm test" }));
 
         try feedRoutingBytes(&app, prefix);
         app.terminal_input_runtime.terminal_action_decoder.started_ms = 0;
@@ -10787,7 +10495,7 @@ test "app_input_runtime fresh escape rearms generic decoder before paste start" 
     const alloc = std.testing.allocator;
     var app = try RoutingFakeApp.init(alloc);
     defer app.deinit();
-    try std.testing.expect(try app.approval_prompt.syncRequest(alloc, .{ .label = "terminal.exec npm test" }));
+    try std.testing.expect(try app.approval_prompt.syncRequest(alloc, .{ .label = "shell.run npm test" }));
     app.terminal_input_runtime.terminal_action_decoder.stage = 3;
     app.terminal_input_runtime.terminal_action_decoder.param = 20;
     app.terminal_input_runtime.terminal_action_decoder.param2 = 2;
@@ -10894,7 +10602,7 @@ test "approval cancellation uses one worker-owned terminal transition" {
     defer app.deinit();
     try std.testing.expect(try app.approval_prompt.syncRequest(
         alloc,
-        .{ .label = "terminal.exec npm test" },
+        .{ .label = "shell.run npm test" },
     ));
 
     try Runtime(FakeApprovalCancelApp).cancelApprovalOperation(&app);
@@ -10961,7 +10669,7 @@ test "bare escape during approval uses worker-owned cancellation" {
     defer app.deinit();
     try std.testing.expect(try app.approval_prompt.syncRequest(
         alloc,
-        .{ .label = "terminal.exec npm test" },
+        .{ .label = "shell.run npm test" },
     ));
     app.terminal_input_runtime.terminal_action_decoder.stage = 1;
     app.terminal_input_runtime.terminal_action_decoder.cancel_pending = true;
@@ -11113,36 +10821,6 @@ const ApprovalOwnershipApp = struct {
     approval_screen: interaction_state.ApprovalScreenState = .{},
     subagents: ApprovalOwnershipSubagents = .{},
 };
-
-test "committed child approval owns input while its refreshed binding catches up" {
-    const alloc = std.testing.allocator;
-    var app = ApprovalOwnershipApp{};
-    defer app.approval_prompt.deinit(alloc);
-    try std.testing.expect(try app.approval_prompt.syncRequest(
-        alloc,
-        .{ .id = 41, .label = "write external-child.txt" },
-    ));
-
-    try std.testing.expect(
-        !Runtime(ApprovalOwnershipApp).approvalOwnsCurrentSurface(&app),
-    );
-    app.approval_screen.recordScreenCommit(41, .{
-        .request_id = 41,
-        .rows = 24,
-        .cols = 112,
-        .file_identity_visible = true,
-        .all_decision_controls_visible = true,
-        .changed_or_notice_visible = true,
-        .document_scrollable = false,
-    });
-    try std.testing.expect(
-        !Runtime(ApprovalOwnershipApp).approvalOwnsCurrentSurface(&app),
-    );
-    app.subagents.card_binding = .{ .child_id = "approval-child" };
-    try std.testing.expect(
-        Runtime(ApprovalOwnershipApp).approvalOwnsCurrentSurface(&app),
-    );
-}
 
 test "app_input_runtime consumes legacy X10 reports during active file approval" {
     const alloc = std.testing.allocator;
@@ -11311,7 +10989,7 @@ test "approval submission transfers feedback to the worker without a local card"
     var app = try RoutingFakeApp.init(alloc);
     defer app.deinit();
     try std.testing.expect(try app.approval_prompt.syncRequest(alloc, .{
-        .label = "terminal.exec printf done",
+        .label = "shell.run printf done",
     }));
     try Runtime(RoutingFakeApp).handleByte(&app, '\t', 4096, 100);
     for ("summarize the output") |byte| {
@@ -11516,7 +11194,7 @@ test "bare escape trace captures approval interrupt context" {
     defer app.deinit();
     try std.testing.expect(try app.approval_prompt.syncRequest(
         alloc,
-        .{ .label = "terminal.exec npm test" },
+        .{ .label = "shell.run npm test" },
     ));
     app.terminal_input_runtime.terminal_action_decoder.stage = 1;
     app.terminal_input_runtime.terminal_action_decoder.cancel_pending = true;
@@ -12105,7 +11783,6 @@ test "composer shortcut line delete handles decoded and raw mutations" {
             .delete_to_line_start,
             null,
             null,
-            null,
             false,
             4096,
             100,
@@ -12186,7 +11863,6 @@ test "composer shortcut line delete preserves no-op picker redraw and metadata s
         .delete_to_line_start,
         null,
         null,
-        null,
         false,
         4096,
         100,
@@ -12201,7 +11877,6 @@ test "composer shortcut line delete preserves no-op picker redraw and metadata s
         &app,
         .delete_to_line_end,
         .delete_to_line_end,
-        null,
         null,
         null,
         false,

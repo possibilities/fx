@@ -29,7 +29,6 @@ const types = @import("../shared/types.zig");
 const diff_mod = @import("../output/diff.zig");
 const domain = @import("domain.zig");
 const execution = @import("execution.zig");
-const parent_delivery_projector = @import("parent_delivery_projector.zig");
 const tool_host = @import("tool_host.zig");
 
 const Allocator = std.mem.Allocator;
@@ -92,8 +91,6 @@ const Context = struct {
         result.interactive = false;
         result.output_chunk_ctx = self;
         result.on_output_chunk = pushLiveOutputChunk;
-        result.background_url_ctx = self;
-        result.on_background_url_ready = discardBackgroundUrl;
         result.web_search_progress_ctx = null;
         result.on_web_search_progress = null;
         result.web_fetch_progress_ctx = null;
@@ -184,6 +181,10 @@ pub fn run(
         .turn_id = debug_trace.nextTurnId(),
         .subagent_id = debug_trace.nextSubagentId(),
     };
+    if (!turn.workerRuntime().beginDirectProcessing(trace_context.turn_id)) {
+        return error.ProviderFailed;
+    }
+    defer turn.workerRuntime().finishProcessing();
     var context = Context{
         .config = routed_config,
         .turn = turn,
@@ -226,6 +227,22 @@ pub fn run(
         .recovery_checkpoint = recovery_checkpoint,
         .recovery_source_already_presented = recovery_checkpoint != null,
     };
+    const child_tool_names = try withoutSubagentNames(
+        arena,
+        config.advertised_tool_names,
+    );
+    const child_functions = try withoutSubagentFunctions(
+        arena,
+        config.advertised_functions,
+    );
+    const child_system_prompt = if (message.system_prompt_overlay.len == 0)
+        config.system_prompt
+    else
+        std.fmt.allocPrint(
+            arena,
+            "{s}\n\n<subagent_instructions>\n{s}\n</subagent_instructions>",
+            .{ config.system_prompt, message.system_prompt_overlay },
+        ) catch return error.OutOfMemory;
     debug_trace.eventf(
         "subagent",
         "trace_identity",
@@ -252,14 +269,14 @@ pub fn run(
             .outcome_allocator = turn.alloc,
         },
         .{
-            .system_prompt = config.system_prompt,
+            .system_prompt = child_system_prompt,
             .model_prompt_overlay = config.model_prompt_overlay,
             .skills_prompt_section = config.skills_prompt_section,
             .explicit_skills_prompt_section = config.explicit_skills_prompt_section,
             .gateway_retry_count = config.tool_context.gateway_retry_count,
             .gateway_chat_url = config.tool_context.gateway_chat_url,
-            .advertised_tool_names = config.advertised_tool_names,
-            .advertised_functions = config.advertised_functions,
+            .advertised_tool_names = child_tool_names,
+            .advertised_functions = child_functions,
             .provider_capabilities = config.provider_set.select(admission.provider).capabilities,
             .custom_tool_guidance = config.custom_tool_guidance,
             .agent_step_limit = config.tool_context.agent_step_limit,
@@ -294,6 +311,42 @@ pub fn run(
     return if (context.turn_outcome == .paused) .paused else .completed;
 }
 
+fn withoutSubagentNames(
+    alloc: Allocator,
+    names: []const []const u8,
+) ![]const []const u8 {
+    var count: usize = 0;
+    for (names) |name| {
+        if (!std.mem.eql(u8, name, "subagent")) count += 1;
+    }
+    const filtered = try alloc.alloc([]const u8, count);
+    var index: usize = 0;
+    for (names) |name| {
+        if (std.mem.eql(u8, name, "subagent")) continue;
+        filtered[index] = name;
+        index += 1;
+    }
+    return filtered;
+}
+
+fn withoutSubagentFunctions(
+    alloc: Allocator,
+    functions: []const model_tool_schema.FunctionSchema,
+) ![]const model_tool_schema.FunctionSchema {
+    var count: usize = 0;
+    for (functions) |function| {
+        if (!std.mem.eql(u8, function.name, "subagent")) count += 1;
+    }
+    const filtered = try alloc.alloc(model_tool_schema.FunctionSchema, count);
+    var index: usize = 0;
+    for (functions) |function| {
+        if (std.mem.eql(u8, function.name, "subagent")) continue;
+        filtered[index] = function;
+        index += 1;
+    }
+    return filtered;
+}
+
 fn runtimeDeps(context: *Context) agent_runtime.AgentRuntimeDeps {
     return .{
         .ctx = context,
@@ -305,8 +358,6 @@ fn runtimeDeps(context: *Context) agent_runtime.AgentRuntimeDeps {
         .release_agent_terminal_lease = releaseAgentTerminalLease,
         .live_tool_authority = context.turn.liveToolAuthorityProvider(),
         .tool_activity_recorder = context.turn.toolActivityRecorder(),
-        .prepare_parent_turn_context = prepareParentTurnContext,
-        .acknowledge_parent_turn_context = acknowledgeParentTurnContext,
         .append_runtime_context = appendRuntimeContext,
         .append_static_context = appendStaticContext,
         .validate_tool_call = validateToolCall,
@@ -373,38 +424,6 @@ fn finalizeTurn(
     context.turn_outcome = outcome;
 }
 
-fn prepareParentTurnContext(
-    raw: *anyopaque,
-    arena: Allocator,
-) !?agent_runtime.PreparedParentTurnContext {
-    const context: *Context = @ptrCast(@alignCast(raw));
-    const child_id = context.turn.child_id orelse return null;
-    return parent_delivery_projector.prepare(
-        arena,
-        context.config.host.sessions,
-        child_id,
-        context.config.host.manager.options.child_store,
-    );
-}
-
-fn acknowledgeParentTurnContext(
-    raw: *anyopaque,
-    arena: Allocator,
-    acknowledgements: []const agent_runtime.ParentTurnDeliveryAck,
-) void {
-    const context: *Context = @ptrCast(@alignCast(raw));
-    const retirement_ready = parent_delivery_projector
-        .acknowledgeWithRetirementSignal(
-        arena,
-        context.config.host.sessions,
-        context.config.host.manager.options.child_store,
-        acknowledgements,
-    );
-    if (retirement_ready) {
-        context.config.host.requestRetirementSweep(io_mod.milliTimestamp());
-    }
-}
-
 fn appendRuntimeContext(raw: *anyopaque, arena: Allocator, messages: *std.ArrayList(types.ChatMessage)) !void {
     const context: *Context = @ptrCast(@alignCast(raw));
     const tool_ctx = context.toolContext();
@@ -414,8 +433,6 @@ fn appendRuntimeContext(raw: *anyopaque, arena: Allocator, messages: *std.ArrayL
         .interactive = false,
         .permission_mode = context.admission.permission_mode,
         .tracker = null,
-        .background = tool_ctx.background,
-        .session = context.turn.sessionRuntime(),
     }, arena, messages);
 }
 

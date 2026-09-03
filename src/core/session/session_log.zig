@@ -690,10 +690,12 @@ pub const LoadedWritableSession = struct {
         failed_tail: FailedTailDisposition,
         options: Options,
     ) !CommitPosition {
-        const usage_sidecar_bytes = if (state.usage) |usage|
+        var replacement = state;
+        replacement.subagent_child = self.state.subagent_child;
+        const usage_sidecar_bytes = if (replacement.usage) |usage|
             encodeUsageSidecarBestEffort(
                 alloc,
-                state.id,
+                replacement.id,
                 usage,
             )
         else
@@ -703,7 +705,7 @@ pub const LoadedWritableSession = struct {
         const same_workspace = std.mem.eql(
             u8,
             self.state.workspace_root,
-            state.workspace_root,
+            replacement.workspace_root,
         );
         const may_defer_cache = same_workspace and switch (reason) {
             .compaction, .log_compaction => true,
@@ -712,13 +714,13 @@ pub const LoadedWritableSession = struct {
         const cache_deferred = if (may_defer_cache)
             try self.prepareCommitLifecycleOpportunistic(alloc, options)
         else blk: {
-            try self.prepareCommitLifecycle(alloc, state.workspace_root, options);
+            try self.prepareCommitLifecycle(alloc, replacement.workspace_root, options);
             break :blk false;
         };
         _ = commitStateReplacementImpl(
             self,
             alloc,
-            state,
+            replacement,
             reason,
             failed_tail,
             options,
@@ -1329,6 +1331,30 @@ pub const Root = struct {
             );
         }
         return state;
+    }
+
+    /// Reads the immutable child-privacy bit from the first event without
+    /// replaying history or acquiring the commit lock. State replacement and
+    /// compaction preserve this bit for the lifetime of the session.
+    pub fn loadSubagentChildIdentity(
+        self: *const Root,
+        alloc: Allocator,
+        session_id: []const u8,
+    ) !bool {
+        var sessions = self.sessions orelse return error.SessionNotFound;
+        try session_layout.validateSessionId(session_id);
+        var session_dir = openSessionDir(
+            &sessions,
+            session_id,
+            .read_only,
+        ) catch |err| switch (err) {
+            error.FileNotFound => return error.SessionNotFound,
+            else => return err,
+        };
+        defer session_dir.close();
+        var log_file = try openManagedFile(&session_dir, events_file, .read_only);
+        defer log_file.close(io_mod.getIo());
+        return session_replay.readSubagentChildIdentity(alloc, log_file);
     }
 
     pub fn admitResumeView(
@@ -2174,6 +2200,7 @@ fn createNativeSession(
             .conversation_language = initial_state.conversation_language,
             .preferences = initial_state.preferences,
             .usage = initial_state.usage orelse synthesized_usage.?,
+            .subagent_child = initial_state.subagent_child,
         } },
     };
     const line = try session_event.encodeFrame(alloc, envelope);
@@ -4166,6 +4193,7 @@ fn compactCanonicalLog(
             .conversation_language = loaded.state.conversation_language,
             .preferences = loaded.state.preferences,
             .usage = loaded.state.usage,
+            .subagent_child = loaded.state.subagent_child,
         } },
     };
     const first_line = try session_event.encodeFrame(alloc, session_started);
@@ -4334,6 +4362,7 @@ fn makeCleanupCandidatesForTest(
             .conversation_language = loaded.state.conversation_language,
             .preferences = loaded.state.preferences,
             .usage = loaded.state.usage,
+            .subagent_child = loaded.state.subagent_child,
         } },
     };
     const line = try session_event.encodeFrame(alloc, envelope);
@@ -5715,6 +5744,36 @@ test "display projection waits for first prompt and preserves derived title" {
     );
 }
 
+test "state replacement preserves subagent child identity" {
+    const alloc = std.testing.allocator;
+    var temp = try TempRoot.init(alloc);
+    defer temp.deinit(alloc);
+    var initial = try testState(alloc, "session-subagent-child", 10);
+    defer initial.deinit(alloc);
+    initial.subagent_child = true;
+
+    {
+        var loaded = try temp.root.startWritableSession(alloc, initial, .{});
+        defer loaded.deinit(alloc);
+        var replacement = try loaded.state.dupe(alloc);
+        defer replacement.deinit(alloc);
+        replacement.updated_at_ms = 20;
+        replacement.subagent_child = false;
+        _ = try loaded.commitStateReplacement(
+            alloc,
+            replacement,
+            .recovery,
+            .retry_expected_tail,
+            .{},
+        );
+        try std.testing.expect(loaded.state.subagent_child);
+    }
+
+    var reloaded = try temp.root.loadReadOnly(alloc, initial.id, .{});
+    defer reloaded.deinit(alloc);
+    try std.testing.expect(reloaded.subagent_child);
+}
+
 fn historyEvent(state: session_codec.DurableSessionState) session_event.Event {
     return .{ .history_turn_committed = .{
         .conversation_language = state.conversation_language,
@@ -6835,17 +6894,10 @@ test "specialized history survives event replacement checkpoint and canonical co
         .tool_calls = calls[0..],
         .tool_results = results[0..],
     }};
-    const record_id = session.StableBackgroundRecordId{
-        0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77,
-        0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff,
-    };
-    const background_template = session.HistoryTurn{ .background_command = .{
+    const historical_template = session.HistoryTurn{ .assistant = .{
         .user = .{ .text = @constCast("run dev") },
-        .assistant = @constCast("The server is starting."),
+        .assistant = @constCast("The historical command is inert."),
         .execution = .{ .tool_steps = steps[0..] },
-        .log_path = @constCast("/tmp/server.log"),
-        .expect_url = true,
-        .background_record_id = record_id,
     } };
     const interrupted_template = session.HistoryTurn{ .interrupted = .{
         .user = .{ .text = @constCast("inspect") },
@@ -6858,7 +6910,7 @@ test "specialized history survives event replacement checkpoint and canonical co
     const append_history = try alloc.alloc(session.HistoryTurn, 1);
     var owns_append_history = true;
     errdefer if (owns_append_history) alloc.free(append_history);
-    append_history[0] = try session.dupeHistoryTurn(alloc, background_template);
+    append_history[0] = try session.dupeHistoryTurn(alloc, historical_template);
     var append_history_initialized = true;
     errdefer if (owns_append_history and append_history_initialized) {
         session.freeHistoryTurn(alloc, append_history[0]);
@@ -6876,8 +6928,8 @@ test "specialized history survives event replacement checkpoint and canonical co
         .{},
     );
     try std.testing.expectEqualStrings(
-        "The server is starting.",
-        loaded.state.history[0].background_command.assistant.?,
+        "The historical command is inert.",
+        loaded.state.history[0].assistant.assistant,
     );
 
     var replacement = try loaded.state.dupe(alloc);
@@ -6891,7 +6943,7 @@ test "specialized history survives event replacement checkpoint and canonical co
         }
         alloc.free(replacement_history);
     };
-    replacement_history[0] = try session.dupeHistoryTurn(alloc, background_template);
+    replacement_history[0] = try session.dupeHistoryTurn(alloc, historical_template);
     copied_replacement_turns += 1;
     replacement_history[1] = try session.dupeHistoryTurn(alloc, interrupted_template);
     copied_replacement_turns += 1;
@@ -6915,11 +6967,10 @@ test "specialized history survives event replacement checkpoint and canonical co
     var replayed = try temp.root.loadReadOnly(alloc, initial.id, .{});
     defer replayed.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 2), replayed.history.len);
-    const background = replayed.history[0].background_command;
-    try std.testing.expectEqualStrings("The server is starting.", background.assistant.?);
-    try std.testing.expectEqual(@as(usize, 1), background.execution.tool_steps.len);
-    try std.testing.expectEqual(.failure, background.execution.tool_steps[0].tool_results[0].status);
-    try std.testing.expectEqualSlices(u8, &record_id, &background.background_record_id.?);
+    const historical = replayed.history[0].assistant;
+    try std.testing.expectEqualStrings("The historical command is inert.", historical.assistant);
+    try std.testing.expectEqual(@as(usize, 1), historical.execution.tool_steps.len);
+    try std.testing.expectEqual(.failure, historical.execution.tool_steps[0].tool_results[0].status);
     const interrupted = replayed.history[1].interrupted;
     try std.testing.expectEqualStrings("I inspected the entry point.", interrupted.assistant.?);
     try std.testing.expectEqual(@as(usize, 1), interrupted.execution.tool_steps.len);

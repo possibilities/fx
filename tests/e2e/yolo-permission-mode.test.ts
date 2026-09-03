@@ -14,7 +14,7 @@ import { runFx } from "../evals/eval-helpers";
 import {
   FAKE_GATEWAY_MODEL,
   fakeGatewayFinalText,
-  fakeGatewayToolCall,
+  fakeShellRun,
   startFakeGateway,
   TmuxSession,
   tmuxAvailable,
@@ -91,11 +91,11 @@ describe("yolo permission mode", () => {
       );
 
       const fake = startFakeGateway([
-        fakeGatewayToolCall("yolo_command", "terminal", {
-          action: "exec",
-          timeout_ms: 600_000,
-          command: `printf 'YOLO_COMMAND_OK\\n' > ${JSON.stringify(markerPath)}`,
-        }),
+        fakeShellRun(
+          "yolo_command",
+          `printf 'YOLO_COMMAND_OK\\n' > ${JSON.stringify(markerPath)}`,
+          { timeout_ms: 600_000 },
+        ),
         fakeGatewayFinalText("YOLO_HEADLESS_DONE"),
       ]);
       gateway = fake;
@@ -130,7 +130,7 @@ describe("yolo permission mode", () => {
       expect(output.output).toContain("YOLO_HEADLESS_DONE");
       expect(
         output.tool_calls.some(
-          (call) => call.name === "terminal" && call.status === "success",
+          (call) => call.name === "shell" && call.status === "success",
         ),
       ).toBe(true);
       expect(readFileSync(markerPath, "utf8")).toBe("YOLO_COMMAND_OK\n");
@@ -200,11 +200,11 @@ describe("yolo permission mode", () => {
       );
 
       const fake = startFakeGateway([
-        fakeGatewayToolCall("legacy_ps", "terminal", {
-          action: "exec",
-          timeout_ms: 600_000,
-          command: `ps -p $$ -o pid= > ${JSON.stringify(psPath)}; printf x >> ${JSON.stringify(attemptsPath)}`,
-        }),
+        fakeShellRun(
+          "legacy_ps",
+          `ps -p $$ -o pid= > ${JSON.stringify(psPath)}; printf x >> ${JSON.stringify(attemptsPath)}`,
+          { timeout_ms: 600_000 },
+        ),
         fakeGatewayFinalText("LEGACY_PS_DONE"),
       ]);
       gateway = fake;
@@ -330,11 +330,11 @@ describe.skipIf(!tmuxAvailable())("yolo interactive mode", () => {
       const fake = startFakeGateway([
         async () => {
           await toolCallGate;
-          return fakeGatewayToolCall("live_auto_command", "terminal", {
-            action: "exec",
-            timeout_ms: 600_000,
-            command: `printf 'LIVE_AUTO_OK\\n' > ${JSON.stringify(markerPath)}`,
-          });
+          return fakeShellRun(
+            "live_auto_command",
+            `printf 'LIVE_AUTO_OK\\n' > ${JSON.stringify(markerPath)}`,
+            { timeout_ms: 600_000 },
+          );
         },
         fakeGatewayFinalText("LIVE_AUTO_DONE"),
       ]);
@@ -375,7 +375,7 @@ describe.skipIf(!tmuxAvailable())("yolo interactive mode", () => {
       expect(readFileSync(markerPath, "utf8")).toBe("LIVE_AUTO_OK\n");
       expect(fake.classifierRequests).toHaveLength(1);
       expect(readFileSync(tracePath, "utf8")).toContain(
-        "tool_name=terminal permission_mode=auto",
+        "tool_name=shell permission_mode=auto",
       );
       expect(JSON.parse(readFileSync(fixture.settingsPath, "utf8"))).toMatchObject({
         permission_mode: "auto",
@@ -409,11 +409,11 @@ describe.skipIf(!tmuxAvailable())("yolo interactive mode", () => {
       const fake = startFakeGateway([
         async () => {
           await toolCallGate;
-          return fakeGatewayToolCall("live_ask_command", "terminal", {
-            action: "exec",
-            timeout_ms: 600_000,
-            command: `printf 'LIVE_ASK_WRONG\\n' > ${JSON.stringify(markerPath)}`,
-          });
+          return fakeShellRun(
+            "live_ask_command",
+            `printf 'LIVE_ASK_WRONG\\n' > ${JSON.stringify(markerPath)}`,
+            { timeout_ms: 600_000 },
+          );
         },
         fakeGatewayFinalText("LIVE_ASK_DONE"),
       ]);
@@ -456,7 +456,7 @@ describe.skipIf(!tmuxAvailable())("yolo interactive mode", () => {
       expect(existsSync(markerPath)).toBe(false);
       expect(fake.classifierRequests).toHaveLength(0);
       expect(readFileSync(tracePath, "utf8")).toContain(
-        "tool_name=terminal permission_mode=ask",
+        "tool_name=shell permission_mode=ask",
       );
 
       await session.sendKeys("3");

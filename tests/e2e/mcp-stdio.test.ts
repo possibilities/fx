@@ -356,6 +356,25 @@ async function expectProcessesExited(pids: Iterable<number>, timeoutMs = 5_000) 
   throw new Error(`MCP fixture processes did not exit: ${live.join(", ")}`);
 }
 
+async function waitForTtyAskExit(
+  session: TmuxSession,
+  expectedStatus: number | null,
+  timeoutMs = 10_000,
+) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const status = session.paneStatus();
+    if (status.dead) {
+      expect(status.status).toBe(expectedStatus);
+      return;
+    }
+    await Bun.sleep(25);
+  }
+  throw new Error(
+    `Timed out waiting for terminal fx ask to exit.\n${await session.captureFullScrollback()}`,
+  );
+}
+
 describe("modern MCP stdio compatibility", () => {
   test("direct docker run servers are cleaned through the injected cidfile", async () => {
     const root = createRoot("docker-cidfile-cleanup", MODERN_FIXTURE);
@@ -883,8 +902,10 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"
         .toContain("enabledMcpjsonServers");
 
       await tui.sendText("/mcp trust reset");
-      await tui.waitForText("MCP configuration reloaded successfully", 15_000);
-      await tui.waitForText("Project MCP server 'fixture' is defined in .mcp.json", 10_000);
+      await tui.waitForPane((pane) =>
+        pane.split("MCP configuration reloaded successfully").length - 1 >= 2 &&
+        pane.split("Project MCP server 'fixture' is defined in .mcp.json").length - 1 >= 2,
+      15_000);
       await tui.sendLiteral("3");
       await tui.waitForText("MCP configuration reloaded successfully", 15_000);
       await tui.sendText("/mcp list");
@@ -1007,7 +1028,7 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"
     await expectFixtureProcessesExited(wire);
   }, 45_000);
 
-  test("one-off child uses only its captured MCP tools resources prompts and completion view", async () => {
+  test("managed child uses only its captured MCP tools resources prompts and completion view", async () => {
     const root = createRoot("one-off-mcp-view", MODERN_FIXTURE, { mode: "features" });
     const parentPrompt = "CREATE_SCOPED_MCP_ONE_OFF";
     const childPrompt = "SCOPED_MCP_ONE_OFF_WORK";
@@ -1069,12 +1090,9 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"
       }
       if (body.includes(parentPrompt)) {
         return fakeGatewayToolCall("create_scoped_child", "subagent", {
-          command: {
-            create: {
-              name: "scoped-mcp-one-off",
-              mode: "one_off",
-              prompt: childPrompt,
-            },
+          request: {
+            action: "run",
+            task: childPrompt,
           },
         });
       }
@@ -1106,9 +1124,9 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"
     await expectFixtureProcessesExited(wire);
   }, 40_000);
 
-  for (const childMode of ["one_off", "persistent"] as const) {
-    const label = childMode === "one_off" ? "one-off" : "persistent";
-    const marker = childMode === "one_off" ? "ONE_OFF" : "PERSISTENT";
+  for (const childMode of ["persistent"] as const) {
+    const label = "persistent";
+    const marker = "PERSISTENT";
     test(`${label} child admits a feature-only MCP server without tool access`, async () => {
       const root = createRoot(`${label}-feature-only`, MODERN_FIXTURE, {
         mode: "features_no_tools",
@@ -1138,12 +1156,9 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"
         }
         if (body.includes(parentPrompt)) {
           return fakeGatewayToolCall("create_feature_only_child", "subagent", {
-            command: {
-              create: {
-                name: `feature-only-${label}`,
-                mode: childMode,
-                prompt: childPrompt,
-              },
+            request: {
+              action: "run",
+              task: childPrompt,
             },
           });
         }
@@ -1192,9 +1207,9 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"
     }, 40_000);
   }
 
-  for (const childMode of ["one_off", "persistent"] as const) {
-    const label = childMode === "one_off" ? "one-off" : "persistent";
-    const marker = childMode === "one_off" ? "ONE_OFF" : "PERSISTENT";
+  for (const childMode of ["persistent"] as const) {
+    const label = "persistent";
+    const marker = "PERSISTENT";
     test(`${label} child with no configured MCP runtime fails closed before transport`, async () => {
       const root = createRoot(`${label}-mcp-disabled`, MODERN_FIXTURE);
       writeFileSync(join(root.home, ".fx", "mcp.json"), JSON.stringify({ mcp: {} }));
@@ -1236,12 +1251,9 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"
         }
         if (body.includes(parentPrompt)) {
           return fakeGatewayToolCall("create_disabled_child", "subagent", {
-            command: {
-              create: {
-                name: `disabled-mcp-${label}`,
-                mode: childMode,
-                prompt: childPrompt,
-              },
+            request: {
+              action: "run",
+              task: childPrompt,
             },
           });
         }
@@ -1268,8 +1280,8 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"
     }, 40_000);
   }
 
-  for (const childMode of ["one_off", "persistent"] as const) {
-    const label = childMode === "one_off" ? "one-off" : "persistent";
+  for (const childMode of ["persistent"] as const) {
+    const label = "persistent";
     test(`${label} scoped search refreshes only its admitted stale MCP server`, async () => {
       const root = createRoot(`${label}-scoped-refresh`, MODERN_FIXTURE, {
         mode: "subscription_cache",
@@ -1334,7 +1346,7 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"
           allowedBaseline = allowedBefore.filter((entry) =>
             entry.message.method === "tools/list"
           ).length;
-          return fakeGatewayToolCall("scoped_refresh_search", "mcp_search_tools", {
+          return fakeGatewayToolCall("scoped_refresh_search", "capability_search", {
             query: "echo",
           });
         }
@@ -1343,12 +1355,9 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"
             "create_scoped_refresh_child",
             "subagent",
             {
-              command: {
-                create: {
-                  name: `scoped-refresh-${label}`,
-                  mode: childMode,
-                  prompt: childPrompt,
-                },
+              request: {
+                action: "run",
+                task: childPrompt,
               },
             },
           );
@@ -1647,12 +1656,12 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"
     });
     const freshTool = "mcp_fixture_fresh";
     gateway = startFakeGateway([
-      fakeGatewayToolCall("search_initial", "mcp_search_tools", {
+      fakeGatewayToolCall("search_initial", "capability_search", {
         query: "echo",
       }),
       async () => {
         await Bun.sleep(200);
-        return fakeGatewayToolCall("search_fresh", "mcp_search_tools", {
+        return fakeGatewayToolCall("search_fresh", "capability_search", {
           query: "fresh",
         });
       },
@@ -1704,13 +1713,13 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"
     });
     const freshTool = "mcp_fixture_fresh";
     gateway = startFakeGateway([
-      fakeGatewayToolCall("search_initial", "mcp_search_tools", {
+      fakeGatewayToolCall("search_initial", "capability_search", {
         query: "echo",
       }),
       async () => {
         writeFileSync(root.invalidationReleasePath, "ready");
         await Bun.sleep(100);
-        return fakeGatewayToolCall("search_fresh", "mcp_search_tools", {
+        return fakeGatewayToolCall("search_fresh", "capability_search", {
           query: "fresh",
         });
       },
@@ -1929,7 +1938,7 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"
         restartLimit: 0,
       });
       gateway = startFakeGateway([
-        fakeGatewayToolCall("search_malformed", "mcp_search_tools", {
+        fakeGatewayToolCall("search_malformed", "capability_search", {
           query: "fixture",
         }),
         fakeGatewayFinalText("Malformed stdio fixture isolated."),
@@ -2444,6 +2453,101 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"
     expect(readAttemptedPids(root.launchLogPath)).toHaveLength(0);
     expect(existsSync(root.wireLogPath)).toBe(false);
   }, 15_000);
+
+  test.skipIf(!tmuxAvailable())(
+    "terminal fx ask starts an unused optional MCP server before its model request",
+    async () => {
+      const root = createRoot("ask-terminal-eager-optional", MODERN_FIXTURE, {
+        recordLaunchAttempts: true,
+      });
+      const activeGateway = startFakeGateway([
+        fakeGatewayFinalText("Terminal MCP startup complete."),
+      ], {
+        models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
+      });
+      gateway = activeGateway;
+      const binary = join(REPO_ROOT, "zig-out", "bin", "fx");
+      tui = await TmuxSession.create({
+        isolated: true,
+        cmd: `${JSON.stringify(binary)} ask --auto --no-save ${JSON.stringify("Answer without using MCP.")}`,
+        cwd: root.workspace,
+        width: 120,
+        height: 34,
+        remainOnExit: true,
+        env: fixtureEnv(root, activeGateway),
+      });
+
+      await tui.waitForText("Terminal MCP startup complete.", 20_000);
+      await waitForTtyAskExit(tui, 0);
+      expect(activeGateway.requests).toHaveLength(1);
+      const prompt = (JSON.parse(activeGateway.requests[0]!.body) as {
+        prompt: Array<{ content: unknown }>;
+      }).prompt.map((message) => contentText(message.content)).join("\n");
+      expect(prompt).toContain(
+        '<server name="fixture" state="ready" tools="1" />',
+      );
+      expect(prompt).not.toContain("available_on_demand");
+      const launch = readStartupLaunchEvidence(root);
+      expect(launch.startedPids.length).toBeGreaterThan(0);
+      expect(launch.childRecordedPids.length).toBeGreaterThan(0);
+
+      await tui.kill();
+      tui = null;
+      await expectProcessesExited(launch.allPids);
+    },
+    30_000,
+  );
+
+  test.skipIf(process.platform === "win32" || !tmuxAvailable())(
+    "terminal fx ask cancels stalled optional MCP startup before its model request",
+    async () => {
+      const root = createRoot("ask-terminal-cancel-startup", MODERN_FIXTURE, {
+        mode: "stall_startup",
+        startupTimeoutMs: 30_000,
+        restartLimit: 0,
+        recordLaunchAttempts: true,
+      });
+      const activeGateway = startFakeGateway([
+        fakeGatewayFinalText("must not be requested"),
+      ], {
+        models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
+      });
+      gateway = activeGateway;
+      const binary = join(REPO_ROOT, "zig-out", "bin", "fx");
+      tui = await TmuxSession.create({
+        isolated: true,
+        cmd: `${JSON.stringify(binary)} ask --auto --no-save ${JSON.stringify("Cancel optional MCP startup.")}`,
+        cwd: root.workspace,
+        width: 120,
+        height: 34,
+        remainOnExit: true,
+        env: fixtureEnv(root, activeGateway),
+      });
+
+      const launchDeadline = Date.now() + 10_000;
+      while (
+        readAttemptedPids(root.launchLogPath).length === 0 &&
+        Date.now() < launchDeadline
+      ) {
+        await Bun.sleep(25);
+      }
+      expect(readAttemptedPids(root.launchLogPath).length).toBeGreaterThan(0);
+
+      const cancelStartedAt = Date.now();
+      await tui.sendKeys("C-c");
+      // fx restores and re-delivers SIGINT after cleanup, so tmux records a
+      // signal exit without a numeric pane status.
+      await waitForTtyAskExit(tui, null, 5_000);
+      expect(Date.now() - cancelStartedAt).toBeLessThan(5_000);
+      expect(activeGateway.requests).toHaveLength(0);
+      const launch = readStartupLaunchEvidence(root);
+
+      await tui.kill();
+      tui = null;
+      await expectProcessesExited(launch.allPids);
+    },
+    20_000,
+  );
 
   test("fx ask accepts the official legacy SDK Draft 7 tool schema", async () => {
     const root = createRoot("ask-legacy-draft7", LEGACY_FIXTURE, {
@@ -3979,7 +4083,7 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"
       recordLaunchAttempts: true,
     });
     const activeGateway = startFakeGateway([
-      fakeGatewayToolCall("search_stalled_startup", "mcp_search_tools", {
+      fakeGatewayToolCall("search_stalled_startup", "capability_search", {
         query: "fixture",
       }),
       fakeGatewayFinalText("Startup timeout bounded."),
@@ -4789,161 +4893,6 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"
     45_000,
   );
 
-  test.skipIf(process.platform === "win32" || !tmuxAvailable())(
-    "MCP reload replaces tools and rejects a stalled child's stale selection without replay",
-    async () => {
-      const root = createRoot("reload-stalled-child", MODERN_FIXTURE, {
-        mode: "stall_operation",
-        operationTimeoutMs: 60_000,
-        expectedElicitation: "both",
-      });
-      const childPrompt = "RELOAD_STALLED_CHILD_PROMPT";
-      const afterReloadPrompt = "AFTER_RELOAD_ROOT_PROMPT";
-      const replacementTool = "mcp_fixture_sum";
-      const activeGateway = startDynamicFakeGateway((body) => {
-        if (body.includes('"toolCallId":"reload_root_call"')) {
-          return fakeGatewayFinalText("AFTER_RELOAD_ROOT_READY");
-        }
-        if (body.includes('"toolCallId":"reload_root_select"')) {
-          return fakeGatewayToolCall("reload_root_call", replacementTool, { text: "replacement" });
-        }
-        if (body.includes(afterReloadPrompt)) {
-          return fakeGatewayToolCall("reload_root_select", "mcp_select_tool", {
-            name: replacementTool,
-          });
-        }
-        if (body.includes('"toolCallId":"reload_child_call"')) {
-          return fakeGatewayFinalText("RELOAD_CHILD_CANCELLED");
-        }
-        if (body.includes('"toolCallId":"reload_child_select"')) {
-          return fakeGatewayToolCall("reload_child_call", TOOL_NAME, { text: "stall" });
-        }
-        if (body.includes('"toolCallId":"reload_child_create"')) {
-          return fakeGatewayFinalText("RELOAD_PARENT_READY");
-        }
-        if (body.includes(childPrompt)) {
-          return fakeGatewayToolCall("reload_child_select", "mcp_select_tool", {
-            name: TOOL_NAME,
-          });
-        }
-        return fakeGatewayToolCall("reload_child_create", "subagent", {
-          command: {
-            create: {
-              name: "reload-mcp-child",
-              mode: "persistent",
-              prompt: childPrompt,
-            },
-          },
-        });
-      }, {
-        classifierDecision: "clear",
-        models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
-      });
-      gateway = activeGateway;
-      const stderrPath = join(root.root, "stderr.log");
-      tui = await TmuxSession.create({
-        isolated: true,
-        cwd: root.workspace,
-        width: 100,
-        height: 30,
-        stderrPath,
-        env: fixtureEnv(root, activeGateway),
-      });
-
-      await tui.waitForComposer(15_000);
-      await tui.sendText("Create the reload MCP child.");
-      await tui.waitForText("RELOAD_PARENT_READY", 15_000);
-      const callDeadline = Date.now() + 10_000;
-      while (
-        (!existsSync(root.wireLogPath) ||
-          !readWire(root.wireLogPath).some((entry) =>
-            entry.message.method === "tools/call"
-          )) &&
-        Date.now() < callDeadline
-      ) {
-        await Bun.sleep(25);
-      }
-      const beforeReload = readWire(root.wireLogPath);
-      const stalledCall = beforeReload.find((entry) =>
-        entry.message.method === "tools/call"
-      );
-      expect(stalledCall).toBeDefined();
-      const retiredPid = stalledCall!.pid;
-      expect(isProcessAlive(retiredPid)).toBe(true);
-
-      const profilePath = join(root.home, ".fx", "mcp.json");
-      const profile = JSON.parse(readFileSync(profilePath, "utf8"));
-      profile.mcp.fixture.environment.FX_MCP_MODE = "normal";
-      profile.mcp.fixture.environment.FX_MCP_INITIAL_TOOL_NAME = "sum";
-      profile.mcp.fixture.environment.FX_MCP_RESULT_TEXT = "RELOADED_TOOL_RESULT";
-      writeFileSync(profilePath, JSON.stringify(profile));
-
-      const reloadStarted = Date.now();
-      await tui.sendText("/mcp reload");
-      await tui.waitForText("MCP configuration reloaded successfully.", 5_000);
-      while (isProcessAlive(retiredPid) && Date.now() - reloadStarted < 5_000) {
-        await Bun.sleep(25);
-      }
-      expect(isProcessAlive(retiredPid)).toBe(false);
-      expect(Date.now() - reloadStarted).toBeLessThan(5_000);
-
-      const replacementDeadline = Date.now() + 10_000;
-      let replacementPid = retiredPid;
-      while (Date.now() < replacementDeadline) {
-        if (existsSync(join(root.root, "mcp.pid"))) {
-          replacementPid = Number(readFileSync(join(root.root, "mcp.pid"), "utf8"));
-          if (replacementPid !== retiredPid && isProcessAlive(replacementPid)) break;
-        }
-        await Bun.sleep(25);
-      }
-      expect(replacementPid).not.toBe(retiredPid);
-      expect(isProcessAlive(replacementPid)).toBe(true);
-
-      const childWakeDeadline = Date.now() + 10_000;
-      while (
-        !activeGateway.requests.some((request) =>
-          request.body.includes('"toolCallId":"reload_child_call"')
-        ) &&
-        Date.now() < childWakeDeadline
-      ) {
-        await Bun.sleep(25);
-      }
-      expect(activeGateway.requests.some((request) =>
-        request.body.includes('"toolCallId":"reload_child_call"')
-      )).toBe(true);
-
-      const wire = readWire(root.wireLogPath);
-      expect(wire.filter((entry) => entry.message.method === "tools/call")).toHaveLength(1);
-      const retirementCancellation = wire.find((entry) =>
-        entry.pid === retiredPid &&
-        entry.message.method === "notifications/cancelled" &&
-        entry.message.params?.requestId === stalledCall!.message.id
-      );
-      if (!retirementCancellation) {
-        cleanupRoot = null;
-        throw new Error(
-          `retirement cancellation missing; retained artifacts: ${root.root}\n${JSON.stringify(wire, null, 2)}`,
-        );
-      }
-
-      await tui.sendText(afterReloadPrompt);
-      await tui.waitForText("AFTER_RELOAD_ROOT_READY", 10_000);
-      const finalWire = readWire(root.wireLogPath);
-      const finalCalls = finalWire.filter((entry) => entry.message.method === "tools/call");
-      expect(finalCalls).toHaveLength(2);
-      expect(finalCalls[0]?.message.params?.name).toBe("echo");
-      expect(finalCalls[1]?.message.params?.name).toBe("sum");
-      expect(finalCalls[1]?.pid).toBe(replacementPid);
-      expect(activeGateway.requests.at(-1)?.body).toContain("RELOADED_TOOL_RESULT:replacement");
-      expect(readFileSync(stderrPath, "utf8")).toBe("");
-
-      await tui.kill();
-      tui = null;
-      await expectFixtureProcessesExited(readWire(root.wireLogPath));
-    },
-    45_000,
-  );
-
   test("fx ask performs one fresh-discovery restart without replaying the failed call", async () => {
     const root = createRoot("ask-restart", MODERN_FIXTURE, {
       mode: "crash_once",
@@ -4987,7 +4936,7 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"
     await expectFixtureProcessesExited(wire);
   }, 30_000);
 
-  for (const childMode of ["one_off", "persistent"] as const) {
+  for (const childMode of ["persistent"] as const) {
     test(`revoked ${childMode} authority prevents stdio recovery effects`, async () => {
       const root = realpathSync(mkdtempSync(join(tmpdir(), `fx-mcp-${childMode}-recovery-`)));
       cleanupRoot = root;

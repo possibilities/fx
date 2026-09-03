@@ -29,6 +29,7 @@ const js_host_session_store = @import("../session/js_host_session_store.zig");
 const session_event = @import("../session/session_event.zig");
 const session_usage = @import("../session/session_usage.zig");
 const session_child_store = @import("../session/session_child_store.zig");
+const legacy_background_migration = @import("../session/legacy_background_migration.zig");
 const result_store = @import("../session/result_store.zig");
 const command_replay_store = @import("../session/command_replay_store.zig");
 const command_output_content = @import("../tooling/command_output_content.zig");
@@ -1077,6 +1078,7 @@ pub const Persistence = struct {
     subagent_host: ?*subagent_tool_host.Runtime = null,
     workspace_preferences: ?session_codec.DurableSessionPreferences = null,
     session_preferences: ?session_codec.DurableSessionPreferences = null,
+    fast_mode_model_bound: bool = false,
     js_host_store: JsHostSessionStore = .{},
     js_host_session: ?JsHostSessionOwner = null,
     process_model_override: ?[]u8 = null,
@@ -1095,7 +1097,7 @@ pub const Persistence = struct {
     /// in a static release-binary template.
     pub fn initInto(storage: *Persistence) void {
         comptime {
-            if (std.meta.fields(Persistence).len != 19) {
+            if (std.meta.fields(Persistence).len != 20) {
                 @compileError("update Persistence.initInto for the changed field set");
             }
         }
@@ -1106,6 +1108,7 @@ pub const Persistence = struct {
         storage.subagent_host = null;
         storage.workspace_preferences = null;
         storage.session_preferences = null;
+        storage.fast_mode_model_bound = false;
         storage.js_host_store = .{};
         storage.js_host_session = null;
         storage.process_model_override = null;
@@ -1158,6 +1161,7 @@ test "persistence in-place initialization preserves empty ownership" {
     try std.testing.expect(persistence.store == null);
     try std.testing.expect(persistence.writable == null);
     try std.testing.expect(persistence.subagent_host == null);
+    try std.testing.expect(!persistence.fast_mode_model_bound);
     try std.testing.expect(!persistence.session_picker.active);
     try std.testing.expect(persistence.session_picker_load.task == null);
     try std.testing.expect(!persistence.session_picker_current_cache.ready);
@@ -1337,6 +1341,7 @@ pub fn Runtime(comptime App: type) type {
             selected_model: []const u8,
             effort: types.ReasoningEffort,
             fast_mode: bool,
+            fast_mode_model_bound: bool,
         ) !void {
             try replacePreferences(
                 app.alloc,
@@ -1353,6 +1358,7 @@ pub fn Runtime(comptime App: type) type {
                 &app.session_persistence.session_preferences,
                 app.session_persistence.workspace_preferences.?,
             );
+            app.session_persistence.fast_mode_model_bound = fast_mode_model_bound;
             if (app.session_persistence.process_model_override) |model| {
                 app.alloc.free(model);
                 app.session_persistence.process_model_override = null;
@@ -1394,30 +1400,32 @@ pub fn Runtime(comptime App: type) type {
 
             configureWebFetchArtifacts(app, loaded);
             enableSubagentHost(app, loaded);
-            restoreManagedBackground(app, loaded, capability);
-        }
-
-        fn restoreManagedBackground(
-            app: *App,
-            loaded: *session_store.LoadedWritableSession,
-            capability: *session_child_store.SessionChildCapability,
-        ) void {
-            if (comptime @hasDecl(
-                @TypeOf(app.background),
-                "restoreFromManagedPersistence",
-            )) {
-                app.background.restoreFromManagedPersistence(
-                    std.heap.c_allocator,
+            if (comptime @hasField(App, "legacy_process_provider")) {
+                const migrated = legacy_background_migration.migrate(
+                    app.alloc,
                     capability,
-                    loaded.active_id,
-                    app.workspace_root,
+                    app.legacy_process_provider,
                 ) catch |err| {
                     debug_trace.logf(
-                        "background",
-                        "interactive managed background restore failed session={s} err={s}",
+                        "session",
+                        "legacy process migration deferred session={s} err={s}",
                         .{ loaded.active_id, @errorName(err) },
                     );
+                    return;
                 };
+                if (migrated.records_removed != 0 or migrated.logs_removed != 0) {
+                    debug_trace.logf(
+                        "session",
+                        "legacy process migration committed session={s} records={d} logs={d} signaled={d} unavailable={d}",
+                        .{
+                            loaded.active_id,
+                            migrated.records_removed,
+                            migrated.logs_removed,
+                            migrated.processes_signaled,
+                            migrated.identities_unavailable,
+                        },
+                    );
+                }
             }
         }
 
@@ -1544,7 +1552,6 @@ pub fn Runtime(comptime App: type) type {
         fn installFreshLiveSession(app: *App) !void {
             try beginFreshPersistedSession(app);
             enableSessionStores(app);
-            refreshSubagentProjectionAfterSessionInstall(app);
             try finishLiveSessionTransition(app);
         }
 
@@ -1610,16 +1617,7 @@ pub fn Runtime(comptime App: type) type {
             app.clearPendingImages();
             app.change_tracker.clear(std.heap.c_allocator);
             diagnostics.resetSession();
-            switch (background_policy) {
-                .carry_forward => app.background.carryForwardWorkspaceState(
-                    std.heap.c_allocator,
-                    app.workspace_root,
-                ),
-                .stop_forget => app.background.stopAndForgetWorkspace(
-                    std.heap.c_allocator,
-                    app.workspace_root,
-                ),
-            }
+            _ = background_policy;
             app.context_snapshot.deinit(app.alloc);
             app.approval_prompt.clear(app.alloc);
             if (comptime @hasField(App, "approval_screen")) {
@@ -1915,7 +1913,6 @@ pub fn Runtime(comptime App: type) type {
             try hydrateResumedSession(app, active.state, display.title, notice);
             active.resume_view_stale = true;
             enableSessionStores(app);
-            refreshSubagentProjectionAfterSessionInstall(app);
         }
 
         fn hydrateResumedSession(
@@ -1989,17 +1986,6 @@ pub fn Runtime(comptime App: type) type {
                 try replayHistoryToSink(app, &sink, state.history);
                 try writeRecoveryCheckpointToSink(app, &sink, state);
             }
-        }
-
-        fn refreshSubagentProjectionAfterSessionInstall(app: *App) void {
-            if (comptime !@hasDecl(App, "refreshSubagentManagerProjectionNow")) return;
-            app.refreshSubagentManagerProjectionNow() catch |err| {
-                debug_trace.logf(
-                    "subagent",
-                    "session projection refresh unavailable err={s}",
-                    .{@errorName(err)},
-                );
-            };
         }
 
         pub fn openSessionPicker(app: *App) !void {
@@ -2696,9 +2682,11 @@ pub fn Runtime(comptime App: type) type {
             else
                 return .committed;
             try subagent_resume_admission.retainExternalRootUserTurn(
+                app.session_persistence.store,
                 app.alloc,
                 loaded,
                 turn,
+                app.worker.active_prompt_is_root_authority,
             );
             convergeDegraded(app, loaded, .{}) catch |err| {
                 return switch (mode) {
@@ -2781,6 +2769,10 @@ pub fn Runtime(comptime App: type) type {
             applySessionPreferencePatch(app, patch) catch |err| {
                 result.session_error = err;
             };
+            if (patch.model != null or patch.fast_mode != null) {
+                app.session_persistence.fast_mode_model_bound =
+                    patch.model != null and patch.fast_mode != null;
+            }
 
             var settings_attempt = config_runtime.attemptUserPreferences(
                 app.alloc,
@@ -3061,6 +3053,7 @@ pub fn Runtime(comptime App: type) type {
         }
 
         pub fn subagentHost(app: *App) ?*subagent_tool_host.Runtime {
+            if (comptime !@hasField(App, "session_persistence")) return null;
             return app.session_persistence.subagent_host;
         }
 
@@ -3155,7 +3148,6 @@ pub fn Runtime(comptime App: type) type {
             defer app.worker.releaseTurnStartHold();
 
             const loaded = &app.session_persistence.writable.?;
-            detachManagedBackground(app, loaded);
             loaded.log.park();
             debug_trace.logf(
                 "session",
@@ -3187,16 +3179,6 @@ pub fn Runtime(comptime App: type) type {
                 "unparked writer lock after suspend session={s}",
                 .{loaded.active_id},
             );
-            const capability = loaded.childCapability() catch |err| {
-                debug_trace.logf(
-                    "session",
-                    "interactive child capability unavailable session={s} err={s}",
-                    .{ loaded.active_id, @errorName(err) },
-                );
-                try lifecycle_result;
-                return;
-            };
-            restoreManagedBackground(app, loaded, capability);
             try lifecycle_result;
         }
 
@@ -3208,14 +3190,12 @@ pub fn Runtime(comptime App: type) type {
         }
 
         /// Tear down a parked writable without converging or checkpointing.
-        /// Background authority must already be detached (or is detached here).
         fn abandonParkedWritableSession(app: *App) void {
             discardAnyPendingCancelledCommand(app, "writable_session_abandon");
             const loaded = if (app.session_persistence.writable) |*value|
                 value
             else
                 return;
-            detachManagedBackground(app, loaded);
             if (comptime @hasDecl(
                 @TypeOf(app.session),
                 "clearWebFetchArtifacts",
@@ -3230,20 +3210,6 @@ pub fn Runtime(comptime App: type) type {
             );
             loaded.deinit(app.alloc);
             app.session_persistence.writable = null;
-        }
-
-        fn detachManagedBackground(
-            app: *App,
-            loaded: *session_store.LoadedWritableSession,
-        ) void {
-            if (comptime @hasField(App, "background") and
-                @hasDecl(@TypeOf(app.background), "detachManagedPersistence"))
-            {
-                app.background.detachManagedPersistence(
-                    std.heap.c_allocator,
-                    loaded.active_id,
-                );
-            }
         }
 
         pub fn deinitPersistence(app: *App) void {
@@ -3648,7 +3614,7 @@ pub fn Runtime(comptime App: type) type {
             var has_prior_turns = false;
             for (state.history) |turn| switch (turn) {
                 .compacted_summary => {},
-                .assistant, .background_command, .interrupted => {
+                .assistant, .interrupted => {
                     has_prior_turns = true;
                     break;
                 },
@@ -3731,31 +3697,6 @@ pub fn Runtime(comptime App: type) type {
                         if (entry.execution.turn_summary) |summary| {
                             try sink.appendTurnSummary(summary);
                         }
-                    },
-                    .background_command => |entry| {
-                        if (entry.execution.turn_summary) |summary| {
-                            sink.setCreatedAtMs(summary.started_at_ms);
-                        }
-                        try sink.appendUserTurn(entry.user, has_prior_turns.*);
-                        has_prior_turns.* = true;
-
-                        try writeExecutionHistoryToSink(app, sink, entry.execution);
-                        if (entry.execution.turn_summary) |summary| {
-                            sink.setCreatedAtMs(summary.completed_at_ms);
-                        }
-                        if (entry.assistant) |assistant| {
-                            if (assistant.len > 0) try writeAssistantHistoryMarkdownToSink(app, sink, assistant);
-                        }
-                        if (entry.execution.turn_summary) |summary| {
-                            try sink.appendTurnSummary(summary);
-                        }
-                        const text = try formatBackgroundReplayContext(app, entry);
-                        defer app.alloc.free(text);
-                        try sink.appendNotice(.{
-                            .topic = "session",
-                            .tone = .neutral,
-                            .body = text,
-                        });
                     },
                     .interrupted => |entry| {
                         if (entry.execution.turn_summary) |summary| {
@@ -4317,28 +4258,6 @@ pub fn Runtime(comptime App: type) type {
             if (!std.mem.endsWith(u8, output, "\n")) try sink.appendRaw("\n");
         }
 
-        fn formatBackgroundReplayContext(app: *App, entry: types.BackgroundCommandHistoryTurn) ![]u8 {
-            if (!@hasDecl(@TypeOf(app.background), "snapshotTaskByLogPath")) {
-                return session_runtime.formatBackgroundHistoryContext(app.alloc, entry);
-            }
-
-            const task = try app.background.snapshotTaskByLogPath(app.alloc, entry.log_path);
-            if (task) |snapshot| {
-                defer snapshot.deinit(app.alloc);
-                if (snapshot.state == .running) {
-                    if (snapshot.server_url) |url| {
-                        return std.fmt.allocPrint(app.alloc, "Session event: the previous background server is still running. Background #{d}; log: {s}; URL: {s}.", .{ snapshot.id, snapshot.log_path, url });
-                    }
-                    if (snapshot.expect_url) {
-                        return std.fmt.allocPrint(app.alloc, "Session event: the previous background server is still running. Background #{d}; log: {s}; URL is still pending.", .{ snapshot.id, snapshot.log_path });
-                    }
-                    return std.fmt.allocPrint(app.alloc, "Session event: the previous background command is still running. Background #{d}; log: {s}.", .{ snapshot.id, snapshot.log_path });
-                }
-            }
-
-            return std.fmt.allocPrint(app.alloc, "Session event: a previous background command was recorded at {s}, but it is no longer live in this workspace.", .{entry.log_path});
-        }
-
         fn AssistantHistoryMarkdownReplay(comptime Sink: type) type {
             return struct {
                 sink: *Sink,
@@ -4495,14 +4414,6 @@ pub fn Runtime(comptime App: type) type {
                 };
                 break :blk .{ .session_id = session_id };
             } else null;
-            if (comptime @hasField(App, "background") and
-                @hasDecl(@TypeOf(app.background), "detachManagedPersistence"))
-            {
-                app.background.detachManagedPersistence(
-                    std.heap.c_allocator,
-                    loaded.active_id,
-                );
-            }
             if (comptime @hasDecl(
                 @TypeOf(app.session),
                 "clearWebFetchArtifacts",
@@ -4909,6 +4820,11 @@ pub fn Runtime(comptime App: type) type {
             app: *App,
             preferences: session_codec.DurableSessionPreferences,
         ) !void {
+            const fast_mode_model_bound = restoredFastModeModelBound(
+                app.session_persistence.fast_mode_model_bound,
+                app.session_persistence.workspace_preferences,
+                preferences,
+            );
             try provider_runtime.replaceSelection(app, preferences.provider, preferences.model);
             if (app.session_persistence.process_model_override) |model| {
                 try provider_runtime.replaceModel(app, model);
@@ -4919,8 +4835,13 @@ pub fn Runtime(comptime App: type) type {
             );
             app.effort = preferences.effort;
             app.fast_mode = preferences.fast_mode;
+            app.session_persistence.fast_mode_model_bound = fast_mode_model_bound;
             app.worker.syncQueuedPromptEffort(preferences.effort);
             app.worker.syncQueuedPromptFastMode(preferences.fast_mode);
+        }
+
+        pub fn fastModeModelBound(app: *const App) bool {
+            return app.session_persistence.fast_mode_model_bound;
         }
 
         fn applySessionPreferencePatch(
@@ -4975,6 +4896,46 @@ fn replacePreferences(
     const replacement = try source.dupe(alloc);
     if (target.*) |*current| current.deinit(alloc);
     target.* = replacement;
+}
+
+fn restoredFastModeModelBound(
+    current_bound: bool,
+    configured: ?session_codec.DurableSessionPreferences,
+    restored: session_codec.DurableSessionPreferences,
+) bool {
+    if (!current_bound) return false;
+    const current = configured orelse return false;
+    return current.provider == restored.provider and
+        std.mem.eql(u8, current.model, restored.model) and
+        current.fast_mode == restored.fast_mode;
+}
+
+test "restored fast mode remains bound only for the configured model selection" {
+    const configured = session_codec.DurableSessionPreferences{
+        .model = @constCast("provider/model"),
+        .effort = .auto,
+        .fast_mode = true,
+    };
+    const matching = session_codec.DurableSessionPreferences{
+        .model = @constCast("provider/model"),
+        .effort = types.ReasoningEffort.literal("high"),
+        .fast_mode = true,
+    };
+    const different_model = session_codec.DurableSessionPreferences{
+        .model = @constCast("provider/other"),
+        .effort = .auto,
+        .fast_mode = true,
+    };
+    const different_fast_mode = session_codec.DurableSessionPreferences{
+        .model = @constCast("provider/model"),
+        .effort = .auto,
+        .fast_mode = false,
+    };
+
+    try std.testing.expect(restoredFastModeModelBound(true, configured, matching));
+    try std.testing.expect(!restoredFastModeModelBound(false, configured, matching));
+    try std.testing.expect(!restoredFastModeModelBound(true, configured, different_model));
+    try std.testing.expect(!restoredFastModeModelBound(true, configured, different_fast_mode));
 }
 
 fn applyPreferencePatch(
@@ -5054,44 +5015,11 @@ const TestResumeTarget = union(enum) {
     }
 };
 
-const FakeBackground = struct {
-    source_session_id: []u8 = &.{},
-    detached: bool = false,
-
-    fn deinit(self: *FakeBackground) void {
-        if (self.source_session_id.len > 0) {
-            std.heap.c_allocator.free(self.source_session_id);
-        }
-        self.* = .{};
-    }
-
-    fn restoreFromManagedPersistence(
-        self: *FakeBackground,
-        alloc: Allocator,
-        _: *session_child_store.SessionChildCapability,
-        source_session_id: []const u8,
-        _: []const u8,
-    ) !void {
-        if (self.source_session_id.len > 0) alloc.free(self.source_session_id);
-        self.source_session_id = try alloc.dupe(u8, source_session_id);
-        self.detached = false;
-    }
-
-    fn detachManagedPersistence(
-        self: *FakeBackground,
-        _: Allocator,
-        source_session_id: []const u8,
-    ) void {
-        if (std.mem.eql(u8, self.source_session_id, source_session_id)) {
-            self.detached = true;
-        }
-    }
-};
-
 const FakeWorker = struct {
     model: std.ArrayList(u8) = .empty,
     effort: types.ReasoningEffort = .auto,
     fast_mode: bool = false,
+    active_prompt_is_root_authority: bool = false,
 
     fn deinit(self: *FakeWorker, alloc: Allocator) void {
         self.model.deinit(alloc);
@@ -5171,7 +5099,6 @@ const TestApp = struct {
     requested_resume: ?TestResumeTarget = null,
     terminal: shell_runtime.TerminalState = .{},
     stream: types.StreamState = .{},
-    background: FakeBackground = .{},
     worker: FakeWorker = .{},
     selected_model: std.ArrayList(u8) = .empty,
     effort: types.ReasoningEffort = .auto,
@@ -5303,7 +5230,6 @@ const TestApp = struct {
         Runtime(TestApp).deinitPersistence(self);
         if (self.requested_resume) |*target| target.deinit(self.alloc);
         self.session.deinit(self.alloc);
-        self.background.deinit();
         self.worker.deinit(std.heap.c_allocator);
         self.selected_model.deinit(self.alloc);
         self.permission_engine.deinit(self.alloc);
@@ -5649,6 +5575,7 @@ test "js-host resume restores transcript context preferences usage and revision"
         "startup/model",
         .auto,
         false,
+        true,
     );
     app.session_persistence.js_host_store = fake.store();
     app.requested_resume = .last;
@@ -5663,6 +5590,7 @@ test "js-host resume restores transcript context preferences usage and revision"
     try std.testing.expectEqualStrings("restored/model", app.selected_model.items);
     try std.testing.expectEqual(types.ReasoningEffort.literal("high"), app.effort);
     try std.testing.expect(app.fast_mode);
+    try std.testing.expect(!Runtime(TestApp).fastModeModelBound(&app));
     try std.testing.expectEqual(@as(u64, 17), app.total_input_tokens);
     try std.testing.expectEqual(@as(u64, 23), app.total_output_tokens);
     var restored_usage = try app.session.usage.snapshot(alloc);
@@ -5705,6 +5633,7 @@ test "js-host resume store failures and missing records fall back to fresh sessi
             "fresh/model",
             .auto,
             false,
+            true,
         );
         app.session_persistence.js_host_store = fake.store();
         app.requested_resume = .last;
@@ -5734,6 +5663,7 @@ test "js-host picker request stays unsupported and starts fresh" {
         "fresh/model",
         .auto,
         false,
+        true,
     );
     app.session_persistence.js_host_store = fake.store();
     app.requested_resume = .pick;
@@ -5759,6 +5689,7 @@ test "js-host completed and interrupted turns propagate revisions preserve owner
         "fresh/model",
         .auto,
         false,
+        true,
     );
     app.session_persistence.js_host_store = fake.store();
     try Runtime(TestApp).beginFreshJsHostSession(&app);
@@ -5826,6 +5757,7 @@ test "js-host preference changes snapshot the updated session preferences" {
         "fresh/model",
         .auto,
         false,
+        true,
     );
     app.session_persistence.js_host_store = fake.store();
     try Runtime(TestApp).beginFreshJsHostSession(&app);
@@ -5920,6 +5852,7 @@ fn configureTestPreferences(app: *TestApp) !void {
         .user_workspace,
         "configured/model",
         types.ReasoningEffort.literal("high"),
+        true,
         true,
     );
 }
@@ -6076,7 +6009,6 @@ test "beginFreshPersistedSession and enableSessionStores create per-session stor
     try std.testing.expect(app.session_persistence.writable != null);
 
     Runtime(TestApp).enableSessionStores(&app);
-    try std.testing.expect(app.background.source_session_id.len > 0);
     try std.testing.expect(app.session_persistence.subagent_host != null);
     const host = app.session_persistence.subagent_host.?;
     var host_authority = try host.host_authority.resolve_fn(
@@ -6090,10 +6022,6 @@ test "beginFreshPersistedSession and enableSessionStores create per-session stor
         if (std.mem.eql(u8, tool_name, "subagent")) found_subagent = true;
     }
     try std.testing.expect(found_subagent);
-    try std.testing.expectEqualStrings(
-        app.session_persistence.writable.?.active_id,
-        app.background.source_session_id,
-    );
 }
 
 test "resume handoff suppresses missing and pristine writable sessions" {
@@ -7551,6 +7479,7 @@ test "upgrade resume restores active session with the installed version notice" 
         "env/model",
         types.ReasoningEffort.literal("high"),
         true,
+        false,
     );
     try Runtime(TestApp).initializePersistence(&app, true);
     var calls = [_]types.ToolCall{.{
@@ -7593,13 +7522,10 @@ test "upgrade resume restores active session with the installed version notice" 
             .assistant = @constCast(""),
             .execution = .{ .tool_steps = steps[0..] },
         } },
-        .{ .background_command = .{
+        .{ .assistant = .{
             .user = .{ .text = @constCast("run server") },
-            .assistant = @constCast("The server is ready."),
+            .assistant = @constCast("The historical server is no longer owned."),
             .execution = .{ .tool_steps = steps[0..] },
-            .log_path = @constCast("/tmp/server.log"),
-            .expect_url = true,
-            .url = null,
         } },
     };
     try writeSessionFixture(
@@ -7618,7 +7544,7 @@ test "upgrade resume restores active session with the installed version notice" 
     try std.testing.expectEqual(@as(usize, 1), app.startup_resume_anchor_count);
     try std.testing.expect(app.startup_resume_anchor_saw_writable);
     try std.testing.expectEqual(@as(usize, 4), app.startup_resume_anchor_history_len);
-    try std.testing.expectEqual(@as(usize, 3), app.startup_resume_anchor_notice_count);
+    try std.testing.expectEqual(@as(usize, 2), app.startup_resume_anchor_notice_count);
     try std.testing.expectEqualStrings(
         "session-1",
         app.session_persistence.writable.?.active_id,
@@ -7634,11 +7560,10 @@ test "upgrade resume restores active session with the installed version notice" 
     try std.testing.expect(std.mem.find(u8, context[0].compacted_summary.summary, "older context") != null);
     try std.testing.expect(std.mem.find(u8, context[0].compacted_summary.summary, "hello") != null);
     try std.testing.expectEqualStrings("inspect file", context[1].assistant.user.text);
-    try std.testing.expectEqualStrings("run server", context[2].background_command.user.text);
-    try std.testing.expectEqual(@as(usize, 3), app.notices.items.len);
+    try std.testing.expectEqualStrings("run server", context[2].assistant.user.text);
+    try std.testing.expectEqual(@as(usize, 2), app.notices.items.len);
     try std.testing.expectEqualStrings("● fx has been updated to v9.9.9", app.notices.items[0]);
     try std.testing.expect(std.mem.find(u8, app.notices.items[1], "older context") != null);
-    try std.testing.expect(std.mem.find(u8, app.notices.items[2], "Re-check runtime context") != null);
     try std.testing.expectEqual(@as(usize, 2), app.completed_tool_statuses.items.len);
     try std.testing.expectEqualStrings("● Completed read_file\n", app.completed_tool_statuses.items[0]);
     try std.testing.expectEqualStrings("● Completed read_file\n", app.completed_tool_statuses.items[1]);
@@ -7650,7 +7575,7 @@ test "upgrade resume restores active session with the installed version notice" 
     try std.testing.expectEqualStrings("inspect file", app.cards.items[1].text);
     try std.testing.expectEqualStrings("run server", app.cards.items[2].text);
     try std.testing.expectEqualStrings(
-        "hi\nI'll inspect it.\nI'll inspect it.\nThe server is ready.\n",
+        "hi\nI'll inspect it.\nI'll inspect it.\nThe historical server is no longer owned.\n",
         app.assistant_text.items,
     );
     try std.testing.expectEqual(@as(usize, 0), app.transcript.items.len);
@@ -7976,13 +7901,6 @@ test "interactive session resume uses the live transition and shared restore pat
     try std.testing.expect(!app.session_persistence.session_picker.active);
 
     const host = app.session_persistence.subagent_host.?;
-    const recovery_deadline = io_mod.milliTimestamp() + 5_000;
-    while ((host.recoveryState() == .scheduled or
-        host.recoveryState() == .running) and
-        io_mod.milliTimestamp() < recovery_deadline)
-    {
-        std.Thread.yield() catch std.atomic.spinLoopHint();
-    }
     try std.testing.expectEqual(
         subagent_tool_host.RecoveryState.complete,
         host.recoveryState(),
@@ -8068,15 +7986,13 @@ test "resumeRequestedSession replays persisted model Markdown without parsing ge
                     "- [x] ASSISTANT_TASK_MARKER\n",
             ),
         } },
-        .{ .background_command = .{
+        .{ .assistant = .{
             .user = .{ .text = @constCast("background model turn") },
             .assistant = @constCast(
                 "| Name | Value |\n" ++
                     "| --- | --- |\n" ++
                     "| BACKGROUND_TABLE_MARKER | 42 |\n",
             ),
-            .log_path = @constCast("/tmp/background.log"),
-            .expect_url = false,
         } },
         .{ .interrupted = .{
             .user = .{ .text = @constCast("interrupted model turn") },
@@ -8132,8 +8048,8 @@ test "resumeRequestedSession replays persisted model Markdown without parsing ge
     );
     try std.testing.expectEqual(@as(usize, 1), app.assistant_thematic_rule_count);
     try std.testing.expectEqual(@as(usize, 0), app.transcript.items.len);
-    try std.testing.expectEqual(@as(usize, 3), app.notices.items.len);
-    try std.testing.expectEqualStrings("● System: cancelled", app.notices.items[2]);
+    try std.testing.expectEqual(@as(usize, 2), app.notices.items.len);
+    try std.testing.expectEqualStrings("● System: cancelled", app.notices.items[1]);
 }
 
 test "resume Markdown replay releases undelivered table payloads once" {
@@ -9007,6 +8923,7 @@ test "fresh interactive session retains one writable schema-v3 handle" {
         .user_workspace,
         "configured/model",
         types.ReasoningEffort.literal("high"),
+        true,
         true,
     );
     try Runtime(TestApp).initializePersistence(&app, true);

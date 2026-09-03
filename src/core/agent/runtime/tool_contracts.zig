@@ -5,6 +5,8 @@ const diff = @import("../../output/diff.zig");
 const file_mutation = @import("../../tooling/file_mutation.zig");
 const session_permission_state = @import("../../permissions/session_permission_state.zig");
 const command_replay_store = @import("../../session/command_replay_store.zig");
+const result_commit = @import("../../tooling/result_commit.zig");
+const tool_dispatch = @import("../../tooling/tool_dispatch.zig");
 
 pub const vision = @import("vision_contracts.zig");
 
@@ -81,6 +83,7 @@ pub const ToolExecutionResult = struct {
     interactive_notice: ?types.SemanticNotice = null,
     context_notices: []const []const u8 = &.{},
     command_result_json: ?[]const u8 = null,
+    turn_control: ?tool_dispatch.TurnControl = null,
     web_search_completion: ?types.WebSearchCompletion = null,
     web_fetch_completion: ?types.WebFetchCompletion = null,
     inner_usage: ?types.ToolUsage = null,
@@ -91,6 +94,7 @@ pub const ToolExecutionResult = struct {
     committed_file_handoff: ?file_mutation.CommittedFileHandoff = null,
     deferred_tool_completion: ?DeferredToolCompletion = null,
     command_replay_capture: ?*command_replay_store.Capture = null,
+    result_commit: ?result_commit.Token = null,
 };
 
 test "tool result retains one memory payload across preparation" {

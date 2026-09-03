@@ -186,6 +186,10 @@ fn entryRetainedBytes(entry: TranscriptEntry) usize {
     };
 }
 
+pub fn entrySnapshotRetainedBytes(entry: TranscriptEntry) usize {
+    return @sizeOf(TranscriptEntry) +| entryRetainedBytes(entry);
+}
+
 fn dupeSkillTokenSpans(alloc: Allocator, skill_tokens: []const SkillTokenSpan) ![]SkillTokenSpan {
     if (skill_tokens.len == 0) return &.{};
     const copy = try alloc.alloc(SkillTokenSpan, skill_tokens.len);
@@ -438,6 +442,10 @@ fn pruneOrphanedCommandOutputBlocks(
     var changed = false;
     var i: usize = 0;
     while (i < self.command_output_blocks.items.len) {
+        if (self.command_output_blocks.items[i].live_entry_ids.items.len != 0) {
+            i += 1;
+            continue;
+        }
         if (self.command_output_display.open_command_block) |open| {
             if (open == i) {
                 i += 1;
@@ -1362,7 +1370,10 @@ pub fn flushRecordedCommandOutputSummaryAtomic(
 
     var shadow = try cloneRecordedMutationState(self, alloc);
     defer shadow.deinit(alloc);
-    const dirty_entry_id = command_output_runtime.openCommandOutputDirtyEntryId(&shadow);
+    const dirty_entry_id = command_output_runtime.commandOutputDirtyEntryIdForLifecycle(
+        &shadow,
+        lifecycle_id,
+    );
     const retention_changed = try command_output_runtime.flushCommandOutputSummaryUncommitted(
         &shadow,
         alloc,

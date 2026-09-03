@@ -248,59 +248,61 @@ function writeLegacySession(
 
 describe("cli: help", () => {
   test(
-    "fx help exits 0 and renders the complete navigation page",
+    "top-level help aliases render the same accurate navigation page",
     async () => {
-      const r = await runFx(["help"]);
-      expect(r.code).toBe(0);
-      expect(r.stderr).toBe("");
-      expect(r.stdout).not.toContain("\x1b[");
-      expect(r.stdout).not.toContain("\x1b]2;");
-      expect(r.stdout).toStartWith(
+      const outputs: string[] = [];
+      for (const args of [["help"], ["--help"], ["-h"]]) {
+        const result = await runFx(args);
+        expect(result.code).toBe(0);
+        expect(result.stderr).toBe("");
+        outputs.push(result.stdout);
+      }
+
+      expect(outputs[1]).toBe(outputs[0]);
+      expect(outputs[2]).toBe(outputs[0]);
+      const stdout = outputs[0]!;
+      expect(stdout).not.toContain("\x1b[");
+      expect(stdout).not.toContain("\x1b]2;");
+      expect(stdout).toStartWith(
         `𝒇x v${sourceVersion()}\nFast, native coding agent for the terminal.\n`,
       );
-      expect(r.stdout).toContain("Commands:\n");
-      expect(r.stdout).toContain("Run one noninteractive request");
-      expect(r.stdout).toContain("credits|balance");
-      expect(r.stdout).toContain("Flags:\n");
-      expect(r.stdout).toContain("--context-limit <spec>");
-      expect(r.stdout).toContain("Set name=bytes|off; repeatable");
-      expect(r.stdout).toContain("--add-dir <path>");
-      expect(r.stdout).toContain("--skills-dir <path>");
-      expect(r.stdout).toContain("--no-default-skills");
-      expect(r.stdout).toContain("-c, --continue");
-      expect(r.stdout).toContain("-r");
-      expect(r.stdout).toContain("Open the saved-session picker");
-      expect(r.stdout).not.toContain("-c, -r, --continue");
-      expect(r.stdout).toContain("--resume [last|<id>]");
-      expect(r.stdout).toContain("--resume-last");
-      expect(r.stdout).toContain("session resume [last|id]");
-      expect(r.stdout).toContain("-v, --version");
-      expect(r.stdout).not.toContain("Must appear before the command");
-      expect(r.stdout).toContain("Examples:\n");
-      expect(r.stdout).toContain("https://fx.sh/docs");
-      expect(r.stdout).toContain("run `/feedback` inside 𝒇x");
-      expect(r.stdout).not.toContain("  Work      ");
-      expect(r.stdout).not.toContain("\n\n\nRun `fx <command> --help`");
-    },
-    TIMEOUT,
-  );
-
-  test(
-    "fx --help exits 0",
-    async () => {
-      const r = await runFx(["--help"]);
-      expect(r.code).toBe(0);
-      expect(r.stdout).toContain("ask");
-    },
-    TIMEOUT,
-  );
-
-  test(
-    "fx -h exits 0",
-    async () => {
-      const r = await runFx(["-h"]);
-      expect(r.code).toBe(0);
-      expect(r.stdout).toContain("ask");
+      expect(stdout.match(/𝒇x/g) ?? []).toHaveLength(1);
+      expect(stdout).toContain("fx starts an interactive session by default.");
+      expect(stdout).toContain("Commands:\n");
+      expect(stdout).toContain("Run one noninteractive request");
+      expect(stdout).toContain("Sign in to a model provider");
+      expect(stdout).toContain("Sign out of a model provider");
+      expect(stdout).toContain("Choose the active model provider");
+      expect(stdout).toContain("Configure a Vercel AI Gateway API key");
+      expect(stdout).toContain("Choose a Vercel AI Gateway team");
+      expect(stdout).toContain("Show Vercel AI Gateway credits");
+      expect(stdout).not.toContain("Sign in to Vercel or a selected provider");
+      expect(stdout).toContain("credits|balance");
+      expect(stdout).toContain("Flags:\n");
+      expect(stdout).toContain("--context-limit <spec>");
+      expect(stdout).toContain("Set name=bytes|off; repeatable");
+      expect(stdout).toContain("--add-dir <path>");
+      expect(stdout).toContain("--skills-dir <path>");
+      expect(stdout).toContain("--no-default-skills");
+      expect(stdout).toContain("-c, --continue");
+      expect(stdout).toContain("-r");
+      expect(stdout).toContain("Open the saved-session picker");
+      expect(stdout).not.toContain("-c, -r, --continue");
+      expect(stdout).toContain("--resume [last|<id>]");
+      expect(stdout).toContain("--resume-last");
+      expect(stdout).toContain("session resume [last|id]");
+      expect(stdout).toContain("-v, --version");
+      expect(stdout).toContain("Print the fx version and exit");
+      expect(stdout).not.toContain("Must appear before the command");
+      expect(stdout).toContain("Examples:\n");
+      expect(stdout).toContain("https://fx.sh/docs");
+      expect(stdout).toContain("run `/feedback` inside fx");
+      expect(stdout).toContain(
+        "Run `fx <command> --help` for command-specific usage and options.",
+      );
+      expect(stdout).not.toContain("command-specific options and examples");
+      expect(stdout).not.toContain("  Work      ");
+      expect(stdout).not.toContain("\n\n\nRun `fx <command> --help`");
     },
     TIMEOUT,
   );
@@ -436,17 +438,28 @@ With --prompt-permissions, JSON and quiet requests may prompt on stderr only whe
 
   for (const alias of ["help", "--help", "-h"]) {
     test(
-      `fx ${alias} --record rejects the interactive-only modifier`,
+      `fx ${alias} hides developer recording surfaces`,
       async () => {
-        const r = await runFx([alias, "--record"]);
-        expect(r.code).not.toBe(0);
-        expect(r.stderr).toContain(
-          "usage: fx --record is only supported for interactive startup",
-        );
+        const r = await runFx([alias]);
+        expect(r.code).toBe(0);
+        expect(r.stdout).not.toContain("--record");
+        expect(r.stdout).not.toContain("replay <tape>");
+        expect(r.stderr).toBe("");
       },
       TIMEOUT,
     );
   }
+
+  test(
+    "fx rejects the removed record flag as unknown input",
+    async () => {
+      const r = await runFx(["--record"]);
+      expect(r.code).not.toBe(0);
+      expect(r.stderr).toContain("fx: unknown subcommand: --record");
+      expect(r.stderr).not.toContain("visual terminal capture:");
+    },
+    TIMEOUT,
+  );
 });
 
 describe("cli: version", () => {
@@ -2111,8 +2124,6 @@ describe("cli: read-only no-create matrix", () => {
     { args: ["sessions", "--json"], code: 0, kind: "sessions", count: 0 },
     { args: ["session", "last", "--json"], code: 1, error: "no saved sessions" },
     { args: ["session", "--id", "missing.valid-id", "--json"], code: 1, error: "record not found" },
-    { args: ["background", "--json"], code: 0, kind: "background", count: 0 },
-    { args: ["background", "999999", "--json"], code: 1, error: "no persisted records" },
     { args: ["doctor", "--json"], code: 0, kind: "doctor" },
   ] as const;
 
@@ -2910,11 +2921,11 @@ describe("cli: sessions", () => {
   );
 });
 
-describe("cli: removed delegated-task commands", () => {
+describe("cli: removed task and background commands", () => {
   test(
-    "fx task and fx tasks are unknown commands",
+    "fx task, fx tasks, and fx background are unknown commands",
     async () => {
-      for (const command of ["task", "tasks"]) {
+      for (const command of ["task", "tasks", "background"]) {
         const result = await runFx([command], { env: NO_GATEWAY_AUTH });
         expect(result.code).toBe(1);
         expect(`${result.stdout}\n${result.stderr}`).toContain("unknown subcommand");
@@ -2956,232 +2967,6 @@ describe("cli: removed delegated-task commands", () => {
     TIMEOUT,
   );
 });
-
-describe("cli: background", () => {
-  test(
-    "fx background --json returns valid background JSON",
-    async () => {
-      const root = mkdtempSync(join(tmpdir(), "fx-e2e-background-empty-"));
-      try {
-        const home = join(root, "home");
-        const workspace = join(root, "workspace");
-        mkdirSync(home, { recursive: true });
-        mkdirSync(workspace, { recursive: true });
-
-        const r = await runFx(["background", "--json"], {
-          cwd: workspace,
-          env: { HOME: home },
-        });
-        expect(r.code).toBe(0);
-        const json = JSON.parse(r.stdout.trim());
-        expect(json.kind).toBe("background");
-        expect(json).toHaveProperty("count");
-        expect(Array.isArray(json.records)).toBe(true);
-      } finally {
-        rmSync(root, { recursive: true, force: true });
-      }
-    },
-    TIMEOUT,
-  );
-
-  test(
-    "fx background --json revalidates saved workspace background records",
-    async () => {
-      const root = mkdtempSync(join(tmpdir(), "fx-e2e-background-"));
-      try {
-        const home = join(root, "home");
-        const workspace = join(root, "workspace");
-        const logs = join(root, "logs");
-        mkdirSync(home, { recursive: true });
-        mkdirSync(workspace, { recursive: true });
-        mkdirSync(logs, { recursive: true });
-
-        const workspaceRoot = realpathSync(workspace);
-        const liveLog = join(logs, "live.log");
-        const staleLog = join(logs, "stale.log");
-        writeFileSync(liveLog, "ready on http://localhost:48976\n");
-        writeFileSync(staleLog, "started once\n");
-
-        writeBackgroundSession({
-          home,
-          sessionId: "session-live",
-          workspaceRoot,
-          updatedAt: 20,
-          record: {
-            id: 1,
-            pid: String(process.pid),
-            command: "npm run dev",
-            cwd: workspaceRoot,
-            logPath: realpathSync(liveLog),
-            expectUrl: true,
-            state: "running",
-          },
-        });
-        writeBackgroundSession({
-          home,
-          sessionId: "session-stale",
-          workspaceRoot,
-          updatedAt: 10,
-          record: {
-            id: 2,
-            pid: "not-a-pid",
-            command: "npm run dev",
-            cwd: workspaceRoot,
-            logPath: realpathSync(staleLog),
-            expectUrl: true,
-            state: "running",
-          },
-        });
-
-        const r = await runFx(["background", "--json"], {
-          cwd: workspaceRoot,
-          env: { HOME: home },
-          timeoutMs: TIMEOUT,
-        });
-        expect(r.code).toBe(0);
-        const json = JSON.parse(r.stdout.trim());
-        expect(json.kind).toBe("background");
-        expect(json.count).toBe(2);
-
-        const records = json.records as BackgroundRecordJson[];
-        const live = records.find((record) => record.log_path === realpathSync(liveLog));
-        expect(live).toBeTruthy();
-        expect(live?.command).toBe("npm run dev");
-        expect(live?.state).toBe("stale");
-        expect(live?.server_url).toBeNull();
-        expect(live?.diagnostic).toContain("no process identity token");
-
-        const stale = records.find((record) => record.log_path === realpathSync(staleLog));
-        expect(stale).toBeTruthy();
-        expect(stale?.state).toBe("stale");
-        expect(stale?.diagnostic).toContain("pid is missing or invalid");
-      } finally {
-        rmSync(root, { recursive: true, force: true });
-      }
-    },
-    TIMEOUT,
-  );
-
-  test(
-    "fx background exact json reports corrupt records instead of hiding them as missing",
-    async () => {
-      const root = mkdtempSync(join(tmpdir(), "fx-e2e-background-corrupt-"));
-      try {
-        const home = join(root, "home");
-        const workspace = join(root, "workspace");
-        const logs = join(root, "logs");
-        mkdirSync(home, { recursive: true });
-        mkdirSync(workspace, { recursive: true });
-        mkdirSync(logs, { recursive: true });
-
-        const workspaceRoot = realpathSync(workspace);
-        const logPath = join(logs, "corrupt.log");
-        writeFileSync(logPath, "started\n");
-        writeBackgroundSession({
-          home,
-          sessionId: "background-corrupt",
-          workspaceRoot,
-          updatedAt: 20,
-          record: {
-            id: 1,
-            pid: "not-a-pid",
-            command: "npm run dev",
-            cwd: workspaceRoot,
-            logPath: realpathSync(logPath),
-            expectUrl: false,
-            state: "running",
-          },
-        });
-        const recordPath = join(
-          home,
-          ".fx",
-          "sessions",
-          "background-corrupt",
-          "background",
-          "1.json",
-        );
-        writeFileSync(recordPath, "{broken", { mode: 0o600 });
-
-        const result = await runFx(["background", "1", "--json"], {
-          cwd: workspaceRoot,
-          env: { HOME: home, ...NO_GATEWAY_AUTH },
-          timeoutMs: TIMEOUT,
-        });
-        expect(result.code).toBe(1);
-        expect(result.stderr).toBe("");
-        const json = JSON.parse(result.stdout.trim());
-        expect(json.kind).toBe("background");
-        expect(json.code).toBe("InvalidBackgroundRecord");
-      } finally {
-        rmSync(root, { recursive: true, force: true });
-      }
-    },
-    TIMEOUT,
-  );
-});
-
-type BackgroundRecordJson = {
-  log_path: string;
-  command: string;
-  state: string;
-  server_url?: string | null;
-  diagnostic?: string | null;
-};
-
-function writeBackgroundSession(args: {
-  home: string;
-  sessionId: string;
-  workspaceRoot: string;
-  updatedAt: number;
-  record: {
-    id: number;
-    pid: string;
-    command: string;
-    cwd: string;
-    logPath: string;
-    expectUrl: boolean;
-    state: string;
-  };
-}): void {
-  const sessionDir = join(args.home, ".fx", "sessions", args.sessionId);
-  const backgroundDir = join(sessionDir, "background");
-  mkdirSync(backgroundDir, { recursive: true, mode: 0o700 });
-  chmodSync(sessionDir, 0o700);
-  chmodSync(backgroundDir, 0o700);
-  writeFileSync(
-    join(sessionDir, "session.json"),
-    JSON.stringify({
-      schema_version: 1,
-      id: args.sessionId,
-      created_at_ms: 1,
-      updated_at_ms: args.updatedAt,
-      workspace_root: args.workspaceRoot,
-      conversation_language: "en",
-      history_len: 0,
-      history: [],
-    }),
-    { mode: 0o600 },
-  );
-  writeFileSync(
-    join(backgroundDir, `${args.record.id}.json`),
-    JSON.stringify({
-      schema_version: 1,
-      id: args.record.id,
-      started_at_ms: 1,
-      updated_at_ms: args.updatedAt,
-      pid: args.record.pid,
-      command: args.record.command,
-      cwd: args.record.cwd,
-      log_path: args.record.logPath,
-      expect_url: args.record.expectUrl,
-      server_url: null,
-      exit_code: null,
-      state: args.record.state,
-      diagnostic: null,
-    }),
-    { mode: 0o600 },
-  );
-}
 
 function modelsGatewayEnv(home: string, modelsUrl: string) {
   return {
@@ -3959,7 +3744,7 @@ describe("cli: ask success", () => {
           "explicit skill ask complete",
         );
         expect(gateway.requests).toHaveLength(1);
-        expect(gateway.modelRequests).toHaveLength(0);
+        expect(gateway.modelRequests).toHaveLength(1);
         expect(gateway.requests[0]!.body).toContain(
           "Explicitly invoked skill content for this query:",
         );
@@ -4020,7 +3805,7 @@ describe("cli: ask success", () => {
         }
 
         expect(gateway.requests).toHaveLength(sizes.length);
-        expect(gateway.modelRequests).toHaveLength(0);
+        expect(gateway.modelRequests).toHaveLength(sizes.length);
       } finally {
         gateway.stop();
         rmSync(root, { recursive: true, force: true });
