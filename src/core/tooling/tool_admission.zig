@@ -146,7 +146,14 @@ pub fn callUsesCommandAuthority(
     if (tool.executor_kind == .run_command) return true;
     const expected_action = tool.captured_command_action orelse return false;
     const args = try tool_args.parseToolArgsObject(arena, call.arguments_json);
-    const action = tool_args.optionalStringArg(args, "action") orelse return false;
+    // The model-facing request may still be wrapped, or may already have been
+    // normalized for internal dispatch. Both name the same command authority,
+    // and a narrowed tool selection admits the wrapped form directly.
+    const arguments = if (args.get("request")) |request| switch (request) {
+        .object => |object| object,
+        else => args,
+    } else args;
+    const action = tool_args.optionalStringArg(arguments, "action") orelse return false;
     return std.mem.eql(u8, action, expected_action);
 }
 

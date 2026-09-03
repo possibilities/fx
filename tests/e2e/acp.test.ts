@@ -1133,16 +1133,18 @@ describe("acp: model-independent", () => {
       const forbiddenCallId = "terminal_exec_only_start";
       const allowedCallId = "terminal_exec_only_exec";
       const gateway = startFakeGateway([
-        fakeGatewayToolCall(forbiddenCallId, "terminal", {
+        fakeGatewayToolCall(forbiddenCallId, "shell", {
           action: "start",
           command: `printf started > '${forbiddenMarker}'`,
           profile: "clean",
         }),
-        fakeGatewayToolCall(allowedCallId, "terminal", {
-          action: "exec",
-          command: `printf allowed > '${allowedMarker}'`,
-          cwd: root.workspace,
-          timeout_ms: 5_000,
+        fakeGatewayToolCall(allowedCallId, "shell", {
+          request: {
+            action: "run",
+            command: `printf allowed > '${allowedMarker}'`,
+            cwd: root.workspace,
+            timeout_ms: 5_000,
+          },
         }),
         finalText("ACP selected tools complete"),
       ]);
@@ -1171,17 +1173,23 @@ describe("acp: model-independent", () => {
         const first = acpGatewayRequest(gateway.requests[0]!.body);
         expect(first.tools.map((tool) => tool.name)).toEqual([
           "read_file",
-          "terminal",
+          "shell",
         ]);
-        const terminal = first.tools.find((tool) => tool.name === "terminal");
+        // The selector keeps its `terminal:exec` spelling; upstream advertises
+        // the tool itself to the model as `shell`.
+        const terminal = first.tools.find((tool) => tool.name === "shell");
         const terminalSchema = JSON.stringify(terminal?.inputSchema);
-        expect(terminalSchema).toContain('"exec"');
+        // One-shot only: the advertised action enum admits `run` and nothing
+        // that could start, address, or retain an interactive session.
+        expect(terminalSchema).toContain('"enum":["run"]');
         expect(terminalSchema).not.toContain('"start"');
+        expect(terminalSchema).not.toContain('"interact"');
+        expect(terminalSchema).not.toContain('"stop"');
         expect(terminalSchema).not.toContain('"session_id"');
         expect(
           acpToolResultText(gateway.requests[1]!.body, forbiddenCallId),
         ).toContain(
-          "terminal:exec selection permits only one-shot exec actions",
+          "terminal:exec selection permits only one-shot shell.run requests",
         );
         expect(
           result.messages
@@ -7789,9 +7797,15 @@ describe("acp: model-independent", () => {
         expect(result.promptResult.result.stopReason).toBe("end_turn");
         await waitForCondition("canonical child completion", () => gateway.requests.length === 3);
         expect(gateway.requests).toHaveLength(3);
+        const advertised = gateway.requests.map((request) =>
+          acpGatewayRequest(request.body).tools.map((tool) => tool.name)
+        );
+        // The parent keeps the whole selection. Its canonical child inherits
+        // that selection without `subagent`, because a child may not delegate.
+        expect(advertised[0]).toEqual(["subagent", "read_file"]);
+        expect(advertised[1]).toEqual(["read_file"]);
+        expect(advertised[2]).toEqual(["subagent", "read_file"]);
         for (const request of gateway.requests) {
-          expect(acpGatewayRequest(request.body).tools.map((tool) => tool.name))
-            .toEqual(["subagent", "read_file"]);
           expect(request.body).not.toContain('"name":"task"');
         }
         expect(client.stderr).toBe("");
