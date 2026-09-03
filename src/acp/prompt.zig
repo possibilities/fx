@@ -357,18 +357,9 @@ const AcpContext = struct {
     }
 
     fn toolRegistry(self: *const AcpContext) tool_dispatch.Registry {
-        return activeToolSet(self.state).registry;
+        return server.activeToolSet(self.state).registry;
     }
 };
-
-fn activeToolSet(state: *const server.ServerState) tool_set_contract.ToolSet {
-    return nativeToolSet(state.cfg.allow_native_tools);
-}
-
-fn nativeToolSet(allow_native_tools: bool) tool_set_contract.ToolSet {
-    if (comptime host_target.is_wasm) return tool_set_contract.empty;
-    return if (allow_native_tools) builtin_tools.advertisement_set else tool_set_contract.empty;
-}
 
 const AcpElicitationResponderContext = struct {
     const AcceptedLegacyUrl = struct {
@@ -573,7 +564,7 @@ pub fn handlePrompt(
         recovery_checkpoint = try checkpoint.dupe(alloc);
     }
 
-    var tool_projection = try state.cfg.mode_registry.buildModelToolProjection(alloc, activeToolSet(state), captured_mode, .{
+    var tool_projection = try state.cfg.mode_registry.buildModelToolProjection(alloc, server.activeToolSet(state), captured_mode, .{
         .permission_mode = captured_permission_mode,
         .permission_rules = session.permission_rules,
         .mcp_runtime = session.mcp,
@@ -735,7 +726,7 @@ pub fn runSubagentChild(
     defer ctx.deinitPublishedToolCalls();
     var child_projection = state.cfg.mode_registry.buildModelToolProjection(
         alloc,
-        activeToolSet(state),
+        server.activeToolSet(state),
         captured_mode,
         .{
             .permission_mode = admission.permission_mode,
@@ -778,9 +769,27 @@ pub fn runSubagentChild(
 }
 
 test "ACP native tool gate keeps the native set empty" {
-    try std.testing.expectEqual(@as(usize, 0), nativeToolSet(false).registry.tools.len);
+    var state: server.ServerState = undefined;
+    state.cfg.allow_native_tools = false;
+    state.cfg.native_tool_set = builtin_tools.advertisement_set;
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        server.activeToolSet(&state).registry.tools.len,
+    );
     if (comptime !host_target.is_wasm) {
-        try std.testing.expect(nativeToolSet(true).registry.tools.len > 0);
+        state.cfg.allow_native_tools = true;
+        state.cfg.native_tool_set = null;
+        try std.testing.expect(server.activeToolSet(&state).registry.tools.len > 0);
+        const selected = tool_set_contract.ToolSet{
+            .registry = .{ .tools = builtin_tools.registry.tools[0..1] },
+            .order = builtin_tools.advertisement_set.order[0..1],
+            .read_only_tool_names = &.{},
+        };
+        state.cfg.native_tool_set = selected;
+        try std.testing.expectEqual(
+            @as(usize, 1),
+            server.activeToolSet(&state).registry.tools.len,
+        );
     }
 }
 
@@ -1253,7 +1262,7 @@ fn validateToolCall(raw_ctx: *anyopaque, arena: Allocator, call: ToolCall) !agen
     const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
     if (ctx.state.active_session) |session| {
         const mode = ctx.captured_mode orelse session.mode;
-        if (try ctx.state.cfg.mode_registry.toolPolicyDeniedJson(arena, activeToolSet(ctx.state), mode, call.name)) |reason| {
+        if (try ctx.state.cfg.mode_registry.toolPolicyDeniedJson(arena, server.activeToolSet(ctx.state), mode, call.name)) |reason| {
             return .{ .failure = reason };
         }
     }

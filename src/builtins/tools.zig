@@ -162,6 +162,26 @@ const shell_process_request_properties = [_]model_tool_schema.Property{.{
     .shape = &.{ .object = &shell_process_action_union_schema },
 }};
 
+const shell_one_shot_run_properties = [_]model_tool_schema.Property{
+    shell_run_properties[0],
+    shell_run_properties[1],
+    shell_run_properties[2],
+    shell_run_properties[3],
+    .{ .name = "timeout_ms", .json_type = .integer, .bounds = &.{ .minimum = 1, .maximum = managed_execution_contract.max_yield_time_ms }, .description = "Optional one-shot deadline, bounded to 30000 ms." },
+};
+
+const shell_one_shot_action_schema = model_tool_schema.ObjectSchema{
+    .properties = &shell_one_shot_run_properties,
+    .required = &.{ "action", "command" },
+    .additional_properties = false,
+};
+
+const shell_one_shot_request_properties = [_]model_tool_schema.Property{.{
+    .name = "request",
+    .json_type = .object,
+    .shape = &.{ .object = &shell_one_shot_action_schema },
+}};
+
 const skill_description =
     "Read an installed skill or one of its relative text resources in bounded chunks. Pass the exact advertised location when one is listed, then use next_offset to continue. When to use: the user explicitly invokes a listed skill or the task clearly matches one. When NOT to use: generic exploration, ordinary file edits, guessing from vague words, or installing a missing skill.";
 const capability_search_description =
@@ -507,6 +527,81 @@ const shell_process_only = blk: {
 
 pub fn shellProcessOnlySpec() ToolSpec {
     return shell_process_only;
+}
+
+const shell_one_shot_only = blk: {
+    var spec = shell;
+    spec.model_schema = .{
+        .name = "shell",
+        .description = shell_description,
+        .input_schema = .{
+            .properties = &shell_one_shot_request_properties,
+            .required = &.{"request"},
+            .additional_properties = false,
+        },
+    };
+    spec.decode = decodeShellOneShotOnly;
+    spec.call = shell_impl.callOneShot;
+    break :blk spec;
+};
+
+fn decodeShellOneShotOnly(
+    ctx: tool_dispatch.DispatchContext,
+    args_json: []const u8,
+) tool_dispatch.DispatchError!tool_dispatch.DecodeResult {
+    var arena_state = std.heap.ArenaAllocator.init(ctx.allocator);
+    defer arena_state.deinit();
+    const raw = std.json.parseFromSliceLeaky(
+        std.json.Value,
+        arena_state.allocator(),
+        args_json,
+        .{ .allocate = .alloc_always },
+    ) catch return shellOneShotDecodeFailure(ctx);
+    if (raw != .object) return shellOneShotDecodeFailure(ctx);
+
+    var payload = &raw.object;
+    if (raw.object.count() == 1) {
+        if (raw.object.getPtr("request")) |request| {
+            if (request.* != .object) return shellOneShotDecodeFailure(ctx);
+            payload = &request.object;
+        }
+    }
+    for (payload.keys()) |field| {
+        if (!nameInSet(&.{ "action", "command", "cwd", "profile", "timeout_ms" }, field)) {
+            return shellOneShotDecodeFailure(ctx);
+        }
+    }
+    const action = payload.get("action") orelse
+        return shellOneShotDecodeFailure(ctx);
+    if (action != .string or !std.mem.eql(u8, action.string, "run")) {
+        return shellOneShotDecodeFailure(ctx);
+    }
+    if (payload.get("timeout_ms")) |timeout| {
+        if (timeout != .integer or timeout.integer < 1 or
+            timeout.integer > managed_execution_contract.max_yield_time_ms)
+        {
+            return shellOneShotDecodeFailure(ctx);
+        }
+    }
+    if (payload == &raw.object) return shell_impl.decode(ctx, args_json);
+
+    var flattened: std.Io.Writer.Allocating = .init(arena_state.allocator());
+    std.json.Stringify.value(std.json.Value{ .object = payload.* }, .{}, &flattened.writer) catch
+        return error.OutOfMemory;
+    return shell_impl.decode(ctx, flattened.written());
+}
+
+pub fn terminalExecOnlySpec() ToolSpec {
+    return shell_one_shot_only;
+}
+
+fn shellOneShotDecodeFailure(
+    ctx: tool_dispatch.DispatchContext,
+) tool_dispatch.DispatchError!tool_dispatch.DecodeResult {
+    return .{ .failure = try ctx.allocator.dupe(
+        u8,
+        "terminal:exec selection permits only one-shot shell.run requests",
+    ) };
 }
 
 pub const capability_search = ToolSpec{
@@ -1079,6 +1174,59 @@ test "process-only shell retains observation without tty input" {
     }
     for ([_][]const u8{ "\"chars\":", "\"tty\":", "\"shell\":{" }) |field| {
         try std.testing.expect(std.mem.find(u8, schema_json, field) == null);
+    }
+}
+
+test "terminal exec selection exposes and decodes only bounded one-shot shell runs" {
+    const alloc = std.testing.allocator;
+    const spec = terminalExecOnlySpec();
+    const schema_json = try tool_specs.toolGatewaySchemaJson(alloc, spec);
+    defer alloc.free(schema_json);
+
+    try std.testing.expectEqualStrings("shell", spec.name);
+    try std.testing.expect(std.mem.find(u8, schema_json, "\"run\"") != null);
+    for ([_][]const u8{
+        "\"interact\"",
+        "\"stop\"",
+        "\"session_id\"",
+        "\"chars\"",
+        "\"tty\"",
+        "\"shell\":",
+        "\"yield_time_ms\"",
+    }) |forbidden| {
+        try std.testing.expect(std.mem.find(u8, schema_json, forbidden) == null);
+    }
+
+    var decoded = try spec.decode(.{ .allocator = alloc }, "{\"request\":{\"action\":\"run\",\"command\":\"printf ok\",\"timeout_ms\":5000}}");
+    switch (decoded) {
+        .input => |input| input.deinit(alloc),
+        .failure => |message| {
+            defer alloc.free(message);
+            return error.TestUnexpectedResult;
+        },
+    }
+
+    for ([_][]const u8{
+        "{\"request\":{\"action\":\"interact\",\"session_id\":\"shell-1\"}}",
+        "{\"request\":{\"action\":\"stop\",\"session_id\":\"shell-1\"}}",
+        "{\"request\":{\"action\":\"run\",\"command\":\"printf no\",\"tty\":true}}",
+        "{\"request\":{\"action\":\"run\",\"command\":\"printf no\",\"yield_time_ms\":0}}",
+        "{\"request\":{\"action\":\"run\",\"command\":\"printf no\",\"timeout_ms\":30001}}",
+    }) |arguments| {
+        decoded = try spec.decode(.{ .allocator = alloc }, arguments);
+        switch (decoded) {
+            .input => |input| {
+                input.deinit(alloc);
+                return error.TestUnexpectedResult;
+            },
+            .failure => |message| {
+                defer alloc.free(message);
+                try std.testing.expectEqualStrings(
+                    "terminal:exec selection permits only one-shot shell.run requests",
+                    message,
+                );
+            },
+        }
     }
 }
 
