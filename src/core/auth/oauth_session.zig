@@ -662,7 +662,7 @@ fn loadFromDir(alloc: Allocator, fx_dir: *std.Io.Dir, mode: LoadMode) !?Session 
         error.OutOfMemory => return err,
         else => {
             debug_trace.logf("auth", "session load failed step=parse err={s}", .{@errorName(err)});
-            return null;
+            if (mode == .tolerate_open_failure) return null else return err;
         },
     };
 }
@@ -1326,6 +1326,26 @@ test "OAuth mutation loads report auth file open failures" {
     try std.testing.expect((try loadFromDir(std.testing.allocator, &tmp.dir, .tolerate_open_failure)) == null);
     try std.testing.expectError(
         error.SymLinkLoop,
+        loadFromDir(std.testing.allocator, &tmp.dir, .report_open_failure),
+    );
+}
+
+test "OAuth mutation distinguishes an invalid session from an absent session" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var file = try tmp.dir.createFile(std.testing.io, auth_file_name, .{
+        .permissions = std.Io.File.Permissions.fromMode(0o600),
+    });
+    try file.writeStreamingAll(std.testing.io, "{\"version\":2}\n");
+    file.close(std.testing.io);
+
+    try std.testing.expect((try loadFromDir(
+        std.testing.allocator,
+        &tmp.dir,
+        .tolerate_open_failure,
+    )) == null);
+    try std.testing.expectError(
+        error.InvalidAuthSession,
         loadFromDir(std.testing.allocator, &tmp.dir, .report_open_failure),
     );
 }
