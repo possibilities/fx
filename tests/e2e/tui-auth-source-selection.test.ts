@@ -532,6 +532,7 @@ function startFakeChatGptOAuth(
   let responseCount = 0;
   let models = [
     { slug: "gpt-5.6-sol", visibility: "list", supported_in_api: true, supported_reasoning_levels: [{ effort: "max" }, { effort: "high" }], additional_speed_tiers: ["fast"], input_modalities: ["text", "image"], context_window: 272000 },
+    { slug: "gpt-5.6-luna", visibility: "list", supported_in_api: true, supported_reasoning_levels: [{ effort: "medium" }], additional_speed_tiers: [], input_modalities: ["text"], context_window: 272000 },
     { slug: "gpt-5.4-mini", visibility: "list", supported_in_api: true, supported_reasoning_levels: [{ effort: "low" }], additional_speed_tiers: [], input_modalities: ["text"], context_window: 128000 },
   ];
   const requests: Array<{
@@ -891,6 +892,7 @@ function startFakeCodexToolLoop(options: {
       if (new URL(request.url).pathname === "/models") {
         return Response.json({ models: [
           { slug: "gpt-5.6-sol", visibility: "list", supported_in_api: true, supported_reasoning_levels: [{ effort: "high" }], additional_speed_tiers: [], input_modalities: inputModalities, context_window: 272000 },
+          { slug: "gpt-5.6-luna", visibility: "list", supported_in_api: true, supported_reasoning_levels: [{ effort: "medium" }], additional_speed_tiers: [], input_modalities: ["text"], context_window: 272000 },
           { slug: "gpt-5.4-mini", visibility: "list", supported_in_api: true, supported_reasoning_levels: [{ effort: "low" }], additional_speed_tiers: [], input_modalities: ["text"], context_window: 128000 },
         ] });
       }
@@ -931,6 +933,7 @@ function startFakeCodexCapacityLoop() {
       if (new URL(request.url).pathname === "/models") {
         return Response.json({ models: [
           { slug: "gpt-5.6-sol", visibility: "list", supported_in_api: true, supported_reasoning_levels: [{ effort: "high" }], additional_speed_tiers: [], input_modalities: ["text"], context_window: 272000 },
+          { slug: "gpt-5.6-luna", visibility: "list", supported_in_api: true, supported_reasoning_levels: [{ effort: "medium" }], additional_speed_tiers: [], input_modalities: ["text"], context_window: 272000 },
         ] });
       }
       bodies.push(await request.text());
@@ -1021,13 +1024,13 @@ function startFakeCodexAutoReview() {
       if (path === "/models") {
         return Response.json({ models: [
           { slug: "gpt-5.6-sol", visibility: "list", supported_in_api: true, supported_reasoning_levels: [{ effort: "high" }], additional_speed_tiers: [], input_modalities: ["text"], context_window: 272000 },
-          { slug: "gpt-5.4-mini", visibility: "list", supported_in_api: true, supported_reasoning_levels: [{ effort: "low" }], additional_speed_tiers: [], input_modalities: ["text"], context_window: 128000 },
+          { slug: "gpt-5.6-luna", visibility: "list", supported_in_api: true, supported_reasoning_levels: [{ effort: "medium" }], additional_speed_tiers: [], input_modalities: ["text"], context_window: 272000 },
         ] });
       }
       const body = await request.text();
       bodies.push(body);
       const model = (JSON.parse(body) as { model?: string }).model;
-      if (model === "gpt-5.4-mini") {
+      if (model === "gpt-5.6-luna") {
         return new Response(
           'data: {"type":"response.output_item.added","output_index":0,"item":{"type":"function_call","call_id":"call_permission","name":"permission_decision"}}\n\n' +
             'data: {"type":"response.function_call_arguments.done","output_index":0,"arguments":"{\\"risk\\":\\"low\\",\\"decision\\":\\"clear\\",\\"rationale\\":\\"The user requested this harmless command.\\"}"}\n\n' +
@@ -1423,6 +1426,7 @@ tmuxTest(
     await session.waitForText("model_source=Codex subscription", TIMEOUT);
     chatgptOauth.setModels([
       { slug: "gpt-5.4-mini", visibility: "list", supported_in_api: true, supported_reasoning_levels: [{ effort: "low" }], additional_speed_tiers: [], input_modalities: ["text"], context_window: 128000 },
+      { slug: "gpt-5.6-luna", visibility: "list", supported_in_api: true, supported_reasoning_levels: [{ effort: "medium" }], additional_speed_tiers: [], input_modalities: ["text"], context_window: 272000 },
     ]);
     await openProviderPicker(session);
     await session.sendKeys("Down");
@@ -2563,6 +2567,7 @@ test(
     const modelIds = (JSON.parse(models.stdout) as { models: Array<{ id: string }> }).models
       .map((model) => model.id);
     expect(modelIds).toContain("gpt-5.6-sol");
+    expect(modelIds).toContain("gpt-5.6-luna");
     expect(modelIds).toContain("gpt-5.4-mini");
     expect(modelIds.some((id) => id.includes("openai-codex/"))).toBe(false);
 
@@ -3530,7 +3535,7 @@ test(
 );
 
 test(
-  "Codex automatic review uses gpt-5.4-mini while Gateway review stays untouched",
+  "Codex automatic review uses gpt-5.6-luna while Gateway review stays untouched",
   async () => {
     home = mkdtempSync(join(tmpdir(), "fx-codex-auto-review-"));
     writeFileSync(join(home, "provider-review-existing.txt"), "before\n");
@@ -3570,7 +3575,7 @@ test(
       expect(result.stdout).toContain("CODEX_AUTO_REVIEW_OK");
       expect(readFileSync(join(home, "provider-review-existing.txt"), "utf8")).toBe("reviewed");
       expect(codex.bodies.map((body) => (JSON.parse(body) as { model: string }).model))
-        .toEqual(["gpt-5.6-sol", "gpt-5.4-mini", "gpt-5.6-sol"]);
+        .toEqual(["gpt-5.6-sol", "gpt-5.6-luna", "gpt-5.6-sol"]);
       expect(codex.bodies[1]).toContain('"name":"permission_decision"');
       expect(codex.bodies[2]).toContain('"type":"function_call_output"');
       expect(codex.bodies[2]).toContain('\\"exit_code\\":0');
@@ -3587,7 +3592,7 @@ test(
         request_count: 3,
         models: [
           { model: "codex/gpt-5.6-sol", request_count: 2 },
-          { model: "codex/gpt-5.4-mini", request_count: 1 },
+          { model: "codex/gpt-5.6-luna", request_count: 1 },
         ],
         pending: [],
       });
@@ -3668,7 +3673,7 @@ test(
 );
 
 test(
-  "Grok automatic review reuses the admitted Grok model and never reaches Gateway",
+  "Grok automatic review uses grok-4.5 and never reaches Gateway",
   async () => {
     home = mkdtempSync(join(tmpdir(), "fx-grok-auto-review-"));
     writeFileSync(join(home, "provider-review-existing.txt"), "before\n");
@@ -3709,17 +3714,17 @@ test(
       expect(result.stdout).toContain("GROK_AUTO_REVIEW_OK");
       expect(readFileSync(join(home, "provider-review-existing.txt"), "utf8")).toBe("reviewed");
       expect(grok.bodies.map((body) => (JSON.parse(body) as { model: string }).model))
-        .toEqual(["grok-4.20", "grok-4.20", "grok-4.20"]);
+        .toEqual(["grok-4.20", "grok-4.5", "grok-4.20"]);
       expect(grok.bodies[1]).toContain('"name":"permission_decision"');
       expect(grok.bodies[2]).toContain('"type":"function_call_output"');
       expect(grok.bodies[2]).toContain('\\"exit_code\\":0');
       expect(grok.headers).toHaveLength(3);
-      for (const headers of grok.headers) {
+      for (const [index, headers] of grok.headers.entries()) {
         expect(headers.tokenAuth).toBe("xai-grok-cli");
         expect(headers.authenticateResponse).toBe("authenticate-response");
         expect(headers.clientIdentifier).toBe("fx");
         expect(headers.clientVersion).toBe("1.0.6");
-        expect(headers.modelOverride).toBe("grok-4.20");
+        expect(headers.modelOverride).toBe(index === 1 ? "grok-4.5" : "grok-4.20");
         expect(headers.grokUserId).toBe("acct_auto_review");
       }
       for (const request of gateway.requests) {
@@ -3733,7 +3738,10 @@ test(
         input_tokens: 20,
         output_tokens: 8,
         request_count: 3,
-        models: [{ model: "grok/grok-4.20", request_count: 3 }],
+        models: [
+          { model: "grok/grok-4.20", request_count: 2 },
+          { model: "grok/grok-4.5", request_count: 1 },
+        ],
         pending: [],
       });
     } finally {
