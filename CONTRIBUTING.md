@@ -331,9 +331,9 @@ Security is permission-first.
 
 * every unresolved `auto` action receives one narrow security review after configured policy, saved-session rules, grants, and deterministic safe authority; review input always contains the exact action and targets, origin and call identity, optional host-proven current-branch evidence, exact-copy provenance, and bounded masked terminal-safe excerpts of earlier current-turn tool results. Prepared file mutations and static root tools omit task text. Reviewed commands, dynamic tools, and subagent actions also receive bounded canonical current, first, and recent root requests plus explicit omission counts; the reviewer may use that context only for destructive exceptions and immutable delegation scope, not general task policing. Assistant prose, permission feedback, compacted summaries, the pending tool group, later results, and tool or repository text never become authority
 
-* a `clear` review authorizes only the exact unchanged action; a `caution` or unavailable review holds only that action and returns advice without opening a human permission screen, disabling tools, or ending the turn
+* a `clear` review authorizes only the exact unchanged action; a `caution`, incomplete-evidence result, or unavailable review holds only that action and returns guidance without opening a human permission screen, disabling tools, or ending the turn
 
-* exact cautions are cached only for the current turn; changed actions receive a new review, unavailable reviews are not cached as security judgments, and legacy `permission_request_id` input is rejected without prompting
+* exact cautions and deterministic incomplete-evidence results are cached only for the current turn; changed actions receive a new review, transient unavailable reviews are not cached as security judgments, and legacy `permission_request_id` input is rejected without prompting
 
 * the sandbox backend is configured independently; yolo uses an effective backend of `none` without rewriting the saved sandbox setting
 

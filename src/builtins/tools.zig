@@ -85,7 +85,7 @@ const shell_interact_properties = [_]model_tool_schema.Property{
     .{ .name = "action", .json_type = .string, .shape = &.{ .enum_values = &.{"interact"} } },
     .{ .name = "session_id", .json_type = .string, .description = "Owned execution handle returned by shell.run." },
     .{ .name = "chars", .json_type = .string, .bounds = &.{ .max_length = terminal_contracts.max_write_bytes }, .description = "Exact characters to send to tty=true work before observing it. Omit or send an empty string to only observe. Observe application readiness before sending control characters. Use \\n for Enter and JSON escapes such as \\u0003 for control characters." },
-    .{ .name = "yield_time_ms", .json_type = .integer, .bounds = &.{ .minimum = 0, .maximum = managed_execution_contract.max_wait_ceiling_ms }, .description = "Observation window after optional input. Defaults to 5000; use 0 for an immediate snapshot. If the process remains running, interact with the same session_id again; never rerun it." },
+    .{ .name = "yield_time_ms", .json_type = .integer, .bounds = &.{ .minimum = 0, .maximum = managed_execution_contract.max_wait_ceiling_ms }, .description = "Wait before yielding output. Empty observations wait 5000-300000 ms; shorter values are raised to 5000. Non-empty input is capped at 30000 ms and keeps shorter requested waits. Defaults to 5000. If the process remains running, interact with the same session_id again; never rerun it." },
 };
 
 const shell_stop_properties = [_]model_tool_schema.Property{
@@ -221,7 +221,7 @@ const subagent_model_request_properties = [_]model_tool_schema.Property{.{
 const vision_description =
     "Inspect authorized images attached by the user or local image paths supplied in the conversation, and return structured factual evidence. Pass exactly one source: image_ids for attached images, or paths for local images. When to use: read visible text, UI state, objects, layout, or other visual details needed for the task. When NOT to use: inspect paths the user did not supply, infer details not visible in an image, or repeat evidence already available in the conversation.";
 const read_tool_result_description =
-    "Read a stored tool result or captured command output by opaque handle from the active session or process, using a bounded byte range or literal query. When to use: inspect more after a tool-result preview or command-output handle says retained output is available. When NOT to use: read arbitrary files, search the workspace, recover secrets, or inspect results from another session or process.";
+    "Read a stored tool result or captured command output by opaque handle from the active session or process. Pass request.query to find a known literal line; otherwise use the optional request byte range. When to use: inspect more after a tool-result preview or command-output handle says retained output is available. When NOT to use: read arbitrary files, search the workspace, recover secrets, or inspect results from another session or process.";
 
 pub const glob_files = ToolSpec{
     .name = "glob_files",
@@ -232,7 +232,7 @@ pub const glob_files = ToolSpec{
         .input_schema = .{
             .properties = &.{
                 .{ .name = "pattern", .json_type = .string, .description = "Glob pattern to match, such as src/**/*.zig or *.md." },
-                .{ .name = "path", .json_type = .string, .description = "Optional search root relative to the workspace root, or an external path using an absolute path, ~/..., or a relative workspace escape such as ../...; external access is subject to permission policy. Defaults to current directory; narrow it when possible." },
+                .{ .name = "path", .json_type = .string, .bounds = &.{ .min_length = 1 }, .description = "Optional search root relative to the workspace root, or an external path using an absolute path, ~/..., or a relative workspace escape such as ../...; external access is subject to permission policy. Omit this field to use the current directory; never send an empty string. Narrow it when possible." },
                 .{ .name = "mode", .json_type = .string, .shape = &.{ .enum_values = &.{ "matches", "count" } }, .description = "Use matches to return sample paths, or count to return an exact matching path count without listing entries." },
             },
             .required = &.{"pattern"},
@@ -262,7 +262,7 @@ pub const grep_files = ToolSpec{
         .input_schema = .{
             .properties = &.{
                 .{ .name = "pattern", .json_type = .string, .description = "Literal plain-text pattern to search for." },
-                .{ .name = "path", .json_type = .string, .description = "Optional search root relative to the workspace root, or an external path using an absolute path, ~/..., or a relative workspace escape such as ../...; external access is subject to permission policy. Defaults to current directory; narrow it when possible." },
+                .{ .name = "path", .json_type = .string, .bounds = &.{ .min_length = 1 }, .description = "Optional search root relative to the workspace root, or an external path using an absolute path, ~/..., or a relative workspace escape such as ../...; external access is subject to permission policy. Omit this field to use the current directory; never send an empty string. Narrow it when possible." },
                 .{ .name = "include", .json_type = .string, .description = "Optional glob pattern applied to candidate file paths before reading files, such as *.zig or src/**/*.ts." },
                 .{ .name = "case_insensitive", .json_type = .boolean, .description = "Search case-insensitively when true." },
                 .{ .name = "mode", .json_type = .string, .shape = &.{ .enum_values = &.{ "matches", "files_with_matches", "count" } }, .description = "Use matches for line matches, files_with_matches for unique matching paths, or count for exact matching-line and matching-file counts." },
@@ -778,6 +778,26 @@ pub const vision = ToolSpec{
     .irreversible_fn = vision_impl.isIrreversible,
 };
 
+const read_tool_result_range_properties = [_]model_tool_schema.Property{
+    .{ .name = "handle", .json_type = .string, .description = "Opaque handle from a prior tool-result preview or captured command output." },
+    .{ .name = "start_byte", .json_type = .integer, .description = "Optional 1-based byte offset. Defaults to 1." },
+    .{ .name = "byte_count", .json_type = .integer, .description = "Optional positive byte count. Bounded by the tool." },
+};
+
+const read_tool_result_query_properties = [_]model_tool_schema.Property{
+    .{ .name = "handle", .json_type = .string, .description = "Opaque handle from a prior tool-result preview or captured command output." },
+    .{ .name = "query", .json_type = .string, .bounds = &.{ .min_length = 1, .max_length = lexical_relevance.max_query_bytes }, .description = "Non-empty literal line query." },
+};
+
+const read_tool_result_input_schemas = [_]model_tool_schema.ObjectSchema{
+    .{ .properties = &read_tool_result_range_properties, .required = &.{"handle"}, .additional_properties = false },
+    .{ .properties = &read_tool_result_query_properties, .required = &.{ "handle", "query" }, .additional_properties = false },
+};
+
+const read_tool_result_request_schema = model_tool_schema.ObjectSchema{
+    .one_of = &read_tool_result_input_schemas,
+};
+
 pub const read_tool_result = ToolSpec{
     .name = "read_tool_result",
     .description = read_tool_result_description,
@@ -785,13 +805,14 @@ pub const read_tool_result = ToolSpec{
         .name = "read_tool_result",
         .description = read_tool_result_description,
         .input_schema = .{
-            .properties = &.{
-                .{ .name = "handle", .json_type = .string, .description = "Opaque handle from a prior tool-result preview or captured command output." },
-                .{ .name = "start_byte", .json_type = .integer, .description = "Optional 1-based byte offset for range reads. Defaults to 1." },
-                .{ .name = "byte_count", .json_type = .integer, .description = "Optional positive byte count for range reads. Bounded by the tool." },
-                .{ .name = "query", .json_type = .string, .bounds = &.{ .min_length = 1, .max_length = lexical_relevance.max_query_bytes }, .description = "Optional non-empty literal line query. When set, range fields are ignored." },
-            },
-            .required = &.{"handle"},
+            .properties = &.{.{
+                .name = "request",
+                .json_type = .object,
+                .shape = &.{ .object = &read_tool_result_request_schema },
+                .description = "Choose one request: handle plus query, or handle plus an optional byte range.",
+            }},
+            .required = &.{"request"},
+            .additional_properties = false,
         },
     },
     .executor_kind = .read_tool_result,
@@ -917,7 +938,7 @@ test "built-in model-facing tool contract stays byte exact" {
 
     const actual_hex = std.fmt.bytesToHex(hasher.finalResult(), .lower);
     try std.testing.expectEqualStrings(
-        "14209d2ea5707d98618a0e98f70b03e739074b66f48e2f59299e1d1d4376ff6e",
+        "47e84930e1fdc99133e76843f795891b35592d32615cacb76a3dfc81e1b23b7a",
         &actual_hex,
     );
 }
@@ -1051,6 +1072,11 @@ test "shell advertises only run interact and stop" {
         schema_json,
         "output_delta is always terminal-safe",
     ) != null);
+    try std.testing.expect(std.mem.find(
+        u8,
+        schema_json,
+        "Empty observations wait 5000-300000 ms",
+    ) != null);
     try std.testing.expect(registry.lookup("terminal") == null);
     try std.testing.expect(registry.lookup("shell") != null);
 }
@@ -1106,7 +1132,8 @@ test "built-in glob_files owns product metadata schema and callbacks" {
     try std.testing.expect(std.mem.find(u8, glob_files.description, "external access is subject to permission policy") != null);
     try std.testing.expect(std.mem.find(u8, schema_json, "\"required\":[\"pattern\"]") != null);
     try std.testing.expect(std.mem.find(u8, schema_json, "\"mode\":{\"type\":\"string\",\"enum\":[\"matches\",\"count\"]") != null);
-    try std.testing.expect(std.mem.find(u8, schema_json, "\"path\":{\"type\":\"string\"") != null);
+    try std.testing.expect(std.mem.find(u8, schema_json, "\"path\":{\"type\":\"string\",\"minLength\":1") != null);
+    try std.testing.expect(std.mem.find(u8, schema_json, "Omit this field to use the current directory") != null);
     try std.testing.expect(std.mem.find(u8, schema_json, "external path") != null);
     try std.testing.expect(std.mem.find(u8, schema_json, "~/...") != null);
     try std.testing.expect(std.mem.find(u8, schema_json, "../...") != null);
@@ -1145,6 +1172,8 @@ test "built-in grep_files owns product metadata schema and callbacks" {
     try std.testing.expect(std.mem.find(u8, schema_json, "\"head_limit\"") != null);
     try std.testing.expect(std.mem.find(u8, schema_json, "\"offset\"") != null);
     try std.testing.expect(std.mem.find(u8, schema_json, "\"context_lines\"") != null);
+    try std.testing.expect(std.mem.find(u8, schema_json, "\"path\":{\"type\":\"string\",\"minLength\":1") != null);
+    try std.testing.expect(std.mem.find(u8, schema_json, "Omit this field to use the current directory") != null);
     try std.testing.expect(std.mem.find(u8, schema_json, "external path") != null);
     try std.testing.expect(std.mem.find(u8, schema_json, "~/...") != null);
     try std.testing.expect(std.mem.find(u8, schema_json, "../...") != null);
@@ -1647,17 +1676,31 @@ test "built-in vision dispatch uses supplied runtime provider" {
 test "built-in read_tool_result owns product metadata schema and callbacks" {
     const schema_json = try tool_specs.toolGatewaySchemaJson(std.testing.allocator, read_tool_result);
     defer std.testing.allocator.free(schema_json);
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, schema_json, .{});
+    defer parsed.deinit();
 
     try std.testing.expectEqualStrings("read_tool_result", read_tool_result.name);
     try std.testing.expect(std.mem.find(u8, read_tool_result.description, "opaque handle from the active session or process") != null);
-    try std.testing.expect(std.mem.find(u8, read_tool_result.description, "bounded byte range or literal query") != null);
+    try std.testing.expect(std.mem.find(u8, read_tool_result.description, "Pass request.query") != null);
     try std.testing.expect(std.mem.find(u8, read_tool_result.description, "inspect results from another session or process") != null);
-    try std.testing.expect(std.mem.find(u8, schema_json, "\"handle\":{\"type\":\"string\"") != null);
-    try std.testing.expect(std.mem.find(u8, schema_json, "\"start_byte\":{\"type\":\"integer\"") != null);
-    try std.testing.expect(std.mem.find(u8, schema_json, "\"byte_count\":{\"type\":\"integer\"") != null);
-    try std.testing.expect(std.mem.find(u8, schema_json, "\"query\":{\"type\":\"string\",\"minLength\":1") != null);
-    try std.testing.expect(std.mem.find(u8, schema_json, "\"query\":{\"type\":\"string\"") != null);
-    try std.testing.expect(std.mem.find(u8, schema_json, "\"required\":[\"handle\"]") != null);
+    try std.testing.expect(std.mem.find(u8, schema_json, "\"mode\"") == null);
+    const input_schema = parsed.value.object.get("inputSchema").?.object;
+    try std.testing.expectEqualStrings("object", input_schema.get("type").?.string);
+    try std.testing.expectEqualStrings("request", input_schema.get("required").?.array.items[0].string);
+    try std.testing.expect(!input_schema.get("additionalProperties").?.bool);
+    const request = input_schema.get("properties").?.object.get("request").?.object;
+    const alternatives = request.get("oneOf").?.array.items;
+    try std.testing.expectEqual(@as(usize, 2), alternatives.len);
+    const range = alternatives[0].object;
+    const query = alternatives[1].object;
+    try std.testing.expect(range.get("properties").?.object.get("query") == null);
+    try std.testing.expect(query.get("properties").?.object.get("start_byte") == null);
+    try std.testing.expect(query.get("properties").?.object.get("byte_count") == null);
+    try std.testing.expectEqualStrings("handle", range.get("required").?.array.items[0].string);
+    try std.testing.expectEqualStrings("handle", query.get("required").?.array.items[0].string);
+    try std.testing.expectEqualStrings("query", query.get("required").?.array.items[1].string);
+    try std.testing.expect(!range.get("additionalProperties").?.bool);
+    try std.testing.expect(!query.get("additionalProperties").?.bool);
     try std.testing.expectEqual(tool_dispatch.ExecutorKind.read_tool_result, read_tool_result.executor_kind);
     try std.testing.expectEqual(types.ToolActivityKind.read, read_tool_result.activity_kind);
     try std.testing.expect(!read_tool_result.requires_approval);
