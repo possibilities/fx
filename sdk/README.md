@@ -1,16 +1,17 @@
 # libfx
 
-`libfx` embeds fx agents and interactive terminals in JavaScript
-applications. It supports Node.js hosts and browser environments with
-JavaScript Promise Integration (JSPI).
-
-## Installation
+`libfx` is the small fx agent kernel for JavaScript hosts. One agent is one
+in-memory conversation with three operations: `prompt`, `checkpoint`, and
+`close`.
 
 ```sh
 npm install libfx
 ```
 
-Requirements:
+Node.js uses the native addon when available and falls back to WebAssembly.
+Browsers use WebAssembly with JSPI. The default package has no runtime
+dependencies and performs no MCP connection, skill scan, process spawn, or
+filesystem read when imported.
 
 - Node.js 20 or later
 - Chrome or Edge 137 or later for browser WebAssembly
@@ -48,34 +49,24 @@ Public exports:
 
 The default Node entry point prefers the native addon and falls back to
 WebAssembly when necessary.
+## Agent
 
 ```js
 import { createFxAgent } from "libfx";
 
 const agent = await createFxAgent({
-  env: {
-    AI_GATEWAY_API_KEY: process.env.AI_GATEWAY_API_KEY,
-  },
-  onEvent(event) {
-    console.log(event.type);
-  },
-  async onPermission(request) {
-    // Return one of request.options[*].optionId to approve it.
-    // Returning null or undefined cancels the request.
-    return null;
-  },
+  apiKey: process.env.AI_GATEWAY_API_KEY,
+  model: "google/gemini-2.5-flash-lite",
 });
 
-const session = await agent.createSession();
-const turn = session.prompt("Explain the files in this project.");
+const turn = agent.prompt("Explain this project.");
 
-for await (const update of turn) {
-  console.log(update);
+for await (const event of turn) {
+  if (event.type === "text_delta") process.stdout.write(event.delta);
 }
 
-console.log("Stopped:", await turn.stopReason);
-
-await session.close();
+console.log(await turn.result); // { stopReason, usage }
+const checkpoint = await agent.checkpoint();
 await agent.close();
 ```
 
@@ -100,9 +91,9 @@ const session = await agent.createSession();
 await session.setConfig({ provider: "gateway" });
 ```
 
-`env.AI_GATEWAY_API_KEY` remains shorthand for Gateway authorization. An
-explicit Gateway entry and the environment value may both be present only
-when they are identical.
+A tagged `auth` entry is translated into libfx's own `apiKey` and `model`
+options before the agent starts, so `auth` and `apiKey` may both be present
+only when they name the same credential.
 
 Codex is native-only. It never reads the fx profile implicitly. Use
 `fxProfileSession()` to opt into `~/.fx/chatgpt-auth.json`, or provide a host
@@ -144,155 +135,137 @@ agent has selected a Codex account, a replacement snapshot for a different
 account is rejected before refresh or write-back.
 
 A prompt may be a string or an array of text and resource blocks:
+`apiKey` is required. `model` is optional and defaults to fx's built-in model.
+Agent configuration uses named options; `env` is reserved for
+`createFxTerminal()`.
+
+`prompt(input, { signal? })` accepts a string or text/resource blocks. It
+returns an async iterable of normalized events:
+
+- `text_delta`
+- `reasoning_delta` when supplied by the provider
+- `tool_start`
+- `tool_end`
+
+Only one prompt may run at a time. `checkpoint()` is idle-only and returns
+opaque, bounded, versioned bytes. Restore them only when creating a fresh
+agent:
 
 ```js
-const turn = session.prompt([
-  { type: "text", text: "Summarize this file." },
-  {
-    type: "resource",
-    resource: {
-      uri: "file:///workspace/README.md",
-      text: readmeContents,
+const restored = await createFxAgent({ apiKey, model, checkpoint });
+```
+
+The checkpoint contains conversation history and usage only. The host owns
+durable storage and must resupply models, credentials, instructions, tools,
+MCP clients, and skill records.
+
+## JavaScript tools and instructions
+
+```js
+const agent = await createFxAgent({
+  apiKey,
+  model,
+  instructions: "Keep answers concise.",
+  tools: [{
+    name: "lookup",
+    description: "Look up a value.",
+    inputSchema: {
+      type: "object",
+      properties: { key: { type: "string" } },
+      required: ["key"],
     },
-  },
-]);
-```
-
-Image prompt blocks are not currently supported.
-
-### Agent lifecycle
-
-The object returned by `createFxAgent()` provides:
-
-| Member | Description |
-| --- | --- |
-| `createSession()` | Creates a new active session |
-| `openSession(id)` | Loads a stored session |
-| `listSessions()` | Lists stored sessions |
-| `close()` | Closes the active session and shuts down cleanly |
-| `abort()` | Immediately aborts the runtime |
-| `exited` | Promise that resolves with the process exit code |
-
-A session provides:
-
-| Member | Description |
-| --- | --- |
-| `prompt(input, options?)` | Starts an async iterable turn |
-| `setModel(model)` | Changes the active model |
-| `setMode(mode)` | Changes the active mode |
-| `setConfig(config)` | Applies multiple configuration values |
-| `close()` | Closes the active session |
-| `remove()` | Removes the stored session |
-| `history` | Previously loaded session updates |
-| `configOptions` | Current configurable values |
-
-Each session allows one active prompt at a time. Cancel a turn directly or
-with an `AbortSignal`:
-
-```js
-const controller = new AbortController();
-const turn = session.prompt("Wait for more instructions.", {
-  signal: controller.signal,
+    async execute(input, { signal }) {
+      return database.get(input.key, { signal });
+    },
+  }],
 });
-
-controller.abort();
-console.log(await turn.stopReason); // "cancelled"
 ```
 
-## Browser agent
+The JavaScript host is the authority for tool effects. The same descriptors,
+schemas, cancellation, results, and events are used by N-API and WebAssembly.
+Instructions are limited to 64 KiB of UTF-8 text, including text assembled by
+the MCP and skills adapters.
 
-Browser hosts always use WebAssembly.
+## MCP
+
+`libfx/mcp` accepts a host-owned MCP client. Transport, authentication,
+elicitation, and cleanup remain outside the kernel.
 
 ```js
-import {
-  createFxAgent,
-  supportsJspi,
-} from "libfx/browser";
+import { createMcpAdapter } from "libfx/mcp";
 
-if (!supportsJspi()) {
-  throw new Error("This browser does not support WebAssembly JSPI.");
-}
+const mcp = await createMcpAdapter(client, {
+  prefix: "github_",
+  resources: ["repo://instructions"],
+  prompts: ["review"],
+});
 
 const agent = await createFxAgent({
   auth: { provider: "gateway", apiKey: "<short-lived credential>" },
+  model,
+  tools: mcp.tools,
+  instructions: mcp.instructions,
 });
 
-const session = await agent.createSession();
-const turn = session.prompt("Describe this workspace.");
-
-for await (const update of turn) {
-  console.log(update);
-}
+// ...
+await agent.close();
+await mcp.close();
 ```
 
-The browser entry point resolves `fx-core.wasm` and `fx-term.wasm` relative to
-the installed package. Pass `wasm` explicitly to provide a URL, `Response`,
-`ArrayBuffer`, typed array, or precompiled `WebAssembly.Module`.
+## Skills
 
-Do not embed a long-lived API key in public browser code. Use a short-lived
-credential or an authenticated server-side proxy.
+Use `libfx/skills` for already-loaded records or `libfx/skills/node` to load a
+`SKILL.md` explicitly in Node or Bun.
+
+```js
+import { loadSkillFile } from "libfx/skills/node";
+import { createSkillsAdapter } from "libfx/skills";
+
+const record = await loadSkillFile("./skills/review/SKILL.md");
+const skills = createSkillsAdapter([record]);
+const agent = await createFxAgent({ apiKey, model, ...skills });
+```
+
+## Backends
+
+```js
+await createFxAgent({ apiKey, backend: "auto" });   // native, then Wasm fallback
+await createFxAgent({ apiKey, backend: "native" }); // require N-API
+await createFxAgent({ apiKey, backend: "wasm" });   // require Wasm + JSPI
+```
+
+Within one JavaScript realm, libfx compiles each stable Wasm source once and
+creates a separate WebAssembly instance for every Agent. Agent memory, history,
+tools, cancellation, and shutdown remain isolated. Workers and separate
+processes maintain their own module caches.
+
+Node.js 20+ is supported. Browser WebAssembly requires a JSPI-capable browser.
+Some Node versions require `--experimental-wasm-jspi`.
 
 Browser and direct WebAssembly agents support Gateway authorization only and
 reject Codex authorization before instantiating WebAssembly.
 
 ## Interactive terminal
 
-Install xterm.js in the host application:
-
-```sh
-npm install @xterm/xterm @xterm/addon-fit
-```
-
-Create the terminal and connect it to fx:
+`createFxTerminal()` remains a separate terminal harness API. In browsers,
+connect it to xterm.js with `xtermAdapter()`:
 
 ```js
-import { Terminal } from "@xterm/xterm";
-import { FitAddon } from "@xterm/addon-fit";
-import "@xterm/xterm/css/xterm.css";
-import {
-  createFxTerminal,
-  supportsJspi,
-  xtermAdapter,
-} from "libfx/browser";
-
-if (!supportsJspi()) {
-  throw new Error("This browser does not support WebAssembly JSPI.");
-}
-
-const terminal = new Terminal({
-  cursorBlink: true,
-  scrollback: 10_000,
-});
-
-const fit = new FitAddon();
-terminal.loadAddon(fit);
-terminal.open(document.querySelector("#terminal"));
-fit.fit();
+import { createFxTerminal, xtermAdapter } from "libfx/browser";
 
 const runtime = await createFxTerminal({
-  terminal: xtermAdapter(terminal),
-  env: {
-    AI_GATEWAY_API_KEY: "<short-lived credential>",
-  },
+  terminal: xtermAdapter(term),
+  env: { AI_GATEWAY_API_KEY: "<short-lived credential>" },
 });
 
 await runtime.interactive;
-
-window.addEventListener("resize", () => {
-  fit.fit();
-  runtime.resize();
-});
 ```
 
-The terminal runtime provides:
+The terminal runtime exposes `interactive`, `exited`, `write`, `resize`, and
+`abort`. Terminal session, config, OAuth, prompt-history, URL, and workspace
+stores remain terminal-only host integrations.
 
-| Member | Description |
-| --- | --- |
-| `interactive` | Resolves after the terminal is ready for input |
-| `exited` | Resolves with the terminal exit code |
-| `write(data)` | Writes input directly to fx |
-| `resize()` | Notifies fx of terminal geometry changes |
-| `abort()` | Stops the terminal and releases subscriptions |
+## Security
 
 Try the hosted terminal at [fx.sh/try](https://fx.sh/try).
 
@@ -431,3 +404,8 @@ Maintainer references:
 
 - [SDK contributor guide](https://github.com/vercel-labs/fx/blob/main/sdk/AGENTS.md)
 - [Native Node-API design and security model](https://github.com/vercel-labs/fx/blob/main/sdk/NAPI.md)
+
+Treat `nativeAddon` and `gatewayChatUrl` as trusted host
+configuration. Do not embed long-lived credentials in public browser code.
+Host tool functions, MCP clients, and skill loaders retain their own authority;
+libfx validates and sequences them but does not grant operating-system access.

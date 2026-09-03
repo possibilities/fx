@@ -91,6 +91,7 @@ pub const FooterPlannerInput = struct {
     show_picker: bool = false,
     picker_kind: input_presentation.PickerKind = .model_stage,
     picker_items: []const []const u8 = &.{},
+    picker_annotations: []const []const u8 = &.{},
     file_picker_items: []const file_index.SearchResult = &.{},
     picker_selection_index: usize = 0,
     picker_window_start: usize = 0,
@@ -581,22 +582,46 @@ fn pushQueuedPromptBannerRows(
 
     if (ctx.queued_prompt_cards.len == 0) {
         var painted: u16 = 0;
-        var summary = try input_presentation.composeQueuedSummaryRow(
-            alloc,
-            ctx.queued_count,
-            ctx.steering_count,
-            ctx.queued_paused,
-            width,
-        );
-        try pushFooterBandRow(alloc, frame, plan, plan.footer.banner, &summary);
-        painted +|= 1;
+        if (ctx.steering_messages.len > 0) {
+            const visible_count = @min(
+                ctx.steering_messages.len,
+                @as(usize, plan.footer.banner_rows),
+            );
+            const visible_start = ctx.steering_messages.len - visible_count;
+            for (ctx.steering_messages[visible_start..], visible_start..) |message, index| {
+                if (painted >= plan.footer.banner_rows) break;
+                var row = try input_presentation.composeSteeringMessageRow(
+                    alloc,
+                    message,
+                    ctx.steering_waits_for_tool and
+                        index + 1 == ctx.steering_messages.len,
+                    width,
+                );
+                try pushFooterBandRow(
+                    alloc,
+                    frame,
+                    plan,
+                    plan.footer.banner +| painted,
+                    &row,
+                );
+                painted +|= 1;
+            }
+        } else {
+            var summary = try input_presentation.composeQueuedSummaryRow(
+                alloc,
+                ctx.queued_count,
+                ctx.queued_paused,
+                width,
+            );
+            try pushFooterBandRow(alloc, frame, plan, plan.footer.banner, &summary);
+            painted +|= 1;
+        }
         if (ctx.queued_paused and painted < plan.footer.banner_rows) {
             var hint = try input_presentation.composeQueueReviewHintRow(
                 alloc,
                 width,
                 false,
                 ctx.queued_cancel_all_available,
-                ctx.steering_count > 0,
             );
             try pushFooterBandRow(alloc, frame, plan, plan.footer.banner +| painted, &hint);
             painted +|= 1;
@@ -720,7 +745,6 @@ fn pushQueuedPromptBannerRows(
             width,
             empty_draft,
             ctx.queued_cancel_all_available,
-            ctx.steering_count > 0,
         );
         try pushFooterBandRow(alloc, frame, plan, hint_row, &hint);
     }
@@ -1021,12 +1045,13 @@ pub fn composeFooterFrame(
             const window = picker_presentation.edgeScrollPickerWindowFromStart(input.picker_items.len, window_start, input.picker_rows);
             var row = rows.picker_start;
             for (input.picker_items[window.start..window.end], window.start..) |item, i| {
-                var picker_row = try picker_presentation.composePickerOptionRow(alloc, input.picker_kind, input.picker_start_col, item, i == selected, shell.layout.cols);
+                const annotation = if (i < input.picker_annotations.len) input.picker_annotations[i] else "";
+                var picker_row = try picker_presentation.composePickerOptionRowAnnotated(alloc, input.picker_kind, input.picker_start_col, item, annotation, i == selected, shell.layout.cols);
                 try pushFooterBandRow(alloc, &frame, plan, row, &picker_row);
                 row += 1;
             }
         } else {
-            var status_row = try picker_presentation.composePickerStatusRow(alloc, input.picker_kind, ctx.model_picker_stage, input.picker_loading, input.picker_failed, input.picker_start_col, shell.layout.cols);
+            var status_row = try picker_presentation.composePickerStatusRowWithProvider(alloc, input.picker_kind, ctx.model_picker_stage, ctx.provider_picker_stage, input.picker_loading, input.picker_failed, input.picker_start_col, shell.layout.cols);
             try pushFooterBandRow(alloc, &frame, plan, rows.picker_start, &status_row);
         }
     }
@@ -1565,6 +1590,61 @@ test "queued prompts collapse to a single summary row until the review opens" {
     try expectFrameRowTextTrimmed(&frame, banner, shell.layout.cols, "2 queued messages · ↑ to edit");
     try expectFrameRowTextTrimmed(&frame, banner + 1, shell.layout.cols, "");
     try std.testing.expect(frame_plan.paint.footer.input_base >= banner + 2);
+}
+
+test "clamped steering banner keeps newest messages and escape hint" {
+    const alloc = std.testing.allocator;
+
+    var input = InputRuntime{};
+    defer input.deinit(alloc);
+
+    var shell = TranscriptRuntime{
+        .layout = .{
+            .rows = 12,
+            .cols = 48,
+            .content_bottom = 6,
+            .divider_top_row = 7,
+            .input_row = 8,
+            .divider_bottom_row = 9,
+            .hint_row = 10,
+        },
+        .owned_top_row = 1,
+        .viewport_top_row = 1,
+        .cursor_row = 4,
+        .cursor_col = 1,
+    };
+    defer shell.deinit(alloc);
+
+    const messages = [_][]const u8{ "first hidden", "second hidden", "third visible", "fourth visible" };
+    var ctx = testContext(&input);
+    ctx.queued_count = messages.len;
+    ctx.steering_messages = &messages;
+    ctx.steering_waits_for_tool = true;
+    const planner_input: FooterPlannerInput = .{
+        .active_label = null,
+        .ctx = ctx,
+        .place_mid_line_active = false,
+        .input_extra = 0,
+        .input_visible = true,
+        .composer_top_chrome_rows = composerTopChromeRows(),
+        .picker_rows = 0,
+        .footer_extra_rows = 2,
+        .banner_active = true,
+        .banner_rows = 2,
+    };
+
+    const frame_plan = planFooterPaint(&shell, planner_input);
+    var frame = try composeFooterFrame(alloc, &shell, planner_input, frame_plan.paint);
+    defer frame.deinit(alloc);
+
+    const banner = frame_plan.paint.footer.banner;
+    try expectFrameRowTextTrimmed(&frame, banner, shell.layout.cols, "third visible");
+    try expectFrameRowTextTrimmed(
+        &frame,
+        banner + 1,
+        shell.layout.cols,
+        "fourth visible · Esc to steer now",
+    );
 }
 
 test "a hidden paused review keeps the summary row above its hint" {
