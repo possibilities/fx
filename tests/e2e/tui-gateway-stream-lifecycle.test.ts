@@ -2908,7 +2908,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       await session.sendText(SPLIT_NEW_USER_PROMPT);
       const cutoffPane = await session.capturePane();
       expect(cutoffPane).not.toContain(
-        `${SPLIT_NEW_USER_PROMPT} · Esc to steer now`,
+        `┋ ${SPLIT_NEW_USER_PROMPT}`,
       );
       expect(cutoffPane).toMatch(/Thinking|Generating/);
       await waitForCondition(
@@ -3160,7 +3160,8 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       await Bun.sleep(150);
       const pendingPane = await session.capturePane();
       expect(toolHandoff.cancelled).toBe(false);
-      expect(pendingPane).toContain(`${steering} · Esc to steer now`);
+      expect(pendingPane).toContain(`┋ ${steering}`);
+      expect(pendingPane).not.toContain("Esc to steer now");
       expect(handoffGateway.requests).toHaveLength(1);
 
       toolHandoff.release?.();
@@ -3251,16 +3252,23 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       await session.sendText(thirdSteering);
       await Bun.sleep(150);
       const pendingPane = await session.capturePane();
-      expect(pendingPane).toContain(firstSteering);
-      expect(pendingPane).toContain(secondSteering);
-      expect(pendingPane).toContain(`${thirdSteering} · Esc to steer now`);
+      expect(pendingPane).toContain(`┋ ${firstSteering}`);
+      expect(pendingPane).toContain(`┋ ${secondSteering}`);
+      expect(pendingPane).toContain(`┋ ${thirdSteering}`);
       expect(pendingPane.indexOf(firstSteering)).toBeLessThan(
         pendingPane.indexOf(secondSteering),
       );
       expect(pendingPane.indexOf(secondSteering)).toBeLessThan(
         pendingPane.indexOf(thirdSteering),
       );
-      expect(countOccurrences(pendingPane, "Esc to steer now")).toBe(1);
+      expect(pendingPane).not.toContain("Esc to steer now");
+      const pendingLines = pendingPane.split("\n");
+      const pendingComposer = pendingLines.findLastIndex(isComposerLine);
+      const pendingSteering = pendingLines.findLastIndex((line) =>
+        line.trimStart().startsWith("┋ ")
+      );
+      expect(pendingComposer - pendingSteering).toBe(2);
+      expect(pendingLines[pendingSteering + 1]!.trim()).toBe("");
       expect(pendingPane).not.toContain("Waiting for tool");
       expect(pendingPane).not.toContain("pending message");
       expect(pendingPane).not.toContain("queued 1");
@@ -3278,7 +3286,17 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       ]) {
         expect(narrowPane).toContain(marker);
       }
-      expect(countOccurrences(narrowPane, "Esc to steer now")).toBe(1);
+      expect(narrowPane).not.toContain("Esc to steer now");
+      const narrowLines = narrowPane.split("\n");
+      expect(
+        narrowLines.filter((line) => line.trimStart().startsWith("┋ ")),
+      ).toHaveLength(6);
+      const narrowComposer = narrowLines.findLastIndex(isComposerLine);
+      const narrowSteering = narrowLines.findLastIndex((line) =>
+        line.trimStart().startsWith("┋ ")
+      );
+      expect(narrowComposer - narrowSteering).toBe(2);
+      expect(narrowLines[narrowSteering + 1]!.trim()).toBe("");
       expect(narrowPane).not.toContain("queued message");
       await session.resizeWindow(120, 40);
 
@@ -3374,7 +3392,9 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       await session.sendText(`/image ${imagePath}`);
       await session.waitForText("attached image: steering-image.png", TIMEOUT);
       await session.sendText(steering);
-      await session.waitForText(`${steering} · Esc to steer now`, TIMEOUT);
+      const pendingPane = await session.waitForText("┋", TIMEOUT);
+      expect(pendingPane).toContain(steering);
+      expect(pendingPane).not.toContain("Esc to steer now");
       expect(steeringGateway.requests).toHaveLength(1);
 
       writeFileSync(releasePath, "release\n");
@@ -3473,7 +3493,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       await session.sendText("Run the failed steering tool fixture.");
       await session.waitForText("Running while", TIMEOUT);
       await session.sendText(steering);
-      await session.waitForText(`${steering} · Esc to steer now`, TIMEOUT);
+      await session.waitForText(`┋ ${steering}`, TIMEOUT);
       expect(steeringGateway.requests).toHaveLength(1);
 
       writeFileSync(releasePath, "release\n");
@@ -3550,7 +3570,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       await session.sendText("Run the immediate steering fixture.");
       await session.waitForText("Running sleep 30", TIMEOUT);
       await session.sendText(steering);
-      await session.waitForText(`${steering} · Esc to steer now`, TIMEOUT);
+      await session.waitForText(`┋ ${steering}`, TIMEOUT);
       expect(steeringGateway.requests).toHaveLength(1);
 
       await session.sendKeys("Escape");
