@@ -2817,12 +2817,13 @@ fn build_gateway_messages_with_response_language_control(
     current_user_message: ChatMessage,
     within_turn_suffix: []const ChatMessage,
     origin: runtime_config.TurnOrigin,
+    enforce_response_language: bool,
     correction_attempted: bool,
     compaction_handoff: ?[]const u8,
     compaction_history_tail: []const ChatMessage,
     compacted_suffix_len: usize,
 ) !GatewayMessageProjection {
-    const effective_overlay = if (origin == .root) blk: {
+    const effective_overlay = if (enforce_response_language and origin == .root) blk: {
         const projected = try alloc.alloc(ChatMessage, ephemeral_overlay.len + 1);
         @memcpy(projected[0..ephemeral_overlay.len], ephemeral_overlay);
         projected[ephemeral_overlay.len] = .{
@@ -2844,7 +2845,7 @@ fn build_gateway_messages_with_response_language_control(
         compacted_suffix_len,
     );
     errdefer messages.deinit(alloc);
-    if (origin == .root and correction_attempted) {
+    if (enforce_response_language and origin == .root and correction_attempted) {
         try messages.append(alloc, .{
             .role = .user,
             .content = response_language_correction_control,
@@ -3942,7 +3943,9 @@ fn processQueuedPromptInner(
 
     debug_trace.eventf("agent", "prompt_start", finish_trace.ctx, "prompt_bytes={d} model={s}", .{ job.prompt.len, job.model });
 
-    try stable_prefix.append(arena, .{ .role = .system, .content = config.system_prompt });
+    if (config.system_prompt.len > 0) {
+        try stable_prefix.append(arena, .{ .role = .system, .content = config.system_prompt });
+    }
     if (config.custom_tool_guidance.len > 0) {
         try stable_prefix.append(arena, .{ .role = .system, .content = config.custom_tool_guidance });
     }
@@ -4808,7 +4811,8 @@ fn processQueuedPromptLoop(
     else
         restored_attempts;
     var retry_pacing: model_response_recovery.RetryPacingState = .idle;
-    const response_language_expectation = if (config.origin == .root and
+    const response_language_expectation = if (config.enforce_response_language and
+        config.origin == .root and
         job.recovery_checkpoint == null)
         response_language.infer_expectation(job.prompt)
     else
@@ -4912,6 +4916,7 @@ fn processQueuedPromptLoop(
             current_user_effective,
             within_turn_suffix.items,
             config.origin,
+            config.enforce_response_language,
             response_language_correction_attempted,
             active_compaction_handoff,
             active_compaction_history_tail,
@@ -5099,6 +5104,7 @@ fn processQueuedPromptLoop(
                 current_user_effective,
                 within_turn_suffix.items,
                 config.origin,
+                config.enforce_response_language,
                 response_language_correction_attempted,
                 active_compaction_handoff,
                 active_compaction_history_tail,
