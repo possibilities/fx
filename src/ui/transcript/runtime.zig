@@ -2596,7 +2596,7 @@ test "historical tool detail attaches to the exact replayed status entry" {
     try std.testing.expectEqual(@as(i64, 123), detail.created_at_ms);
 }
 
-test "historical deferred tool detail keeps the call without result evidence" {
+test "historical context-withheld tool detail keeps the call without result evidence" {
     const alloc = std.testing.allocator;
     var runtime = TranscriptRuntime{};
     defer runtime.deinit(alloc);
@@ -2606,7 +2606,7 @@ test "historical deferred tool detail keeps the call without result evidence" {
         alloc,
         &metrics,
         .deferred,
-        "Context updated: Running cat nested/input.txt",
+        "Not run — project instructions changed: Running cat nested/input.txt",
         true,
     );
     try runtime.attachHistoricalToolDetail(
@@ -7591,6 +7591,7 @@ pub const TranscriptRuntime = struct {
         source_bytes: []const u8,
         prepared: *transcript_painter.PreparedTranscriptSurfacePaint,
         target_layout: render_engine.frame_layout.CommittedLayoutSnapshot,
+        projection_area: render_engine.frame_layout.FrameRect,
         scroll_plan: render_engine.frame_scroll_plan.FrameScrollPlan,
         scroll_facts: TranscriptScrollFacts,
         accepted_semantic_rows: u32,
@@ -7646,7 +7647,7 @@ pub const TranscriptRuntime = struct {
                         alloc,
                         self.layout,
                         prepared,
-                        target_layout.transcript_area,
+                        projection_area,
                         scroll_facts.source_visual_offset + accepted_semantic_progress_rows,
                     );
                 }
@@ -7658,7 +7659,7 @@ pub const TranscriptRuntime = struct {
                         alloc,
                         self.layout,
                         prepared,
-                        target_layout.transcript_area,
+                        projection_area,
                     );
                 }
                 if (target.normal_buffer_recovery_pending and
@@ -7673,7 +7674,7 @@ pub const TranscriptRuntime = struct {
                     !scroll_facts.recovery_rebase and
                     !self.fullTranscriptActive() and
                     !prepared.selection.split_active and
-                    !target_layout.transcript_area.isEmpty() and
+                    !projection_area.isEmpty() and
                     scroll_facts.target_visual_offset -|
                         committedProjectionVisualOffset(anchor) >
                         scroll_facts.semantic_rows and
@@ -7687,7 +7688,7 @@ pub const TranscriptRuntime = struct {
                         alloc,
                         self.layout,
                         prepared,
-                        target_layout.transcript_area,
+                        projection_area,
                         scroll_facts.target_visual_offset,
                     );
                     target.hold_staged = true;
@@ -7706,7 +7707,7 @@ pub const TranscriptRuntime = struct {
                         alloc,
                         self.layout,
                         prepared,
-                        target_layout.transcript_area,
+                        projection_area,
                         history_floor,
                     );
                     target.source_endpoint_visual_offset = history_floor;
@@ -7746,19 +7747,19 @@ pub const TranscriptRuntime = struct {
                             alloc,
                             self.layout,
                             prepared,
-                            target_layout.transcript_area,
+                            projection_area,
                             target.visual_offset,
                         );
                     } else {
                         const projection_layout = try layoutForTranscriptProjection(
                             self.layout,
-                            target_layout.transcript_area,
+                            projection_area,
                         );
                         try transcript_painter.reprojectPreparedTranscriptForVisualOffset(
                             alloc,
                             projection_layout,
                             prepared,
-                            target_layout.transcript_area,
+                            projection_area,
                             target.visual_offset,
                         );
                         target.usePreparedProjection(prepared);
@@ -7774,7 +7775,7 @@ pub const TranscriptRuntime = struct {
                     alloc,
                     self.layout,
                     prepared,
-                    target_layout.transcript_area,
+                    projection_area,
                     accepted_semantic_progress_rows,
                 );
             },
@@ -8180,6 +8181,39 @@ pub const TranscriptRuntime = struct {
         destructive_invalidation: bool,
         activity_overlay_active: bool,
     ) !ResolvedTranscriptTarget {
+        return self.resolveTranscriptTransitionTargetForFrameInArea(
+            alloc,
+            source,
+            prepared,
+            target_layout,
+            target_layout.transcript_area,
+            scroll_plan,
+            scroll_facts,
+            destructive_invalidation,
+            activity_overlay_active,
+        );
+    }
+
+    pub fn resolveTranscriptTransitionTargetForFrameInArea(
+        self: *const TranscriptRuntime,
+        alloc: Allocator,
+        source: *const TranscriptPreparationSource,
+        prepared: *transcript_painter.PreparedTranscriptSurfacePaint,
+        target_layout: render_engine.frame_layout.CommittedLayoutSnapshot,
+        projection_area: render_engine.frame_layout.FrameRect,
+        scroll_plan: render_engine.frame_scroll_plan.FrameScrollPlan,
+        scroll_facts: TranscriptScrollFacts,
+        destructive_invalidation: bool,
+        activity_overlay_active: bool,
+    ) !ResolvedTranscriptTarget {
+        const target_area = target_layout.transcript_area;
+        if (target_area.isEmpty() != projection_area.isEmpty() or
+            (!target_area.isEmpty() and
+                (projection_area.top != target_area.top or
+                    projection_area.bottom > target_area.bottom)))
+        {
+            return error.InvalidTranscriptTransition;
+        }
         try scroll_plan.validate(self.layout.rows);
         if (scroll_plan.requested_inline_advance_rows != scroll_facts.planned_rows) {
             return error.InvalidFrameScrollPlan;
@@ -8198,6 +8232,7 @@ pub const TranscriptRuntime = struct {
             source.bytes,
             prepared,
             target_layout,
+            projection_area,
             scroll_plan,
             scroll_facts,
             accepted.semantic_rows,
@@ -8224,16 +8259,16 @@ pub const TranscriptRuntime = struct {
             );
             return err;
         };
-        if (!target_layout.transcript_area.isEmpty() and
-            target.selection.last_visible_row > target_layout.transcript_area.bottom)
+        if (!projection_area.isEmpty() and
+            target.selection.last_visible_row > projection_area.bottom)
         {
             debug_trace.logf(
                 "scroll",
                 "transcript_target_outside_candidate last_visible={d} target_area={d}..{d} body_disposition={s}",
                 .{
                     target.selection.last_visible_row,
-                    target_layout.transcript_area.top,
-                    target_layout.transcript_area.bottom,
+                    projection_area.top,
+                    projection_area.bottom,
                     @tagName(target.body_disposition),
                 },
             );
@@ -11827,6 +11862,131 @@ test "pending resume projection accepts candidate row below base content through
         runtime.transcriptCommitDiagnostic().state,
     );
     try std.testing.expectEqualStrings(flow.items, runtime.transcript.items);
+}
+
+test "pending tail projection seals against the complete frame layout" {
+    const alloc = std.testing.allocator;
+    const layout = invalidationTestLayout();
+    var runtime = TranscriptRuntime{
+        .layout = layout,
+        .owned_top_row = 1,
+    };
+    defer runtime.deinit(alloc);
+
+    var flow: std.ArrayList(u8) = .empty;
+    defer flow.deinit(alloc);
+    for (0..100) |_| try flow.appendSlice(alloc, "row\n");
+    runtime.pending_resume_source = try source_preparation.prepareFullTranscriptViewportSource(
+        &runtime,
+        alloc,
+        try alloc.dupe(u8, flow.items),
+    );
+
+    const candidate = render_engine.frame_layout.solve(.{
+        .terminal = layout,
+        .owned_top = runtime.owned_top_row,
+        .footer = .{
+            .natural_rows = 3,
+            .min_rows = 3,
+            .max_rows = 3,
+        },
+        .transcript = runtime.pending_resume_source.?.preview,
+        .prior = runtime.committed_frame_layout,
+    });
+    const projection_area = render_engine.frame_layout.FrameRect{
+        .top = candidate.transcript_area.top,
+        .bottom = candidate.transcript_area.bottom - 1,
+    };
+    const source = (try runtime.pendingResumeSourceInterruptible(alloc, null)) orelse
+        return error.TestExpectedPendingResumeSource;
+    var metrics: Metrics = .{};
+    var prepared = try runtime.prepareTranscriptSurfacePaintFromSourceForArea(
+        alloc,
+        &metrics,
+        source,
+        projection_area,
+    );
+    errdefer prepared.deinit(alloc);
+    const facts = try runtime.prepareTranscriptScrollFactsForFrame(
+        alloc,
+        source,
+        &prepared,
+        false,
+        false,
+    );
+    const scroll_plan = render_engine.frame_scroll_plan.merge(
+        layout.rows,
+        runtime.owned_top_row,
+        0,
+        facts.planned_rows,
+    );
+    const footer_rows = render_engine.footer_layout.resolve(.{
+        .footer_top_for_extra = candidate.footer_area.top,
+        .terminal_rows = layout.rows,
+        .activity_offset = 0,
+        .extra_input_rows = 0,
+        .input_extra = 0,
+        .composer_top_chrome_rows = 0,
+        .picker_rows = 0,
+        .banner_active = false,
+    });
+    var plan = candidate.toPaintPlan(.{
+        .footer_rows = footer_rows,
+        .viewport = prepared.selection,
+        .cursor_target = .{
+            .row = prepared.cursor.cursor_row,
+            .col = prepared.cursor.cursor_col,
+            .visible = true,
+        },
+    });
+    const target_layout = render_engine.frame_layout.CommittedLayoutSnapshot.fromLayout(candidate);
+    try std.testing.expectError(
+        error.InvalidTranscriptTransition,
+        runtime.resolveTranscriptTransitionTargetForFrameInArea(
+            alloc,
+            source,
+            &prepared,
+            target_layout,
+            .{
+                .top = projection_area.top,
+                .bottom = target_layout.transcript_area.bottom + 1,
+            },
+            scroll_plan,
+            facts,
+            false,
+            false,
+        ),
+    );
+    const resolved = try runtime.resolveTranscriptTransitionTargetForFrameInArea(
+        alloc,
+        source,
+        &prepared,
+        target_layout,
+        projection_area,
+        scroll_plan,
+        facts,
+        false,
+        false,
+    );
+    try std.testing.expectEqual(projection_area.bottom, resolved.selection().bottom_row);
+    try std.testing.expectEqual(
+        candidate.transcript_area.bottom,
+        resolved.target_layout.transcript_area.bottom,
+    );
+    resolved.applyToPaintPlan(&plan);
+    var transition = try runtime.sealTranscriptTransition(
+        alloc,
+        source,
+        &prepared,
+        &plan,
+        resolved,
+    );
+    prepared.deinit(alloc);
+    defer transition.deinit(alloc);
+    try std.testing.expectEqual(
+        candidate.transcript_area.bottom,
+        transition.target_layout.transcript_area.bottom,
+    );
 }
 
 test "transition commit keeps unplanned physical scroll as recovery debt" {

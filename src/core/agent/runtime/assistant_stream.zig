@@ -20,6 +20,7 @@ const runtime_telemetry = @import("telemetry.zig");
 const runtime_tool_contracts = @import("tool_contracts.zig");
 const runtime_tool_presentation = @import("tool_presentation.zig");
 const model_response_recovery = @import("model_response_recovery.zig");
+const response_language = @import("response_language.zig");
 
 const Allocator = std.mem.Allocator;
 const ChatMessage = types.ChatMessage;
@@ -35,6 +36,7 @@ const SecondaryPublicationReport = runtime_tool_contracts.SecondaryPublicationRe
 const ToolExecutionResult = runtime_tool_contracts.ToolExecutionResult;
 const TablePayload = assistant_presentation.TablePayload;
 const CodeBlockPayload = assistant_presentation.CodeBlockPayload;
+const response_language_probe_limit_bytes: usize = 4096;
 
 const test_tools = [_]tool_dispatch.Tool{
     test_builtin_tools.read_file,
@@ -78,6 +80,10 @@ pub const StreamChunkContext = struct {
     published_phase: ?types.TurnPhase = null,
     initial_line_prefix: std.ArrayList(u8) = .empty,
     provisional_statuses: runtime_tool_presentation.ProvisionalToolStatuses = .{},
+    response_language_expected: ?response_language.Script = null,
+    response_language_accepted: bool = false,
+    response_language_hold_until_completion: bool = false,
+    response_language_next_probe_bytes: usize = 5,
 
     fn markModelOutput(self: *StreamChunkContext) void {
         if (self.first_model_output_at_ms == null) self.first_model_output_at_ms = io_mod.milliTimestamp();
@@ -120,6 +126,9 @@ pub const StreamChunkContext = struct {
     }
 
     pub fn beginRecoveryAttempt(self: *StreamChunkContext) void {
+        if (self.response_language_staging()) {
+            self.drop_staged_response_language_candidate();
+        }
         self.continuation_pending.clearRetainingCapacity();
         self.continuation_prefix_len = self.raw_text.items.len;
         self.continuation_probe_remaining = self.continuation_prefix_len;
@@ -129,6 +138,56 @@ pub const StreamChunkContext = struct {
         self.saw_visible_text_after_tool_start = false;
         self.first_model_output_at_ms = null;
         self.published_phase = null;
+    }
+
+    pub fn accepted_source(self: *const StreamChunkContext) []const u8 {
+        return if (self.response_language_staging()) "" else self.raw_text.items;
+    }
+
+    pub fn accepted_source_or(self: *const StreamChunkContext, fallback: []const u8) []const u8 {
+        if (self.response_language_staging()) return "";
+        return if (self.raw_text.items.len > 0) self.raw_text.items else fallback;
+    }
+
+    pub fn interruption_source_or(self: *const StreamChunkContext, fallback: []const u8) []const u8 {
+        if (!self.response_language_staging()) {
+            return if (self.raw_text.items.len > 0) self.raw_text.items else fallback;
+        }
+        const candidate = if (self.raw_text.items.len > 0) self.raw_text.items else fallback;
+        const actual = response_language.evidence(candidate).script orelse return candidate;
+        return if (actual == self.response_language_expected.?) candidate else "";
+    }
+
+    pub fn accept_staged_response_language(self: *StreamChunkContext) !void {
+        if (!self.response_language_staging()) return;
+        self.response_language_accepted = true;
+        try publishAssistantChunkResolved(self, self.raw_text.items);
+    }
+
+    pub fn drop_staged_response_language_candidate(self: *StreamChunkContext) void {
+        if (!self.response_language_staging()) return;
+        if (self.raw_text.items.len > 0) {
+            debug_trace.logf(
+                "agent",
+                "dropping rejected response language candidate bytes={d}",
+                .{self.raw_text.items.len},
+            );
+        }
+        self.raw_text.clearRetainingCapacity();
+        self.continuation_pending.clearRetainingCapacity();
+        self.continuation_prefix_len = 0;
+        self.continuation_probe_remaining = 0;
+        self.continuation_resolved = true;
+        self.initial_line_prefix.clearRetainingCapacity();
+        self.saw_visible_text = false;
+        self.last_byte_was_newline = false;
+        self.trailing_newline_count = 0;
+        self.response_language_next_probe_bytes = 5;
+    }
+
+    fn response_language_staging(self: *const StreamChunkContext) bool {
+        return self.response_language_expected != null and
+            !self.response_language_accepted;
     }
 
     /// Restores durable partial source before a restarted turn sends anything.
@@ -198,6 +257,11 @@ pub fn onStreamReasoningChunk(ctx: *anyopaque, chunk: []const u8) void {
     if (stream_ctx.token_progress) |progress| {
         pushTokenProgressUpdate(stream_ctx, progress.consumeReasoning(chunk)) catch |err| {
             debug_trace.logf("agent", "token progress publication failed source=reasoning err={s}", .{@errorName(err)});
+        };
+    }
+    if (stream_ctx.hooks.push_reasoning_delta) |push| {
+        push(stream_ctx.hooks.ctx, chunk) catch |err| {
+            debug_trace.logf("agent", "reasoning publication failed err={s}", .{@errorName(err)});
         };
     }
 }
@@ -306,6 +370,33 @@ fn streamAssistantChunkResolved(stream_ctx: *StreamChunkContext, chunk: []const 
     if (chunk.len == 0) return;
     const alloc = stream_ctx.alloc;
     try stream_ctx.raw_text.appendSlice(alloc, chunk);
+    if (stream_ctx.response_language_staging()) {
+        if (stream_ctx.response_language_hold_until_completion) return;
+        if (stream_ctx.raw_text.items.len >= stream_ctx.response_language_next_probe_bytes) {
+            const prefix_len = @min(
+                stream_ctx.raw_text.items.len,
+                response_language_probe_limit_bytes,
+            );
+            const prefix = stream_ctx.raw_text.items[0..prefix_len];
+            if (response_language.evidence(prefix).script == stream_ctx.response_language_expected) {
+                try stream_ctx.accept_staged_response_language();
+            } else if (prefix_len == response_language_probe_limit_bytes) {
+                stream_ctx.response_language_next_probe_bytes = std.math.maxInt(usize);
+            } else {
+                stream_ctx.response_language_next_probe_bytes = @min(
+                    response_language_probe_limit_bytes,
+                    @max(stream_ctx.raw_text.items.len +| 1, stream_ctx.raw_text.items.len *| 2),
+                );
+            }
+        }
+        return;
+    }
+    try publishAssistantChunkResolved(stream_ctx, chunk);
+}
+
+fn publishAssistantChunkResolved(stream_ctx: *StreamChunkContext, chunk: []const u8) !void {
+    if (chunk.len == 0) return;
+    const alloc = stream_ctx.alloc;
     try stream_ctx.hooks.push_text(stream_ctx.hooks.ctx, .{ .assistant_source = chunk });
 
     var start: usize = 0;
@@ -379,6 +470,7 @@ pub fn flushAssistantStream(stream_ctx: *StreamChunkContext) !void {
         try streamAssistantChunkResolved(stream_ctx, novel);
         stream_ctx.continuation_pending.clearRetainingCapacity();
     }
+    if (stream_ctx.response_language_staging()) return;
     const alloc = stream_ctx.alloc;
     stream_ctx.initial_line_prefix.clearRetainingCapacity();
     var out: std.ArrayList(u8) = .empty;

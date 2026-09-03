@@ -738,6 +738,24 @@ test "catalog authentication fallback is anonymous and bounded" {
     try std.testing.expect(std.mem.find(u8, trace, "/v1/models") == null);
 }
 
+test "strict authenticated catalog requests never retry anonymously" {
+    const access = credentials.catalogAccessForCredential(
+        .fx_login,
+        "test-token",
+        "team_123",
+    ).withExplicitAuthority();
+    const rejection = Failure{ .category = .authentication, .http_status = .unauthorized };
+    var probe = FallbackProbe{ .failures = .{ rejection, null } };
+
+    const failed = fetchWithPublicFallback(probe.provider(), std.testing.allocator, .{
+        .access = access,
+        .endpoint = "/v1/models",
+    }).failed;
+    try std.testing.expectEqual(AccessLevel.authenticated, failed.access.level);
+    try std.testing.expect(!failed.anonymous_fallback_used);
+    try std.testing.expectEqual(@as(usize, 1), probe.calls);
+}
+
 test "catalog fallback classification stays bounded across repeated cycles" {
     const access = credentials.catalogAccessForCredential(
         .ai_gateway_api_key,

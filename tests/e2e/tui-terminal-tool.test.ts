@@ -187,7 +187,7 @@ async function waitForFile(path: string): Promise<void> {
 }
 
 test.skipIf(!tmuxAvailable())(
-  "shell captured execution yields one handle and waits without respawn",
+  "shell captured empty observation floors short waits without respawn",
   async () => {
     const fixture = createFixture("fx-shell-captured-");
     let sessionId = "";
@@ -195,7 +195,7 @@ test.skipIf(!tmuxAvailable())(
       fakeGatewayToolCall("shell_run", "shell", {
         request: {
           action: "run",
-          command: "printf CAPTURED_READY; sleep 0.2; printf CAPTURED_DONE",
+          command: "sleep 2; printf CAPTURED_DONE",
           profile: "clean",
           yield_time_ms: 0,
         },
@@ -207,7 +207,7 @@ test.skipIf(!tmuxAvailable())(
           request: {
             action: "interact",
             session_id: sessionId,
-            yield_time_ms: 5_000,
+            yield_time_ms: 1_000,
           },
         });
       },
@@ -232,10 +232,16 @@ test.skipIf(!tmuxAvailable())(
       gateway.requests[1]!.body,
       "shell_run",
     );
+    const interactResult = toolResultEnvelope(
+      gateway.requests[2]!.body,
+      "shell_interact",
+    );
     expect(runResult).not.toContain('\\"next_action\\"');
     expect(runResult).toContain(`\\"session_id\\":\\"${sessionId}\\"`);
+    expect(interactResult).toContain('\\"state\\":\\"completed\\"');
+    expect(interactResult).toContain("CAPTURED_DONE");
     const scrollback = await active.captureFullScrollback();
-    expect(scrollback).toContain("Ran printf CAPTURED_READY");
+    expect(scrollback).toContain("Ran sleep 2; printf CAPTURED_DONE");
     expect(scrollback).toContain(`Observed session ${sessionId}`);
     expect(scrollback).not.toContain("Using terminal");
     expect(scrollback).not.toContain("Used terminal");
@@ -293,6 +299,76 @@ test.skipIf(!tmuxAvailable())(
       gateway.requests[3]!.body,
       "shell_cross_turn_stop",
     )).toContain('\\"state\\":\\"stopped\\"');
+    expect(readFileSync(fixture.stderrPath, "utf8")).toBe("");
+  },
+  TIMEOUT,
+);
+
+test.skipIf(!tmuxAvailable())(
+  "force stop settles a stubborn captured command and permits later work",
+  async () => {
+    const fixture = createFixture("fx-shell-force-stop-");
+    const pidPath = join(fixture.workspace, "stubborn.pid");
+    let sessionId = "";
+    const gateway = startFakeGateway([
+      fakeGatewayToolCall("shell_stubborn_run", "shell", {
+        request: {
+          action: "run",
+          command: `printf '%s' "$$" > ${JSON.stringify(pidPath)}; trap '' TERM; while :; do sleep 1; done`,
+          profile: "clean",
+          yield_time_ms: 0,
+        },
+      }),
+      (body) => {
+        sessionId = findSessionId(JSON.parse(body)) ?? "";
+        if (!sessionId) return new Response("missing session id", { status: 500 });
+        return fakeGatewayToolCall("shell_stubborn_stop", "shell", {
+          request: {
+            action: "stop",
+            session_id: sessionId,
+            force: true,
+          },
+        });
+      },
+      fakeGatewayToolCall("shell_after_stop", "shell", {
+        request: {
+          action: "run",
+          command: "printf AFTER_STOP",
+          profile: "clean",
+        },
+      }),
+      fakeGatewayFinalText("SHELL_FORCE_STOP_OK"),
+    ]);
+    gateways.push(gateway);
+    const active = await launch(fixture, gateway);
+    await active.sendText("Force-stop the stubborn command, then run the follow-up command.");
+    await active.sendKeys("Enter");
+    await active.waitForText("SHELL_FORCE_STOP_OK", TIMEOUT);
+
+    expect(sessionId.length).toBeGreaterThan(0);
+    const stopResult = toolResultEnvelope(
+      gateway.requests[2]!.body,
+      "shell_stubborn_stop",
+    );
+    expect(stopResult).toContain('\\"state\\":\\"stopped\\"');
+    expect(stopResult).toContain('\\"termination_indeterminate\\":false');
+    expect(toolResultEnvelope(
+      gateway.requests[3]!.body,
+      "shell_after_stop",
+    )).toContain("AFTER_STOP");
+    await waitForFile(pidPath);
+    const pid = Number(readFileSync(pidPath, "utf8"));
+    expect(Number.isSafeInteger(pid) && pid > 0).toBe(true);
+    const deadline = Date.now() + 3_000;
+    while (Date.now() < deadline) {
+      try {
+        process.kill(pid, 0);
+      } catch {
+        break;
+      }
+      await Bun.sleep(25);
+    }
+    expect(() => process.kill(pid, 0)).toThrow();
     expect(readFileSync(fixture.stderrPath, "utf8")).toBe("");
   },
   TIMEOUT,

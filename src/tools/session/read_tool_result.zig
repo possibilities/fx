@@ -14,13 +14,20 @@ const HandleNormalization = struct {
 
 pub const Input = struct {
     handle: []u8,
-    start_byte: usize = 1,
-    byte_count: usize = result_store.read_default_bytes,
-    query: ?[]u8 = null,
+    selector: union(enum) {
+        range: struct {
+            start_byte: usize = 1,
+            byte_count: usize = result_store.read_default_bytes,
+        },
+        query: []u8,
+    } = .{ .range = .{} },
 
     pub fn deinit(self: *Input, alloc: Allocator) void {
         alloc.free(self.handle);
-        if (self.query) |query| alloc.free(query);
+        switch (self.selector) {
+            .range => {},
+            .query => |query| alloc.free(query),
+        }
         self.* = .{ .handle = &.{} };
     }
 };
@@ -33,8 +40,13 @@ pub fn decode(ctx: tool_dispatch.DispatchContext, args_json: []const u8) tool_di
     if (parsed.value != .object) {
         return .{ .failure = try ctx.allocator.dupe(u8, "read_tool_result arguments must be an object") };
     }
-
-    const handle_value = parsed.value.object.get("handle") orelse {
+    const args = if (parsed.value.object.get("request")) |request| blk: {
+        if (request != .object) {
+            return .{ .failure = try ctx.allocator.dupe(u8, "read_tool_result field \"request\" must be an object") };
+        }
+        break :blk request.object;
+    } else parsed.value.object;
+    const handle_value = args.get("handle") orelse {
         return .{ .failure = try ctx.allocator.dupe(u8, "read_tool_result requires string field \"handle\"") };
     };
     if (handle_value != .string) {
@@ -46,23 +58,25 @@ pub fn decode(ctx: tool_dispatch.DispatchContext, args_json: []const u8) tool_di
     input.* = .{ .handle = try ctx.allocator.dupe(u8, handle_value.string) };
     errdefer input.deinit(ctx.allocator);
 
-    if (parsed.value.object.get("start_byte")) |value| {
+    if (args.get("start_byte")) |value| {
         const start_byte = parsePositiveInteger(value) orelse {
             return .{ .failure = try ctx.allocator.dupe(u8, "read_tool_result field \"start_byte\" must be a positive integer") };
         };
-        input.start_byte = @intCast(start_byte);
+        input.selector.range.start_byte = @intCast(start_byte);
     }
-    if (parsed.value.object.get("byte_count")) |value| {
+    if (args.get("byte_count")) |value| {
         const byte_count = parsePositiveInteger(value) orelse {
             return .{ .failure = try ctx.allocator.dupe(u8, "read_tool_result field \"byte_count\" must be a positive integer") };
         };
-        input.byte_count = @intCast(@min(byte_count, result_store.read_max_bytes));
+        input.selector.range.byte_count = @intCast(@min(byte_count, result_store.read_max_bytes));
     }
-    if (parsed.value.object.get("query")) |value| {
+    if (args.get("query")) |value| {
         if (value != .string) {
             return .{ .failure = try ctx.allocator.dupe(u8, "read_tool_result field \"query\" must be a string") };
         }
-        input.query = try ctx.allocator.dupe(u8, value.string);
+        if (value.string.len > 0) {
+            input.selector = .{ .query = try ctx.allocator.dupe(u8, value.string) };
+        }
     }
 
     return .{ .input = .{ .ptr = input, .deinit_fn = inputDeinit } };
@@ -118,55 +132,55 @@ pub fn call(ctx: tool_dispatch.DispatchContext, erased: tool_dispatch.ToolInput)
 
 fn readOutput(ctx: tool_dispatch.DispatchContext, input: *Input) ![]u8 {
     if (ctx.session_child_capability) |capability| {
-        const ordinary = if (input.query) |query|
-            result_store.searchByQueryManaged(ctx.allocator, capability, input.handle, query)
-        else
-            result_store.readByRangeManaged(ctx.allocator, capability, input.handle, input.start_byte, input.byte_count);
+        const ordinary = switch (input.selector) {
+            .query => |query| result_store.searchByQueryManaged(ctx.allocator, capability, input.handle, query),
+            .range => |range| result_store.readByRangeManaged(ctx.allocator, capability, input.handle, range.start_byte, range.byte_count),
+        };
         return ordinary catch |err| switch (err) {
-            error.ResultHandleNotFound => if (input.query) |query|
-                command_replay_store.searchAgentQueryManaged(
+            error.ResultHandleNotFound => switch (input.selector) {
+                .query => |query| command_replay_store.searchAgentQueryManaged(
                     ctx.allocator,
                     capability,
                     input.handle,
                     query,
                     result_store.read_max_bytes,
-                )
-            else
-                command_replay_store.readAgentPageManaged(
+                ),
+                .range => |range| command_replay_store.readAgentPageManaged(
                     ctx.allocator,
                     capability,
                     input.handle,
-                    input.start_byte,
-                    input.byte_count,
+                    range.start_byte,
+                    range.byte_count,
                 ),
+            },
             else => return err,
         };
     }
 
     if (ctx.ephemeral_command_replay) |store| {
-        return if (input.query) |query|
-            command_replay_store.searchAgentQueryEphemeral(
+        return switch (input.selector) {
+            .query => |query| command_replay_store.searchAgentQueryEphemeral(
                 ctx.allocator,
                 store,
                 input.handle,
                 query,
                 result_store.read_max_bytes,
-            )
-        else
-            command_replay_store.readAgentPageEphemeral(
+            ),
+            .range => |range| command_replay_store.readAgentPageEphemeral(
                 ctx.allocator,
                 store,
                 input.handle,
-                input.start_byte,
-                input.byte_count,
-            );
+                range.start_byte,
+                range.byte_count,
+            ),
+        };
     }
 
     const dir = ctx.tool_result_dir.?;
-    return if (input.query) |query|
-        result_store.searchByQuery(ctx.allocator, dir, input.handle, query)
-    else
-        result_store.readByRange(ctx.allocator, dir, input.handle, input.start_byte, input.byte_count);
+    return switch (input.selector) {
+        .query => |query| result_store.searchByQuery(ctx.allocator, dir, input.handle, query),
+        .range => |range| result_store.readByRange(ctx.allocator, dir, input.handle, range.start_byte, range.byte_count),
+    };
 }
 
 fn formatReadFailure(alloc: Allocator, handle: []const u8, err: anyerror) ![]u8 {
@@ -190,7 +204,41 @@ pub fn isIrreversible(_: tool_dispatch.ToolInput) bool {
 
 test "read_tool_result decodes range and query inputs" {
     const alloc = std.testing.allocator;
-    const decoded = try decode(.{ .allocator = alloc }, "{\"handle\":\"h.txt\",\"start_byte\":2,\"byte_count\":9,\"query\":\"needle\"}");
+    const decoded_range = try decode(.{ .allocator = alloc }, "{\"handle\":\"h.txt\",\"start_byte\":2,\"byte_count\":9}");
+    const range_input = switch (decoded_range) {
+        .input => |value| value,
+        .failure => return error.TestUnexpectedDecodeFailure,
+    };
+    defer range_input.deinit(alloc);
+    const typed_range = range_input.as(Input);
+    switch (typed_range.selector) {
+        .range => |range| {
+            try std.testing.expectEqual(@as(usize, 2), range.start_byte);
+            try std.testing.expectEqual(@as(usize, 9), range.byte_count);
+        },
+        .query => return error.TestUnexpectedDecodeFailure,
+    }
+
+    const decoded_query = try decode(.{ .allocator = alloc }, "{\"handle\":\"h.txt\",\"query\":\"needle\"}");
+    const query_input = switch (decoded_query) {
+        .input => |value| value,
+        .failure => return error.TestUnexpectedDecodeFailure,
+    };
+    defer query_input.deinit(alloc);
+    const typed_query = query_input.as(Input);
+    try std.testing.expectEqualStrings("h.txt", typed_query.handle);
+    switch (typed_query.selector) {
+        .query => |query| try std.testing.expectEqualStrings("needle", query),
+        .range => return error.TestUnexpectedDecodeFailure,
+    }
+}
+
+test "read_tool_result decodes nested model requests" {
+    const alloc = std.testing.allocator;
+    const decoded = try decode(
+        .{ .allocator = alloc },
+        "{\"request\":{\"handle\":\"h.txt\",\"query\":\"needle\"}}",
+    );
     const input = switch (decoded) {
         .input => |value| value,
         .failure => return error.TestUnexpectedDecodeFailure,
@@ -198,9 +246,31 @@ test "read_tool_result decodes range and query inputs" {
     defer input.deinit(alloc);
     const typed = input.as(Input);
     try std.testing.expectEqualStrings("h.txt", typed.handle);
-    try std.testing.expectEqual(@as(usize, 2), typed.start_byte);
-    try std.testing.expectEqual(@as(usize, 9), typed.byte_count);
-    try std.testing.expectEqualStrings("needle", typed.query.?);
+    switch (typed.selector) {
+        .query => |query| try std.testing.expectEqualStrings("needle", query),
+        .range => return error.TestUnexpectedDecodeFailure,
+    }
+}
+
+test "read_tool_result treats exact empty legacy query as range" {
+    const alloc = std.testing.allocator;
+    const decoded = try decode(
+        .{ .allocator = alloc },
+        "{\"handle\":\"h.txt\",\"start_byte\":2,\"byte_count\":9,\"query\":\"\"}",
+    );
+    const input = switch (decoded) {
+        .input => |value| value,
+        .failure => return error.TestUnexpectedDecodeFailure,
+    };
+    defer input.deinit(alloc);
+    const typed = input.as(Input);
+    switch (typed.selector) {
+        .range => |range| {
+            try std.testing.expectEqual(@as(usize, 2), range.start_byte);
+            try std.testing.expectEqual(@as(usize, 9), range.byte_count);
+        },
+        .query => return error.TestUnexpectedDecodeFailure,
+    }
 }
 
 test "read_tool_result admission restores only omitted stored-result suffixes" {
@@ -239,6 +309,28 @@ test "read_tool_result admission restores only omitted stored-result suffixes" {
             return error.TestUnexpectedDecodeFailure;
         }
         try std.testing.expectEqualStrings(case.expected_handle, input.as(Input).handle);
+    }
+}
+
+test "read_tool_result admission treats an empty query as a range read" {
+    const alloc = std.testing.allocator;
+    const decoded = try decode(
+        .{ .allocator = alloc },
+        "{\"handle\":\"result-read_file-1705079ba6e278c4-553514ccf082aeb9.txt\",\"start_byte\":2,\"byte_count\":9,\"query\":\"\"}",
+    );
+    const input = switch (decoded) {
+        .input => |value| value,
+        .failure => return error.TestUnexpectedDecodeFailure,
+    };
+    defer input.deinit(alloc);
+    try std.testing.expect((try validate(.{ .allocator = alloc }, input)) == null);
+    const typed = input.as(Input);
+    switch (typed.selector) {
+        .range => |range| {
+            try std.testing.expectEqual(@as(usize, 2), range.start_byte);
+            try std.testing.expectEqual(@as(usize, 9), range.byte_count);
+        },
+        .query => return error.TestUnexpectedQuery,
     }
 }
 
@@ -339,8 +431,10 @@ test "read_tool_result pages and searches saved command replay handles" {
 
     var page_input = Input{
         .handle = try alloc.dupe(u8, descriptor.handle),
-        .start_byte = 1,
-        .byte_count = 4096,
+        .selector = .{ .range = .{
+            .start_byte = 1,
+            .byte_count = 4096,
+        } },
     };
     defer page_input.deinit(alloc);
     const page = try readOutput(.{
@@ -355,7 +449,7 @@ test "read_tool_result pages and searches saved command replay handles" {
 
     var query_input = Input{
         .handle = try alloc.dupe(u8, descriptor.handle),
-        .query = try alloc.dupe(u8, "needle"),
+        .selector = .{ .query = try alloc.dupe(u8, "needle") },
     };
     defer query_input.deinit(alloc);
     const query = try readOutput(.{
