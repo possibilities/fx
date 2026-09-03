@@ -104,6 +104,13 @@ pub const PromptAdmission = enum {
 
 pub fn Runtime(comptime App: type) type {
     return struct {
+        pub fn ownsComposer(app: *const App) bool {
+            if (comptime @hasField(App, "queued_prompt_review")) {
+                return app.queued_prompt_review.visible;
+            }
+            return false;
+        }
+
         pub fn requestCancelAndOpen(app: *App) bool {
             return openAfterPause(app, app.worker.requestInteractiveCancel());
         }
@@ -820,6 +827,18 @@ const ReviewTestApp = struct {
         self.pending_images.clearRetainingCapacity();
     }
 };
+
+test "queue review owns the composer only while its draft is visible" {
+    var app = ReviewTestApp{ .alloc = std.testing.allocator };
+    defer app.deinit();
+    const rt = Runtime(ReviewTestApp);
+
+    try std.testing.expect(!rt.ownsComposer(&app));
+    app.queued_prompt_review.reason = .manual;
+    try std.testing.expect(!rt.ownsComposer(&app));
+    app.queued_prompt_review.visible = true;
+    try std.testing.expect(rt.ownsComposer(&app));
+}
 
 fn makeReviewTestPrompt(alloc: std.mem.Allocator, text: []const u8) !worker_runtime.QueuedPrompt {
     const prompt = try alloc.dupe(u8, text);
