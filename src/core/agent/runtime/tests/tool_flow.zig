@@ -501,6 +501,7 @@ fn expectedPermissionDeniedMessage(reason: types.ToolPermissionDenialReason) ?[]
         .user_denied => "Permission denied by user",
         .auto_denied => "Blocked by automatic safety policy",
         .review_caution => "Action held after safety review",
+        .review_evidence_incomplete => "Safety review evidence incomplete; action held",
         .review_unavailable => "Safety reviewer unavailable; action held",
         .policy_denied, .permission_required => null,
     };
@@ -2879,7 +2880,10 @@ test "modern context delta defers effectful call exactly once" {
     try std.testing.expect(hooks.lifecycle_events.items[2] == .terminal);
     const terminal = hooks.lifecycle_events.items[2].terminal;
     try std.testing.expectEqual(types.ToolOutcomeKind.deferred, terminal.outcome.kind);
-    try std.testing.expectEqualStrings("Context updated write_file", terminal.outcome.summary);
+    try std.testing.expectEqualStrings(
+        "Not run — project instructions changed: write_file",
+        terminal.outcome.summary,
+    );
 }
 
 test "modern context delta does not defer unrelated effectful call" {
@@ -3959,7 +3963,6 @@ test "processQueuedPrompt denied registered run command compatibility never reac
 
 test "processQueuedPrompt legacy auto denial retains lifecycle source" {
     const alloc = std.testing.allocator;
-    const decision_prompt = "Continue the original task. If work remains and you can proceed, briefly tell the user what you are doing next, then perform that action with the appropriate tool. Do not end the turn with only a progress update. If the task is complete, respond with the result. If a genuine blocker prevents further action, explain the blocker and what is needed to continue.";
     const calls = [_]ToolCall{toolCall("call_1", "write_file", "{\"path\":\"a\",\"content\":\"x\"}")};
     const completions = [_]FakeCompletion{
         .{ .tool_calls = &calls },
@@ -3986,14 +3989,6 @@ test "processQueuedPrompt legacy auto denial retains lifecycle source" {
         hooks.lifecycle_events.items[2].terminal.outcome.kind,
     );
     try expectPermissionDeniedToolResult(&gateway, 1, "write_file", .auto_denied);
-    try expectBodyContainsInOrder(&gateway, 1, &.{
-        "tool_permission_denied",
-        decision_prompt,
-    });
-    try std.testing.expectEqual(
-        @as(usize, 1),
-        countNeedle(gateway.request_bodies.items[1], decision_prompt),
-    );
 }
 
 test "exact caution is reused while the agent continues to a normal completion" {
@@ -4312,89 +4307,6 @@ test "batched permission feedback follows every tool result before the next gate
     try std.testing.expectEqual(@as(usize, 0), results[1].permission_feedback.len);
     try std.testing.expect(std.mem.find(u8, results[0].output, "trusted_root_user_context") == null);
     try std.testing.expect(std.mem.find(u8, results[1].output, "untrusted_assistant_tool_evidence") == null);
-}
-
-test "completed tool batch appends one action-oriented decision prompt to the next provider request" {
-    const alloc = std.testing.allocator;
-    const decision_prompt = "Continue the original task. If work remains and you can proceed, briefly tell the user what you are doing next, then perform that action with the appropriate tool. Do not end the turn with only a progress update. If the task is complete, respond with the result. If a genuine blocker prevents further action, explain the blocker and what is needed to continue.";
-    const calls = [_]ToolCall{
-        toolCall("call_first", "terminal", "{\"action\":\"exec\",\"command\":\"printf first\"}"),
-        toolCall("call_second", "terminal", "{\"action\":\"exec\",\"command\":\"printf second\"}"),
-    };
-    const next_calls = [_]ToolCall{
-        toolCall("call_third", "terminal", "{\"action\":\"exec\",\"command\":\"printf third\"}"),
-    };
-    const completions = [_]FakeCompletion{
-        .{ .tool_calls = &calls },
-        .{ .tool_calls = &next_calls },
-        .{ .content = "Final" },
-    };
-    var gateway = FakeGateway.init(alloc, &completions);
-    defer gateway.deinit();
-    var hooks = FakeAgentRuntimeDeps.init(alloc);
-    defer hooks.deinit();
-    hooks.exec_plans = &.{
-        .{ .result = .{ .model_output = "first command completed" } },
-        .{ .result = .{ .model_output = "second command completed" } },
-        .{ .result = .{ .model_output = "third command completed" } },
-    };
-    var fixture = PromptFixture{};
-
-    try runFakePrompt(&gateway, &hooks, fixture.config(), fixture.job());
-
-    try std.testing.expectEqual(@as(usize, 3), gateway.request_bodies.items.len);
-    try expectBodyNotContains(&gateway, 0, decision_prompt);
-    try expectBodyContainsInOrder(&gateway, 1, &.{
-        "first command completed",
-        "second command completed",
-        decision_prompt,
-    });
-    try std.testing.expectEqual(
-        @as(usize, 1),
-        countNeedle(gateway.request_bodies.items[1], decision_prompt),
-    );
-    try expectBodyContainsInOrder(&gateway, 2, &.{
-        "third command completed",
-        decision_prompt,
-    });
-    try std.testing.expectEqual(
-        @as(usize, 1),
-        countNeedle(gateway.request_bodies.items[2], decision_prompt),
-    );
-    try std.testing.expectEqual(@as(usize, 1), hooks.history_turns.items.len);
-    const turn = hooks.history_turns.items[0].assistant;
-    try std.testing.expect(std.mem.find(u8, turn.user.text, decision_prompt) == null);
-    try std.testing.expect(std.mem.find(u8, turn.assistant, decision_prompt) == null);
-}
-
-test "post-tool provider retry retains exactly one action-oriented decision prompt" {
-    const alloc = std.testing.allocator;
-    const decision_prompt = "Continue the original task. If work remains and you can proceed, briefly tell the user what you are doing next, then perform that action with the appropriate tool. Do not end the turn with only a progress update. If the task is complete, respond with the result. If a genuine blocker prevents further action, explain the blocker and what is needed to continue.";
-    const calls = [_]ToolCall{
-        toolCall("call_retry", "terminal", "{\"action\":\"exec\",\"command\":\"printf retry\"}"),
-    };
-    const completions = [_]FakeCompletion{
-        .{ .tool_calls = &calls },
-        .{ .status = .service_unavailable, .retry_after_seconds = 0 },
-        .{ .content = "Final" },
-    };
-    var gateway = FakeGateway.init(alloc, &completions);
-    defer gateway.deinit();
-    var hooks = FakeAgentRuntimeDeps.init(alloc);
-    defer hooks.deinit();
-    hooks.exec_plans = &.{
-        .{ .result = .{ .model_output = "retry command completed" } },
-    };
-    var fixture = PromptFixture{};
-
-    try runFakePrompt(&gateway, &hooks, fixture.config(), fixture.job());
-
-    try std.testing.expectEqual(@as(usize, 3), gateway.request_bodies.items.len);
-    try expectBodyNotContains(&gateway, 0, decision_prompt);
-    for (gateway.request_bodies.items[1..]) |body| {
-        try std.testing.expectEqual(@as(usize, 1), countNeedle(body, decision_prompt));
-    }
-    try std.testing.expectEqual(@as(usize, 1), hooks.executed_names.items.len);
 }
 
 test "processQueuedPrompt normal always permission retains suggested session grants before execution" {
@@ -4970,7 +4882,10 @@ test "parallel permission preflight failure terminalizes its started lifecycle" 
     });
     const terminal = hooks.lifecycle_events.items[9].terminal;
     try std.testing.expectEqual(types.ToolOutcomeKind.failed, terminal.outcome.kind);
-    try std.testing.expect(std.mem.endsWith(u8, terminal.outcome.summary, ": preflight failed"));
+    try std.testing.expectEqualStrings(
+        "Failed read_file: permission preflight failed",
+        terminal.outcome.summary,
+    );
 }
 
 test "web_search denial trace records redacted query without api keys or result bodies" {

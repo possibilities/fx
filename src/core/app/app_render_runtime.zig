@@ -11,6 +11,7 @@ const managed_execution = @import("../execution/managed_execution.zig");
 const terminal_ui_projection = @import("../terminal/ui_projection.zig");
 const worker_runtime = @import("../agent/worker_runtime.zig");
 const auth_runtime = @import("../auth/auth_runtime.zig");
+const provider_picker_runtime = @import("provider_picker_runtime.zig");
 const model_capabilities = @import("../config/model_capabilities.zig");
 const picker_state = @import("../input/picker_state.zig");
 const core_input_runtime = @import("../input/runtime.zig");
@@ -136,12 +137,18 @@ const RenderReconciliation = union(enum) {
 
 const QueuedCardProjection = struct {
     cards: []render_input.QueuedPromptCard = &.{},
+    steering_messages: [][]u8 = &.{},
+    steering_waits_for_tool: bool = false,
+    ordinary_count: usize = 0,
+    paused: bool = false,
     row_count: u16 = 0,
     editor_active: bool = false,
 
     fn deinit(self: *QueuedCardProjection, alloc: std.mem.Allocator) void {
         for (self.cards) |card| alloc.free(card.bytes);
         if (self.cards.len > 0) alloc.free(self.cards);
+        for (self.steering_messages) |message| alloc.free(message);
+        if (self.steering_messages.len > 0) alloc.free(self.steering_messages);
         self.* = .{};
     }
 };
@@ -311,14 +318,36 @@ fn previewWithPendingCard(
     return next;
 }
 
-// Queued prompts stay collapsed behind their summary row until the review is
-// opened; only then does the banner expand into one card per queued prompt.
+// Steering text stays visible while ordinary queued prompts remain collapsed
+// until review opens. Every slice in the result is owned for one render frame.
 fn buildQueuedCardProjection(comptime App: type, app: *App) !QueuedCardProjection {
-    if (comptime !@hasField(App, "queued_prompt_review")) return .{};
+    var projection: QueuedCardProjection = .{};
+    errdefer projection.deinit(app.alloc);
+    if (comptime @hasDecl(@TypeOf(app.worker), "snapshotQueuePresentation")) {
+        var snapshot = try app.worker.snapshotQueuePresentation(app.alloc);
+        defer snapshot.deinit(app.alloc);
+        projection.ordinary_count = snapshot.ordinary_count;
+        projection.paused = snapshot.paused;
+        projection.steering_waits_for_tool = snapshot.steering_waits_for_tool;
+        projection.steering_messages = snapshot.steering_messages;
+        snapshot.steering_messages = &.{};
+    } else {
+        const queue_preview = app.worker.queuePreview();
+        const steering_count = if (comptime @hasField(@TypeOf(queue_preview), "steering_count"))
+            queue_preview.steering_count
+        else
+            0;
+        projection.ordinary_count = queue_preview.count -| steering_count;
+        projection.paused = if (comptime @hasField(@TypeOf(queue_preview), "paused"))
+            queue_preview.paused
+        else
+            false;
+    }
+    if (comptime !@hasField(App, "queued_prompt_review")) return projection;
     const review_entries = app.queued_prompt_review.entries;
     if (!app.queued_prompt_review.visible or
         !app.queued_prompt_review.active() or
-        review_entries.len == 0) return .{};
+        review_entries.len == 0) return projection;
     const draft_count = review_entries.len;
 
     const measurement = try input_queue_runtime.measureVisibleReviewRows(
@@ -387,11 +416,10 @@ fn buildQueuedCardProjection(comptime App: type, app: *App) !QueuedCardProjectio
         cards[built] = .{ .bytes = bytes };
     }
 
-    return .{
-        .cards = cards,
-        .row_count = measurement.card_rows,
-        .editor_active = measurement.editor_active,
-    };
+    projection.cards = cards;
+    projection.row_count = measurement.card_rows;
+    projection.editor_active = measurement.editor_active;
+    return projection;
 }
 
 noinline fn approvalScreenNeedsClear(
@@ -506,6 +534,7 @@ pub fn Runtime(comptime App: type) type {
         var effort_picker_values_buf: [types.ReasoningEffort.max_options + 1]types.ReasoningEffort = undefined;
         var effort_picker_labels_buf: [types.ReasoningEffort.max_options + 1][]const u8 = undefined;
         var fast_picker_labels_buf: [2][]const u8 = undefined;
+        var provider_picker_column: provider_picker_runtime.ColumnBuffer = .{};
         var file_completions_buf: [input_completion_runtime.file_picker_completion_cap]file_index.SearchResult = undefined;
         var file_match_spans_buf: [input_completion_runtime.file_picker_completion_cap * file_index.max_path_len]file_index.MatchSpan = undefined;
         var file_path_storage_buf: [input_completion_runtime.file_picker_path_storage_cap]u8 = undefined;
@@ -515,8 +544,6 @@ pub fn Runtime(comptime App: type) type {
             shimmer_pos: i16,
             queued_cards: *const QueuedCardProjection,
         ) render_input.RenderContext {
-            const queue_preview = app.worker.queuePreview();
-
             const model_query = app.input_runtime.picker.activeModelPickerQuery(&app.input_runtime.edit_state);
             const pending_model = if (app.input_runtime.picker.hasPendingModelPickerSelection()) app.input_runtime.picker.model_picker_pending_model.items else null;
             var model_picker_stage: picker_state.ModelPickerStage = .model;
@@ -558,7 +585,47 @@ pub fn Runtime(comptime App: type) type {
                 }
             }
 
-            const file_query = if (model_query == null) app.input_runtime.picker.activeFilePickerQuery(&app.input_runtime.edit_state) else null;
+            const provider_query = if (model_query == null)
+                app.input_runtime.picker.activeProviderPickerQuery(&app.input_runtime.edit_state)
+            else
+                null;
+            var provider_stage: picker_state.ProviderPickerStage = .provider;
+            var provider_picker_items: []const []const u8 = &.{};
+            var provider_picker_annotations: []const []const u8 = &.{};
+            var provider_picker_index: usize = 0;
+            var provider_picker_window_start: usize = 0;
+            var provider_picker_anchor: usize = 0;
+            if (provider_query) |picker_query| {
+                provider_stage = picker_query.stage;
+                provider_picker_anchor = picker_query.token_start;
+                const count = provider_picker_runtime.Runtime(App).columnOptions(app, picker_query, &provider_picker_column);
+                provider_picker_items = provider_picker_column.labels[0..count];
+                provider_picker_annotations = provider_picker_column.annotations[0..count];
+                switch (picker_query.stage) {
+                    .provider => {
+                        provider_picker_index = app.input_runtime.picker.provider_column_index;
+                        provider_picker_window_start = app.input_runtime.picker.provider_column_window_start;
+                    },
+                    .method => {
+                        provider_picker_index = app.input_runtime.picker.method_column_index;
+                        provider_picker_window_start = app.input_runtime.picker.method_column_window_start;
+                    },
+                    .team => {
+                        provider_picker_index = app.input_runtime.picker.team_column_index;
+                        provider_picker_window_start = app.input_runtime.picker.team_column_window_start;
+                    },
+                    .key_source => {
+                        provider_picker_index = app.input_runtime.picker.key_source_column_index;
+                        provider_picker_window_start = app.input_runtime.picker.key_source_column_window_start;
+                    },
+                    .api_key => {},
+                }
+            }
+
+            const file_query = if (model_query == null and provider_query == null)
+                app.input_runtime.picker.activeFilePickerQuery(&app.input_runtime.edit_state)
+            else
+                null;
             var file_items: []const file_index.SearchResult = &.{};
             var file_anchor: usize = 0;
             var file_selection_index: usize = 0;
@@ -625,15 +692,13 @@ pub fn Runtime(comptime App: type) type {
                     app.permission_engine.mode
                 else
                     .ask,
-                .queued_count = if (queued_cards.cards.len > 0) queued_cards.cards.len else queue_preview.count,
-                .steering_count = if (comptime @hasField(@TypeOf(queue_preview), "steering_count"))
-                    queue_preview.steering_count
+                .queued_count = if (queued_cards.cards.len > 0)
+                    queued_cards.cards.len
                 else
-                    0,
-                .queued_paused = if (comptime @hasField(@TypeOf(queue_preview), "paused"))
-                    queue_preview.paused
-                else
-                    false,
+                    queued_cards.ordinary_count + queued_cards.steering_messages.len,
+                .steering_messages = queued_cards.steering_messages,
+                .steering_waits_for_tool = queued_cards.steering_waits_for_tool,
+                .queued_paused = queued_cards.paused,
                 .queued_cancel_all_available = if (comptime @hasField(App, "queued_prompt_review"))
                     app.queued_prompt_review.active() and
                         app.queued_prompt_review.reason.? == .post_cancel and
@@ -659,6 +724,13 @@ pub fn Runtime(comptime App: type) type {
                 .model_completion_index = picker_index,
                 .model_completion_window_start = picker_window_start,
                 .model_completion_anchor = picker_anchor,
+                .provider_query_active = provider_query != null,
+                .provider_picker_stage = provider_stage,
+                .provider_picker_completions = provider_picker_items,
+                .provider_picker_annotations = provider_picker_annotations,
+                .provider_picker_completion_index = provider_picker_index,
+                .provider_picker_completion_window_start = provider_picker_window_start,
+                .provider_picker_completion_anchor = provider_picker_anchor,
                 .file_query_active = file_query != null,
                 .file_completions = file_items,
                 .file_completion_index = file_selection_index,
@@ -1284,6 +1356,14 @@ pub fn Runtime(comptime App: type) type {
                     measurement.activity_projection
                 else
                     .{ .turn_thinking = .{ .label = footer_frame.label() } };
+                const prompt_turn_reservation = promptTurnReservation(
+                    app,
+                    presentation_shell,
+                    canonical_transcript_preview,
+                    pending_card,
+                    if (footer_measurement) |*measurement| measurement else null,
+                    frame_activity,
+                );
                 var fixed_point_ctx = FixedPointTranscriptContext(App){
                     .app = app,
                     .presentation_shell = presentation_shell,
@@ -1316,6 +1396,7 @@ pub fn Runtime(comptime App: type) type {
                         .footer = neutral_footer,
                         .transcript = transcript_preview,
                         .activity = frame_activity,
+                        .prompt_turn = prompt_turn_reservation,
                         .body_mode = .transcript,
                         .prior = active_committed_layout,
                     },
@@ -1327,7 +1408,7 @@ pub fn Runtime(comptime App: type) type {
                 scroll_plan = fixed_point.scroll_plan;
                 debug_trace.logf(
                     "frame_layout",
-                    "layout_id={x} solved_frame_height={d} footer_height={d} footer_top={d} owned_top={d} owned_bottom={d} scroll_rows={d}",
+                    "layout_id={x} solved_frame_height={d} footer_height={d} footer_top={d} owned_top={d} owned_bottom={d} prompt_turn_transcript_rows={d} prompt_turn_active={s} scroll_rows={d}",
                     .{
                         solved.layout_id,
                         solved.solved_frame_height,
@@ -1335,6 +1416,8 @@ pub fn Runtime(comptime App: type) type {
                         solved.footer_area.top,
                         solved.owned_top,
                         solved.owned_band.bottom,
+                        prompt_turn_reservation.transcript_rows,
+                        if (prompt_turn_reservation.active()) "true" else "false",
                         scroll_plan.terminal_scroll_rows,
                     },
                 );
@@ -2097,11 +2180,15 @@ fn FixedPointTranscriptContext(comptime App: type) type {
                 self.presentation_shell.committed_frame_layout.transcript_area,
                 candidate_plan.invalidation,
             );
-            const target = try self.presentation_shell.resolveTranscriptTransitionTargetForFrame(
+            const target = try self.presentation_shell.resolveTranscriptTransitionTargetForFrameInArea(
                 self.app.alloc,
                 source,
                 prepared,
                 render_engine.frame_layout.CommittedLayoutSnapshot.fromLayout(candidate),
+                transcriptAreaBeforePendingTail(
+                    candidate.transcript_area,
+                    self.pending_tail_rows,
+                ),
                 scroll_plan,
                 scroll_facts,
                 destructive_invalidation,
@@ -2198,6 +2285,44 @@ fn validatePreparedTranscriptFitsPlan(
         );
         return error.InvalidPaintPlan;
     }
+}
+
+fn promptTurnReservation(
+    app: anytype,
+    shell: *const transcript_runtime.TranscriptRuntime,
+    canonical_preview: render_engine.frame_layout.TranscriptFlowPreview,
+    pending_card: ?PendingCardProjection,
+    footer_measurement: ?*const surface_frame.SurfaceFooterMeasurement,
+    frame_activity: render_engine.frame_layout.ActivityState,
+) render_engine.frame_layout.PromptTurnReservation {
+    if (frame_activity != .none) return .{};
+    const measurement = footer_measurement orelse return .{};
+    if (!measurement.input_visible or
+        measurement.show_picker or
+        measurement.picker_rows > 0 or
+        measurement.banner_active or
+        measurement.footer_gap_active or
+        app.stream.active or
+        shell.fullTranscriptActive()) return .{};
+    if (comptime @hasField(@TypeOf(app.*), "skills")) {
+        if (comptime @hasDecl(@TypeOf(app.skills), "menuVisible")) {
+            if (app.skills.menuVisible()) return .{};
+        }
+    }
+
+    const future_activity = render_engine.frame_layout.ActivityState.thinkingAfterUserTurn();
+    const pending_submission_active = if (comptime @hasField(@TypeOf(app.*), "submission"))
+        app.submission.pending != null
+    else
+        false;
+    if (pending_card != null or pending_submission_active) {
+        const canonical_rows = if (pending_card) |card|
+            canonical_preview.natural_visual_rows +| (card.row_count -| 1)
+        else
+            canonical_preview.natural_visual_rows;
+        return .{ .transcript_rows = canonical_rows, .activity = future_activity };
+    }
+    return .{};
 }
 
 fn footerMeasurementFromRows(rows: render_engine.footer_layout.FooterRows) render_engine.frame_layout.FooterMeasurement {

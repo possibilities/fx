@@ -123,7 +123,12 @@ pub fn buildExplicitPromptSection(
     var diagnostic_notices: std.Io.Writer.Allocating = .init(alloc);
     defer diagnostic_notices.deinit();
 
-    try out.writer.writeAll("Explicitly invoked skill content for this query:\n");
+    try out.writer.writeAll(
+        "Explicitly invoked skill content for this query:\n" ++
+            "Every skill below is already loaded and must be used for this query.\n" ++
+            "Follow each skill's complete instructions and required resources before substantive work.\n" ++
+            "If a skill cannot be followed, state the blocker instead of silently substituting another workflow.\n",
+    );
     for (binding_plan) |binding| {
         try appendExplicitSkill(
             alloc,
@@ -1437,7 +1442,9 @@ test "explicit invocation supplies the bounded first skill chunk before the resp
     );
     defer explicit.deinit(alloc);
 
-    try expectContains(explicit.text, "Explicitly invoked skill content for this query");
+    try expectContains(explicit.text, "Every skill below is already loaded and must be used for this query.");
+    try expectContains(explicit.text, "Follow each skill's complete instructions and required resources before substantive work.");
+    try expectContains(explicit.text, "If a skill cannot be followed, state the blocker instead of silently substituting another workflow.");
     try expectContains(explicit.text, "<skill_content name=\"workflow\" resource=\"SKILL.md\" offset=\"0\"");
     try expectContains(explicit.text, "name=\"skill_chunk_bytes\" action=\"truncated\"");
     try expectNotContains(explicit.text, "TAIL MUST WAIT");
