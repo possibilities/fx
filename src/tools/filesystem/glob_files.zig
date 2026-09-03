@@ -60,7 +60,11 @@ pub fn decode(ctx: tool_dispatch.DispatchContext, args_json: []const u8) tool_di
 
     const owned_pattern = try ctx.allocator.dupe(u8, pattern_value.string);
     errdefer ctx.allocator.free(owned_pattern);
-    const owned_path = try ctx.allocator.dupe(u8, path_string orelse ".");
+    const effective_path = if (path_string) |path|
+        if (path.len == 0) "." else path
+    else
+        ".";
+    const owned_path = try ctx.allocator.dupe(u8, effective_path);
     errdefer ctx.allocator.free(owned_path);
 
     const input = try ctx.allocator.create(Input);
@@ -608,6 +612,7 @@ test "glob_files decodes invalid argument shapes as failures" {
 
 test "glob_files decodes omitted path and valid input" {
     try expectDecodeInput("{\"pattern\":\"*.zig\"}", "*.zig", ".");
+    try expectDecodeInput("{\"pattern\":\"*.zig\",\"path\":\"\"}", "*.zig", ".");
     try expectDecodeInput("{\"pattern\":\"*.zig\",\"path\":\"src\"}", "*.zig", "src");
     try expectDecodeInput("{\"pattern\":\"*.zig\",\"path\":1}", "*.zig", ".");
 }
