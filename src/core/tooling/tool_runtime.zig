@@ -6707,6 +6707,54 @@ test "supplied session grant authorizes skill in a fresh session" {
     try std.testing.expectEqual(ToolPermissionDecision.once, decision);
 }
 
+test "skill tool loads an invocation-root skill" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/workspace");
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx/skills");
+    try tmp.dir.createDirPath(io_mod.getIo(), "custom/workflow");
+    {
+        var file = try tmp.dir.createFile(io_mod.getIo(), "custom/workflow/SKILL.md", .{});
+        defer file.close(io_mod.getIo());
+        try file.writeStreamingAll(
+            io_mod.getIo(),
+            "---\nname: workflow\ndescription: invocation workflow\n---\n\nINVOCATION ROOT BODY\n",
+        );
+    }
+
+    const workspace_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home/workspace");
+    defer alloc.free(workspace_root);
+    const skills_dir = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home/.fx/skills");
+    defer alloc.free(skills_dir);
+    const custom_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "custom");
+    defer alloc.free(custom_root);
+    const invocation_skill_roots = [_][]const u8{custom_root};
+    try setTestHome(null);
+    defer setTestHome(null) catch {};
+
+    var rt = TestRuntime{
+        .workspace_root = workspace_root,
+        .skills_dir = skills_dir,
+        .skill_root_policy = .{
+            .invocation_roots = &invocation_skill_roots,
+            .exclusive_invocation_roots = true,
+            .managed_root_source = null,
+        },
+    };
+    defer rt.deinit(alloc);
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const result = try executeToolCall(
+        rt.context(),
+        arena_state.allocator(),
+        .{ .id = "1", .name = "skill", .arguments_json = "{\"name\":\"workflow\"}" },
+    );
+    try std.testing.expectEqual(tool_contracts.ToolExecutionStatus.success, result.status);
+    try expectContains(result.model_output, "INVOCATION ROOT BODY");
+}
+
 test "skill tool reports missing skill" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});

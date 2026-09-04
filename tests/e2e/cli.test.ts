@@ -4034,6 +4034,146 @@ describe("cli: ask success", () => {
   );
 
   test(
+    "repeatable --skills-dir roots load in invocation order",
+    async () => {
+      const root = mkdtempSync(join(tmpdir(), "fx-e2e-invocation-skills-"));
+      const home = join(root, "home");
+      const workspace = join(root, "workspace");
+      const firstRoot = join(root, "first-root");
+      const secondRoot = join(root, "second-root");
+      const firstBody = "FIRST_INVOCATION_SKILL_BODY";
+      const secondBody = "SECOND_INVOCATION_SKILL_BODY";
+      const gateway = startFakeGateway([
+        fakeGatewayFinalText("invocation skills complete"),
+      ]);
+      try {
+        mkdirSync(home);
+        mkdirSync(workspace);
+        mkdirSync(join(firstRoot, "first-invocation"), { recursive: true });
+        mkdirSync(join(secondRoot, "second-invocation"), { recursive: true });
+        writeFileSync(
+          join(firstRoot, "first-invocation", "SKILL.md"),
+          `---\nname: first-invocation\ndescription: first invocation root\n---\n\n${firstBody}\n`,
+        );
+        writeFileSync(
+          join(secondRoot, "second-invocation", "SKILL.md"),
+          `---\nname: second-invocation\ndescription: second invocation root\n---\n\n${secondBody}\n`,
+        );
+
+        const result = await runFx(
+          [
+            "--skills-dir",
+            "../first-root",
+            `--skills-dir=${realpathSync(secondRoot)}`,
+            "ask",
+            "--json",
+            "--auto",
+            "--no-save",
+            "$first-invocation apply the selected skill.",
+          ],
+          {
+            cwd: realpathSync(workspace),
+            env: {
+              HOME: realpathSync(home),
+              AI_GATEWAY_API_KEY: "fake-invocation-skills-key",
+              VERCEL_OIDC_TOKEN: undefined,
+              FX_GATEWAY_BASE_URL: gateway.baseUrl,
+              FX_GATEWAY_CHAT_URL: gateway.chatUrl,
+              FX_MODEL: FAKE_GATEWAY_MODEL,
+              FX_AUTO_UPGRADE: "0",
+            },
+            timeoutMs: TIMEOUT,
+          },
+        );
+
+        expect(result.code).toBe(0);
+        expect(result.stderr).toBe("");
+        expect(JSON.parse(result.stdout).output.trim()).toBe(
+          "invocation skills complete",
+        );
+        expect(gateway.requests).toHaveLength(1);
+        const body = gateway.requests[0]!.body;
+        expect(body.indexOf("first invocation root")).toBeLessThan(
+          body.indexOf("second invocation root"),
+        );
+        expect(body).toContain(firstBody);
+        expect(body).not.toContain(secondBody);
+      } finally {
+        gateway.stop();
+        rmSync(root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test("--skills-dir remains usable without HOME", async () => {
+    const root = mkdtempSync(join(tmpdir(), "fx-e2e-home-free-skills-"));
+    const workspace = join(root, "workspace");
+    const invocationRoot = join(root, "invocation-root");
+    const skillBody = "HOME_FREE_INVOCATION_SKILL_BODY";
+    const gateway = startFakeGateway([
+      fakeGatewayFinalText("home-free invocation skill complete"),
+    ]);
+    try {
+      mkdirSync(workspace);
+      mkdirSync(join(invocationRoot, "home-free"), { recursive: true });
+      writeFileSync(
+        join(invocationRoot, "home-free", "SKILL.md"),
+        `---\nname: home-free\ndescription: home-free invocation root\n---\n\n${skillBody}\n`,
+      );
+
+      const result = await runFx(
+        [
+          "--skills-dir",
+          invocationRoot,
+          "ask",
+          "--json",
+          "--auto",
+          "--no-save",
+          "$home-free apply the selected skill.",
+        ],
+        {
+          cwd: realpathSync(workspace),
+          env: {
+            HOME: undefined,
+            AI_GATEWAY_API_KEY: "fake-home-free-skills-key",
+            VERCEL_OIDC_TOKEN: undefined,
+            FX_GATEWAY_BASE_URL: gateway.baseUrl,
+            FX_GATEWAY_CHAT_URL: gateway.chatUrl,
+            FX_MODEL: FAKE_GATEWAY_MODEL,
+            FX_AUTO_UPGRADE: "0",
+          },
+          timeoutMs: TIMEOUT,
+        },
+      );
+
+      expect(result.code).toBe(0);
+      expect(JSON.parse(result.stdout).output.trim()).toBe(
+        "home-free invocation skill complete",
+      );
+      expect(result.stderr).toContain("reason=home unavailable");
+      expect(gateway.requests).toHaveLength(1);
+      expect(gateway.requests[0]!.body).toContain(skillBody);
+    } finally {
+      gateway.stop();
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("--skills-dir rejects a missing directory before agent startup", async () => {
+    const result = await runFx(
+      ["--skills-dir", "/definitely/missing/fx-skills", "ask", "hello"],
+      { env: NO_GATEWAY_AUTH, timeoutMs: TIMEOUT },
+    );
+
+    expect(result.code).toBe(1);
+    expect(result.stdout).toBe("");
+    expect(result.stderr).toContain(
+      "could not use skills directory /definitely/missing/fx-skills: directory is missing or unreadable",
+    );
+  });
+
+  test(
     "fx ask stdin prompts above the old 1 MiB limit reach Gateway byte-for-byte",
     async () => {
       const root = mkdtempSync(join(tmpdir(), "fx-e2e-ask-large-stdin-"));

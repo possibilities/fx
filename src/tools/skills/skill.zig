@@ -207,7 +207,6 @@ fn loadByIdentity(
         max_tool_result_bytes,
     );
 }
-
 pub fn readsOnly(_: tool_dispatch.ToolInput) bool {
     return false;
 }

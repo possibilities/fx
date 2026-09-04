@@ -553,6 +553,7 @@ const TestCapture = struct {
     mcp_profile_home: ?[]const u8 = null,
     skill_profile_home: ?[]const u8 = null,
     load_skills_workspace: []const u8 = "",
+    load_skills_invocation_root_count: usize = 0,
     load_skills_workspace_root_count: usize = 0,
     load_skills_global_root_count: usize = 0,
     transcript_recorded: bool = false,
@@ -1008,6 +1009,7 @@ test "app_bootstrap_runtime transfers startup state and starts a fresh session" 
     );
     try std.testing.expect(!capture.initialize_required);
     try std.testing.expectEqualStrings("/workspace", capture.load_skills_workspace);
+    try std.testing.expectEqual(@as(usize, 0), capture.load_skills_invocation_root_count);
     try std.testing.expectEqual(@as(usize, 1), capture.load_skills_workspace_root_count);
     try std.testing.expectEqual(@as(usize, 1), capture.load_skills_global_root_count);
     const events = capture.eventSlice();

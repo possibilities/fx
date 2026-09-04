@@ -328,6 +328,10 @@ pub const top_level_help_groups = [_]TopLevelHelpGroup{
 
 pub const top_level_flags = [_]TopLevelFlag{
     .{
+        .usage = "--skills-dir <path>",
+        .description = "Load an invocation skill root; repeatable",
+    },
+    .{
         .usage = "--context-limit <spec>",
         .description = "Set name=bytes|off; repeatable",
     },

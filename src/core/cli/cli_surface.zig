@@ -150,8 +150,8 @@ pub const LaunchModifiers = struct {
         return self.permission_policy != null;
     }
 
-    pub fn hasSkillModifiers(self: LaunchModifiers) bool {
-        return self.skill_directories.len > 0 or self.no_default_skills;
+    pub fn hasSkillDirectories(self: LaunchModifiers) bool {
+        return self.skill_directories.len > 0;
     }
 
     pub fn skillRootPolicy(self: LaunchModifiers, default_policy: skill_contract.RootPolicy) skill_contract.RootPolicy {
@@ -379,6 +379,14 @@ const GlobalLaunchArgs = struct {
     }
 };
 
+/// Duplicates a global path argument and transfers its ownership to `paths`.
+/// If growing the list fails, this helper remains responsible for the duplicate.
+fn dupeAndAppendPath(alloc: Allocator, paths: *std.ArrayList([]u8), value: []const u8) !void {
+    const path = try alloc.dupe(u8, value);
+    errdefer alloc.free(path);
+    try paths.append(alloc, path);
+}
+
 fn parseGlobalLaunchArgs(
     alloc: Allocator,
     args: []const [:0]const u8,
@@ -416,11 +424,11 @@ fn parseGlobalLaunchArgs(
         } else if (std.mem.eql(u8, arg, "--add-dir")) {
             index += 1;
             if (index >= args.len or args[index].len == 0) return error.MissingAddDirectoryValue;
-            try directories.append(alloc, try alloc.dupe(u8, args[index]));
+            try dupeAndAppendPath(alloc, &directories, args[index]);
         } else if (std.mem.startsWith(u8, arg, "--add-dir=")) {
             const value = arg["--add-dir=".len..];
             if (value.len == 0) return error.MissingAddDirectoryValue;
-            try directories.append(alloc, try alloc.dupe(u8, value));
+            try dupeAndAppendPath(alloc, &directories, value);
         } else if (std.mem.eql(u8, arg, "--no-additional-dirs")) {
             if (suppress_saved) return error.DuplicateAdditionalDirectorySuppression;
             suppress_saved = true;
@@ -459,11 +467,11 @@ fn parseGlobalLaunchArgs(
         } else if (std.mem.eql(u8, arg, "--skills-dir")) {
             index += 1;
             if (index >= args.len or args[index].len == 0) return error.MissingSkillsDirectoryValue;
-            try skill_directories.append(alloc, try alloc.dupe(u8, args[index]));
+            try dupeAndAppendPath(alloc, &skill_directories, args[index]);
         } else if (std.mem.startsWith(u8, arg, "--skills-dir=")) {
             const value = arg["--skills-dir=".len..];
             if (value.len == 0) return error.MissingSkillsDirectoryValue;
-            try skill_directories.append(alloc, try alloc.dupe(u8, value));
+            try dupeAndAppendPath(alloc, &skill_directories, value);
         } else if (std.mem.eql(u8, arg, "--no-default-skills")) {
             if (no_default_skills) return error.DuplicateDefaultSkillsSuppression;
             no_default_skills = true;
@@ -1013,7 +1021,12 @@ fn runIfRequestedWithDeps(alloc: Allocator, args: []const [:0]const u8, cfg: Con
         return .handled_failure;
     };
     switch (parsed_launch) {
-        .interactive => |launch| {
+        .interactive => |value| {
+            var launch = value;
+            if (!try prepareSkillDirectories(alloc, &launch.modifiers, deps)) {
+                launch.deinit(alloc);
+                return .handled_failure;
+            }
             try writeMcpProfileWarningIfPresent(alloc, cfg, deps);
             return .{ .interactive = launch };
         },
@@ -1065,10 +1078,19 @@ fn runNonInteractiveWithDeps(
         try writeStateHomeUsage(deps);
         return .handled_failure;
     }
-    if (global_args.modifiers.hasSkillModifiers() and
-        !commandSupportsSkillModifiers(parsed_command))
+    if (global_args.modifiers.hasSkillDirectories() and
+        !commandSupportsInvocationSkillRoots(parsed_command))
     {
-        try writeSkillModifierUsage(deps);
+        try writeInvocationSkillRootUsage(deps);
+        return .handled_failure;
+    }
+    if (global_args.modifiers.no_default_skills and
+        !commandSupportsExclusiveSkillRoots(parsed_command))
+    {
+        try writeExclusiveSkillRootUsage(deps);
+        return .handled_failure;
+    }
+    if (!try prepareSkillDirectories(alloc, &global_args.modifiers, deps)) {
         return .handled_failure;
     }
 
@@ -3353,6 +3375,7 @@ fn workflowConfigWithLaunchModifiers(
     var result = workflowConfig(cfg);
     result.context_limit_overrides = modifiers.context_limit_overrides;
     result.additional_directories = modifiers.additional_directories;
+    result.skill_root_policy = modifiers.skillRootPolicy(cfg.skill_root_policy);
     result.saved_directories_suppressed = modifiers.saved_directories_suppressed;
     return result;
 }
@@ -3367,6 +3390,13 @@ fn commandSupportsWorkspaceModifiers(command: Command) bool {
 fn commandSupportsNativeToolModifier(command: Command) bool {
     return switch (command) {
         .interactive, .acp, .resume_session => true,
+        else => false,
+    };
+}
+
+fn commandSupportsInvocationSkillRoots(command: Command) bool {
+    return switch (command) {
+        .interactive, .ask, .acp, .pr, .issue, .resume_session => true,
         else => false,
     };
 }
@@ -3392,11 +3422,48 @@ fn commandSupportsStateHome(command: Command) bool {
     };
 }
 
-fn commandSupportsSkillModifiers(command: Command) bool {
+fn commandSupportsExclusiveSkillRoots(command: Command) bool {
     return switch (command) {
         .interactive, .acp, .resume_session => true,
         else => false,
     };
+}
+
+fn prepareSkillDirectories(
+    alloc: Allocator,
+    modifiers: *LaunchModifiers,
+    deps: RunDeps,
+) !bool {
+    for (modifiers.skill_directories, 0..) |path, index| {
+        const canonical_path = io_mod.realpathAlloc(alloc, path) catch |err| {
+            if (err == error.OutOfMemory) return error.OutOfMemory;
+            const message = try std.fmt.allocPrint(
+                alloc,
+                "fx: could not use skills directory {s}: directory is missing or unreadable\n",
+                .{path},
+            );
+            defer alloc.free(message);
+            try writeStderr(deps, message);
+            return false;
+        };
+        var dir = io_mod.openDirAbsoluteNoFollow(canonical_path, .{}) catch |err| {
+            defer alloc.free(canonical_path);
+            if (err == error.OutOfMemory) return error.OutOfMemory;
+            const message = try std.fmt.allocPrint(
+                alloc,
+                "fx: could not use skills directory {s}: path is not a readable directory\n",
+                .{path},
+            );
+            defer alloc.free(message);
+            try writeStderr(deps, message);
+            return false;
+        };
+        dir.close(io_mod.getIo());
+
+        alloc.free(path);
+        modifiers.skill_directories[index] = canonical_path;
+    }
+    return true;
 }
 
 fn writeWorkspaceModifierUsage(deps: RunDeps) !void {
@@ -3434,16 +3501,24 @@ fn writeStateHomeUsage(deps: RunDeps) !void {
     );
 }
 
-fn writeSkillModifierUsage(deps: RunDeps) !void {
+fn writeExclusiveSkillRootUsage(deps: RunDeps) !void {
     try writeStderr(
         deps,
-        "fx: --skills-dir and --no-default-skills are only supported for interactive, resume, and ACP launches\n",
+        "fx: --no-default-skills is only supported for interactive, resume, and ACP launches\n",
+    );
+}
+
+fn writeInvocationSkillRootUsage(deps: RunDeps) !void {
+    try writeStderr(
+        deps,
+        "fx: --skills-dir is only supported for interactive, resume, ask, ACP, PR, and issue launches\n",
     );
 }
 
 fn globalLaunchErrorMessage(err: anyerror) ?[]const u8 {
     return switch (err) {
         error.MissingAddDirectoryValue => "--add-dir requires a directory path",
+        error.MissingSkillsDirectoryValue => "--skills-dir requires a directory path",
         error.DuplicateAdditionalDirectorySuppression => "--no-additional-dirs may only be specified once",
         error.DuplicateNativeToolSuppression => "--no-native-tools may only be specified once",
         error.MissingPermissionsFileValue => "--permissions-file requires a file path",
@@ -3455,7 +3530,6 @@ fn globalLaunchErrorMessage(err: anyerror) ?[]const u8 {
         error.MissingStateDirectoryValue => "--state-dir requires a directory path",
         error.DuplicateStateDirectory => "--state-dir may only be specified once",
         error.InvalidStateDirectory => "--state-dir must name an existing directory",
-        error.MissingSkillsDirectoryValue => "--skills-dir requires a directory path",
         error.DuplicateDefaultSkillsSuppression => "--no-default-skills may only be specified once",
         else => null,
     };
@@ -4165,6 +4239,86 @@ test "global launch permission policy owns canonical rules before the command" {
     );
 }
 
+test "global launch modifiers own ordered invocation skill roots" {
+    var parsed = try parseGlobalLaunchArgs(std.testing.allocator, &.{
+        @constCast("--skills-dir"),
+        @constCast("./team skills"),
+        @constCast("--skills-dir=/opt/shared-skills"),
+        @constCast("ask"),
+        @constCast("inspect"),
+    });
+    defer parsed.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 2), parsed.modifiers.skill_directories.len);
+    try std.testing.expectEqualStrings("./team skills", parsed.modifiers.skill_directories[0]);
+    try std.testing.expectEqualStrings("/opt/shared-skills", parsed.modifiers.skill_directories[1]);
+    try std.testing.expectEqualStrings("ask", parsed.remaining[0]);
+}
+
+test "invocation skill root flags fail closed when malformed" {
+    try std.testing.expectError(
+        error.MissingSkillsDirectoryValue,
+        parseGlobalLaunchArgs(std.testing.allocator, &.{@constCast("--skills-dir")}),
+    );
+    try std.testing.expectError(
+        error.MissingSkillsDirectoryValue,
+        parseGlobalLaunchArgs(std.testing.allocator, &.{@constCast("--skills-dir=")}),
+    );
+}
+
+test "invocation skill root canonicalization preserves allocator failure" {
+    const alloc = std.testing.allocator;
+    const roots = try alloc.alloc([]u8, 1);
+    roots[0] = try alloc.dupe(u8, "/tmp");
+    var modifiers = LaunchModifiers{ .skill_directories = roots };
+    defer modifiers.deinit(alloc);
+
+    var failing = std.testing.FailingAllocator.init(alloc, .{ .fail_index = 0 });
+    try std.testing.expectError(
+        error.OutOfMemory,
+        prepareSkillDirectories(failing.allocator(), &modifiers, .{}),
+    );
+}
+
+test "invocation skill root command support is limited to launch surfaces" {
+    for ([_]Command{
+        .interactive,
+        .{ .ask = &.{} },
+        .{ .acp = &.{} },
+        .{ .pr = &.{} },
+        .{ .issue = &.{} },
+    }) |command| {
+        try std.testing.expect(commandSupportsInvocationSkillRoots(command));
+    }
+    try std.testing.expect(commandSupportsInvocationSkillRoots(.{ .resume_session = .{
+        .args = &.{},
+        .top_level_alias = false,
+    } }));
+    for ([_]Command{
+        .help,
+        .{ .models = &.{} },
+        .{ .status = &.{} },
+        .{ .doctor = &.{} },
+        .{ .upgrade = &.{} },
+    }) |command| {
+        try std.testing.expect(!commandSupportsInvocationSkillRoots(command));
+    }
+}
+
+test "workflow launch config preserves ordered invocation skill roots" {
+    var roots = [_][]u8{
+        @constCast("/tmp/team-skills"),
+        @constCast("/opt/shared-skills"),
+    };
+    const workflow_cfg = workflowConfigWithLaunchModifiers(testConfig(), .{
+        .skill_directories = &roots,
+    });
+
+    try std.testing.expectEqual(@as(usize, 2), workflow_cfg.skill_root_policy.invocation_roots.len);
+    try std.testing.expectEqualStrings("/tmp/team-skills", workflow_cfg.skill_root_policy.invocation_roots[0]);
+    try std.testing.expectEqualStrings("/opt/shared-skills", workflow_cfg.skill_root_policy.invocation_roots[1]);
+}
+
 test "parse acp args extracts known flags and rejects invalid arguments" {
     const opts = try parseAcpArgs(&.{
         @constCast("--model"),
@@ -4221,6 +4375,7 @@ test "global state home canonicalization rejects missing paths and files" {
 test "ACP command routes parsed options and launch config through the injected runner" {
     const Capture = struct {
         expected: Config,
+        expected_skill_roots: []const []const u8,
         calls: usize = 0,
         config_matches: bool = false,
         launch_matches: bool = false,
@@ -4277,9 +4432,9 @@ test "ACP command routes parsed options and launch config through the injected r
                 std.mem.eql(u8, cfg.additional_directories[0], "/tmp/acp-extra") and
                 cfg.saved_directories_suppressed and
                 cfg.skill_root_policy.exclusive_invocation_roots and
-                cfg.skill_root_policy.invocation_roots.len == 2 and
-                std.mem.eql(u8, cfg.skill_root_policy.invocation_roots[0], "/tmp/acp-first-skills") and
-                std.mem.eql(u8, cfg.skill_root_policy.invocation_roots[1], "/tmp/acp-second-skills") and
+                cfg.skill_root_policy.invocation_roots.len == self.expected_skill_roots.len and
+                std.mem.eql(u8, cfg.skill_root_policy.invocation_roots[0], self.expected_skill_roots[0]) and
+                std.mem.eql(u8, cfg.skill_root_policy.invocation_roots[1], self.expected_skill_roots[1]) and
                 std.mem.eql(u8, cfg.model_override.?, "model-override") and
                 std.mem.eql(u8, cfg.log_file.?, "/tmp/acp.log") and
                 !cfg.allow_native_tools and
@@ -4292,6 +4447,8 @@ test "ACP command routes parsed options and launch config through the injected r
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "skills/first");
+    try tmp.dir.createDirPath(std.testing.io, "skills/second");
     {
         var file = try tmp.dir.createFile(std.testing.io, "policy.json", .{});
         defer file.close(std.testing.io);
@@ -4305,10 +4462,19 @@ test "ACP command routes parsed options and launch config through the injected r
     defer std.testing.allocator.free(policy_path);
     const policy_arg = try std.testing.allocator.dupeZ(u8, policy_path);
     defer std.testing.allocator.free(policy_arg);
+    const first_skill_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "skills/first");
+    defer std.testing.allocator.free(first_skill_root);
+    const first_skill_root_z = try std.testing.allocator.dupeZ(u8, first_skill_root);
+    defer std.testing.allocator.free(first_skill_root_z);
+    const second_skill_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "skills/second");
+    defer std.testing.allocator.free(second_skill_root);
+    const second_skill_root_z = try std.testing.allocator.dupeZ(u8, second_skill_root);
+    defer std.testing.allocator.free(second_skill_root_z);
+    const expected_skill_roots = [_][]const u8{ first_skill_root, second_skill_root };
 
     var cfg = testConfig();
     cfg.provider_set.gateway.permission_reviewer = test_builtin_gateway.permission_reviewer.provider;
-    var capture = Capture{ .expected = cfg };
+    var capture = Capture{ .expected = cfg, .expected_skill_roots = &expected_skill_roots };
     cfg.acp_runner = .{ .context = &capture, .run_fn = Capture.run };
     const result = try runIfRequestedWithDeps(
         std.testing.allocator,
@@ -4324,8 +4490,9 @@ test "ACP command routes parsed options and launch config through the injected r
             @constCast("--no-project-instructions"),
             @constCast("--no-default-skills"),
             @constCast("--skills-dir"),
-            @constCast("/tmp/acp-first-skills"),
-            @constCast("--skills-dir=/tmp/acp-second-skills"),
+            first_skill_root_z,
+            @constCast("--skills-dir"),
+            second_skill_root_z,
             @constCast("acp"),
             @constCast("--model"),
             @constCast("model-override"),

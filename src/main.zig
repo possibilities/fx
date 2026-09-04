@@ -3414,6 +3414,9 @@ pub fn runWasmTerminal(init: std.process.Init) !void {
         },
     };
     defer launch.deinit(alloc);
+    if (launch.modifiers.hasInvocationSkillRoots()) {
+        return error.WasmTerminalInvocationSkillRootsUnsupported;
+    }
     const outcome = try app_entry_runtime.runInteractiveCooperative(App, alloc, &launch, .local);
     switch (outcome) {
         .returned => {},

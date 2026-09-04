@@ -33,7 +33,20 @@ pub fn loadSkills(
     workspace_root: []const u8,
     root_policy: skill_contract.RootPolicy,
 ) LoadSkillsError!LoadedSkills {
-    const configured_home = io_mod.getenv("HOME") orelse return .{};
+    const configured_home = io_mod.getenv("HOME") orelse {
+        const discovery = try skill_runtime.loadVisibleSkillsWithHomes(
+            alloc,
+            workspace_root,
+            null,
+            null,
+            "",
+            root_policy,
+        );
+        return .{
+            .skills = discovery.skills,
+            .diagnostics = discovery.diagnostics,
+        };
+    };
     return loadSkillsFromHomes(
         alloc,
         workspace_root,
@@ -177,6 +190,54 @@ test "loadSkills returns empty defaults when HOME is missing" {
 
     try std.testing.expectEqual(@as(usize, 0), loaded.dir.len);
     try std.testing.expectEqual(@as(usize, 0), loaded.skills.len);
+}
+
+test "loadSkills discovers ordered invocation roots when HOME is missing" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try writeTempFile(&tmp, "first/review/SKILL.md",
+        \\---
+        \\name: review
+        \\description: First invocation skill
+        \\---
+        \\Review carefully.
+    );
+    try writeTempFile(&tmp, "second/release/SKILL.md",
+        \\---
+        \\name: release
+        \\description: Second invocation skill
+        \\---
+        \\Prepare a release.
+    );
+    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
+
+    const first = try tmpPath(alloc, tmp.dir, "first");
+    defer alloc.free(first);
+    const second = try tmpPath(alloc, tmp.dir, "second");
+    defer alloc.free(second);
+    const workspace = try tmpPath(alloc, tmp.dir, "workspace");
+    defer alloc.free(workspace);
+    const roots = [_][]const u8{ first, second };
+
+    const home = try TestHome.install(alloc, null);
+    defer home.deinit();
+
+    var loaded = try loadSkills(alloc, workspace, .{
+        .invocation_roots = &roots,
+        .managed_root_source = .global_fx,
+    });
+    defer loaded.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 0), loaded.dir.len);
+    try std.testing.expectEqual(@as(usize, 2), loaded.skills.len);
+    try std.testing.expectEqualStrings("review", loaded.skills[0].name);
+    try std.testing.expectEqualStrings("release", loaded.skills[1].name);
+    try std.testing.expectEqual(skill_runtime.SkillSource.invocation, loaded.skills[0].source);
+    try std.testing.expectEqual(skill_runtime.SkillSource.invocation, loaded.skills[1].source);
+    try std.testing.expectEqualStrings(first, loaded.skills[0].read_authority.?);
+    try std.testing.expectEqualStrings(second, loaded.skills[1].read_authority.?);
 }
 
 test "loadSkills loads managed skills under HOME" {
