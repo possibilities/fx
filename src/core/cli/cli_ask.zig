@@ -1700,6 +1700,7 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
         startup.workspace_root,
         ctx.mcp_elicitation_capabilities,
         null,
+        null,
     );
     if (ctx.mcp) |mcp| {
         var health_snapshot = try mcp.snapshotHealth(

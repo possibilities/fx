@@ -211,6 +211,7 @@ pub fn build(b: *std.Build) void {
             "session provenance round trips and stays absent when unrecorded",
             "turn authority carries its shape and reads turns recorded without one",
             "durable provenance rejects malformed shapes and out-of-order placement",
+            "shape identity and history selectors compose as three independent axes",
         },
     });
     const run_fxnk_gate_tests = b.addRunArtifact(fxnk_gate_tests);

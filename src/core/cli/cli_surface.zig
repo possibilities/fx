@@ -137,6 +137,17 @@ pub const LaunchModifiers = struct {
     permission_policy: ?config_runtime.LaunchPermissionPolicy = null,
     project_instructions_enabled: bool = true,
     state_home: ?[]u8 = null,
+    /// The root supplying this launch's shape when it is not the state root:
+    /// its conventional system prompt, its skills, and its MCP configuration.
+    shape_home: ?[]u8 = null,
+    /// The profile whose already-valid credential this launch borrows. The
+    /// borrowed profile is read only, exactly as for the environment form.
+    identity_home: ?[]u8 = null,
+    /// The root owning sessions, prompt history, and usage when history is
+    /// deliberately kept apart from the profile that shapes the instance.
+    history_home: ?[]u8 = null,
+    /// The MCP configuration file backing this launch's shape.
+    mcp_config_path: ?[]u8 = null,
     skill_directories: [][]u8 = &.{},
     no_default_skills: bool = false,
     prompt_files: system_prompt_files.Request = .{},
@@ -151,6 +162,10 @@ pub const LaunchModifiers = struct {
         if (self.invocation_skill_roots.len > 0) alloc.free(self.invocation_skill_roots);
         if (self.permission_policy) |*policy| policy.deinit(alloc);
         if (self.state_home) |path| alloc.free(path);
+        if (self.shape_home) |path| alloc.free(path);
+        if (self.identity_home) |path| alloc.free(path);
+        if (self.history_home) |path| alloc.free(path);
+        if (self.mcp_config_path) |path| alloc.free(path);
         for (self.skill_directories) |path| alloc.free(path);
         if (self.skill_directories.len > 0) alloc.free(self.skill_directories);
         self.prompt_files.deinit(alloc);
@@ -453,6 +468,14 @@ fn parseGlobalLaunchArgs(
     var project_instructions_enabled = true;
     var state_home: ?[]u8 = null;
     errdefer if (state_home) |path| alloc.free(path);
+    var shape_home: ?[]u8 = null;
+    errdefer if (shape_home) |path| alloc.free(path);
+    var identity_home: ?[]u8 = null;
+    errdefer if (identity_home) |path| alloc.free(path);
+    var history_home: ?[]u8 = null;
+    errdefer if (history_home) |path| alloc.free(path);
+    var mcp_config_path: ?[]u8 = null;
+    errdefer if (mcp_config_path) |path| alloc.free(path);
     var skill_directories: std.ArrayList([]u8) = .empty;
     errdefer {
         for (skill_directories.items) |path| alloc.free(path);
@@ -524,6 +547,70 @@ fn parseGlobalLaunchArgs(
                 error.OutOfMemory => return error.OutOfMemory,
                 else => return error.InvalidStateDirectory,
             };
+        } else if (std.mem.eql(u8, arg, "--shape")) {
+            if (shape_home != null) return error.DuplicateShapeDirectory;
+            index += 1;
+            if (index >= args.len or args[index].len == 0) return error.MissingShapeDirectoryValue;
+            shape_home = canonicalizeStateHome(alloc, args[index]) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => return error.InvalidShapeDirectory,
+            };
+        } else if (std.mem.startsWith(u8, arg, "--shape=")) {
+            if (shape_home != null) return error.DuplicateShapeDirectory;
+            const value = arg["--shape=".len..];
+            if (value.len == 0) return error.MissingShapeDirectoryValue;
+            shape_home = canonicalizeStateHome(alloc, value) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => return error.InvalidShapeDirectory,
+            };
+        } else if (std.mem.eql(u8, arg, "--identity")) {
+            if (identity_home != null) return error.DuplicateIdentityDirectory;
+            index += 1;
+            if (index >= args.len or args[index].len == 0) return error.MissingIdentityDirectoryValue;
+            identity_home = canonicalizeStateHome(alloc, args[index]) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => return error.InvalidIdentityDirectory,
+            };
+        } else if (std.mem.startsWith(u8, arg, "--identity=")) {
+            if (identity_home != null) return error.DuplicateIdentityDirectory;
+            const value = arg["--identity=".len..];
+            if (value.len == 0) return error.MissingIdentityDirectoryValue;
+            identity_home = canonicalizeStateHome(alloc, value) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => return error.InvalidIdentityDirectory,
+            };
+        } else if (std.mem.eql(u8, arg, "--history-dir")) {
+            if (history_home != null) return error.DuplicateHistoryDirectory;
+            index += 1;
+            if (index >= args.len or args[index].len == 0) return error.MissingHistoryDirectoryValue;
+            history_home = canonicalizeStateHome(alloc, args[index]) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => return error.InvalidHistoryDirectory,
+            };
+        } else if (std.mem.startsWith(u8, arg, "--history-dir=")) {
+            if (history_home != null) return error.DuplicateHistoryDirectory;
+            const value = arg["--history-dir=".len..];
+            if (value.len == 0) return error.MissingHistoryDirectoryValue;
+            history_home = canonicalizeStateHome(alloc, value) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => return error.InvalidHistoryDirectory,
+            };
+        } else if (std.mem.eql(u8, arg, "--mcp-config")) {
+            if (mcp_config_path != null) return error.DuplicateMcpConfig;
+            index += 1;
+            if (index >= args.len or args[index].len == 0) return error.MissingMcpConfigValue;
+            mcp_config_path = canonicalizeConfigFile(alloc, args[index]) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => return error.InvalidMcpConfig,
+            };
+        } else if (std.mem.startsWith(u8, arg, "--mcp-config=")) {
+            if (mcp_config_path != null) return error.DuplicateMcpConfig;
+            const value = arg["--mcp-config=".len..];
+            if (value.len == 0) return error.MissingMcpConfigValue;
+            mcp_config_path = canonicalizeConfigFile(alloc, value) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => return error.InvalidMcpConfig,
+            };
         } else if (std.mem.eql(u8, arg, "--skills-dir")) {
             index += 1;
             if (index >= args.len or args[index].len == 0) return error.MissingSkillsDirectoryValue;
@@ -579,6 +666,28 @@ fn parseGlobalLaunchArgs(
         return error.ConflictingNativeToolSelection;
     }
 
+    // A shape root carries its whole definition: the conventional prompt is
+    // composed later, and its skills and MCP configuration are adopted here.
+    // Each is optional, so a root holding only a prompt stays valid.
+    if (shape_home) |home| {
+        if (mcp_config_path == null) {
+            const candidate = try profile_paths.mcpConfigPath(alloc, home);
+            var keep = false;
+            defer if (!keep) alloc.free(candidate);
+            if (regularFileExists(candidate)) {
+                mcp_config_path = candidate;
+                keep = true;
+            }
+        }
+        const skills = try profile_paths.managedSkillsDir(alloc, home);
+        var keep_skills = false;
+        defer if (!keep_skills) alloc.free(skills);
+        if (directoryExists(skills)) {
+            try skill_roots.append(alloc, skills);
+            keep_skills = true;
+        }
+    }
+
     const override_slice = try overrides.toOwnedSlice(alloc);
     errdefer if (override_slice.len > 0) alloc.free(override_slice);
     const directory_slice = try directories.toOwnedSlice(alloc);
@@ -613,6 +722,10 @@ fn parseGlobalLaunchArgs(
             .permission_policy = permission_policy,
             .project_instructions_enabled = project_instructions_enabled,
             .state_home = state_home,
+            .shape_home = shape_home,
+            .identity_home = identity_home,
+            .history_home = history_home,
+            .mcp_config_path = mcp_config_path,
             .skill_directories = skill_directory_slice,
             .no_default_skills = no_default_skills,
             .prompt_files = .{
@@ -631,6 +744,33 @@ fn canonicalizeStateHome(alloc: Allocator, path: []const u8) ![]u8 {
     defer dir.close(io_mod.getIo());
     const stat = try dir.stat(io_mod.getIo());
     if (stat.kind != .directory) return error.NotDir;
+    return canonical;
+}
+
+fn regularFileExists(path: []const u8) bool {
+    var file = std.Io.Dir.openFileAbsolute(io_mod.getIo(), path, .{ .mode = .read_only }) catch
+        return false;
+    defer file.close(io_mod.getIo());
+    const stat = file.stat(io_mod.getIo()) catch return false;
+    return stat.kind == .file;
+}
+
+fn directoryExists(path: []const u8) bool {
+    var dir = std.Io.Dir.openDirAbsolute(io_mod.getIo(), path, .{}) catch return false;
+    dir.close(io_mod.getIo());
+    return true;
+}
+
+/// Resolves a launch-selected configuration file to its real path. Requiring a
+/// regular file keeps a shape from selecting a directory or a dangling symlink
+/// and then behaving as though it carried no configuration at all.
+fn canonicalizeConfigFile(alloc: Allocator, path: []const u8) ![]u8 {
+    const canonical = try io_mod.realpathAlloc(alloc, path);
+    errdefer alloc.free(canonical);
+    var file = try std.Io.Dir.openFileAbsolute(io_mod.getIo(), canonical, .{ .mode = .read_only });
+    defer file.close(io_mod.getIo());
+    const stat = try file.stat(io_mod.getIo());
+    if (stat.kind != .file) return error.NotFile;
     return canonical;
 }
 
@@ -653,7 +793,11 @@ pub fn argsAfterGlobalLaunchArgs(args: []const [:0]const u8) []const [:0]const u
             std.mem.eql(u8, arg, "--skills-dir") or
             std.mem.eql(u8, arg, "--system-prompt-file") or
             std.mem.eql(u8, arg, "--append-system-prompt-file") or
-            std.mem.eql(u8, arg, "--tool"))
+            std.mem.eql(u8, arg, "--tool") or
+            std.mem.eql(u8, arg, "--shape") or
+            std.mem.eql(u8, arg, "--identity") or
+            std.mem.eql(u8, arg, "--history-dir") or
+            std.mem.eql(u8, arg, "--mcp-config"))
         {
             index += 1;
             if (index >= args.len) return &.{};
@@ -668,7 +812,11 @@ pub fn argsAfterGlobalLaunchArgs(args: []const [:0]const u8) []const [:0]const u
             !std.mem.eql(u8, arg, "--no-project-instructions") and
             !std.mem.eql(u8, arg, "--no-default-skills") and
             !std.mem.startsWith(u8, arg, "--system-prompt-file=") and
-            !std.mem.startsWith(u8, arg, "--append-system-prompt-file="))
+            !std.mem.startsWith(u8, arg, "--append-system-prompt-file=") and
+            !std.mem.startsWith(u8, arg, "--shape=") and
+            !std.mem.startsWith(u8, arg, "--identity=") and
+            !std.mem.startsWith(u8, arg, "--history-dir=") and
+            !std.mem.startsWith(u8, arg, "--mcp-config="))
         {
             return args[index..];
         }
@@ -690,7 +838,9 @@ pub fn systemPromptFilesRequested(args: []const [:0]const u8) bool {
             std.mem.startsWith(u8, arg, "--system-prompt-file=") or
             std.mem.startsWith(u8, arg, "--append-system-prompt-file=") or
             std.mem.eql(u8, arg, "--state-dir") or
-            std.mem.startsWith(u8, arg, "--state-dir="))
+            std.mem.startsWith(u8, arg, "--state-dir=") or
+            std.mem.eql(u8, arg, "--shape") or
+            std.mem.startsWith(u8, arg, "--shape="))
         {
             return true;
         }
@@ -698,6 +848,9 @@ pub fn systemPromptFilesRequested(args: []const [:0]const u8) bool {
             std.mem.eql(u8, arg, "--add-dir") or
             std.mem.eql(u8, arg, "--skills-dir") or
             std.mem.eql(u8, arg, "--tool") or
+            std.mem.eql(u8, arg, "--identity") or
+            std.mem.eql(u8, arg, "--history-dir") or
+            std.mem.eql(u8, arg, "--mcp-config") or
             std.mem.eql(u8, arg, "--permissions-file"))
         {
             index += 1;
@@ -706,6 +859,9 @@ pub fn systemPromptFilesRequested(args: []const [:0]const u8) bool {
             !std.mem.startsWith(u8, arg, "--add-dir=") and
             !std.mem.startsWith(u8, arg, "--skills-dir=") and
             !std.mem.startsWith(u8, arg, "--tool=") and
+            !std.mem.startsWith(u8, arg, "--identity=") and
+            !std.mem.startsWith(u8, arg, "--history-dir=") and
+            !std.mem.startsWith(u8, arg, "--mcp-config=") and
             !std.mem.startsWith(u8, arg, "--permissions-file=") and
             !std.mem.eql(u8, arg, "--no-additional-dirs") and
             !std.mem.eql(u8, arg, "--no-native-tools") and
@@ -2638,6 +2794,7 @@ fn loadMcpCommandRuntime(
         startup.workspace_root,
         .{ .form = true, .url = true },
         null,
+        null,
     );
     return .{ .startup = startup, .runtime = runtime };
 }
@@ -3733,7 +3890,9 @@ fn prepareSystemPromptFiles(
     var prompt_files = try modifiers.prompt_files.cloneForPreparation(alloc);
     defer prompt_files.deinit(alloc);
     if (apply_state_convention) {
-        if (modifiers.state_home) |state_home| {
+        // A shape root names where the agent's definition comes from, so its
+        // conventional prompt wins over the state root's when both are given.
+        if (modifiers.shape_home orelse modifiers.state_home) |state_home| {
             const state_result = prompt_files.applyStateConvention(alloc, state_home) catch |err| {
                 if (err == error.OutOfMemory) return error.OutOfMemory;
                 var message: std.Io.Writer.Allocating = .init(alloc);
@@ -3895,6 +4054,18 @@ fn globalLaunchErrorMessage(err: anyerror) ?[]const u8 {
         error.MissingStateDirectoryValue => "--state-dir requires a directory path",
         error.DuplicateStateDirectory => "--state-dir may only be specified once",
         error.InvalidStateDirectory => "--state-dir must name an existing directory",
+        error.MissingShapeDirectoryValue => "--shape requires a directory path",
+        error.DuplicateShapeDirectory => "--shape may only be specified once",
+        error.InvalidShapeDirectory => "--shape must name an existing directory",
+        error.MissingIdentityDirectoryValue => "--identity requires a directory path",
+        error.DuplicateIdentityDirectory => "--identity may only be specified once",
+        error.InvalidIdentityDirectory => "--identity must name an existing directory",
+        error.MissingHistoryDirectoryValue => "--history-dir requires a directory path",
+        error.DuplicateHistoryDirectory => "--history-dir may only be specified once",
+        error.InvalidHistoryDirectory => "--history-dir must name an existing directory",
+        error.MissingMcpConfigValue => "--mcp-config requires a file path",
+        error.DuplicateMcpConfig => "--mcp-config may only be specified once",
+        error.InvalidMcpConfig => "--mcp-config must name an existing regular file",
         error.DuplicateDefaultSkillsSuppression => "--no-default-skills may only be specified once",
         error.MissingSystemPromptFileValue => "--system-prompt-file requires a file path",
         error.DuplicateSystemPromptFile => "--system-prompt-file may only be specified once",
@@ -6894,6 +7065,7 @@ fn noMcpRuntimeForTest(
     _: []const u8,
     _: @import("../mcp/elicitation.zig").Capabilities,
     _: ?[]const u8,
+    _: ?[]const u8,
 ) !?*mcp_runtime.McpRuntime {
     return null;
 }
@@ -7240,4 +7412,92 @@ const CreditsProviderProbe = struct {
 
 fn ownedCreditsErrorSnapshot(alloc: Allocator, message: []const u8) output_contracts.CreditsSnapshot {
     return .{ .err_message = alloc.dupe(u8, message) catch null };
+}
+
+test "shape identity and history selectors compose as three independent axes" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "reviewer/.fx/skills");
+    try tmp.dir.createDirPath(std.testing.io, "work-account/.fx");
+    try tmp.dir.createDirPath(std.testing.io, "shared-history/.fx");
+    for ([_]struct { path: []const u8, content: []const u8 }{
+        .{ .path = "reviewer/.fx/SYSTEM_APPEND.md", .content = "REVIEW_CAREFULLY" },
+        .{ .path = "reviewer/.fx/mcp.json", .content = "{\"mcpServers\":{}}" },
+        .{ .path = "elsewhere.json", .content = "{\"mcpServers\":{}}" },
+    }) |fixture| {
+        var file = try tmp.dir.createFile(std.testing.io, fixture.path, .{});
+        defer file.close(std.testing.io);
+        try file.writeStreamingAll(std.testing.io, fixture.content);
+    }
+
+    const shape = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "reviewer");
+    defer alloc.free(shape);
+    const shape_z = try alloc.dupeZ(u8, shape);
+    defer alloc.free(shape_z);
+    const identity = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "work-account");
+    defer alloc.free(identity);
+    const identity_z = try alloc.dupeZ(u8, identity);
+    defer alloc.free(identity_z);
+    const history = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "shared-history");
+    defer alloc.free(history);
+    const history_z = try alloc.dupeZ(u8, history);
+    defer alloc.free(history_z);
+
+    // Every selector takes a value, so the command must survive all three.
+    const args = [_][:0]const u8{
+        @constCast("--shape"),       shape_z,
+        @constCast("--identity"),    identity_z,
+        @constCast("--history-dir"), history_z,
+        @constCast("ask"),           @constCast("hello"),
+    };
+    try std.testing.expectEqualStrings("ask", commandAfterGlobalLaunchArgs(&args).?);
+    try std.testing.expect(systemPromptFilesRequested(&args));
+
+    var parsed = try parseGlobalLaunchArgs(alloc, &args);
+    defer parsed.deinit(alloc);
+    try std.testing.expect(parsed.modifiers.state_home == null);
+    try std.testing.expectEqualStrings(shape, parsed.modifiers.shape_home.?);
+    try std.testing.expectEqualStrings(identity, parsed.modifiers.identity_home.?);
+    try std.testing.expectEqualStrings(history, parsed.modifiers.history_home.?);
+    try std.testing.expectEqualStrings("ask", parsed.remaining[0]);
+
+    // The shape root adopts its own MCP configuration and skills.
+    try std.testing.expect(std.mem.endsWith(
+        u8,
+        parsed.modifiers.mcp_config_path.?,
+        "reviewer/.fx/mcp.json",
+    ));
+    try std.testing.expectEqual(@as(usize, 1), parsed.modifiers.invocation_skill_roots.len);
+    try std.testing.expect(std.mem.endsWith(
+        u8,
+        parsed.modifiers.invocation_skill_roots[0],
+        "reviewer/.fx/skills",
+    ));
+
+    // An explicit configuration wins over the one the shape root would supply.
+    const explicit = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "elsewhere.json");
+    defer alloc.free(explicit);
+    const explicit_z = try alloc.dupeZ(u8, explicit);
+    defer alloc.free(explicit_z);
+    var overridden = try parseGlobalLaunchArgs(alloc, &.{
+        @constCast("--shape"),      shape_z,
+        @constCast("--mcp-config"), explicit_z,
+    });
+    defer overridden.deinit(alloc);
+    try std.testing.expectEqualStrings(explicit, overridden.modifiers.mcp_config_path.?);
+
+    for ([_]struct { args: []const [:0]const u8, expected: anyerror }{
+        .{ .args = &.{@constCast("--shape")}, .expected = error.MissingShapeDirectoryValue },
+        .{ .args = &.{ @constCast("--shape"), shape_z, @constCast("--shape"), shape_z }, .expected = error.DuplicateShapeDirectory },
+        .{ .args = &.{ @constCast("--shape"), @constCast("/definitely/not/here") }, .expected = error.InvalidShapeDirectory },
+        .{ .args = &.{@constCast("--identity")}, .expected = error.MissingIdentityDirectoryValue },
+        .{ .args = &.{ @constCast("--identity"), identity_z, @constCast("--identity=/tmp") }, .expected = error.DuplicateIdentityDirectory },
+        .{ .args = &.{@constCast("--history-dir")}, .expected = error.MissingHistoryDirectoryValue },
+        .{ .args = &.{@constCast("--mcp-config")}, .expected = error.MissingMcpConfigValue },
+        // A directory is not a configuration file.
+        .{ .args = &.{ @constCast("--mcp-config"), shape_z }, .expected = error.InvalidMcpConfig },
+    }) |invalid| {
+        try std.testing.expectError(invalid.expected, parseGlobalLaunchArgs(alloc, invalid.args));
+    }
 }

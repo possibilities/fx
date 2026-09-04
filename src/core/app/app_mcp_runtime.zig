@@ -941,6 +941,9 @@ pub const State = struct {
     lock: std.Io.RwLock = .init,
     runtime: ?*mcp_runtime.McpRuntime = null,
     profile_home: ?[]const u8 = null,
+    /// The MCP configuration this launch's shape selected, when it is not the
+    /// profile home's own. Credentials stay with the profile home either way.
+    selected_config_path: ?[]const u8 = null,
     pending_reload: ?*PendingReload = null,
     pending_authentication: ?*PendingAuthentication = null,
     pending_menu_operation: ?*PendingMenuOperation = null,
@@ -1599,6 +1602,12 @@ pub const State = struct {
         std.debug.assert(self.pending_reload == null);
         std.debug.assert(self.pending_authentication == null);
         self.profile_home = home;
+    }
+
+    pub fn setSelectedConfigPath(self: *State, path: ?[]const u8) void {
+        std.debug.assert(self.runtime == null);
+        std.debug.assert(self.pending_reload == null);
+        self.selected_config_path = path;
     }
 
     pub fn installInitial(self: *State, runtime: ?*mcp_runtime.McpRuntime) void {
@@ -2334,7 +2343,7 @@ pub const State = struct {
             destroyRuntime(alloc, runtime);
         }
 
-        const candidate = loader(alloc, workspace_root, elicitation_capabilities, self.profile_home) catch |err| {
+        const candidate = loader(alloc, workspace_root, elicitation_capabilities, self.profile_home, self.selected_config_path) catch |err| {
             if (authority_reduced) {
                 debug_trace.logf(
                     "mcp",
@@ -2438,7 +2447,7 @@ pub const State = struct {
     ) !ReloadOutcome {
         if (cancel_requested.load(.acquire)) return error.Cancelled;
         const candidate = if (rebuild)
-            try loader(alloc, workspace_root, elicitation_capabilities, self.profile_home)
+            try loader(alloc, workspace_root, elicitation_capabilities, self.profile_home, self.selected_config_path)
         else
             null;
         var candidate_owned = candidate != null;

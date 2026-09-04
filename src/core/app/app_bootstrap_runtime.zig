@@ -219,6 +219,10 @@ pub fn Runtime(comptime App: type) type {
                     app.profile_home
                 else
                     null,
+                .identity_home = if (comptime @hasField(App, "identity_home"))
+                    app.identity_home
+                else
+                    null,
                 .auth_mode = if (comptime @hasDecl(@TypeOf(app.auth), "authMode"))
                     app.auth.authMode()
                 else
@@ -360,6 +364,7 @@ pub fn Runtime(comptime App: type) type {
                 app.workspace_root,
                 .{ .form = true, .url = true },
                 if (comptime @hasField(App, "profile_home")) app.profile_home else null,
+                if (comptime @hasField(App, "mcp")) app.mcp.selected_config_path else null,
             );
             if (comptime @hasDecl(App, "installInitialMcpRuntime")) {
                 app.installInitialMcpRuntime(profile_mcp);

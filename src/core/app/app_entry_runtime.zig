@@ -744,6 +744,7 @@ fn noMcpRuntimeForTest(
     _: []const u8,
     _: @import("../mcp/elicitation.zig").Capabilities,
     _: ?[]const u8,
+    _: ?[]const u8,
 ) !?*mcp_runtime.McpRuntime {
     return null;
 }

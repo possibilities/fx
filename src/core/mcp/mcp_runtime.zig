@@ -95,10 +95,14 @@ fn allocateRuntimeGeneration() u64 {
     return generation;
 }
 
+/// Workspace root, elicitation capabilities, the profile home owning MCP
+/// credentials, and the configuration file this launch's shape selected. A null
+/// configuration path keeps the profile home's own `mcp.json`.
 pub const LoadRuntimeFn = *const fn (
     Allocator,
     []const u8,
     elicitation.Capabilities,
+    ?[]const u8,
     ?[]const u8,
 ) anyerror!?*McpRuntime;
 

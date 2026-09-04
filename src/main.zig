@@ -12,6 +12,7 @@ const api_key_validator = @import("core/auth/api_key_validator.zig");
 const oauth_transport = @import("core/auth/oauth_transport.zig");
 const js_host_auth = @import("core/auth/js_host_auth.zig");
 const credentials = @import("core/auth/credentials.zig");
+const shape_authority = @import("core/auth/shape_authority.zig");
 const secret = @import("core/auth/secret.zig");
 const model_cache_runtime = @import("core/app/model_cache_runtime.zig");
 const usage_dashboard_runtime = @import("core/app/usage_dashboard_runtime.zig");
@@ -553,6 +554,20 @@ const App = struct {
     usage_dashboard: usage_dashboard_runtime.Runtime = usage_dashboard_runtime.Runtime.init(std.heap.c_allocator),
     /// Explicit Fx profile home; child processes continue to inherit real HOME.
     profile_home: ?[]const u8 = null,
+    /// Profile whose credential this launch borrows, read only, without moving
+    /// settings, sessions, or any other write away from the profile home.
+    identity_home: ?[]const u8 = null,
+    /// Root owning sessions, prompt history, and usage when history is kept
+    /// apart from the profile that shapes this instance.
+    history_home: ?[]const u8 = null,
+    /// The shape this instance is running, recorded beside every session it
+    /// writes so one history can be read back by shape and account. Resolved
+    /// once at launch; null only before the launch controls are applied.
+    shape: ?shape_authority.Identity = null,
+    /// Inline storage for the shape's label. A label is bounded, so owning it
+    /// here keeps it alive for the process without a second allocation to free.
+    shape_label_storage: [shape_authority.max_label_bytes]u8 = undefined,
+    shape_label_len: u8 = 0,
     workspace_root: []u8 = &.{},
     workspace_identity: statusline_identity.Runtime = .{},
     workspace_host: WorkspaceHostRuntime = .{},
@@ -641,8 +656,45 @@ const App = struct {
         _: []const u8,
         _: @import("core/mcp/elicitation.zig").Capabilities,
         _: ?[]const u8,
+        _: ?[]const u8,
     ) !?*mcp_runtime_mod.McpRuntime {
         return null;
+    }
+
+    /// The resolved shape of this launch, read from the controls that decide
+    /// how the agent behaves. Identity is chosen separately and is not here.
+    fn shapeDeclaration(modifiers: *const cli_surface.LaunchModifiers) shape_authority.Declaration {
+        return .{
+            .system_prompt = modifiers.effective_system_prompt,
+            .system_prompt_replaces_base = modifiers.prompt_files.replacement_path != null or
+                modifiers.prompt_files.state_replaces_base,
+            .skill_roots = modifiers.invocation_skill_roots,
+            .default_skills_enabled = !modifiers.no_default_skills,
+            .mcp_config_path = modifiers.mcp_config_path,
+            .native_tools_enabled = modifiers.allow_native_tools,
+            .selected_tools = modifiers.selected_native_tools,
+            .permissions_path = if (modifiers.permission_policy) |policy| policy.path else null,
+            .project_instructions_enabled = modifiers.project_instructions_enabled,
+        };
+    }
+
+    /// Resolves the shape once, while the launch controls still own their
+    /// paths, and copies the label into storage that outlives them.
+    fn adoptShape(self: *Self, modifiers: *const cli_surface.LaunchModifiers) void {
+        const declaration = shapeDeclaration(modifiers);
+        self.shape = shape_authority.derive(declaration);
+        const label = if (modifiers.shape_home) |home|
+            shape_authority.labelFromRoot(home)
+        else
+            shape_authority.labelForDeclaration(declaration);
+        const length = @min(label.len, self.shape_label_storage.len);
+        @memcpy(self.shape_label_storage[0..length], label[0..length]);
+        self.shape_label_len = @intCast(length);
+    }
+
+    pub fn shapeLabel(self: *const Self) []const u8 {
+        if (self.shape_label_len == 0) return shape_authority.default_label;
+        return self.shape_label_storage[0..self.shape_label_len];
     }
 
     pub fn init(
@@ -698,7 +750,11 @@ const App = struct {
             }
         }
         app.profile_home = launch.modifiers.state_home;
+        app.identity_home = launch.modifiers.identity_home;
+        app.history_home = launch.modifiers.history_home;
+        app.adoptShape(&launch.modifiers);
         app.mcp.setProfileHome(app.profile_home);
+        app.mcp.setSelectedConfigPath(launch.modifiers.mcp_config_path);
         app.auth.setProfileHome(app.profile_home);
         app.shell.max_transcript_bytes = max_transcript_bytes;
         if (launch.requested_resume) |target| {

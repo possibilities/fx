@@ -92,6 +92,7 @@ const expected_names = [_][]const u8{
     "core.session.session_codec.test.session provenance round trips and stays absent when unrecorded",
     "core.session.session_codec.test.turn authority carries its shape and reads turns recorded without one",
     "core.session.session_codec.test.durable provenance rejects malformed shapes and out-of-order placement",
+    "core.cli.cli_surface.test.shape identity and history selectors compose as three independent axes",
 };
 
 fn isExpected(name: []const u8) bool {
