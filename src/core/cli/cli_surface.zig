@@ -7224,6 +7224,7 @@ fn configuredMcpRuntimeForTest(
     workspace_root: []const u8,
     _: @import("../mcp/elicitation.zig").Capabilities,
     _: ?[]const u8,
+    _: ?[]const u8,
 ) !?*mcp_runtime.McpRuntime {
     try std.testing.expectEqualStrings("/tmp/fx", workspace_root);
     const runtime = try alloc.create(mcp_runtime.McpRuntime);

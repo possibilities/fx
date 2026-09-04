@@ -2726,6 +2726,7 @@ fn loadTestReloadRuntime(
     _: []const u8,
     _: elicitation.Capabilities,
     profile_home: ?[]const u8,
+    _: ?[]const u8,
 ) !?*mcp_runtime.McpRuntime {
     test_reload_profile_home = profile_home;
     switch (test_reload_mode) {

@@ -828,6 +828,7 @@ fn loadMcpRuntimeForTest(
     _: []const u8,
     _: @import("../mcp/elicitation.zig").Capabilities,
     profile_home: ?[]const u8,
+    _: ?[]const u8,
 ) !?*mcp_runtime.McpRuntime {
     active_capture.?.mcp_profile_home = profile_home;
     active_capture.?.recordEvent("load_mcp");

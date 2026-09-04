@@ -4792,6 +4792,7 @@ fn testNoMcpRuntime(
     _: []const u8,
     _: mcp_elicitation.Capabilities,
     _: ?[]const u8,
+    _: ?[]const u8,
 ) !?*mcp_runtime.McpRuntime {
     return null;
 }
@@ -5992,6 +5993,7 @@ fn testLoadMcpRuntimeWithCancellation(
     _: Allocator,
     _: []const u8,
     _: mcp_elicitation.Capabilities,
+    _: ?[]const u8,
     _: ?[]const u8,
 ) !?*mcp_runtime.McpRuntime {
     test_startup_cancellation_mcp_calls += 1;
