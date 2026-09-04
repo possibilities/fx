@@ -1463,7 +1463,12 @@ const App = struct {
             std.heap.c_allocator,
             queued,
             intent == .steer,
+            .{
+                .ctx = self,
+                .report = reportPromptAdmission,
+            },
         );
+        LifecycleAppRuntime.reportPromptWorking(self);
         WorkerAppRuntime.syncState(
             self,
             app_callbacks.Bindings(App).worker_tool_lifecycle_presenter(self),
@@ -1513,8 +1518,11 @@ const App = struct {
             user_prompt_already_presented,
         );
         errdefer worker_runtime.freeQueuedPrompt(std.heap.c_allocator, queued);
-        try self.worker.enqueuePrompt(std.heap.c_allocator, queued);
-        HerdrAppRuntime.reportWorking(self);
+        try self.worker.enqueuePromptObserved(std.heap.c_allocator, queued, .{
+            .ctx = self,
+            .report = reportPromptAdmission,
+        });
+        LifecycleAppRuntime.reportPromptWorking(self);
         return true;
     }
 

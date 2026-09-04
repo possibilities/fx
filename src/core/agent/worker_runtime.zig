@@ -844,7 +844,7 @@ pub const WorkerRuntime = struct {
         prompt: QueuedPrompt,
         observer: ?PromptAdmissionObserver,
     ) !void {
-        try self.admitPromptObserved(alloc, prompt, true, observer);
+        _ = try self.admitPromptObserved(alloc, prompt, true, observer);
     }
 
     pub fn enqueueContextCompaction(
