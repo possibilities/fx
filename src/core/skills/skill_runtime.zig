@@ -459,7 +459,7 @@ fn appendConfiguredSkillRoots(
         );
     }
     if (root_policy.managed_root_source) |source| {
-        try appendDupeRoot(alloc, roots, source, skills_dir);
+        try appendManagedRoot(alloc, roots, source, skills_dir);
     }
     if (home) |home_root| {
         for (root_policy.global_roots) |spec| {
