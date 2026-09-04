@@ -20,6 +20,7 @@ const auth_runtime = @import("../core/auth/auth_runtime.zig");
 const model_provider = @import("../core/config/model_provider.zig");
 const debug_trace = @import("../core/shared/debug_trace.zig");
 const gateway_provider = @import("../core/gateway/gateway_provider.zig");
+const provider_set = @import("../core/gateway/provider_set.zig");
 const model_catalog = @import("../core/gateway/model_catalog.zig");
 const hooks = @import("../core/hooks/hooks.zig");
 const mcp_runtime = @import("../core/mcp/mcp_runtime.zig");
@@ -45,6 +46,7 @@ const tool_set_contract = @import("../core/tooling/tool_set.zig");
 const permissions = @import("../core/permissions/permissions.zig");
 const host_tool_runtime = @import("../core/tooling/host_tool_runtime.zig");
 const agent_checkpoint = @import("../core/agent/runtime/checkpoint.zig");
+const builtin_gateway = @import("../builtins/gateway.zig");
 
 const Allocator = std.mem.Allocator;
 const ErrorCode = jsonrpc.ErrorCode;
@@ -412,6 +414,9 @@ fn refreshConfiguredCredentialForAccount(
     expected_account_id: ?[]const u8,
 ) !?credentials.Credential {
     if (state.cfg.minimal_kernel and source == .chatgpt_subscription) {
+        // Embedded kernels make their host store the sole credential authority;
+        // they must never combine that write-capable store with a borrowed home.
+        std.debug.assert(state.cfg.identity_home == null);
         return auth_runtime.refreshCredentialForAccountWithStore(
             state.cfg.gateway_provider.oauth_transport,
             alloc,
@@ -2902,6 +2907,30 @@ test "ACP permission responses map canonical option ids" {
     }
 }
 
+fn acpServerTestConfig() Config {
+    return .{
+        .default_model = "default/model",
+        .default_agent_step_limit = 50,
+        .gateway_retry_count = 0,
+        .gateway_chat_url = "http://127.0.0.1/unused",
+        .gateway_models_path = "/v1/models",
+        .gateway_provider = builtin_gateway.provider,
+        .provider_set = provider_set.gateway_only(builtin_gateway.provider_bundle),
+        .secret_store = host_contract.unavailable_secret_store,
+        .prompt_policy = .{ .system_prompt = "test" },
+        .ignored_list_entries = &.{},
+        .max_list_entries = 0,
+        .max_read_file_bytes = 0,
+        .max_read_file_lines = 0,
+        .max_read_file_line_len = 0,
+        .max_command_output_bytes = 0,
+        .max_tool_result_bytes = 0,
+        .max_history_turns = 0,
+        .context_registry = .{ .default_provider = context_contract.empty_provider },
+        .mode_registry = .{ .default_mode_id = "normal" },
+    };
+}
+
 test "ACP selected profile state loads settings without workspace override" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -2915,11 +2944,12 @@ test "ACP selected profile state loads settings without workspace override" {
     const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "state");
     defer alloc.free(home);
 
-    var state: ServerState = undefined;
+    var state = ServerState{
+        .alloc = alloc,
+        .cfg = acpServerTestConfig(),
+        .writer = jsonrpc.Writer.init(),
+    };
     state.cfg.home_override = home;
-    state.cfg.workspace_root_override = null;
-    state.cfg.default_model = "default/model";
-    state.cfg.default_agent_step_limit = 50;
     var startup = try loadConfiguredStartupState(&state, alloc);
     defer startup.deinit(alloc);
     try std.testing.expectEqualStrings("isolated/model", startup.configured_model);
@@ -2968,15 +2998,13 @@ test "ACP identity remains the only credential authority across routing and refr
     const identity_home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "identity");
     defer alloc.free(identity_home);
 
-    var state: ServerState = undefined;
+    var state = ServerState{
+        .alloc = alloc,
+        .cfg = acpServerTestConfig(),
+        .writer = jsonrpc.Writer.init(),
+    };
     state.cfg.home_override = state_home;
     state.cfg.identity_home = identity_home;
-    state.cfg.workspace_root_override = null;
-    state.cfg.default_model = "default/model";
-    state.cfg.default_agent_step_limit = 50;
-    state.cfg.auth_mode = .local;
-    state.cfg.secret_store = host_contract.unavailable_secret_store;
-    state.cfg.gateway_provider = @import("../builtins/gateway.zig").provider;
 
     var startup = try loadConfiguredStartupState(&state, alloc);
     defer startup.deinit(alloc);
@@ -3479,6 +3507,7 @@ test "ACP publishes an account-bound refreshed Codex token for later prompts" {
         state.active_session.?.session_rt.deinit(alloc);
         secret.zeroAndFree(alloc, state.api_key);
         alloc.free(state.account_id.?);
+        if (state.codex_account_id) |account_id| alloc.free(account_id);
     }
 
     var refreshed = credentials.Credential{
