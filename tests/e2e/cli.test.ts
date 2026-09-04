@@ -57,6 +57,16 @@ function sourceVersion(): string {
   return match[1];
 }
 
+function fxnkVersion(): string {
+  const source = readFileSync(
+    join(REPO_ROOT, "src/core/cli/fxnk_identity.zig"),
+    "utf8",
+  );
+  const match = source.match(/pub const version = "([^"]+)";/);
+  if (!match) throw new Error("fxnk identity version declaration not found");
+  return match[1];
+}
+
 function doctorSessionDiagnosticsLimit(): number {
   const source = readFileSync(
     join(REPO_ROOT, "src/core/cli/doctor_runtime.zig"),
@@ -319,6 +329,7 @@ describe("cli: help", () => {
       expect(stdout).toContain("--resume-last");
       expect(stdout).toContain("session resume [last|id]");
       expect(stdout).toContain("-v, --version");
+      expect(stdout).not.toContain("--fxnk-version");
       expect(stdout).toContain("Print the fx version and exit");
       expect(stdout).not.toContain("Must appear before the command");
       expect(stdout).toContain("Examples:\n");
@@ -509,6 +520,19 @@ describe("cli: version", () => {
       TIMEOUT,
     );
   }
+
+  test(
+    "fx --fxnk-version prints the fork and source versions",
+    async () => {
+      const r = await runFx(["--fxnk-version"]);
+      expect(r.code).toBe(0);
+      expect(r.stdout).toBe(
+        `fxnk ${fxnkVersion()} (fx ${sourceVersion()})\n`,
+      );
+      expect(r.stderr).toBe("");
+    },
+    TIMEOUT,
+  );
 });
 
 describe("cli: status", () => {
