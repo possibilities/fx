@@ -201,6 +201,16 @@ pub fn build(b: *std.Build) void {
             "read-only resolution refuses refresh-due subscription without rewriting its profile",
             "selected state loads settings locally while borrowing only a stored credential",
             "FX_PROVIDER selects one process provider and FX_MODEL supplies its missing profile model",
+            "an unshaped launch has one stable default identity",
+            "each shape input changes the derived identity",
+            "list fields cannot be confused by concatenation",
+            "an absent optional differs from an empty one",
+            "identity is stable across equal declarations",
+            "shape labels come from the selected root",
+            "stored labels reject control characters and overlong names",
+            "session provenance round trips and stays absent when unrecorded",
+            "turn authority carries its shape and reads turns recorded without one",
+            "durable provenance rejects malformed shapes and out-of-order placement",
         },
     });
     const run_fxnk_gate_tests = b.addRunArtifact(fxnk_gate_tests);

@@ -82,6 +82,16 @@ const expected_names = [_][]const u8{
     "napi_session_store.test.N-API Codex session bridge exchanges requests and keeps stale operations inert",
     "core.auth.auth_runtime.test.pinned ChatGPT account rejects a swapped host session before refresh side effects",
     "ui.transcript.runtime.test.pending resume projection accepts candidate row below base content through recovery",
+    "core.auth.shape_authority.test.an unshaped launch has one stable default identity",
+    "core.auth.shape_authority.test.each shape input changes the derived identity",
+    "core.auth.shape_authority.test.list fields cannot be confused by concatenation",
+    "core.auth.shape_authority.test.an absent optional differs from an empty one",
+    "core.auth.shape_authority.test.identity is stable across equal declarations",
+    "core.auth.shape_authority.test.shape labels come from the selected root",
+    "core.auth.shape_authority.test.stored labels reject control characters and overlong names",
+    "core.session.session_codec.test.session provenance round trips and stays absent when unrecorded",
+    "core.session.session_codec.test.turn authority carries its shape and reads turns recorded without one",
+    "core.session.session_codec.test.durable provenance rejects malformed shapes and out-of-order placement",
 };
 
 fn isExpected(name: []const u8) bool {
