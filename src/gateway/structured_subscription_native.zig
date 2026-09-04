@@ -8,7 +8,7 @@ const oauth_transport = @import("../core/auth/oauth_transport.zig");
 const provider_set = @import("../core/gateway/provider_set.zig");
 const io_mod = @import("../core/shared/io.zig");
 const profile_paths = @import("../core/shared/profile_paths.zig");
-const openai_codex_models = @import("openai_codex_models.zig");
+const provider_versions = @import("provider_versions.zig");
 
 const Allocator = std.mem.Allocator;
 const state_dir_name = "structured-subscription-inference-v1";
@@ -41,6 +41,13 @@ pub fn run(
     const bundle = providers.select(.codex);
     const catalog = bundle.model_catalog orelse return error.CodexModelCatalogUnavailable;
     const responses = bundle.agent_stream orelse return error.CodexResponsesUnavailable;
+    var version_cancel = std.atomic.Value(bool).init(false);
+    const catalog_client_version = try provider_versions.resolve(
+        alloc,
+        .codex,
+        &version_cancel,
+        null,
+    );
     var resolver_context = ResolverContext{
         .transport = transport,
         .secret_store = secret_store,
@@ -52,7 +59,7 @@ pub fn run(
         },
         .catalog = catalog,
         .responses = responses,
-        .catalog_client_version = openai_codex_models.protocol_client_version,
+        .catalog_client_version = catalog_client_version.slice(),
         .provider_protocol = responses_protocol,
     };
 

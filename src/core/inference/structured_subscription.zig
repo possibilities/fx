@@ -261,11 +261,11 @@ pub fn infer(
     var event_capture = EventCapture{};
     const messages = [_]types.ChatMessage{.{ .role = .user, .content = request.prompt }};
     var provider_result = dependencies.responses.stream(alloc, .{
-        .credential = .{
-            .secret = credential.token,
+        .credential = .{ .direct = .{
+            .secret_bytes = credential.token,
             .source = credential.source,
             .account_id = credential.accountId(),
-        },
+        } },
         .session_id = null,
         .model = request.model,
         .retry_count = 1,
