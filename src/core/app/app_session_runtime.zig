@@ -16,7 +16,6 @@ const diagnostics = @import("../workspace/diagnostics.zig");
 const app_lifecycle = @import("app_lifecycle.zig");
 const provider_runtime = @import("provider_runtime.zig");
 const input_completion_runtime = @import("input_completion_runtime.zig");
-const input_queue_runtime = @import("input_queue_runtime.zig");
 const image_attachments = @import("../images/image_attachments.zig");
 const core_input_runtime = @import("../input/runtime.zig");
 const io_mod = @import("../shared/io.zig");
@@ -1611,9 +1610,6 @@ pub fn Runtime(comptime App: type) type {
         fn beginLiveSessionCancellation(app: *App) void {
             app.worker.requestCancel();
             app.pacer.clear(app.alloc);
-            if (comptime @hasField(App, "queued_prompt_review")) {
-                input_queue_runtime.Runtime(App).reset(app);
-            }
             if (comptime @hasDecl(App, "clearPendingSubmissionForSessionTransition")) {
                 App.clearPendingSubmissionForSessionTransition(app);
             } else {
@@ -1871,12 +1867,14 @@ pub fn Runtime(comptime App: type) type {
         }
 
         pub fn startResumedSessionReconciliation(app: *App) void {
+            if (comptime @hasDecl(App, "startModelCacheWarmup")) app.startModelCacheWarmup();
             if (comptime !@hasField(App, "auth") or !provider_runtime.supported(App)) return;
             if (comptime !@hasDecl(@TypeOf(app.auth), "credentialSource") or
                 !@hasDecl(@TypeOf(app.auth), "accountId") or
                 !@hasDecl(@TypeOf(app.session.usage), "replaceProviderReconciliationCredential")) return;
 
             const source = app.auth.credentialSource() orelse return;
+            if (!model_provider.authorizesCredential(provider_runtime.provider(app), source)) return;
             const credential = app.auth.apiKey() orelse return;
             app.session.usage.replaceProviderReconciliationCredential(
                 app.alloc,
@@ -1960,6 +1958,7 @@ pub fn Runtime(comptime App: type) type {
             display_title: []const u8,
             notice: ResumeNotice,
         ) !void {
+            const previous_provider = provider_runtime.provider(app);
             if (comptime @hasField(App, "next_image_id")) {
                 app.next_image_id = try nextImageIdForResumedHistory(
                     app.alloc,
@@ -2033,6 +2032,9 @@ pub fn Runtime(comptime App: type) type {
                 try writeResumeNotice(app, &sink, display_title, notice);
                 try replayHistoryToSink(app, &sink, state.history);
                 try writeRecoveryCheckpointToSink(app, &sink, state);
+            }
+            if (comptime @hasDecl(App, "restoreSessionCredential")) {
+                try app.restoreSessionCredential(previous_provider);
             }
         }
 
@@ -3280,6 +3282,20 @@ pub fn Runtime(comptime App: type) type {
                     try self.app.writeTranscript(text, true);
                 }
 
+                fn appendTurnCancellation(self: *Self) !void {
+                    const line = try transcript_runtime.formatHistoricalToolStatusLine(
+                        self.app.alloc,
+                        .cancelled,
+                        "Cancelled",
+                    );
+                    defer self.app.alloc.free(line);
+                    try self.app.writeTranscriptClassified(
+                        line,
+                        true,
+                        .turn_cancellation,
+                    );
+                }
+
                 fn appendToolStatus(
                     self: *Self,
                     kind: types.ToolOutcomeKind,
@@ -3515,6 +3531,19 @@ pub fn Runtime(comptime App: type) type {
 
                 fn appendRaw(self: *Self, text: []const u8) !void {
                     _ = try self.projection.appendRawClassified(text, .unknown_raw);
+                }
+
+                fn appendTurnCancellation(self: *Self) !void {
+                    const line = try transcript_runtime.formatHistoricalToolStatusLine(
+                        self.projection.alloc,
+                        .cancelled,
+                        "Cancelled",
+                    );
+                    defer self.projection.alloc.free(line);
+                    _ = try self.projection.appendRawClassified(
+                        line,
+                        .turn_cancellation,
+                    );
                 }
 
                 fn appendToolStatus(
@@ -3810,7 +3839,14 @@ pub fn Runtime(comptime App: type) type {
                         if (entry.cancelled_command) |presentation| {
                             try writeCancelledCommandPresentation(app, sink, entry.tool_call.?, presentation);
                         }
-                        try sink.appendNotice(session_runtime.interruptedTurnNotice(entry));
+                        switch (entry.terminal_reason) {
+                            .cancelled => if (entry.cancelled_command == null) {
+                                try sink.appendTurnCancellation();
+                            },
+                            .failed => try sink.appendNotice(
+                                session_runtime.interruptedTurnNotice(entry),
+                            ),
+                        }
                         if (entry.execution.turn_summary) |summary| {
                             try sink.appendTurnSummary(summary);
                         }
@@ -5225,7 +5261,15 @@ const TestApp = struct {
     terminal_title_label_len: usize = 0,
     input_runtime: core_input_runtime.Runtime = .{},
     terminal_input_runtime: ui_input.Runtime = .{},
-    shell: transcript_runtime.TranscriptRuntime = .{},
+    shell: transcript_runtime.TranscriptRuntime = .{ .layout = .{
+        .rows = 24,
+        .cols = 80,
+        .content_bottom = 21,
+        .divider_top_row = 22,
+        .input_row = 23,
+        .divider_bottom_row = 24,
+        .hint_row = 22,
+    } },
     metrics: types.Metrics = .{},
     pending_images: std.ArrayList(types.ImageAttachment) = .empty,
     next_image_id: usize = 1,
@@ -5242,6 +5286,7 @@ const TestApp = struct {
     notices: std.ArrayList([]u8) = .empty,
     cards: std.ArrayList(PromptCard) = .empty,
     transcript: std.ArrayList(u8) = .empty,
+    raw_transcript_classes: std.ArrayList(transcript_runtime.RawEntryClass) = .empty,
     completed_tool_statuses: std.ArrayList([]u8) = .empty,
     completed_tool_outcomes: std.ArrayList(types.ToolOutcomeKind) = .empty,
     next_transcript_entry_id: u32 = 1,
@@ -5343,6 +5388,7 @@ const TestApp = struct {
         for (self.cards.items) |*card| card.deinit(self.alloc);
         self.cards.deinit(self.alloc);
         self.transcript.deinit(self.alloc);
+        self.raw_transcript_classes.deinit(self.alloc);
         for (self.completed_tool_statuses.items) |status| self.alloc.free(status);
         self.completed_tool_statuses.deinit(self.alloc);
         self.completed_tool_outcomes.deinit(self.alloc);
@@ -5419,14 +5465,20 @@ const TestApp = struct {
     }
 
     fn writeTranscript(self: *TestApp, text: []const u8, record: bool) !void {
-        _ = record;
-        try self.transcript.appendSlice(self.alloc, text);
-        try self.replay_events.append(self.alloc, .raw_transcript);
-        try self.assistant_presentation_events.append(self.alloc, .raw_transcript);
+        try self.writeTranscriptClassified(text, record, .unknown_raw);
     }
 
-    fn writeTranscriptClassified(self: *TestApp, text: []const u8, record: bool, _: anytype) !void {
-        try self.writeTranscript(text, record);
+    fn writeTranscriptClassified(
+        self: *TestApp,
+        text: []const u8,
+        record: bool,
+        class: transcript_runtime.RawEntryClass,
+    ) !void {
+        _ = record;
+        try self.transcript.appendSlice(self.alloc, text);
+        try self.raw_transcript_classes.append(self.alloc, class);
+        try self.replay_events.append(self.alloc, .raw_transcript);
+        try self.assistant_presentation_events.append(self.alloc, .raw_transcript);
     }
 
     fn writeCompletedToolStatus(
@@ -7195,7 +7247,7 @@ test "upgrade notice body identifies stable notes and dev changes" {
                 .previous_revision = "",
                 .revision = "",
             },
-            .expected = "fx has been updated to v9.9.9 \x1b]8;;https://fx.sh/changelog#v9.9.9\x1b\\\x1b[4m(notes)\x1b[24m\x1b]8;;\x1b\\",
+            .expected = "fx has been updated to v9.9.9 (\x1b]8;;https://fx.sh/changelog#v9.9.9\x1b\\\x1b[4mnotes\x1b[24m\x1b]8;;\x1b\\)",
         },
         .{
             .upgrade = .{
@@ -7204,7 +7256,7 @@ test "upgrade notice body identifies stable notes and dev changes" {
                 .previous_revision = "1111111111111111111111111111111111111111",
                 .revision = "abcdef0123456789abcdef0123456789abcdef01",
             },
-            .expected = "fx has been updated to dev abcdef012345 (v9.9.9) \x1b]8;;https://github.com/vercel-labs/fx/compare/1111111111111111111111111111111111111111...abcdef0123456789abcdef0123456789abcdef01\x1b\\\x1b[4m(changes)\x1b[24m\x1b]8;;\x1b\\",
+            .expected = "fx has been updated to dev abcdef012345 (v9.9.9) (\x1b]8;;https://github.com/vercel-labs/fx/compare/1111111111111111111111111111111111111111...abcdef0123456789abcdef0123456789abcdef01\x1b\\\x1b[4mchanges\x1b[24m\x1b]8;;\x1b\\)",
         },
         .{
             .upgrade = .{
@@ -7213,7 +7265,7 @@ test "upgrade notice body identifies stable notes and dev changes" {
                 .previous_revision = "",
                 .revision = "abcdef0123456789abcdef0123456789abcdef01",
             },
-            .expected = "fx has been updated to dev abcdef012345 (v9.9.9) \x1b]8;;https://github.com/vercel-labs/fx/commit/abcdef0123456789abcdef0123456789abcdef01\x1b\\\x1b[4m(changes)\x1b[24m\x1b]8;;\x1b\\",
+            .expected = "fx has been updated to dev abcdef012345 (v9.9.9) (\x1b]8;;https://github.com/vercel-labs/fx/commit/abcdef0123456789abcdef0123456789abcdef01\x1b\\\x1b[4mchanges\x1b[24m\x1b]8;;\x1b\\)",
         },
     };
 
@@ -7748,7 +7800,7 @@ test "upgrade resume restores active session with the installed version notice" 
     try std.testing.expectEqualStrings("run server", context[2].assistant.user.text);
     try std.testing.expectEqual(@as(usize, 2), app.notices.items.len);
     try std.testing.expectEqualStrings(
-        "● fx has been updated to v9.9.9 \x1b]8;;https://fx.sh/changelog#v9.9.9\x1b\\\x1b[4m(notes)\x1b[24m\x1b]8;;\x1b\\",
+        "● fx has been updated to v9.9.9 (\x1b]8;;https://fx.sh/changelog#v9.9.9\x1b\\\x1b[4mnotes\x1b[24m\x1b]8;;\x1b\\)",
         app.notices.items[0],
     );
     try std.testing.expect(std.mem.find(u8, app.notices.items[1], "older context") != null);
@@ -8212,6 +8264,7 @@ test "resumeRequestedSession replays persisted model Markdown without parsing ge
         .code_block,
         .thematic_rule,
         .text,
+        .raw_transcript,
     };
     try std.testing.expectEqualSlices(
         AssistantPresentationEvent,
@@ -8235,9 +8288,15 @@ test "resumeRequestedSession replays persisted model Markdown without parsing ge
         app.assistant_code_blocks.items[0].code,
     );
     try std.testing.expectEqual(@as(usize, 1), app.assistant_thematic_rule_count);
-    try std.testing.expectEqual(@as(usize, 0), app.transcript.items.len);
-    try std.testing.expectEqual(@as(usize, 2), app.notices.items.len);
-    try std.testing.expectEqualStrings("● System: cancelled", app.notices.items[1]);
+    try std.testing.expect(std.mem.find(u8, app.transcript.items, "Cancelled") != null);
+    try std.testing.expect(std.mem.find(u8, app.transcript.items, "What can fx do differently?") != null);
+    try std.testing.expect(std.mem.find(u8, app.transcript.items, "System:") == null);
+    try std.testing.expect(std.mem.find(u8, app.transcript.items, "Cancelling") == null);
+    try std.testing.expectEqual(
+        transcript_runtime.RawEntryClass.turn_cancellation,
+        app.raw_transcript_classes.getLast(),
+    );
+    try std.testing.expectEqual(@as(usize, 1), app.notices.items.len);
 }
 
 test "resume Markdown replay releases undelivered table payloads once" {
@@ -8361,10 +8420,12 @@ test "resumeRequestedSession replays active-tool interruption with live cancella
 
     try std.testing.expectEqual(@as(usize, 1), app.cards.items.len);
     try std.testing.expectEqualStrings("inspect the browser", app.cards.items[0].text);
-    try std.testing.expectEqual(@as(usize, 0), app.transcript.items.len);
-    try std.testing.expectEqual(@as(usize, 2), app.notices.items.len);
+    try std.testing.expect(std.mem.find(u8, app.transcript.items, "Cancelled") != null);
+    try std.testing.expect(std.mem.find(u8, app.transcript.items, "What can fx do differently?") != null);
+    try std.testing.expect(std.mem.find(u8, app.transcript.items, "System:") == null);
+    try std.testing.expect(std.mem.find(u8, app.transcript.items, "Cancelling") == null);
+    try std.testing.expectEqual(@as(usize, 1), app.notices.items.len);
     try std.testing.expectEqualStrings("● Session resumed: inspect the browser", app.notices.items[0]);
-    try std.testing.expectEqualStrings("● System: cancelled", app.notices.items[1]);
     try std.testing.expect(std.mem.find(u8, app.transcript.items, "localhost") == null);
 }
 
@@ -10116,6 +10177,24 @@ test "resumed sessions install provider-scoped usage reconciliation authority" {
     Runtime(ReconciliationOriginApp).startResumedSessionReconciliation(&gateway);
     try std.testing.expectEqual(model_provider.ProviderId.gateway, gateway.session.usage.replaced_provider.?);
     try std.testing.expectEqual(types.CredentialSource.ai_gateway_api_key, gateway.session.usage.replaced_source.?);
+}
+
+test "resumed usage reconciliation rejects the previous provider credential" {
+    const cases = .{
+        .{ model_provider.ProviderId.gateway, types.CredentialSource.chatgpt_subscription },
+        .{ model_provider.ProviderId.gateway, types.CredentialSource.grok_subscription },
+        .{ model_provider.ProviderId.codex, types.CredentialSource.fx_login },
+        .{ model_provider.ProviderId.grok, types.CredentialSource.fx_login },
+    };
+    inline for (cases) |case| {
+        var app = ReconciliationOriginApp{
+            .auth = .{ .source = case[1] },
+            .selected_provider = case[0],
+        };
+        Runtime(ReconciliationOriginApp).startResumedSessionReconciliation(&app);
+        try std.testing.expect(app.session.usage.replaced_provider == null);
+        try std.testing.expect(app.session.usage.replaced_source == null);
+    }
 }
 
 test "ensureCachedSessionTitle derives from the first prompt and then freezes" {

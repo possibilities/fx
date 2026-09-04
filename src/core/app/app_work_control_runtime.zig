@@ -4,11 +4,9 @@ const worker_runtime = @import("../agent/worker_runtime.zig");
 const input_approval_runtime = @import("input_approval_runtime.zig");
 const input_interrupt_runtime = @import("input_interrupt_runtime.zig");
 const input_question_runtime = @import("input_question_runtime.zig");
-const input_queue_runtime = @import("input_queue_runtime.zig");
 
 pub fn Runtime(comptime App: type) type {
     return struct {
-        const QueueRuntime = input_queue_runtime.Runtime(App);
         const ApprovalRuntime = input_approval_runtime.ApprovalRuntime(App);
         const InterruptRuntime = input_interrupt_runtime.InterruptRuntime(App);
         const QuestionRuntime = input_question_runtime.QuestionRuntime(App);
@@ -54,9 +52,8 @@ pub fn Runtime(comptime App: type) type {
             request: *const work_control.Request,
             intent: App.PromptSubmitIntent,
         ) ![]u8 {
-            try requireQueueEditorHidden(app);
             const admission = try app.admitWorkControlPrompt(request.text.?, intent);
-            QueueRuntime.resumeAfterNewPrompt(app);
+            _ = app.worker.resumeQueue();
             var snapshot = try takeSnapshot(app);
             defer snapshot.deinit(std.heap.c_allocator);
             return work_control.encodeAdmissionResponse(
@@ -69,18 +66,17 @@ pub fn Runtime(comptime App: type) type {
         }
 
         fn interrupt(app: *App, request_id: []const u8) ![]u8 {
-            try requireQueueEditorHidden(app);
             if (app.approval_prompt.isActive()) {
                 if (approvalTargetsSubagent(app)) return error.SubagentControlUnsupported;
-                try ApprovalRuntime.cancelApprovalOperation(app, .hidden);
+                try ApprovalRuntime.cancelApprovalOperation(app);
             } else if (app.question_prompt.isActive()) {
-                try QuestionRuntime.cancelQuestionPrompt(app, .hidden);
+                try QuestionRuntime.cancelQuestionPrompt(app);
             } else if (app.stream.active) {
-                try InterruptRuntime.cancelActiveOperation(app, .hidden);
+                try InterruptRuntime.cancelActiveOperation(app);
             } else {
                 return error.NoActiveWork;
             }
-            clearHiddenQueuePresentation(app);
+            _ = app.worker.pauseQueue();
             var snapshot = try takeSnapshot(app);
             defer snapshot.deinit(std.heap.c_allocator);
             return work_control.encodeMutationResponse(
@@ -92,7 +88,6 @@ pub fn Runtime(comptime App: type) type {
         }
 
         fn update(app: *App, request: *const work_control.Request) ![]u8 {
-            try requireQueueEditorHidden(app);
             switch (try app.worker.updateQueuedPromptText(
                 std.heap.c_allocator,
                 request.turn_id.?,
@@ -102,25 +97,21 @@ pub fn Runtime(comptime App: type) type {
                 .not_found => return error.QueuedWorkNotFound,
                 .carries_non_text_state => return error.QueuedWorkNotTextOnly,
             }
-            clearHiddenQueuePresentation(app);
             return encodeSnapshot(app, request.request_id);
         }
 
         fn delete(app: *App, request: *const work_control.Request) ![]u8 {
-            try requireQueueEditorHidden(app);
-            if (!app.worker.deleteQueuedPromptDraft(
+            if (!app.worker.removeQueuedPrompt(
                 std.heap.c_allocator,
                 request.turn_id.?,
                 app.input_runtime.kill_ring.images.items,
             )) return error.QueuedWorkNotFound;
-            clearHiddenQueuePresentation(app);
-            if (app.worker.queuedPromptCount() == 0) _ = app.worker.resumeQueueReview();
+            if (app.worker.queuedPromptCount() == 0) _ = app.worker.resumeQueue();
             return encodeSnapshot(app, request.request_id);
         }
 
         fn resumeQueue(app: *App, request_id: []const u8) ![]u8 {
-            try requireQueueEditorHidden(app);
-            if (!try QueueRuntime.submitPausedQueueUnchanged(app)) {
+            if (!app.worker.resumeQueue()) {
                 return error.QueueNotPaused;
             }
             return encodeSnapshot(app, request_id);
@@ -131,15 +122,6 @@ pub fn Runtime(comptime App: type) type {
                 .max_entries = work_control.max_snapshot_entries,
                 .max_text_bytes = work_control.max_snapshot_text_bytes,
             });
-        }
-
-        fn requireQueueEditorHidden(app: *const App) !void {
-            if (app.queued_prompt_review.visible) return error.QueueEditorVisible;
-        }
-
-        fn clearHiddenQueuePresentation(app: *App) void {
-            std.debug.assert(!app.queued_prompt_review.visible);
-            QueueRuntime.reset(app);
         }
 
         fn approvalTargetsSubagent(app: *App) bool {
@@ -153,7 +135,6 @@ pub fn Runtime(comptime App: type) type {
 
 fn applicationErrorCode(err: anyerror) []const u8 {
     return switch (err) {
-        error.QueueEditorVisible => "queue_editor_visible",
         error.NoActiveWork => "no_active_work",
         error.SubagentControlUnsupported => "subagent_control_unsupported",
         error.QueuedWorkNotFound => "queued_work_not_found",
@@ -171,11 +152,10 @@ fn applicationErrorCode(err: anyerror) []const u8 {
 
 fn applicationErrorMessage(err: anyerror) []const u8 {
     return switch (err) {
-        error.QueueEditorVisible => "the human queue editor is visible",
         error.NoActiveWork => "the main Agent has no interruptible work",
         error.SubagentControlUnsupported => "work control does not target subagents",
         error.QueuedWorkNotFound => "queued work no longer exists",
-        error.QueuedWorkNotTextOnly => "queued work carries images, skills, or a native review draft",
+        error.QueuedWorkNotTextOnly => "queued work carries images or skills",
         error.QueueNotPaused => "the work queue is not paused",
         error.WorkSnapshotEntryLimitExceeded,
         error.WorkSnapshotTextLimitExceeded,
