@@ -449,16 +449,40 @@ pub fn loadAccess(
     transport: oauth_transport.Provider,
     mode: RefreshMode,
 ) !?Access {
+    return loadAccessFromStore(alloc, transport, mode, chatgpt_session.default_store);
+}
+
+pub fn loadAccessFromStore(
+    alloc: Allocator,
+    transport: oauth_transport.Provider,
+    mode: RefreshMode,
+    store: chatgpt_session.Store,
+) !?Access {
+    return loadAccessForAccountFromStore(alloc, transport, mode, null, store);
+}
+
+pub fn loadAccessForAccountFromStore(
+    alloc: Allocator,
+    transport: oauth_transport.Provider,
+    mode: RefreshMode,
+    expected_account_id: ?[]const u8,
+    store: chatgpt_session.Store,
+) !?Access {
     if (mode == .stored) {
-        var session = (try chatgpt_session.load(alloc)) orelse return null;
+        var session = (try chatgpt_session.loadFromStore(alloc, store)) orelse return null;
         defer session.deinit(alloc);
+        try validateExpectedAccount(session, expected_account_id);
         return takeAccess(&session);
     }
 
-    var mutation = (try chatgpt_session.beginExistingMutation()) orelse return null;
+    var mutation = (try chatgpt_session.beginExistingMutationForStore(store)) orelse return null;
     defer mutation.deinit();
     var session = (try mutation.load(alloc)) orelse return null;
     defer session.deinit(alloc);
+    // Account pinning is an authorization boundary. Validate the loaded
+    // credential before a forced or expiry-driven refresh can send its token
+    // or commit a rotated replacement.
+    try validateExpectedAccount(session, expected_account_id);
 
     if (mode == .force or session.expired(io_mod.milliTimestamp())) {
         try refreshSession(alloc, transport, &mutation, &session);
@@ -489,6 +513,11 @@ pub fn loadAccessFromHome(
     return takeAccess(&session);
 }
 
+fn validateExpectedAccount(session: chatgpt_session.Session, expected_account_id: ?[]const u8) !void {
+    const expected = expected_account_id orelse return;
+    if (!std.mem.eql(u8, expected, session.account_id)) return error.ChatGptAccountChanged;
+}
+
 fn takeAccess(session: *chatgpt_session.Session) Access {
     const access_token = session.access_token;
     session.access_token = &.{};
@@ -508,13 +537,18 @@ fn refreshSession(
     session: *chatgpt_session.Session,
 ) !void {
     try mutation.requireWritable();
-    var body: std.Io.Writer.Allocating = .init(alloc);
-    defer body.deinit();
+    const body_capacity = try refreshBodyCapacity(session.refresh_token.len);
+    var body = try std.Io.Writer.Allocating.initCapacity(alloc, body_capacity);
+    defer {
+        std.crypto.secureZero(u8, @volatileCast(body.writer.buffer));
+        body.deinit();
+    }
     try body.writer.writeAll("{\"client_id\":");
     try std.json.Stringify.value(client_id, .{}, &body.writer);
     try body.writer.writeAll(",\"grant_type\":\"refresh_token\",\"refresh_token\":");
     try std.json.Stringify.value(session.refresh_token, .{}, &body.writer);
     try body.writer.writeByte('}');
+    std.debug.assert(body.writer.buffer.len == body_capacity);
     var token = requestRefreshToken(alloc, transport, body.written()) catch |err| switch (err) {
         error.CredentialRefreshRejected,
         error.InvalidChatGptOAuthResponse,
@@ -585,6 +619,20 @@ fn refresh_replacement(
 fn retire_refresh_session(mutation: *chatgpt_session.Mutation) !void {
     const outcome = mutation.delete() catch return error.CredentialRefreshPersistenceUncertain;
     if (outcome == .deleted_not_durable) return error.CredentialRefreshPersistenceUncertain;
+}
+
+fn refreshBodyCapacity(refresh_token_len: usize) Allocator.Error!usize {
+    const prefix = "{\"client_id\":";
+    const middle = ",\"grant_type\":\"refresh_token\",\"refresh_token\":";
+    const string_quotes: usize = 2;
+    const client_bytes = std.math.mul(usize, client_id.len, 6) catch return error.OutOfMemory;
+    const refresh_bytes = std.math.mul(usize, refresh_token_len, 6) catch return error.OutOfMemory;
+    var capacity = std.math.add(usize, prefix.len, client_bytes) catch return error.OutOfMemory;
+    capacity = std.math.add(usize, capacity, string_quotes) catch return error.OutOfMemory;
+    capacity = std.math.add(usize, capacity, middle.len) catch return error.OutOfMemory;
+    capacity = std.math.add(usize, capacity, refresh_bytes) catch return error.OutOfMemory;
+    capacity = std.math.add(usize, capacity, string_quotes + 1) catch return error.OutOfMemory;
+    return capacity;
 }
 
 const RefreshTokenResponse = struct {

@@ -56,6 +56,12 @@ pub fn handleNewLibfxSession(
     );
     var session_rt_owned = true;
     defer if (session_rt_owned) session_rt.deinit(alloc);
+    if (comptime !host_target.is_wasm) {
+        _ = try session_rt.initializeProfileUsage(
+            alloc,
+            state.cfg.home_override orelse io_mod.getenv("HOME"),
+        );
+    }
 
     state.active_session = .{
         .session_id = session_id,
@@ -77,6 +83,9 @@ pub fn handleNewLibfxSession(
         .cancel_flag = std.atomic.Value(bool).init(false),
         .pending_prompt_id = null,
     };
+    if (comptime !host_target.is_wasm) {
+        state.active_session.?.session_rt.attachProfileUsagePublisher(alloc);
+    }
     session_id_owned = false;
     model_owned = false;
     session_rt_owned = false;
@@ -187,12 +196,12 @@ pub fn handleNewSession(state: *server.ServerState, alloc: Allocator, msg: *json
         }),
     };
     defer mcp_configs.deinit(alloc);
-    if (!state.cfg.allow_acp_mcp and mcp_configs.items.items.len > 0) {
-        return state.writer.writeError(alloc, msg.id, .{
-            .code = ErrorCode.invalid_params,
-            .message = "MCP servers are unavailable in this runtime",
-        });
-    }
+    if (try rejectUnavailableMcpServers(
+        state,
+        alloc,
+        msg,
+        mcp_configs.items.items.len,
+    )) return;
     if (state.cfg.allow_acp_mcp) try appendProjectMcpConfigs(state, alloc, &mcp_configs);
     retireReducedActiveMcp(state, alloc, mcp_configs.items.items);
     var mcp_preparation = try mcp_servers.prepare(
@@ -254,7 +263,10 @@ pub fn handleNewSession(state: *server.ServerState, alloc: Allocator, msg: *json
     );
     var session_rt_owned = true;
     defer if (session_rt_owned) session_rt.deinit(alloc);
-    _ = try session_rt.initializeProfileUsage(alloc, state.cfg.home_override orelse io_mod.getenv("HOME"));
+    _ = try session_rt.initializeProfileUsage(
+        alloc,
+        state.cfg.home_override orelse io_mod.getenv("HOME"),
+    );
     if (writable.state.usage) |usage| {
         try session_rt.usage.restore(
             alloc,
@@ -309,7 +321,11 @@ fn writeNewSessionResponse(
     try writeJsonStr(session_id, &out.writer);
     try out.writer.writeAll(",\"configOptions\":[");
     if (comptime !host_target.is_wasm) {
-        try writeProviderConfigOption(&out.writer, state.active_session.?.provider);
+        try writeProviderConfigOption(
+            &out.writer,
+            state.active_session.?.provider,
+            state.cfg.allowed_providers,
+        );
         try out.writer.writeAll(",");
     }
     try writeModelConfigOption(
@@ -526,16 +542,13 @@ fn handleRestoreSession(
         }),
     };
     defer mcp_configs.deinit(alloc);
-    if (!state.cfg.allow_acp_mcp) {
-        if (mcp_configs.items.items.len > 0) {
-            return state.writer.writeError(alloc, msg.id, .{
-                .code = ErrorCode.invalid_params,
-                .message = "MCP servers are unavailable in this runtime",
-            });
-        }
-    } else {
-        try appendProjectMcpConfigs(state, alloc, &mcp_configs);
-    }
+    if (try rejectUnavailableMcpServers(
+        state,
+        alloc,
+        msg,
+        mcp_configs.items.items.len,
+    )) return;
+    if (state.cfg.allow_acp_mcp) try appendProjectMcpConfigs(state, alloc, &mcp_configs);
     retireReducedActiveMcp(state, alloc, mcp_configs.items.items);
     var mcp_preparation = try mcp_servers.prepare(
         alloc,
@@ -663,7 +676,10 @@ fn handleRestoreSession(
     );
     var session_rt_owned = true;
     defer if (session_rt_owned) session_rt.deinit(alloc);
-    _ = try session_rt.initializeProfileUsage(alloc, state.cfg.home_override orelse io_mod.getenv("HOME"));
+    _ = try session_rt.initializeProfileUsage(
+        alloc,
+        state.cfg.home_override orelse io_mod.getenv("HOME"),
+    );
     try session_rt.restoreWithPermissionState(
         alloc,
         writable.state.conversation_language,
@@ -865,7 +881,11 @@ fn writeLoadSessionResponse(
     defer out.deinit();
     try out.writer.writeAll("{\"configOptions\":[");
     if (comptime !host_target.is_wasm) {
-        try writeProviderConfigOption(&out.writer, state.active_session.?.provider);
+        try writeProviderConfigOption(
+            &out.writer,
+            state.active_session.?.provider,
+            state.cfg.allowed_providers,
+        );
         try out.writer.writeAll(",");
     }
     try writeModelConfigOption(
@@ -1443,12 +1463,26 @@ pub fn writeModelConfigOption(
 pub fn writeProviderConfigOption(
     w: *std.Io.Writer,
     current: model_provider.ProviderId,
+    allowed: std.EnumSet(model_provider.ProviderId),
 ) !void {
     try w.writeAll("{\"id\":\"provider\",\"name\":\"Provider\",\"category\":\"model\",\"type\":\"select\",\"currentValue\":");
     try writeJsonStr(@tagName(current), w);
-    try w.writeAll(",\"options\":[{\"value\":\"gateway\",\"name\":\"Vercel AI Gateway\"},{\"value\":\"codex\",\"name\":\"Codex subscription\"}");
-    if (comptime !host_target.is_wasm) {
-        try w.writeAll(",{\"value\":\"grok\",\"name\":\"Grok subscription\"}");
+    try w.writeAll(",\"options\":[");
+    var wrote = false;
+    for ([_]model_provider.ProviderId{ .gateway, .codex, .grok }) |provider| {
+        if (!allowed.contains(provider)) continue;
+        if (comptime host_target.is_wasm) if (provider != .gateway) continue;
+        if (wrote) try w.writeAll(",");
+        try w.writeAll("{\"value\":");
+        try writeJsonStr(@tagName(provider), w);
+        try w.writeAll(",\"name\":");
+        try writeJsonStr(switch (provider) {
+            .gateway => "Vercel AI Gateway",
+            .codex => "Codex subscription",
+            .grok => "Grok subscription",
+        }, w);
+        try w.writeAll("}");
+        wrote = true;
     }
     try w.writeAll("]}");
 }
@@ -1730,7 +1764,10 @@ test "ACP restore rejects MCP servers when host capability is disabled" {
         @as(usize, 2),
         std.mem.count(u8, captured, "MCP servers are unavailable in this runtime"),
     );
-    try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, captured, "failed to start"));
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        std.mem.count(u8, captured, "failed to start"),
+    );
 }
 
 var acp_session_stable_test_environ: ?*std.process.Environ.Map = null;

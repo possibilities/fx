@@ -1,6 +1,8 @@
 #!/usr/bin/env node
 import { strict as assert } from "node:assert";
+import { mkdtempSync, rmSync } from "node:fs";
 import { createServer } from "node:http";
+import { tmpdir } from "node:os";
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { createFxAgent } from "../node.js";
@@ -61,6 +63,8 @@ const timeout = (label, ms = 5000) => new Promise((_, reject) => {
   timer.unref();
 });
 let agent;
+const isolatedHome = mkdtempSync(resolve(tmpdir(), "libfx-native-stream-home-"));
+const isolatedWorkspace = mkdtempSync(resolve(tmpdir(), "libfx-native-stream-workspace-"));
 try {
   let fetchCalls = 0;
   let firstAbortResolve;
@@ -97,6 +101,8 @@ try {
         cancel(reason) { return reader.cancel(reason); },
       }), { status: response.status, headers: response.headers });
     },
+    home: isolatedHome,
+    workspaceRoot: isolatedWorkspace,
     apiKey: "native-core-stream-key",
     gatewayChatUrl: `http://127.0.0.1:${port}/chat`,
     model: "native/test-model",
@@ -163,4 +169,6 @@ try {
   firstResponse?.destroy();
   server.closeAllConnections();
   await new Promise((resolveClose) => server.close(resolveClose));
+  rmSync(isolatedHome, { recursive: true, force: true });
+  rmSync(isolatedWorkspace, { recursive: true, force: true });
 }

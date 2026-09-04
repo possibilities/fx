@@ -379,9 +379,41 @@ pub fn resolveForProvider(
     provider: model_provider.ProviderId,
     preferred: ?Source,
 ) !Resolution {
+    return resolveForProviderWithStore(
+        alloc,
+        transport,
+        secret_store,
+        mode,
+        provider,
+        preferred,
+        chatgpt_session.default_store,
+    );
+}
+
+pub fn resolveForProviderWithStore(
+    alloc: std.mem.Allocator,
+    transport: oauth_transport.Provider,
+    secret_store: host.SecretStore,
+    mode: LoadMode,
+    provider: model_provider.ProviderId,
+    preferred: ?Source,
+    chatgpt_store: chatgpt_session.Store,
+) !Resolution {
     if (provider != .gateway) {
         const source = provider_catalog.find(provider).login_source;
-        const credential = loadPreferredSource(alloc, transport, secret_store, mode, source) catch |err| {
+        if (provider == .codex) switch (chatgpt_store) {
+            .profile => |configured_home| if (configured_home == null) try requireSourceStorage(source),
+            .host => {},
+        };
+        const credential = (if (provider == .codex)
+            loadChatGptCredentialFromStore(
+                alloc,
+                if (mode == .stored) oauth_transport.unavailable_provider else transport,
+                if (mode == .stored) .stored else .if_needed,
+                chatgpt_store,
+            )
+        else
+            loadPreferredSource(alloc, transport, secret_store, mode, source)) catch |err| {
             if (err == error.OutOfMemory) return err;
             debug_trace.logf("auth", "provider source load failed source={t} err={s}", .{ source, @errorName(err) });
             return .{ .failure = .{ .source = source, .err = err } };
@@ -837,7 +869,32 @@ fn loadChatGptCredential(
     mode: chatgpt_oauth.RefreshMode,
 ) !?Credential {
     try requireSourceStorage(.chatgpt_subscription);
-    var access = (try chatgpt_oauth.loadAccess(alloc, transport, mode)) orelse return null;
+    return loadChatGptCredentialFromStore(alloc, transport, mode, chatgpt_session.default_store);
+}
+
+pub fn loadChatGptCredentialFromStore(
+    alloc: std.mem.Allocator,
+    transport: oauth_transport.Provider,
+    mode: chatgpt_oauth.RefreshMode,
+    store: chatgpt_session.Store,
+) !?Credential {
+    return loadChatGptCredentialForAccountFromStore(alloc, transport, mode, null, store);
+}
+
+pub fn loadChatGptCredentialForAccountFromStore(
+    alloc: std.mem.Allocator,
+    transport: oauth_transport.Provider,
+    mode: chatgpt_oauth.RefreshMode,
+    expected_account_id: ?[]const u8,
+    store: chatgpt_session.Store,
+) !?Credential {
+    var access = (try chatgpt_oauth.loadAccessForAccountFromStore(
+        alloc,
+        transport,
+        mode,
+        expected_account_id,
+        store,
+    )) orelse return null;
     defer access.deinit(alloc);
     const token = access.access_token;
     access.access_token = &.{};
@@ -1043,6 +1100,14 @@ pub fn refreshChatGptCredential(
     transport: oauth_transport.Provider,
 ) !?Credential {
     return loadChatGptCredential(alloc, transport, .force);
+}
+
+pub fn refreshChatGptCredentialFromStore(
+    alloc: std.mem.Allocator,
+    transport: oauth_transport.Provider,
+    store: chatgpt_session.Store,
+) !?Credential {
+    return loadChatGptCredentialFromStore(alloc, transport, .force, store);
 }
 
 pub fn refreshGrokCredential(

@@ -3,6 +3,8 @@ const api_key_validator = @import("api_key_validator.zig");
 const auth_transition = @import("auth_transition.zig");
 const credentials = @import("credentials.zig");
 const chatgpt_oauth = @import("chatgpt_oauth.zig");
+const chatgpt_session = @import("chatgpt_session.zig");
+const js_host_auth = @import("js_host_auth.zig");
 const grok_oauth = @import("grok_oauth.zig");
 const host = @import("../hosts/host.zig");
 const host_target = @import("../hosts/target.zig");
@@ -125,6 +127,81 @@ pub fn classifyCredentialFailure(
     };
 }
 
+test "pinned ChatGPT account rejects a swapped host session before refresh side effects" {
+    const Fixture = struct {
+        load_calls: usize = 0,
+        commit_calls: usize = 0,
+        oauth_calls: usize = 0,
+
+        const session_bytes =
+            "{\"version\":1,\"access_token\":\"access-b\",\"refresh_token\":\"refresh-b\"," ++
+            "\"expires_at_ms\":0,\"account_id\":\"account-b\"}\n";
+
+        fn load(raw: ?*anyopaque, alloc: Allocator) !?js_host_auth.StoredSession {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.load_calls += 1;
+            const bytes = try alloc.dupe(u8, session_bytes);
+            errdefer alloc.free(bytes);
+            return .{
+                .bytes = bytes,
+                .revision = try alloc.dupe(u8, "revision-b"),
+            };
+        }
+
+        fn commit(
+            raw: ?*anyopaque,
+            alloc: Allocator,
+            _: []const u8,
+            _: ?[]const u8,
+        ) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.commit_calls += 1;
+            return alloc.dupe(u8, "unexpected-revision");
+        }
+
+        fn remove(_: ?*anyopaque, _: ?[]const u8) !js_host_auth.RemoveOutcome {
+            return .missing;
+        }
+
+        fn execute(
+            raw: ?*anyopaque,
+            _: Allocator,
+            _: oauth_transport.Request,
+        ) !oauth_transport.Response {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.oauth_calls += 1;
+            return error.UnexpectedOAuthRequest;
+        }
+    };
+
+    var fixture: Fixture = .{};
+    const store: chatgpt_session.Store = .{ .host = .{
+        .context = @ptrCast(&fixture),
+        .load_fn = Fixture.load,
+        .commit_fn = Fixture.commit,
+        .remove_fn = Fixture.remove,
+    } };
+    const transport: oauth_transport.Provider = .{
+        .context = @ptrCast(&fixture),
+        .execute_fn = Fixture.execute,
+    };
+
+    try std.testing.expectError(
+        error.ChatGptAccountChanged,
+        refreshCredentialForAccountWithStore(
+            transport,
+            std.testing.allocator,
+            .chatgpt_subscription,
+            .force,
+            "account-a",
+            store,
+        ),
+    );
+    try std.testing.expectEqual(@as(usize, 1), fixture.load_calls);
+    try std.testing.expectEqual(@as(usize, 0), fixture.oauth_calls);
+    try std.testing.expectEqual(@as(usize, 0), fixture.commit_calls);
+}
+
 pub const FailureReason = enum {
     credential_refresh_failed,
     http_unauthorized,
@@ -192,9 +269,29 @@ pub fn refreshCredentialForAccount(
     mode: CredentialRefreshMode,
     expected_account_id: ?[]const u8,
 ) !?credentials.Credential {
+    return refreshCredentialForAccountWithStore(
+        transport,
+        alloc,
+        source,
+        mode,
+        expected_account_id,
+        chatgpt_session.default_store,
+    );
+}
+
+/// The host-supplied-store twin: a libfx host owns its ChatGPT session bytes,
+/// so a refresh reads and commits through that store instead of the profile.
+pub fn refreshCredentialForAccountWithStore(
+    transport: oauth_transport.Provider,
+    alloc: Allocator,
+    source: credentials.Source,
+    mode: CredentialRefreshMode,
+    expected_account_id: ?[]const u8,
+    chatgpt_store: chatgpt_session.Store,
+) !?credentials.Credential {
     if (!credentials.sourceRefreshable(source)) return null;
 
-    var credential = (loadCredentialForRefresh(alloc, transport, source, mode) catch |err| {
+    var credential = (loadCredentialForRefresh(alloc, transport, source, mode, expected_account_id, chatgpt_store) catch |err| {
         debug_trace.logf(
             "auth",
             "credential refresh provider failed source={t} mode={t} err={s}",
@@ -280,6 +377,8 @@ fn loadCredentialForRefresh(
     transport: oauth_transport.Provider,
     source: credentials.Source,
     mode: CredentialRefreshMode,
+    expected_account_id: ?[]const u8,
+    chatgpt_store: chatgpt_session.Store,
 ) !?credentials.Credential {
     return switch (source) {
         .fx_login => switch (mode) {
@@ -287,8 +386,20 @@ fn loadCredentialForRefresh(
             .force => credentials.refreshFxLoginCredential(alloc, transport),
         },
         .chatgpt_subscription => switch (mode) {
-            .if_needed => credentials.loadSource(alloc, transport, host.unavailable_secret_store, source),
-            .force => credentials.refreshChatGptCredential(alloc, transport),
+            .if_needed => credentials.loadChatGptCredentialForAccountFromStore(
+                alloc,
+                transport,
+                .if_needed,
+                expected_account_id,
+                chatgpt_store,
+            ),
+            .force => credentials.loadChatGptCredentialForAccountFromStore(
+                alloc,
+                transport,
+                .force,
+                expected_account_id,
+                chatgpt_store,
+            ),
         },
         .grok_subscription => switch (mode) {
             .if_needed => credentials.loadSource(alloc, transport, host.unavailable_secret_store, source),
@@ -329,6 +440,49 @@ pub fn prepareCredentialFromHome(
         debug_trace.logf(
             "auth",
             "isolated credential preparation failed provider={t} source={s} err={s}",
+            .{
+                provider,
+                if (requestedSource(provider, preferred)) |source| @tagName(source) else "automatic",
+                @errorName(err),
+            },
+        );
+        break :failure credentials.Resolution{ .failure = .{
+            .source = requestedSource(provider, preferred) orelse .fx_login,
+            .err = err,
+        } };
+    };
+    return prepareResolvedCredential(
+        alloc,
+        provider,
+        io_mod.milliTimestamp(),
+        &resolution,
+    );
+}
+
+/// The host-supplied-store twin of `prepareCredential`.
+/// Null means authentication is needed; storage, transport and authority
+/// failures stay errors. Non-null `preferred` is an exact Gateway source.
+pub fn prepareCredentialWithStore(
+    alloc: Allocator,
+    transport: oauth_transport.Provider,
+    secret_store: host.SecretStore,
+    provider: model_provider.ProviderId,
+    preferred: ?credentials.Source,
+    chatgpt_store: chatgpt_session.Store,
+) CredentialPreparationError!?credentials.Credential {
+    var resolution = credentials.resolveForProviderWithStore(
+        alloc,
+        transport,
+        secret_store,
+        .refresh_if_needed,
+        provider,
+        preferred,
+        chatgpt_store,
+    ) catch |err| failure: {
+        if (err == error.OutOfMemory) return error.OutOfMemory;
+        debug_trace.logf(
+            "auth",
+            "stored credential preparation failed provider={t} source={s} err={s}",
             .{
                 provider,
                 if (requestedSource(provider, preferred)) |source| @tagName(source) else "automatic",

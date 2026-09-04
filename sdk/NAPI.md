@@ -42,6 +42,8 @@ Zig Runtime thread runs acp_server.runWithTransport()
         |
         +---- FetchBridge <----> sdk/node.js fetch + AbortController
         |
+        +---- SessionBridge <---> sdk/node.js Codex session store
+        |
         v
 newline-delimited ACP JSON-RPC
         |
@@ -57,7 +59,7 @@ shared createFxAgent() logic in sdk/fx-sdk.js
 - `exited` settles when the native runtime exits.
 - `abort()` aborts Node fetch and closes native input.
 
-Each core has one nonblocking Unix socketpair for readiness. The adapter takes ownership of the reader with `takeCoreReadyFd()` and watches it through `node:net`; Bun adopts the descriptor through `connect()`. The native writer signals when a fetch request becomes pending, output changes from empty to non-empty, or the core exits. Wake bytes carry no state: JavaScript drains the bounded fetch and output queues to quiescence and then checks exit state. While a body pump exists it calls `coreFetchActive()` for that fetch handle. An inactive handle aborts its matching `AbortController` on the next readiness event. ACP output is accumulated to newline boundaries and parsed as JSON. Gateway requests are transferred to Node as bounded request records; Node runs the configured `fetch`, streams bounded response chunks back to Zig, and owns the `AbortController`. This matches the WebAssembly host-fetch boundary and ensures the N-API core never uses the native `std.http` Gateway transport.
+Each core has one nonblocking Unix socketpair for readiness. The adapter takes ownership of the reader with `takeCoreReadyFd()` and watches it through `node:net`; Bun adopts the descriptor through `connect()`. The native writer signals when a fetch or Codex session-store request becomes pending, output changes from empty to non-empty, or the core exits. Wake bytes carry no state: JavaScript drains the bounded queues to quiescence and then checks exit state. While a fetch body pump exists it calls only `coreFetchActive()` for that fetch handle; an inactive handle aborts its matching `AbortController` on the next readiness event. ACP output is accumulated to newline boundaries and parsed as JSON. Gateway requests are transferred to Node as bounded request records; Node runs the configured `fetch`, streams bounded response chunks back to Zig, and owns the `AbortController`. This matches the WebAssembly host-fetch boundary and ensures the N-API core never uses the native `std.http` Gateway transport. Codex uses the native provider transport, while its explicit session store crosses a separate bounded bridge. Node runs `load()` and revisioned `commit()` with an `AbortSignal`; the runtime thread never calls N-API.
 
 The shared JavaScript Agent wrapper emits bounded `transport.start`, `transport.response`, and `transport.error` diagnostics around that host-owned fetch. It allowlists request, generation, model, provider, status, attempt, endpoint, and elapsed-time fields rather than exposing credentials or arbitrary headers.
 
@@ -78,11 +80,13 @@ The native kernel installs only the host-stream provider and static model metada
 | `closeCore(handle)` | Closes input and wakes a blocked ACP reader. |
 | `drainCore(handle)` | Returns up to 1 MiB of queued output as a Node Buffer. |
 | `takeCoreFetch(runtime)` | Takes the pending bounded Gateway request, including its positive `fetchHandle`, for Node-owned fetch. |
+| `takeCoreCodexSessionOperation(runtime)` | Takes one pending bounded Codex session load or commit for the Node host. |
+| `finishCoreCodexSessionOperation(runtime, operationHandle, status, bytes, revision)` | Completes only the matching Codex session operation; stale completions are ignored. |
 | `coreFetchActive(runtime, fetchHandle)` | Reports whether that request may still receive host response operations. |
 | `startCoreFetchResponse(runtime, fetchHandle, status)` | Publishes the matching fetch response status. |
 | `pushCoreFetchResponse(runtime, fetchHandle, buffer)` | Appends a bounded matching response chunk. |
 | `finishCoreFetch(runtime, fetchHandle)` / `failCoreFetch(runtime, fetchHandle)` | Completes only the matching host stream successfully or with transport failure. |
-| `abortCoreFetch(runtime)` | Aborts the current fetch and wakes the Zig worker. Idle calls do not cancel a future fetch; ACP owns turn cancellation. |
+| `abortCoreFetch(runtime)` | Aborts the current fetch and wakes blocked host effects while Node aborts their matching `AbortController` values. Idle calls do not cancel a future fetch; ACP owns turn cancellation. |
 | `coreExited(handle)` | Reports whether the ACP thread has exited. |
 | `coreExitCode(handle)` | Returns the ACP thread's numeric exit status. |
 | `destroyCore(handle)` | Closes input, joins the thread, and releases native memory. |
@@ -104,11 +108,11 @@ Creating a core performs these steps:
 1. Atomically reserve one of 64 process-wide runtime slots.
 2. Read and copy bounded configuration strings from the JavaScript options object.
 3. Validate the Gateway endpoint.
-4. Allocate a `Runtime` and bounded fetch bridge using Zig's C allocator.
+4. Allocate a `Runtime` with bounded fetch and Codex session bridges using Zig's C allocator.
 5. Spawn one native thread.
 6. Run `acp_server.runWithTransport()` on that thread using callback-backed ACP queues and the shared host-stream provider.
 
-The runtime thread never reads or mutates JavaScript values or calls Node-API. It blocks on the fetch bridge while Node owns `fetch`, response-body iteration, and `AbortController`. Queue state remains authoritative when readiness writes coalesce. An environment cleanup hook shuts down and joins every runtime, including worker termination. Explicit destruction unregisters that hook. Destruction marks the bridge shutting down, wakes every wait, joins the runtime thread, and then closes the readiness writer and any unclaimed reader before freeing native memory. The JavaScript adapter destroys its reader socket and waits for its close before settling `exited`.
+The runtime thread never reads or mutates JavaScript values or calls Node-API. It blocks on bridges while Node owns `fetch`, response-body iteration, Codex session-store promises, and `AbortController`. Queue state remains authoritative when readiness writes coalesce. Cancellation completes a pending session operation with a generic failure and scrubs the bridge request promptly. A commit receives a separate copy that is scrubbed when its host promise settles. Because abort is advisory, Node keeps that store pump quarantined until the original promise settles. A store timeout also poisons and closes the native runtime, so a never-settling promise cannot strand a later Codex request. A late native completion carries the old handle and is ignored. An environment cleanup hook shuts down and joins every runtime, including worker termination; explicit destruction unregisters that hook. Destruction marks both bridges shutting down, wakes every wait, joins the runtime thread, and then closes the readiness writer and any unclaimed reader before freeing native memory. The JavaScript adapter destroys its reader socket and waits for its close before settling `exited`.
 
 The addon initializes one process-wide `std.Io.Threaded` instance. Atomic state protects one-time initialization when the addon is loaded in multiple Node worker environments. The same initialization installs inherited process-environment access before any runtime thread starts. It does not configure fx product tracing from ambient `FX_TRACE_*` variables; libfx remains silent unless its JavaScript host explicitly requests SDK observability.
 
@@ -139,6 +143,11 @@ The native core is intentionally more restricted than the native `fx` CLI. Its A
 - command output limits to zero.
 
 As a result, the model receives no native tool advertisement, cannot launch commands, cannot read workspace files through fx tools, cannot start ACP-provided MCP servers, and cannot access the native secret store. `home` and `workspaceRoot` still provide identity and session context to shared ACP code, but they do not grant a tool capability by themselves.
+
+The native core composes Gateway and Codex only. Gateway streams through the
+host-fetch bridge. Codex is enabled only when the caller supplies a custom
+session store or explicitly opts into an fx profile with `fxProfileSession()`.
+Grok remains unavailable. Browser and WebAssembly cores remain Gateway-only.
 
 The native core also performs no model-catalog lookup while creating or prompting an Agent. It uses the local fallback capability policy for the host-selected model. Initial model-visible system context comes only from the host's explicit `instructions`, including text assembled by the MCP and skills adapters.
 
@@ -175,6 +184,8 @@ All untrusted values crossing the native boundary are bounded before allocation 
 | Fetch request record | 8 MiB |
 | Fetch response queue | 8 MiB |
 | Gateway error body | 1 MiB |
+| Codex session snapshot | 64 KiB |
+| Codex session revision | 1 KiB |
 | One output drain | 1 MiB |
 | Active runtimes | 64 per process |
 | ACP tool result | 64 KiB |
@@ -204,7 +215,7 @@ Do not replace the tagged wrapped object with a numeric pointer, externalized ad
 
 The API key is copied from the JavaScript string into native heap memory and passed as an in-memory credential override. It is not read from process-global environment state, written into generated package artifacts, or intentionally logged. Per-runtime overrides also avoid mutating environment variables shared by concurrent runtimes and workers.
 
-The copied key remains resident for the runtime lifetime and is freed during destruction. The allocation is not currently zeroized before free. Code handling diagnostics, crash reports, heap inspection, or allocator changes must treat this memory as sensitive. A future zeroization change should cover all destruction and partial-construction paths and must not be optimized away.
+The copied Gateway key remains resident for the runtime lifetime and is zeroized before free. Codex session request and response buffers are likewise zeroized when released. JavaScript strings and host-owned store values remain subject to the host runtime's memory behavior. Code handling diagnostics, crash reports, heap inspection, or allocator changes must treat all credential material as sensitive.
 
 ## Native code trust boundary
 
@@ -277,6 +288,8 @@ The lane covers:
 - same-environment concurrency and Node worker isolation;
 - finalization of abandoned handles and active worker termination;
 - ACP initialization, sessions, streaming, cancellation, and graceful shutdown;
+- explicit Codex stores, optimistic refresh write-back, profile opt-in, model
+  catalogs, provider switching, malformed stores, and secret isolation;
 - loader selection, API version checks, endpoint validation, and fallback diagnostics.
 
 When changing the transport or lifecycle, run the individual failing test directly while iterating, then run the complete N-API lane. Changes to shared JavaScript loading also require the Node plus WebAssembly lane because `sdk/node.js` owns both paths.

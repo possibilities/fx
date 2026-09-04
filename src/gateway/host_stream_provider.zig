@@ -3,6 +3,7 @@ const stream_provider = @import("../core/agent/stream_provider.zig");
 const io_mod = @import("../core/shared/io.zig");
 const gateway_client = @import("client.zig");
 const credential_authority = @import("../core/auth/credential_authority.zig");
+const secret = @import("../core/auth/secret.zig");
 
 const Allocator = std.mem.Allocator;
 const max_error_body_bytes = 1024 * 1024;
@@ -15,19 +16,19 @@ pub const Transport = struct {
     next_fn: *const fn (?*anyopaque, i32, []u8) i32,
     close_fn: *const fn (?*anyopaque, i32) void,
 
-    fn open(self: Transport, method: []const u8, url: []const u8, headers: []const u8, body: []const u8) !i32 {
+    pub fn open(self: Transport, method: []const u8, url: []const u8, headers: []const u8, body: []const u8) !i32 {
         return self.open_fn(self.context, method, url, headers, body);
     }
 
-    fn status(self: Transport, handle: i32, status_out: *u16) i32 {
+    pub fn status(self: Transport, handle: i32, status_out: *u16) i32 {
         return self.status_fn(self.context, handle, status_out);
     }
 
-    fn next(self: Transport, handle: i32, out: []u8) i32 {
+    pub fn next(self: Transport, handle: i32, out: []u8) i32 {
         return self.next_fn(self.context, handle, out);
     }
 
-    fn close(self: Transport, handle: i32) void {
+    pub fn close(self: Transport, handle: i32) void {
         self.close_fn(self.context, handle);
     }
 };
@@ -77,7 +78,7 @@ fn stream(raw: ?*anyopaque, alloc: Allocator, request: stream_provider.ModelRequ
         try std.fmt.allocPrint(alloc, "Bearer {s}", .{credential})
     else
         null;
-    defer if (auth) |value| alloc.free(value);
+    defer if (auth) |value| secret.zeroAndFree(alloc, value);
 
     const Header = struct { name: []const u8, value: []const u8 };
     var headers: std.ArrayList(Header) = .empty;
@@ -99,7 +100,11 @@ fn stream(raw: ?*anyopaque, alloc: Allocator, request: stream_provider.ModelRequ
     });
 
     var headers_json: std.Io.Writer.Allocating = .init(alloc);
-    defer headers_json.deinit();
+    defer {
+        const serialized = headers_json.writer.buffered();
+        if (serialized.len > 0) std.crypto.secureZero(u8, @constCast(@volatileCast(serialized)));
+        headers_json.deinit();
+    }
     try std.json.Stringify.value(headers.items, .{}, &headers_json.writer);
 
     const endpoint = context.endpoint.url();
@@ -243,7 +248,11 @@ fn failureKind(status: std.http.Status) stream_provider.FailureKind {
 }
 
 fn pulse(value: ?stream_provider.CooperativePulse) !void {
-    if (value) |callback| try callback.pulse();
+    if (value) |callback| {
+        try callback.pulse();
+    } else {
+        io_mod.sleep(cooperative_pulse_interval_ms * std.time.ns_per_ms);
+    }
 }
 
 fn deadlineExpired(deadline: ?std.Io.Clock.Timestamp) bool {
@@ -362,7 +371,7 @@ const HostStreamReader = struct {
             if (count == -3) {
                 if (self.cooperative_pulse != null) {
                     self.pulseAt(std.Io.Clock.Timestamp.now(io_mod.getIo(), .awake)) catch return error.ReadFailed;
-                }
+                } else io_mod.sleep(cooperative_pulse_interval_ms * std.time.ns_per_ms);
                 continue;
             }
             if (count == -2) return self.abortRead();

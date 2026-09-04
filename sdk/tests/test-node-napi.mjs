@@ -15,6 +15,7 @@ const scripts = [
   "test-agent-request-context.mjs",
   "test-agent-transport-retry.mjs",
   "test-native-core-stream.mjs",
+  "test-native-core-codex.mjs",
   "test-native-core-fetch-failure.mjs",
   "test-native-core-cancel-before-fetch.mjs",
   "test-native-core-cancel.mjs",
