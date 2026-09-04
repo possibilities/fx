@@ -301,6 +301,7 @@ fn writeNewSessionResponse(
     msg: *jsonrpc.Message,
     session_id: []const u8,
 ) !void {
+    try server.refreshModelCatalogForOptions(state);
     var out: std.Io.Writer.Allocating = .init(alloc);
     defer out.deinit();
 
@@ -859,6 +860,7 @@ fn writeLoadSessionResponse(
     msg: *jsonrpc.Message,
     model: []const u8,
 ) !void {
+    try server.refreshModelCatalogForOptions(state);
     var out: std.Io.Writer.Allocating = .init(alloc);
     defer out.deinit();
     try out.writer.writeAll("{\"configOptions\":[");
