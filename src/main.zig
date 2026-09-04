@@ -1517,7 +1517,6 @@ const App = struct {
             intent == .steer,
             null,
         );
-        HerdrAppRuntime.reportWorking(self);
         WorkerAppRuntime.syncState(
             self,
             app_callbacks.Bindings(App).worker_tool_lifecycle_presenter(self),
