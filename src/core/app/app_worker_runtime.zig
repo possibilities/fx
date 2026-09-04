@@ -1722,6 +1722,7 @@ const FakeApp = struct {
     last_attention_kind: ?@import("../hooks/hooks.zig").AttentionKind = null,
     child_attention_count: usize = 0,
     last_attention_child_session_id: ?[]const u8 = null,
+    last_attention_child_session_storage: [approval_registry.max_pending_child_id_bytes]u8 = undefined,
 
     fn init(alloc: std.mem.Allocator) FakeApp {
         return .{ .alloc = alloc };
@@ -1807,7 +1808,9 @@ const FakeApp = struct {
         self.last_attention_kind = kind;
         if (child_session_id) |session_id| {
             self.child_attention_count += 1;
-            self.last_attention_child_session_id = session_id;
+            std.debug.assert(session_id.len <= self.last_attention_child_session_storage.len);
+            @memcpy(self.last_attention_child_session_storage[0..session_id.len], session_id);
+            self.last_attention_child_session_id = self.last_attention_child_session_storage[0..session_id.len];
         }
     }
 };
