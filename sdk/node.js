@@ -1,5 +1,7 @@
 import { access, readFile } from "node:fs/promises";
+import { closeSync } from "node:fs";
 import { createRequire } from "node:module";
+import { Socket } from "node:net";
 import { homedir } from "node:os";
 import { isAbsolute, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -12,9 +14,11 @@ import {
   supportsJspi,
   xtermAdapter,
 } from "./fx-sdk.js";
+import { nativeHostAuthBrand } from "./internal.js";
 
 export { encodeXtermKeyEvent, fxSdkApiVersion, listModels, supportsJspi, xtermAdapter };
 export const libfxApiVersion = 3;
+const nativeCoreApiVersion = 3;
 
 const fetchOperationStale = 0;
 const fetchOperationApplied = 1;
@@ -162,10 +166,10 @@ async function loadNativeCandidate(candidate) {
 function validateNativeBackend(backend) {
   if (!backend) return null;
   const hasLowLevelCore = typeof backend.createCore === "function";
-  if ((hasLowLevelCore && backend.libfxApiVersion !== libfxApiVersion) ||
-    (!hasLowLevelCore && backend.libfxApiVersion !== undefined && backend.libfxApiVersion !== libfxApiVersion)) {
+  const expectedVersion = hasLowLevelCore ? nativeCoreApiVersion : libfxApiVersion;
+  if ((hasLowLevelCore || backend.libfxApiVersion !== undefined) && backend.libfxApiVersion !== expectedVersion) {
     const actualVersion = backend.libfxApiVersion ?? "missing";
-    throw new Error(`native addon API version ${actualVersion} is incompatible with libfx API version ${libfxApiVersion}`);
+    throw new Error(`native addon API version ${actualVersion} is incompatible with expected API version ${expectedVersion}`);
   }
   if (typeof backend.createCore !== "function" && typeof backend.createFxTerminal !== "function") {
     throw new Error("native addon must export createCore() or createFxTerminal()");
@@ -235,9 +239,23 @@ function createNativeCoreRuntime(addon, options) {
     ...(model === undefined ? {} : { model }),
     ...(gatewayChatUrl === undefined ? {} : { gatewayChatUrl }),
   });
+  let readyFd;
+  let readySocket;
+  try {
+    readyFd = addon.takeCoreReadyFd(core);
+    readySocket = new Socket({ fd: readyFd, readable: true, writable: false });
+  } catch (error) {
+    if (readyFd !== undefined) {
+      try { closeSync(readyFd); } catch {}
+    }
+    addon.destroyCore(core);
+    throw error;
+  }
+  const readyClosed = new Promise((resolve) => readySocket.once("close", resolve));
   let exitedResolve;
   let lineHandler = null;
   let lineBuffer = "";
+  const decoder = new TextDecoder();
   let settled = false;
   let fetchState = null;
   let codexSessionState = null;
@@ -250,20 +268,21 @@ function createNativeCoreRuntime(addon, options) {
   const finish = (code) => {
     if (settled) return;
     settled = true;
-    clearInterval(timer);
     abortHostEffects();
     try { addon.destroyCore(core); } catch {}
-    exitedResolve(code);
+    readySocket.destroy();
+    void readyClosed.then(() => exitedResolve(code));
   };
   const pumpFetch = async (request) => {
     const controller = new AbortController();
     const state = { handle: request.handle, controller };
     fetchState = state;
+    const requestBody = request.body?.length ? Buffer.from(request.body, "base64") : undefined;
     try {
       const response = await (options.fetch ?? globalThis.fetch)(request.url, {
         method: request.method,
         headers: new Headers(JSON.parse(request.headers).map(({ name, value }) => [name, value])),
-        body: request.body?.length ? Buffer.from(request.body, "base64") : undefined,
+        body: requestBody,
         signal: controller.signal,
       });
       const started = addon.startCoreFetchResponse(core, state.handle, response.status);
@@ -297,7 +316,11 @@ function createNativeCoreRuntime(addon, options) {
         } catch {}
       }
     } finally {
-      if (fetchState === state) fetchState = null;
+      requestBody?.fill(0);
+      if (fetchState === state) {
+        fetchState = null;
+        queueMicrotask(drainReady);
+      }
     }
   };
   const finishCodexSessionOperation = (request, status, bytes = Buffer.alloc(0), revision = "") => {
@@ -396,7 +419,8 @@ function createNativeCoreRuntime(addon, options) {
       if (!operation || operationSettled) releaseState();
     }
   };
-  const timer = setInterval(() => {
+  function drainReady() {
+    if (settled) return;
     try {
       if (fetchState) {
         if (!fetchState.controller.signal.aborted && !addon.coreFetchActive(core, fetchState.handle)) {
@@ -404,28 +428,48 @@ function createNativeCoreRuntime(addon, options) {
         }
       } else {
         const fetchRequest = addon.takeCoreFetch(core);
-        if (fetchRequest) void pumpFetch(JSON.parse(fetchRequest.toString("utf8")));
+        if (fetchRequest) {
+          let request;
+          try {
+            request = JSON.parse(fetchRequest.toString("utf8"));
+          } finally {
+            fetchRequest.fill(0);
+          }
+          void pumpFetch(request);
+        }
       }
       if (!codexSessionState) {
         const sessionRequest = addon.takeCoreCodexSessionOperation(core);
         if (sessionRequest) void pumpCodexSession(sessionRequest);
       }
-      const chunk = addon.drainCore(core);
-      if (chunk.length && lineHandler) {
-        lineBuffer += chunk.toString("utf8");
+      if (lineHandler) {
         for (;;) {
-          const newline = lineBuffer.indexOf("\n");
-          if (newline < 0) break;
-          const line = lineBuffer.slice(0, newline);
-          lineBuffer = lineBuffer.slice(newline + 1);
-          if (line) void Promise.resolve(lineHandler(JSON.parse(line))).catch(() => finish(1));
+          const chunk = addon.drainCore(core);
+          if (!chunk.length) break;
+          lineBuffer += decoder.decode(chunk, { stream: true });
+          for (;;) {
+            const newline = lineBuffer.indexOf("\n");
+            if (newline < 0) break;
+            const line = lineBuffer.slice(0, newline);
+            lineBuffer = lineBuffer.slice(newline + 1);
+            if (line) void Promise.resolve(lineHandler(JSON.parse(line))).catch(() => finish(1));
+          }
         }
       }
       if (addon.coreExited(core)) finish(addon.coreExitCode(core));
     } catch {
       finish(1);
     }
-  }, 2);
+  }
+
+  readySocket.on("data", drainReady);
+  readySocket.on("end", () => { drainReady(); if (!settled) finish(1); });
+  readySocket.on("error", () => finish(1));
+  readySocket.on("close", () => { if (!settled) finish(1); });
+  // Some runtimes defer descriptor adoption until connect().
+  if (readySocket.pending) {
+    try { readySocket.connect({ fd: readyFd }); } catch (error) { finish(1); throw error; }
+  }
 
   return {
     exited,
@@ -433,13 +477,14 @@ function createNativeCoreRuntime(addon, options) {
     closeStdin() { addon.closeCore(core); },
     abortHostEffects,
     abort() { abortHostEffects(); addon.closeCore(core); },
-    setLineHandler(handler) { lineHandler = handler; },
+    setLineHandler(handler) { lineHandler = handler; drainReady(); },
   };
 }
 
 function createNativeAgent(addon, options) {
   return createWasmAgent({
     ...options,
+    [nativeHostAuthBrand]: Boolean(options[normalizedAuthBrand]?.codex),
     runtimeFactory(runtimeOptions) {
       return createNativeCoreRuntime(addon, runtimeOptions);
     },
@@ -467,13 +512,10 @@ async function createWithFallback(surface, nativeMethod, wasmFactory, defaultWas
     if (typeof native.backend?.[nativeMethod] === "function") {
       nativeAttempted = true;
       try {
-        if (surface === "agent" && !requiresNativeCodex) {
+        if (surface === "agent") {
           return await createNativeAgent(native.backend, effectiveOptions);
         }
-        const nativeOptions = surface === "agent" && runtimeOptions.auth !== undefined
-          ? { ...effectiveOptions, auth: runtimeOptions.auth }
-          : effectiveOptions;
-        return await native.backend[nativeMethod](nativeOptions);
+        return await native.backend[nativeMethod](effectiveOptions);
       } catch (error) {
         nativeError = error;
         if (backend === "native") throw error;
