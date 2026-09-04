@@ -407,7 +407,7 @@ const App = struct {
         Self,
         builtin_hooks.notifications.provider(Self),
     );
-    const HerdrAppRuntime = builtin_hooks.Runtime(Self);
+    const LifecycleAppRuntime = builtin_hooks.Runtime(Self);
     const RenderAppRuntime = app_render_runtime.Runtime(Self);
     const SessionAppRuntime = app_session_runtime.Runtime(Self);
     const UpgradeAppRuntime = app_upgrade_runtime.Runtime(Self);
@@ -539,6 +539,8 @@ const App = struct {
     lifecycle_runtime: hooks.Runtime = hooks.Runtime.init(std.heap.c_allocator),
     lifecycle_view: hooks.RuntimeView = hooks.RuntimeView.empty(),
     notifications: builtin_hooks.notifications.State = .{},
+    lifecycle_state: builtin_hooks.lifecycle_state.Reducer = .{},
+    ade_events: builtin_hooks.ade_events.Client = .{},
     herdr: builtin_hooks.Client = .{},
 
     session: SessionRuntime = SessionRuntime.initWithProviders(
@@ -729,10 +731,15 @@ const App = struct {
     }
 
     pub fn configureNotifications(self: *App) !void {
-        // Register herdr hooks before NotificationAppRuntime.configure freezes
-        // the lifecycle runtime (its call to freeze() is the sole freeze site).
-        try HerdrAppRuntime.configure(self, SessionAppRuntime.activeSessionId(self));
+        // Register built-in observers before NotificationAppRuntime.configure
+        // freezes the lifecycle runtime (its call to freeze() is the sole
+        // freeze site).
+        try LifecycleAppRuntime.configure(self, SessionAppRuntime.activeSessionId(self));
         try NotificationAppRuntime.configure(self);
+    }
+
+    pub fn reportSessionIdentityChanged(self: *App, session_id: ?[]const u8) void {
+        LifecycleAppRuntime.reportSessionChanged(self, session_id);
     }
 
     pub fn rebindAfterInit(self: *App) void {
@@ -799,8 +806,83 @@ const App = struct {
         self: *App,
         turn_id: u64,
         kind: hooks.AttentionKind,
+        child_session_id: ?[]const u8,
     ) void {
-        NotificationAppRuntime.dispatchAttentionRequired(self, turn_id, kind);
+        self.dispatchAttentionRequiredTokenized(turn_id, kind, child_session_id, null);
+    }
+
+    pub fn dispatchAttentionRequiredTokenized(
+        self: *App,
+        turn_id: u64,
+        kind: hooks.AttentionKind,
+        child_session_id: ?[]const u8,
+        attention_token: ?hooks.AttentionToken,
+    ) void {
+        agent_runtime.dispatchAttentionRequiredCheckpoint(.{
+            .view = self.lifecycle_view,
+            .scope = self.attentionScope(child_session_id),
+            .outcome_allocator = self.alloc,
+        }, .{
+            .turn_id = if (child_session_id == null) turn_id else null,
+            .kind = kind,
+            .presented_interactively = true,
+            .attention_token = attention_token,
+        });
+    }
+
+    pub fn dispatchAttentionResolved(
+        self: *App,
+        turn_id: u64,
+        kind: hooks.AttentionKind,
+        child_session_id: ?[]const u8,
+    ) void {
+        self.dispatchAttentionResolvedTokenized(turn_id, kind, child_session_id, null);
+    }
+
+    pub fn dispatchAttentionResolvedTokenized(
+        self: *App,
+        turn_id: u64,
+        kind: hooks.AttentionKind,
+        child_session_id: ?[]const u8,
+        attention_token: ?hooks.AttentionToken,
+    ) void {
+        agent_runtime.dispatchAttentionResolvedCheckpoint(.{
+            .view = self.lifecycle_view,
+            .scope = self.attentionScope(child_session_id),
+            .outcome_allocator = self.alloc,
+        }, .{
+            .turn_id = if (child_session_id == null) turn_id else null,
+            .kind = kind,
+            .presented_interactively = true,
+            .attention_token = attention_token,
+        });
+    }
+
+    pub fn invalidateSubagentAttentionToken(
+        self: *App,
+        child_session_id: []const u8,
+        attention_token: hooks.AttentionToken,
+    ) void {
+        _ = self.lifecycle_state.closeAttentionToken(
+            .{ .subagent_session = child_session_id },
+            .permission,
+            attention_token,
+        );
+    }
+
+    fn attentionScope(
+        self: *App,
+        child_session_id: ?[]const u8,
+    ) hooks.Scope {
+        return if (child_session_id) |session_id| .{
+            .kind = .subagent,
+            .workspace_root = self.workspace_root,
+            .session_id = session_id,
+        } else .{
+            .kind = .interactive,
+            .workspace_root = self.workspace_root,
+            .session_id = SessionAppRuntime.activeSessionId(self),
+        };
     }
 
     /// Must be called after init() returns so the AutoUpgrade thread
@@ -883,6 +965,8 @@ const App = struct {
         self.worker.deinit(std.heap.c_allocator);
         self.web_fetch_runtime.deinit(self.alloc);
         self.web_search_runtime.deinit();
+        LifecycleAppRuntime.prepareStopped(self);
+        self.ade_events.deinit();
         self.prompt_history.deinit(self.alloc);
         self.clearPendingImages();
         self.pending_images.deinit(self.alloc);
@@ -910,6 +994,7 @@ const App = struct {
         self.context_snapshot.deinit(self.alloc);
         self.file_index.deinit(std.heap.c_allocator);
         self.lifecycle_runtime.deinit();
+        LifecycleAppRuntime.deinit(self);
 
         self.auth.deinit(self.alloc);
         WorkspaceAppRuntime.deinit(self);
@@ -1342,8 +1427,11 @@ const App = struct {
             false,
         );
         errdefer worker_runtime.freeQueuedPrompt(std.heap.c_allocator, queued);
-        try self.worker.admitInteractivePrompt(std.heap.c_allocator, queued);
-        HerdrAppRuntime.reportWorking(self);
+        try self.worker.admitInteractivePromptObserved(std.heap.c_allocator, queued, .{
+            .ctx = self,
+            .report = reportPromptAdmission,
+        });
+        LifecycleAppRuntime.reportPromptWorking(self);
         return true;
     }
 
@@ -1388,8 +1476,11 @@ const App = struct {
             user_prompt_already_presented,
         );
         errdefer worker_runtime.freeQueuedPrompt(std.heap.c_allocator, queued);
-        try self.worker.enqueuePrompt(std.heap.c_allocator, queued);
-        HerdrAppRuntime.reportWorking(self);
+        try self.worker.enqueuePromptObserved(std.heap.c_allocator, queued, .{
+            .ctx = self,
+            .report = reportPromptAdmission,
+        });
+        LifecycleAppRuntime.reportPromptWorking(self);
         return true;
     }
 
@@ -1503,6 +1594,11 @@ const App = struct {
         };
     }
 
+    fn reportPromptAdmission(raw: *anyopaque) void {
+        const self: *App = @ptrCast(@alignCast(raw));
+        LifecycleAppRuntime.reportPromptQueued(self);
+    }
+
     pub fn enqueueContextCompaction(self: *App) !bool {
         if (self.worker.isProcessing() or self.worker.queuedPromptCount() > 0) return false;
         const selection = self.provider_selection.selection();
@@ -1538,7 +1634,7 @@ const App = struct {
             .context_history_start = self.session.contextHistoryStart(),
             .unversioned_history_count = self.session.unversionedHistoryEnd(),
         });
-        HerdrAppRuntime.reportWorking(self);
+        LifecycleAppRuntime.reportPromptWorking(self);
         return true;
     }
 

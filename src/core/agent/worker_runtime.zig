@@ -373,6 +373,23 @@ pub const PermissionSubmissionResult = enum {
     no_pending,
 };
 
+pub const QuestionSubmissionResult = enum {
+    accepted,
+    no_pending,
+};
+
+/// Runs after a human decision has been reserved under `worker_mutex`, but
+/// before the waiting worker is released. The callback never runs with the
+/// worker mutex held, so lifecycle projections may perform synchronous I/O.
+pub const DecisionObserver = struct {
+    context: *anyopaque,
+    observe_fn: *const fn (*anyopaque, u64) void,
+
+    fn observe(self: DecisionObserver, turn_id: u64) void {
+        self.observe_fn(self.context, turn_id);
+    }
+};
+
 const OwnedQuestionOption = struct {
     label: []u8,
     description: ?[]u8 = null,
@@ -387,6 +404,23 @@ pub const QuestionPromptSource = enum {
     agent_question,
     route_recovery,
     mcp_elicitation,
+};
+
+/// Runs after a pending question has been reserved for presentation under
+/// `worker_mutex`, but before cancellation can resolve it. The callback never
+/// runs with the worker mutex held, so lifecycle projections may perform
+/// synchronous I/O.
+pub const QuestionPresentationObserver = struct {
+    context: *anyopaque,
+    observe_fn: *const fn (*anyopaque, u64, QuestionPromptSource) void,
+
+    fn observe(
+        self: QuestionPresentationObserver,
+        turn_id: u64,
+        source: QuestionPromptSource,
+    ) void {
+        self.observe_fn(self.context, turn_id, source);
+    }
 };
 
 const OwnedQuestionBatch = struct {
@@ -482,11 +516,13 @@ pub const WorkerRuntime = struct {
     turn_start_held: bool = false,
     next_permission_request_id: u64 = 1,
     pending_permission_response: ?permission_request.OwnedPermissionResponse = null,
+    pending_permission_response_reserved: bool = false,
     pending_permission_request_shared: ?permission_request.OwnedPermissionRequest = null,
     pending_permission_review: ?*const diff_mod.FileReview = null,
     pending_permission_waiting: bool = false,
     pending_question_shared: ?OwnedQuestionBatch = null,
     pending_question_response: QuestionResponse = .pending,
+    pending_question_response_reserved: bool = false,
     agent_turn_settings: AgentTurnSettings = .{},
     active_agent_turn_settings: ?AgentTurnSettings = null,
     active_context_snapshot: ?*const context_contract.GatheredContextSnapshot = null,
@@ -504,6 +540,7 @@ pub const WorkerRuntime = struct {
             self.discardPermissionResponse(response, "deinit");
         }
         self.pending_permission_response = null;
+        self.pending_permission_response_reserved = false;
         if (self.pending_permission_request_shared) |*request| request.deinit(alloc);
         self.pending_permission_request_shared = null;
         self.pending_permission_review = null;
@@ -511,6 +548,7 @@ pub const WorkerRuntime = struct {
         self.pending_question_shared = null;
         freeQuestionResponse(alloc, self.pending_question_response);
         self.pending_question_response = .pending;
+        self.pending_question_response_reserved = false;
 
         for (self.queued_prompts.items) |prompt| discardQueuedPrompt(alloc, prompt, &.{});
         self.queued_prompts.deinit(alloc);
@@ -737,12 +775,35 @@ pub const WorkerRuntime = struct {
         return self.takeEventBatch().events;
     }
 
+    pub const PromptAdmissionObserver = struct {
+        ctx: *anyopaque,
+        report: *const fn (ctx: *anyopaque) void,
+    };
+
     pub fn enqueuePrompt(self: *WorkerRuntime, alloc: std.mem.Allocator, prompt: QueuedPrompt) !void {
-        try self.admitPrompt(alloc, prompt, false);
+        try self.admitPromptObserved(alloc, prompt, false, null);
+    }
+
+    pub fn enqueuePromptObserved(
+        self: *WorkerRuntime,
+        alloc: std.mem.Allocator,
+        prompt: QueuedPrompt,
+        observer: ?PromptAdmissionObserver,
+    ) !void {
+        try self.admitPromptObserved(alloc, prompt, false, observer);
     }
 
     pub fn admitInteractivePrompt(self: *WorkerRuntime, alloc: std.mem.Allocator, prompt: QueuedPrompt) !void {
         try self.admitPrompt(alloc, prompt, true);
+    }
+
+    pub fn admitInteractivePromptObserved(
+        self: *WorkerRuntime,
+        alloc: std.mem.Allocator,
+        prompt: QueuedPrompt,
+        observer: ?PromptAdmissionObserver,
+    ) !void {
+        try self.admitPromptObserved(alloc, prompt, true, observer);
     }
 
     pub fn enqueueContextCompaction(
@@ -823,11 +884,22 @@ pub const WorkerRuntime = struct {
         prompt: QueuedPrompt,
         steer_if_active: bool,
     ) !void {
+        try self.admitPromptObserved(alloc, prompt, steer_if_active, null);
+    }
+
+    pub fn admitPromptObserved(
+        self: *WorkerRuntime,
+        alloc: std.mem.Allocator,
+        prompt: QueuedPrompt,
+        steer_if_active: bool,
+        observer: ?PromptAdmissionObserver,
+    ) !void {
         var queued = prompt;
         if (queued.turn_id == 0) queued.turn_id = debug_trace.nextTurnId();
 
         self.worker_mutex.lockUncancelable(io_mod.getIo());
-        defer self.worker_mutex.unlock(io_mod.getIo());
+        var locked = true;
+        defer if (locked) self.worker_mutex.unlock(io_mod.getIo());
         if (self.finalization_failure != null) return error.TurnFinalizationDeliveryFailed;
         if (self.worker_stop_requested) return error.WorkerStopped;
         if (queued.recovery_checkpoint != null and
@@ -852,6 +924,9 @@ pub const WorkerRuntime = struct {
             }
             self.worker_cancel_requested.store(true, .seq_cst);
         }
+        self.worker_mutex.unlock(io_mod.getIo());
+        locked = false;
+        if (observer) |admitted| admitted.report(admitted.ctx);
     }
 
     fn sameTurnSteeringEligible(prompt: QueuedPrompt) bool {
@@ -1767,6 +1842,7 @@ pub const WorkerRuntime = struct {
             self.discardPermissionResponse(response, "request_replaced");
         }
         self.pending_permission_response = null;
+        self.pending_permission_response_reserved = false;
         self.pending_permission_waiting = true;
 
         if (observer) |value| {
@@ -1783,14 +1859,17 @@ pub const WorkerRuntime = struct {
             };
         }
 
-        while (self.pending_permission_response == null and !self.worker_stop_requested) {
-            self.worker_cond.wait(io_mod.getIo(), &self.worker_mutex) catch break;
+        while (self.pending_permission_response == null and
+            (!self.worker_stop_requested or self.pending_permission_response_reserved))
+        {
+            self.worker_cond.waitUncancelable(io_mod.getIo(), &self.worker_mutex);
         }
 
         const response = self.pending_permission_response orelse
             permission_request.OwnedPermissionResponse.init(alloc, .deny, null);
         self.pending_permission_waiting = false;
         self.pending_permission_response = null;
+        self.pending_permission_response_reserved = false;
         if (self.pending_permission_request_shared) |*old| {
             old.deinit(alloc);
             self.pending_permission_request_shared = null;
@@ -1804,15 +1883,25 @@ pub const WorkerRuntime = struct {
         expected_request_id: u64,
         response: permission_request.OwnedPermissionResponse,
     ) PermissionSubmissionResult {
-        self.worker_mutex.lockUncancelable(io_mod.getIo());
-        defer self.worker_mutex.unlock(io_mod.getIo());
+        return self.submitPermissionResponseObserved(
+            expected_request_id,
+            response,
+            null,
+        );
+    }
 
-        if (self.permissionSubmissionBlockedLocked(expected_request_id)) |blocked| {
-            self.discardPermissionResponse(response, @tagName(blocked));
-            return blocked;
-        }
-        std.debug.assert(self.resolvePendingPermissionLocked(response));
-        return .accepted;
+    pub fn submitPermissionResponseObserved(
+        self: *WorkerRuntime,
+        expected_request_id: u64,
+        response: permission_request.OwnedPermissionResponse,
+        observer: ?DecisionObserver,
+    ) PermissionSubmissionResult {
+        return self.submitPermissionResponseAfterCommitObserved(
+            expected_request_id,
+            response,
+            null,
+            observer,
+        ) catch unreachable;
     }
 
     pub const PermissionCommitError = error{
@@ -1835,18 +1924,51 @@ pub const WorkerRuntime = struct {
         response: permission_request.OwnedPermissionResponse,
         commit: ?PermissionCommit,
     ) PermissionCommitError!PermissionSubmissionResult {
-        self.worker_mutex.lockUncancelable(io_mod.getIo());
-        defer self.worker_mutex.unlock(io_mod.getIo());
+        return self.submitPermissionResponseAfterCommitObserved(
+            expected_request_id,
+            response,
+            commit,
+            null,
+        );
+    }
 
+    /// Reserves a valid response and its active turn identity, runs the
+    /// lifecycle observer without `worker_mutex`, then publishes the response
+    /// and wakes the waiter. An unrelated broadcast or stop request cannot let
+    /// the waiter resume while the observer is in flight.
+    pub fn submitPermissionResponseAfterCommitObserved(
+        self: *WorkerRuntime,
+        expected_request_id: u64,
+        response: permission_request.OwnedPermissionResponse,
+        commit: ?PermissionCommit,
+        observer: ?DecisionObserver,
+    ) PermissionCommitError!PermissionSubmissionResult {
+        self.worker_mutex.lockUncancelable(io_mod.getIo());
         if (self.permissionSubmissionBlockedLocked(expected_request_id)) |blocked| {
+            self.worker_mutex.unlock(io_mod.getIo());
             self.discardPermissionResponse(response, @tagName(blocked));
             return blocked;
         }
         if (commit) |effect| effect.commit_fn(effect.context) catch |err| {
+            self.worker_mutex.unlock(io_mod.getIo());
             self.discardPermissionResponse(response, "commit_failed");
             return err;
         };
-        std.debug.assert(self.resolvePendingPermissionLocked(response));
+        self.pending_permission_response_reserved = true;
+        const turn_id = self.active_turn_id;
+        self.worker_mutex.unlock(io_mod.getIo());
+
+        if (observer) |value| value.observe(turn_id);
+
+        self.worker_mutex.lockUncancelable(io_mod.getIo());
+        std.debug.assert(self.pending_permission_response_reserved);
+        std.debug.assert(self.pending_permission_waiting);
+        std.debug.assert(self.pending_permission_request_shared != null);
+        std.debug.assert(self.pending_permission_response == null);
+        self.pending_permission_response_reserved = false;
+        self.pending_permission_response = response;
+        self.worker_cond.broadcast(io_mod.getIo());
+        self.worker_mutex.unlock(io_mod.getIo());
         return .accepted;
     }
 
@@ -1855,7 +1977,8 @@ pub const WorkerRuntime = struct {
         expected_request_id: u64,
     ) ?PermissionSubmissionResult {
         if (!self.permissionRequestAwaitedLocked() or
-            self.pending_permission_response != null)
+            self.pending_permission_response != null or
+            self.pending_permission_response_reserved)
         {
             return .no_pending;
         }
@@ -1889,7 +2012,8 @@ pub const WorkerRuntime = struct {
         self: *const WorkerRuntime,
     ) bool {
         return self.permissionRequestAwaitedLocked() and
-            self.pending_permission_response == null;
+            self.pending_permission_response == null and
+            !self.pending_permission_response_reserved;
     }
 
     fn resolvePendingPermissionLocked(
@@ -1950,16 +2074,20 @@ pub const WorkerRuntime = struct {
         self.pending_question_shared = owned;
         freeQuestionResponse(alloc, self.pending_question_response);
         self.pending_question_response = .pending;
+        self.pending_question_response_reserved = false;
         self.worker_events.append(alloc, .question_requested) catch |err| {
             self.pending_question_shared = null;
             self.pending_question_response = .pending;
+            self.pending_question_response_reserved = false;
             return err;
         };
         owns_pending_question = false;
         self.worker_cond.broadcast(io_mod.getIo());
 
-        while (self.pending_question_response == .pending and !self.worker_stop_requested) {
-            self.worker_cond.wait(io_mod.getIo(), &self.worker_mutex) catch break;
+        while (self.pending_question_response == .pending and
+            (!self.worker_stop_requested or self.pending_question_response_reserved))
+        {
+            self.worker_cond.waitUncancelable(io_mod.getIo(), &self.worker_mutex);
         }
 
         if (self.pending_question_shared) |pending| {
@@ -1969,6 +2097,7 @@ pub const WorkerRuntime = struct {
 
         const response = self.pending_question_response;
         self.pending_question_response = .pending;
+        self.pending_question_response_reserved = false;
         return switch (response) {
             .answered => |labels| labels,
             .cancelled, .pending => null,
@@ -1976,6 +2105,17 @@ pub const WorkerRuntime = struct {
     }
 
     pub fn submitQuestionBatchAnswer(self: *WorkerRuntime, alloc: std.mem.Allocator, answers: ?[]const []const u8) !void {
+        _ = try self.submitQuestionBatchAnswerObserved(alloc, answers, null);
+    }
+
+    /// Reserves one accepted answer, observes its lifecycle transition without
+    /// `worker_mutex`, and only then releases the waiting worker.
+    pub fn submitQuestionBatchAnswerObserved(
+        self: *WorkerRuntime,
+        alloc: std.mem.Allocator,
+        answers: ?[]const []const u8,
+        observer: ?DecisionObserver,
+    ) !QuestionSubmissionResult {
         var new_response: QuestionResponse = .cancelled;
         if (answers) |labels| {
             const dup = try alloc.alloc([]u8, labels.len);
@@ -1989,30 +2129,97 @@ pub const WorkerRuntime = struct {
             new_response = .{ .answered = dup };
         }
 
-        self.worker_mutex.lockUncancelable(io_mod.getIo());
-        defer self.worker_mutex.unlock(io_mod.getIo());
-        if (self.pending_question_shared == null or self.pending_question_response != .pending) {
-            freeQuestionResponse(alloc, new_response);
-            debug_trace.logf("worker", "ignored late question response pending=false", .{});
-            return;
-        }
-        freeQuestionResponse(alloc, self.pending_question_response);
-        self.pending_question_response = new_response;
-        self.worker_cond.broadcast(io_mod.getIo());
+        return self.submitQuestionResponseObserved(alloc, new_response, observer);
     }
 
-    pub fn cancelPendingQuestionBatch(self: *WorkerRuntime) bool {
+    /// Reserves an accepted cancellation, observes its lifecycle transition,
+    /// and only then releases the waiting worker. Unlike answer submission,
+    /// cancellation owns no response allocation and cannot fail.
+    pub fn cancelPendingQuestionBatchObserved(
+        self: *WorkerRuntime,
+        observer: ?DecisionObserver,
+    ) QuestionSubmissionResult {
+        return self.submitQuestionResponseObserved(
+            std.heap.c_allocator,
+            .cancelled,
+            observer,
+        );
+    }
+
+    fn submitQuestionResponseObserved(
+        self: *WorkerRuntime,
+        alloc: std.mem.Allocator,
+        new_response: QuestionResponse,
+        observer: ?DecisionObserver,
+    ) QuestionSubmissionResult {
         self.worker_mutex.lockUncancelable(io_mod.getIo());
-        defer self.worker_mutex.unlock(io_mod.getIo());
-        if (self.pending_question_shared == null or self.pending_question_response != .pending) return false;
-        self.pending_question_response = .cancelled;
+        if (self.pending_question_shared == null or
+            self.pending_question_response != .pending or
+            self.pending_question_response_reserved or
+            self.worker_stop_requested)
+        {
+            self.worker_mutex.unlock(io_mod.getIo());
+            freeQuestionResponse(alloc, new_response);
+            debug_trace.logf("worker", "ignored late question response pending=false", .{});
+            return .no_pending;
+        }
+        self.pending_question_response_reserved = true;
+        const turn_id = self.active_turn_id;
+        self.worker_mutex.unlock(io_mod.getIo());
+
+        if (observer) |value| value.observe(turn_id);
+
+        self.worker_mutex.lockUncancelable(io_mod.getIo());
+        std.debug.assert(self.pending_question_response_reserved);
+        std.debug.assert(self.pending_question_shared != null);
+        std.debug.assert(self.pending_question_response == .pending);
+        self.pending_question_response_reserved = false;
+        self.pending_question_response = new_response;
         self.worker_cond.broadcast(io_mod.getIo());
+        self.worker_mutex.unlock(io_mod.getIo());
+        return .accepted;
+    }
+
+    /// Reserves the still-pending question while its interactive presentation
+    /// is observed. Accepted answers and cancellations cannot overtake the
+    /// observation; a stop that arrives during it is woken again on release.
+    pub fn presentPendingQuestionBatchObserved(
+        self: *WorkerRuntime,
+        observer: QuestionPresentationObserver,
+    ) bool {
+        self.worker_mutex.lockUncancelable(io_mod.getIo());
+        const pending = self.pending_question_shared orelse {
+            self.worker_mutex.unlock(io_mod.getIo());
+            return false;
+        };
+        if (self.worker_stop_requested or
+            self.pending_question_response != .pending or
+            self.pending_question_response_reserved)
+        {
+            self.worker_mutex.unlock(io_mod.getIo());
+            return false;
+        }
+        self.pending_question_response_reserved = true;
+        const turn_id = self.active_turn_id;
+        const source = pending.source;
+        self.worker_mutex.unlock(io_mod.getIo());
+
+        observer.observe(turn_id, source);
+
+        self.worker_mutex.lockUncancelable(io_mod.getIo());
+        std.debug.assert(self.pending_question_response_reserved);
+        std.debug.assert(self.pending_question_shared != null);
+        std.debug.assert(self.pending_question_response == .pending);
+        self.pending_question_response_reserved = false;
+        self.worker_cond.broadcast(io_mod.getIo());
+        self.worker_mutex.unlock(io_mod.getIo());
         return true;
     }
 
     pub fn snapshotPendingQuestionBatch(self: *WorkerRuntime, alloc: std.mem.Allocator) !?PendingQuestionBatchSnapshot {
         self.worker_mutex.lockUncancelable(io_mod.getIo());
         defer self.worker_mutex.unlock(io_mod.getIo());
+        if (self.pending_question_response != .pending) return null;
         const pending = self.pending_question_shared orelse return null;
         return try dupePendingBatchSnapshot(alloc, pending);
     }
@@ -3896,6 +4103,45 @@ test "state snapshot allocation failures preserve pending event ownership" {
     );
 }
 
+test "prompt admission observer runs exactly once only after queue admission" {
+    const AdmissionCapture = struct {
+        calls: usize = 0,
+
+        fn report(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+        }
+    };
+
+    const alloc = std.testing.allocator;
+    var runtime = WorkerRuntime{};
+    defer runtime.deinit(alloc);
+    var capture = AdmissionCapture{};
+    try runtime.enqueuePromptObserved(
+        alloc,
+        try makePrompt(alloc, "accepted", "model"),
+        .{ .ctx = &capture, .report = AdmissionCapture.report },
+    );
+    try std.testing.expectEqual(@as(usize, 1), capture.calls);
+    try std.testing.expectEqual(@as(usize, 1), runtime.queued_prompt_count);
+
+    runtime.latchFinalizationFailure(.{
+        .turn_id = 40,
+        .outcome = .failed,
+    });
+    const rejected = try makePrompt(alloc, "rejected", "model");
+    try std.testing.expectError(
+        error.TurnFinalizationDeliveryFailed,
+        runtime.enqueuePromptObserved(
+            alloc,
+            rejected,
+            .{ .ctx = &capture, .report = AdmissionCapture.report },
+        ),
+    );
+    freeQueuedPrompt(alloc, rejected);
+    try std.testing.expectEqual(@as(usize, 1), capture.calls);
+}
+
 test "finalization failure latches fixed metadata and closes interactive admission" {
     const alloc = std.testing.allocator;
     var runtime = WorkerRuntime{};
@@ -5222,6 +5468,76 @@ const PermissionThreadState = struct {
     err: ?anyerror = null,
 };
 
+const BlockingDecisionObserver = struct {
+    entered: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    release: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    turn_id: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+
+    fn interface(self: *BlockingDecisionObserver) DecisionObserver {
+        return .{
+            .context = self,
+            .observe_fn = observe,
+        };
+    }
+
+    fn observe(raw: *anyopaque, turn_id: u64) void {
+        const self: *BlockingDecisionObserver = @ptrCast(@alignCast(raw));
+        self.turn_id.store(turn_id, .seq_cst);
+        self.entered.store(true, .seq_cst);
+        while (!self.release.load(.seq_cst)) {
+            std.Thread.yield() catch std.atomic.spinLoopHint();
+        }
+    }
+};
+
+const CountingDecisionObserver = struct {
+    count: usize = 0,
+    turn_id: u64 = 0,
+
+    fn interface(self: *CountingDecisionObserver) DecisionObserver {
+        return .{
+            .context = self,
+            .observe_fn = observe,
+        };
+    }
+
+    fn observe(raw: *anyopaque, turn_id: u64) void {
+        const self: *CountingDecisionObserver = @ptrCast(@alignCast(raw));
+        self.count += 1;
+        self.turn_id = turn_id;
+    }
+};
+
+const BlockingQuestionPresentationObserver = struct {
+    entered: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    release: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    turn_id: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    source: QuestionPromptSource = .agent_question,
+
+    fn interface(
+        self: *BlockingQuestionPresentationObserver,
+    ) QuestionPresentationObserver {
+        return .{
+            .context = self,
+            .observe_fn = observe,
+        };
+    }
+
+    fn observe(
+        raw: *anyopaque,
+        turn_id: u64,
+        source: QuestionPromptSource,
+    ) void {
+        const self: *BlockingQuestionPresentationObserver = @ptrCast(@alignCast(raw));
+        self.turn_id.store(turn_id, .seq_cst);
+        self.source = source;
+        self.entered.store(true, .seq_cst);
+        while (!self.release.load(.seq_cst)) {
+            std.Thread.yield() catch std.atomic.spinLoopHint();
+        }
+    }
+};
+
 fn runPermissionRequest(state: *PermissionThreadState, runtime: *WorkerRuntime, label: []const u8) void {
     var response = runtime.requestPermissionBlocking(
         std.testing.allocator,
@@ -5325,6 +5641,133 @@ test "permission blocking handles submit and stop" {
     var shutdown_snapshot = try shutdown_runtime.snapshotState(alloc);
     defer shutdown_snapshot.deinit(alloc);
     try std.testing.expect(shutdown_snapshot.pending_permission_request == null);
+}
+
+test "observed permission response projects before waiter release and keeps assigned turn" {
+    const alloc = std.testing.allocator;
+    var runtime = WorkerRuntime{};
+    defer runtime.deinit(alloc);
+    runtime.worker_processing = true;
+    runtime.active_turn_id = 73;
+
+    const Waiter = struct {
+        runtime: *WorkerRuntime,
+        completed: *std.atomic.Value(bool),
+        decision: ?types.ToolPermissionDecision = null,
+        err: ?anyerror = null,
+
+        fn run(self: *@This()) void {
+            var response = self.runtime.requestPermissionBlocking(
+                std.testing.allocator,
+                .{ .label = "finish immediately" },
+            ) catch |err| {
+                self.err = err;
+                self.completed.store(true, .seq_cst);
+                return;
+            };
+            defer response.deinit();
+            self.decision = response.decision;
+            self.runtime.finishProcessing();
+            self.completed.store(true, .seq_cst);
+        }
+    };
+    const Submitter = struct {
+        runtime: *WorkerRuntime,
+        request_id: u64,
+        observer: *BlockingDecisionObserver,
+        result: ?PermissionSubmissionResult = null,
+
+        fn run(self: *@This()) void {
+            self.result = self.runtime.submitPermissionResponseObserved(
+                self.request_id,
+                permission_request.OwnedPermissionResponse.init(
+                    std.testing.allocator,
+                    .once,
+                    null,
+                ),
+                self.observer.interface(),
+            );
+        }
+    };
+
+    var completed = std.atomic.Value(bool).init(false);
+    var waiter = Waiter{
+        .runtime = &runtime,
+        .completed = &completed,
+    };
+    const waiter_thread = try std.Thread.spawn(.{}, Waiter.run, .{&waiter});
+    const request_id = try waitForPermissionLabel(&runtime, "finish immediately");
+
+    var observer = BlockingDecisionObserver{};
+    var submitter = Submitter{
+        .runtime = &runtime,
+        .request_id = request_id,
+        .observer = &observer,
+    };
+    const submitter_thread = try std.Thread.spawn(.{}, Submitter.run, .{&submitter});
+    while (!observer.entered.load(.seq_cst)) {
+        std.Thread.yield() catch std.atomic.spinLoopHint();
+    }
+
+    runtime.requestStop();
+    io_mod.sleep(5 * std.time.ns_per_ms);
+    try std.testing.expect(!completed.load(.seq_cst));
+    try std.testing.expectEqual(@as(u64, 73), runtime.activeTurnId());
+    try std.testing.expectEqual(@as(u64, 73), observer.turn_id.load(.seq_cst));
+
+    observer.release.store(true, .seq_cst);
+    submitter_thread.join();
+    waiter_thread.join();
+
+    try std.testing.expectEqual(PermissionSubmissionResult.accepted, submitter.result.?);
+    try std.testing.expect(waiter.err == null);
+    try std.testing.expectEqual(types.ToolPermissionDecision.once, waiter.decision.?);
+    try std.testing.expect(completed.load(.seq_cst));
+    try std.testing.expectEqual(@as(u64, 0), runtime.activeTurnId());
+}
+
+test "stale and duplicate permission responses do not run decision observer" {
+    const alloc = std.testing.allocator;
+    var runtime = WorkerRuntime{};
+    defer runtime.deinit(alloc);
+    runtime.worker_processing = true;
+    runtime.active_turn_id = 79;
+    runtime.pending_permission_waiting = true;
+    runtime.pending_permission_request_shared =
+        try permission_request.OwnedPermissionRequest.dupe(
+            alloc,
+            .{ .id = 31, .label = "current" },
+        );
+
+    var observer = CountingDecisionObserver{};
+    try std.testing.expectEqual(
+        PermissionSubmissionResult.stale,
+        runtime.submitPermissionResponseObserved(
+            30,
+            permission_request.OwnedPermissionResponse.init(alloc, .once, null),
+            observer.interface(),
+        ),
+    );
+    try std.testing.expectEqual(@as(usize, 0), observer.count);
+    try std.testing.expectEqual(
+        PermissionSubmissionResult.accepted,
+        runtime.submitPermissionResponseObserved(
+            31,
+            permission_request.OwnedPermissionResponse.init(alloc, .deny, null),
+            observer.interface(),
+        ),
+    );
+    try std.testing.expectEqual(@as(usize, 1), observer.count);
+    try std.testing.expectEqual(@as(u64, 79), observer.turn_id);
+    try std.testing.expectEqual(
+        PermissionSubmissionResult.no_pending,
+        runtime.submitPermissionResponseObserved(
+            31,
+            permission_request.OwnedPermissionResponse.init(alloc, .always, null),
+            observer.interface(),
+        ),
+    );
+    try std.testing.expectEqual(@as(usize, 1), observer.count);
 }
 
 test "permission response accepts feedback ownership" {
@@ -5658,6 +6101,382 @@ test "question batch snapshot answer and cancellation" {
     try std.testing.expect(cancel_state.err == null);
     try std.testing.expect(cancel_state.answers == null);
     try std.testing.expect(try cancel_runtime.snapshotPendingQuestionBatch(alloc) == null);
+}
+
+test "observed question response projects before waiter release" {
+    const alloc = std.testing.allocator;
+    const options = [_]types.QuestionOption{
+        .{ .label = "Continue", .description = null },
+    };
+    const entries = [_]types.QuestionBatchEntry{.{
+        .question = "Finish immediately?",
+        .options = &options,
+    }};
+
+    var runtime = WorkerRuntime{};
+    defer runtime.deinit(alloc);
+    runtime.worker_processing = true;
+    runtime.active_turn_id = 83;
+
+    const Waiter = struct {
+        runtime: *WorkerRuntime,
+        entries: []const types.QuestionBatchEntry,
+        completed: *std.atomic.Value(bool),
+        answers: ?[][]u8 = null,
+        err: ?anyerror = null,
+
+        fn run(self: *@This()) void {
+            self.answers = self.runtime.requestQuestionBatchAnswerBlocking(
+                std.testing.allocator,
+                self.entries,
+            ) catch |err| {
+                self.err = err;
+                self.completed.store(true, .seq_cst);
+                return;
+            };
+            self.runtime.finishProcessing();
+            self.completed.store(true, .seq_cst);
+        }
+    };
+    const Submitter = struct {
+        runtime: *WorkerRuntime,
+        observer: *BlockingDecisionObserver,
+        result: ?QuestionSubmissionResult = null,
+        err: ?anyerror = null,
+
+        fn run(self: *@This()) void {
+            self.result = self.runtime.submitQuestionBatchAnswerObserved(
+                std.testing.allocator,
+                &.{"Continue"},
+                self.observer.interface(),
+            ) catch |err| {
+                self.err = err;
+                return;
+            };
+        }
+    };
+
+    var completed = std.atomic.Value(bool).init(false);
+    var waiter = Waiter{
+        .runtime = &runtime,
+        .entries = &entries,
+        .completed = &completed,
+    };
+    const waiter_thread = try std.Thread.spawn(.{}, Waiter.run, .{&waiter});
+    var snapshot = try waitForQuestionSnapshot(&runtime);
+    snapshot.deinit(alloc);
+
+    var observer = BlockingDecisionObserver{};
+    var submitter = Submitter{
+        .runtime = &runtime,
+        .observer = &observer,
+    };
+    const submitter_thread = try std.Thread.spawn(.{}, Submitter.run, .{&submitter});
+    while (!observer.entered.load(.seq_cst)) {
+        std.Thread.yield() catch std.atomic.spinLoopHint();
+    }
+
+    runtime.requestStop();
+    io_mod.sleep(5 * std.time.ns_per_ms);
+    try std.testing.expect(!completed.load(.seq_cst));
+    try std.testing.expectEqual(@as(u64, 83), runtime.activeTurnId());
+    try std.testing.expectEqual(@as(u64, 83), observer.turn_id.load(.seq_cst));
+
+    observer.release.store(true, .seq_cst);
+    submitter_thread.join();
+    waiter_thread.join();
+    defer freeAnswers(alloc, waiter.answers);
+
+    try std.testing.expect(submitter.err == null);
+    try std.testing.expectEqual(QuestionSubmissionResult.accepted, submitter.result.?);
+    try std.testing.expect(waiter.err == null);
+    try std.testing.expectEqualStrings("Continue", waiter.answers.?[0]);
+    try std.testing.expect(completed.load(.seq_cst));
+    try std.testing.expectEqual(@as(u64, 0), runtime.activeTurnId());
+}
+
+test "question presentation projects before cancellation can resolve" {
+    const alloc = std.testing.allocator;
+    const options = [_]types.QuestionOption{
+        .{ .label = "Continue", .description = null },
+    };
+    const entries = [_]types.QuestionBatchEntry{.{
+        .question = "Wait for presentation?",
+        .options = &options,
+    }};
+
+    var runtime = WorkerRuntime{};
+    defer runtime.deinit(alloc);
+    runtime.worker_processing = true;
+    runtime.active_turn_id = 84;
+
+    var state = QuestionThreadState{};
+    const waiter_thread = try std.Thread.spawn(
+        .{},
+        runQuestionRequest,
+        .{ &state, &runtime, &entries },
+    );
+    var snapshot = try waitForQuestionSnapshot(&runtime);
+    snapshot.deinit(alloc);
+
+    const Presenter = struct {
+        runtime: *WorkerRuntime,
+        observer: *BlockingQuestionPresentationObserver,
+        presented: bool = false,
+
+        fn run(self: *@This()) void {
+            self.presented = self.runtime.presentPendingQuestionBatchObserved(
+                self.observer.interface(),
+            );
+        }
+    };
+    var presentation_observer = BlockingQuestionPresentationObserver{};
+    var presenter = Presenter{
+        .runtime = &runtime,
+        .observer = &presentation_observer,
+    };
+    const presenter_thread = try std.Thread.spawn(.{}, Presenter.run, .{&presenter});
+    while (!presentation_observer.entered.load(.seq_cst)) {
+        std.Thread.yield() catch std.atomic.spinLoopHint();
+    }
+
+    var resolution_observer = CountingDecisionObserver{};
+    try std.testing.expectEqual(
+        QuestionSubmissionResult.no_pending,
+        runtime.cancelPendingQuestionBatchObserved(
+            resolution_observer.interface(),
+        ),
+    );
+    try std.testing.expectEqual(@as(usize, 0), resolution_observer.count);
+    try std.testing.expectEqual(@as(u64, 84), runtime.activeTurnId());
+    try std.testing.expectEqual(
+        @as(u64, 84),
+        presentation_observer.turn_id.load(.seq_cst),
+    );
+    try std.testing.expectEqual(
+        QuestionPromptSource.agent_question,
+        presentation_observer.source,
+    );
+
+    presentation_observer.release.store(true, .seq_cst);
+    presenter_thread.join();
+    try std.testing.expect(presenter.presented);
+
+    try std.testing.expectEqual(
+        QuestionSubmissionResult.accepted,
+        runtime.cancelPendingQuestionBatchObserved(
+            resolution_observer.interface(),
+        ),
+    );
+    waiter_thread.join();
+
+    try std.testing.expect(state.err == null);
+    try std.testing.expect(state.answers == null);
+    try std.testing.expectEqual(@as(usize, 1), resolution_observer.count);
+    try std.testing.expectEqual(@as(u64, 84), resolution_observer.turn_id);
+}
+
+test "question shutdown waits for presentation without accepting resolution" {
+    const alloc = std.testing.allocator;
+    const options = [_]types.QuestionOption{
+        .{ .label = "Continue", .description = null },
+    };
+    const entries = [_]types.QuestionBatchEntry{.{
+        .question = "Shut down after presentation?",
+        .options = &options,
+    }};
+
+    var runtime = WorkerRuntime{};
+    defer runtime.deinit(alloc);
+    runtime.worker_processing = true;
+    runtime.active_turn_id = 85;
+
+    const Waiter = struct {
+        runtime: *WorkerRuntime,
+        entries: []const types.QuestionBatchEntry,
+        completed: *std.atomic.Value(bool),
+        answers: ?[][]u8 = null,
+        err: ?anyerror = null,
+
+        fn run(self: *@This()) void {
+            self.answers = self.runtime.requestQuestionBatchAnswerBlocking(
+                std.testing.allocator,
+                self.entries,
+            ) catch |err| {
+                self.err = err;
+                self.completed.store(true, .seq_cst);
+                return;
+            };
+            self.completed.store(true, .seq_cst);
+        }
+    };
+    var completed = std.atomic.Value(bool).init(false);
+    var waiter = Waiter{
+        .runtime = &runtime,
+        .entries = &entries,
+        .completed = &completed,
+    };
+    const waiter_thread = try std.Thread.spawn(.{}, Waiter.run, .{&waiter});
+    var snapshot = try waitForQuestionSnapshot(&runtime);
+    snapshot.deinit(alloc);
+
+    const Presenter = struct {
+        runtime: *WorkerRuntime,
+        observer: *BlockingQuestionPresentationObserver,
+        presented: bool = false,
+
+        fn run(self: *@This()) void {
+            self.presented = self.runtime.presentPendingQuestionBatchObserved(
+                self.observer.interface(),
+            );
+        }
+    };
+    var presentation_observer = BlockingQuestionPresentationObserver{};
+    var presenter = Presenter{
+        .runtime = &runtime,
+        .observer = &presentation_observer,
+    };
+    const presenter_thread = try std.Thread.spawn(.{}, Presenter.run, .{&presenter});
+    while (!presentation_observer.entered.load(.seq_cst)) {
+        std.Thread.yield() catch std.atomic.spinLoopHint();
+    }
+
+    runtime.requestStop();
+    io_mod.sleep(5 * std.time.ns_per_ms);
+    try std.testing.expect(!completed.load(.seq_cst));
+
+    presentation_observer.release.store(true, .seq_cst);
+    presenter_thread.join();
+    waiter_thread.join();
+    try std.testing.expect(presenter.presented);
+    try std.testing.expect(waiter.err == null);
+    try std.testing.expect(waiter.answers == null);
+
+    var resolution_observer = CountingDecisionObserver{};
+    try std.testing.expectEqual(
+        QuestionSubmissionResult.no_pending,
+        runtime.cancelPendingQuestionBatchObserved(
+            resolution_observer.interface(),
+        ),
+    );
+    try std.testing.expectEqual(@as(usize, 0), resolution_observer.count);
+}
+
+test "observed question cancellation projects before waiter release" {
+    const alloc = std.testing.allocator;
+    const options = [_]types.QuestionOption{
+        .{ .label = "Continue", .description = null },
+    };
+    const entries = [_]types.QuestionBatchEntry{.{
+        .question = "Cancel this question?",
+        .options = &options,
+    }};
+
+    var runtime = WorkerRuntime{};
+    defer runtime.deinit(alloc);
+    runtime.worker_processing = true;
+    runtime.active_turn_id = 84;
+
+    const Waiter = struct {
+        runtime: *WorkerRuntime,
+        entries: []const types.QuestionBatchEntry,
+        completed: *std.atomic.Value(bool),
+        answers: ?[][]u8 = null,
+        err: ?anyerror = null,
+
+        fn run(self: *@This()) void {
+            self.answers = self.runtime.requestQuestionBatchAnswerBlocking(
+                std.testing.allocator,
+                self.entries,
+            ) catch |err| {
+                self.err = err;
+                self.completed.store(true, .seq_cst);
+                return;
+            };
+            self.runtime.finishProcessing();
+            self.completed.store(true, .seq_cst);
+        }
+    };
+    const Submitter = struct {
+        runtime: *WorkerRuntime,
+        observer: *BlockingDecisionObserver,
+        result: ?QuestionSubmissionResult = null,
+        err: ?anyerror = null,
+
+        fn run(self: *@This()) void {
+            self.result = self.runtime.submitQuestionBatchAnswerObserved(
+                std.testing.allocator,
+                null,
+                self.observer.interface(),
+            ) catch |err| {
+                self.err = err;
+                return;
+            };
+        }
+    };
+
+    var completed = std.atomic.Value(bool).init(false);
+    var waiter = Waiter{
+        .runtime = &runtime,
+        .entries = &entries,
+        .completed = &completed,
+    };
+    const waiter_thread = try std.Thread.spawn(.{}, Waiter.run, .{&waiter});
+    var snapshot = try waitForQuestionSnapshot(&runtime);
+    snapshot.deinit(alloc);
+
+    var observer = BlockingDecisionObserver{};
+    var submitter = Submitter{
+        .runtime = &runtime,
+        .observer = &observer,
+    };
+    const submitter_thread = try std.Thread.spawn(.{}, Submitter.run, .{&submitter});
+    while (!observer.entered.load(.seq_cst)) {
+        std.Thread.yield() catch std.atomic.spinLoopHint();
+    }
+
+    runtime.requestStop();
+    io_mod.sleep(5 * std.time.ns_per_ms);
+    try std.testing.expect(!completed.load(.seq_cst));
+    try std.testing.expectEqual(@as(u64, 84), runtime.activeTurnId());
+    try std.testing.expectEqual(@as(u64, 84), observer.turn_id.load(.seq_cst));
+
+    observer.release.store(true, .seq_cst);
+    submitter_thread.join();
+    waiter_thread.join();
+
+    try std.testing.expect(submitter.err == null);
+    try std.testing.expectEqual(QuestionSubmissionResult.accepted, submitter.result.?);
+    try std.testing.expect(waiter.err == null);
+    try std.testing.expect(waiter.answers == null);
+    try std.testing.expect(completed.load(.seq_cst));
+    try std.testing.expectEqual(@as(u64, 0), runtime.activeTurnId());
+}
+
+test "late question response does not run decision observer" {
+    const alloc = std.testing.allocator;
+    var runtime = WorkerRuntime{};
+    defer runtime.deinit(alloc);
+    var observer = CountingDecisionObserver{};
+
+    try std.testing.expectEqual(
+        QuestionSubmissionResult.no_pending,
+        try runtime.submitQuestionBatchAnswerObserved(
+            alloc,
+            &.{"late"},
+            observer.interface(),
+        ),
+    );
+    try std.testing.expectEqual(@as(usize, 0), observer.count);
+    try std.testing.expectEqual(
+        QuestionSubmissionResult.no_pending,
+        try runtime.submitQuestionBatchAnswerObserved(
+            alloc,
+            null,
+            observer.interface(),
+        ),
+    );
+    try std.testing.expectEqual(@as(usize, 0), observer.count);
 }
 
 test "question batch source distinguishes route recovery from agent questions" {
