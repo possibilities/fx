@@ -17,6 +17,7 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { FX_BIN, runFx } from "../evals/eval-helpers";
+import { findFooterBlocks } from "./tui-render-assertions";
 import {
   FAKE_GATEWAY_MODEL,
   fakeGatewayFinalText,
@@ -5176,9 +5177,11 @@ test.skipIf(!tmuxAvailable())(
       const resumed = await waitForScrollback(active, "UPGRADE_CTRL_G_INITIAL_DONE");
       expect(resumed).toContain("UPGRADE_CTRL_G_INITIAL_DONE");
       expect(resumed).toContain(updatedNotice);
-      expect(await active.capturePaneEscapes()).toContain(
-        `\x1b[4m\x1b]8;;https://fx.sh/changelog#v${version}\x1b\\(notes)\x1b]8;;\x1b\\`,
+      const noticeEscapes = await active.capturePaneEscapes();
+      expect(noticeEscapes).toContain(
+        `(\x1b[4m\x1b]8;;https://fx.sh/changelog#v${version}\x1b\\notes\x1b[0m`,
       );
+      expect(noticeEscapes).toContain("\x1b]8;;\x1b\\)");
       expect(resumed).not.toContain("● Session resumed:");
       expect(resumed).not.toContain("● Session: resumed:");
 
@@ -6392,6 +6395,37 @@ test.skipIf(!tmuxAvailable())(
       expect(await active.waitForSessionEnd()).toBe(true);
       await active.kill();
       active = null;
+
+      const resumedGateway = startFakeGateway([]);
+      gateways.push(resumedGateway);
+      active = await TmuxSession.create({
+        cmd: `${FX_BIN} resume last`,
+        cwd: workspaceRoot,
+        env: gatewayEnv(home, resumedGateway),
+        stderrPath,
+        width: 120,
+        height: 40,
+      });
+      await active.waitForComposer(TIMEOUT);
+      await active.waitForText("What can fx do differently?", TIMEOUT);
+      const resumedGrid = await active.capturePaneGrid();
+      const footer = findFooterBlocks(resumedGrid).at(-1);
+      const cancelledRow = resumedGrid.findIndex((row) => row.includes("■ Cancelled"));
+      expect(footer).toBeDefined();
+      expect(cancelledRow).toBeGreaterThanOrEqual(0);
+      expect(cancelledRow).toBeLessThan(footer!.topDivider);
+      const gapRows = resumedGrid.slice(cancelledRow + 1, footer!.topDivider);
+      expect(gapRows.length).toBeGreaterThanOrEqual(1);
+      expect(gapRows.map((row) => row.trim())).toEqual(
+        Array.from({ length: gapRows.length }, () => ""),
+      );
+      expect(resumedGateway.requests).toHaveLength(0);
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+
+      await active.sendText("/quit");
+      expect(await active.waitForSessionEnd()).toBe(true);
+      await active.kill();
+      active = null;
     } finally {
       if (active) await active.kill();
       for (const gateway of gateways) gateway.stop();
@@ -6651,15 +6685,20 @@ test.skipIf(!tmuxAvailable())(
         height: 32,
       });
       await active.waitForComposer(TIMEOUT);
-      const resumed = stripAnsi(await waitForScrollback(active, "● System: cancelled", timeout));
+      const resumed = stripAnsi(await waitForScrollback(
+        active,
+        "What can fx do differently?",
+        timeout,
+      ));
       const cancelledIndex = resumed.indexOf("Cancelled");
-      const cancellationNoticeIndex = resumed.indexOf("● System: cancelled");
       expect(cancelledIndex).toBeGreaterThanOrEqual(0);
-      expect(cancellationNoticeIndex).toBeGreaterThan(cancelledIndex);
-      expect(countOccurrences(resumed, "● System: cancelled")).toBe(1);
+      expect(resumed).toContain("■ Cancelled");
+      expect(countOccurrences(resumed, "What can fx do differently?")).toBe(1);
+      expect(resumed).not.toContain("System: cancelled");
+      expect(resumed).not.toContain("Cancelling");
       expect(resumed).not.toContain("Interrupted by user after completing");
       expect(resumed).not.toContain("<turn_aborted>");
-      const restoredPresentation = resumed.slice(cancelledIndex, cancellationNoticeIndex);
+      const restoredPresentation = resumed.slice(cancelledIndex);
       expect(
         restoredPresentation.split("\n").some((line) => line.trimStart().startsWith("│")),
       ).toBe(false);

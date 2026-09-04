@@ -70,6 +70,17 @@ pub const Bridge = struct {
     response_status: Status = .failure,
     response_bytes: std.ArrayList(u8) = .empty,
     response_revision: std.ArrayList(u8) = .empty,
+    notify_context: ?*anyopaque = null,
+    notify_fn: ?*const fn (?*anyopaque) void = null,
+
+    pub fn setNotifier(
+        self: *Bridge,
+        context: ?*anyopaque,
+        notify_fn: *const fn (?*anyopaque) void,
+    ) void {
+        self.notify_context = context;
+        self.notify_fn = notify_fn;
+    }
 
     pub fn provider(self: *Bridge) js_host_auth.SessionStore {
         return .{
@@ -157,6 +168,7 @@ pub const Bridge = struct {
         self.kind = kind;
         self.phase = .pending;
         self.wake.broadcast(io);
+        if (self.notify_fn) |notify| notify(self.notify_context);
 
         while (self.phase != .complete and self.phase != .shutdown) {
             self.wake.waitUncancelable(io, &self.mutex);

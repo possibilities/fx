@@ -28,12 +28,12 @@ function normalizeBrowserAgentAuth(options) {
   if (typeof entries[0].apiKey !== "string" || !entries[0].apiKey.length) {
     throw new TypeError("Gateway auth requires a non-empty apiKey");
   }
-  const configured = options.env?.AI_GATEWAY_API_KEY;
+  const configured = options.apiKey;
   if (configured !== undefined && configured !== entries[0].apiKey) {
-    throw new TypeError("Gateway auth conflicts with env.AI_GATEWAY_API_KEY");
+    throw new TypeError("Gateway auth conflicts with apiKey");
   }
   const { auth: _auth, ...rest } = options;
-  return { ...rest, env: { ...rest.env, AI_GATEWAY_API_KEY: entries[0].apiKey } };
+  return { ...rest, apiKey: entries[0].apiKey };
 }
 
 export function createFxAgent(options = {}) {

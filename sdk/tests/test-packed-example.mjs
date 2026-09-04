@@ -41,7 +41,7 @@ const agent = await createFxAgent({
   model: "packed/model",
 });
 try {
-  assert.deepEqual(Object.keys(agent).sort(), ["checkpoint", "close", "prompt"]);
+  assert.deepEqual(Object.keys(agent).sort(), ["checkpoint", "close", "configOptions", "prompt", "setConfig"]);
   const turn = agent.prompt("hello");
   let text = "";
   for await (const event of turn) if (event.type === "text_delta") text += event.delta;

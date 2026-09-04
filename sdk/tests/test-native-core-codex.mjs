@@ -8,12 +8,13 @@ import { fileURLToPath } from "node:url";
 import { createFxAgent, fxProfileSession } from "../node.js";
 
 const accountId = "acct_libfx_codex";
+const otherAccountId = "acct_libfx_codex_other";
 const initialRefreshToken = "LIBFX_INITIAL_REFRESH_SECRET";
 const rotatedRefreshToken = "LIBFX_ROTATED_REFRESH_SECRET";
 const gatewayApiKey = "LIBFX_GATEWAY_SECRET";
-const chatgptToken = (marker) => {
+const chatgptToken = (marker, tokenAccountId = accountId) => {
   const payload = Buffer.from(JSON.stringify({
-    "https://api.openai.com/auth": { chatgpt_account_id: accountId },
+    "https://api.openai.com/auth": { chatgpt_account_id: tokenAccountId },
     marker,
   })).toString("base64url");
   return `header.${payload}.signature`;
@@ -27,6 +28,9 @@ let codexCalls = 0;
 let gatewayCalls = 0;
 let failModels = false;
 let rejectNextCodex = false;
+let stallGatewayModels = false;
+let oversizedGatewayModels = false;
+let gatewayModelCalls = 0;
 const readBody = (request) => new Promise((resolveBody, rejectBody) => {
   let body = "";
   request.setEncoding("utf8");
@@ -85,16 +89,31 @@ const server = createServer(async (request, response) => {
           input_modalities: ["text"],
           context_window: 128000,
         },
+        {
+          slug: "gpt-5.6-luna",
+          visibility: "list",
+          supported_in_api: true,
+          supported_reasoning_levels: [{ effort: "medium" }],
+          additional_speed_tiers: [],
+          input_modalities: ["text"],
+          context_window: 272000,
+        },
       ] }));
       return;
     }
     if (url.pathname === "/gateway/models") {
+      gatewayModelCalls += 1;
+      if (stallGatewayModels) return;
       response.writeHead(200, { "content-type": "application/json" });
-      response.end(JSON.stringify({ data: [{
-        id: "native/gateway-model",
-        type: "language",
-        tags: ["tool-use"],
-      }] }));
+      response.end(JSON.stringify({
+        data: oversizedGatewayModels
+          ? Array.from({ length: 10_001 }, (_, index) => ({ id: `native/model-${index}` }))
+          : [{
+              id: "native/gateway-model",
+              type: "language",
+              tags: ["tool-use"],
+            }],
+      }));
       return;
     }
     if (url.pathname === "/chatgpt/responses") {
@@ -139,6 +158,7 @@ const envOverrides = {
   FX_E2E_OPENAI_CODEX_MODELS_URL: `${baseUrl}/chatgpt/models`,
   FX_E2E_OPENAI_CODEX_RESPONSES_URL: `${baseUrl}/chatgpt/responses`,
   FX_E2E_GATEWAY_MODELS_URL: `${baseUrl}/gateway/models`,
+  FX_E2E_GATEWAY_CATALOG_TIMEOUT_MS: "40",
 };
 const originalEnv = Object.fromEntries(
   Object.keys(envOverrides).map((key) => [key, process.env[key]]),
@@ -155,22 +175,36 @@ mkdirSync(ambientHome);
 const originalHome = process.env.HOME;
 process.env.HOME = ambientHome;
 
-const sessionBytes = (accessToken, refreshToken, expiresAtMs = Date.now() + 3_600_000) => Buffer.from(
+const sessionBytes = (
+  accessToken,
+  refreshToken,
+  expiresAtMs = Date.now() + 3_600_000,
+  sessionAccountId = accountId,
+) => Buffer.from(
   `${JSON.stringify({
     version: 1,
     access_token: accessToken,
     refresh_token: refreshToken,
     expires_at_ms: expiresAtMs,
-    account_id: accountId,
+    account_id: sessionAccountId,
   })}\n`,
 );
+const waitFor = async (predicate, timeoutMs = 1_000) => {
+  const deadline = Date.now() + timeoutMs;
+  while (!predicate()) {
+    if (Date.now() >= deadline) throw new Error("timed out waiting for native libfx state");
+    await new Promise((resolveWait) => setTimeout(resolveWait, 5));
+  }
+};
+const settleWithin = (promise, timeoutMs) => Promise.race([
+  promise,
+  new Promise((_, reject) => setTimeout(() => reject(new Error("native libfx operation did not settle")), timeoutMs)),
+]);
 const collectTurn = async (session, prompt) => {
   const turn = session.prompt(prompt);
   let text = "";
   for await (const update of turn) {
-    if (update.sessionUpdate === "agent_message_chunk" && !update.content.text.startsWith("[context]")) {
-      text += update.content.text;
-    }
+    if (update.type === "text_delta") text += update.delta;
   }
   assert.equal((await turn.result).stopReason, "end_turn");
   return text.trimEnd();
@@ -210,23 +244,39 @@ try {
     ],
     home: root,
     workspaceRoot: workspace,
-    env: { FX_GATEWAY_CHAT_URL: `${baseUrl}/gateway/chat` },
+    gatewayChatUrl: `${baseUrl}/gateway/chat`,
     onEvent(event) { events.push(event); },
   });
-  const session = await agent.createSession();
-  const providerConfig = session.configOptions.find((option) => option.id === "provider");
+  const providerConfig = agent.configOptions.find((option) => option.id === "provider");
   assert.deepEqual(providerConfig.options.map((option) => option.value), ["gateway", "codex"]);
-  assert.equal(await collectTurn(session, "use Codex"), "codex 1");
-  await session.setConfig({ provider: "gateway" });
-  assert.equal(await collectTurn(session, "use Gateway"), "gateway 1");
-  await session.setConfig({ provider: "codex" });
-  assert.equal(await collectTurn(session, "use Codex again"), "codex 2");
+  assert.equal(await collectTurn(agent, "use Codex"), "codex 1");
+  await agent.setConfig({ provider: "gateway" });
+  assert.equal(await collectTurn(agent, "use Gateway"), "gateway 1");
+  const accountABytes = Buffer.from(currentBytes);
+  currentBytes = sessionBytes(
+    chatgptToken("other-account", otherAccountId),
+    "LIBFX_OTHER_ACCOUNT_REFRESH_SECRET",
+    0,
+    otherAccountId,
+  );
+  currentRevision = "external-account-b";
+  const tokenCallsBeforeAccountSwap = tokenCalls;
+  const commitCallsBeforeAccountSwap = commitCalls;
   await assert.rejects(
-    session.setConfig({ provider: "grok" }),
+    agent.setConfig({ provider: "codex" }),
+    /Codex account changed/,
+  );
+  assert.equal(tokenCalls, tokenCallsBeforeAccountSwap, "an account swap must fail before OAuth refresh");
+  assert.equal(commitCalls, commitCallsBeforeAccountSwap, "an account swap must fail before store write-back");
+  currentBytes = accountABytes;
+  currentRevision = "external-account-a";
+  await agent.setConfig({ provider: "codex" });
+  assert.equal(await collectTurn(agent, "use Codex again"), "codex 2");
+  await assert.rejects(
+    agent.setConfig({ provider: "grok" }),
     /Provider was not supplied by this host/,
   );
-  await session.close();
-  assert.equal(await agent.close(), 0);
+  assert.equal(await agent.close(), undefined);
   agent = null;
 
   assert.ok(loadCalls >= 2, "Codex initialization and switching must read the supplied store");
@@ -248,7 +298,6 @@ try {
     true,
     "the Gateway turn must publish usage under the explicit libfx home",
   );
-
   const codexRequests = requests.filter((request) =>
     request.path === "/chatgpt/models" || request.path === "/chatgpt/responses");
   assert.ok(codexRequests.length >= 4);
@@ -260,6 +309,7 @@ try {
     request.path === "/gateway/models" || request.path === "/gateway/chat");
   assert.ok(gatewayRequests.length >= 2);
   for (const request of gatewayRequests) {
+    assert.equal(request.authorization, `Bearer ${gatewayApiKey}`);
     assert.notEqual(request.authorization, `Bearer ${initialAccessToken}`);
     assert.notEqual(request.authorization, `Bearer ${refreshedAccessToken}`);
   }
@@ -267,6 +317,59 @@ try {
   for (const secret of [initialRefreshToken, rotatedRefreshToken, gatewayApiKey]) {
     assert.equal(eventText.includes(secret), false, `event stream exposed ${secret}`);
   }
+
+  const switchAgentOptions = {
+    nativeAddon: addon,
+    backend: "native",
+    auth: [
+      { provider: "codex", session: store },
+      { provider: "gateway", apiKey: gatewayApiKey },
+    ],
+    home: root,
+    workspaceRoot: workspace,
+    gatewayChatUrl: `${baseUrl}/gateway/chat`,
+  };
+
+  let deadlineAgent = await createFxAgent(switchAgentOptions);
+  stallGatewayModels = true;
+  let startedAt = Date.now();
+  await assert.rejects(
+    deadlineAgent.setConfig({ provider: "gateway" }),
+    /Failed to load provider model catalog/,
+  );
+  assert.ok(Date.now() - startedAt < 500, "a stalled Gateway catalog must honor its bounded deadline");
+  await deadlineAgent.close();
+  deadlineAgent = null;
+
+  stallGatewayModels = false;
+  oversizedGatewayModels = true;
+  let oversizedAgent = await createFxAgent(switchAgentOptions);
+  await assert.rejects(
+    oversizedAgent.setConfig({ provider: "gateway" }),
+    /Failed to load provider model catalog/,
+  );
+  await oversizedAgent.close();
+  oversizedAgent = null;
+
+  oversizedGatewayModels = false;
+  process.env.FX_E2E_GATEWAY_CATALOG_TIMEOUT_MS = "5000";
+  let closingAgent = await createFxAgent(switchAgentOptions);
+  stallGatewayModels = true;
+  const gatewayModelBaseline = gatewayModelCalls;
+  const stalledSwitch = closingAgent.setConfig({ provider: "gateway" });
+  void stalledSwitch.catch(() => {});
+  await waitFor(() => gatewayModelCalls > gatewayModelBaseline);
+  startedAt = Date.now();
+  const [switchOutcome, closeOutcome] = await settleWithin(
+    Promise.allSettled([stalledSwitch, closingAgent.close()]),
+    500,
+  );
+  assert.equal(switchOutcome.status, "rejected");
+  assert.equal(closeOutcome.status, "fulfilled");
+  assert.ok(Date.now() - startedAt < 500, "close must abort a stalled Gateway catalog fetch");
+  closingAgent = null;
+  stallGatewayModels = false;
+  process.env.FX_E2E_GATEWAY_CATALOG_TIMEOUT_MS = "40";
 
   const profileHome = join(root, "profile-home");
   mkdirSync(join(profileHome, ".fx"), { recursive: true, mode: 0o700 });
@@ -282,10 +385,8 @@ try {
     home: profileHome,
     workspaceRoot: workspace,
   });
-  const profileSession = await profileAgent.createSession();
-  assert.equal(await collectTurn(profileSession, "use the explicit profile"), "codex 3");
-  await profileSession.close();
-  assert.equal(await profileAgent.close(), 0);
+  assert.equal(await collectTurn(profileAgent, "use the explicit profile"), "codex 3");
+  assert.equal(await profileAgent.close(), undefined);
   assert.equal(tokenCalls, 1, "an unexpired profile session must not refresh");
 
   const malformedSecret = "LIBFX_MALFORMED_STORE_SECRET";
@@ -386,16 +487,14 @@ try {
     home: root,
     workspaceRoot: workspace,
   });
-  const timeoutSession = await timeoutAgent.createSession();
   rejectNextCodex = true;
   const timeoutStartedAt = Date.now();
-  const timeoutTurn = timeoutSession.prompt("force a live credential refresh");
+  const timeoutTurn = timeoutAgent.prompt("force a live credential refresh");
   const timeoutTurnDone = (async () => {
     for await (const _ of timeoutTurn) {}
     return timeoutTurn.result;
   })();
   void timeoutTurnDone.catch(() => {});
-  assert.equal(await timeoutAgent.exited, 1, "a timed-out store must poison the native runtime");
   await assert.rejects(timeoutTurnDone);
   assert.ok(Date.now() - timeoutStartedAt < 250, "ignored AbortSignal must not delay adapter failure");
   assert.equal(lateCommitSignal?.aborted, true);
@@ -429,7 +528,7 @@ try {
 
   console.log("native Codex core passed: stores, refresh CAS, timeout poisoning, home isolation, catalog, streaming, switching, and profile opt-in");
 } finally {
-  agent?.abort();
+  if (agent) await agent.close().catch(() => {});
   for (const [key, value] of Object.entries(originalEnv)) {
     if (value === undefined) delete process.env[key];
     else process.env[key] = value;

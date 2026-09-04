@@ -30,6 +30,7 @@
   },
   "files": [
     "browser.js",
+    "internal.js",
     "node.js",
     "fx-sdk.js",
     "mcp.js",

@@ -56,6 +56,12 @@ pub fn handleNewLibfxSession(
     );
     var session_rt_owned = true;
     defer if (session_rt_owned) session_rt.deinit(alloc);
+    if (comptime !host_target.is_wasm) {
+        _ = try session_rt.initializeProfileUsage(
+            alloc,
+            state.cfg.home_override orelse io_mod.getenv("HOME"),
+        );
+    }
 
     state.active_session = .{
         .session_id = session_id,
@@ -77,6 +83,9 @@ pub fn handleNewLibfxSession(
         .cancel_flag = std.atomic.Value(bool).init(false),
         .pending_prompt_id = null,
     };
+    if (comptime !host_target.is_wasm) {
+        state.active_session.?.session_rt.attachProfileUsagePublisher(alloc);
+    }
     session_id_owned = false;
     model_owned = false;
     session_rt_owned = false;
@@ -304,6 +313,7 @@ fn writeNewSessionResponse(
     msg: *jsonrpc.Message,
     session_id: []const u8,
 ) !void {
+    try server.refreshModelCatalogForOptions(state);
     var out: std.Io.Writer.Allocating = .init(alloc);
     defer out.deinit();
 
@@ -866,6 +876,7 @@ fn writeLoadSessionResponse(
     msg: *jsonrpc.Message,
     model: []const u8,
 ) !void {
+    try server.refreshModelCatalogForOptions(state);
     var out: std.Io.Writer.Allocating = .init(alloc);
     defer out.deinit();
     try out.writer.writeAll("{\"configOptions\":[");
