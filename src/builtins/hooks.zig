@@ -8,6 +8,7 @@ const std = @import("std");
 const worker_runtime = @import("../core/agent/worker_runtime.zig");
 const hooks = @import("../core/hooks/hooks.zig");
 const permission_request = @import("../core/permissions/permission_request.zig");
+const tool_runtime = @import("../core/tooling/tool_runtime.zig");
 const herdr = @import("hooks/herdr.zig");
 
 pub const ade_events = @import("hooks/ade_events.zig");
@@ -82,6 +83,10 @@ pub fn Runtime(comptime App: type) type {
 
         pub fn reportPromptWorking(app: *App) void {
             if (app.herdr.enabled) app.herdr.reportState(.working, null);
+        }
+
+        pub fn editedPathObserver(app: *App) ?tool_runtime.EditedPathObserver {
+            return app.ade_events.git_roots.editedPathObserver();
         }
 
         pub fn reportSessionChanged(app: *App, session_id: ?[]const u8) void {

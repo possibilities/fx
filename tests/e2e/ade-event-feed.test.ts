@@ -6,6 +6,7 @@ import {
   readFileSync,
   realpathSync,
   rmSync,
+  statSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -153,6 +154,18 @@ function latestPrompt(body: string): string {
   return JSON.stringify(request.prompt?.at(-1) ?? "");
 }
 
+async function waitForJsonFile(
+  path: string,
+  timeoutMs = TIMEOUT,
+): Promise<unknown> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (existsSync(path)) return JSON.parse(readFileSync(path, "utf8"));
+    await Bun.sleep(25);
+  }
+  throw new Error(`timed out waiting for JSON file ${path}`);
+}
+
 describe.skipIf(!tmuxAvailable())("ADE event feed", () => {
   test(
     "publishes ordered main, attention, subagent, and shutdown lifecycle records",
@@ -161,10 +174,19 @@ describe.skipIf(!tmuxAvailable())("ADE event feed", () => {
       root = realpathSync(mkdtempSync(join(tempRoot, "fx-ade-feed-e2e-")));
       const home = join(root, "home");
       const workspace = join(root, "workspace");
+      const secondWorkspace = join(root, "second-workspace");
       const socketPath = join(root, "ade.sock");
+      const checkpointPath = join(root, "git-roots.json");
       const stderrPath = join(root, "stderr.log");
       mkdirSync(join(home, ".fx"), { recursive: true });
       mkdirSync(workspace);
+      mkdirSync(secondWorkspace);
+      expect(Bun.spawnSync(["git", "init", "-q", workspace]).exitCode).toBe(
+        0,
+      );
+      expect(
+        Bun.spawnSync(["git", "init", "-q", secondWorkspace]).exitCode,
+      ).toBe(0);
       writeFileSync(
         join(home, ".fx", "settings.json"),
         JSON.stringify({ sandbox: "none", permission_mode: "ask", permission: {} }),
@@ -191,9 +213,12 @@ describe.skipIf(!tmuxAvailable())("ADE event feed", () => {
         }
         if (latest.includes(childPrompt)) {
           return fakeGatewayToolCall("ade_child_terminal_1", "terminal", {
-            action: "exec",
-            command: "printf ADE_CHILD_TOOL > ade-child.txt",
-            timeout_ms: 600_000,
+            action: "start",
+            command: "touch ADE_CHILD_EDITED",
+            cwd: secondWorkspace,
+            profile: "clean",
+            return_when: { kind: "exit" },
+            wait_ceiling_ms: 10_000,
           });
         }
         if (latest.includes("ADE_QUESTION_REQUEST")) {
@@ -238,6 +263,7 @@ describe.skipIf(!tmuxAvailable())("ADE event feed", () => {
           FX_AUTO_UPGRADE: "0",
           FX_ADE_SOCKET_PATH: socketPath,
           FX_ADE_INSTANCE_ID: INSTANCE_ID,
+          FX_ADE_CHECKPOINT_PATH: checkpointPath,
           NO_COLOR: "1",
         },
         width: 100,
@@ -246,6 +272,24 @@ describe.skipIf(!tmuxAvailable())("ADE event feed", () => {
       });
       await session.waitForComposer(TIMEOUT);
       await receiver.waitFor((record) => record.event === "FxStarted");
+      const launchRoot = await receiver.waitFor(
+        (record) =>
+          record.event === "GitRootDiscovered" &&
+          record.payload.reason === "launch_directory",
+      );
+      expect(launchRoot.payload).toEqual({
+        git_root: realpathSync(workspace),
+        revision: 1,
+        reason: "launch_directory",
+      });
+      expect(receiver.records[0]?.event).toBe("FxStarted");
+      expect(JSON.parse(readFileSync(checkpointPath, "utf8"))).toEqual({
+        schema: 1,
+        instance_id: INSTANCE_ID,
+        revision: 1,
+        git_roots: [realpathSync(workspace)],
+      });
+      expect(statSync(checkpointPath).mode & 0o777).toBe(0o600);
 
       await session.sendText("ADE_QUESTION_REQUEST");
       await session.waitForText("Which ADE event path should continue?", TIMEOUT);
@@ -292,7 +336,7 @@ describe.skipIf(!tmuxAvailable())("ADE event feed", () => {
         (pane) =>
           pane.includes("Subagent: ade-child") &&
           pane.includes("status: approval") &&
-          pane.includes("printf ADE_CHILD_TOOL > ade-child.txt") &&
+          pane.includes("terminal start") &&
           pane.includes("❯ 1. Yes"),
         TIMEOUT,
       );
@@ -314,6 +358,27 @@ describe.skipIf(!tmuxAvailable())("ADE event feed", () => {
           record.event === "PostTurnEnd" &&
           record.context.agent_role === "subagent",
       );
+      const childRoot = await receiver.waitFor(
+        (record) =>
+          record.event === "GitRootDiscovered" &&
+          record.payload.reason === "subagent_terminal_write",
+      );
+      expect(childRoot.context.agent_role).toBe("subagent");
+      expect(childRoot.context.session_id).toBe(childAttention.context.session_id);
+      expect(childRoot.context.parent_session_id).toBe(
+        childAttention.context.parent_session_id,
+      );
+      expect(childRoot.payload).toEqual({
+        git_root: realpathSync(secondWorkspace),
+        revision: 2,
+        reason: "subagent_terminal_write",
+      });
+      expect(JSON.parse(readFileSync(checkpointPath, "utf8"))).toEqual({
+        schema: 1,
+        instance_id: INSTANCE_ID,
+        revision: 2,
+        git_roots: [realpathSync(workspace), realpathSync(secondWorkspace)],
+      });
       await session.waitForComposer(TIMEOUT);
 
       const originalMainSession = receiver.records.find(
@@ -361,6 +426,12 @@ describe.skipIf(!tmuxAvailable())("ADE event feed", () => {
           record.payload.previous_session_id === freshMainSession &&
           record.payload.session_id === originalMainSession,
       );
+      expect(JSON.parse(readFileSync(checkpointPath, "utf8"))).toEqual({
+        schema: 1,
+        instance_id: INSTANCE_ID,
+        revision: 2,
+        git_roots: [realpathSync(workspace), realpathSync(secondWorkspace)],
+      });
       await session.waitForComposer(TIMEOUT);
       await session.sendText("/quit");
       expect(await session.waitForSessionEnd(TIMEOUT)).toBe(true);
@@ -475,6 +546,54 @@ describe.skipIf(!tmuxAvailable())("ADE event feed", () => {
     },
     60_000,
   );
+
+  test("keeps the checkpoint current when the ADE socket is unavailable", async () => {
+    const tempRoot = existsSync("/private/tmp") ? "/private/tmp" : tmpdir();
+    root = realpathSync(mkdtempSync(join(tempRoot, "fx-ade-checkpoint-e2e-")));
+    const home = join(root, "home");
+    const workspace = join(root, "workspace");
+    const checkpointPath = join(root, "git-roots.json");
+    const stderrPath = join(root, "stderr.log");
+    mkdirSync(join(home, ".fx"), { recursive: true });
+    mkdirSync(workspace);
+    expect(Bun.spawnSync(["git", "init", "-q", workspace]).exitCode).toBe(0);
+    writeFileSync(
+      join(home, ".fx", "settings.json"),
+      JSON.stringify({ sandbox: "none", permission_mode: "auto", permission: {} }),
+    );
+    writeFileSync(stderrPath, "");
+    gateway = startDynamicFakeGateway(() => fakeGatewayFinalText("unused"));
+
+    session = await TmuxSession.create({
+      cwd: realpathSync(workspace),
+      env: {
+        HOME: realpathSync(home),
+        AI_GATEWAY_API_KEY: "ade-checkpoint-key",
+        VERCEL_OIDC_TOKEN: undefined,
+        FX_GATEWAY_BASE_URL: gateway.baseUrl,
+        FX_GATEWAY_CHAT_URL: gateway.chatUrl,
+        FX_MODEL: FAKE_GATEWAY_MODEL,
+        FX_AUTO_UPGRADE: "0",
+        FX_ADE_SOCKET_PATH: join(root, "missing.sock"),
+        FX_ADE_INSTANCE_ID: "checkpoint-without-socket",
+        FX_ADE_CHECKPOINT_PATH: checkpointPath,
+        NO_COLOR: "1",
+      },
+      width: 100,
+      height: 28,
+      stderrPath,
+    });
+    await session.waitForComposer(TIMEOUT);
+    expect(await waitForJsonFile(checkpointPath)).toEqual({
+      schema: 1,
+      instance_id: "checkpoint-without-socket",
+      revision: 1,
+      git_roots: [realpathSync(workspace)],
+    });
+    await session.sendText("/quit");
+    expect(await session.waitForSessionEnd(TIMEOUT)).toBe(true);
+    expect(readFileSync(stderrPath, "utf8")).toBe("");
+  }, TIMEOUT);
 });
 
 describe("ADE event feed process exclusions", () => {

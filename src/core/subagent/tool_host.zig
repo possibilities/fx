@@ -737,6 +737,7 @@ fn captureAdmission(
         return error.AdmissionFailed;
     defer snapshot.deinit(alloc);
     return domain.captureAdmission(alloc, .{
+        .root_id = snapshot.root_id,
         .parent_id = request.parent_id,
         .source_id = request.source_id,
         .model = request.preferences.model,

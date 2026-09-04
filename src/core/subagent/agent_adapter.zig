@@ -107,6 +107,7 @@ const Context = struct {
             .workspace_root = result.workspace_root,
             .session_id = self.turn.child_id,
             .subagent_id = self.subagent_id,
+            .parent_session_id = self.admission.root_id,
         };
         return result;
     }
@@ -279,6 +280,7 @@ pub fn run(
                 .workspace_root = config.tool_context.workspace_root,
                 .session_id = turn.child_id,
                 .subagent_id = trace_context.subagent_id,
+                .parent_session_id = admission.root_id,
             },
             .outcome_allocator = turn.alloc,
         },
