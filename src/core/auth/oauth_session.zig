@@ -680,7 +680,7 @@ pub fn loadFromHome(alloc: Allocator, home: []const u8) !?Session {
         return null;
     };
     defer fx_dir.close(io_mod.getIo());
-    return loadFromDir(alloc, &fx_dir, .tolerate_open_failure);
+    return loadFromDir(alloc, &fx_dir);
 }
 
 fn loadFromHost(alloc: Allocator, store: js_host_auth.SessionStore) !?Session {

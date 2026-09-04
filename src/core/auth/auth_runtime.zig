@@ -1526,7 +1526,7 @@ pub const Runtime = struct {
         auth_mode: credentials.AuthMode,
     ) void {
         comptime {
-            if (std.meta.fields(Self).len != 30) {
+            if (std.meta.fields(Self).len != 31) {
                 @compileError("update Runtime.initInto for the changed field set");
             }
         }
