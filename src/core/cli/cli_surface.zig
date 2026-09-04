@@ -155,7 +155,6 @@ pub const LaunchModifiers = struct {
     /// transport, but it is not a `--skills-dir` request and must not be judged
     /// as one by the launch surfaces that refuse those.
     requested_skill_root_count: usize = 0,
-    skill_directories: [][]u8 = &.{},
     no_default_skills: bool = false,
     prompt_files: system_prompt_files.Request = .{},
     effective_system_prompt: ?[]u8 = null,
@@ -173,8 +172,6 @@ pub const LaunchModifiers = struct {
         if (self.identity_home) |path| alloc.free(path);
         if (self.history_home) |path| alloc.free(path);
         if (self.mcp_config_path) |path| alloc.free(path);
-        for (self.skill_directories) |path| alloc.free(path);
-        if (self.skill_directories.len > 0) alloc.free(self.skill_directories);
         self.prompt_files.deinit(alloc);
         if (self.effective_system_prompt) |prompt| alloc.free(prompt);
         for (self.selected_native_tools) |name| alloc.free(name);
@@ -188,10 +185,6 @@ pub const LaunchModifiers = struct {
 
     pub fn hasPermissionPolicy(self: LaunchModifiers) bool {
         return self.permission_policy != null;
-    }
-
-    pub fn hasSkillDirectories(self: LaunchModifiers) bool {
-        return self.skill_directories.len > 0;
     }
 
     /// The resolved shape of this launch: the controls that decide how the
@@ -511,11 +504,6 @@ fn parseGlobalLaunchArgs(
     errdefer if (history_home) |path| alloc.free(path);
     var mcp_config_path: ?[]u8 = null;
     errdefer if (mcp_config_path) |path| alloc.free(path);
-    var skill_directories: std.ArrayList([]u8) = .empty;
-    errdefer {
-        for (skill_directories.items) |path| alloc.free(path);
-        skill_directories.deinit(alloc);
-    }
     var no_default_skills = false;
     var replacement_path: ?[]u8 = null;
     errdefer if (replacement_path) |path| alloc.free(path);
@@ -731,11 +719,6 @@ fn parseGlobalLaunchArgs(
         for (directory_slice) |path| alloc.free(path);
         if (directory_slice.len > 0) alloc.free(directory_slice);
     }
-    const skill_directory_slice = try skill_directories.toOwnedSlice(alloc);
-    errdefer {
-        for (skill_directory_slice) |path| alloc.free(path);
-        if (skill_directory_slice.len > 0) alloc.free(skill_directory_slice);
-    }
     const skill_root_slice = try skill_roots.toOwnedSlice(alloc);
     errdefer {
         for (skill_root_slice) |path| alloc.free(path);
@@ -763,7 +746,6 @@ fn parseGlobalLaunchArgs(
             .history_home = history_home,
             .mcp_config_path = mcp_config_path,
             .requested_skill_root_count = requested_skill_root_count,
-            .skill_directories = skill_directory_slice,
             .no_default_skills = no_default_skills,
             .prompt_files = .{
                 .replacement_path = replacement_path,
