@@ -447,6 +447,7 @@ fn addWasmArtifact(
             .strip = true,
         }),
     });
+    if (surface == .core) wasm_exe.stack_size = 1024 * 1024;
     wasm_exe.root_module.addImport("build_options", wasm_options.createModule());
 
     const install_wasm = b.addInstallArtifact(wasm_exe, .{});
