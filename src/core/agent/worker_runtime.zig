@@ -4406,7 +4406,7 @@ test "prompt admission observer runs exactly once only after queue admission" {
         .{ .ctx = &capture, .report = AdmissionCapture.report },
     );
     try std.testing.expectEqual(@as(usize, 1), capture.calls);
-    try std.testing.expectEqual(@as(usize, 1), runtime.queued_prompt_count);
+    try std.testing.expectEqual(@as(usize, 1), runtime.queued_prompts.items.len);
 
     runtime.latchFinalizationFailure(.{
         .turn_id = 40,
