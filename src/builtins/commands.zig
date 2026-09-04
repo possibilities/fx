@@ -347,6 +347,10 @@ pub const top_level_flags = [_]TopLevelFlag{
         .description = "Replace configured rules for TUI or ACP",
     },
     .{
+        .usage = "--no-project-instructions",
+        .description = "Ignore repository instructions for TUI or ACP",
+    },
+    .{
         .usage = "-c, --continue",
         .description = "Resume the latest workspace session",
     },

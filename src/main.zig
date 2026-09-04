@@ -575,6 +575,7 @@ const App = struct {
     file_index: file_index_mod.FileIndex = .{},
     context_enabled: bool = true,
     allow_native_tools: bool = true,
+    project_instructions_enabled: bool = true,
     context_limits: config_runtime.context_limits.Values = .{},
     fast_mode: bool = false,
     auto_upgrade_enabled: bool = true,
@@ -622,6 +623,7 @@ const App = struct {
             else
                 shell_process_provider.provider,
             .allow_native_tools = launch.modifiers.allow_native_tools,
+            .project_instructions_enabled = launch.modifiers.project_instructions_enabled,
         };
         auth_runtime.Runtime.initIntoWithMode(
             &app.auth,
@@ -3647,6 +3649,7 @@ test "full entry config commands also use early threaded io" {
         @as([:0]const u8, "--context-limit=project_bytes=2048"),
         @as([:0]const u8, "--no-additional-dirs"),
         @as([:0]const u8, "--no-native-tools"),
+        @as([:0]const u8, "--no-project-instructions"),
         @as([:0]const u8, "acp"),
     }));
 }

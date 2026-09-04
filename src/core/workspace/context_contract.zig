@@ -128,6 +128,7 @@ fn hashUsize(hasher: *std.crypto.hash.sha2.Sha256, value: usize) void {
 pub const InitialContextInput = struct {
     workspace_root: []const u8,
     access_scope: ?workspace_access.AccessScope = null,
+    project_instructions_enabled: bool = true,
     targets: []const ApplicableTarget = &.{},
     omissions: []const ContextOmissionInput = &.{},
     omission_summary: ?ContextOmissionSummary = null,
@@ -137,6 +138,7 @@ pub const InitialContextInput = struct {
 pub const LaterContextInput = struct {
     workspace_root: []const u8,
     access_scope: ?workspace_access.AccessScope = null,
+    project_instructions_enabled: bool = true,
     targets: []const ApplicableTarget,
     delivered_sources: []const []const u8,
     evaluated_endpoints: []const []const u8,
@@ -305,6 +307,7 @@ pub const Registry = struct {
     }
 
     pub fn gatherDefaultSnapshot(self: Registry, alloc: Allocator, input: InitialContextInput) ProviderError!GatheredContextSnapshot {
+        if (!input.project_instructions_enabled) return .{};
         const provider = self.defaultProvider();
         var gathered = try provider.gatherProjectContext(alloc, input);
         errdefer gathered.deinit(alloc);
@@ -336,6 +339,7 @@ pub const Registry = struct {
     }
 
     pub fn selectDefaultApplicableContext(self: Registry, alloc: Allocator, input: LaterContextInput) ProviderError!ProviderContext {
+        if (!input.project_instructions_enabled) return .{};
         return self.defaultProvider().selectApplicableProjectContext(alloc, input);
     }
 

@@ -285,6 +285,7 @@ describe("cli: help", () => {
       expect(stdout).toContain("--no-native-tools");
       expect(stdout).toContain("--permissions-file <path>");
       expect(stdout).toContain("Replace configured rules for TUI or ACP");
+      expect(stdout).toContain("--no-project-instructions");
       expect(stdout).toContain("-c, --continue");
       expect(stdout).toContain("-r");
       expect(stdout).toContain("Open the saved-session picker");
@@ -4731,6 +4732,24 @@ describe("cli: workspace access", () => {
       expect(unsupportedNativeToolGate.code).toBe(1);
       expect(unsupportedNativeToolGate.stderr).toContain(
         "--no-native-tools is only supported for interactive, resume, and ACP launches",
+      );
+
+      const duplicateProjectInstructionGate = await runFx(
+        ["--no-project-instructions", "--no-project-instructions"],
+        { env: enabled },
+      );
+      expect(duplicateProjectInstructionGate.code).toBe(1);
+      expect(duplicateProjectInstructionGate.stderr).toContain(
+        "--no-project-instructions may only be specified once",
+      );
+
+      const unsupportedProjectInstructionGate = await runFx(
+        ["--no-project-instructions", "ask", "hello"],
+        { env: enabled },
+      );
+      expect(unsupportedProjectInstructionGate.code).toBe(1);
+      expect(unsupportedProjectInstructionGate.stderr).toContain(
+        "--no-project-instructions is only supported for interactive, resume, and ACP launches",
       );
     },
     TIMEOUT,

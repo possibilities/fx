@@ -46,6 +46,7 @@ pub const Config = struct {
     permission_rules_override: ?types.PermissionRuleSet = null,
     allow_acp_mcp: bool = true,
     allow_native_tools: bool = true,
+    project_instructions_enabled: bool = true,
     minimal_kernel: bool = false,
 };
 

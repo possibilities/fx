@@ -53,6 +53,7 @@ pub const Config = struct {
     custom_tool_guidance: []const u8 = "",
     context_registry: context_contract.Registry,
     context_enabled: bool,
+    project_instructions_enabled: bool = true,
     project_context: []const u8 = "",
     lifecycle_view: hooks.RuntimeView = hooks.RuntimeView.empty(),
 };
@@ -359,6 +360,7 @@ fn runtimeDeps(context: *Context) agent_runtime.AgentRuntimeDeps {
         .tool_registry = context.config.tool_context.tool_registry,
         .context_registry = context.config.context_registry,
         .context_enabled = context.config.context_enabled,
+        .project_instructions_enabled = context.config.project_instructions_enabled,
         .finalize_turn = finalizeTurn,
         .release_agent_terminal_lease = releaseAgentTerminalLease,
         .live_tool_authority = context.turn.liveToolAuthorityProvider(),

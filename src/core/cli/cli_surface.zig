@@ -125,6 +125,7 @@ pub const LaunchModifiers = struct {
     saved_directories_suppressed: bool = false,
     allow_native_tools: bool = true,
     permission_policy: ?config_runtime.LaunchPermissionPolicy = null,
+    project_instructions_enabled: bool = true,
 
     pub fn deinit(self: *LaunchModifiers, alloc: Allocator) void {
         if (self.context_limit_overrides.len > 0) alloc.free(self.context_limit_overrides);
@@ -373,6 +374,7 @@ fn parseGlobalLaunchArgs(
     var allow_native_tools = true;
     var permission_policy: ?config_runtime.LaunchPermissionPolicy = null;
     errdefer if (permission_policy) |*policy| policy.deinit(alloc);
+    var project_instructions_enabled = true;
 
     var index: usize = 0;
     while (index < args.len) {
@@ -407,6 +409,9 @@ fn parseGlobalLaunchArgs(
             const value = arg["--permissions-file=".len..];
             if (value.len == 0) return error.MissingPermissionsFileValue;
             permission_policy = try config_runtime.loadLaunchPermissionPolicy(alloc, value);
+        } else if (std.mem.eql(u8, arg, "--no-project-instructions")) {
+            if (!project_instructions_enabled) return error.DuplicateProjectInstructionSuppression;
+            project_instructions_enabled = false;
         } else {
             break;
         }
@@ -424,6 +429,7 @@ fn parseGlobalLaunchArgs(
             .saved_directories_suppressed = suppress_saved,
             .allow_native_tools = allow_native_tools,
             .permission_policy = permission_policy,
+            .project_instructions_enabled = project_instructions_enabled,
         },
     };
 }
@@ -450,7 +456,8 @@ pub fn argsAfterGlobalLaunchArgs(args: []const [:0]const u8) []const [:0]const u
             !std.mem.startsWith(u8, arg, "--add-dir=") and
             !std.mem.startsWith(u8, arg, "--permissions-file=") and
             !std.mem.eql(u8, arg, "--no-additional-dirs") and
-            !std.mem.eql(u8, arg, "--no-native-tools"))
+            !std.mem.eql(u8, arg, "--no-native-tools") and
+            !std.mem.eql(u8, arg, "--no-project-instructions"))
         {
             return args[index..];
         }
@@ -968,6 +975,12 @@ fn runNonInteractiveWithDeps(
         try writeLaunchPermissionPolicyUsage(deps);
         return .handled_failure;
     }
+    if (!global_args.modifiers.project_instructions_enabled and
+        !commandSupportsProjectInstructionModifier(parsed_command))
+    {
+        try writeProjectInstructionModifierUsage(deps);
+        return .handled_failure;
+    }
 
     if (isVersionFlag(effective_args[0])) {
         if (effective_args.len != 1) {
@@ -1035,6 +1048,7 @@ fn runNonInteractiveWithDeps(
                 .log_file = acp_opts.log_file,
                 .allow_acp_mcp = acp_opts.allow_acp_mcp,
                 .allow_native_tools = global_args.modifiers.allow_native_tools,
+                .project_instructions_enabled = global_args.modifiers.project_instructions_enabled,
             });
             return .handled_success;
         },
@@ -3254,6 +3268,13 @@ fn commandSupportsLaunchPermissionPolicy(command: Command) bool {
     };
 }
 
+fn commandSupportsProjectInstructionModifier(command: Command) bool {
+    return switch (command) {
+        .interactive, .acp, .resume_session => true,
+        else => false,
+    };
+}
+
 fn writeWorkspaceModifierUsage(deps: RunDeps) !void {
     try writeStderr(
         deps,
@@ -3275,6 +3296,13 @@ fn writeLaunchPermissionPolicyUsage(deps: RunDeps) !void {
     );
 }
 
+fn writeProjectInstructionModifierUsage(deps: RunDeps) !void {
+    try writeStderr(
+        deps,
+        "fx: --no-project-instructions is only supported for interactive, resume, and ACP launches\n",
+    );
+}
+
 fn globalLaunchErrorMessage(err: anyerror) ?[]const u8 {
     return switch (err) {
         error.MissingAddDirectoryValue => "--add-dir requires a directory path",
@@ -3285,6 +3313,7 @@ fn globalLaunchErrorMessage(err: anyerror) ?[]const u8 {
         error.PermissionPolicyUnavailable => "--permissions-file must name a readable regular file",
         error.PermissionPolicyTooLarge => "--permissions-file exceeds the 64 KiB limit",
         error.InvalidPermissionPolicy => "--permissions-file must contain valid permission-rule JSON",
+        error.DuplicateProjectInstructionSuppression => "--no-project-instructions may only be specified once",
         else => null,
     };
 }
@@ -3854,6 +3883,7 @@ test "global launch modifiers own repeatable additional directories and suppress
         @constCast("--add-dir=/tmp/shared-two"),
         @constCast("--no-additional-dirs"),
         @constCast("--no-native-tools"),
+        @constCast("--no-project-instructions"),
         @constCast("ask"),
         @constCast("inspect"),
     });
@@ -3864,6 +3894,7 @@ test "global launch modifiers own repeatable additional directories and suppress
     try std.testing.expectEqualStrings("/tmp/shared-two", parsed.modifiers.additional_directories[1]);
     try std.testing.expect(parsed.modifiers.saved_directories_suppressed);
     try std.testing.expect(!parsed.modifiers.allow_native_tools);
+    try std.testing.expect(!parsed.modifiers.project_instructions_enabled);
     try std.testing.expectEqualStrings("ask", parsed.remaining[0]);
 }
 
@@ -3883,6 +3914,10 @@ test "additional directory flags fail closed when malformed" {
     try std.testing.expectError(
         error.DuplicateNativeToolSuppression,
         parseGlobalLaunchArgs(std.testing.allocator, &.{ @constCast("--no-native-tools"), @constCast("--no-native-tools") }),
+    );
+    try std.testing.expectError(
+        error.DuplicateProjectInstructionSuppression,
+        parseGlobalLaunchArgs(std.testing.allocator, &.{ @constCast("--no-project-instructions"), @constCast("--no-project-instructions") }),
     );
 }
 
@@ -4017,7 +4052,8 @@ test "ACP command routes parsed options and launch config through the injected r
                 std.mem.eql(u8, cfg.model_override.?, "model-override") and
                 std.mem.eql(u8, cfg.log_file.?, "/tmp/acp.log") and
                 !cfg.allow_native_tools and
-                !cfg.allow_acp_mcp;
+                !cfg.allow_acp_mcp and
+                !cfg.project_instructions_enabled;
         }
     };
 
@@ -4052,6 +4088,7 @@ test "ACP command routes parsed options and launch config through the injected r
             @constCast("/tmp/acp-extra"),
             @constCast("--no-additional-dirs"),
             @constCast("--no-native-tools"),
+            @constCast("--no-project-instructions"),
             @constCast("acp"),
             @constCast("--model"),
             @constCast("model-override"),
