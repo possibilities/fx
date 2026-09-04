@@ -5481,6 +5481,30 @@ test "session deny narrows configured command allow" {
     try std.testing.expectEqual(ToolPermissionDecision.policy_denied, denied.decision);
     try std.testing.expect(denied.execution_authority == null);
     try std.testing.expectEqual(@as(usize, 0), recording.calls);
+
+    rules[0].action = .deny;
+    var empty_allow: session_permission_state.State = .{};
+    defer empty_allow.deinit(alloc);
+    var applied_allow = try session_permission_state.apply(alloc, empty_allow, .{ .set = .{
+        .key = key,
+        .display_identity = "touch configured.txt",
+        .decision = .allow,
+        .expected_generation = null,
+    } });
+    var allow_state = applied_allow.takeApplied() orelse return error.TestExpectedAppliedState;
+    defer allow_state.deinit(alloc);
+    input.session_permission_state = &allow_state;
+
+    const launch_denied = try requestPermissionOutcome(
+        input,
+        arena,
+        call,
+        .auto,
+        &.{},
+    );
+    try std.testing.expectEqual(ToolPermissionDecision.policy_denied, launch_denied.decision);
+    try std.testing.expect(launch_denied.execution_authority == null);
+    try std.testing.expectEqual(@as(usize, 0), recording.calls);
 }
 
 test "prepared session deny blocks local file mutation without setup effects" {

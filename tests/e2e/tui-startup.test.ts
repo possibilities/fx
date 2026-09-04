@@ -26,6 +26,10 @@ const TIMEOUT = 30_000;
 
 let session: TmuxSession | null = null;
 
+function shellQuote(value: string): string {
+  return `'${value.replaceAll("'", `'"'"'`)}'`;
+}
+
 afterEach(async () => {
   if (session) { await session.kill(); session = null; }
 });
@@ -114,6 +118,85 @@ describe.skipIf(SKIP_TMUX)("tui: fresh-session commands", () => {
         session = null;
       } finally {
         gateway.stop();
+        if (session) {
+          await session.kill();
+          session = null;
+        }
+        rmSync(root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "launch permission policy replaces ambient rules and survives allowlist reloads",
+    async () => {
+      const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-e2e-tui-permissions-")));
+      const home = join(root, "home");
+      const workspace = join(root, "workspace");
+      const policyPath = join(root, "launch-permissions.json");
+      const settingsPath = join(home, ".fx", "settings.json");
+      const stderrPath = join(root, "stderr.log");
+      mkdirSync(join(home, ".fx"), { recursive: true, mode: 0o700 });
+      mkdirSync(workspace, { recursive: true });
+      writeFileSync(
+        settingsPath,
+        JSON.stringify({ permission: { bash: { "ambient *": "allow" } } }),
+      );
+      writeFileSync(
+        policyPath,
+        JSON.stringify({ bash: { "launch *": "allow" }, edit: "deny" }),
+      );
+      writeFileSync(stderrPath, "");
+
+      try {
+        session = await TmuxSession.create({
+          cmd: `${shellQuote(FX_BIN)} --permissions-file ${shellQuote(policyPath)}`,
+          cwd: workspace,
+          env: {
+            HOME: home,
+            AI_GATEWAY_API_KEY: undefined,
+            VERCEL_OIDC_TOKEN: undefined,
+            FX_AUTO_UPGRADE: "0",
+            FX_DISABLE_KEYCHAIN: "1",
+            FX_SKIP_ONBOARDING: "1",
+          },
+          stderrPath,
+          width: 120,
+          height: 40,
+        });
+
+        await session.waitForComposer(10_000);
+        await session.sendText("/permissions");
+        const initial = await session.waitForText("launch *", 5_000);
+        expect(initial).not.toContain("ambient *");
+
+        await session.sendText('/allowlist user add command "mutated *"');
+        await session.waitForText("added command", 5_000);
+        await session.sendText("/clear");
+        await session.waitForPane(
+          (pane) => !pane.includes("added command") && hasEmptyComposer(pane),
+          5_000,
+        );
+        await session.sendText("/permissions");
+        const latestPermissions = await session.waitForPane(
+          (pane) =>
+            pane.includes("launch *") &&
+            pane.includes("saved-session permission rules: none"),
+          5_000,
+        );
+        expect(latestPermissions).toContain("launch *");
+        expect(latestPermissions).toContain("deny edit -> *");
+        expect(latestPermissions).not.toContain("ambient *");
+        expect(latestPermissions).not.toContain("mutated *");
+
+        const persisted = JSON.parse(readFileSync(settingsPath, "utf8"));
+        expect(persisted.permission.bash["mutated *"]).toBe("allow");
+        await session.sendText("/quit");
+        expect(await session.waitForSessionEnd(5_000)).toBe(true);
+        session = null;
+        expect(readFileSync(stderrPath, "utf8")).toBe("");
+      } finally {
         if (session) {
           await session.kill();
           session = null;

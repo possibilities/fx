@@ -7,6 +7,7 @@ const host = @import("../hosts/host.zig");
 const credentials = @import("../auth/credentials.zig");
 const mode_registry = @import("../modes/mode_registry.zig");
 const prompt_policy = @import("../config/prompt_policy.zig");
+const types = @import("../shared/types.zig");
 const context_contract = @import("../workspace/context_contract.zig");
 
 const Allocator = std.mem.Allocator;
@@ -41,6 +42,8 @@ pub const Config = struct {
     context_limit_overrides: []const config_runtime.context_limits.Override = &.{},
     additional_directories: []const []const u8 = &.{},
     saved_directories_suppressed: bool = false,
+    /// Borrowed invocation policy; the server duplicates it during initialize.
+    permission_rules_override: ?types.PermissionRuleSet = null,
     allow_acp_mcp: bool = true,
     allow_native_tools: bool = true,
     minimal_kernel: bool = false,

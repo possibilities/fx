@@ -283,6 +283,8 @@ describe("cli: help", () => {
       expect(stdout).toContain("Set name=bytes|off; repeatable");
       expect(stdout).toContain("--add-dir <path>");
       expect(stdout).toContain("--no-native-tools");
+      expect(stdout).toContain("--permissions-file <path>");
+      expect(stdout).toContain("Replace configured rules for TUI or ACP");
       expect(stdout).toContain("-c, --continue");
       expect(stdout).toContain("-r");
       expect(stdout).toContain("Open the saved-session picker");
@@ -4571,6 +4573,108 @@ describe("cli: error handling", () => {
         expect(gateway.requests).toHaveLength(0);
       } finally {
         gateway.stop();
+        rmSync(root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+});
+
+describe("cli: launch permission policy", () => {
+  test(
+    "permissions file validates before TUI or ACP startup with stable errors",
+    async () => {
+      const root = mkdtempSync(join(tmpdir(), "fx-permissions-file-cli-"));
+      try {
+        const valid = join(root, "valid.json");
+        const malformed = join(root, "malformed.json");
+        const invalidRule = join(root, "invalid-rule.json");
+        const unreadable = join(root, "unreadable.json");
+        const oversized = join(root, "oversized.json");
+        const directory = join(root, "directory");
+        writeFileSync(valid, JSON.stringify({ bash: { "git *": "allow" } }));
+        writeFileSync(malformed, "{not json");
+        writeFileSync(invalidRule, JSON.stringify({ bash: "sometimes" }));
+        writeFileSync(unreadable, JSON.stringify({ edit: "deny" }), { mode: 0o000 });
+        writeFileSync(oversized, Buffer.alloc(64 * 1024 + 1, "x"));
+        mkdirSync(directory);
+
+        const help = await runFx([
+          `--permissions-file=${valid}`,
+          "acp",
+          "--help",
+        ]);
+        expect(help.code).toBe(0);
+        expect(help.stdout.startsWith("fx acp\n\n")).toBe(true);
+        expect(help.stderr).toBe("");
+
+        const cases: Array<{
+          args: string[];
+          message: string;
+          hidden: string;
+        }> = [
+          {
+            args: ["--permissions-file"],
+            message: "--permissions-file requires a file path",
+            hidden: "MissingPermissionsFileValue",
+          },
+          {
+            args: [
+              "--permissions-file",
+              valid,
+              "--permissions-file",
+              valid,
+              "acp",
+            ],
+            message: "--permissions-file may only be specified once",
+            hidden: "DuplicatePermissionsFile",
+          },
+          {
+            args: ["--permissions-file", join(root, "missing.json"), "acp"],
+            message: "--permissions-file must name a readable regular file",
+            hidden: "PermissionPolicyUnavailable",
+          },
+          {
+            args: ["--permissions-file", directory, "acp"],
+            message: "--permissions-file must name a readable regular file",
+            hidden: "PermissionPolicyUnavailable",
+          },
+          {
+            args: ["--permissions-file", unreadable, "acp"],
+            message: "--permissions-file must name a readable regular file",
+            hidden: "PermissionPolicyUnavailable",
+          },
+          {
+            args: ["--permissions-file", malformed, "acp"],
+            message: "--permissions-file must contain valid permission-rule JSON",
+            hidden: "InvalidPermissionPolicy",
+          },
+          {
+            args: ["--permissions-file", invalidRule, "acp"],
+            message: "--permissions-file must contain valid permission-rule JSON",
+            hidden: "InvalidPermissionPolicy",
+          },
+          {
+            args: ["--permissions-file", oversized, "acp"],
+            message: "--permissions-file exceeds the 64 KiB limit",
+            hidden: "PermissionPolicyTooLarge",
+          },
+          {
+            args: ["--permissions-file", valid, "status"],
+            message:
+              "--permissions-file is only supported for interactive, resume, and ACP launches",
+            hidden: "InvalidPermissionPolicy",
+          },
+        ];
+
+        for (const fixture of cases) {
+          const result = await runFx(fixture.args);
+          expect(result.code).toBe(1);
+          expect(result.stdout).toBe("");
+          expect(result.stderr).toContain(fixture.message);
+          expect(result.stderr).not.toContain(fixture.hidden);
+        }
+      } finally {
         rmSync(root, { recursive: true, force: true });
       }
     },
