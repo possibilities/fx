@@ -113,7 +113,26 @@ fx ask "explain the changes in this repository"
 
 With `--json`, `output` contains accumulated assistant Markdown across the request. Recovery replaces failed preview text rather than joining separate responses. If recovery pauses before a replacement is accepted, `output` keeps the latest preview. `final_output` contains only a completed final assistant response and is `""` for interrupted, failed, background, or otherwise absent final responses.
 
-Foreground terminal commands run with an explicit finite deadline. fx uses durable terminal sessions for services, watchers, GUI applications, and other long-lived work, and keeps captured foreground output available through an opaque bounded-read handle for the active session or `--no-save` process.
+Customize the system prompt for one model-launching invocation with global
+file options placed before the command:
+
+```bash
+fx --system-prompt-file ./base-prompt.md ask "review this change"
+fx --append-system-prompt-file ./team-rules.md --append-system-prompt-file ./task-rules.md
+```
+
+`--system-prompt-file` replaces the effective base prompt and may be supplied
+once. `--append-system-prompt-file` preserves that base and adds files in CLI
+order, separated by blank lines. The options also apply to interactive and
+resumed sessions, ACP, `pr`, and `issue`. Custom prompt files must be regular
+UTF-8 files without NUL bytes and may contain at most 256 KiB combined. File
+errors stop the launch. For `fx ask`, these options cannot be combined with
+the inline `--system` option.
+
+Foreground terminal commands run with an explicit finite deadline. fx uses
+durable terminal sessions for services, watchers, GUI applications, and other
+long-lived work, and keeps captured foreground output available through an
+opaque bounded-read handle for the active session or `--no-save` process.
 
 Invalid Shell requests return the specific argument problems before any command runs. When the intended repair is unambiguous, the error includes a `retry_with` request for the agent to submit through normal validation and permissions. Repeated equivalent corrections stop the tool loop.
 

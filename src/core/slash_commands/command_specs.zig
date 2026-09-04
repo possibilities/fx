@@ -1329,7 +1329,9 @@ fn maxTopLevelFlagUsageWidth(registry: TopLevelRegistry) usize {
     for (registry.flags) |flag| {
         width = @max(width, flag.usage.len);
     }
-    return width;
+    // Keep ordinary flag descriptions in a compact column. A longer usage may
+    // extend past this column on its own row without shifting every other flag.
+    return @min(width, 24);
 }
 
 fn maxTopLevelResourceLabelWidth(registry: TopLevelRegistry) usize {
@@ -1356,11 +1358,12 @@ fn writeTopLevelHelpEntry(writer: *std.Io.Writer, registry: TopLevelRegistry, en
 
 fn writeTopLevelFlag(writer: *std.Io.Writer, flag: TopLevelFlag, usage_width: usize, columns: usize, style: HelpStyle) !void {
     const spaces = "                                                                ";
-    const padding = usage_width - flag.usage.len + 2;
+    const row_usage_width = @max(usage_width, flag.usage.len);
+    const padding = row_usage_width - flag.usage.len + 2;
     var prefix_buf: [160]u8 = undefined;
     var continuation_buf: [96]u8 = undefined;
     const prefix = try std.fmt.bufPrint(&prefix_buf, "  {s}{s}{s}{s}", .{ styleStart(style, .syntax), flag.usage, styleEnd(style), spaces[0..padding] });
-    const continuation = try std.fmt.bufPrint(&continuation_buf, "  {s}", .{spaces[0 .. usage_width + 2]});
+    const continuation = try std.fmt.bufPrint(&continuation_buf, "  {s}", .{spaces[0 .. row_usage_width + 2]});
     try writeWrappedLine(writer, prefix, continuation, flag.description, columns);
 }
 
@@ -1668,6 +1671,8 @@ test "top-level help renders flags as compact aligned rows" {
     defer std.testing.allocator.free(narrow);
 
     try std.testing.expect(lineContainsBoth(wide, "--skills-dir <path>", "Load an invocation skill root; repeatable"));
+    try std.testing.expect(lineContainsBoth(wide, "--system-prompt-file <path>", "Replace launch system prompt"));
+    try std.testing.expect(lineContainsBoth(wide, "--append-system-prompt-file <path>", "Append UTF-8 system prompt"));
     try std.testing.expect(lineContainsBoth(wide, "--context-limit <spec>", "Set name=bytes|off; repeatable"));
     try std.testing.expect(lineContainsBoth(wide, "--add-dir <path>", "Add a workspace directory; repeatable"));
     try std.testing.expect(lineContainsBoth(wide, "--no-native-tools", "Disable native tools for TUI or ACP"));
