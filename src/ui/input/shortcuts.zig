@@ -109,8 +109,10 @@ test "focused editor controls include only ticketed cursor and deletion aliases"
 test "composer shortcut table excludes app and terminal controls" {
     const excluded_bytes = [_]u8{
         3,
+        7,
         15,
         18,
+        20,
         22,
         24,
         '\r',
@@ -130,8 +132,10 @@ test "composer shortcut table excludes app and terminal controls" {
         .toggle_permission_mode,
         .{ .mouse_wheel = .up },
         .{ .remapped_byte = 3 },
+        .{ .remapped_byte = 7 },
         .{ .remapped_byte = 15 },
         .{ .remapped_byte = 18 },
+        .{ .remapped_byte = 20 },
         .{ .remapped_byte = 24 },
     };
     for (excluded_actions) |action| {
