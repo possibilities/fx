@@ -13221,7 +13221,15 @@ test "updateRawBytesEntry updates modal entry in place after intervening append"
 
 test "tool status raw entry updates after command output appends" {
     const alloc = std.testing.allocator;
-    var runtime = TranscriptRuntime{};
+    var runtime = TranscriptRuntime{ .layout = .{
+        .rows = 24,
+        .cols = 80,
+        .content_bottom = 21,
+        .divider_top_row = 22,
+        .input_row = 23,
+        .divider_bottom_row = 24,
+        .hint_row = 22,
+    } };
     defer runtime.deinit(alloc);
     var metrics = Metrics{};
 
@@ -13239,8 +13247,24 @@ test "tool status raw entry updates after command output appends" {
     var source = try runtime.prepareTranscriptSource(alloc, null);
     defer source.deinit(alloc);
     try std.testing.expect(std.mem.indexOf(u8, source.bytes, "Ran npm test") != null);
-    try std.testing.expect(std.mem.indexOf(u8, source.bytes, "│ ok") != null);
+    try std.testing.expect(std.mem.indexOf(u8, source.bytes, "│ ok") == null);
     try std.testing.expect(std.mem.indexOf(u8, source.bytes, "Running npm test") == null);
+
+    runtime.full_transcript.depth = .full;
+    var projection = try runtime.buildFullTranscriptProjection(alloc, null);
+    defer projection.deinit(alloc);
+    const full = try full_transcript_screen.renderProjectionViewportSourceInterruptible(
+        alloc,
+        &projection,
+        null,
+        runtime.layout.cols,
+        64,
+        0,
+        null,
+    );
+    defer alloc.free(full);
+    try std.testing.expect(std.mem.indexOf(u8, full, "│ ok") != null);
+    try std.testing.expect(std.mem.indexOf(u8, full, "Running npm test") == null);
 }
 
 test "advanceCursor row advance matches visualRowsForLine - 1 for wrap-exact content" {
@@ -14795,6 +14819,265 @@ test "transcript lifecycle terminal markers preserve ANSI summaries and normaliz
         "{s}●{s} Tool failed\n",
         .{ ui_render.red_style, ui_render.reset_style },
     ));
+}
+
+test "active tool cancellation is presented immediately without closing lifecycle state" {
+    const alloc = std.testing.allocator;
+    var runtime = lifecycleTestRuntime(null);
+    defer runtime.deinit(alloc);
+
+    const ids = [_]types.ToolLifecycleId{
+        lifecycleId(1, "read"),
+        lifecycleId(1, "command"),
+    };
+    for (ids) |id| {
+        _ = try runtime.applyToolLifecycle(alloc, .{ .authoritative_started = .{
+            .id = id,
+            .reconciles_provisional_call_id = null,
+            .tool_name = if (std.mem.eql(u8, id.call_id, "read")) "read_file" else "run_command",
+            .activity_kind = if (std.mem.eql(u8, id.call_id, "read")) .read else .command,
+        } });
+    }
+
+    try std.testing.expect(try runtime.presentActiveToolCancellation(alloc));
+    try std.testing.expectEqual(@as(usize, 2), runtime.activeToolActivityCount());
+
+    var rendered = try runtime.prepareTranscriptSource(alloc, null);
+    defer rendered.deinit(alloc);
+    try std.testing.expectEqual(
+        @as(usize, 2),
+        std.mem.count(u8, rendered.bytes, "What can fx do differently?"),
+    );
+    try std.testing.expect(std.mem.find(u8, rendered.bytes, "System:") == null);
+    try std.testing.expect(std.mem.find(u8, rendered.bytes, "Cancelling") == null);
+
+    _ = try runtime.applyToolLifecycle(alloc, .{ .terminal = .{
+        .id = ids[1],
+        .outcome = .{ .kind = .cancelled, .summary = "Cancelled sleep 30" },
+    } });
+    try std.testing.expectEqual(@as(usize, 1), runtime.activeToolActivityCount());
+}
+
+test "late successful settlement preserves its result and one turn cancellation" {
+    const alloc = std.testing.allocator;
+    for ([_]bool{ false, true }) |finish_before_terminal| {
+        var runtime = lifecycleTestRuntime(null);
+        defer runtime.deinit(alloc);
+
+        const id = lifecycleId(1, "late-success");
+        _ = try runtime.applyToolLifecycle(alloc, .{ .authoritative_started = .{
+            .id = id,
+            .reconciles_provisional_call_id = null,
+            .tool_name = "read_file",
+            .activity_kind = .read,
+        } });
+
+        try std.testing.expect(try runtime.presentActiveToolCancellation(alloc));
+        if (finish_before_terminal) {
+            _ = try runtime.applyToolLifecycle(alloc, .{ .turn_finished = .{
+                .turn_id = id.turn_id,
+                .outcome = .interrupted,
+            } });
+        }
+        _ = try runtime.applyToolLifecycle(alloc, .{ .terminal = .{
+            .id = id,
+            .outcome = .{ .kind = .completed, .summary = "Read the file" },
+            .result = "late result",
+        } });
+        if (!finish_before_terminal) {
+            _ = try runtime.applyToolLifecycle(alloc, .{ .turn_finished = .{
+                .turn_id = id.turn_id,
+                .outcome = .interrupted,
+            } });
+        }
+
+        var rendered = try runtime.prepareTranscriptSource(alloc, null);
+        defer rendered.deinit(alloc);
+        try std.testing.expectEqual(
+            @as(usize, 1),
+            std.mem.count(u8, rendered.bytes, "What can fx do differently?"),
+        );
+        try std.testing.expectEqual(
+            @as(usize, 1),
+            std.mem.count(u8, rendered.bytes, "Read the file"),
+        );
+        try std.testing.expectEqual(
+            RawEntryClass.turn_cancellation,
+            runtime.entries.getLast().raw_bytes.class,
+        );
+        const detail = runtime.toolDetailForEntry(runtime.toolActivityRecord(id).?.entry_id).?;
+        try std.testing.expectEqualStrings("late result", detail.result.?);
+        try std.testing.expectEqual(types.ToolOutcomeKind.completed, detail.outcome.?);
+    }
+}
+
+test "post-cancel sibling settlement preserves one turn cancellation" {
+    const alloc = std.testing.allocator;
+    for ([_]bool{ false, true }) |sibling_reports_terminal| {
+        var runtime = lifecycleTestRuntime(null);
+        defer runtime.deinit(alloc);
+
+        const first = lifecycleId(1, "first");
+        _ = try runtime.applyToolLifecycle(alloc, .{ .authoritative_started = .{
+            .id = first,
+            .reconciles_provisional_call_id = null,
+            .tool_name = "read_file",
+            .activity_kind = .read,
+        } });
+        try std.testing.expect(try runtime.presentActiveToolCancellation(alloc));
+        _ = try runtime.applyToolLifecycle(alloc, .{ .terminal = .{
+            .id = first,
+            .outcome = .{ .kind = .completed, .summary = "Read first" },
+        } });
+
+        const sibling = lifecycleId(1, "sibling");
+        _ = try runtime.applyToolLifecycle(alloc, .{ .authoritative_started = .{
+            .id = sibling,
+            .reconciles_provisional_call_id = null,
+            .tool_name = "grep_files",
+            .activity_kind = .read,
+        } });
+        if (sibling_reports_terminal) {
+            _ = try runtime.applyToolLifecycle(alloc, .{ .terminal = .{
+                .id = sibling,
+                .outcome = .{ .kind = .cancelled, .summary = "Search cancelled" },
+            } });
+        }
+        _ = try runtime.applyToolLifecycle(alloc, .{ .turn_finished = .{
+            .turn_id = first.turn_id,
+            .outcome = .interrupted,
+        } });
+
+        var rendered = try runtime.prepareTranscriptSource(alloc, null);
+        defer rendered.deinit(alloc);
+        try std.testing.expectEqual(
+            @as(usize, 1),
+            std.mem.count(u8, rendered.bytes, "What can fx do differently?"),
+        );
+        try std.testing.expectEqual(
+            @as(usize, 1),
+            std.mem.count(u8, rendered.bytes, "Read first"),
+        );
+    }
+}
+
+test "late zero-output command settlement reserves distinct presentation entries" {
+    const alloc = std.testing.allocator;
+    for ([_]bool{ false, true }) |finish_before_terminal| {
+        var runtime = lifecycleTestRuntime(null);
+        defer runtime.deinit(alloc);
+
+        const id = lifecycleId(1, "zero-output-command");
+        _ = try runtime.applyToolLifecycle(alloc, .{ .authoritative_started = .{
+            .id = id,
+            .reconciles_provisional_call_id = null,
+            .tool_name = "shell",
+            .activity_kind = .command,
+            .arguments_json = "{\"request\":{\"action\":\"run\",\"command\":\"true\"}}",
+        } });
+        try std.testing.expect(try runtime.presentActiveToolCancellation(alloc));
+        if (finish_before_terminal) {
+            _ = try runtime.applyToolLifecycle(alloc, .{ .turn_finished = .{
+                .turn_id = id.turn_id,
+                .outcome = .interrupted,
+            } });
+        }
+        _ = try runtime.applyToolLifecycle(alloc, .{ .terminal = .{
+            .id = id,
+            .outcome = .{ .kind = .completed, .summary = "Ran true" },
+            .result = "exit_code=0\n",
+            .result_memory = .{
+                .command_process_presentation = .{ .exit_code = 0 },
+            },
+        } });
+        if (!finish_before_terminal) {
+            _ = try runtime.applyToolLifecycle(alloc, .{ .turn_finished = .{
+                .turn_id = id.turn_id,
+                .outcome = .interrupted,
+            } });
+        }
+
+        var rendered = try runtime.prepareTranscriptSource(alloc, null);
+        defer rendered.deinit(alloc);
+        try std.testing.expectEqual(
+            @as(usize, 1),
+            std.mem.count(u8, rendered.bytes, "What can fx do differently?"),
+        );
+        try std.testing.expectEqual(
+            @as(usize, 1),
+            std.mem.count(u8, rendered.bytes, "Ran true"),
+        );
+        const detail = runtime.toolDetailForEntry(runtime.toolActivityRecord(id).?.entry_id).?;
+        try std.testing.expectEqual(types.ToolOutcomeKind.completed, detail.outcome.?);
+        try std.testing.expectEqual(
+            types.CommandProcessPresentation{ .exit_code = 0 },
+            detail.command_process_presentation.?,
+        );
+        try std.testing.expectEqual(
+            RawEntryClass.command_output,
+            runtime.rawEntryClass(detail.command_output_entry_id.?).?,
+        );
+        for (runtime.entries.items, 0..) |entry, entry_index| {
+            for (runtime.entries.items[entry_index + 1 ..]) |other| {
+                try std.testing.expect(entry.id() != other.id());
+            }
+        }
+    }
+}
+
+fn checkLateZeroOutputCommandCancellationAllocationFailuresImpl(alloc: Allocator) !void {
+    var runtime = lifecycleTestRuntime(null);
+    defer runtime.deinit(alloc);
+
+    const id = lifecycleId(1, "allocation-command");
+    _ = try runtime.applyToolLifecycle(alloc, .{ .authoritative_started = .{
+        .id = id,
+        .reconciles_provisional_call_id = null,
+        .tool_name = "shell",
+        .activity_kind = .command,
+        .arguments_json = "{\"request\":{\"action\":\"run\",\"command\":\"true\"}}",
+    } });
+    try std.testing.expect(try runtime.presentActiveToolCancellation(alloc));
+    _ = try runtime.applyToolLifecycle(alloc, .{ .turn_finished = .{
+        .turn_id = id.turn_id,
+        .outcome = .interrupted,
+    } });
+    _ = try runtime.applyToolLifecycle(alloc, .{ .terminal = .{
+        .id = id,
+        .outcome = .{ .kind = .completed, .summary = "Ran true" },
+        .result = "exit_code=0\n",
+        .result_memory = .{
+            .command_process_presentation = .{ .exit_code = 0 },
+        },
+    } });
+
+    const detail = runtime.toolDetailForEntry(runtime.toolActivityRecord(id).?.entry_id).?;
+    try std.testing.expectEqual(types.ToolOutcomeKind.completed, detail.outcome.?);
+    try std.testing.expectEqual(
+        RawEntryClass.command_output,
+        runtime.rawEntryClass(detail.command_output_entry_id.?).?,
+    );
+    var rendered = try runtime.prepareTranscriptSource(alloc, null);
+    defer rendered.deinit(alloc);
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        std.mem.count(u8, rendered.bytes, "What can fx do differently?"),
+    );
+}
+
+fn checkLateZeroOutputCommandCancellationAllocationFailures(alloc: Allocator) !void {
+    return checkLateZeroOutputCommandCancellationAllocationFailuresImpl(alloc) catch |err| switch (err) {
+        error.WriteFailed => error.OutOfMemory,
+        else => err,
+    };
+}
+
+test "late zero-output command cancellation remains atomic across allocation failures" {
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        checkLateZeroOutputCommandCancellationAllocationFailures,
+        .{},
+    );
 }
 
 fn expectRawEntryBytes(

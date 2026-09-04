@@ -123,6 +123,7 @@ pub const RawEntryClass = enum {
     command_output,
     diff_block,
     question_resolution,
+    turn_cancellation,
     subagent_status,
     unknown_raw,
 };
@@ -193,6 +194,7 @@ pub fn blockKindForRawClass(class: RawEntryClass) TranscriptBlockKind {
         .command_output => .command_output,
         .diff_block => .diff_block,
         .question_resolution => .cancel_notice,
+        .turn_cancellation => .cancel_notice,
         .subagent_status => .subagent_status,
         .unknown_raw => .unknown_raw,
     };
@@ -252,6 +254,7 @@ pub fn entryClassForEntry(entry: TranscriptEntry) TranscriptEntryClass {
             .command_output => .command_output,
             .diff_block => .diff_block,
             .question_resolution => .cancel_notice,
+            .turn_cancellation => .cancel_notice,
             .subagent_status => .subagent_status,
             .unknown_raw => .unknown_raw,
         },
@@ -2572,6 +2575,10 @@ pub fn footerBoundaryGapRowsForTail(kind: ?TranscriptBlockKind) u16 {
 }
 
 test "footer boundary gap applies to response-like and notice tail blocks" {
+    try std.testing.expectEqual(
+        TranscriptBlockKind.cancel_notice,
+        blockKindForRawClass(.turn_cancellation),
+    );
     try std.testing.expectEqual(@as(u16, 1), footerBoundaryGapRowsForTail(.assistant_turn));
     try std.testing.expectEqual(@as(u16, 1), footerBoundaryGapRowsForTail(.turn_summary));
     try std.testing.expectEqual(@as(u16, 1), footerBoundaryGapRowsForTail(.tool_status));
