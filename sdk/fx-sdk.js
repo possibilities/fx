@@ -1,4 +1,4 @@
-import { nativeHostAuthBrand } from "./internal.js";
+import { consumeNativeHostAuthorization } from "./internal.js";
 
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
@@ -44,12 +44,11 @@ function normalizeAgentOptions(value) {
   if (!value || typeof value !== "object" || Array.isArray(value)) {
     throw new TypeError("createFxAgent() options must be an object");
   }
+  const nativeHostAuth = consumeNativeHostAuthorization(value);
   const options = { ...value };
   if (Object.hasOwn(options, "env")) {
     throw new TypeError("createFxAgent() does not accept env; pass apiKey and model directly");
   }
-  const nativeHostAuth = options[nativeHostAuthBrand] === true;
-  delete options[nativeHostAuthBrand];
   options.apiKey = boundedString(
     options.apiKey,
     "apiKey",

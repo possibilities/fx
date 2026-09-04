@@ -14,7 +14,7 @@ import {
   supportsJspi,
   xtermAdapter,
 } from "./fx-sdk.js";
-import { nativeHostAuthBrand } from "./internal.js";
+import { authorizeNativeHostOptions } from "./internal.js";
 
 export { encodeXtermKeyEvent, fxSdkApiVersion, listModels, supportsJspi, xtermAdapter };
 export const libfxApiVersion = 3;
@@ -482,13 +482,14 @@ function createNativeCoreRuntime(addon, options) {
 }
 
 function createNativeAgent(addon, options) {
-  return createWasmAgent({
+  const nativeOptions = {
     ...options,
-    [nativeHostAuthBrand]: Boolean(options[normalizedAuthBrand]?.codex),
     runtimeFactory(runtimeOptions) {
       return createNativeCoreRuntime(addon, runtimeOptions);
     },
-  });
+  };
+  if (options[normalizedAuthBrand]?.codex) authorizeNativeHostOptions(nativeOptions);
+  return createWasmAgent(nativeOptions);
 }
 
 async function createWithFallback(surface, nativeMethod, wasmFactory, defaultWasm, options) {

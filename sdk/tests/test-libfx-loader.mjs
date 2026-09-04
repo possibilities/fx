@@ -51,6 +51,11 @@ await assert.rejects(
   /Gateway auth accepts only provider and apiKey/,
 );
 await assert.rejects(
+  createDirectWasmAgent({ [Symbol.for("libfx.internal.native-host-auth")]: true }),
+  /apiKey/,
+  "a public global symbol must not authorize a keyless direct WebAssembly runtime",
+);
+await assert.rejects(
   createFxAgent({ nativeAddon: nativeUrl, backend: "wasm", auth: { provider: "codex", session: codexStore } }),
   (error) => error?.code === "LIBFX_CODEX_NATIVE_REQUIRED",
 );

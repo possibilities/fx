@@ -144,12 +144,63 @@ fn deadlineExpired(deadline: std.Io.Clock.Timestamp) bool {
 }
 
 fn catalogEntryCount(alloc: Allocator, body: []const u8) !usize {
-    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
-    defer parsed.deinit();
-    if (parsed.value != .object) return error.MalformedResponse;
-    const data = parsed.value.object.get("data") orelse return error.MalformedResponse;
-    if (data != .array) return error.MalformedResponse;
-    return data.array.items.len;
+    var scanner = std.json.Scanner.initCompleteInput(alloc, body);
+    defer scanner.deinit();
+
+    switch (try scanner.next()) {
+        .object_begin => {},
+        else => return error.MalformedResponse,
+    }
+    var entry_count: ?usize = null;
+    while (true) {
+        switch (try scanner.peekNextTokenType()) {
+            .object_end => {
+                _ = try scanner.next();
+                break;
+            },
+            .string => {},
+            else => return error.MalformedResponse,
+        }
+
+        const key_is_data = key: {
+            const token = try scanner.nextAllocMax(alloc, .alloc_if_needed, max_catalog_bytes);
+            defer switch (token) {
+                .allocated_string => |value| alloc.free(value),
+                else => {},
+            };
+            const value = switch (token) {
+                .string => |value| value,
+                .allocated_string => |value| value,
+                else => return error.MalformedResponse,
+            };
+            break :key std.mem.eql(u8, value, "data");
+        };
+        if (!key_is_data) {
+            try scanner.skipValue();
+            continue;
+        }
+        if (entry_count != null) return error.MalformedResponse;
+        switch (try scanner.next()) {
+            .array_begin => {},
+            else => return error.MalformedResponse,
+        }
+        var count: usize = 0;
+        while (true) {
+            if (try scanner.peekNextTokenType() == .array_end) {
+                _ = try scanner.next();
+                break;
+            }
+            if (count == max_catalog_entries) return max_catalog_entries + 1;
+            count += 1;
+            try scanner.skipValue();
+        }
+        entry_count = count;
+    }
+    switch (try scanner.next()) {
+        .end_of_document => {},
+        else => return error.MalformedResponse,
+    }
+    return entry_count orelse error.MalformedResponse;
 }
 
 fn catalogUrl(alloc: Allocator, path: []const u8) ![]u8 {
@@ -158,4 +209,35 @@ fn catalogUrl(alloc: Allocator, path: []const u8) ![]u8 {
         return alloc.dupe(u8, candidate);
     }
     return std.fmt.allocPrint(alloc, "{s}{s}", .{ builtin_gateway.default_model_catalog_base_url, path });
+}
+
+test "host model catalog preflight bounds entries before full parsing" {
+    const alloc = std.testing.allocator;
+    for ([_]usize{ max_catalog_entries, max_catalog_entries + 1 }) |count| {
+        var body: std.Io.Writer.Allocating = .init(alloc);
+        defer body.deinit();
+        try body.writer.writeAll("{\"metadata\":{\"nested\":[1]},\"data\":[");
+        for (0..count) |index| {
+            if (index > 0) try body.writer.writeByte(',');
+            try body.writer.writeAll("{}");
+        }
+        try body.writer.writeAll("]}");
+
+        try std.testing.expectEqual(
+            @min(count, max_catalog_entries + 1),
+            try catalogEntryCount(alloc, body.writer.buffered()),
+        );
+    }
+}
+
+test "host model catalog preflight requires one data array" {
+    const alloc = std.testing.allocator;
+    try std.testing.expectError(
+        error.MalformedResponse,
+        catalogEntryCount(alloc, "{\"data\":{}}"),
+    );
+    try std.testing.expectError(
+        error.MalformedResponse,
+        catalogEntryCount(alloc, "{\"data\":[],\"data\":[]}"),
+    );
 }
