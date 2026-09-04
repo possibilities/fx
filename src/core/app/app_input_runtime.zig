@@ -62,7 +62,6 @@ const shell_runtime = @import("../../ui/shell_runtime.zig");
 const render_request = @import("../../ui/render_request.zig");
 const transcript_runtime = @import("../../ui/transcript/runtime.zig");
 const input_interrupt_runtime = @import("input_interrupt_runtime.zig");
-const input_queue_runtime = @import("input_queue_runtime.zig");
 const input_history_runtime = @import("input_history_runtime.zig");
 const input_completion_runtime = @import("input_completion_runtime.zig");
 const provider_picker_runtime = @import("provider_picker_runtime.zig");
@@ -124,45 +123,6 @@ fn projectMcpPromptMayOwnInput(state: ProjectMcpPromptInputState) bool {
         !state.authentication_active;
 }
 
-fn shortcutMayMutateQueuedDraft(action: input_action.ShortcutAction) bool {
-    return switch (action) {
-        .move,
-        .select_all,
-        .copy_selection,
-        .redraw,
-        => false,
-        .cut_selection,
-        .undo,
-        .redo,
-        .history_previous,
-        .history_next,
-        .delete_backward,
-        .delete_forward,
-        .delete_word_left,
-        .delete_whitespace_word_left,
-        .delete_word_right,
-        .delete_to_line_start,
-        .delete_to_line_end,
-        .yank,
-        .insert_newline,
-        => true,
-    };
-}
-
-fn shortcutDeletesQueuedDraft(action: input_action.ShortcutAction) bool {
-    return switch (action) {
-        .delete_backward,
-        .delete_forward,
-        .delete_word_left,
-        .delete_whitespace_word_left,
-        .delete_word_right,
-        .delete_to_line_start,
-        .delete_to_line_end,
-        => true,
-        else => false,
-    };
-}
-
 fn parseExplicitModelSelection(input: []const u8) ExplicitModelSelectionParse {
     const trimmed = std.mem.trim(u8, input, " \t\r\n");
     if (!std.ascii.startsWithIgnoreCase(trimmed, "/model")) return .none;
@@ -221,7 +181,6 @@ pub fn Runtime(comptime App: type) type {
         const approval_rt = input_approval_runtime.ApprovalRuntime(App);
         const question_rt = input_question_runtime.QuestionRuntime(App);
         const interrupt_rt = input_interrupt_runtime.InterruptRuntime(App);
-        const queue_rt = input_queue_runtime.Runtime(App);
         const full_transcript_rt = input_full_transcript_runtime.Runtime(App);
 
         const ctrl_c_exit_window_ms = gesture_state.ctrl_c_exit_window_ms;
@@ -287,10 +246,6 @@ pub fn Runtime(comptime App: type) type {
         }
 
         fn routeComposerShortcutAction(app: *App, action: input_action.ShortcutAction, max_input_len: usize) !void {
-            if (comptime @hasField(App, "queued_prompt_review")) {
-                if (shortcutDeletesQueuedDraft(action) and try queue_rt.deleteEmptyVisibleDraft(app)) return;
-                if (shortcutMayMutateQueuedDraft(action)) queue_rt.markVisibleSelectionDirty(app);
-            }
             switch (action) {
                 .move => |intent| {
                     switch (intent.kind) {
@@ -956,14 +911,6 @@ pub fn Runtime(comptime App: type) type {
             {
                 app.shell.render_requests.request(.footer);
             }
-            if (isComposerEditingByte(byte, raw.composer_shortcut) and
-                !activeCatalogMenuOwnsByte(app, byte))
-            {
-                if (comptime @hasField(App, "queued_prompt_review")) {
-                    queue_rt.markVisibleSelectionDirty(app);
-                }
-            }
-
             try handleComposerByte(
                 app,
                 byte,
@@ -1022,9 +969,6 @@ pub fn Runtime(comptime App: type) type {
                     }
                 }
                 dismissActiveMenusThenRedraw(app);
-                if (comptime @hasField(App, "queued_prompt_review")) {
-                    queue_rt.markVisibleSelectionDirty(app);
-                }
                 paste_rt.beginPaste(app, max_input_len);
                 return .done;
             }
@@ -1133,10 +1077,6 @@ pub fn Runtime(comptime App: type) type {
                 => {},
                 .clear_line => {
                     dismissActiveMenusThenRedraw(app);
-                    if (comptime @hasField(App, "queued_prompt_review")) {
-                        if (try queue_rt.deleteEmptyVisibleDraft(app)) return .done;
-                        queue_rt.markVisibleSelectionDirty(app);
-                    }
                     if (draftHasState(app)) {
                         clearDraftState(app, "clear_line");
                         app.shell.render_requests.request(.footer);
@@ -1421,9 +1361,6 @@ pub fn Runtime(comptime App: type) type {
                     if (dismissActiveMenusForComposerEdit(app)) {
                         app.shell.render_requests.request(.footer);
                     }
-                    if (comptime @hasField(App, "queued_prompt_review")) {
-                        queue_rt.markVisibleSelectionDirty(app);
-                    }
                     switch (try insertComposerSliceBounded(
                         app,
                         bytes,
@@ -1459,9 +1396,6 @@ pub fn Runtime(comptime App: type) type {
                     try handleSemanticCtrlD(app, max_input_len);
                 },
                 '\t' => {
-                    if (comptime @hasField(App, "queued_prompt_review")) {
-                        queue_rt.markVisibleSelectionDirty(app);
-                    }
                     if (cycleHelpMenuCategory(app, 1) or cycleSettingsMenuCategory(app, 1)) {
                         app.shell.render_requests.request(.footer);
                     } else if (moveAuthPickerIfActive(app, 1)) {
@@ -1512,8 +1446,7 @@ pub fn Runtime(comptime App: type) type {
                 },
                 ' ' => {
                     dismissMentionSkillsMenuForSpace(app);
-                    if (!queue_rt.ownsComposer(app) and
-                        app.input_runtime.edit_state.selectionRange() == null and
+                    if (app.input_runtime.edit_state.selectionRange() == null and
                         !commandSkillsMenuActive(app) and
                         completion_rt.hasModelQuery(app))
                     {
@@ -1545,13 +1478,12 @@ pub fn Runtime(comptime App: type) type {
                     return;
                 },
                 '\r' => {
-                    const queue_review_owns_composer = queue_rt.ownsComposer(app);
                     if (try submitSettingsMenuSelection(app)) return;
                     if (try submitHelpMenuSelection(app, max_input_len, max_prompt_history)) return;
                     if (try submitAuthPickerSelection(app)) return;
-                    if (!queue_review_owns_composer and try submitModelMenuSelection(app)) return;
+                    if (try submitModelMenuSelection(app)) return;
                     if (try submitSkillsMenuSelection(app, max_input_len)) return;
-                    if (!queue_review_owns_composer and try submitSlashPickerSelection(app)) return;
+                    if (try submitSlashPickerSelection(app)) return;
                     if (comptime runtime_profile.allows(App, .durable_sessions)) {
                         if (try submitSessionPickerSelection(app)) return;
                     }
@@ -1562,13 +1494,11 @@ pub fn Runtime(comptime App: type) type {
                         app.shell.render_requests.request(.footer);
                         return;
                     }
-                    if (!queue_review_owns_composer and
-                        picker_state.isBareModelCommandAtCursor(&app.input_runtime.edit_state))
-                    {
+                    if (picker_state.isBareModelCommandAtCursor(&app.input_runtime.edit_state)) {
                         try openModelBrowseCatalog(app);
                         return;
                     }
-                    if (!queue_review_owns_composer and provider_picker_rt.hasQuery(app)) {
+                    if (provider_picker_rt.hasQuery(app)) {
                         if (app.stream.active) {
                             try app.writeDomainNotice(.{
                                 .topic = "provider",
@@ -1580,10 +1510,10 @@ pub fn Runtime(comptime App: type) type {
                         }
                         if (try provider_picker_rt.submit(app)) return;
                     }
-                    if (!queue_review_owns_composer and completion_rt.hasModelQuery(app)) {
+                    if (completion_rt.hasModelQuery(app)) {
                         if (try completion_rt.submitModelPicker(app)) return;
                     }
-                    if (!queue_review_owns_composer and try submitExplicitModelSelection(
+                    if (try submitExplicitModelSelection(
                         app,
                         resolveExplicitModelSelection(app, app.input_runtime.edit_state.input.items),
                     )) return;
@@ -2683,7 +2613,6 @@ pub fn Runtime(comptime App: type) type {
 
         fn submitSlashPickerSelection(app: *App) !bool {
             if (comptime !@hasField(App, "skills")) return false;
-            if (queue_rt.ownsComposer(app)) return false;
             if (nonSlashPickerOwnsEnter(app)) return false;
             const items = app.input_runtime.edit_state.input.items;
             const prefix = command_specs.slashCompletionPrefix(
@@ -2743,7 +2672,6 @@ pub fn Runtime(comptime App: type) type {
             app: *App,
             parsed: ExplicitModelSelectionParse,
         ) !bool {
-            if (queue_rt.ownsComposer(app)) return false;
             switch (parsed) {
                 .none => return false,
                 .invalid => {
@@ -2985,12 +2913,6 @@ pub fn Runtime(comptime App: type) type {
                     app.shell.render_requests.request(.footer);
                     return;
                 }
-                if (comptime @hasField(App, "queued_prompt_review")) {
-                    if (try queue_rt.hideVisibleDraft(app)) {
-                        _ = disarmEscapeClear(app);
-                        return;
-                    }
-                }
                 if (!interrupt_rt.pauseActiveRecovery(app)) {
                     try interrupt_rt.cancelActiveOperation(app);
                 }
@@ -3016,16 +2938,6 @@ pub fn Runtime(comptime App: type) type {
                 _ = disarmEscapeClear(app);
                 app.shell.render_requests.request(.footer);
                 return;
-            }
-            if (comptime @hasField(App, "queued_prompt_review")) {
-                if (try queue_rt.hideVisibleDraft(app)) {
-                    _ = disarmEscapeClear(app);
-                    return;
-                }
-                if (queue_rt.cancelAllHiddenPostCancelQueued(app)) {
-                    _ = disarmEscapeClear(app);
-                    return;
-                }
             }
             if (!draftHasState(app)) {
                 _ = disarmEscapeClear(app);
@@ -3429,16 +3341,6 @@ const RoutingWorker = struct {
     queued_count: usize = 0,
     synced_permission_mode: ?types.PermissionMode = null,
     permission_mode_sync_count: usize = 0,
-    queue_review_reason: ?worker_runtime.QueueReviewReason = null,
-    replaced_queue_prompt: [128]u8 = undefined,
-    replaced_queue_prompt_len: usize = 0,
-
-    pub fn queuePreview(self: *RoutingWorker) @import("../agent/worker_runtime.zig").QueuePreview {
-        return .{
-            .count = self.queued_count,
-            .paused = self.queue_review_reason != null,
-        };
-    }
 
     pub fn queuedPromptCount(self: *const RoutingWorker) usize {
         return self.queued_count;
@@ -3456,15 +3358,8 @@ const RoutingWorker = struct {
         self.cancel_requested = true;
     }
 
-    pub fn requestInteractiveCancel(self: *RoutingWorker) bool {
+    pub fn requestInteractiveCancel(self: *RoutingWorker) void {
         self.cancel_requested = true;
-        return self.beginQueueReview(.post_cancel);
-    }
-
-    pub fn beginQueueReview(self: *RoutingWorker, reason: worker_runtime.QueueReviewReason) bool {
-        if (self.queued_count == 0 and self.queue_review_reason == null) return false;
-        self.queue_review_reason = reason;
-        return true;
     }
 
     pub fn interactiveAdmissionSnapshot(self: *RoutingWorker) worker_runtime.InteractiveAdmissionSnapshot {
@@ -3544,13 +3439,6 @@ const RoutingWorker = struct {
 
     pub fn syncQueuedPromptEffort(_: *RoutingWorker, _: types.ReasoningEffort) void {}
 
-    pub fn snapshotQueuedPromptDrafts(
-        _: *RoutingWorker,
-        _: std.mem.Allocator,
-    ) ![]worker_runtime.QueuedPromptDraft {
-        return &.{};
-    }
-
     pub fn clearQueuedPrompts(
         self: *RoutingWorker,
         _: std.mem.Allocator,
@@ -3559,7 +3447,7 @@ const RoutingWorker = struct {
         self.queued_count = 0;
     }
 
-    pub fn deleteQueuedPromptDraft(
+    pub fn removeQueuedPrompt(
         self: *RoutingWorker,
         _: std.mem.Allocator,
         _: u64,
@@ -3567,33 +3455,6 @@ const RoutingWorker = struct {
     ) bool {
         if (self.queued_count == 0) return false;
         self.queued_count -= 1;
-        return true;
-    }
-
-    pub fn queueReviewReason(self: *const RoutingWorker) ?worker_runtime.QueueReviewReason {
-        return self.queue_review_reason;
-    }
-
-    pub fn replaceQueuedPromptDrafts(
-        self: *RoutingWorker,
-        _: std.mem.Allocator,
-        drafts: []const worker_runtime.QueuedPromptDraft,
-    ) !bool {
-        if (drafts.len == 0) return true;
-        self.replaced_queue_prompt_len = @min(
-            drafts[0].prompt.len,
-            self.replaced_queue_prompt.len,
-        );
-        @memcpy(
-            self.replaced_queue_prompt[0..self.replaced_queue_prompt_len],
-            drafts[0].prompt[0..self.replaced_queue_prompt_len],
-        );
-        return true;
-    }
-
-    pub fn resumeQueueReview(self: *RoutingWorker) bool {
-        if (self.queue_review_reason == null) return false;
-        self.queue_review_reason = null;
         return true;
     }
 };
@@ -3630,40 +3491,6 @@ fn armEscapeClearForTest(input_runtime: *core_input_runtime.Runtime, armed_ms: i
         input_runtime.gestures,
         armed_ms,
     ).next;
-}
-
-test "queued draft cursor movement does not lock vertical navigation" {
-    const cursor_actions = [_]input_action.ShortcutAction{
-        .{ .move = .{ .kind = .character_left } },
-        .{ .move = .{ .kind = .character_right } },
-        .{ .move = .{ .kind = .line_start } },
-        .{ .move = .{ .kind = .line_end } },
-        .{ .move = .{ .kind = .word_left } },
-        .{ .move = .{ .kind = .word_right } },
-    };
-    for (cursor_actions) |action| {
-        try std.testing.expect(!shortcutMayMutateQueuedDraft(action));
-    }
-    try std.testing.expect(shortcutMayMutateQueuedDraft(.delete_backward));
-    try std.testing.expect(shortcutMayMutateQueuedDraft(.insert_newline));
-}
-
-test "all destructive composer shortcuts can delete an empty queued draft" {
-    const deletion_actions = [_]input_action.ShortcutAction{
-        .delete_backward,
-        .delete_forward,
-        .delete_word_left,
-        .delete_whitespace_word_left,
-        .delete_word_right,
-        .delete_to_line_start,
-        .delete_to_line_end,
-    };
-    for (deletion_actions) |action| {
-        try std.testing.expect(shortcutDeletesQueuedDraft(action));
-    }
-    try std.testing.expect(!shortcutDeletesQueuedDraft(.cut_selection));
-    try std.testing.expect(!shortcutDeletesQueuedDraft(.{ .move = .{ .kind = .character_left } }));
-    try std.testing.expect(!shortcutDeletesQueuedDraft(.insert_newline));
 }
 
 test "project MCP prompt waits for every existing modal owner" {
@@ -3705,7 +3532,6 @@ const RoutingFakeApp = struct {
     approval_screen: interaction_state.ApprovalScreenState = .{},
     question_prompt: question_prompt.QuestionPrompt = .{},
     input_runtime: core_input_runtime.Runtime = .{},
-    queued_prompt_review: input_queue_runtime.State = .{},
     terminal_input_runtime: test_ui_input.Runtime = .{},
     shell: transcript_runtime.TranscriptRuntime = .{},
     terminal: shell_runtime.TerminalState = .{},
@@ -3813,7 +3639,6 @@ const RoutingFakeApp = struct {
         self.auth.deinit(self.alloc);
         self.approval_prompt.deinit(self.alloc);
         self.question_prompt.deinit(self.alloc);
-        self.queued_prompt_review.deinit(self.alloc);
         self.input_runtime.deinit(self.alloc);
         self.terminal_input_runtime.deinit(self.alloc);
         self.subagents.deinit(self.alloc);
@@ -4150,31 +3975,6 @@ const RoutingFakeApp = struct {
         self.pending_images.clearRetainingCapacity();
     }
 };
-
-fn openRoutingQueueReview(app: *RoutingFakeApp, input: []const u8) !void {
-    const entries = try app.alloc.alloc(input_queue_runtime.ReviewEntry, 1);
-    var entries_owned = true;
-    errdefer if (entries_owned) app.alloc.free(entries);
-    const prompt = try app.alloc.dupe(u8, input);
-    var prompt_owned = true;
-    errdefer if (prompt_owned) app.alloc.free(prompt);
-    entries[0] = .{ .draft = .{
-        .turn_id = 1,
-        .prompt = prompt,
-        .images = &.{},
-        .skill_display_spans = &.{},
-    } };
-    app.queued_prompt_review = .{
-        .entries = entries,
-        .selected_index = 0,
-        .reason = .manual,
-        .visible = true,
-    };
-    entries_owned = false;
-    prompt_owned = false;
-    app.worker.queue_review_reason = .manual;
-    try app.input_runtime.textReplacementState().replace(app.alloc, input);
-}
 
 fn routingOpenUrl(
     _: ?*anyopaque,
@@ -6611,46 +6411,6 @@ test "app_input_runtime Enter on selected model slash completion opens browse on
     try std.testing.expect(app.model_cache.menu.active);
     try std.testing.expectEqualStrings("", app.input_runtime.edit_state.input.items);
     try std.testing.expectEqual(@as(usize, 0), app.transcript.items.len);
-}
-
-test "queue review keeps model-shaped Space in the queued draft" {
-    const alloc = std.testing.allocator;
-    var app = try RoutingFakeApp.init(alloc);
-    defer app.deinit();
-    try openRoutingQueueReview(&app, "/model openai/gpt-5");
-
-    try Runtime(RoutingFakeApp).handleByte(&app, ' ', 4096, 100);
-
-    try std.testing.expectEqualStrings("/model openai/gpt-5 ", app.input_runtime.edit_state.input.items);
-    try std.testing.expect(app.queued_prompt_review.visible);
-    try std.testing.expectEqual(@as(usize, 0), app.preference_commit_count);
-    try std.testing.expect(!app.model_cache.menu.active);
-}
-
-test "queue review Enter submits model-shaped text as the queued draft" {
-    const cases = [_][]const u8{
-        "/model",
-        "/mode",
-        "/model openai/gpt-5 auto normal",
-    };
-    for (cases) |input| {
-        const alloc = std.testing.allocator;
-        var app = try RoutingFakeApp.init(alloc);
-        defer app.deinit();
-        try openRoutingQueueReview(&app, input);
-
-        try Runtime(RoutingFakeApp).handleByte(&app, '\r', 4096, 100);
-
-        try std.testing.expectEqualStrings(
-            input,
-            app.worker.replaced_queue_prompt[0..app.worker.replaced_queue_prompt_len],
-        );
-        try std.testing.expect(!app.queued_prompt_review.active());
-        try std.testing.expectEqual(@as(usize, 0), app.preference_commit_count);
-        try std.testing.expect(!app.model_cache.menu.active);
-        try std.testing.expect(app.last_command == null);
-        try std.testing.expectEqualStrings("test/model", app.selected_model.items);
-    }
 }
 
 test "app_input_runtime bare model Tab opens on current scrolled selection before staging effort" {
@@ -10589,17 +10349,20 @@ test "app_input_runtime active Ctrl-C cancels stream and arms exit window" {
 
     try std.testing.expect(!app.stream.active);
     try std.testing.expect(app.worker.cancel_requested);
-    try std.testing.expectEqualStrings("● System: cancelled", app.transcript.items);
-    try std.testing.expectEqualStrings("system", app.notice_topic.items);
-    try std.testing.expectEqual(types.NoticeTone.cancelled, app.notice_tone);
-    try std.testing.expectEqualStrings("cancelled", app.notice_body.items);
+    var rendered = try app.shell.prepareTranscriptSource(alloc, null);
+    defer rendered.deinit(alloc);
+    try std.testing.expect(std.mem.find(u8, rendered.bytes, "Cancelled") != null);
+    try std.testing.expect(std.mem.find(u8, rendered.bytes, "What can fx do differently?") != null);
+    try std.testing.expect(std.mem.find(u8, rendered.bytes, "System:") == null);
+    try std.testing.expect(std.mem.find(u8, rendered.bytes, "Cancelling") == null);
+    try std.testing.expectEqual(@as(usize, 0), app.notice_write_count);
     try std.testing.expect(app.input_runtime.gestures.ctrlCExitArmed());
     try std.testing.expect(app.input_runtime.gestures.ctrlCExitArmedAt() != null);
     try std.testing.expect(!app.should_exit);
     try std.testing.expect(app.shell.render_requests.hasReason(.footer));
 }
 
-test "app_input_runtime active tool Escape waits for terminal feedback before repainting" {
+test "app_input_runtime active tool Escape presents final cancellation immediately" {
     const alloc = std.testing.allocator;
     var app = try RoutingFakeApp.init(alloc);
     defer app.deinit();
@@ -10617,10 +10380,16 @@ test "app_input_runtime active tool Escape waits for terminal feedback before re
 
     try std.testing.expect(app.stream.active);
     try std.testing.expect(app.worker.cancel_requested);
-    try std.testing.expectEqualStrings("", app.transcript.items);
+    var rendered = try app.shell.prepareTranscriptSource(alloc, null);
+    defer rendered.deinit(alloc);
+    try std.testing.expect(std.mem.find(u8, rendered.bytes, "Cancelled") != null);
+    try std.testing.expect(std.mem.find(u8, rendered.bytes, "What can fx do differently?") != null);
+    try std.testing.expect(std.mem.find(u8, rendered.bytes, "System:") == null);
+    try std.testing.expect(std.mem.find(u8, rendered.bytes, "Cancelling") == null);
+    try std.testing.expectEqual(@as(usize, 1), app.shell.activeToolActivityCount());
     try std.testing.expectEqualStrings("", app.notice_topic.items);
     try std.testing.expectEqualStrings("", app.notice_body.items);
-    try std.testing.expect(!app.shell.render_requests.hasReason(.footer));
+    try std.testing.expect(app.shell.render_requests.hasReason(.footer));
 }
 
 test "app_input_runtime second Ctrl-C after active cancellation exits without duplicate notice" {
@@ -10633,8 +10402,13 @@ test "app_input_runtime second Ctrl-C after active cancellation exits without du
     try Runtime(RoutingFakeApp).handleByte(&app, 3, 4096, 100);
 
     try std.testing.expect(app.should_exit);
-    try std.testing.expectEqualStrings("● System: cancelled", app.transcript.items);
-    try std.testing.expectEqual(types.NoticeTone.cancelled, app.notice_tone);
+    var rendered = try app.shell.prepareTranscriptSource(alloc, null);
+    defer rendered.deinit(alloc);
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        std.mem.count(u8, rendered.bytes, "What can fx do differently?"),
+    );
+    try std.testing.expect(std.mem.find(u8, rendered.bytes, "System:") == null);
 }
 
 test "app_input_runtime pending Ctrl-C exits before repeating active cancellation" {
@@ -11665,7 +11439,7 @@ const FakeSubmitApp = struct {
             self.held = false;
         }
 
-        pub fn deleteQueuedPromptDraft(
+        pub fn removeQueuedPrompt(
             self: *@This(),
             _: std.mem.Allocator,
             turn_id: u64,
@@ -11845,12 +11619,12 @@ const FakeSubmitApp = struct {
 
     pub fn adoptPendingUserPrompt(
         _: *FakeSubmitApp,
-        _: *const worker_runtime.QueuedPromptDraft,
+        _: *const input_submit_runtime.PendingPromptDraft,
     ) !void {}
 
     pub fn finalizePendingSubmission(
         self: *FakeSubmitApp,
-        draft: *const worker_runtime.QueuedPromptDraft,
+        draft: *const input_submit_runtime.PendingPromptDraft,
     ) !void {
         if (self.fail_pending_finalization) {
             return error.InjectedPendingFinalizationFailure;
@@ -12261,7 +12035,7 @@ test "app_input_runtime submit resolves slash completion through core command sp
     try std.testing.expect(app.shell.render_requests.hasReason(.footer));
 }
 
-test "app_input_runtime idle submit installs one pending owner before queue effects" {
+test "app_input_runtime idle submit commits its frame before credential preflight" {
     const alloc = std.testing.allocator;
     var app = FakeSubmitApp{ .alloc = alloc };
     defer app.deinit();
@@ -12278,12 +12052,22 @@ test "app_input_runtime idle submit installs one pending owner before queue effe
         app.submission.pending.?.phase,
     );
     try std.testing.expect(app.worker.held);
+    try std.testing.expectEqual(@as(usize, 0), app.preflight_count);
     try std.testing.expectEqual(@as(usize, 0), app.queue_accept_count);
     try std.testing.expect(app.last_prompt == null);
     try std.testing.expectEqual(@as(usize, 1), app.input_runtime.composer_history.count());
     try std.testing.expectEqual(@as(usize, 0), app.input_runtime.edit_state.input.items.len);
     try std.testing.expect(app.shell.render_requests.hasReason(.transcript));
     try std.testing.expect(app.shell.render_requests.hasReason(.footer));
+
+    input_submit_runtime.SubmitRuntime(FakeSubmitApp).noteCommittedFrame(&app);
+    input_submit_runtime.SubmitRuntime(FakeSubmitApp).collectPendingSubmissionFacts(&app);
+
+    try std.testing.expectEqual(@as(usize, 1), app.preflight_count);
+    try std.testing.expectEqual(
+        input_submit_runtime.PendingPhase.queued,
+        app.submission.pending.?.phase,
+    );
 }
 
 test "app_input_runtime second Enter preserves the newer draft until pending acknowledgement" {
@@ -12303,7 +12087,7 @@ test "app_input_runtime second Enter preserves the newer draft until pending ack
     try std.testing.expectEqualStrings("newer draft", app.input_runtime.edit_state.input.items);
     try std.testing.expectEqual(@as(usize, 0), app.queue_accept_count);
     try std.testing.expectEqual(@as(usize, 1), app.input_runtime.composer_history.count());
-    try std.testing.expectEqual(@as(usize, 1), app.preflight_count);
+    try std.testing.expectEqual(@as(usize, 0), app.preflight_count);
     try std.testing.expectEqual(@as(usize, 0), app.command_count);
     try std.testing.expectEqual(@as(usize, 0), app.capture_count);
     try std.testing.expect(app.worker.held);
@@ -12314,7 +12098,7 @@ test "app_input_runtime second Enter preserves the newer draft until pending ack
     try Runtime(FakeSubmitApp).submit(&app, 100);
 
     try std.testing.expectEqualStrings("/help", app.input_runtime.edit_state.input.items);
-    try std.testing.expectEqual(@as(usize, 1), app.preflight_count);
+    try std.testing.expectEqual(@as(usize, 0), app.preflight_count);
     try std.testing.expectEqual(@as(usize, 0), app.command_count);
 }
 

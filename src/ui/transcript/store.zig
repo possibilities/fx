@@ -1449,6 +1449,7 @@ pub fn replacePinnedToolStatusForTerminalAtomic(
     new_bytes: []const u8,
     additional_tool_detail_capacity: usize,
     additional_command_output_capacity: usize,
+    turn_cancellation_line: ?[]const u8,
 ) !bool {
     return replacePinnedToolStatusAtomicInternal(
         self,
@@ -1460,6 +1461,7 @@ pub fn replacePinnedToolStatusForTerminalAtomic(
         .{
             .tool_details = additional_tool_detail_capacity,
             .command_output_entries = additional_command_output_capacity,
+            .turn_cancellation_line = turn_cancellation_line,
         },
     );
 }
@@ -1467,9 +1469,12 @@ pub fn replacePinnedToolStatusForTerminalAtomic(
 const LifecycleStatusReservations = struct {
     tool_details: usize = 0,
     command_output_entries: usize = 0,
+    turn_cancellation_line: ?[]const u8 = null,
 
     fn empty(self: LifecycleStatusReservations) bool {
-        return self.tool_details == 0 and self.command_output_entries == 0;
+        return self.tool_details == 0 and
+            self.command_output_entries == 0 and
+            self.turn_cancellation_line == null;
     }
 };
 
@@ -1504,7 +1509,11 @@ fn replacePinnedToolStatusAtomicInternal(
     var shadow = try cloneMutationState(self, alloc);
     defer shadow.deinit(alloc);
     try shadow.tool_details.ensureUnusedCapacity(alloc, reservations.tool_details);
-    try shadow.entries.ensureUnusedCapacity(alloc, reservations.command_output_entries);
+    try shadow.entries.ensureUnusedCapacity(
+        alloc,
+        reservations.command_output_entries +
+            @intFromBool(reservations.turn_cancellation_line != null),
+    );
     try shadow.command_output_blocks.ensureUnusedCapacity(
         alloc,
         reservations.command_output_entries,
@@ -1519,10 +1528,23 @@ fn replacePinnedToolStatusAtomicInternal(
         const entry = shadow.entries.orderedRemove(shadow_index);
         shadow.entries.appendAssumeCapacity(entry);
     }
+    var retention_anchor = entry_id;
+    if (reservations.turn_cancellation_line) |cancellation_line| {
+        const owned = try alloc.dupe(u8, cancellation_line);
+        var handed_off = false;
+        errdefer if (!handed_off) alloc.free(owned);
+        retention_anchor = try appendRawBytesEntryClassified(
+            &shadow,
+            alloc,
+            owned,
+            .turn_cancellation,
+        );
+        handed_off = true;
+    }
     const retention_changed = try enforceStructuredRetentionAndReport(
         &shadow,
         alloc,
-        entry_id,
+        retention_anchor,
     );
     try rebuildTranscriptCacheFromEntries(
         &shadow,
@@ -1548,6 +1570,7 @@ pub fn replacePinnedToolStatusesAtomic(
     alloc: Allocator,
     updates: []const LifecycleEntryUpdate,
     additional_tool_detail_capacity: usize,
+    turn_cancellation_line: ?[]const u8,
 ) !void {
     return replacePinnedToolStatusesAtomicWithRewriteMode(
         self,
@@ -1555,6 +1578,7 @@ pub fn replacePinnedToolStatusesAtomic(
         updates,
         .strict,
         additional_tool_detail_capacity,
+        turn_cancellation_line,
     );
 }
 
@@ -1563,6 +1587,7 @@ pub fn replacePinnedToolStatusesPreservingNormalBufferAnchorAtomic(
     alloc: Allocator,
     updates: []const LifecycleEntryUpdate,
     additional_tool_detail_capacity: usize,
+    turn_cancellation_line: ?[]const u8,
 ) !void {
     return replacePinnedToolStatusesAtomicWithRewriteMode(
         self,
@@ -1570,6 +1595,7 @@ pub fn replacePinnedToolStatusesPreservingNormalBufferAnchorAtomic(
         updates,
         .preserve_same_epoch,
         additional_tool_detail_capacity,
+        turn_cancellation_line,
     );
 }
 
@@ -1579,8 +1605,9 @@ fn replacePinnedToolStatusesAtomicWithRewriteMode(
     updates: []const LifecycleEntryUpdate,
     rewrite_mode: TranscriptSourceRewriteMode,
     additional_tool_detail_capacity: usize,
+    turn_cancellation_line: ?[]const u8,
 ) !void {
-    if (updates.len == 0) return;
+    if (updates.len == 0 and turn_cancellation_line == null) return;
     try self.assertCanMutateTranscript();
 
     var shadow = try cloneMutationState(self, alloc);
@@ -1588,6 +1615,10 @@ fn replacePinnedToolStatusesAtomicWithRewriteMode(
     try shadow.tool_details.ensureUnusedCapacity(
         alloc,
         additional_tool_detail_capacity,
+    );
+    try shadow.entries.ensureUnusedCapacity(
+        alloc,
+        @intFromBool(turn_cancellation_line != null),
     );
     for (updates) |update| {
         const entry_index = rawEntryIndex(&shadow, update.entry_id) orelse
@@ -1600,10 +1631,23 @@ fn replacePinnedToolStatusesAtomicWithRewriteMode(
         shadow.entries.items[entry_index].raw_bytes.bytes = replacement;
         shadow.entries.items[entry_index].raw_bytes.class = .tool_status;
     }
+    var turn_cancellation_entry_id: ?u32 = null;
+    if (turn_cancellation_line) |line| {
+        const owned = try alloc.dupe(u8, line);
+        var handed_off = false;
+        errdefer if (!handed_off) alloc.free(owned);
+        turn_cancellation_entry_id = try appendRawBytesEntryClassified(
+            &shadow,
+            alloc,
+            owned,
+            .turn_cancellation,
+        );
+        handed_off = true;
+    }
     const retention_changed = try enforceStructuredRetentionAndReport(
         &shadow,
         alloc,
-        null,
+        turn_cancellation_entry_id,
     );
     try rebuildTranscriptCacheFromEntries(
         &shadow,
@@ -1613,16 +1657,21 @@ fn replacePinnedToolStatusesAtomicWithRewriteMode(
     shadow.recomputeCursorFromTranscript();
     requestTranscriptPaint(&shadow);
 
-    var dirty_entry_index = rawEntryIndex(&shadow, updates[0].entry_id) orelse
-        return error.MissingLifecycleTranscriptEntry;
-    for (updates[1..]) |update| {
-        dirty_entry_index = @min(
-            dirty_entry_index,
-            rawEntryIndex(&shadow, update.entry_id) orelse
-                return error.MissingLifecycleTranscriptEntry,
-        );
+    var dirty_entry_id: u32 = undefined;
+    if (updates.len > 0) {
+        var dirty_entry_index = rawEntryIndex(&shadow, updates[0].entry_id) orelse
+            return error.MissingLifecycleTranscriptEntry;
+        for (updates[1..]) |update| {
+            dirty_entry_index = @min(
+                dirty_entry_index,
+                rawEntryIndex(&shadow, update.entry_id) orelse
+                    return error.MissingLifecycleTranscriptEntry,
+            );
+        }
+        dirty_entry_id = shadow.entries.items[dirty_entry_index].id();
+    } else {
+        dirty_entry_id = turn_cancellation_entry_id.?;
     }
-    const dirty_entry_id = shadow.entries.items[dirty_entry_index].id();
     try commitAuthoritativeRecordedMutationStateFromEntry(
         self,
         &shadow,
@@ -2919,6 +2968,7 @@ fn themeOwnsRawEntry(class: RawEntryClass) bool {
         .tool_status,
         .diff_block,
         .question_resolution,
+        .turn_cancellation,
         .subagent_status,
         => true,
         .command_output, .unknown_raw => false,
