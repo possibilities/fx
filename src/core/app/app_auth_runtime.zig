@@ -8,7 +8,6 @@ const io_mod = @import("../shared/io.zig");
 const credentials = @import("../auth/credentials.zig");
 const auth_runtime = @import("../auth/auth_runtime.zig");
 const login_flow = @import("../auth/login_flow.zig");
-const oauth = @import("../auth/oauth.zig");
 const chatgpt_oauth = @import("../auth/chatgpt_oauth.zig");
 const grok_oauth = @import("../auth/grok_oauth.zig");
 const provider_catalog = @import("../auth/provider_catalog.zig");
@@ -87,6 +86,12 @@ const TeamCatalogValidation = union(enum) {
     }
 };
 
+pub const PendingPromptCredentialReadiness = enum {
+    pending,
+    current,
+    rejected,
+};
+
 pub fn Runtime(comptime App: type) type {
     return struct {
         fn ensurePromptCredential(app: *App) !bool {
@@ -94,33 +99,101 @@ pub fn Runtime(comptime App: type) type {
                 @hasDecl(@TypeOf(app.auth), "selectForProvider"))
             {
                 const provider = provider_runtime.provider(app);
-                const required_source: credentials.Source = switch (provider) {
-                    .codex => .chatgpt_subscription,
-                    .grok => .grok_subscription,
-                    .gateway => app.auth.credentialSource() orelse .fx_login,
-                };
-                const route_change = app.auth.selectForProvider(app.alloc, provider) catch |err| switch (err) {
-                    error.OutOfMemory => return err,
-                    else => return recoverCredentialFailure(app, required_source, err),
-                };
-                if (route_change) |changed| {
-                    applyCredentialChange(app, changed);
-                } else if (!model_provider.authorizesCredential(provider, app.auth.credentialSource())) {
-                    try app.writeDomainNotice(.{
-                        .topic = "auth",
-                        .tone = .warning,
-                        .body = if (provider == .grok)
-                            credentials.missing_grok_interactive_credential_message
-                        else if (provider == .codex)
-                            credentials.missing_chatgpt_interactive_credential_message
-                        else
-                            credentials.missing_interactive_credential_message,
-                    }, true);
-                    app.shell.render_requests.request(.footer);
-                    return false;
+                if (!model_provider.authorizesCredential(provider, app.auth.credentialSource())) {
+                    const selection = selectProviderCredential(app, provider) catch |err| {
+                        if (err == error.OutOfMemory) return err;
+                        debug_trace.logf("auth", "prompt credential preference load failed err={s}", .{@errorName(err)});
+                        try writeAuthNotice(app, .{
+                            .topic = "auth",
+                            .tone = .@"error",
+                            .body = "Could not load authentication settings. Check user settings, then press Enter to retry.",
+                        });
+                        return false;
+                    };
+                    switch (selection) {
+                        .selected => applyCredentialChange(app, true),
+                        .unchanged => {},
+                        .failed => |failure| return recoverCredentialFailure(app, failure.source, failure.err),
+                        .missing => return missingPromptCredential(app, provider),
+                    }
                 }
             }
             if (app.auth.credentialSource() != null) return true;
+            return missingPromptCredential(app, .gateway);
+        }
+
+        fn selectProviderCredential(app: *App, provider: model_provider.ProviderId) !auth_runtime.ProviderCredentialSelection {
+            if (hostManagesAuth(app) or model_provider.authorizesCredential(provider, app.auth.credentialSource())) return .unchanged;
+            var preferred: ?credentials.Source = null;
+            if (provider == .gateway and !host_target.is_wasm) {
+                var settings = try config_runtime.loadMergedSettings(app.alloc, app.workspace_root);
+                defer settings.deinit(app.alloc);
+                preferred = settings.credential_source;
+            }
+            return app.auth.selectForProvider(app.alloc, provider, preferred);
+        }
+
+        pub fn restoreSessionCredential(app: *App, previous_provider: model_provider.ProviderId) !void {
+            // Hydration can run before App.init returns, so it must not start background tasks.
+            const provider = provider_runtime.provider(app);
+            const provider_changed = previous_provider != provider;
+            if (provider_changed) {
+                app.auth.cancelPromptCredentialRefresh();
+                app.model_cache.resetForProviderChange();
+            }
+            if (comptime host_target.is_wasm) return;
+            if (hostManagesAuth(app)) return;
+            const selection = selectProviderCredential(app, provider) catch |err| {
+                if (err == error.OutOfMemory) return err;
+                debug_trace.logf("auth", "resumed credential preference load failed err={s}", .{@errorName(err)});
+                try app.writeDomainNotice(.{
+                    .topic = "auth",
+                    .tone = .@"error",
+                    .body = "Could not load authentication settings for the resumed session. Check user settings and retry.",
+                }, true);
+                app.shell.render_requests.request(.footer);
+                return;
+            };
+            switch (selection) {
+                .selected => app.model_cache.reset(),
+                .unchanged => {},
+                .missing => try app.writeDomainNotice(.{
+                    .topic = "auth",
+                    .tone = .warning,
+                    .body = switch (provider) {
+                        .gateway => credentials.missing_interactive_credential_message,
+                        .codex => credentials.missing_chatgpt_interactive_credential_message,
+                        .grok => credentials.missing_grok_interactive_credential_message,
+                    },
+                }, true),
+                .failed => |failure| {
+                    const classified = auth_runtime.classifyCredentialFailure(failure.source, failure.err);
+                    const message = if (auth_runtime.preparationError(classified)) |err|
+                        auth_runtime.preparationFailureNotice(err).?
+                    else
+                        "Authentication is unavailable. Run /provider to repair this source.";
+                    debug_trace.logf("auth", "resumed credential unavailable source={t} err={s}", .{ failure.source, @errorName(failure.err) });
+                    const body = try std.fmt.allocPrint(app.alloc, "{s}: {s}", .{ credentials.sourceLabel(failure.source), message });
+                    defer app.alloc.free(body);
+                    try app.writeDomainNotice(.{ .topic = "auth", .tone = .@"error", .body = body }, true);
+                },
+            }
+            app.shell.render_requests.request(.footer);
+        }
+
+        fn missingPromptCredential(app: *App, provider: model_provider.ProviderId) !bool {
+            if (provider != .gateway) {
+                try app.writeDomainNotice(.{
+                    .topic = "auth",
+                    .tone = .warning,
+                    .body = if (provider == .grok)
+                        credentials.missing_grok_interactive_credential_message
+                    else
+                        credentials.missing_chatgpt_interactive_credential_message,
+                }, true);
+                app.shell.render_requests.request(.footer);
+                return false;
+            }
 
             const auth_view = app.auth.view();
             if (auth_view.onboarding_skipped) {
@@ -335,6 +408,16 @@ pub fn Runtime(comptime App: type) type {
             const result = app.auth.takeSourceInventoryRefresh() orelse return;
             switch (result) {
                 .ready => |action| {
+                    var unavailable = app.auth.pickerView().unavailable_sources.iterator();
+                    while (unavailable.next()) |source| {
+                        const body = try std.fmt.allocPrint(
+                            app.alloc,
+                            "{s} is unavailable. Check the saved credential or choose another option.",
+                            .{credentials.sourceLabel(source)},
+                        );
+                        defer app.alloc.free(body);
+                        try writeAuthNotice(app, .{ .topic = "auth", .tone = .warning, .body = body });
+                    }
                     switch (action.destination) {
                         .auth_picker => app.auth.openPickerForProvider(app.alloc, action.provider),
                         .provider_picker_login, .provider_picker_command => if (comptime @hasField(App, "input_runtime")) {
@@ -700,6 +783,7 @@ pub fn Runtime(comptime App: type) type {
                 .tone = .neutral,
                 .body = "Using automatic credential precedence again.",
             }, true);
+            try resumePromptAfterAuth(app);
         }
 
         fn forgetCredentialSource(app: *App) void {
@@ -744,6 +828,7 @@ pub fn Runtime(comptime App: type) type {
                 .tone = .neutral,
                 .body = body,
             }, true);
+            try resumePromptAfterAuth(app);
             return true;
         }
 
@@ -964,15 +1049,14 @@ pub fn Runtime(comptime App: type) type {
                         target,
                         if (target == .gateway) settings.credential_source else null,
                     )) catch |err| {
+                    if (err == error.OutOfMemory) return err;
                     debug_trace.logf("provider", "credential preparation failed provider={t} err={s}", .{ target, @errorName(err) });
+                    const body = try auth_runtime.preparationFailureText(app.alloc, target, err);
+                    defer app.alloc.free(body);
                     try app.writeDomainNotice(.{
                         .topic = "provider",
                         .tone = .@"error",
-                        .body = providerFailureMessage(
-                            intent,
-                            "Could not prepare the target provider credential. The current provider is unchanged.",
-                            "Subscription sign-in completed, but its credential could not be prepared. The current provider is unchanged.",
-                        ),
+                        .body = body,
                     }, true);
                     return;
                 }) orelse {
@@ -1146,17 +1230,26 @@ pub fn Runtime(comptime App: type) type {
             /// A session exists but its teams could not be listed. The reason
             /// has already been reported.
             unavailable,
+            /// Credential preparation failed; no source may be activated.
+            blocked,
         };
 
         pub fn loadTeamsForProviderPicker(app: *App) !TeamColumn {
+            const view = app.auth.pickerView();
+            if (view.unavailable_sources.contains(.fx_login)) {
+                const body = try auth_runtime.preparationFailureText(app.alloc, .gateway, error.CredentialStorageUnavailable);
+                defer app.alloc.free(body);
+                try writeAuthNotice(app, .{ .topic = "auth", .tone = .warning, .body = body });
+                return .blocked;
+            }
             if (comptime @hasDecl(@TypeOf(app.auth), "credentialFailure")) {
                 if (app.auth.credentialFailure()) |failure| {
-                    if (failure.source == .fx_login and !failure.retryable()) {
+                    if (failure.source == .fx_login and failure.requiresSignIn()) {
                         return .needs_sign_in;
                     }
                 }
             }
-            if (!app.auth.pickerView().fx_login_session_available) return .needs_sign_in;
+            if (!view.fx_login_session_available) return .needs_sign_in;
             try app.flushBeforeBlockingExternalWork();
 
             var selection = login_flow.loadTeamSelection(app.alloc, app.auth.oauthTransport()) catch |err| {
@@ -1164,16 +1257,15 @@ pub fn Runtime(comptime App: type) type {
                 // A session file that exists but can no longer be refreshed is
                 // not a listing failure: there is nothing to list until the
                 // user signs in again.
-                switch (err) {
-                    error.NoSession,
-                    error.NoRefreshToken,
-                    error.SessionChanged,
-                    oauth.OAuthError.InvalidClient,
-                    oauth.OAuthError.ExpiredToken,
-                    oauth.OAuthError.AccessDenied,
-                    oauth.OAuthError.InvalidGrant,
-                    => return .needs_sign_in,
-                    else => {},
+                if (err == error.NoSession or auth_runtime.classifyCredentialFailure(.fx_login, err).requiresSignIn()) {
+                    return .needs_sign_in;
+                }
+                if (err != error.NoTeams and err != error.TeamRequestFailed) {
+                    if (err == error.OutOfMemory) return err;
+                    const body = try auth_runtime.preparationFailureText(app.alloc, .gateway, err);
+                    defer app.alloc.free(body);
+                    try writeAuthNotice(app, .{ .topic = "auth", .tone = .warning, .body = body });
+                    return .blocked;
                 }
                 try app.writeDomainNotice(.{
                     .topic = "auth",
@@ -1412,6 +1504,13 @@ pub fn Runtime(comptime App: type) type {
 
         fn refreshFxLoginCredentialIfNeeded(app: *App) !void {
             const change = try app.auth.refreshSelectedCredentialIfNeeded(app.alloc);
+            applyCredentialRefreshChange(app, change);
+        }
+
+        fn applyCredentialRefreshChange(
+            app: *App,
+            change: auth_transition.CredentialChange,
+        ) void {
             if (change == .none) return;
             reconcileGatewayCredential(app);
             if (app.auth.modelCatalogAccess().authorizationCredential() == null) return;
@@ -1435,10 +1534,82 @@ pub fn Runtime(comptime App: type) type {
             return preparePromptCredential(app);
         }
 
-        fn preparePromptCredential(app: *App) !bool {
+        pub fn startPromptCredentialPrewarm(app: *App) void {
+            if (comptime !@hasDecl(@TypeOf(app.auth), "beginPromptCredentialRefresh")) return;
+            if (comptime provider_runtime.supported(App)) {
+                if (!model_provider.authorizesCredential(provider_runtime.provider(app), app.auth.credentialSource())) return;
+            }
+            const outcome = app.auth.beginPromptCredentialRefresh();
+            debug_trace.logf(
+                "auth",
+                "prompt credential prewarm start outcome={s}",
+                .{@tagName(outcome)},
+            );
+        }
+
+        pub fn collectPendingPromptCredential(
+            app: *App,
+        ) !PendingPromptCredentialReadiness {
+            if (comptime host_target.is_wasm) {
+                return if (try admitPromptCredential(app)) .current else .rejected;
+            }
+            if (!try ensurePromptCredential(app)) return .rejected;
+            const source = app.auth.credentialSource() orelse return .rejected;
+            if (!credentials.sourceRefreshable(source)) {
+                return if (app.auth.gatewayCredential() != null) .current else .rejected;
+            }
+
+            var refresh = app.auth.pollPromptCredentialRefresh();
+            defer refresh.deinit();
+            switch (refresh) {
+                .idle => {
+                    return switch (app.auth.beginPromptCredentialRefresh()) {
+                        .started, .pending => .pending,
+                        .not_needed => if (app.auth.gatewayCredential() != null) .current else .rejected,
+                        .failed => if (try admitPromptCredential(app)) .current else .rejected,
+                    };
+                },
+                .pending => return .pending,
+                .failed => |failure| {
+                    _ = try recoverCredentialFailure(app, failure.source, failure.err);
+                    return .rejected;
+                },
+                .ready => |*refreshed| {
+                    var owned = try refreshed.clone(app.alloc);
+                    defer owned.deinit(app.alloc);
+                    const change = app.auth.adoptPreparedCredential(app.alloc, &owned);
+                    applyCredentialRefreshChange(app, change);
+                    return if (app.auth.gatewayCredential() != null) .current else .pending;
+                },
+            }
+        }
+
+        pub fn retryPendingPromptCredential(
+            app: *App,
+        ) !PendingPromptCredentialReadiness {
+            if (comptime host_target.is_wasm) {
+                return if (try admitPromptCredential(app)) .current else .rejected;
+            }
+            if (!try ensurePromptCredential(app)) return .rejected;
             if (comptime @hasDecl(@TypeOf(app.auth), "credentialFailure")) {
                 if (app.auth.credentialFailure()) |failure| {
                     if (!failure.retryable()) {
+                        return if (try preparePromptCredential(app)) .current else .rejected;
+                    }
+                }
+            }
+            app.auth.cancelPromptCredentialRefresh();
+            return switch (app.auth.beginPromptCredentialRefresh()) {
+                .started, .pending => .pending,
+                .not_needed => if (app.auth.gatewayCredential() != null) .current else .rejected,
+                .failed => if (try preparePromptCredential(app)) .current else .rejected,
+            };
+        }
+
+        fn preparePromptCredential(app: *App) !bool {
+            if (comptime @hasDecl(@TypeOf(app.auth), "credentialFailure")) {
+                if (app.auth.credentialFailure()) |failure| {
+                    if (failure.requiresSignIn()) {
                         try beginCredentialRepair(app, failure);
                         return false;
                     }
@@ -1537,7 +1708,7 @@ pub fn Runtime(comptime App: type) type {
                 ),
                 .invalid_storage => std.fmt.allocPrint(
                     alloc,
-                    "{s} saved sign-in is unreadable.\nPress Enter to sign in again. Your prompt is saved.",
+                    "{s}: Saved credential storage is unavailable.\nCheck credential storage, then press Enter to retry. Your prompt is saved.",
                     .{source_label},
                 ),
                 .persistence_uncertain => std.fmt.allocPrint(
@@ -1552,7 +1723,7 @@ pub fn Runtime(comptime App: type) type {
                 ),
                 .temporary_unavailable => std.fmt.allocPrint(
                     alloc,
-                    "{s} credential refresh failed.\nCheck your connection and press Enter to retry. Your prompt is saved.",
+                    "{s} credential refresh failed.\nPress Enter to retry. Your prompt is saved.",
                     .{source_label},
                 ),
             };
@@ -1560,6 +1731,9 @@ pub fn Runtime(comptime App: type) type {
 
         fn applyCredentialChange(app: *App, changed: bool) void {
             if (!changed) return;
+            if (comptime @hasDecl(@TypeOf(app.auth), "cancelPromptCredentialRefresh")) {
+                app.auth.cancelPromptCredentialRefresh();
+            }
             reconcileGatewayCredential(app);
             app.model_cache.reset();
             if (comptime @hasDecl(App, "startModelCacheWarmup")) {
@@ -1618,6 +1792,14 @@ pub fn Runtime(comptime App: type) type {
         }
 
         fn writeLoginError(app: *App, source: credentials.Source, err: anyerror) !void {
+            const failure = auth_runtime.classifyCredentialFailure(source, err);
+            if (failure.reason == .invalid_storage or failure.reason == .persistence_uncertain) {
+                const notice = auth_runtime.preparationFailureNotice(auth_runtime.preparationError(failure).?).?;
+                const body = try std.fmt.allocPrint(app.alloc, "{s}: {s}", .{ credentials.sourceLabel(source), notice });
+                defer app.alloc.free(body);
+                try writeAuthNotice(app, .{ .topic = "auth", .tone = .@"error", .body = body });
+                return;
+            }
             const notice: types.SemanticNotice = if (source == .chatgpt_subscription)
                 switch (err) {
                     error.ChatGptAuthorizationFailed => .{ .topic = "auth", .tone = .@"error", .body = "Codex sign-in was denied. The current credential is unchanged." },
@@ -1914,10 +2096,38 @@ const TestAuth = struct {
     sign_in_code_submit_succeeds: bool = true,
     inventory_refresh_action: ?auth_runtime.InventoryRefreshAction = null,
     inventory_refresh_fails: bool = false,
+    prompt_refresh_start: auth_runtime.PromptCredentialRefreshStart = .not_needed,
+    prompt_refresh_start_count: usize = 0,
 
     fn credentialSource(self: *const TestAuth) ?credentials.Source {
         return self.active_source;
     }
+
+    fn view(self: *const TestAuth) auth_runtime.View {
+        return .{
+            .active_source = self.active_source,
+            .available_inactive_sources = .empty,
+            .selected_team = null,
+            .refreshable = if (self.active_source) |source|
+                credentials.sourceRefreshable(source)
+            else
+                false,
+            .stored_key_status = .not_attempted,
+            .fx_login_status = .not_attempted,
+            .onboarding_skipped = false,
+        };
+    }
+
+    fn beginPromptCredentialRefresh(self: *TestAuth) auth_runtime.PromptCredentialRefreshStart {
+        self.prompt_refresh_start_count += 1;
+        return self.prompt_refresh_start;
+    }
+
+    fn pollPromptCredentialRefresh(_: *TestAuth) auth_runtime.PromptCredentialRefreshPoll {
+        return .idle;
+    }
+
+    fn cancelPromptCredentialRefresh(_: *TestAuth) void {}
 
     fn selectSource(self: *TestAuth, _: std.mem.Allocator, source: credentials.Source) !?bool {
         self.selected_source = source;
@@ -2039,6 +2249,14 @@ const TestAuth = struct {
         return if (self.gateway_ready) .{ .api_key = "refreshed-key" } else null;
     }
 
+    fn adoptPreparedCredential(
+        self: *TestAuth,
+        _: std.mem.Allocator,
+        _: *credentials.Credential,
+    ) auth_transition.CredentialChange {
+        return self.refresh_change;
+    }
+
     fn modelCatalogAccess(self: *const TestAuth) credentials.CatalogAccess {
         return if (self.catalog_ready)
             credentials.catalogAccessForCredential(.fx_login, "refreshed-key", "team_123")
@@ -2053,6 +2271,10 @@ const TestAuth = struct {
 
     fn refreshSourceInventory(self: *TestAuth, _: std.mem.Allocator) !void {
         self.source_inventory_refresh_count += 1;
+    }
+
+    fn openOnboardingPicker(self: *TestAuth, _: std.mem.Allocator) void {
+        self.picker_opened = true;
     }
 
     fn refreshSourceInventoryForLogout(self: *TestAuth, _: std.mem.Allocator) !void {
@@ -2600,6 +2822,28 @@ test "team catalog rejection preserves the previous authority before commit" {
     try std.testing.expect(std.mem.find(u8, app.transcript.items, "Changed Vercel team") == null);
 }
 
+test "prompt credential prewarm ignores the previous provider credential" {
+    const ProviderApp = struct {
+        selected_model: std.ArrayList(u8) = .empty,
+        selected_provider: model_provider.ProviderId,
+        auth: TestAuth = .{},
+    };
+    const cases = .{
+        .{ model_provider.ProviderId.gateway, credentials.Source.chatgpt_subscription, credentials.Source.fx_login },
+        .{ model_provider.ProviderId.codex, credentials.Source.fx_login, credentials.Source.chatgpt_subscription },
+        .{ model_provider.ProviderId.grok, credentials.Source.fx_login, credentials.Source.grok_subscription },
+    };
+    inline for (cases) |case| {
+        var app = ProviderApp{ .selected_provider = case[0] };
+        app.auth.active_source = case[1];
+        Runtime(ProviderApp).startPromptCredentialPrewarm(&app);
+        try std.testing.expectEqual(@as(usize, 0), app.auth.prompt_refresh_start_count);
+        app.auth.active_source = case[2];
+        Runtime(ProviderApp).startPromptCredentialPrewarm(&app);
+        try std.testing.expectEqual(@as(usize, 1), app.auth.prompt_refresh_start_count);
+    }
+}
+
 test "prompt credential refresh preserves catalog for secret rotation" {
     var app: TestApp = .{};
     defer app.deinit();
@@ -2679,7 +2923,7 @@ test "prompt credential refresh failure is recoverable and detail-free" {
 
     try std.testing.expect(!try Runtime(TestApp).preparePromptCredential(&app));
     try std.testing.expect(std.mem.find(u8, app.transcript.items, "fx login credential refresh failed.") != null);
-    try std.testing.expect(std.mem.find(u8, app.transcript.items, "Check your connection and press Enter to retry.") != null);
+    try std.testing.expect(std.mem.find(u8, app.transcript.items, "Press Enter to retry.") != null);
     try std.testing.expect(std.mem.find(u8, app.transcript.items, "Your prompt is saved.") != null);
     try std.testing.expect(std.mem.find(u8, app.transcript.items, "Choose another source") == null);
     try std.testing.expect(std.mem.find(u8, app.transcript.items, "OAuthRequestFailed") == null);
@@ -2748,4 +2992,27 @@ test "prompt credential refresh allows only OutOfMemory to escape" {
     try std.testing.expect(!app.shell.render_requests.footer_requested);
     try std.testing.expectEqual(@as(usize, 0), app.auth.source_inventory_refresh_count);
     try std.testing.expect(!app.auth.picker_opened);
+}
+
+test "prompt credential refresh falls back when its task cannot start" {
+    var app: TestApp = .{};
+    defer app.deinit();
+    app.auth.active_source = .fx_login;
+    app.auth.prompt_refresh_start = .failed;
+    app.auth.gateway_ready = false;
+    app.auth.gateway_ready_after_refresh_count = 1;
+
+    try std.testing.expectEqual(
+        PendingPromptCredentialReadiness.current,
+        try Runtime(TestApp).collectPendingPromptCredential(&app),
+    );
+    try std.testing.expectEqual(@as(usize, 1), app.auth.refresh_count);
+
+    app.auth.gateway_ready = false;
+    app.auth.gateway_ready_after_refresh_count = 2;
+    try std.testing.expectEqual(
+        PendingPromptCredentialReadiness.current,
+        try Runtime(TestApp).retryPendingPromptCredential(&app),
+    );
+    try std.testing.expectEqual(@as(usize, 2), app.auth.refresh_count);
 }
