@@ -24,7 +24,6 @@ const app_input_runtime = @import("core/app/app_input_runtime.zig");
 const input_full_transcript_runtime = @import("core/app/input_full_transcript_runtime.zig");
 const input_submit_runtime = @import("core/app/input_submit_runtime.zig");
 const core_input_runtime = @import("core/input/runtime.zig");
-const input_queue_runtime = @import("core/app/input_queue_runtime.zig");
 const app_bootstrap_runtime = @import("core/app/app_bootstrap_runtime.zig");
 const app_notification_runtime = @import("core/app/app_notification_runtime.zig");
 const app_permission_runtime = @import("core/app/app_permission_runtime.zig");
@@ -137,10 +136,8 @@ const footer_runtime = @import("ui/footer/runtime.zig");
 const question_ui = @import("ui/footer/question_ui.zig");
 const ui_input = @import("ui/input/runtime.zig");
 const input_action = @import("core/input/input_action.zig");
-const paste_blocks = @import("core/input/pasted_blocks.zig");
 const paste_framing = @import("core/input/paste_framing.zig");
 const registered_entities = @import("core/input/registered_entities.zig");
-const entity_spans = @import("core/shared/entity_spans.zig");
 const ui_render = @import("ui/render.zig");
 const shell_runtime = @import("ui/shell_runtime.zig");
 const ui_terminal = @import("ui/terminal/terminal.zig");
@@ -560,7 +557,6 @@ const App = struct {
     should_exit: bool = false,
     input_runtime: InputRuntime = .{},
     terminal_input_runtime: TerminalInputRuntime = .{},
-    queued_prompt_review: input_queue_runtime.State = .{},
     submission: input_submit_runtime.State = .{},
     pending_images: std.ArrayList(types.ImageAttachment) = .empty,
     next_image_id: usize = 1,
@@ -872,7 +868,6 @@ const App = struct {
         self.worker.deinit(std.heap.c_allocator);
         self.web_fetch_runtime.deinit(self.alloc);
         self.web_search_runtime.deinit();
-        self.queued_prompt_review.deinit(self.alloc);
         self.prompt_history.deinit(self.alloc);
         self.clearPendingImages();
         self.pending_images.deinit(self.alloc);
@@ -963,6 +958,28 @@ const App = struct {
 
     pub fn ensurePromptCredential(self: *App) !bool {
         return AuthAppRuntime.admitPromptCredential(self);
+    }
+
+    pub fn restoreSessionCredential(self: *App, previous_provider: model_provider.ProviderId) !void {
+        try AuthAppRuntime.restoreSessionCredential(self, previous_provider);
+    }
+
+    pub fn startPromptCredentialPrewarm(self: *App) void {
+        if (comptime !host_target.is_wasm) {
+            AuthAppRuntime.startPromptCredentialPrewarm(self);
+        }
+    }
+
+    pub fn collectPendingPromptCredential(
+        self: *App,
+    ) !app_auth_runtime.PendingPromptCredentialReadiness {
+        return AuthAppRuntime.collectPendingPromptCredential(self);
+    }
+
+    pub fn retryPendingPromptCredential(
+        self: *App,
+    ) !app_auth_runtime.PendingPromptCredentialReadiness {
+        return AuthAppRuntime.retryPendingPromptCredential(self);
     }
 
     pub fn runProviderCommand(self: *App) !void {
@@ -1084,48 +1101,6 @@ const App = struct {
     }
 
     pub fn enqueuePromptWithSkillBindings(self: *App, prompt: []const u8, skill_tokens: []const registered_entities.SkillTokenSpan) !bool {
-        return self.enqueuePromptWithOptionalReview(
-            prompt,
-            skill_tokens,
-            null,
-        );
-    }
-
-    pub fn enqueuePromptWithReviewDraft(
-        self: *App,
-        prompt: []const u8,
-        skill_tokens: []const registered_entities.SkillTokenSpan,
-        review_input: []const u8,
-        review_pasted_blocks: []const paste_blocks.PastedBlock,
-        review_image_tokens: []const entity_spans.ImageTokenSpan,
-        review_skill_tokens: []const registered_entities.SkillTokenSpan,
-    ) !bool {
-        const review_skill_spans = try dupeSkillDisplaySpansFromTokens(
-            self.alloc,
-            review_skill_tokens,
-        );
-        defer worker_runtime.freeSkillDisplaySpans(
-            self.alloc,
-            review_skill_spans,
-        );
-        return self.enqueuePromptWithOptionalReview(
-            prompt,
-            skill_tokens,
-            .{
-                .input = @constCast(review_input),
-                .pasted_blocks = @constCast(review_pasted_blocks),
-                .image_tokens = @constCast(review_image_tokens),
-                .skill_display_spans = review_skill_spans,
-            },
-        );
-    }
-
-    fn enqueuePromptWithOptionalReview(
-        self: *App,
-        prompt: []const u8,
-        skill_tokens: []const registered_entities.SkillTokenSpan,
-        review_draft: ?worker_runtime.QueueReviewDraft,
-    ) !bool {
         const context_targets = if (self.context_enabled)
             try context_contract.applicableTargetsForImages(self.alloc, self.pending_images.items)
         else
@@ -1148,7 +1123,6 @@ const App = struct {
         if (!try self.snapshotAndAdmitInteractivePromptWithSkillBindings(
             prompt,
             skill_tokens,
-            review_draft,
         )) return false;
         WorkerAppRuntime.syncState(
             self,
@@ -1159,7 +1133,7 @@ const App = struct {
 
     pub fn adoptPendingUserPrompt(
         self: *App,
-        draft: *const worker_runtime.QueuedPromptDraft,
+        draft: *const input_submit_runtime.PendingPromptDraft,
     ) !void {
         try self.writeUserPromptCardWithSkillBindings(
             .{ .text = draft.prompt, .images = draft.images },
@@ -1170,7 +1144,7 @@ const App = struct {
 
     pub fn finalizePendingSubmission(
         self: *App,
-        draft: *const worker_runtime.QueuedPromptDraft,
+        draft: *const input_submit_runtime.PendingPromptDraft,
     ) !void {
         const context_targets = if (self.context_enabled)
             try context_contract.applicableTargetsForImages(self.alloc, draft.images)
@@ -1188,7 +1162,6 @@ const App = struct {
         if (!try self.snapshotAndQueuePrompt(
             draft.prompt,
             skill_tokens,
-            null,
             null,
             draft.images,
             draft.turn_id,
@@ -1345,12 +1318,10 @@ const App = struct {
         self: *App,
         prompt: []const u8,
         skill_tokens: []const registered_entities.SkillTokenSpan,
-        review_draft: ?worker_runtime.QueueReviewDraft,
     ) !bool {
         const queued = try self.snapshotPrompt(
             prompt,
             skill_tokens,
-            review_draft,
             null,
             null,
             0,
@@ -1373,7 +1344,6 @@ const App = struct {
         if (!try self.snapshotAndQueuePrompt(
             checkpoint.user.text,
             &.{},
-            null,
             checkpoint,
             null,
             checkpoint.turn_id,
@@ -1390,7 +1360,6 @@ const App = struct {
         self: *App,
         prompt: []const u8,
         skill_tokens: []const registered_entities.SkillTokenSpan,
-        review_draft: ?worker_runtime.QueueReviewDraft,
         recovery_checkpoint: ?*const session_codec.RecoveryCheckpoint,
         prompt_images: ?[]const types.ImageAttachment,
         turn_id: u64,
@@ -1399,7 +1368,6 @@ const App = struct {
         const queued = try self.snapshotPrompt(
             prompt,
             skill_tokens,
-            review_draft,
             recovery_checkpoint,
             prompt_images,
             turn_id,
@@ -1416,7 +1384,6 @@ const App = struct {
         self: *App,
         prompt: []const u8,
         skill_tokens: []const registered_entities.SkillTokenSpan,
-        review_draft: ?worker_runtime.QueueReviewDraft,
         recovery_checkpoint: ?*const session_codec.RecoveryCheckpoint,
         prompt_images: ?[]const types.ImageAttachment,
         turn_id: u64,
@@ -1496,19 +1463,6 @@ const App = struct {
         const skill_display_spans = try dupeSkillDisplaySpansFromTokens(std.heap.c_allocator, skill_tokens);
         errdefer worker_runtime.freeSkillDisplaySpans(std.heap.c_allocator, skill_display_spans);
 
-        const review_draft_copy = if (review_draft) |review|
-            try worker_runtime.dupeQueueReviewDraft(
-                std.heap.c_allocator,
-                review,
-            )
-        else
-            null;
-        errdefer if (review_draft_copy) |review|
-            worker_runtime.freeQueueReviewDraft(
-                std.heap.c_allocator,
-                review,
-            );
-
         return .{
             .turn_id = if (recovery_checkpoint) |checkpoint| checkpoint.turn_id else turn_id,
             .prompt = prompt_copy,
@@ -1528,7 +1482,6 @@ const App = struct {
             .grants = grants_copy,
             .skill_bindings = skill_bindings,
             .skill_display_spans = skill_display_spans,
-            .review_draft = review_draft_copy,
             .context_snapshot = context_snapshot_copy,
             .recovery_checkpoint = recovery_checkpoint_copy,
             .recovery_source_already_presented = recovery_checkpoint != null,
