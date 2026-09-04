@@ -1154,6 +1154,93 @@ describe("acp: model-independent", () => {
   );
 
   test(
+    "ACP native tool selection narrows schema and rejects terminal session actions before permission",
+    async () => {
+      const root = createIsolatedRoot("fx-acp-native-tool-selection-");
+      const forbiddenMarker = join(root.root, "terminal-started");
+      const allowedMarker = join(root.root, "terminal-exec-ran");
+      const forbiddenCallId = "terminal_exec_only_start";
+      const allowedCallId = "terminal_exec_only_exec";
+      const gateway = startFakeGateway([
+        fakeGatewayToolCall(forbiddenCallId, "shell", {
+          action: "start",
+          command: `printf started > '${forbiddenMarker}'`,
+          profile: "clean",
+        }),
+        fakeGatewayToolCall(allowedCallId, "shell", {
+          request: {
+            action: "run",
+            command: `printf allowed > '${allowedMarker}'`,
+            cwd: root.workspace,
+            timeout_ms: 5_000,
+          },
+        }),
+        finalText("ACP selected tools complete"),
+      ]);
+      try {
+        client = await AcpClient.create({
+          cwd: root.workspace,
+          args: [
+            "--tool",
+            "read_file",
+            "--tool",
+            "terminal:exec",
+            "acp",
+          ],
+          env: fakeGatewayEnv(root, gateway),
+        });
+        client.setPermissionOption("allow_once");
+        await startCodeSession(client);
+        const result = await runPrompt(
+          client,
+          "Try the selected terminal surface.",
+          TIMEOUT,
+        );
+
+        expect(result.promptResult.result.stopReason).toBe("end_turn");
+        expect(gateway.requests).toHaveLength(3);
+        const first = acpGatewayRequest(gateway.requests[0]!.body);
+        expect(first.tools.map((tool) => tool.name)).toEqual([
+          "read_file",
+          "shell",
+        ]);
+        // The selector keeps its `terminal:exec` spelling; upstream advertises
+        // the tool itself to the model as `shell`.
+        const terminal = first.tools.find((tool) => tool.name === "shell");
+        const terminalSchema = JSON.stringify(terminal?.inputSchema);
+        // One-shot only: the advertised action enum admits `run` and nothing
+        // that could start, address, or retain an interactive session.
+        expect(terminalSchema).toContain('"enum":["run"]');
+        expect(terminalSchema).not.toContain('"start"');
+        expect(terminalSchema).not.toContain('"interact"');
+        expect(terminalSchema).not.toContain('"stop"');
+        expect(terminalSchema).not.toContain('"session_id"');
+        expect(
+          acpToolResultText(gateway.requests[1]!.body, forbiddenCallId),
+        ).toContain(
+          "terminal:exec selection permits only one-shot shell.run requests",
+        );
+        expect(
+          result.messages
+            .filter(
+              (message: any) =>
+                message.method === "session/request_permission",
+            )
+            .map((message: any) => message.params.toolCall.toolCallId),
+        ).toEqual([]);
+        expect(existsSync(forbiddenMarker)).toBe(false);
+        expect(readFileSync(allowedMarker, "utf8")).toBe("allowed");
+        expect(client.stderr).toBe("");
+      } finally {
+        await client?.close();
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
     "host-managed ACP sessions stream without local credentials",
     async () => {
       const root = createIsolatedRoot("fx-acp-host-managed-");
@@ -8337,6 +8424,56 @@ describe("acp: model-independent", () => {
         expect(result.promptResult.result.stopReason).toBe("end_turn");
         expect(gateway.requests).toHaveLength(3);
         expect(gateway.requests[0]!.body).toContain('"name":"subagent"');
+        expect(client.stderr).toBe("");
+      } finally {
+        await client?.close();
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "ACP selected native tools propagate to canonical subagents",
+    async () => {
+      const root = createIsolatedRoot("fx-acp-subagent-tools-");
+      const childPrompt = "Inspect the workspace and report back.";
+      const gateway = startFakeGateway([
+        fakeGatewayToolCall("acp_child_tools", "subagent", {
+          request: { action: "run", task: childPrompt },
+        }),
+        finalText("ACP_SUBAGENT_TOOLS_CHILD_OK"),
+        finalText("ACP_SUBAGENT_TOOLS_PARENT_OK"),
+      ]);
+      try {
+        client = await AcpClient.create({
+          cwd: root.workspace,
+          args: [
+            "--tool",
+            "subagent",
+            "--tool",
+            "read_file",
+            "acp",
+          ],
+          env: fakeGatewayEnv(root, gateway),
+        });
+        await startCodeSession(client);
+        const result = await runPrompt(client, "Delegate workspace inspection.", TIMEOUT);
+        expect(result.promptResult.result.stopReason).toBe("end_turn");
+        await waitForCondition("canonical child completion", () => gateway.requests.length === 3);
+        expect(gateway.requests).toHaveLength(3);
+        const advertised = gateway.requests.map((request) =>
+          acpGatewayRequest(request.body).tools.map((tool) => tool.name)
+        );
+        // The parent keeps the whole selection. Its canonical child inherits
+        // that selection without `subagent`, because a child may not delegate.
+        expect(advertised[0]).toEqual(["subagent", "read_file"]);
+        expect(advertised[1]).toEqual(["read_file"]);
+        expect(advertised[2]).toEqual(["subagent", "read_file"]);
+        for (const request of gateway.requests) {
+          expect(request.body).not.toContain('"name":"task"');
+        }
         expect(client.stderr).toBe("");
       } finally {
         await client?.close();

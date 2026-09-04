@@ -22,6 +22,7 @@ const mcp_contract = @import("../mcp/mcp_contract.zig");
 const mcp_command_provider = @import("../mcp/command_provider.zig");
 const mcp_health = @import("../mcp/health.zig");
 const mcp_runtime = @import("../mcp/mcp_runtime.zig");
+const tool_selection = @import("../tooling/tool_selection.zig");
 const tool_set_contract = @import("../tooling/tool_set.zig");
 const update_target = @import("../upgrade/update_target.zig");
 const test_builtin_gateway = if (builtin.is_test)
@@ -93,6 +94,7 @@ pub const Config = struct {
     context_registry: context_contract.Registry,
     mode_registry: mode_registry.Registry,
     tool_set: tool_set_contract.ToolSet,
+    tool_selection_catalog: tool_selection.Catalog = .{},
     inspect_mcp_profile_config: mcp_contract.InspectProfileConfigFn,
     inspect_mcp_local_config: mcp_health.InspectLocalConfigFn =
         mcp_health.inspectLocalConfigUnavailable,
@@ -438,6 +440,7 @@ fn cliSurfaceConfig(cfg: Config) cli_surface.Config {
         .context_registry = cfg.context_registry,
         .mode_registry = cfg.mode_registry,
         .tool_set = cfg.tool_set,
+        .tool_selection_catalog = cfg.tool_selection_catalog,
         .inspect_mcp_profile_config = cfg.inspect_mcp_profile_config,
         .inspect_mcp_local_config = cfg.inspect_mcp_local_config,
         .load_mcp_runtime = cfg.load_mcp_runtime,
@@ -1055,6 +1058,44 @@ test "app entry carries the previous revision through upgrade relaunch" {
         "1111111111111111111111111111111111111111",
         capture.replaceArg(4),
     );
+}
+
+test "app entry preserves ordered native tool selection across upgrade relaunch" {
+    const alloc = std.testing.allocator;
+    const selected = try alloc.alloc([]u8, 2);
+    selected[0] = try alloc.dupe(u8, "terminal:exec");
+    selected[1] = try alloc.dupe(u8, "read_file");
+    var capture = TestCapture.init(.{ .interactive = .{
+        .modifiers = .{ .selected_native_tools = selected },
+    } });
+    defer capture.deinit();
+    capture.resume_handoff_id = "session-123";
+    capture.upgrade_relaunch_path = "/tmp/fx-upgraded";
+
+    const outcome = try runWithDeps(
+        TestApp,
+        alloc,
+        &.{},
+        testConfig(),
+        capture.deps(),
+    );
+
+    try std.testing.expectEqual(@as(u8, 1), outcome.exit);
+    try std.testing.expectEqual(@as(usize, 1), capture.replace_calls);
+    try std.testing.expectEqual(@as(usize, 8), capture.replace_arg_count);
+    try std.testing.expectEqualStrings("/tmp/fx-upgraded", capture.replaceArg(0));
+    try std.testing.expectEqualStrings("--tool", capture.replaceArg(1));
+    try std.testing.expectEqualStrings("terminal:exec", capture.replaceArg(2));
+    try std.testing.expectEqualStrings("--tool", capture.replaceArg(3));
+    try std.testing.expectEqualStrings("read_file", capture.replaceArg(4));
+    try std.testing.expectEqualStrings("resume", capture.replaceArg(5));
+    try std.testing.expectEqualStrings("session-123", capture.replaceArg(6));
+    try std.testing.expectEqualStrings("--upgrade-relaunch", capture.replaceArg(7));
+    try std.testing.expect(std.mem.find(
+        u8,
+        capture.stderr.written(),
+        "fx --tool terminal:exec --tool read_file --resume session-123",
+    ) != null);
 }
 
 test "app entry never relaunches without a validated handoff" {

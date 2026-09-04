@@ -323,6 +323,7 @@ describe("cli: help", () => {
       expect(stdout).toContain("--state-dir <path>");
       expect(stdout).toContain("--skills-dir <path>");
       expect(stdout).toContain("--no-default-skills");
+      expect(stdout).toContain("--tool <name>");
       expect(stdout).toContain("-c, --continue");
       expect(stdout).toContain("-r");
       expect(stdout).toContain("Open the saved-session picker");
@@ -5320,6 +5321,57 @@ describe("cli: workspace access", () => {
       expect(unsupportedSkillPolicy.code).toBe(1);
       expect(unsupportedSkillPolicy.stderr).toContain(
         "--skills-dir and --no-default-skills are only supported for interactive, resume, and ACP launches",
+      );
+
+      const missingNativeTool = await runFx(["--tool"], { env: enabled });
+      expect(missingNativeTool.code).toBe(1);
+      expect(missingNativeTool.stderr).toContain(
+        "--tool requires a native tool name",
+      );
+
+      const unknownNativeTool = await runFx(
+        ["--tool", "missing_native_tool"],
+        { env: enabled },
+      );
+      expect(unknownNativeTool.code).toBe(1);
+      expect(unknownNativeTool.stderr).toContain(
+        "unknown native tool selection: missing_native_tool",
+      );
+
+      const duplicateNativeTool = await runFx(
+        ["--tool", "read_file", "--tool=read_file"],
+        { env: enabled },
+      );
+      expect(duplicateNativeTool.code).toBe(1);
+      expect(duplicateNativeTool.stderr).toContain(
+        "native tool may only be selected once: read_file",
+      );
+
+      const conflictingTerminalTool = await runFx(
+        ["--tool", "terminal", "--tool", "terminal:exec"],
+        { env: enabled },
+      );
+      expect(conflictingTerminalTool.code).toBe(1);
+      expect(conflictingTerminalTool.stderr).toContain(
+        "conflicting native tool selections: terminal and terminal:exec",
+      );
+
+      const conflictingNativeToolGate = await runFx(
+        ["--tool", "read_file", "--no-native-tools"],
+        { env: enabled },
+      );
+      expect(conflictingNativeToolGate.code).toBe(1);
+      expect(conflictingNativeToolGate.stderr).toContain(
+        "--tool cannot be combined with --no-native-tools",
+      );
+
+      const unsupportedNativeToolSelection = await runFx(
+        ["--tool", "read_file", "ask", "hello"],
+        { env: enabled },
+      );
+      expect(unsupportedNativeToolSelection.code).toBe(1);
+      expect(unsupportedNativeToolSelection.stderr).toContain(
+        "--tool is only supported for interactive, resume, and ACP launches",
       );
     },
     TIMEOUT,

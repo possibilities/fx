@@ -123,6 +123,7 @@ const tool_admission = @import("core/tooling/tool_admission.zig");
 const tool_projection = @import("core/tooling/tool_projection.zig");
 const command_output_content = @import("core/tooling/command_output_content.zig");
 const tool_dispatch = @import("core/tooling/tool_dispatch.zig");
+const tool_selection = @import("core/tooling/tool_selection.zig");
 const tool_set_contract = @import("core/tooling/tool_set.zig");
 const tool_mcp_runtime = @import("core/tooling/tool_mcp_runtime.zig");
 const tool_runtime = @import("core/tooling/tool_runtime.zig");
@@ -385,6 +386,14 @@ else
 const wasm_skill_root_policy: @import("core/skills/skill_contract.zig").RootPolicy = .{
     .managed_root_source = null,
 };
+const native_tool_selection_aliases = [_]tool_selection.Alias{.{
+    .token = "terminal:exec",
+    .tool = builtin_tools.terminalExecOnlySpec(),
+}};
+const native_tool_selection_catalog = tool_selection.Catalog{
+    .default_set = builtin_tools.advertisement_set,
+    .aliases = &native_tool_selection_aliases,
+};
 fn currentBuild() update_target.CurrentBuild {
     return .{
         .channel = compiled_update_channel,
@@ -598,6 +607,8 @@ const App = struct {
     context_enabled: bool = true,
     allow_native_tools: bool = true,
     project_instructions_enabled: bool = true,
+    native_tool_selection: tool_selection.Resolved =
+        tool_selection.Resolved.borrowed(builtin_tools.advertisement_set),
     context_limits: config_runtime.context_limits.Values = .{},
     fast_mode: bool = false,
     auto_upgrade_enabled: bool = true,
@@ -710,6 +721,11 @@ const App = struct {
             try app.work_control.configureFromEnvironment();
         }
         app.system_prompt_override = launch.modifiers.takeEffectiveSystemPrompt();
+        app.native_tool_selection = try tool_selection.resolve(
+            alloc,
+            native_tool_selection_catalog,
+            launch.modifiers.selected_native_tools,
+        );
         try WorkspaceAppRuntime.applyLaunch(
             &app,
             launch.modifiers.additional_directories,
@@ -1025,6 +1041,7 @@ const App = struct {
         for (self.diff_entries.items) |*entry| entry.deinit(std.heap.c_allocator);
         self.diff_entries.deinit(std.heap.c_allocator);
         self.mcp.deinit(self.alloc);
+        self.native_tool_selection.deinit(self.alloc);
         self.skills.deinit(std.heap.c_allocator);
         self.context_snapshot.deinit(self.alloc);
         self.file_index.deinit(std.heap.c_allocator);
@@ -1944,7 +1961,7 @@ const App = struct {
     fn effectiveToolSet(self: *const App) tool_set_contract.ToolSet {
         if (!self.allow_native_tools) return tool_set_contract.empty;
         if (comptime host_profile.tools) {
-            return builtin_tools.advertisement_set;
+            return self.native_tool_selection.tool_set;
         }
         return browser_workspace_tools.selectToolSet(
             false,
@@ -3951,6 +3968,25 @@ test "interactive native tool suppression controls advertisement and dispatch" {
     try std.testing.expectEqual(@as(usize, 0), app.toolAdvertisementSet().order.len);
 }
 
+test "interactive native tool selection controls advertisement and dispatch" {
+    var app = App{ .alloc = std.testing.allocator };
+    app.native_tool_selection = try tool_selection.resolve(
+        std.testing.allocator,
+        native_tool_selection_catalog,
+        &.{ "terminal:exec", "read_file" },
+    );
+    defer app.native_tool_selection.deinit(std.testing.allocator);
+
+    const selected = app.toolAdvertisementSet();
+    try std.testing.expectEqual(@as(usize, 2), selected.order.len);
+    try std.testing.expectEqualStrings("terminal", selected.order[0]);
+    try std.testing.expectEqualStrings("read_file", selected.order[1]);
+    try std.testing.expectEqualStrings(
+        builtin_tools.terminalExecOnlySpec().description,
+        app.toolRegistry().lookup("terminal").?.description,
+    );
+}
+
 fn fullEntryConfig(auth_mode: credentials.AuthMode) app_entry_runtime.Config {
     return .{
         .version = version,
@@ -3981,6 +4017,7 @@ fn fullEntryConfig(auth_mode: credentials.AuthMode) app_entry_runtime.Config {
         .context_registry = default_context_registry,
         .mode_registry = builtin_modes.registry,
         .tool_set = builtin_tools.advertisement_set,
+        .tool_selection_catalog = native_tool_selection_catalog,
         .inspect_mcp_profile_config = builtin_mcp.inspectProfileConfig,
         .inspect_mcp_local_config = builtin_mcp.inspectLocalConfig,
         .load_mcp_runtime = builtin_mcp.loadRuntime,
@@ -4020,6 +4057,7 @@ fn localEntryConfig(auth_mode: credentials.AuthMode) app_entry_runtime.Config {
         .context_registry = default_context_registry,
         .mode_registry = builtin_modes.registry,
         .tool_set = builtin_tools.advertisement_set,
+        .tool_selection_catalog = native_tool_selection_catalog,
         .inspect_mcp_profile_config = builtin_mcp.inspectProfileConfig,
         .inspect_mcp_local_config = builtin_mcp.inspectLocalConfig,
         .load_mcp_runtime = builtin_mcp.loadRuntime,
@@ -4059,6 +4097,7 @@ fn emptyEntryConfig(auth_mode: credentials.AuthMode) app_entry_runtime.Config {
         .context_registry = default_context_registry,
         .mode_registry = builtin_modes.registry,
         .tool_set = builtin_tools.advertisement_set,
+        .tool_selection_catalog = native_tool_selection_catalog,
         .inspect_mcp_profile_config = builtin_mcp.inspectProfileConfig,
         .inspect_mcp_local_config = builtin_mcp.inspectLocalConfig,
         .load_mcp_runtime = builtin_mcp.loadRuntime,

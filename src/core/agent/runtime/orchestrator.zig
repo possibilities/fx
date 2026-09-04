@@ -1137,10 +1137,16 @@ fn agentShellWriteLeaseSessionId(
         else => error.InvalidTerminalLeaseTrackingInput,
     };
     if (parsed != .object) return error.InvalidTerminalLeaseTrackingInput;
-    const action = parsed.object.get("action") orelse return error.InvalidTerminalLeaseTrackingInput;
+    // The model-facing request may still be wrapped, or may already have been
+    // normalized for internal dispatch. Both name the same command authority.
+    const arguments = if (parsed.object.get("request")) |wrapped| arguments: {
+        if (wrapped != .object) return error.InvalidTerminalLeaseTrackingInput;
+        break :arguments wrapped.object;
+    } else parsed.object;
+    const action = arguments.get("action") orelse return error.InvalidTerminalLeaseTrackingInput;
     if (action != .string) return error.InvalidTerminalLeaseTrackingInput;
     if (!std.mem.eql(u8, action.string, "write")) return null;
-    const session_id = parsed.object.get("session_id") orelse
+    const session_id = arguments.get("session_id") orelse
         return error.InvalidTerminalLeaseTrackingInput;
     if (session_id != .string or session_id.string.len == 0) {
         return error.InvalidTerminalLeaseTrackingInput;
