@@ -669,6 +669,16 @@ const AskContext = struct {
         self.lifecycle_view = self.lifecycle_runtime.freeze();
     }
 
+    fn initializeUsageAuthority(self: *AskContext, save_session: bool) !void {
+        self.session.usage.setShape(self.cfg.shape, self.cfg.shape_label);
+        if (!save_session) return;
+        _ = try self.session.initializeProfileUsage(
+            self.alloc,
+            self.cfg.history_home orelse io_mod.getenv("HOME"),
+        );
+        self.session.attachProfileUsagePublisher(self.alloc);
+    }
+
     fn dispatchAttentionRequired(self: *AskContext, kind: hooks.AttentionKind) void {
         agent_runtime.dispatchAttentionRequiredCheckpoint(self.lifecycleContext(), .{
             .turn_id = self.active_turn_id,
@@ -1546,10 +1556,7 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
     defer if (owned_resumed_model) |model| alloc.free(model);
     var ctx = AskContext.init(alloc, cfg, options.deps, startup.workspace_root);
     defer ctx.deinit();
-    if (options.save_session) {
-        _ = try ctx.session.initializeProfileUsage(alloc, io_mod.getenv("HOME"));
-        ctx.session.attachProfileUsagePublisher(alloc);
-    }
+    try ctx.initializeUsageAuthority(options.save_session);
     ctx.use_process_interrupt_flag = options.deps.install_headless_interrupt;
     try ctx.checkCancellation();
     var presenter: ?ask_presentation.Runtime = null;
@@ -1874,6 +1881,7 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
     ctx.retain_external_root_user_turn = current_prompt_is_root_authority;
     options.deps.process_queued_prompt(&ctx.session.agent, &deps, semantic_presentation, ctx.lifecycleContext(), .{
         .system_prompt = cfg.prompt_policy.system_prompt,
+        .shape = cfg.shape,
         .model_prompt_overlay = cfg.prompt_policy.modelPromptOverlay(ctx.model),
         .skills_prompt_section = skills_section,
         .explicit_skills_prompt_section = explicit_skills.text,
@@ -2043,6 +2051,8 @@ fn agentRuntimeDeps(ctx: *AskContext) agent_runtime.AgentRuntimeDeps {
     );
     return .{
         .ctx = @ptrCast(ctx),
+        .shape = ctx.cfg.shape,
+        .shape_label = ctx.cfg.shape_label,
         .agent_stream_provider = ctx.agentStreamProvider(),
         .render_assistant_text = ctx.output_mode.isTerminal(),
         .compaction_route = ctx.cfg.provider_set.compactionRoute(
@@ -4241,6 +4251,44 @@ fn testConfig() Config {
         .mode_registry = test_mode_registry,
         .load_mcp_runtime = testNoMcpRuntime,
     };
+}
+
+test "ask usage and recovery dependencies keep selected shape and history authority" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const history_home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(history_home);
+
+    const shape = shape_authority.derive(.{ .system_prompt = "review carefully" });
+    var cfg = testConfig();
+    cfg.history_home = history_home;
+    cfg.shape = shape;
+    cfg.shape_label = "reviewer";
+
+    var stdout_capture: TestCapture = .{};
+    defer stdout_capture.deinit(alloc);
+    var stderr_capture: TestCapture = .{};
+    defer stderr_capture.deinit(alloc);
+    var ctx = AskContext.init(
+        alloc,
+        cfg,
+        testPromptRunDeps(&stdout_capture, &stderr_capture, testPresentKeyStartup),
+        "/tmp/workspace",
+    );
+    defer ctx.deinit();
+
+    try ctx.initializeUsageAuthority(true);
+    try std.testing.expect(ctx.session.usage.shape.?.eql(shape));
+    try std.testing.expectEqualStrings("reviewer", ctx.session.usage.shape_label);
+    try std.testing.expectEqualStrings(
+        history_home,
+        ctx.session.profile_usage.store.?.home_path,
+    );
+
+    const deps = agentRuntimeDeps(&ctx);
+    try std.testing.expect(deps.shape.?.eql(shape));
+    try std.testing.expectEqualStrings("reviewer", deps.shape_label);
 }
 
 fn testMissingKeyStartup(alloc: Allocator, _: oauth_transport.Provider, _: host.SecretStore, default_model: []const u8, default_agent_step_limit: usize) !app_lifecycle.StartupState {

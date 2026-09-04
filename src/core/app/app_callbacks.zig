@@ -5,6 +5,7 @@ const command_admission = @import("../permissions/command_admission.zig");
 const permission_auto_classifier = @import("../permissions/auto_classifier.zig");
 const auth_runtime = @import("../auth/auth_runtime.zig");
 const credentials = @import("../auth/credentials.zig");
+const shape_authority = @import("../auth/shape_authority.zig");
 const secret = @import("../auth/secret.zig");
 const model_capabilities = @import("../config/model_capabilities.zig");
 const input_completion_runtime = @import("input_completion_runtime.zig");
@@ -268,6 +269,11 @@ pub fn Bindings(comptime App: type) type {
         pub fn agentRuntimeDeps(app: *App) agent_runtime.AgentRuntimeDeps {
             var deps: agent_runtime.AgentRuntimeDeps = .{
                 .ctx = @ptrCast(app),
+                .shape = if (comptime @hasField(App, "shape")) app.shape else null,
+                .shape_label = if (comptime @hasDecl(App, "shapeLabel"))
+                    app.shapeLabel()
+                else
+                    shape_authority.default_label,
                 .agent_stream_provider = if (comptime @hasDecl(App, "agentStreamProvider"))
                     app.agentStreamProvider()
                 else
@@ -1502,6 +1508,8 @@ const FakeShell = struct {
 
 const FakeApp = struct {
     alloc: std.mem.Allocator,
+    shape: ?shape_authority.Identity = null,
+    shape_label: []const u8 = shape_authority.default_label,
     worker: FakeWorker = .{},
     session: FakeSession = .{},
     input_runtime: core_input_runtime.Runtime = .{},
@@ -1553,6 +1561,10 @@ const FakeApp = struct {
         self.pacer.deinit(self.alloc);
         self.transcript.deinit(self.alloc);
         self.last_notice_topic.deinit(self.alloc);
+    }
+
+    pub fn shapeLabel(self: *const FakeApp) []const u8 {
+        return self.shape_label;
     }
 
     pub fn modelCompletions(self: *FakeApp, _: []const u8, out: *[32][]const u8) usize {
@@ -1917,7 +1929,13 @@ test "agent deps forward app callbacks through core types" {
     var app = FakeApp.init(std.testing.allocator);
     defer app.deinit();
 
+    const shape = shape_authority.derive(.{ .system_prompt = "review carefully" });
+    app.shape = shape;
+    app.shape_label = "reviewer";
+
     const deps = Bindings(FakeApp).agentRuntimeDeps(&app);
+    try std.testing.expect(deps.shape.?.eql(shape));
+    try std.testing.expectEqualStrings("reviewer", deps.shape_label);
     try std.testing.expect(deps.prepare_parent_turn_context == null);
     try std.testing.expect(deps.acknowledge_parent_turn_context == null);
     try deps.push_text(deps.ctx, .{ .assistant_rendered = "hello" });
