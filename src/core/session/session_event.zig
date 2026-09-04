@@ -942,7 +942,7 @@ fn applyDelta(
                 try provenance.dupe(alloc)
             else
                 null;
-            errdefer if (next.usage) |*usage| usage.deinit(alloc);
+            errdefer if (next.provenance) |*value| value.deinit(alloc);
             try session_codec.validateState(next);
             state.* = next;
         },

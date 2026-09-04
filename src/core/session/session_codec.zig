@@ -1162,6 +1162,10 @@ fn parseIdentityDigest(comptime Identity: type, value: std.json.Value) !?Identit
     return switch (value) {
         .null => null,
         .string => |hex| identity: {
+            // Guard the length before decoding: hexToBytes succeeds on any
+            // short even-length input and leaves the rest of the buffer
+            // undefined, which bytesToHex would then read.
+            if (hex.len != Sha256.digest_length * 2) return error.InvalidDurableField;
             var bytes: [Sha256.digest_length]u8 = undefined;
             _ = std.fmt.hexToBytes(&bytes, hex) catch return error.InvalidDurableField;
             const canonical = std.fmt.bytesToHex(bytes, .lower);

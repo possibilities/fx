@@ -997,11 +997,14 @@ const IndexedSummaryView = struct {
         errdefer if (title) |value| alloc.free(value);
         const preview = if (self.preview) |value| try alloc.dupe(u8, value.text) else null;
         errdefer if (preview) |value| alloc.free(value);
-        // A label without its digest is provenance this listing cannot trust,
-        // so both travel together or neither does.
-        const shape: ?shape_authority.Reference = if (self.shape_id) |label| shape: {
-            const identity = self.shape_identity orelse break :shape null;
-            break :shape .{ .id = try alloc.dupe(u8, label.text), .identity = identity };
+        // The same rule the value-based reader applies, so one index file can
+        // never read two ways depending on which listing surface loaded it.
+        if ((self.shape_id == null) != (self.shape_identity == null)) {
+            return error.InvalidSessionIndex;
+        }
+        const shape: ?shape_authority.Reference = if (self.shape_id) |label| .{
+            .id = try alloc.dupe(u8, label.text),
+            .identity = self.shape_identity.?,
         } else null;
         errdefer if (shape) |stored| alloc.free(stored.id);
         return .{
@@ -1192,12 +1195,7 @@ fn readIndexedSummaryView(
                 } else if (std.mem.eql(u8, key.text, "shape_identity")) {
                     const hex = try readJsonString(scanner, alloc);
                     defer hex.deinit(alloc);
-                    var bytes: [32]u8 = undefined;
-                    _ = std.fmt.hexToBytes(&bytes, hex.text) catch
-                        return error.InvalidSessionIndex;
-                    const canonical = std.fmt.bytesToHex(bytes, .lower);
-                    if (!std.mem.eql(u8, &canonical, hex.text)) return error.InvalidSessionIndex;
-                    shape_identity = .{ .bytes = bytes };
+                    shape_identity = try indexedShapeDigest(hex.text);
                 } else if (std.mem.eql(u8, key.text, "credential_source")) {
                     const source = try readJsonString(scanner, alloc);
                     defer source.deinit(alloc);
@@ -1757,20 +1755,34 @@ fn writeIndexedSummaryJson(writer: *std.Io.Writer, summary: SessionSummary) !voi
     try writer.writeByte('}');
 }
 
-/// Reads one stored shape reference from an index entry. A label without its
-/// digest, or a digest that is not exactly 32 lower-case hex bytes, is not a
-/// shape this listing will show: provenance it cannot trust is dropped rather
-/// than displayed as though the session had been read correctly.
+/// Reads one stored shape reference from an index entry. The label and its
+/// digest travel together: half a pair, an unusable label, or a digest that is
+/// not exactly 32 lower-case hex bytes fails the whole index rather than
+/// listing a session as though its provenance had been read correctly. The
+/// index is a rebuildable cache, so refusing costs a rebuild while dropping
+/// would silently misreport what produced a session, and never self-correct.
 fn indexedShape(alloc: Allocator, root: std.json.ObjectMap) !?shape_authority.Reference {
-    const label_value = root.get("shape_id") orelse return null;
+    const label_value = root.get("shape_id") orelse {
+        if (root.get("shape_identity") != null) return error.InvalidSessionIndex;
+        return null;
+    };
     const identity_value = root.get("shape_identity") orelse return error.InvalidSessionIndex;
     if (label_value != .string or identity_value != .string) return error.InvalidSessionIndex;
     shape_authority.validateLabel(label_value.string) catch return error.InvalidSessionIndex;
+    const identity = try indexedShapeDigest(identity_value.string);
+    return .{ .id = try alloc.dupe(u8, label_value.string), .identity = identity };
+}
+
+/// A stored digest must be exactly 32 lower-case hex bytes. The length is
+/// checked before decoding because hexToBytes accepts any shorter even-length
+/// input and leaves the rest of the buffer undefined.
+fn indexedShapeDigest(hex: []const u8) !shape_authority.Identity {
+    if (hex.len != 64) return error.InvalidSessionIndex;
     var bytes: [32]u8 = undefined;
-    _ = std.fmt.hexToBytes(&bytes, identity_value.string) catch return error.InvalidSessionIndex;
+    _ = std.fmt.hexToBytes(&bytes, hex) catch return error.InvalidSessionIndex;
     const canonical = std.fmt.bytesToHex(bytes, .lower);
-    if (!std.mem.eql(u8, &canonical, identity_value.string)) return error.InvalidSessionIndex;
-    return .{ .id = try alloc.dupe(u8, label_value.string), .identity = .{ .bytes = bytes } };
+    if (!std.mem.eql(u8, &canonical, hex)) return error.InvalidSessionIndex;
+    return .{ .bytes = bytes };
 }
 
 fn indexedCredentialSource(root: std.json.ObjectMap) !?shared_types.CredentialSource {

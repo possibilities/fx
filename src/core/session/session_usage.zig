@@ -2737,6 +2737,7 @@ pub fn writeRichSnapshot(writer: *std.Io.Writer, snapshot: Snapshot) !void {
         } else {
             try writer.writeAll("null");
         }
+        try writePendingShape(writer, pending);
         try writer.writeByte('}');
     }
     try writer.writeAll("],\"publication_backlog\":[");
@@ -2777,13 +2778,20 @@ fn writePendingAuthority(writer: *std.Io.Writer, pending: PendingGeneration) !vo
     } else {
         try writer.writeAll("null");
     }
-    if (pending.shape) |shape| {
-        try writer.writeAll(",\"shape_id\":");
-        try std.json.Stringify.value(shape.id, .{}, writer);
-        try writer.writeAll(",\"shape_identity\":");
-        const hex = std.fmt.bytesToHex(shape.identity.bytes, .lower);
-        try std.json.Stringify.value(&hex, .{}, writer);
-    }
+}
+
+/// Shape travels with the rich sidecar entry only. The durable session payload
+/// is frozen in its pre-usage-dashboard shape because older binaries reject
+/// unknown snapshot fields outright, so a field added there makes every session
+/// this build writes unreadable on rollback. `observed_at_ms` is kept out of
+/// the shared helper for exactly this reason; shape follows it.
+fn writePendingShape(writer: *std.Io.Writer, pending: PendingGeneration) !void {
+    const shape = pending.shape orelse return;
+    try writer.writeAll(",\"shape_id\":");
+    try std.json.Stringify.value(shape.id, .{}, writer);
+    try writer.writeAll(",\"shape_identity\":");
+    const hex = std.fmt.bytesToHex(shape.identity.bytes, .lower);
+    try std.json.Stringify.value(&hex, .{}, writer);
 }
 
 /// Parses either the rollback-readable or current usage snapshot schema.
@@ -3598,6 +3606,7 @@ fn parseCredentialIdentityOptional(value: ?std.json.Value) !?credential_authorit
     return switch (actual) {
         .null => null,
         .string => |hex| identity: {
+            if (hex.len != Sha256.digest_length * 2) return error.InvalidUsageSnapshot;
             var bytes: [Sha256.digest_length]u8 = undefined;
             _ = std.fmt.hexToBytes(&bytes, hex) catch return error.InvalidUsageSnapshot;
             const canonical = std.fmt.bytesToHex(bytes, .lower);
@@ -5199,6 +5208,10 @@ test "populated usage snapshot keeps the rollback-readable durable shape" {
     const alloc = std.testing.allocator;
     var usage = Usage.initFresh();
     defer usage.deinit(alloc);
+    // Every real launch sets a shape, so the guard must hold with one set.
+    // Without this the durable payload could grow keys and this test would
+    // still pass, which is exactly how a rollback break reached review.
+    usage.setShape(shape_authority.derive(.{ .system_prompt = "review" }), "reviewer");
 
     const first_sequence = try usage.reserveInvocation();
     try usage.finishObservedInvocation(
@@ -5976,16 +5989,30 @@ test "usage generations carry the shape that made them and fail closed on a mism
     try std.testing.expectEqualStrings("reviewer", snapshot.pending[0].shape.?.id);
     try std.testing.expect(snapshot.pending[0].shape.?.identity.eql(reviewer));
 
-    // The stored record round trips through the durable snapshot unchanged.
+    // Shape rides the rich sidecar and round trips there.
     var encoded: std.Io.Writer.Allocating = .init(alloc);
     defer encoded.deinit();
-    try writeSnapshot(&encoded.writer, snapshot);
+    try writeRichSnapshot(&encoded.writer, snapshot);
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, encoded.written(), .{});
     defer parsed.deinit();
     var restored = try parseSnapshotValue(alloc, parsed.value);
     defer restored.deinit(alloc);
     try std.testing.expectEqualStrings("reviewer", restored.pending[0].shape.?.id);
     try std.testing.expect(restored.pending[0].shape.?.identity.eql(reviewer));
+
+    // The durable payload must not have grown: an older binary rejects unknown
+    // snapshot fields, so a key added here makes this session unreadable on
+    // rollback. Eight keys is the frozen pre-usage-dashboard shape.
+    var durable: std.Io.Writer.Allocating = .init(alloc);
+    defer durable.deinit();
+    try writeSnapshot(&durable.writer, snapshot);
+    var durable_parsed = try std.json.parseFromSlice(std.json.Value, alloc, durable.written(), .{});
+    defer durable_parsed.deinit();
+    for (durable_parsed.value.object.get("pending").?.array.items) |pending| {
+        try std.testing.expectEqual(@as(usize, 8), pending.object.count());
+        try std.testing.expect(pending.object.get("shape_id") == null);
+        try std.testing.expect(pending.object.get("shape_identity") == null);
+    }
 
     // Re-observing the same generation under a different shape is a conflict,
     // not a silent overwrite: the digest, not the label, decides.

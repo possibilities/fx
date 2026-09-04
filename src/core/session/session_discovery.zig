@@ -563,6 +563,7 @@ pub fn classifySchemaV3Candidate(
     const workspace_root = try alloc.dupe(u8, manifest.workspace_root);
     errdefer alloc.free(workspace_root);
     var display = try session_display_metadata.readSidecarOrFallback(alloc, session_dir);
+    errdefer display.deinit(alloc);
     if (display.origin_workspace_root) |root| {
         alloc.free(root);
         display.origin_workspace_root = null;
