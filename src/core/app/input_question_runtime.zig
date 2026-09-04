@@ -8,13 +8,11 @@ const input_limit_rejection = @import("../input/input_limit_rejection.zig");
 const question_ui = @import("../../ui/footer/question_ui.zig");
 const question_freeform_layout = @import("../../ui/footer/question_freeform_layout.zig");
 const input_interrupt_runtime = @import("input_interrupt_runtime.zig");
-const input_queue_runtime = @import("input_queue_runtime.zig");
 const hooks = @import("../hooks/hooks.zig");
 
 pub fn QuestionRuntime(comptime App: type) type {
     return struct {
         const interrupt = input_interrupt_runtime.InterruptRuntime(App);
-        const queue_rt = input_queue_runtime.Runtime(App);
 
         const AttentionResolutionObserver = struct {
             app: *App,
@@ -88,8 +86,8 @@ pub fn QuestionRuntime(comptime App: type) type {
             const attention_kind = currentAttentionKind(app);
             interrupt.traceInterruptRequested(app, "input_question");
             if (!route_recovery) {
-                if (comptime @hasField(App, "queued_prompt_review")) {
-                    _ = queue_rt.requestCancelAndOpen(app);
+                if (comptime @hasDecl(@TypeOf(app.worker), "requestInteractiveCancel")) {
+                    app.worker.requestInteractiveCancel();
                 } else {
                     app.worker.requestCancel();
                 }
