@@ -253,6 +253,15 @@ pub const Config = struct {
     /// An already-validated profile whose credential this run borrows, read
     /// only. Resolving it is the launch surface's job; by here it is settled.
     borrowed_authorization_home: ?[]const u8 = null,
+    /// Writable profile authority for MCP OAuth credentials. This follows the
+    /// selected state profile and deliberately never follows borrowed identity.
+    profile_home: ?[]const u8 = null,
+    /// Canonical MCP configuration selected by the launch shape.
+    mcp_config_path: ?[]const u8 = null,
+    /// Invocation-only permission rules, replacing persisted profile rules.
+    permission_rules_override: ?types.PermissionRuleSet = null,
+    /// Whether project instructions may contribute model-visible context.
+    project_instructions_enabled: bool = true,
     /// The shape this run is running, recorded on the session it writes.
     shape: ?shape_authority.Identity = null,
     shape_label: []const u8 = shape_authority.default_label,
@@ -1499,7 +1508,33 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
     defer alloc.free(owned_prompt);
 
     try checkHeadlessCancellation(options.deps);
-    var startup = if (cfg.auth_mode == .host_managed)
+    var startup = if (cfg.profile_home) |profile_home|
+        if (cfg.auth_mode == .host_managed) state: {
+            var state = try app_lifecycle.loadEmbeddedStartupState(
+                alloc,
+                profile_home,
+                ".",
+                cfg.default_model,
+                cfg.default_agent_step_limit,
+            );
+            state.auth_mode = .host_managed;
+            break :state state;
+        } else if (cfg.borrowed_authorization_home) |authorization_home|
+            try app_lifecycle.loadCatalogStartupStateFromHomes(
+                alloc,
+                profile_home,
+                authorization_home,
+                cfg.default_model,
+                cfg.default_agent_step_limit,
+            )
+        else
+            try app_lifecycle.loadCatalogStartupStateFromHome(
+                alloc,
+                profile_home,
+                cfg.default_model,
+                cfg.default_agent_step_limit,
+            )
+    else if (cfg.auth_mode == .host_managed)
         try options.deps.load_startup_state_with_auth_mode(
             alloc,
             cfg.gateway_provider.oauth_transport,
@@ -1531,6 +1566,10 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
         startup.credential = borrowed.credential;
         startup.stored_key_status = borrowed.stored_key_status;
         startup.fx_login_status = borrowed.fx_login_status;
+        startup.credential_load_failure = if (borrowed.failure) |failure|
+            .{ .source = failure.source, .err = failure.err }
+        else
+            null;
     }
     try checkHeadlessCancellation(options.deps);
 
@@ -1606,7 +1645,10 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
     ctx.first_call_tool_choice = startup.first_call_tool_choice;
     ctx.permission_mode = permission_mode;
     ctx.mode_id = mode_id;
-    ctx.permission_rules = try takeCorePermissionRules(alloc, &startup);
+    ctx.permission_rules = if (cfg.permission_rules_override) |rules|
+        try types.dupePermissionRuleSet(alloc, rules)
+    else
+        try takeCorePermissionRules(alloc, &startup);
     ctx.context_enabled = startup.context_enabled;
     if (options.output_mode.isTerminal()) {
         presenter = try ask_presentation.Runtime.init(alloc, .{
@@ -1680,17 +1722,34 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
         else
             false;
         const startup_credential_is_final = startup_matches_final_model and
-            !credentials.sourceRefreshable(startup.credential.?.source);
+            (cfg.borrowed_authorization_home != null or
+                !credentials.sourceRefreshable(startup.credential.?.source));
         const credential: *const credentials.Credential = if (startup_credential_is_final)
             &startup.credential.?
         else routed: {
-            routed_credential = try auth_runtime.prepareCredential(
-                alloc,
-                cfg.gateway_provider.oauth_transport,
-                cfg.secret_store,
-                ctx.provider,
-                if (ctx.provider == .gateway) startup.credential_source_preference else null,
-            );
+            routed_credential = if (cfg.borrowed_authorization_home) |authorization_home|
+                (try credentials.resolveReadOnlyForProviderFromHome(
+                    alloc,
+                    ctx.provider,
+                    if (ctx.provider == .gateway) startup.credential_source_preference else null,
+                    authorization_home,
+                )).credential
+            else if (cfg.profile_home) |profile_home|
+                try auth_runtime.prepareCredentialFromHome(
+                    alloc,
+                    cfg.gateway_provider.oauth_transport,
+                    ctx.provider,
+                    if (ctx.provider == .gateway) startup.credential_source_preference else null,
+                    profile_home,
+                )
+            else
+                try auth_runtime.prepareCredential(
+                    alloc,
+                    cfg.gateway_provider.oauth_transport,
+                    cfg.secret_store,
+                    ctx.provider,
+                    if (ctx.provider == .gateway) startup.credential_source_preference else null,
+                );
             if (routed_credential == null) {
                 return missingCredentialResult(alloc, options, ctx.provider);
             }
@@ -1769,19 +1828,14 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
             .access_scope = ctx.workspace_access.scope(ctx.workspace_root),
             .targets = context_targets,
             .context_limits = ctx.context_limits,
+            .project_instructions_enabled = cfg.project_instructions_enabled,
         });
         try ctx.checkCancellation();
         for (ctx.context_snapshot.notices) |notice| try pushContextNotice(@ptrCast(&ctx), notice);
     }
 
     try ctx.checkCancellation();
-    ctx.mcp = try options.deps.load_mcp_runtime(
-        alloc,
-        startup.workspace_root,
-        ctx.mcp_elicitation_capabilities,
-        null,
-        null,
-    );
+    ctx.mcp = try loadConfiguredMcpRuntime(&ctx);
     if (ctx.mcp) |mcp| {
         var health_snapshot = try mcp.snapshotHealth(
             alloc,
@@ -2083,6 +2137,7 @@ fn agentRuntimeDeps(ctx: *AskContext) agent_runtime.AgentRuntimeDeps {
         .tool_registry = ctx.toolRegistry(),
         .context_registry = ctx.deps.context_registry,
         .context_enabled = ctx.context_enabled,
+        .project_instructions_enabled = ctx.cfg.project_instructions_enabled,
         .finalize_turn = finalizeTurn,
         .release_agent_terminal_lease = releaseAgentTerminalLease,
         .append_runtime_context = appendRuntimeContext,
@@ -2126,6 +2181,16 @@ fn agentRuntimeDeps(ctx: *AskContext) agent_runtime.AgentRuntimeDeps {
     };
 }
 
+fn loadConfiguredMcpRuntime(ctx: *AskContext) !?*mcp_runtime.McpRuntime {
+    return ctx.deps.load_mcp_runtime(
+        ctx.alloc,
+        ctx.workspace_root,
+        ctx.mcp_elicitation_capabilities,
+        ctx.cfg.profile_home,
+        ctx.cfg.mcp_config_path,
+    );
+}
+
 fn releaseAgentTerminalLease(raw_ctx: *anyopaque, session_id: []const u8) !void {
     const ctx: *AskContext = @ptrCast(@alignCast(raw_ctx));
     return tool_runtime.release_agent_terminal_lease(ctx.toolContext(), session_id);
@@ -2139,13 +2204,24 @@ fn refreshGatewayCredential(
     expected_account_id: ?[]const u8,
 ) !?[]u8 {
     const ctx: *AskContext = @ptrCast(@alignCast(raw_ctx));
-    var refreshed = (try auth_runtime.refreshCredentialForAccount(
-        ctx.cfg.gateway_provider.oauth_transport,
-        ctx.alloc,
-        source,
-        mode,
-        expected_account_id,
-    )) orelse return null;
+    if (ctx.cfg.borrowed_authorization_home != null) return null;
+    var refreshed = (if (ctx.cfg.profile_home) |profile_home|
+        try auth_runtime.refreshCredentialForAccountFromHome(
+            ctx.cfg.gateway_provider.oauth_transport,
+            ctx.alloc,
+            source,
+            mode,
+            expected_account_id,
+            profile_home,
+        )
+    else
+        try auth_runtime.refreshCredentialForAccount(
+            ctx.cfg.gateway_provider.oauth_transport,
+            ctx.alloc,
+            source,
+            mode,
+            expected_account_id,
+        )) orelse return null;
     defer refreshed.deinit(ctx.alloc);
     return try adoptRefreshedAskCredential(ctx, alloc, &refreshed);
 }
@@ -4286,6 +4362,7 @@ test "ask usage and recovery dependencies keep selected shape and history author
     cfg.history_home = history_home;
     cfg.shape = shape;
     cfg.shape_label = "reviewer";
+    cfg.project_instructions_enabled = false;
 
     var stdout_capture: TestCapture = .{};
     defer stdout_capture.deinit(alloc);
@@ -4310,6 +4387,7 @@ test "ask usage and recovery dependencies keep selected shape and history author
     const deps = agentRuntimeDeps(&ctx);
     try std.testing.expect(deps.shape.?.eql(shape));
     try std.testing.expectEqualStrings("reviewer", deps.shape_label);
+    try std.testing.expect(!deps.project_instructions_enabled);
 }
 
 test "ask system override is included in the final shape identity" {
@@ -4362,6 +4440,70 @@ fn testPresentKeyStartup(alloc: Allocator, _: oauth_transport.Provider, _: host.
     state.selected_model = try alloc.dupe(u8, default_model);
     state.context_enabled = true;
     return state;
+}
+
+fn testRefreshableCodexStartup(alloc: Allocator, _: oauth_transport.Provider, _: host.SecretStore, default_model: []const u8, default_agent_step_limit: usize) !app_lifecycle.StartupState {
+    var state = app_lifecycle.StartupState{ .agent_step_limit = default_agent_step_limit };
+    errdefer state.deinit(alloc);
+    state.workspace_root = try alloc.dupe(u8, "/tmp/fx-test");
+    state.credential = .{
+        .token = try alloc.dupe(u8, "ambient-token-must-not-run"),
+        .source = .chatgpt_subscription,
+        .account_id = try alloc.dupe(u8, "ambient-account"),
+        .refresh_after_ms = 0,
+    };
+    state.provider = .codex;
+    state.selected_model = try alloc.dupe(u8, default_model);
+    state.context_enabled = false;
+    return state;
+}
+
+test "ask borrowed identity remains final for refreshable provider credentials" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io_mod.getIo(), "identity/.fx");
+    {
+        var file = try tmp.dir.createFile(
+            io_mod.getIo(),
+            "identity/.fx/chatgpt-auth.json",
+            .{ .permissions = std.Io.File.Permissions.fromMode(0o600) },
+        );
+        defer file.close(io_mod.getIo());
+        try file.writeStreamingAll(
+            io_mod.getIo(),
+            "{\"version\":1,\"access_token\":\"identity-token\",\"refresh_token\":\"identity-refresh\",\"expires_at_ms\":4000000000000,\"account_id\":\"identity-account\"}\n",
+        );
+    }
+    const identity_home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "identity");
+    defer alloc.free(identity_home);
+
+    var cfg = testConfig();
+    cfg.borrowed_authorization_home = identity_home;
+    cfg.provider_set.codex = test_builtin_gateway.provider_bundle;
+    var stdout_capture: TestCapture = .{};
+    defer stdout_capture.deinit(alloc);
+    var stderr_capture: TestCapture = .{};
+    defer stderr_capture.deinit(alloc);
+    const deps = testPromptRunDeps(
+        &stdout_capture,
+        &stderr_capture,
+        testRefreshableCodexStartup,
+    );
+
+    const exit_code = try runWithDeps(
+        alloc,
+        &.{ "--json", "--no-save", "hello" },
+        cfg,
+        deps,
+    );
+    try std.testing.expectEqual(@as(u8, 0), exit_code);
+    try std.testing.expectEqualStrings("", stderr_capture.bytes.items);
+    try std.testing.expect(std.mem.find(
+        u8,
+        stdout_capture.bytes.items,
+        "assistant text",
+    ) != null);
 }
 
 fn testMissingKeyAcknowledgedStartup(alloc: Allocator, transport: oauth_transport.Provider, secret_store: host.SecretStore, default_model: []const u8, default_agent_step_limit: usize) !app_lifecycle.StartupState {
@@ -4896,6 +5038,29 @@ fn testNoMcpRuntime(
     return null;
 }
 
+var test_mcp_authority_calls: usize = 0;
+var test_mcp_authority_expected_profile: ?[]const u8 = null;
+var test_mcp_authority_expected_config: ?[]const u8 = null;
+
+fn testMcpRuntimeAuthority(
+    _: Allocator,
+    _: []const u8,
+    _: mcp_elicitation.Capabilities,
+    profile_home: ?[]const u8,
+    selected_config_path: ?[]const u8,
+) !?*mcp_runtime.McpRuntime {
+    test_mcp_authority_calls += 1;
+    try std.testing.expectEqualStrings(
+        test_mcp_authority_expected_profile orelse return error.TestExpectedEqual,
+        profile_home orelse return error.TestExpectedEqual,
+    );
+    try std.testing.expectEqualStrings(
+        test_mcp_authority_expected_config orelse return error.TestExpectedEqual,
+        selected_config_path orelse return error.TestExpectedEqual,
+    );
+    return null;
+}
+
 fn testPromptRunDeps(stdout_capture: *TestCapture, stderr_capture: *TestCapture, load_startup_state: LoadStartupStateFn) RunDeps {
     return .{
         .stdout_ctx = stdout_capture,
@@ -4916,6 +5081,31 @@ fn testPromptRunDepsWithProcess(stdout_capture: *TestCapture, stderr_capture: *T
     var deps = testPromptRunDeps(stdout_capture, stderr_capture, testPresentKeyStartup);
     deps.process_queued_prompt = process;
     return deps;
+}
+
+test "ask MCP runtime receives selected profile and shape configuration" {
+    const alloc = std.testing.allocator;
+    var stdout_capture: TestCapture = .{};
+    defer stdout_capture.deinit(alloc);
+    var stderr_capture: TestCapture = .{};
+    defer stderr_capture.deinit(alloc);
+    var cfg = testConfig();
+    cfg.profile_home = "/profiles/work";
+    cfg.mcp_config_path = "/shapes/reviewer/.fx/mcp.json";
+    test_mcp_authority_calls = 0;
+    test_mcp_authority_expected_profile = cfg.profile_home;
+    test_mcp_authority_expected_config = cfg.mcp_config_path;
+    var deps = testPromptRunDeps(
+        &stdout_capture,
+        &stderr_capture,
+        testPresentKeyNoContextStartup,
+    );
+    deps.load_mcp_runtime = testMcpRuntimeAuthority;
+
+    var ctx = AskContext.init(alloc, cfg, deps, "/tmp/fx-test");
+    defer ctx.deinit();
+    ctx.mcp = try loadConfiguredMcpRuntime(&ctx);
+    try std.testing.expectEqual(@as(usize, 1), test_mcp_authority_calls);
 }
 
 fn testPermissionRuleSet(alloc: Allocator, permission: []const u8, pattern: []const u8, action: types.PermissionAction) !types.PermissionRuleSet {

@@ -395,6 +395,21 @@ pub fn Bindings(comptime App: type) type {
             expected_account_id: ?[]const u8,
         ) !?[]u8 {
             const app: *App = @ptrCast(@alignCast(raw_ctx));
+            if (comptime @hasField(App, "identity_home")) {
+                // A selected identity is borrowed read only. Its credential is
+                // either still valid or unavailable; never refresh it through
+                // the writable state profile or the ambient credential store.
+                if (app.identity_home != null) return null;
+            }
+            if (comptime @hasField(App, "profile_home")) {
+                // The legacy environment form is the same read-only authority,
+                // and is valid only together with an explicit state profile.
+                if (app.profile_home != null and
+                    io_mod.getenv(credentials.read_only_authorization_home_env) != null)
+                {
+                    return null;
+                }
+            }
             const isolated_home: ?[]const u8 = if (comptime @hasField(App, "profile_home"))
                 app.profile_home
             else

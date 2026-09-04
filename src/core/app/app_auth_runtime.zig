@@ -94,6 +94,30 @@ pub const PendingPromptCredentialReadiness = enum {
 
 pub fn Runtime(comptime App: type) type {
     return struct {
+        fn selectedStateHome(app: *const App) ?[]const u8 {
+            if (comptime @hasField(App, "profile_home")) return app.profile_home;
+            return null;
+        }
+
+        fn selectedIdentityHome(app: *const App) ?[]const u8 {
+            if (comptime @hasField(App, "identity_home")) return app.identity_home;
+            return null;
+        }
+
+        fn borrowedAuthorizationHome(app: *const App) !?[]u8 {
+            return credentials.borrowedAuthorizationHomeFromLaunch(
+                app.alloc,
+                selectedStateHome(app),
+                selectedIdentityHome(app),
+            );
+        }
+
+        fn borrowsAuthorization(app: *const App) bool {
+            return selectedIdentityHome(app) != null or
+                (selectedStateHome(app) != null and
+                    io_mod.getenv(credentials.read_only_authorization_home_env) != null);
+        }
+
         fn ensurePromptCredential(app: *App) !bool {
             if (comptime provider_runtime.supported(App) and
                 @hasDecl(@TypeOf(app.auth), "selectForProvider"))
@@ -130,7 +154,75 @@ pub fn Runtime(comptime App: type) type {
                 defer settings.deinit(app.alloc);
                 preferred = settings.credential_source;
             }
+            const borrowed_home = try borrowedAuthorizationHome(app);
+            defer if (borrowed_home) |home| app.alloc.free(home);
+            if (borrowed_home) |home| {
+                var resolution = credentials.resolveReadOnlyForProviderFromHome(
+                    app.alloc,
+                    provider,
+                    preferred,
+                    home,
+                ) catch |err| {
+                    if (err == error.OutOfMemory) return error.OutOfMemory;
+                    return .{ .failed = .{
+                        .source = if (provider == .gateway)
+                            preferred orelse .fx_login
+                        else
+                            provider_catalog.find(provider).login_source,
+                        .err = err,
+                    } };
+                };
+                defer if (resolution.credential) |*credential| credential.deinit(app.alloc);
+                if (resolution.credential) |*credential| {
+                    return if (app.auth.adoptCredential(app.alloc, credential))
+                        .selected
+                    else
+                        .unchanged;
+                }
+                if (resolution.failure) |failure| return .{ .failed = failure };
+                return .missing;
+            }
             return app.auth.selectForProvider(app.alloc, provider, preferred);
+        }
+
+        fn prepareProviderCredential(
+            app: *App,
+            provider: model_provider.ProviderId,
+            preferred: ?credentials.Source,
+        ) !?credentials.Credential {
+            const borrowed_home = try borrowedAuthorizationHome(app);
+            defer if (borrowed_home) |home| app.alloc.free(home);
+            if (borrowed_home) |home| {
+                var resolution = try credentials.resolveReadOnlyForProviderFromHome(
+                    app.alloc,
+                    provider,
+                    preferred,
+                    home,
+                );
+                if (resolution.failure) |failure| {
+                    if (resolution.credential) |*credential| credential.deinit(app.alloc);
+                    return failure.err;
+                }
+                const credential = resolution.credential;
+                resolution.credential = null;
+                return credential;
+            }
+            if (app_profile_runtime.explicitHome(app)) |profile_home| {
+                return auth_runtime.prepareCredentialFromHome(
+                    app.alloc,
+                    app.auth.oauthTransport(),
+                    provider,
+                    preferred,
+                    profile_home,
+                );
+            }
+            return auth_runtime.prepareCredential(
+                app.alloc,
+                app.auth.oauthTransport(),
+                app.auth.secretStore(),
+                provider,
+                preferred,
+            );
         }
 
         pub fn restoreSessionCredential(app: *App, previous_provider: model_provider.ProviderId) !void {
@@ -1033,22 +1125,11 @@ pub fn Runtime(comptime App: type) type {
             var credential: ?credentials.Credential = null;
             defer if (credential) |*value| value.deinit(app.alloc);
             if (!hostManagesAuth(app)) {
-                credential = ((if (app_profile_runtime.explicitHome(app)) |profile_home|
-                    auth_runtime.prepareCredentialFromHome(
-                        app.alloc,
-                        app.auth.oauthTransport(),
-                        target,
-                        if (target == .gateway) settings.credential_source else null,
-                        profile_home,
-                    )
-                else
-                    auth_runtime.prepareCredential(
-                        app.alloc,
-                        app.auth.oauthTransport(),
-                        app.auth.secretStore(),
-                        target,
-                        if (target == .gateway) settings.credential_source else null,
-                    )) catch |err| {
+                credential = prepareProviderCredential(
+                    app,
+                    target,
+                    if (target == .gateway) settings.credential_source else null,
+                ) catch |err| {
                     if (err == error.OutOfMemory) return err;
                     debug_trace.logf("provider", "credential preparation failed provider={t} err={s}", .{ target, @errorName(err) });
                     const body = try auth_runtime.preparationFailureText(app.alloc, target, err);
@@ -1059,12 +1140,12 @@ pub fn Runtime(comptime App: type) type {
                         .body = body,
                     }, true);
                     return;
-                }) orelse {
-                    if (target == .codex and allow_login) {
+                } orelse {
+                    if (!borrowsAuthorization(app) and target == .codex and allow_login) {
                         try beginCodexSignInForProviderSwitch(app);
                         return;
                     }
-                    if (target == .grok and allow_login) {
+                    if (!borrowsAuthorization(app) and target == .grok and allow_login) {
                         try beginGrokSignInForProviderSwitch(app);
                         return;
                     }
@@ -1536,6 +1617,7 @@ pub fn Runtime(comptime App: type) type {
 
         pub fn startPromptCredentialPrewarm(app: *App) void {
             if (comptime !@hasDecl(@TypeOf(app.auth), "beginPromptCredentialRefresh")) return;
+            if (borrowsAuthorization(app)) return;
             if (comptime provider_runtime.supported(App)) {
                 if (!model_provider.authorizesCredential(provider_runtime.provider(app), app.auth.credentialSource())) return;
             }
@@ -1554,6 +1636,9 @@ pub fn Runtime(comptime App: type) type {
                 return if (try admitPromptCredential(app)) .current else .rejected;
             }
             if (!try ensurePromptCredential(app)) return .rejected;
+            if (borrowsAuthorization(app)) {
+                return if (app.auth.gatewayCredential() != null) .current else .rejected;
+            }
             const source = app.auth.credentialSource() orelse return .rejected;
             if (!credentials.sourceRefreshable(source)) {
                 return if (app.auth.gatewayCredential() != null) .current else .rejected;
@@ -1591,6 +1676,9 @@ pub fn Runtime(comptime App: type) type {
                 return if (try admitPromptCredential(app)) .current else .rejected;
             }
             if (!try ensurePromptCredential(app)) return .rejected;
+            if (borrowsAuthorization(app)) {
+                return if (app.auth.gatewayCredential() != null) .current else .rejected;
+            }
             if (comptime @hasDecl(@TypeOf(app.auth), "credentialFailure")) {
                 if (app.auth.credentialFailure()) |failure| {
                     if (!failure.retryable()) {
@@ -1607,6 +1695,9 @@ pub fn Runtime(comptime App: type) type {
         }
 
         fn preparePromptCredential(app: *App) !bool {
+            if (borrowsAuthorization(app)) {
+                return app.auth.gatewayCredential() != null;
+            }
             if (comptime @hasDecl(@TypeOf(app.auth), "credentialFailure")) {
                 if (app.auth.credentialFailure()) |failure| {
                     if (failure.requiresSignIn()) {
@@ -1907,6 +1998,50 @@ test "provider switch state machine no-ops rejects busy work and prepares only i
             .queued_prompts = 0,
         }),
     );
+}
+
+test "interactive credential selection cannot escape the borrowed identity" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "identity/.fx");
+    var file = try tmp.dir.createFile(
+        std.testing.io,
+        "identity/.fx/chatgpt-auth.json",
+        .{ .permissions = std.Io.File.Permissions.fromMode(0o600) },
+    );
+    try file.writeStreamingAll(
+        std.testing.io,
+        "{\"version\":1,\"access_token\":\"identity-token\",\"refresh_token\":\"identity-refresh\",\"expires_at_ms\":4000000000000,\"account_id\":\"identity-account\"}\n",
+    );
+    file.close(std.testing.io);
+    const identity_home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "identity");
+    defer alloc.free(identity_home);
+
+    const IdentityApp = struct {
+        alloc: std.mem.Allocator,
+        identity_home: ?[]const u8,
+        workspace_root: []const u8 = ".",
+        auth: auth_runtime.Runtime,
+    };
+    var app = IdentityApp{
+        .alloc = alloc,
+        .identity_home = identity_home,
+        .auth = auth_runtime.Runtime.init(
+            @import("../auth/api_key_validator.zig").unavailable_provider,
+            @import("../auth/oauth_transport.zig").unavailable_provider,
+            host.unavailable_secret_store,
+        ),
+    };
+    defer app.auth.deinit(alloc);
+
+    try std.testing.expectEqual(
+        auth_runtime.ProviderCredentialSelection.selected,
+        try Runtime(IdentityApp).selectProviderCredential(&app, .codex),
+    );
+    try std.testing.expectEqual(credentials.Source.chatgpt_subscription, app.auth.credentialSource().?);
+    try std.testing.expectEqualStrings("identity-account", app.auth.accountId().?);
+    try std.testing.expectEqualStrings("identity-token", app.auth.gatewayCredential().?.api_key.?);
 }
 
 test "post OAuth catalog selection keeps valid current then saved then first" {

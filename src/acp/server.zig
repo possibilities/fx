@@ -4,6 +4,7 @@ const acp_runner = @import("../core/cli/acp_runner.zig");
 const config_runtime = @import("../core/config/config_runtime.zig");
 const io_mod = @import("../core/shared/io.zig");
 const host_target = @import("../core/hosts/target.zig");
+const host_contract = @import("../core/hosts/host.zig");
 const jsonrpc = @import("jsonrpc.zig");
 const acp_types = @import("types.zig");
 const sessions = @import("sessions.zig");
@@ -376,16 +377,16 @@ fn prepareConfiguredCredential(
             state.cfg.identity_home,
         );
     defer if (borrowed_authorization_home) |home| alloc.free(home);
+    if (borrowed_authorization_home) |authorization_home| {
+        const resolution = try credentials.resolveReadOnlyForProviderFromHome(
+            alloc,
+            provider,
+            preferred,
+            authorization_home,
+        );
+        return resolution.credential;
+    }
     if (state.cfg.home_override) |home| {
-        if (borrowed_authorization_home) |authorization_home| {
-            const resolution = try credentials.resolveReadOnlyForProviderFromHome(
-                alloc,
-                provider,
-                preferred,
-                authorization_home,
-            );
-            return resolution.credential;
-        }
         return auth_runtime.prepareCredentialFromHome(
             alloc,
             state.cfg.gateway_provider.oauth_transport,
@@ -420,6 +421,14 @@ fn refreshConfiguredCredentialForAccount(
             state.cfg.chatgpt_session_store,
         );
     }
+    const borrowed_authorization_home =
+        try credentials.borrowedAuthorizationHomeFromLaunch(
+            alloc,
+            state.cfg.home_override,
+            state.cfg.identity_home,
+        );
+    defer if (borrowed_authorization_home) |home| alloc.free(home);
+    if (borrowed_authorization_home != null) return null;
     if (state.cfg.home_override) |home| {
         return auth_runtime.refreshCredentialForAccountFromHome(
             state.cfg.gateway_provider.oauth_transport,
@@ -1918,8 +1927,36 @@ fn loadConfiguredStartupState(state: *const ServerState, alloc: Allocator) !app_
             state.cfg.default_model,
             state.cfg.default_agent_step_limit,
         );
+        errdefer startup.deinit(alloc);
         startup.auth_mode = state.cfg.auth_mode;
+        if (borrowed_authorization_home) |authorization_home| {
+            var resolution = try credentials.resolveReadOnlyForProviderFromHome(
+                alloc,
+                startup.provider,
+                startup.credential_source_preference,
+                authorization_home,
+            );
+            if (startup.credential) |*credential| credential.deinit(alloc);
+            startup.credential = resolution.credential;
+            resolution.credential = null;
+            startup.stored_key_status = resolution.stored_key_status;
+            startup.fx_login_status = resolution.fx_login_status;
+            startup.credential_load_failure = if (resolution.failure) |failure|
+                .{ .source = failure.source, .err = failure.err }
+            else
+                null;
+        }
         return startup;
+    }
+    if (borrowed_authorization_home) |authorization_home| {
+        return app_lifecycle.loadCatalogStartupStateBorrowingIdentity(
+            alloc,
+            state.cfg.secret_store,
+            authorization_home,
+            state.cfg.default_model,
+            state.cfg.default_agent_step_limit,
+            state.cfg.auth_mode,
+        );
     }
     return app_lifecycle.loadStartupStateWithAuthMode(
         alloc,
@@ -2015,6 +2052,15 @@ fn handleInitialize(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message
         state.account_id = null;
         state.gateway_team = null;
     } else {
+        const borrowed_authorization_home: ?[]u8 = if (state.cfg.minimal_kernel)
+            null
+        else
+            try credentials.borrowedAuthorizationHomeFromLaunch(
+                alloc,
+                state.cfg.home_override,
+                state.cfg.identity_home,
+            );
+        defer if (borrowed_authorization_home) |home| alloc.free(home);
         var startup_credential = startup.takeCredential();
         defer if (startup_credential) |*credential| credential.deinit(alloc);
         var routed_credential: ?credentials.Credential = null;
@@ -2024,7 +2070,8 @@ fn handleInitialize(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message
         else
             false;
         const startup_credential_is_final = startup_matches_model and
-            !credentials.sourceRefreshable(startup_credential.?.source);
+            (borrowed_authorization_home != null or
+                !credentials.sourceRefreshable(startup_credential.?.source));
         const credential: *credentials.Credential = if (state.provider == .gateway and state.cfg.credential_override != null) override: {
             routed_credential = .{
                 .token = try alloc.dupe(u8, state.cfg.credential_override.?),
@@ -2876,6 +2923,77 @@ test "ACP selected profile state loads settings without workspace override" {
     var startup = try loadConfiguredStartupState(&state, alloc);
     defer startup.deinit(alloc);
     try std.testing.expectEqualStrings("isolated/model", startup.configured_model);
+}
+
+test "ACP identity remains the only credential authority across routing and refresh" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "state/.fx");
+    try tmp.dir.createDirPath(std.testing.io, "identity/.fx");
+    {
+        var file = try tmp.dir.createFile(std.testing.io, "state/.fx/settings.json", .{});
+        defer file.close(std.testing.io);
+        try file.writeStreamingAll(
+            std.testing.io,
+            "{\"provider\":\"codex\",\"codex_model\":\"isolated/model\"}\n",
+        );
+    }
+    {
+        var file = try tmp.dir.createFile(
+            std.testing.io,
+            "state/.fx/chatgpt-auth.json",
+            .{ .permissions = std.Io.File.Permissions.fromMode(0o600) },
+        );
+        defer file.close(std.testing.io);
+        try file.writeStreamingAll(
+            std.testing.io,
+            "{\"version\":1,\"access_token\":\"state-token\",\"refresh_token\":\"state-refresh\",\"expires_at_ms\":4000000000000,\"account_id\":\"state-account\"}\n",
+        );
+    }
+    {
+        var file = try tmp.dir.createFile(
+            std.testing.io,
+            "identity/.fx/chatgpt-auth.json",
+            .{ .permissions = std.Io.File.Permissions.fromMode(0o600) },
+        );
+        defer file.close(std.testing.io);
+        try file.writeStreamingAll(
+            std.testing.io,
+            "{\"version\":1,\"access_token\":\"identity-token\",\"refresh_token\":\"identity-refresh\",\"expires_at_ms\":4000000000000,\"account_id\":\"identity-account\"}\n",
+        );
+    }
+    const state_home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "state");
+    defer alloc.free(state_home);
+    const identity_home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "identity");
+    defer alloc.free(identity_home);
+
+    var state: ServerState = undefined;
+    state.cfg.home_override = state_home;
+    state.cfg.identity_home = identity_home;
+    state.cfg.workspace_root_override = null;
+    state.cfg.default_model = "default/model";
+    state.cfg.default_agent_step_limit = 50;
+    state.cfg.auth_mode = .local;
+    state.cfg.secret_store = host_contract.unavailable_secret_store;
+    state.cfg.gateway_provider = @import("../builtins/gateway.zig").provider;
+
+    var startup = try loadConfiguredStartupState(&state, alloc);
+    defer startup.deinit(alloc);
+    try std.testing.expectEqualStrings("identity-token", startup.apiKey().?);
+    try std.testing.expectEqualStrings("identity-account", startup.credential.?.accountId().?);
+
+    var routed = (try prepareConfiguredCredential(&state, alloc, .codex, null)).?;
+    defer routed.deinit(alloc);
+    try std.testing.expectEqualStrings("identity-token", routed.token);
+    try std.testing.expectEqualStrings("identity-account", routed.accountId().?);
+    try std.testing.expect((try refreshConfiguredCredentialForAccount(
+        &state,
+        alloc,
+        .chatgpt_subscription,
+        .if_needed,
+        "identity-account",
+    )) == null);
 }
 
 test "ACP outbound waiters resolve to deny on cancellation" {

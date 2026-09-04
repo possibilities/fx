@@ -1600,7 +1600,19 @@ fn runNonInteractiveWithDeps(
             defer if (borrowed) |home| alloc.free(home);
             var ask_cfg = workflowConfigWithLaunchModifiers(cfg, global_args.modifiers);
             ask_cfg.borrowed_authorization_home = borrowed;
-            const exit_code = try cli_ask.run(alloc, rest, ask_cfg, cfg.context_registry, cfg.tool_set);
+            var selected_tools = try resolveLaunchNativeTools(
+                alloc,
+                cfg.tool_selection_catalog,
+                global_args.modifiers,
+            );
+            defer selected_tools.deinit(alloc);
+            const exit_code = try cli_ask.run(
+                alloc,
+                rest,
+                ask_cfg,
+                cfg.context_registry,
+                selected_tools.tool_set,
+            );
             return if (exit_code == 0) .handled_success else .handled_failure;
         },
         .acp => |rest| {
@@ -1616,10 +1628,10 @@ fn runNonInteractiveWithDeps(
                 acp_prompt_policy.system_prompt,
                 acp_opts.allow_acp_mcp,
             );
-            var selected_tools = try tool_selection.resolve(
+            var selected_tools = try resolveLaunchNativeTools(
                 alloc,
                 cfg.tool_selection_catalog,
-                global_args.modifiers.selected_native_tools,
+                global_args.modifiers,
             );
             defer selected_tools.deinit(alloc);
             try cfg.acp_runner.run(alloc, .{
@@ -1662,6 +1674,7 @@ fn runNonInteractiveWithDeps(
                 .native_tool_set = selected_tools.tool_set,
                 .history_home_override = global_args.modifiers.history_home,
                 .identity_home = global_args.modifiers.identity_home,
+                .mcp_config_path = global_args.modifiers.mcp_config_path,
                 .shape = shape_authority.derive(acp_shape_declaration),
                 .shape_label = global_args.modifiers.shapeLabel(acp_opts.allow_acp_mcp),
             });
@@ -3891,6 +3904,13 @@ fn workflowConfigWithLaunchModifiers(
     result.skill_root_policy = modifiers.skillRootPolicy(cfg.skill_root_policy);
     result.saved_directories_suppressed = modifiers.saved_directories_suppressed;
     result.history_home = app_history_home.forSelection(modifiers.history_home, modifiers.state_home);
+    result.profile_home = modifiers.state_home;
+    result.mcp_config_path = modifiers.mcp_config_path;
+    result.permission_rules_override = if (modifiers.permission_policy) |policy|
+        policy.rules
+    else
+        null;
+    result.project_instructions_enabled = modifiers.project_instructions_enabled;
     result.prompt_policy = promptPolicyWithLaunchModifiers(result.prompt_policy, modifiers);
     const declaration = modifiers.shapeDeclaration(result.prompt_policy.system_prompt, true);
     result.shape_declaration = declaration;
@@ -3906,6 +3926,17 @@ fn promptPolicyWithLaunchModifiers(base: prompt_policy.Policy, modifiers: Launch
     return result;
 }
 
+fn resolveLaunchNativeTools(
+    alloc: Allocator,
+    catalog: tool_selection.Catalog,
+    modifiers: LaunchModifiers,
+) !tool_selection.Resolved {
+    if (!modifiers.allow_native_tools) {
+        return tool_selection.Resolved.borrowed(tool_set_contract.empty);
+    }
+    return tool_selection.resolve(alloc, catalog, modifiers.selected_native_tools);
+}
+
 fn commandSupportsWorkspaceModifiers(command: Command) bool {
     return switch (command) {
         .interactive, .ask, .acp, .pr, .issue, .resume_session => true,
@@ -3915,7 +3946,7 @@ fn commandSupportsWorkspaceModifiers(command: Command) bool {
 
 fn commandSupportsNativeToolModifier(command: Command) bool {
     return switch (command) {
-        .interactive, .acp, .resume_session => true,
+        .interactive, .ask, .acp, .resume_session => true,
         else => false,
     };
 }
@@ -3936,28 +3967,28 @@ fn commandSupportsPromptFileModifiers(command: Command) bool {
 
 fn commandSupportsLaunchPermissionPolicy(command: Command) bool {
     return switch (command) {
-        .interactive, .acp, .resume_session => true,
+        .interactive, .ask, .acp, .resume_session => true,
         else => false,
     };
 }
 
 fn commandSupportsProjectInstructionModifier(command: Command) bool {
     return switch (command) {
-        .interactive, .acp, .resume_session => true,
+        .interactive, .ask, .acp, .resume_session => true,
         else => false,
     };
 }
 
 fn commandSupportsStateHome(command: Command) bool {
     return switch (command) {
-        .interactive, .acp, .resume_session => true,
+        .interactive, .ask, .acp, .resume_session => true,
         else => false,
     };
 }
 
 fn commandSupportsExclusiveSkillRoots(command: Command) bool {
     return switch (command) {
-        .interactive, .acp, .resume_session => true,
+        .interactive, .ask, .acp, .resume_session => true,
         else => false,
     };
 }
@@ -7685,4 +7716,55 @@ test "resolved shape projection includes the base prompt and surface suppression
         shape_authority.custom_label,
         (LaunchModifiers{}).shapeLabel(false),
     );
+}
+
+test "ask launch retains state MCP permission context and native tool controls" {
+    var rules = [_]types.PermissionRule{.{
+        .permission = @constCast("shell"),
+        .pattern = @constCast("git status"),
+        .action = .allow,
+    }};
+    var selections = [_][]u8{@constCast("read_file")};
+    const modifiers = LaunchModifiers{
+        .state_home = @constCast("/profiles/work"),
+        .mcp_config_path = @constCast("/shapes/reviewer/.fx/mcp.json"),
+        .permission_policy = .{
+            .path = @constCast("/shapes/reviewer/.fx/permissions.json"),
+            .rules = .{ .rules = &rules },
+        },
+        .project_instructions_enabled = false,
+        .selected_native_tools = &selections,
+    };
+    const workflow = workflowConfigWithLaunchModifiers(testConfig(), modifiers);
+    try std.testing.expectEqualStrings("/profiles/work", workflow.profile_home.?);
+    try std.testing.expectEqualStrings(
+        "/shapes/reviewer/.fx/mcp.json",
+        workflow.mcp_config_path.?,
+    );
+    try std.testing.expectEqual(@as(usize, 1), workflow.permission_rules_override.?.rules.len);
+    try std.testing.expect(!workflow.project_instructions_enabled);
+
+    const ask: Command = .{ .ask = &.{} };
+    try std.testing.expect(commandSupportsNativeToolModifier(ask));
+    try std.testing.expect(commandSupportsLaunchPermissionPolicy(ask));
+    try std.testing.expect(commandSupportsProjectInstructionModifier(ask));
+    try std.testing.expect(commandSupportsStateHome(ask));
+    try std.testing.expect(commandSupportsExclusiveSkillRoots(ask));
+
+    var selected = try resolveLaunchNativeTools(
+        std.testing.allocator,
+        testConfig().tool_selection_catalog,
+        modifiers,
+    );
+    defer selected.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 1), selected.tool_set.registry.tools.len);
+    try std.testing.expectEqualStrings("read_file", selected.tool_set.registry.tools[0].name);
+
+    var suppressed = try resolveLaunchNativeTools(
+        std.testing.allocator,
+        testConfig().tool_selection_catalog,
+        .{ .allow_native_tools = false },
+    );
+    defer suppressed.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 0), suppressed.tool_set.registry.tools.len);
 }

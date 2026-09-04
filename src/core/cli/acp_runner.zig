@@ -53,6 +53,9 @@ pub const Config = struct {
     history_home_override: ?[]const u8 = null,
     /// The profile whose credential this launch borrows, read only.
     identity_home: ?[]const u8 = null,
+    /// Canonical profile MCP configuration selected by the launch shape.
+    /// Stored MCP credentials remain with the writable state/profile home.
+    mcp_config_path: ?[]const u8 = null,
     /// The shape this launch is running, recorded beside every session.
     shape: ?shape_authority.Identity = null,
     shape_label: []const u8 = shape_authority.default_label,
