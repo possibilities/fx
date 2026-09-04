@@ -831,8 +831,11 @@ test "ACP child authority preserves native-tool suppression and allowlisting" {
         .order = builtin_tools.advertisement_set.order[0..1],
         .read_only_tool_names = &.{},
     };
-    var state: ServerState = undefined;
-    state.alloc = alloc;
+    var state = ServerState{
+        .alloc = alloc,
+        .cfg = undefined,
+        .writer = jsonrpc.Writer.init(),
+    };
     state.cfg.allow_native_tools = false;
     state.cfg.native_tool_set = selected;
     state.cfg.mode_registry = .{
