@@ -212,6 +212,8 @@ pub fn build(b: *std.Build) void {
             "turn authority carries its shape and reads turns recorded without one",
             "durable provenance rejects malformed shapes and out-of-order placement",
             "shape identity and history selectors compose as three independent axes",
+            "potentially sent recovery rejects a turn begun under a different shape",
+            "an explicit history root wins and otherwise the profile home owns history",
         },
     });
     const run_fxnk_gate_tests = b.addRunArtifact(fxnk_gate_tests);

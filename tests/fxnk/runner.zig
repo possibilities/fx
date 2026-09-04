@@ -93,6 +93,8 @@ const expected_names = [_][]const u8{
     "core.session.session_codec.test.turn authority carries its shape and reads turns recorded without one",
     "core.session.session_codec.test.durable provenance rejects malformed shapes and out-of-order placement",
     "core.cli.cli_surface.test.shape identity and history selectors compose as three independent axes",
+    "core.agent.runtime.orchestrator.test.potentially sent recovery rejects a turn begun under a different shape",
+    "core.app.app_history_home.test.an explicit history root wins and otherwise the profile home owns history",
 };
 
 fn isExpected(name: []const u8) bool {

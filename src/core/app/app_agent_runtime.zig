@@ -1355,6 +1355,7 @@ pub fn Runtime(comptime App: type) type {
             const prompt_policy = app.promptPolicy();
             return .{
                 .system_prompt = prompt_policy.system_prompt,
+                .shape = if (comptime @hasField(App, "shape")) app.shape else null,
                 .model_prompt_overlay = prompt_policy.modelPromptOverlay(job.model),
                 .skills_prompt_section = skills_section,
                 .explicit_skills_prompt_section = explicit_skills_section,

@@ -6,6 +6,7 @@ const app_permission_runtime = @import("app_permission_runtime.zig");
 const app_render_runtime = @import("app_render_runtime.zig");
 const app_runtime_setup = @import("app_runtime_setup.zig");
 const app_session_runtime = @import("app_session_runtime.zig");
+const app_history_home = @import("app_history_home.zig");
 const auth_runtime = @import("../auth/auth_runtime.zig");
 const credentials = @import("../auth/credentials.zig");
 const config_runtime = @import("../config/config_runtime.zig");
@@ -276,10 +277,7 @@ pub fn Runtime(comptime App: type) type {
                 prompt_history_unavailable =
                     (try app.prompt_history.initialize(
                         app.alloc,
-                        if (comptime @hasField(App, "profile_home"))
-                            app.profile_home orelse shared_io.getenv("HOME")
-                        else
-                            shared_io.getenv("HOME"),
+                        app_history_home.forApp(app) orelse shared_io.getenv("HOME"),
                         startup.prompt_history_enabled,
                         startup.prompt_history_store_allowed,
                     )) == .unavailable;
@@ -289,10 +287,7 @@ pub fn Runtime(comptime App: type) type {
             {
                 _ = try app.session.initializeProfileUsage(
                     app.alloc,
-                    if (comptime @hasField(App, "profile_home"))
-                        app.profile_home orelse shared_io.getenv("HOME")
-                    else
-                        shared_io.getenv("HOME"),
+                    app_history_home.forApp(app) orelse shared_io.getenv("HOME"),
                 );
             }
 

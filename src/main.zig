@@ -661,32 +661,11 @@ const App = struct {
         return null;
     }
 
-    /// The resolved shape of this launch, read from the controls that decide
-    /// how the agent behaves. Identity is chosen separately and is not here.
-    fn shapeDeclaration(modifiers: *const cli_surface.LaunchModifiers) shape_authority.Declaration {
-        return .{
-            .system_prompt = modifiers.effective_system_prompt,
-            .system_prompt_replaces_base = modifiers.prompt_files.replacement_path != null or
-                modifiers.prompt_files.state_replaces_base,
-            .skill_roots = modifiers.invocation_skill_roots,
-            .default_skills_enabled = !modifiers.no_default_skills,
-            .mcp_config_path = modifiers.mcp_config_path,
-            .native_tools_enabled = modifiers.allow_native_tools,
-            .selected_tools = modifiers.selected_native_tools,
-            .permissions_path = if (modifiers.permission_policy) |policy| policy.path else null,
-            .project_instructions_enabled = modifiers.project_instructions_enabled,
-        };
-    }
-
     /// Resolves the shape once, while the launch controls still own their
     /// paths, and copies the label into storage that outlives them.
     fn adoptShape(self: *Self, modifiers: *const cli_surface.LaunchModifiers) void {
-        const declaration = shapeDeclaration(modifiers);
-        self.shape = shape_authority.derive(declaration);
-        const label = if (modifiers.shape_home) |home|
-            shape_authority.labelFromRoot(home)
-        else
-            shape_authority.labelForDeclaration(declaration);
+        self.shape = modifiers.shapeIdentity();
+        const label = modifiers.shapeLabel();
         const length = @min(label.len, self.shape_label_storage.len);
         @memcpy(self.shape_label_storage[0..length], label[0..length]);
         self.shape_label_len = @intCast(length);

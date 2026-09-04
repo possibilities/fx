@@ -26,6 +26,7 @@ const host = @import("../hosts/host.zig");
 const login_flow = @import("../auth/login_flow.zig");
 const oauth_transport = @import("../auth/oauth_transport.zig");
 const provider_catalog = @import("../auth/provider_catalog.zig");
+const shape_authority = @import("../auth/shape_authority.zig");
 const secret = @import("../auth/secret.zig");
 const output_contracts = @import("../output/output_contracts.zig");
 const prompt_policy = @import("../config/prompt_policy.zig");
@@ -185,6 +186,34 @@ pub const LaunchModifiers = struct {
 
     pub fn hasSkillDirectories(self: LaunchModifiers) bool {
         return self.skill_directories.len > 0;
+    }
+
+    /// The resolved shape of this launch: the controls that decide how the
+    /// agent behaves. Identity is chosen separately and is deliberately absent.
+    pub fn shapeDeclaration(self: LaunchModifiers) shape_authority.Declaration {
+        return .{
+            .system_prompt = self.effective_system_prompt,
+            .system_prompt_replaces_base = self.prompt_files.replacement_path != null or
+                self.prompt_files.state_replaces_base,
+            .skill_roots = self.invocation_skill_roots,
+            .default_skills_enabled = !self.no_default_skills,
+            .mcp_config_path = self.mcp_config_path,
+            .native_tools_enabled = self.allow_native_tools,
+            .selected_tools = self.selected_native_tools,
+            .permissions_path = if (self.permission_policy) |policy| policy.path else null,
+            .project_instructions_enabled = self.project_instructions_enabled,
+        };
+    }
+
+    pub fn shapeIdentity(self: LaunchModifiers) shape_authority.Identity {
+        return shape_authority.derive(self.shapeDeclaration());
+    }
+
+    /// The operator's name for this shape. A shape root names itself; otherwise
+    /// the declaration decides between the default and a flag-built custom one.
+    pub fn shapeLabel(self: LaunchModifiers) []const u8 {
+        if (self.shape_home) |home| return shape_authority.labelFromRoot(home);
+        return shape_authority.labelForDeclaration(self.shapeDeclaration());
     }
 
     pub fn skillRootPolicy(self: LaunchModifiers, default_policy: skill_contract.RootPolicy) skill_contract.RootPolicy {
@@ -1557,6 +1586,10 @@ fn runNonInteractiveWithDeps(
                 .project_instructions_enabled = global_args.modifiers.project_instructions_enabled,
                 .home_override = global_args.modifiers.state_home,
                 .native_tool_set = selected_tools.tool_set,
+                .history_home_override = global_args.modifiers.history_home,
+                .identity_home = global_args.modifiers.identity_home,
+                .shape = global_args.modifiers.shapeIdentity(),
+                .shape_label = global_args.modifiers.shapeLabel(),
             });
             return .handled_success;
         },

@@ -7,6 +7,8 @@ test {
     _ = @import("builtins/hooks/ade_git_roots.zig");
     _ = @import("builtins/hooks/lifecycle_state.zig");
     _ = @import("core/agent/runtime/gateway_step.zig");
+    _ = @import("core/agent/runtime/orchestrator.zig");
+    _ = @import("core/app/app_history_home.zig");
     _ = @import("core/app/app_entry_runtime.zig");
     _ = @import("core/app/app_input_runtime.zig");
     _ = @import("core/app/app_lifecycle.zig");

@@ -7,9 +7,20 @@ const acp_types = @import("types.zig");
 const mcp_servers = @import("mcp_servers.zig");
 const server = @import("server.zig");
 const session_test_controls = @import("session_test_controls.zig");
+const app_history_home = @import("../core/app/app_history_home.zig");
+const credential_authority = @import("../core/auth/credential_authority.zig");
 const session_codec = @import("../core/session/session_codec.zig");
 const session_display_metadata = @import("../core/session/session_display_metadata.zig");
 const session_store = @import("../core/session/session_store.zig");
+
+/// Sessions, prompt history, and usage follow the selected history root; every
+/// other ACP read keeps the profile home that shaped or authorized this launch.
+fn historyHome(state: *const server.ServerState) ?[]const u8 {
+    return app_history_home.forSelection(
+        state.cfg.history_home_override,
+        state.cfg.home_override,
+    );
+}
 const legacy_background_migration = @import("../core/session/legacy_background_migration.zig");
 const js_host_session_store = @import("../core/session/js_host_session_store.zig");
 const session_runtime = @import("../core/session/session.zig");
@@ -59,7 +70,7 @@ pub fn handleNewLibfxSession(
     if (comptime !host_target.is_wasm) {
         _ = try session_rt.initializeProfileUsage(
             alloc,
-            state.cfg.home_override orelse io_mod.getenv("HOME"),
+            historyHome(state) orelse io_mod.getenv("HOME"),
         );
     }
 
@@ -227,7 +238,7 @@ pub fn handleNewSession(state: *server.ServerState, alloc: Allocator, msg: *json
         }
     };
 
-    var store = (if (state.cfg.home_override) |home|
+    var store = (if (historyHome(state)) |home|
         session_store.Store.initFromHome(alloc, home, state.workspace_root)
     else
         session_store.Store.init(alloc, state.workspace_root)) catch
@@ -265,7 +276,7 @@ pub fn handleNewSession(state: *server.ServerState, alloc: Allocator, msg: *json
     defer if (session_rt_owned) session_rt.deinit(alloc);
     _ = try session_rt.initializeProfileUsage(
         alloc,
-        state.cfg.home_override orelse io_mod.getenv("HOME"),
+        historyHome(state) orelse io_mod.getenv("HOME"),
     );
     if (writable.state.usage) |usage| {
         try session_rt.usage.restore(
@@ -614,7 +625,7 @@ fn handleRestoreSession(
         }
     }
 
-    var store = (if (state.cfg.home_override) |home|
+    var store = (if (historyHome(state)) |home|
         session_store.Store.initFromHome(alloc, home, state.workspace_root)
     else
         session_store.Store.init(alloc, state.workspace_root)) catch
@@ -678,7 +689,7 @@ fn handleRestoreSession(
     defer if (session_rt_owned) session_rt.deinit(alloc);
     _ = try session_rt.initializeProfileUsage(
         alloc,
-        state.cfg.home_override orelse io_mod.getenv("HOME"),
+        historyHome(state) orelse io_mod.getenv("HOME"),
     );
     try session_rt.restoreWithPermissionState(
         alloc,
@@ -923,6 +934,7 @@ fn freshAcpState(
     errdefer alloc.free(model);
     const history = try alloc.alloc(types.HistoryTurn, 0);
     errdefer alloc.free(history);
+    const provenance = try acpProvenance(state, alloc);
     return .{
         .id = id,
         .origin_workspace_root = origin,
@@ -939,6 +951,27 @@ fn freshAcpState(
         .history = history,
         .total_input_tokens = 0,
         .total_output_tokens = 0,
+        .provenance = provenance,
+    };
+}
+
+/// The shape and credential in effect for an ACP session, recorded the same way
+/// the interactive surface records it so one history reads back identically.
+fn acpProvenance(
+    state: *server.ServerState,
+    alloc: Allocator,
+) !?session_codec.SessionProvenance {
+    const identity = state.cfg.shape orelse return null;
+    return .{
+        .shape = .{
+            .id = try alloc.dupe(u8, state.cfg.shape_label),
+            .identity = identity,
+        },
+        .credential_source = state.credential_source,
+        .credential_identity = if (state.credential_source) |source|
+            credential_authority.derive(source, state.account_id)
+        else
+            null,
     };
 }
 
@@ -1092,7 +1125,7 @@ pub fn handleListSessions(state: *server.ServerState, alloc: Allocator, msg: *js
             .code = ErrorCode.invalid_params,
             .message = "Invalid params",
         });
-    var store = (if (state.cfg.home_override) |home|
+    var store = (if (historyHome(state)) |home|
         session_store.Store.initReadOnlyFromHome(alloc, home, params.cwd orelse state.workspace_root)
     else
         session_store.Store.initReadOnly(alloc, params.cwd orelse state.workspace_root)) catch {

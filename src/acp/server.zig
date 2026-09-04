@@ -26,6 +26,7 @@ const mode_registry = @import("../core/modes/mode_registry.zig");
 const skill_runtime = @import("../core/skills/skill_runtime.zig");
 const session_codec = @import("../core/session/session_codec.zig");
 const session_log = @import("../core/session/session_log.zig");
+const app_history_home = @import("../core/app/app_history_home.zig");
 const session_store = @import("../core/session/session_store.zig");
 const session_runtime = @import("../core/session/session.zig");
 const worker_runtime = @import("../core/agent/worker_runtime.zig");
@@ -369,9 +370,10 @@ fn prepareConfiguredCredential(
         );
     }
     const borrowed_authorization_home =
-        try credentials.readOnlyAuthorizationHomeFromEnvironment(
+        try credentials.borrowedAuthorizationHomeFromLaunch(
             alloc,
             state.cfg.home_override,
+            state.cfg.identity_home,
         );
     defer if (borrowed_authorization_home) |home| alloc.free(home);
     if (state.cfg.home_override) |home| {
@@ -733,7 +735,10 @@ pub fn enableSubagentHost(state: *ServerState) void {
     disableSubagentHost(state);
     const active = if (state.active_session) |*session| session else return;
     if (active.writable == null) return;
-    state.subagent_store = (if (state.cfg.home_override) |home|
+    state.subagent_store = (if (app_history_home.forSelection(
+        state.cfg.history_home_override,
+        state.cfg.home_override,
+    )) |home|
         session_store.Store.initFromHome(state.alloc, home, state.workspace_root)
     else
         session_store.Store.init(state.alloc, state.workspace_root)) catch |err| {
@@ -1898,9 +1903,10 @@ fn loadConfiguredStartupState(state: *const ServerState, alloc: Allocator) !app_
         );
     }
     const borrowed_authorization_home =
-        try credentials.readOnlyAuthorizationHomeFromEnvironment(
+        try credentials.borrowedAuthorizationHomeFromLaunch(
             alloc,
             state.cfg.home_override,
+            state.cfg.identity_home,
         );
     defer if (borrowed_authorization_home) |home| alloc.free(home);
     if (state.cfg.home_override) |home_dir| {
