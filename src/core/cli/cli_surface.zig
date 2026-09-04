@@ -298,6 +298,7 @@ const SessionRecoveryOptions = struct {
 
 const AcpOptions = struct {
     model: ?[]const u8 = null,
+    effort: ?types.ReasoningEffort = null,
     log_file: ?[]const u8 = null,
     allow_acp_mcp: bool = true,
 };
@@ -1051,7 +1052,7 @@ fn runNonInteractiveWithDeps(
         },
         .acp => |rest| {
             const acp_opts = parseAcpArgs(rest) catch {
-                try writeStderr(deps, "usage: fx acp [--model <id>] [--log-file <path>] [--no-acp-mcp]\n");
+                try writeStderr(deps, "usage: fx acp [--model <id>] [--effort <name>] [--log-file <path>] [--no-acp-mcp]\n");
                 return .handled_failure;
             };
             try cfg.acp_runner.run(alloc, .{
@@ -1084,6 +1085,7 @@ fn runNonInteractiveWithDeps(
                 else
                     null,
                 .model_override = acp_opts.model,
+                .effort_override = acp_opts.effort,
                 .log_file = acp_opts.log_file,
                 .allow_acp_mcp = acp_opts.allow_acp_mcp,
                 .allow_native_tools = global_args.modifiers.allow_native_tools,
@@ -2223,6 +2225,7 @@ fn doctorSnapshotFromRuntime(snapshot: doctor_runtime.Snapshot) output_contracts
     return .{
         .workspace_root = snapshot.workspace_root,
         .model = snapshot.model,
+        .effort = snapshot.effort,
         .provider = snapshot.provider,
         .auth = snapshot.auth,
         .permission_mode = permissionModeForSnapshot(snapshot.permission_mode),
@@ -3384,6 +3387,10 @@ fn parseAcpArgs(args: []const [:0]const u8) !AcpOptions {
             if (opts.model != null or i + 1 >= args.len) return error.InvalidAcpArgs;
             i += 1;
             opts.model = args[i];
+        } else if (std.mem.eql(u8, args[i], "--effort")) {
+            if (opts.effort != null or i + 1 >= args.len) return error.InvalidAcpArgs;
+            i += 1;
+            opts.effort = types.ReasoningEffort.parse(args[i]) orelse return error.InvalidAcpArgs;
         } else if (std.mem.eql(u8, args[i], "--log-file")) {
             if (opts.log_file != null or i + 1 >= args.len) return error.InvalidAcpArgs;
             i += 1;
@@ -4047,16 +4054,21 @@ test "parse acp args extracts known flags and rejects invalid arguments" {
     const opts = try parseAcpArgs(&.{
         @constCast("--model"),
         @constCast("openai/gpt-4o"),
+        @constCast("--effort"),
+        @constCast("high"),
         @constCast("--log-file"),
         @constCast("/tmp/fx.log"),
         @constCast("--no-acp-mcp"),
     });
     try std.testing.expectEqualStrings("openai/gpt-4o", opts.model.?);
+    try std.testing.expect(opts.effort.?.eql(types.ReasoningEffort.literal("high")));
     try std.testing.expectEqualStrings("/tmp/fx.log", opts.log_file.?);
     try std.testing.expect(!opts.allow_acp_mcp);
 
     try std.testing.expectError(error.InvalidAcpArgs, parseAcpArgs(&.{@constCast("--unknown")}));
     try std.testing.expectError(error.InvalidAcpArgs, parseAcpArgs(&.{@constCast("--model")}));
+    try std.testing.expectError(error.InvalidAcpArgs, parseAcpArgs(&.{@constCast("--effort")}));
+    try std.testing.expectError(error.InvalidAcpArgs, parseAcpArgs(&.{ @constCast("--effort"), @constCast("not valid") }));
     try std.testing.expectError(error.InvalidAcpArgs, parseAcpArgs(&.{@constCast("--log-file")}));
     try std.testing.expectError(error.InvalidAcpArgs, parseAcpArgs(&.{@constCast("--state-dir")}));
     try std.testing.expectError(
@@ -4154,6 +4166,7 @@ test "ACP command routes parsed options and launch config through the injected r
                 !cfg.allow_native_tools and
                 !cfg.allow_acp_mcp and
                 !cfg.project_instructions_enabled and
+                cfg.effort_override.?.eql(types.ReasoningEffort.literal("high")) and
                 cfg.home_override == null;
         }
     };
@@ -4193,6 +4206,8 @@ test "ACP command routes parsed options and launch config through the injected r
             @constCast("acp"),
             @constCast("--model"),
             @constCast("model-override"),
+            @constCast("--effort"),
+            @constCast("high"),
             @constCast("--log-file"),
             @constCast("/tmp/acp.log"),
             @constCast("--no-acp-mcp"),
@@ -5598,6 +5613,7 @@ test "writeRenderedJsonLine renders doctor json through output contract" {
     const snapshot = doctor_runtime.Snapshot{
         .workspace_root = @constCast("/tmp/fx"),
         .model = "test-model",
+        .effort = types.ReasoningEffort.literal("low"),
         .auth = .{ .active_source = .ai_gateway_api_key },
         .permission_mode = .auto,
         .agent_step_limit = 42,
@@ -5613,7 +5629,7 @@ test "writeRenderedJsonLine renders doctor json through output contract" {
     );
 
     try std.testing.expectEqualStrings(
-        "{\"kind\":\"doctor\",\"ok_count\":1,\"warn_count\":1,\"fail_count\":0,\"workspace\":\"/tmp/fx\",\"model\":\"test-model\",\"auth\":\"AI_GATEWAY_API_KEY\",\"auth_refreshable\":false,\"permission_mode\":\"auto\",\"agent_step_limit\":42,\"checks\":[{\"name\":\"auth\",\"status\":\"ok\",\"detail\":\"AI_GATEWAY_API_KEY is configured\"},{\"name\":\"gh\",\"status\":\"warn\",\"detail\":\"GitHub CLI not found in PATH\"}]}\n",
+        "{\"kind\":\"doctor\",\"ok_count\":1,\"warn_count\":1,\"fail_count\":0,\"workspace\":\"/tmp/fx\",\"model\":\"test-model\",\"effort\":\"low\",\"auth\":\"AI_GATEWAY_API_KEY\",\"auth_refreshable\":false,\"permission_mode\":\"auto\",\"agent_step_limit\":42,\"checks\":[{\"name\":\"auth\",\"status\":\"ok\",\"detail\":\"AI_GATEWAY_API_KEY is configured\"},{\"name\":\"gh\",\"status\":\"warn\",\"detail\":\"GitHub CLI not found in PATH\"}]}\n",
         capture.stdout.written(),
     );
 }

@@ -47,6 +47,8 @@ fn BootstrapDeps(comptime App: type) type {
             config_runtime.ModelSource,
             []const u8,
             types.ReasoningEffort,
+            config_runtime.ConfigSource,
+            types.ReasoningEffort,
             bool,
             bool,
         ) anyerror!void;
@@ -149,6 +151,8 @@ pub fn Runtime(comptime App: type) type {
             configured_model: []const u8,
             model_source: config_runtime.ModelSource,
             selected_model: []const u8,
+            configured_effort: types.ReasoningEffort,
+            effort_source: config_runtime.ConfigSource,
             effort: types.ReasoningEffort,
             fast_mode: bool,
             fast_mode_model_bound: bool,
@@ -159,6 +163,8 @@ pub fn Runtime(comptime App: type) type {
                 configured_model,
                 model_source,
                 selected_model,
+                configured_effort,
+                effort_source,
                 effort,
                 fast_mode,
                 fast_mode_model_bound,
@@ -300,6 +306,8 @@ pub fn Runtime(comptime App: type) type {
                 startup.configured_model,
                 startup.model_source,
                 active_model,
+                startup.configured_effort,
+                startup.effort_source,
                 startup.effort,
                 startup.fast_mode,
                 startup.fast_mode_model_bound,
@@ -537,6 +545,8 @@ const TestCapture = struct {
     runtime_model: [64]u8 = undefined,
     runtime_model_len: usize = 0,
     configured_effort: types.ReasoningEffort = .auto,
+    configured_effort_source: config_runtime.ConfigSource = .compiled_default,
+    runtime_effort: types.ReasoningEffort = .auto,
     configured_fast_mode: bool = false,
     configured_fast_mode_model_bound: bool = false,
     initialize_required: bool = false,
@@ -775,6 +785,8 @@ fn makeStartupState(alloc: Allocator) !app_lifecycle.StartupState {
     state.auto_upgrade = false;
     state.update_channel = .dev;
     state.effort = types.ReasoningEffort.literal("high");
+    state.configured_effort = types.ReasoningEffort.literal("low");
+    state.effort_source = .process_override;
     state.statusline_workspace = true;
     if (active_capture.?.emit_config_diagnostics) {
         const diagnostics = try alloc.alloc(config_runtime.ConfigDiagnostic, 2);
@@ -863,6 +875,8 @@ fn configureSessionPreferencesForTest(
     configured_model: []const u8,
     model_source: config_runtime.ModelSource,
     selected_model: []const u8,
+    configured_effort: types.ReasoningEffort,
+    effort_source: config_runtime.ConfigSource,
     effort: types.ReasoningEffort,
     fast_mode: bool,
     fast_mode_model_bound: bool,
@@ -885,7 +899,9 @@ fn configureSessionPreferencesForTest(
         capture.runtime_model[0..capture.runtime_model_len],
         selected_model[0..capture.runtime_model_len],
     );
-    capture.configured_effort = effort;
+    capture.configured_effort = configured_effort;
+    capture.configured_effort_source = effort_source;
+    capture.runtime_effort = effort;
     capture.configured_fast_mode = fast_mode;
     capture.configured_fast_mode_model_bound = fast_mode_model_bound;
 }
@@ -973,8 +989,16 @@ test "app_bootstrap_runtime transfers startup state and starts a fresh session" 
     );
     try std.testing.expectEqualStrings("model-x", capture.runtimeModel());
     try std.testing.expectEqual(
-        types.ReasoningEffort.literal("high"),
+        types.ReasoningEffort.literal("low"),
         capture.configured_effort,
+    );
+    try std.testing.expectEqual(
+        config_runtime.ConfigSource.process_override,
+        capture.configured_effort_source,
+    );
+    try std.testing.expectEqual(
+        types.ReasoningEffort.literal("high"),
+        capture.runtime_effort,
     );
     try std.testing.expect(capture.configured_fast_mode);
     try std.testing.expect(capture.configured_fast_mode_model_bound);
