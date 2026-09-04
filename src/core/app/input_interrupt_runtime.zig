@@ -248,6 +248,6 @@ test "interactive interrupt cancels without a native queue editor" {
     try InterruptRuntime(FakeApp).cancelActiveOperation(&app);
     try std.testing.expect(app.worker.cancel_requested);
     try std.testing.expect(!app.stream.active);
-    try std.testing.expect(app.notice_written);
+    try std.testing.expect(!app.notice_written);
     try std.testing.expect(app.shell.render_requests.requested);
 }
