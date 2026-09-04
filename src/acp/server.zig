@@ -12,7 +12,6 @@ const prompt_handler = @import("prompt.zig");
 const prompt_test_controls = @import("prompt_test_controls.zig");
 const app_lifecycle = @import("../core/app/app_lifecycle.zig");
 const app_runtime_setup = @import("../core/app/app_runtime_setup.zig");
-const builtin_skills = @import("../builtins/skills.zig");
 const builtin_tools = @import("../builtins/tools.zig");
 const credentials = @import("../core/auth/credentials.zig");
 const secret = @import("../core/auth/secret.zig");
@@ -1926,9 +1925,9 @@ fn handleInitialize(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message
     if (comptime !host_target.is_wasm) {
         if (!state.cfg.minimal_kernel) {
             var loaded_skills = if (state.cfg.home_override) |home|
-                try app_runtime_setup.loadSkillsFromHome(alloc, state.workspace_root, home, builtin_skills.root_policy)
+                try app_runtime_setup.loadSkillsFromHome(alloc, state.workspace_root, home, state.cfg.skill_root_policy)
             else
-                try app_runtime_setup.loadSkills(alloc, state.workspace_root, builtin_skills.root_policy);
+                try app_runtime_setup.loadSkills(alloc, state.workspace_root, state.cfg.skill_root_policy);
             errdefer loaded_skills.deinit(alloc);
             skill_runtime.traceDiagnostics("acp_startup", loaded_skills.diagnostics);
             try state.skills.replaceLoaded(alloc, loaded_skills.dir, loaded_skills.skills, loaded_skills.diagnostics);

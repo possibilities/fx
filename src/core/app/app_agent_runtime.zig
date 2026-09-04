@@ -303,6 +303,10 @@ pub fn Runtime(comptime App: type) type {
                 .session = &app.session,
                 .session_allocator = app.alloc,
                 .skills_dir = app.skills.dir,
+                .skill_root_policy = if (comptime @hasField(App, "skill_root_policy"))
+                    app.skill_root_policy
+                else
+                    null,
                 .context_limits = if (comptime @hasField(App, "context_limits")) app.context_limits else .{},
                 .context_enabled = if (comptime @hasField(App, "context_enabled")) app.context_enabled else true,
                 .context_registry = app.contextRegistry(),

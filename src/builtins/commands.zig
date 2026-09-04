@@ -356,6 +356,14 @@ pub const top_level_flags = [_]TopLevelFlag{
         .description = "Use an isolated Fx profile for TUI or ACP",
     },
     .{
+        .usage = "--skills-dir <path>",
+        .description = "Add a skill root; repeatable",
+    },
+    .{
+        .usage = "--no-default-skills",
+        .description = "Use only --skills-dir roots",
+    },
+    .{
         .usage = "-c, --continue",
         .description = "Resume the latest workspace session",
     },

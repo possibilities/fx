@@ -575,6 +575,7 @@ const App = struct {
     change_tracker: change_tracker_mod.ChangeTracker = .{},
     mcp: app_mcp_runtime.State = .{},
     skills: skill_runtime.Runtime = .{},
+    skill_root_policy: @import("core/skills/skill_contract.zig").RootPolicy = builtin_skills.root_policy,
     context_snapshot: context_contract.GatheredContextSnapshot = .{},
     file_index: file_index_mod.FileIndex = .{},
     context_enabled: bool = true,
@@ -639,6 +640,10 @@ const App = struct {
         );
         usage_dashboard_runtime.Runtime.initInto(&app.usage_dashboard, std.heap.c_allocator);
         app_session_runtime.Persistence.initInto(&app.session_persistence);
+        app.skill_root_policy = launch.modifiers.skillRootPolicy(if (comptime host_target.is_wasm)
+            wasm_skill_root_policy
+        else
+            builtin_skills.root_policy);
         if (comptime host_profile.js_host_workspace) {
             app.workspace_host = js_host_workspace.Runtime.init(alloc) catch |err| blk: {
                 if (err != error.WorkspaceUnavailable) {
@@ -672,7 +677,7 @@ const App = struct {
             handle_sigwinch,
             .{
                 .load_mcp_runtime = if (comptime host_target.is_wasm) loadNoMcpRuntime else builtin_mcp.loadRuntime,
-                .skill_root_policy = if (comptime host_target.is_wasm) wasm_skill_root_policy else builtin_skills.root_policy,
+                .skill_root_policy = app.skill_root_policy,
                 .terminal_title = app.terminalTitle(),
             },
         );
@@ -2047,7 +2052,7 @@ const App = struct {
             std.heap.c_allocator,
             self.workspace_root,
             home,
-            builtin_skills.root_policy,
+            self.skill_root_policy,
         );
     }
 
@@ -3760,6 +3765,8 @@ test "full entry config commands also use early threaded io" {
         @as([:0]const u8, "--no-additional-dirs"),
         @as([:0]const u8, "--no-native-tools"),
         @as([:0]const u8, "--no-project-instructions"),
+        @as([:0]const u8, "--no-default-skills"),
+        @as([:0]const u8, "--skills-dir=/tmp/acp-skills"),
         @as([:0]const u8, "acp"),
     }));
 }

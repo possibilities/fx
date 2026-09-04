@@ -7463,6 +7463,74 @@ describe("acp: model-independent", () => {
   );
 
   test(
+    "exclusive invocation skill roots reach ACP in flag order without defaults",
+    async () => {
+      const root = createIsolatedRoot("fx-acp-exclusive-skill-roots-");
+      const firstRoot = join(root.root, "first-skills");
+      const secondRoot = join(root.root, "second-skills");
+      mkdirSync(join(root.home, ".fx", "skills", "managed-default"), {
+        recursive: true,
+      });
+      mkdirSync(join(root.workspace, "skills", "workspace-default"), {
+        recursive: true,
+      });
+      mkdirSync(join(firstRoot, "first-invocation"), { recursive: true });
+      mkdirSync(join(secondRoot, "second-invocation"), { recursive: true });
+      writeFileSync(
+        join(root.home, ".fx", "skills", "managed-default", "SKILL.md"),
+        "---\nname: managed-default\ndescription: must not load\n---\n",
+      );
+      writeFileSync(
+        join(root.workspace, "skills", "workspace-default", "SKILL.md"),
+        "---\nname: workspace-default\ndescription: must not load\n---\n",
+      );
+      writeFileSync(
+        join(firstRoot, "first-invocation", "SKILL.md"),
+        "---\nname: first-invocation\ndescription: first selected root\n---\n",
+      );
+      writeFileSync(
+        join(secondRoot, "second-invocation", "SKILL.md"),
+        "---\nname: second-invocation\ndescription: second selected root\n---\n",
+      );
+      const gateway = startFakeGateway([
+        finalText("ACP exclusive skill roots complete"),
+      ]);
+      try {
+        client = await AcpClient.create({
+          args: [
+            "--no-default-skills",
+            "--skills-dir",
+            firstRoot,
+            `--skills-dir=${secondRoot}`,
+            "acp",
+          ],
+          cwd: root.workspace,
+          env: fakeGatewayEnv(root, gateway),
+        });
+        await startCodeSession(client);
+        const result = await runPrompt(client, "List available skills.", TIMEOUT);
+
+        expect(result.promptResult.result.stopReason).toBe("end_turn");
+        expect(gateway.requests).toHaveLength(1);
+        const promptText = acpPromptText(gateway.requests[0]!.body);
+        expect(promptText).toContain("first-invocation");
+        expect(promptText).toContain("second-invocation");
+        expect(promptText.indexOf("first-invocation")).toBeLessThan(
+          promptText.indexOf("second-invocation"),
+        );
+        expect(promptText).not.toContain("managed-default");
+        expect(promptText).not.toContain("workspace-default");
+        expect(client.stderr).toBe("");
+      } finally {
+        await client?.close();
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
     "ACP binds an explicitly invoked skill into the prompt",
     async () => {
       const root = createIsolatedRoot("fx-acp-explicit-skill-");

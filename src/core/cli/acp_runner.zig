@@ -7,7 +7,7 @@ const host = @import("../hosts/host.zig");
 const credentials = @import("../auth/credentials.zig");
 const mode_registry = @import("../modes/mode_registry.zig");
 const prompt_policy = @import("../config/prompt_policy.zig");
-const types = @import("../shared/types.zig");
+const skill_contract = @import("../skills/skill_contract.zig");
 const context_contract = @import("../workspace/context_contract.zig");
 const types = @import("../shared/types.zig");
 
@@ -46,6 +46,7 @@ pub const Config = struct {
     saved_directories_suppressed: bool = false,
     /// Borrowed invocation policy; the server duplicates it during initialize.
     permission_rules_override: ?types.PermissionRuleSet = null,
+    skill_root_policy: skill_contract.RootPolicy = .{ .managed_root_source = null },
     allow_acp_mcp: bool = true,
     allow_native_tools: bool = true,
     project_instructions_enabled: bool = true,

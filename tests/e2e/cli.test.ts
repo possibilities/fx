@@ -308,6 +308,9 @@ describe("cli: help", () => {
       expect(stdout).toContain("--permissions-file <path>");
       expect(stdout).toContain("Replace configured rules for TUI or ACP");
       expect(stdout).toContain("--no-project-instructions");
+      expect(stdout).toContain("--state-dir <path>");
+      expect(stdout).toContain("--skills-dir <path>");
+      expect(stdout).toContain("--no-default-skills");
       expect(stdout).toContain("-c, --continue");
       expect(stdout).toContain("-r");
       expect(stdout).toContain("Open the saved-session picker");
@@ -5000,6 +5003,30 @@ describe("cli: workspace access", () => {
       expect(unsupportedProjectInstructionGate.code).toBe(1);
       expect(unsupportedProjectInstructionGate.stderr).toContain(
         "--no-project-instructions is only supported for interactive, resume, and ACP launches",
+      );
+
+      const missingSkillsRoot = await runFx(["--skills-dir"], { env: enabled });
+      expect(missingSkillsRoot.code).toBe(1);
+      expect(missingSkillsRoot.stderr).toContain(
+        "--skills-dir requires a directory path",
+      );
+
+      const duplicateDefaultSkillGate = await runFx(
+        ["--no-default-skills", "--no-default-skills"],
+        { env: enabled },
+      );
+      expect(duplicateDefaultSkillGate.code).toBe(1);
+      expect(duplicateDefaultSkillGate.stderr).toContain(
+        "--no-default-skills may only be specified once",
+      );
+
+      const unsupportedSkillPolicy = await runFx(
+        ["--no-default-skills", "ask", "hello"],
+        { env: enabled },
+      );
+      expect(unsupportedSkillPolicy.code).toBe(1);
+      expect(unsupportedSkillPolicy.stderr).toContain(
+        "--skills-dir and --no-default-skills are only supported for interactive, resume, and ACP launches",
       );
     },
     TIMEOUT,
