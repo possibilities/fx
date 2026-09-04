@@ -3,6 +3,7 @@ const credentials = @import("../auth/credentials.zig");
 const activity_status = @import("../output/activity_status.zig");
 const app_session_runtime = @import("app_session_runtime.zig");
 const approval_registry = @import("../subagent/approval_registry.zig");
+const subagent_tool_host = @import("../subagent/tool_host.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const diff_mod = @import("../output/diff.zig");
 const file_mutation_contract = @import("../tooling/file_mutation_contract.zig");
@@ -1796,6 +1797,11 @@ const FakeApp = struct {
         kind: @import("../hooks/hooks.zig").AttentionKind,
         child_session_id: ?[]const u8,
     ) void {
+        if (child_session_id) |session_id| {
+            if (self.last_attention_child_session_id) |previous| {
+                if (std.mem.eql(u8, previous, session_id) and self.last_attention_kind == kind) return;
+            }
+        }
         self.attention_count += 1;
         self.last_attention_turn_id = turn_id;
         self.last_attention_kind = kind;
@@ -1804,6 +1810,35 @@ const FakeApp = struct {
             self.last_attention_child_session_id = session_id;
         }
     }
+};
+
+const FakeChildApprovalRoute = struct {
+    fn route(self: *@This()) approval_registry.WorkerRoute {
+        return .{
+            .context = self,
+            .submit_fn = submit,
+            .cancel_fn = cancel,
+            .pin_fn = pin,
+            .release_fn = release,
+        };
+    }
+
+    fn submit(
+        _: *anyopaque,
+        _: u64,
+        response: permission_request.OwnedPermissionResponse,
+        _: ?worker_runtime.WorkerRuntime.PermissionCommit,
+    ) worker_runtime.WorkerRuntime.PermissionCommitError!worker_runtime.PermissionSubmissionResult {
+        var owned = response;
+        owned.deinit();
+        return .accepted;
+    }
+
+    fn cancel(_: *anyopaque) void {}
+    fn pin(_: *anyopaque) bool {
+        return true;
+    }
+    fn release(_: *anyopaque) void {}
 };
 
 const NoopBridge = struct {
@@ -3043,12 +3078,29 @@ test "core.app_worker_runtime attributes surfaced child permission attention to 
     defer app.deinit();
     app.worker.processing = true;
     app.worker.active_turn_id = 73;
-    app.subagents.pending_approval = .{
-        .id = 19,
-        .label = "subagent command",
-        .origin = .{ .subagent = "child-name" },
-    };
-    app.subagents.pending_child_session_id = "child-session-19";
+    var host: subagent_tool_host.Runtime = undefined;
+    host.root_id = @constCast("root");
+    host.approvals = .{ .alloc = app.alloc };
+    app.session_persistence.subagent_host = &host;
+    defer {
+        app.session_persistence.subagent_host = null;
+        host.approvals.deinit();
+    }
+    var route = FakeChildApprovalRoute{};
+    try host.approvals.registerTool(
+        "approval-19",
+        "child-session-19",
+        "root",
+        "work-19",
+        .{
+            .id = 19,
+            .label = "subagent command",
+            .origin = .{ .subagent = "child-name" },
+        },
+        &.{},
+        route.route(),
+        0,
+    );
 
     Runtime(FakeApp).syncState(&app, NoopBridge.lifecyclePresenter(&app));
 
