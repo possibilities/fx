@@ -637,7 +637,7 @@ const AskContext = struct {
         turn_end: bool,
         attention_required: bool,
     ) !void {
-        self.notification_player = notification_sound.Player.init(.{
+        self.notification_player = try notification_sound.Player.init(.{
             .ctx = self,
             .emit = emitAskNotificationBell,
         });
@@ -711,6 +711,8 @@ const AskContext = struct {
     }
 
     fn deinit(self: *AskContext) void {
+        if (self.notification_player) |*player| player.deinit();
+        self.notification_player = null;
         if (self.subagent_host) |subagent_host| subagent_host.deinit();
         self.subagent_host = null;
         self.managed_executions.deinit();
