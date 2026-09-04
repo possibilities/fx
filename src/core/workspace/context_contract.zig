@@ -127,6 +127,9 @@ fn hashUsize(hasher: *std.crypto.hash.sha2.Sha256, value: usize) void {
 
 pub const InitialContextInput = struct {
     workspace_root: []const u8,
+    /// Optional Fx profile home for profile-level instructions. Workspace
+    /// ancestry still follows the process home.
+    profile_home: ?[]const u8 = null,
     access_scope: ?workspace_access.AccessScope = null,
     project_instructions_enabled: bool = true,
     targets: []const ApplicableTarget = &.{},

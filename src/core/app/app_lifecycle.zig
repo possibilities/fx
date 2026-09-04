@@ -259,6 +259,7 @@ pub const BootstrapConfig = struct {
     default_model: []const u8,
     default_agent_step_limit: usize,
     secret_store: host.SecretStore,
+    profile_home: ?[]const u8 = null,
     auth_mode: credentials.AuthMode = .local,
     resize_handler: ResizeHandler,
     fx_version: []const u8 = "",
@@ -367,6 +368,26 @@ pub fn loadCatalogStartupStateWithAuthMode(
 ) !StartupState {
     const workspace_root = try io_mod.realpathAlloc(alloc, ".");
     return loadStartupStateFromOwnedWorkspace(alloc, oauth_transport.unavailable_provider, secret_store, workspace_root, default_model, default_agent_step_limit, auth_mode, null, .stored);
+}
+
+pub fn loadCatalogStartupStateFromHome(
+    alloc: Allocator,
+    home_dir: []const u8,
+    default_model: []const u8,
+    default_agent_step_limit: usize,
+) !StartupState {
+    const workspace_root = try io_mod.realpathAlloc(alloc, ".");
+    return loadStartupStateFromOwnedWorkspace(
+        alloc,
+        oauth_transport.unavailable_provider,
+        host.unavailable_secret_store,
+        workspace_root,
+        default_model,
+        default_agent_step_limit,
+        .local,
+        home_dir,
+        .stored,
+    );
 }
 
 pub fn loadStartupStatus(
@@ -503,14 +524,24 @@ fn loadStartupStateFromOwnedWorkspace(
     state.credential_source_preference = settings.credential_source;
     if (auth_mode == .local) {
         if (credential_mode) |mode| {
-            const resolution = try credentials.resolveForProvider(
-                alloc,
-                transport,
-                secret_store,
-                mode,
-                state.provider,
-                settings.credential_source,
-            );
+            const resolution = if (profile_home) |home_dir|
+                try credentials.resolveForProviderFromHome(
+                    alloc,
+                    transport,
+                    mode,
+                    state.provider,
+                    settings.credential_source,
+                    home_dir,
+                )
+            else
+                try credentials.resolveForProvider(
+                    alloc,
+                    transport,
+                    secret_store,
+                    mode,
+                    state.provider,
+                    settings.credential_source,
+                );
             state.credential = resolution.credential;
             state.credential_load_failure = resolution.failure;
             state.stored_key_status = resolution.stored_key_status;
@@ -590,13 +621,21 @@ pub fn bootstrapInteractiveApp(cfg: BootstrapConfig) !StartupState {
     cfg.shell.layout = minimalLayout();
     try cfg.shell.initBacking(cfg.alloc);
 
-    var state = try loadCatalogStartupStateWithAuthMode(
-        cfg.alloc,
-        cfg.secret_store,
-        cfg.default_model,
-        cfg.default_agent_step_limit,
-        cfg.auth_mode,
-    );
+    var state = if (cfg.profile_home) |home_dir|
+        try loadCatalogStartupStateFromHome(
+            cfg.alloc,
+            home_dir,
+            cfg.default_model,
+            cfg.default_agent_step_limit,
+        )
+    else
+        try loadCatalogStartupStateWithAuthMode(
+            cfg.alloc,
+            cfg.secret_store,
+            cfg.default_model,
+            cfg.default_agent_step_limit,
+            cfg.auth_mode,
+        );
     errdefer state.deinit(cfg.alloc);
 
     state.credential_onboarding_skipped = cfg.auth_mode == .host_managed or credentialOnboardingDisabled();

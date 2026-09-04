@@ -114,11 +114,32 @@ pub const TeamSelection = struct {
     }
 
     pub fn select(self: *const TeamSelection, alloc: Allocator, selected_index: usize) !SelectedTeam {
+        return self.selectFromOptionalHome(alloc, selected_index, null);
+    }
+
+    pub fn selectFromHome(
+        self: *const TeamSelection,
+        alloc: Allocator,
+        selected_index: usize,
+        home: []const u8,
+    ) !SelectedTeam {
+        return self.selectFromOptionalHome(alloc, selected_index, home);
+    }
+
+    fn selectFromOptionalHome(
+        self: *const TeamSelection,
+        alloc: Allocator,
+        selected_index: usize,
+        profile_home: ?[]const u8,
+    ) !SelectedTeam {
         const session = self.session orelse return LoginError.NoSession;
         if (selected_index >= self.teams.items.len) return LoginError.InvalidTeamSelection;
         const selected = self.teams.items[selected_index];
 
-        var mutation = (try oauth_session.beginExistingMutation()) orelse return LoginError.SessionChanged;
+        var mutation = (try if (profile_home) |home|
+            oauth_session.beginExistingMutationFromHome(home)
+        else
+            oauth_session.beginExistingMutation()) orelse return LoginError.SessionChanged;
         defer mutation.deinit();
         var current = (try mutation.load(alloc)) orelse return LoginError.SessionChanged;
         defer current.deinit(alloc);
@@ -280,10 +301,19 @@ pub const SignInRuntime = struct {
         alloc: Allocator,
         transport: oauth_transport.Provider,
     ) !bool {
+        return self.startWithDeps(alloc, transport, .{});
+    }
+
+    pub fn startWithDeps(
+        self: *Self,
+        alloc: Allocator,
+        transport: oauth_transport.Provider,
+        deps: SignInRuntimeDeps,
+    ) !bool {
         const prepared = try prepareLogin(alloc, transport);
-        return self.startPrepared(alloc, prepared, .{
-            .oauth_transport = transport,
-        });
+        var configured = deps;
+        configured.oauth_transport = transport;
+        return self.startPrepared(alloc, prepared, configured);
     }
 
     pub fn startPrepared(
@@ -752,8 +782,27 @@ pub fn loadTeamSelection(
     alloc: Allocator,
     transport: oauth_transport.Provider,
 ) !TeamSelection {
+    return loadTeamSelectionFromOptionalHome(alloc, transport, null);
+}
+
+pub fn loadTeamSelectionFromHome(
+    alloc: Allocator,
+    transport: oauth_transport.Provider,
+    home: []const u8,
+) !TeamSelection {
+    return loadTeamSelectionFromOptionalHome(alloc, transport, home);
+}
+
+fn loadTeamSelectionFromOptionalHome(
+    alloc: Allocator,
+    transport: oauth_transport.Provider,
+    profile_home: ?[]const u8,
+) !TeamSelection {
     var session = blk: {
-        var mutation = (try oauth_session.beginExistingMutation()) orelse return LoginError.NoSession;
+        var mutation = (try if (profile_home) |home|
+            oauth_session.beginExistingMutationFromHome(home)
+        else
+            oauth_session.beginExistingMutation()) orelse return LoginError.NoSession;
         defer mutation.deinit();
 
         var loaded = (try mutation.load(alloc)) orelse return LoginError.NoSession;
@@ -786,11 +835,30 @@ pub fn logout(
     alloc: Allocator,
     transport: oauth_transport.Provider,
 ) !LogoutResult {
+    return logoutFromOptionalHome(alloc, transport, null);
+}
+
+pub fn logoutFromHome(
+    alloc: Allocator,
+    transport: oauth_transport.Provider,
+    home: []const u8,
+) !LogoutResult {
+    return logoutFromOptionalHome(alloc, transport, home);
+}
+
+fn logoutFromOptionalHome(
+    alloc: Allocator,
+    transport: oauth_transport.Provider,
+    profile_home: ?[]const u8,
+) !LogoutResult {
     var session: ?oauth_session.Session = null;
     var session_load_failed = false;
     defer if (session) |*loaded| loaded.deinit(alloc);
     const delete_result = blk: {
-        var mutation = (oauth_session.beginExistingMutation() catch {
+        var mutation = ((if (profile_home) |home|
+            oauth_session.beginExistingMutationFromHome(home)
+        else
+            oauth_session.beginExistingMutation()) catch {
             return LogoutError.SessionDeleteFailed;
         }) orelse return .{};
         defer mutation.deinit();

@@ -7,6 +7,7 @@ const grok_oauth = @import("grok_oauth.zig");
 const host = @import("../hosts/host.zig");
 const host_target = @import("../hosts/target.zig");
 const login_flow = @import("login_flow.zig");
+const oauth_session = @import("oauth_session.zig");
 const oauth = @import("oauth.zig");
 const model_provider = @import("../config/model_provider.zig");
 const provider_catalog = @import("provider_catalog.zig");
@@ -215,6 +216,65 @@ pub fn refreshCredentialForAccount(
     return credential;
 }
 
+/// The isolated-profile twin of `refreshCredentialForAccount`: it reads and
+/// refreshes only beneath the selected state root, never the ambient profile
+/// or an account-global keychain.
+pub fn refreshCredentialForAccountFromHome(
+    transport: oauth_transport.Provider,
+    alloc: Allocator,
+    source: credentials.Source,
+    mode: CredentialRefreshMode,
+    expected_account_id: ?[]const u8,
+    home: []const u8,
+) !?credentials.Credential {
+    if (!credentials.sourceRefreshable(source)) return null;
+
+    var credential = (loadCredentialForRefreshFromHome(alloc, transport, source, mode, home) catch |err| {
+        debug_trace.logf(
+            "auth",
+            "isolated credential refresh provider failed source={t} mode={t} err={s}",
+            .{ source, mode, @errorName(err) },
+        );
+        return err;
+    }) orelse return null;
+    errdefer credential.deinit(alloc);
+    if (expected_account_id) |expected| {
+        const actual = credential.accountId() orelse {
+            debug_trace.logf("auth", "isolated credential refresh rejected stage=account_missing source={t}", .{source});
+            return error.ChatGptAccountChanged;
+        };
+        if (!std.mem.eql(u8, expected, actual)) {
+            debug_trace.logf("auth", "isolated credential refresh rejected stage=account_changed source={t}", .{source});
+            return error.ChatGptAccountChanged;
+        }
+    }
+    return credential;
+}
+
+fn loadCredentialForRefreshFromHome(
+    alloc: Allocator,
+    transport: oauth_transport.Provider,
+    source: credentials.Source,
+    mode: CredentialRefreshMode,
+    home: []const u8,
+) !?credentials.Credential {
+    return switch (source) {
+        .fx_login => switch (mode) {
+            .if_needed => credentials.loadFxLoginCredentialFromHome(alloc, transport, home),
+            .force => credentials.refreshFxLoginCredentialFromHome(alloc, transport, home),
+        },
+        .chatgpt_subscription => switch (mode) {
+            .if_needed => credentials.loadSourceFromHome(alloc, transport, source, home),
+            .force => credentials.refreshChatGptCredentialFromHome(alloc, transport, home),
+        },
+        .grok_subscription => switch (mode) {
+            .if_needed => credentials.loadSourceFromHome(alloc, transport, source, home),
+            .force => credentials.refreshGrokCredentialFromHome(alloc, transport, home),
+        },
+        else => null,
+    };
+}
+
 fn loadCredentialForRefresh(
     alloc: Allocator,
     transport: oauth_transport.Provider,
@@ -247,8 +307,47 @@ pub const CredentialPreparationError = Allocator.Error || error{
 
 /// Resolves and refreshes one provider credential. The returned value is owned
 /// by the caller and must be released with `Credential.deinit`.
+/// The isolated-profile twin of `prepareCredential`.
 /// Null means authentication is needed; storage, transport and authority
 /// failures stay errors. Non-null `preferred` is an exact Gateway source.
+pub fn prepareCredentialFromHome(
+    alloc: Allocator,
+    transport: oauth_transport.Provider,
+    provider: model_provider.ProviderId,
+    preferred: ?credentials.Source,
+    home: []const u8,
+) CredentialPreparationError!?credentials.Credential {
+    var resolution = credentials.resolveForProviderFromHome(
+        alloc,
+        transport,
+        .refresh_if_needed,
+        provider,
+        preferred,
+        home,
+    ) catch |err| failure: {
+        if (err == error.OutOfMemory) return error.OutOfMemory;
+        debug_trace.logf(
+            "auth",
+            "isolated credential preparation failed provider={t} source={s} err={s}",
+            .{
+                provider,
+                if (requestedSource(provider, preferred)) |source| @tagName(source) else "automatic",
+                @errorName(err),
+            },
+        );
+        break :failure credentials.Resolution{ .failure = .{
+            .source = requestedSource(provider, preferred) orelse .fx_login,
+            .err = err,
+        } };
+    };
+    return prepareResolvedCredential(
+        alloc,
+        provider,
+        io_mod.milliTimestamp(),
+        &resolution,
+    );
+}
+
 pub fn prepareCredential(
     alloc: Allocator,
     transport: oauth_transport.Provider,
@@ -421,6 +520,58 @@ test "credential preparation rejects refresh-due and provider-mismatched credent
         defer if (prepared) |*credential| credential.deinit(std.testing.allocator);
         try std.testing.expect(prepared == null);
     }
+}
+
+/// Refreshes only authorization rooted beneath an explicit Fx profile home.
+/// The returned token is owned by the caller and must be zero-freed.
+pub fn refreshCredentialTokenForAccountFromHome(
+    transport: oauth_transport.Provider,
+    alloc: Allocator,
+    source: credentials.Source,
+    mode: CredentialRefreshMode,
+    expected_account_id: ?[]const u8,
+    home: []const u8,
+) !?[]u8 {
+    if (!credentials.sourceRefreshable(source)) return null;
+
+    var credential = switch (source) {
+        .fx_login => switch (mode) {
+            .if_needed => (try credentials.loadFxLoginCredentialFromHome(alloc, transport, home)) orelse return null,
+            .force => (try credentials.refreshFxLoginCredentialFromHome(alloc, transport, home)) orelse return null,
+        },
+        .chatgpt_subscription => switch (mode) {
+            .if_needed => (try credentials.resolveForProviderFromHome(
+                alloc,
+                transport,
+                .refresh_if_needed,
+                .codex,
+                source,
+                home,
+            )).credential orelse return null,
+            .force => (try credentials.refreshChatGptCredentialFromHome(alloc, transport, home)) orelse return null,
+        },
+        .grok_subscription => switch (mode) {
+            .if_needed => (try credentials.resolveForProviderFromHome(
+                alloc,
+                transport,
+                .refresh_if_needed,
+                .grok,
+                source,
+                home,
+            )).credential orelse return null,
+            .force => (try credentials.refreshGrokCredentialFromHome(alloc, transport, home)) orelse return null,
+        },
+        else => unreachable,
+    };
+    defer credential.deinit(alloc);
+    if (expected_account_id) |expected| {
+        const actual = credential.accountId() orelse return error.ChatGptAccountChanged;
+        if (!std.mem.eql(u8, expected, actual)) return error.ChatGptAccountChanged;
+    }
+
+    const token = credential.token;
+    credential.token = &.{};
+    return token;
 }
 
 test "credential preparation preserves failure categories across providers" {
@@ -1302,6 +1453,8 @@ pub const Runtime = struct {
     api_key_validator: api_key_validator.Provider = api_key_validator.unavailable_provider,
     oauth_transport: oauth_transport.Provider = oauth_transport.unavailable_provider,
     secret_store: host.SecretStore = host.unavailable_secret_store,
+    /// Borrowed explicit Fx profile home; never exported as process HOME.
+    profile_home: ?[]const u8 = null,
     auth_mode: credentials.AuthMode = .local,
     selected_credential: ?credentials.Credential = null,
     credential_failure: ?CredentialFailure = null,
@@ -1381,6 +1534,7 @@ pub const Runtime = struct {
         storage.api_key_validator = validator;
         storage.oauth_transport = transport;
         storage.secret_store = secret_store;
+        storage.profile_home = null;
         storage.auth_mode = auth_mode;
         storage.selected_credential = null;
         storage.credential_failure = null;
@@ -1468,6 +1622,10 @@ pub const Runtime = struct {
 
     pub fn secretStore(self: *const Self) host.SecretStore {
         return self.secret_store;
+    }
+
+    pub fn setProfileHome(self: *Self, home: ?[]const u8) void {
+        self.profile_home = home;
     }
 
     pub fn modelCatalogAccess(self: *const Self) credentials.CatalogAccess {
@@ -1648,7 +1806,7 @@ pub const Runtime = struct {
 
     pub fn refreshChatGptSourceInventory(self: *Self, alloc: Allocator) !void {
         if (self.auth_mode == .host_managed) return;
-        if (try credentials.sourceExists(alloc, self.secret_store, .chatgpt_subscription)) {
+        if (try probeCredentialSource(self, alloc, .chatgpt_subscription)) {
             self.source_inventory.insert(.chatgpt_subscription);
         } else if (self.credentialSource() != .chatgpt_subscription) {
             self.source_inventory.remove(.chatgpt_subscription);
@@ -1657,7 +1815,7 @@ pub const Runtime = struct {
 
     pub fn refreshGrokSourceInventory(self: *Self, alloc: Allocator) !void {
         if (self.auth_mode == .host_managed) return;
-        if (try credentials.sourceExists(alloc, self.secret_store, .grok_subscription)) {
+        if (try probeCredentialSource(self, alloc, .grok_subscription)) {
             self.source_inventory.insert(.grok_subscription);
         } else if (self.credentialSource() != .grok_subscription) {
             self.source_inventory.remove(.grok_subscription);
@@ -1926,9 +2084,31 @@ pub const Runtime = struct {
     ) !bool {
         self.exitSignInStage(alloc);
         const started = switch (source) {
-            .fx_login => try self.sign_in_flow.start(alloc, self.oauth_transport),
-            .chatgpt_subscription => try chatgpt_oauth.startSignIn(&self.sign_in_flow, alloc, self.oauth_transport),
-            .grok_subscription => try grok_oauth.startSignIn(&self.sign_in_flow, alloc, self.oauth_transport),
+            .fx_login => if (self.profile_home != null)
+                try self.sign_in_flow.startWithDeps(alloc, self.oauth_transport, .{
+                    .ctx = self,
+                    .save = saveRuntimeSignIn,
+                })
+            else
+                try self.sign_in_flow.start(alloc, self.oauth_transport),
+            .chatgpt_subscription => if (self.profile_home) |home|
+                try chatgpt_oauth.startSignInFromHome(
+                    &self.sign_in_flow,
+                    alloc,
+                    self.oauth_transport,
+                    home,
+                )
+            else
+                try chatgpt_oauth.startSignIn(&self.sign_in_flow, alloc, self.oauth_transport),
+            .grok_subscription => if (self.profile_home) |home|
+                try grok_oauth.startSignInFromHome(
+                    &self.sign_in_flow,
+                    alloc,
+                    self.oauth_transport,
+                    home,
+                )
+            else
+                try grok_oauth.startSignIn(&self.sign_in_flow, alloc, self.oauth_transport),
             else => return error.InvalidSignInSource,
         };
         if (!started) return false;
@@ -2402,7 +2582,7 @@ pub const Runtime = struct {
         const source = self.credentialSource() orelse return .none;
         if (!credentials.sourceRefreshable(source)) return .none;
 
-        const loaded = (try credentials.loadSource(alloc, self.oauth_transport, self.secret_store, source)) orelse {
+        const loaded = (try loadRuntimeCredentialSource(self, alloc, source)) orelse {
             if (self.credentialNeedsRefresh()) return error.CredentialRefreshUnavailable;
             return .none;
         };
@@ -2555,6 +2735,7 @@ test "auth in-place initialization preserves empty runtime state" {
 
     try std.testing.expect(runtime.selected_credential == null);
     try std.testing.expect(runtime.credential_failure == null);
+    try std.testing.expect(runtime.profile_home == null);
     try std.testing.expect(runtime.source_inventory.count() == 0);
     try std.testing.expect(runtime.stored_key_status == .not_attempted);
     try std.testing.expect(!runtime.picker_active);
@@ -2594,15 +2775,21 @@ test "host-managed runtime exposes authority without local credential state" {
     try std.testing.expectEqual(@as(usize, 0), runtime.source_inventory.count());
 }
 
-fn probeCredentialSource(raw_context: ?*anyopaque, _: Allocator, source: credentials.Source) !bool {
+fn probeCredentialSource(raw_context: ?*anyopaque, alloc: Allocator, source: credentials.Source) !bool {
     const self: *Runtime = @ptrCast(@alignCast(raw_context.?));
     if (self.auth_mode == .host_managed) return false;
+    if (self.profile_home) |home| {
+        return credentials.sourceExistsFromHome(alloc, source, home);
+    }
     return sourcePresenceAvailable(credentials.sourcePresence(self.secret_store, source), .fail);
 }
 
-fn probeCredentialSourceForLogout(raw_context: ?*anyopaque, _: Allocator, source: credentials.Source) !bool {
+fn probeCredentialSourceForLogout(raw_context: ?*anyopaque, alloc: Allocator, source: credentials.Source) !bool {
     const self: *Runtime = @ptrCast(@alignCast(raw_context.?));
     if (self.auth_mode == .host_managed) return false;
+    if (self.profile_home) |home| {
+        return credentials.sourceExistsFromHome(alloc, source, home);
+    }
     const presence = credentials.sourcePresence(self.secret_store, source);
     if (presence == .unavailable) {
         debug_trace.logf("auth", "logout inventory omitted unavailable source={s}", .{@tagName(source)});
@@ -2639,6 +2826,15 @@ fn loadRuntimeCredentialSource(raw: ?*anyopaque, alloc: Allocator, source: crede
     // the issuer rejects must read as "unavailable" (the callers all explain
     // that), not ride a `try` chain out of the event loop. `resolve()` keeps
     // its own error handling for startup status reporting.
+    if (self.profile_home) |home| {
+        return credentials.loadSourceFromHome(alloc, self.oauth_transport, source, home) catch |err| switch (err) {
+            error.OutOfMemory => err,
+            else => {
+                debug_trace.logf("auth", "isolated credential load failed source={t} err={s}", .{ source, @errorName(err) });
+                return null;
+            },
+        };
+    }
     return credentials.loadSource(alloc, self.oauth_transport, self.secret_store, source) catch |err| switch (err) {
         error.OutOfMemory => err,
         else => {
@@ -2650,7 +2846,26 @@ fn loadRuntimeCredentialSource(raw: ?*anyopaque, alloc: Allocator, source: crede
 
 fn storeRuntimeSecret(raw: ?*anyopaque, alloc: Allocator, value: []const u8) !void {
     const self: *Runtime = @ptrCast(@alignCast(raw.?));
+    if (self.profile_home) |home| {
+        return credentials.storeKeyFromHome(alloc, home, value);
+    }
     return self.secret_store.store(alloc, value);
+}
+
+fn saveRuntimeSignIn(
+    raw: ?*anyopaque,
+    alloc: Allocator,
+    completion: login_flow.SignInCompletion,
+) !void {
+    const self: *Runtime = @ptrCast(@alignCast(raw.?));
+    const session = switch (completion) {
+        .vercel => |selection| selection.session orelse return login_flow.LoginError.NoSession,
+        .chatgpt, .grok => return error.InvalidSignInCompletion,
+    };
+    if (self.profile_home) |home| {
+        return oauth_session.saveNewSessionFromHome(alloc, home, session);
+    }
+    return oauth_session.saveNewSession(alloc, session);
 }
 
 fn storeUnavailableSecret(_: ?*anyopaque, _: Allocator, _: []const u8) !void {

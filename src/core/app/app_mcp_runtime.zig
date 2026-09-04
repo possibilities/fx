@@ -940,6 +940,7 @@ fn deinitAuthenticationResult(result: anyerror!mcp_auth.AuthenticationResult) vo
 pub const State = struct {
     lock: std.Io.RwLock = .init,
     runtime: ?*mcp_runtime.McpRuntime = null,
+    profile_home: ?[]const u8 = null,
     pending_reload: ?*PendingReload = null,
     pending_authentication: ?*PendingAuthentication = null,
     pending_menu_operation: ?*PendingMenuOperation = null,
@@ -1591,6 +1592,13 @@ pub const State = struct {
 
     pub fn cancelMenuOperation(self: *State) void {
         self.cancelPendingMenuOperation("menu_back");
+    }
+
+    pub fn setProfileHome(self: *State, home: ?[]const u8) void {
+        std.debug.assert(self.runtime == null);
+        std.debug.assert(self.pending_reload == null);
+        std.debug.assert(self.pending_authentication == null);
+        self.profile_home = home;
     }
 
     pub fn installInitial(self: *State, runtime: ?*mcp_runtime.McpRuntime) void {
@@ -2283,7 +2291,11 @@ pub const State = struct {
         pending: ?*PendingReload,
     ) !ReloadOutcome {
         if (cancel_requested.load(.acquire)) return error.Cancelled;
-        const next_authority = preview_workspace_authority(alloc, workspace_root) catch |err| {
+        const next_authority = preview_workspace_authority(
+            alloc,
+            workspace_root,
+            self.profile_home,
+        ) catch |err| {
             const detached = try self.detachForReducingReload(cancel_requested, pending);
             if (detached) |runtime| {
                 destroyRuntime(alloc, runtime);
@@ -2322,7 +2334,7 @@ pub const State = struct {
             destroyRuntime(alloc, runtime);
         }
 
-        const candidate = loader(alloc, workspace_root, elicitation_capabilities) catch |err| {
+        const candidate = loader(alloc, workspace_root, elicitation_capabilities, self.profile_home) catch |err| {
             if (authority_reduced) {
                 debug_trace.logf(
                     "mcp",
@@ -2426,7 +2438,7 @@ pub const State = struct {
     ) !ReloadOutcome {
         if (cancel_requested.load(.acquire)) return error.Cancelled;
         const candidate = if (rebuild)
-            try loader(alloc, workspace_root, elicitation_capabilities)
+            try loader(alloc, workspace_root, elicitation_capabilities, self.profile_home)
         else
             null;
         var candidate_owned = candidate != null;
@@ -2697,12 +2709,16 @@ const TestReloadMode = enum {
 };
 
 var test_reload_mode: TestReloadMode = .empty;
+var test_reload_profile_home: ?[]const u8 = null;
+var test_reload_preview_profile_home: ?[]const u8 = null;
 
 fn loadTestReloadRuntime(
     alloc: Allocator,
     _: []const u8,
     _: elicitation.Capabilities,
+    profile_home: ?[]const u8,
 ) !?*mcp_runtime.McpRuntime {
+    test_reload_profile_home = profile_home;
     switch (test_reload_mode) {
         .parse_failure => return error.McpConfigInvalidJson,
         .empty => return null,
@@ -2753,12 +2769,47 @@ fn loadTestReloadRuntime(
     return runtime;
 }
 
-fn previewTestWorkspaceAuthority(alloc: Allocator, _: []const u8) ![][]u8 {
+fn previewTestWorkspaceAuthority(
+    alloc: Allocator,
+    _: []const u8,
+    profile_home: ?[]const u8,
+) ![][]u8 {
+    test_reload_preview_profile_home = profile_home;
     return alloc.alloc([]u8, 0);
 }
 
 fn failPendingReloadSpawn(_: *PendingReload) !std.Thread {
     return error.TestSpawnFailed;
+}
+
+test "MCP reload retains the selected profile home" {
+    const alloc = std.testing.allocator;
+    var state: State = .{};
+    defer state.deinit(alloc);
+    state.setProfileHome("/selected-state");
+    test_reload_mode = .empty;
+    test_reload_profile_home = null;
+    test_reload_preview_profile_home = null;
+
+    var outcome = try state.reload(
+        alloc,
+        "/",
+        .{},
+        loadTestReloadRuntime,
+        previewTestWorkspaceAuthority,
+        .{},
+        10,
+    );
+    defer outcome.deinit(alloc);
+
+    try std.testing.expectEqualStrings(
+        "/selected-state",
+        test_reload_profile_home.?,
+    );
+    try std.testing.expectEqualStrings(
+        "/selected-state",
+        test_reload_preview_profile_home.?,
+    );
 }
 
 test "transactional reload retains old runtime and publishes only accepted candidates" {

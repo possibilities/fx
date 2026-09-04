@@ -149,13 +149,22 @@ pub fn run(
         admission.provider,
         config.tool_context.credential_source,
     )) {
-        routed_credential = auth_runtime.prepareCredential(
-            turn.alloc,
-            config.tool_context.oauth_transport,
-            config.tool_context.secret_store,
-            admission.provider,
-            config.tool_context.credential_source,
-        ) catch |err| {
+        routed_credential = (if (config.tool_context.profile_home) |home|
+            auth_runtime.prepareCredentialFromHome(
+                turn.alloc,
+                config.tool_context.oauth_transport,
+                admission.provider,
+                config.tool_context.credential_source,
+                home,
+            )
+        else
+            auth_runtime.prepareCredential(
+                turn.alloc,
+                config.tool_context.oauth_transport,
+                config.tool_context.secret_store,
+                admission.provider,
+                config.tool_context.credential_source,
+            )) catch |err| {
             if (err == error.OutOfMemory) return error.OutOfMemory;
             turn.setFailureDiagnostic("model_credential_resolution_failed", @errorName(err)) catch
                 return error.OutOfMemory;
@@ -412,13 +421,23 @@ fn refreshGatewayCredential(
     expected_account_id: ?[]const u8,
 ) !?[]u8 {
     const context: *Context = @ptrCast(@alignCast(raw));
-    var refreshed = (try auth_runtime.refreshCredentialForAccount(
-        context.config.tool_context.oauth_transport,
-        context.turn.alloc,
-        source,
-        mode,
-        expected_account_id,
-    )) orelse return null;
+    var refreshed = (if (context.config.tool_context.profile_home) |home|
+        try auth_runtime.refreshCredentialForAccountFromHome(
+            context.config.tool_context.oauth_transport,
+            context.turn.alloc,
+            source,
+            mode,
+            expected_account_id,
+            home,
+        )
+    else
+        try auth_runtime.refreshCredentialForAccount(
+            context.config.tool_context.oauth_transport,
+            context.turn.alloc,
+            source,
+            mode,
+            expected_account_id,
+        )) orelse return null;
     defer refreshed.deinit(context.turn.alloc);
     if (context.config.tool_context.credential_source != refreshed.source or
         !optionalCredentialFieldEqual(

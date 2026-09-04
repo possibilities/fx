@@ -58,6 +58,12 @@ fn BootstrapDeps(comptime App: type) type {
             []const u8,
             skill_contract.RootPolicy,
         ) app_runtime_setup.LoadSkillsError!app_runtime_setup.LoadedSkills;
+        const LoadSkillsFromHomeFn = *const fn (
+            Allocator,
+            []const u8,
+            []const u8,
+            skill_contract.RootPolicy,
+        ) app_runtime_setup.LoadSkillsError!app_runtime_setup.LoadedSkills;
         const WelcomeMessageFn = *const fn (Allocator) anyerror![]u8;
         const BeginFreshPersistedSessionFn = *const fn (*App) anyerror!void;
         const EnableSessionStoresFn = *const fn (*App) void;
@@ -68,6 +74,7 @@ fn BootstrapDeps(comptime App: type) type {
         publish_staged_resume_view: PublishStagedResumeViewFn,
         load_mcp_runtime: mcp_runtime.LoadRuntimeFn,
         load_skills: LoadSkillsFn,
+        load_skills_from_home: LoadSkillsFromHomeFn,
         skill_root_policy: skill_contract.RootPolicy,
         welcome_message: WelcomeMessageFn,
         begin_fresh_persisted_session: BeginFreshPersistedSessionFn,
@@ -105,6 +112,7 @@ pub fn Runtime(comptime App: type) type {
                 .publish_staged_resume_view = publishStagedResumeViewDefault,
                 .load_mcp_runtime = capability_providers.load_mcp_runtime,
                 .load_skills = app_runtime_setup.loadSkills,
+                .load_skills_from_home = app_runtime_setup.loadSkillsFromHome,
                 .skill_root_policy = capability_providers.skill_root_policy,
                 .welcome_message = welcomeMessageDefault,
                 .begin_fresh_persisted_session = beginFreshPersistedSessionDefault,
@@ -201,6 +209,10 @@ pub fn Runtime(comptime App: type) type {
                     app.secretStore()
                 else
                     host.unavailable_secret_store,
+                .profile_home = if (comptime @hasField(App, "profile_home"))
+                    app.profile_home
+                else
+                    null,
                 .auth_mode = if (comptime @hasDecl(@TypeOf(app.auth), "authMode"))
                     app.auth.authMode()
                 else
@@ -254,7 +266,10 @@ pub fn Runtime(comptime App: type) type {
                 prompt_history_unavailable =
                     (try app.prompt_history.initialize(
                         app.alloc,
-                        shared_io.getenv("HOME"),
+                        if (comptime @hasField(App, "profile_home"))
+                            app.profile_home orelse shared_io.getenv("HOME")
+                        else
+                            shared_io.getenv("HOME"),
                         startup.prompt_history_enabled,
                         startup.prompt_history_store_allowed,
                     )) == .unavailable;
@@ -264,7 +279,10 @@ pub fn Runtime(comptime App: type) type {
             {
                 _ = try app.session.initializeProfileUsage(
                     app.alloc,
-                    shared_io.getenv("HOME"),
+                    if (comptime @hasField(App, "profile_home"))
+                        app.profile_home orelse shared_io.getenv("HOME")
+                    else
+                        shared_io.getenv("HOME"),
                 );
             }
 
@@ -330,6 +348,7 @@ pub fn Runtime(comptime App: type) type {
                 app.alloc,
                 app.workspace_root,
                 .{ .form = true, .url = true },
+                if (comptime @hasField(App, "profile_home")) app.profile_home else null,
             );
             if (comptime @hasDecl(App, "installInitialMcpRuntime")) {
                 app.installInitialMcpRuntime(profile_mcp);
@@ -337,11 +356,26 @@ pub fn Runtime(comptime App: type) type {
                 app.mcp_runtime = profile_mcp;
             }
 
-            var loaded = try deps.load_skills(
-                std.heap.c_allocator,
-                app.workspace_root,
-                deps.skill_root_policy,
-            );
+            var loaded = if (comptime @hasField(App, "profile_home"))
+                if (app.profile_home) |home_dir|
+                    try deps.load_skills_from_home(
+                        std.heap.c_allocator,
+                        app.workspace_root,
+                        home_dir,
+                        deps.skill_root_policy,
+                    )
+                else
+                    try deps.load_skills(
+                        std.heap.c_allocator,
+                        app.workspace_root,
+                        deps.skill_root_policy,
+                    )
+            else
+                try deps.load_skills(
+                    std.heap.c_allocator,
+                    app.workspace_root,
+                    deps.skill_root_policy,
+                );
             errdefer loaded.deinit(std.heap.c_allocator);
             skill_runtime.traceDiagnostics("interactive_startup", loaded.diagnostics);
             try app.skills.replaceLoaded(std.heap.c_allocator, loaded.dir, loaded.skills, loaded.diagnostics);
@@ -506,6 +540,8 @@ const TestCapture = struct {
     configured_fast_mode: bool = false,
     configured_fast_mode_model_bound: bool = false,
     initialize_required: bool = false,
+    mcp_profile_home: ?[]const u8 = null,
+    skill_profile_home: ?[]const u8 = null,
     load_skills_workspace: []const u8 = "",
     load_skills_workspace_root_count: usize = 0,
     load_skills_global_root_count: usize = 0,
@@ -586,6 +622,7 @@ const TestApp = struct {
     statusline_session: bool = false,
     workspace_identity: statusline_identity.Runtime = .{},
     requested_resume: ?u8 = null,
+    profile_home: ?[]const u8 = null,
     mcp_runtime: ?*mcp_runtime.McpRuntime = null,
     skills: skill_runtime.Runtime = .{},
     transcript: std.ArrayList(u8) = .empty,
@@ -663,6 +700,7 @@ fn testDeps() BootstrapDeps(TestApp) {
         .publish_staged_resume_view = publishStagedResumeViewForTest,
         .load_mcp_runtime = loadMcpRuntimeForTest,
         .load_skills = loadSkillsForTest,
+        .load_skills_from_home = loadSkillsFromHomeForTest,
         .skill_root_policy = .{
             .workspace_roots = &test_workspace_skill_roots,
             .managed_root_source = .global_fx,
@@ -766,7 +804,13 @@ fn publishStagedResumeViewForTest(_: *TestApp, entry_id: u32) !void {
     active_capture.?.recordEvent("resume_view_publish");
 }
 
-fn loadMcpRuntimeForTest(_: Allocator, _: []const u8, _: @import("../mcp/elicitation.zig").Capabilities) !?*mcp_runtime.McpRuntime {
+fn loadMcpRuntimeForTest(
+    _: Allocator,
+    _: []const u8,
+    _: @import("../mcp/elicitation.zig").Capabilities,
+    profile_home: ?[]const u8,
+) !?*mcp_runtime.McpRuntime {
+    active_capture.?.mcp_profile_home = profile_home;
     active_capture.?.recordEvent("load_mcp");
     return null;
 }
@@ -797,6 +841,16 @@ fn loadSkillsForTest(
         .cause = .{ .invalid_metadata = .missing_name },
     };
     return .{ .dir = dir, .skills = &.{}, .diagnostics = diagnostics };
+}
+
+fn loadSkillsFromHomeForTest(
+    alloc: Allocator,
+    workspace_root: []const u8,
+    profile_home: []const u8,
+    policy: skill_contract.RootPolicy,
+) app_runtime_setup.LoadSkillsError!app_runtime_setup.LoadedSkills {
+    active_capture.?.skill_profile_home = profile_home;
+    return loadSkillsForTest(alloc, workspace_root, policy);
 }
 
 fn welcomeMessageForTest(alloc: Allocator) ![]u8 {
@@ -968,6 +1022,25 @@ test "app_bootstrap_runtime transfers startup state and starts a fresh session" 
     try std.testing.expect(app.transcript_recorded);
     try std.testing.expect(app.shell.render_requests.hasReason(.first_frame));
     try std.testing.expect(app.begin_fresh_called);
+}
+
+test "app_bootstrap_runtime routes selected profile home to TUI capabilities" {
+    const alloc = std.testing.allocator;
+    var capture = TestCapture.init(alloc);
+    var app = TestApp.init(alloc);
+    defer app.deinit();
+    app.profile_home = "/selected-state";
+
+    try runBootstrapForTest(&app, &capture);
+
+    try std.testing.expectEqualStrings(
+        "/selected-state",
+        capture.mcp_profile_home.?,
+    );
+    try std.testing.expectEqualStrings(
+        "/selected-state",
+        capture.skill_profile_home.?,
+    );
 }
 
 test "app_bootstrap_runtime opens onboarding before first frame without a credential" {

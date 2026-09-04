@@ -126,12 +126,14 @@ pub const LaunchModifiers = struct {
     allow_native_tools: bool = true,
     permission_policy: ?config_runtime.LaunchPermissionPolicy = null,
     project_instructions_enabled: bool = true,
+    state_home: ?[]u8 = null,
 
     pub fn deinit(self: *LaunchModifiers, alloc: Allocator) void {
         if (self.context_limit_overrides.len > 0) alloc.free(self.context_limit_overrides);
         for (self.additional_directories) |path| alloc.free(path);
         if (self.additional_directories.len > 0) alloc.free(self.additional_directories);
         if (self.permission_policy) |*policy| policy.deinit(alloc);
+        if (self.state_home) |path| alloc.free(path);
         self.* = .{};
     }
 
@@ -375,6 +377,8 @@ fn parseGlobalLaunchArgs(
     var permission_policy: ?config_runtime.LaunchPermissionPolicy = null;
     errdefer if (permission_policy) |*policy| policy.deinit(alloc);
     var project_instructions_enabled = true;
+    var state_home: ?[]u8 = null;
+    errdefer if (state_home) |path| alloc.free(path);
 
     var index: usize = 0;
     while (index < args.len) {
@@ -412,6 +416,22 @@ fn parseGlobalLaunchArgs(
         } else if (std.mem.eql(u8, arg, "--no-project-instructions")) {
             if (!project_instructions_enabled) return error.DuplicateProjectInstructionSuppression;
             project_instructions_enabled = false;
+        } else if (std.mem.eql(u8, arg, "--state-dir")) {
+            if (state_home != null) return error.DuplicateStateDirectory;
+            index += 1;
+            if (index >= args.len or args[index].len == 0) return error.MissingStateDirectoryValue;
+            state_home = canonicalizeStateHome(alloc, args[index]) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => return error.InvalidStateDirectory,
+            };
+        } else if (std.mem.startsWith(u8, arg, "--state-dir=")) {
+            if (state_home != null) return error.DuplicateStateDirectory;
+            const value = arg["--state-dir=".len..];
+            if (value.len == 0) return error.MissingStateDirectoryValue;
+            state_home = canonicalizeStateHome(alloc, value) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => return error.InvalidStateDirectory,
+            };
         } else {
             break;
         }
@@ -430,8 +450,19 @@ fn parseGlobalLaunchArgs(
             .allow_native_tools = allow_native_tools,
             .permission_policy = permission_policy,
             .project_instructions_enabled = project_instructions_enabled,
+            .state_home = state_home,
         },
     };
+}
+
+fn canonicalizeStateHome(alloc: Allocator, path: []const u8) ![]u8 {
+    const canonical = try io_mod.realpathAlloc(alloc, path);
+    errdefer alloc.free(canonical);
+    var dir = try std.Io.Dir.openDirAbsolute(io_mod.getIo(), canonical, .{});
+    defer dir.close(io_mod.getIo());
+    const stat = try dir.stat(io_mod.getIo());
+    if (stat.kind != .directory) return error.NotDir;
+    return canonical;
 }
 
 /// Returns the command that follows the supported global launch modifiers.
@@ -448,7 +479,8 @@ pub fn argsAfterGlobalLaunchArgs(args: []const [:0]const u8) []const [:0]const u
         const arg = args[index];
         if (std.mem.eql(u8, arg, "--context-limit") or
             std.mem.eql(u8, arg, "--add-dir") or
-            std.mem.eql(u8, arg, "--permissions-file"))
+            std.mem.eql(u8, arg, "--permissions-file") or
+            std.mem.eql(u8, arg, "--state-dir"))
         {
             index += 1;
             if (index >= args.len) return &.{};
@@ -457,6 +489,7 @@ pub fn argsAfterGlobalLaunchArgs(args: []const [:0]const u8) []const [:0]const u
             !std.mem.startsWith(u8, arg, "--permissions-file=") and
             !std.mem.eql(u8, arg, "--no-additional-dirs") and
             !std.mem.eql(u8, arg, "--no-native-tools") and
+            !std.mem.startsWith(u8, arg, "--state-dir=") and
             !std.mem.eql(u8, arg, "--no-project-instructions"))
         {
             return args[index..];
@@ -930,7 +963,7 @@ fn runIfRequestedWithDeps(alloc: Allocator, args: []const [:0]const u8, cfg: Con
         } else {
             try writer.writer.print("fx: invalid global launch option: {s}\n", .{@errorName(err)});
         }
-        try writer.writer.writeAll("usage: fx [--context-limit NAME=BYTES|off] [--add-dir PATH]... [--no-additional-dirs] [--permissions-file FILE] <command>\n");
+        try writer.writer.writeAll("usage: fx [--context-limit NAME=BYTES|off] [--add-dir PATH]... [--no-additional-dirs] [--no-native-tools] [--permissions-file FILE] [--no-project-instructions] [--state-dir DIR] <command>\n");
         try writeStderr(deps, writer.written());
         return .handled_failure;
     };
@@ -979,6 +1012,12 @@ fn runNonInteractiveWithDeps(
         !commandSupportsProjectInstructionModifier(parsed_command))
     {
         try writeProjectInstructionModifierUsage(deps);
+        return .handled_failure;
+    }
+    if (global_args.modifiers.state_home != null and
+        !commandSupportsStateHome(parsed_command))
+    {
+        try writeStateHomeUsage(deps);
         return .handled_failure;
     }
 
@@ -1049,6 +1088,7 @@ fn runNonInteractiveWithDeps(
                 .allow_acp_mcp = acp_opts.allow_acp_mcp,
                 .allow_native_tools = global_args.modifiers.allow_native_tools,
                 .project_instructions_enabled = global_args.modifiers.project_instructions_enabled,
+                .home_override = global_args.modifiers.state_home,
             });
             return .handled_success;
         },
@@ -2274,6 +2314,7 @@ fn loadMcpCommandRuntime(
         alloc,
         startup.workspace_root,
         .{ .form = true, .url = true },
+        null,
     );
     return .{ .startup = startup, .runtime = runtime };
 }
@@ -3275,6 +3316,13 @@ fn commandSupportsProjectInstructionModifier(command: Command) bool {
     };
 }
 
+fn commandSupportsStateHome(command: Command) bool {
+    return switch (command) {
+        .interactive, .acp, .resume_session => true,
+        else => false,
+    };
+}
+
 fn writeWorkspaceModifierUsage(deps: RunDeps) !void {
     try writeStderr(
         deps,
@@ -3303,6 +3351,13 @@ fn writeProjectInstructionModifierUsage(deps: RunDeps) !void {
     );
 }
 
+fn writeStateHomeUsage(deps: RunDeps) !void {
+    try writeStderr(
+        deps,
+        "fx: --state-dir is only supported for interactive, resume, and ACP launches\n",
+    );
+}
+
 fn globalLaunchErrorMessage(err: anyerror) ?[]const u8 {
     return switch (err) {
         error.MissingAddDirectoryValue => "--add-dir requires a directory path",
@@ -3314,6 +3369,9 @@ fn globalLaunchErrorMessage(err: anyerror) ?[]const u8 {
         error.PermissionPolicyTooLarge => "--permissions-file exceeds the 64 KiB limit",
         error.InvalidPermissionPolicy => "--permissions-file must contain valid permission-rule JSON",
         error.DuplicateProjectInstructionSuppression => "--no-project-instructions may only be specified once",
+        error.MissingStateDirectoryValue => "--state-dir requires a directory path",
+        error.DuplicateStateDirectory => "--state-dir may only be specified once",
+        error.InvalidStateDirectory => "--state-dir must name an existing directory",
         else => null,
     };
 }
@@ -3898,6 +3956,25 @@ test "global launch modifiers own repeatable additional directories and suppress
     try std.testing.expectEqualStrings("ask", parsed.remaining[0]);
 }
 
+test "global state directory is canonicalized and owned for interactive and ACP launches" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "state");
+    const expected = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "state");
+    defer alloc.free(expected);
+    const state_arg = try alloc.dupeZ(u8, expected);
+    defer alloc.free(state_arg);
+
+    var interactive = try parseGlobalLaunchArgs(alloc, &.{
+        @constCast("--state-dir"),
+        state_arg,
+    });
+    defer interactive.deinit(alloc);
+    try std.testing.expectEqualStrings(expected, interactive.modifiers.state_home.?);
+    try std.testing.expectEqual(@as(usize, 0), interactive.remaining.len);
+}
+
 test "additional directory flags fail closed when malformed" {
     try std.testing.expectError(
         error.MissingAddDirectoryValue,
@@ -3981,6 +4058,7 @@ test "parse acp args extracts known flags and rejects invalid arguments" {
     try std.testing.expectError(error.InvalidAcpArgs, parseAcpArgs(&.{@constCast("--unknown")}));
     try std.testing.expectError(error.InvalidAcpArgs, parseAcpArgs(&.{@constCast("--model")}));
     try std.testing.expectError(error.InvalidAcpArgs, parseAcpArgs(&.{@constCast("--log-file")}));
+    try std.testing.expectError(error.InvalidAcpArgs, parseAcpArgs(&.{@constCast("--state-dir")}));
     try std.testing.expectError(
         error.InvalidAcpArgs,
         parseAcpArgs(&.{ @constCast("--model"), @constCast("first"), @constCast("--model"), @constCast("second") }),
@@ -3989,6 +4067,28 @@ test "parse acp args extracts known flags and rejects invalid arguments" {
         error.InvalidAcpArgs,
         parseAcpArgs(&.{ @constCast("--no-acp-mcp"), @constCast("--no-acp-mcp") }),
     );
+}
+
+test "global state home canonicalization rejects missing paths and files" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "state");
+    var file = try tmp.dir.createFile(std.testing.io, "not-a-directory", .{});
+    file.close(std.testing.io);
+
+    const expected = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "state");
+    defer alloc.free(expected);
+    const state = try canonicalizeStateHome(alloc, expected);
+    defer alloc.free(state);
+    try std.testing.expectEqualStrings(expected, state);
+
+    const file_path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "not-a-directory");
+    defer alloc.free(file_path);
+    try std.testing.expectError(error.NotDir, canonicalizeStateHome(alloc, file_path));
+    const missing = try std.fs.path.join(alloc, &.{ expected, "missing" });
+    defer alloc.free(missing);
+    try std.testing.expectError(error.FileNotFound, canonicalizeStateHome(alloc, missing));
 }
 
 test "ACP command routes parsed options and launch config through the injected runner" {
@@ -4053,7 +4153,8 @@ test "ACP command routes parsed options and launch config through the injected r
                 std.mem.eql(u8, cfg.log_file.?, "/tmp/acp.log") and
                 !cfg.allow_native_tools and
                 !cfg.allow_acp_mcp and
-                !cfg.project_instructions_enabled;
+                !cfg.project_instructions_enabled and
+                cfg.home_override == null;
         }
     };
 
@@ -4542,6 +4643,8 @@ test "runIfRequested help writes top-level help" {
     try std.testing.expectEqual(RunResult.handled_success, result);
     try std.testing.expect(std.mem.startsWith(u8, capture.stdout.written(), "𝒇x v0.0.0\nFast, native coding agent for the terminal."));
     try std.testing.expect(std.mem.find(u8, capture.stdout.written(), testConfig().version) != null);
+    try std.testing.expect(std.mem.find(u8, capture.stdout.written(), "--state-dir <path>") != null);
+    try std.testing.expect(std.mem.find(u8, capture.stdout.written(), "Use an isolated Fx profile for TUI or ACP") != null);
     try std.testing.expectEqualStrings("", capture.stderr.written());
 }
 
@@ -5632,7 +5735,12 @@ const test_surface_context_registry = context_contract.Registry{ .default_provid
     .append_transient_fn = appendNoopTransientContextForTest,
 } };
 
-fn noMcpRuntimeForTest(_: Allocator, _: []const u8, _: @import("../mcp/elicitation.zig").Capabilities) !?*mcp_runtime.McpRuntime {
+fn noMcpRuntimeForTest(
+    _: Allocator,
+    _: []const u8,
+    _: @import("../mcp/elicitation.zig").Capabilities,
+    _: ?[]const u8,
+) !?*mcp_runtime.McpRuntime {
     return null;
 }
 
@@ -5680,6 +5788,7 @@ fn configuredMcpRuntimeForTest(
     alloc: Allocator,
     workspace_root: []const u8,
     _: @import("../mcp/elicitation.zig").Capabilities,
+    _: ?[]const u8,
 ) !?*mcp_runtime.McpRuntime {
     try std.testing.expectEqualStrings("/tmp/fx", workspace_root);
     const runtime = try alloc.create(mcp_runtime.McpRuntime);

@@ -362,6 +362,24 @@ pub fn loadVisibleSkills(
     skills_dir: []const u8,
     root_policy: skill_contract.RootPolicy,
 ) !SkillDiscovery {
+    return loadVisibleSkillsWithHomes(
+        alloc,
+        workspace_root,
+        home,
+        home,
+        skills_dir,
+        root_policy,
+    );
+}
+
+pub fn loadVisibleSkillsWithHomes(
+    alloc: Allocator,
+    workspace_root: ?[]const u8,
+    workspace_home: ?[]const u8,
+    profile_home: ?[]const u8,
+    skills_dir: []const u8,
+    root_policy: skill_contract.RootPolicy,
+) !SkillDiscovery {
     var skills: std.ArrayList(Skill) = .empty;
     errdefer {
         for (skills.items) |skill| freeSkill(alloc, skill);
@@ -385,7 +403,8 @@ pub fn loadVisibleSkills(
         alloc,
         &roots,
         workspace_root,
-        home,
+        workspace_home,
+        profile_home,
         skills_dir,
         root_policy,
     );
@@ -403,11 +422,16 @@ pub fn loadVisibleSkills(
     };
 }
 
+/// Workspace ancestor skills resolve against the real workspace home while
+/// profile-global skills resolve against the selected state profile, so a
+/// selected `--state-dir` never leaks globals into the workspace boundary or
+/// the other way round.
 fn appendConfiguredSkillRoots(
     alloc: Allocator,
     roots: *std.ArrayList(SkillRoot),
     workspace_root: ?[]const u8,
-    home: ?[]const u8,
+    workspace_home: ?[]const u8,
+    profile_home: ?[]const u8,
     skills_dir: []const u8,
     root_policy: skill_contract.RootPolicy,
 ) !void {
@@ -416,14 +440,14 @@ fn appendConfiguredSkillRoots(
             alloc,
             roots,
             root,
-            home,
+            workspace_home,
             root_policy.workspace_roots,
         );
     }
     if (root_policy.managed_root_source) |source| {
         try appendDupeRoot(alloc, roots, source, skills_dir);
     }
-    if (home) |home_root| {
+    if (profile_home) |home_root| {
         for (root_policy.global_roots) |spec| {
             try appendSpecRoot(alloc, roots, home_root, spec);
         }
@@ -446,6 +470,7 @@ fn collectRootFingerprints(
         alloc,
         &roots,
         workspace_root,
+        home,
         home,
         skills_dir,
         root_policy,
@@ -537,6 +562,10 @@ fn appendWorkspaceRoots(
     home: ?[]const u8,
     root_specs: []const skill_contract.RootSpec,
 ) !void {
+    const scan_ancestors = if (home) |home_root|
+        pathing.pathInside(home_root, workspace_root)
+    else
+        false;
     var current: ?[]const u8 = workspace_root;
     while (current) |dir| : (current = std.fs.path.dirname(dir)) {
         if (home) |home_root| {
@@ -546,6 +575,7 @@ fn appendWorkspaceRoots(
         for (root_specs) |spec| {
             try appendSpecRoot(alloc, roots, dir, spec);
         }
+        if (!scan_ancestors) break;
     }
 }
 
@@ -2003,9 +2033,13 @@ const CatalogRefreshTask = struct {
             },
             .full_discovery => {},
         }
-        const discovery = loadVisibleSkills(
+        // Refresh keeps the same separation discovery does: workspace ancestor
+        // skills resolve against the real workspace home while profile-global
+        // skills resolve against the selected state profile this task carries.
+        const discovery = loadVisibleSkillsWithHomes(
             self.alloc,
             self.workspace_root,
+            io_mod.getenv("HOME"),
             self.home,
             self.skills_dir,
             self.root_policy,

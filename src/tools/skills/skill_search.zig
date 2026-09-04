@@ -24,6 +24,7 @@ pub fn searchRequest(
         ctx.allocator,
         ctx.workspace_root,
         ctx.skills_dir,
+        ctx.profile_home,
     );
     defer discovery.deinit(ctx.allocator);
     skill_runtime.traceDiagnostics("capability_search", discovery.diagnostics);
