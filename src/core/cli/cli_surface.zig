@@ -694,12 +694,23 @@ pub fn systemPromptFilesRequested(args: []const [:0]const u8) bool {
         {
             return true;
         }
-        if (std.mem.eql(u8, arg, "--context-limit") or std.mem.eql(u8, arg, "--add-dir")) {
+        if (std.mem.eql(u8, arg, "--context-limit") or
+            std.mem.eql(u8, arg, "--add-dir") or
+            std.mem.eql(u8, arg, "--skills-dir") or
+            std.mem.eql(u8, arg, "--tool") or
+            std.mem.eql(u8, arg, "--permissions-file"))
+        {
             index += 1;
             if (index >= args.len) return false;
         } else if (!std.mem.startsWith(u8, arg, "--context-limit=") and
             !std.mem.startsWith(u8, arg, "--add-dir=") and
-            !std.mem.eql(u8, arg, "--no-additional-dirs"))
+            !std.mem.startsWith(u8, arg, "--skills-dir=") and
+            !std.mem.startsWith(u8, arg, "--tool=") and
+            !std.mem.startsWith(u8, arg, "--permissions-file=") and
+            !std.mem.eql(u8, arg, "--no-additional-dirs") and
+            !std.mem.eql(u8, arg, "--no-native-tools") and
+            !std.mem.eql(u8, arg, "--no-project-instructions") and
+            !std.mem.eql(u8, arg, "--no-default-skills"))
         {
             return false;
         }
