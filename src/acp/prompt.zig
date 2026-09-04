@@ -433,8 +433,12 @@ const AcpContext = struct {
 
 fn activeToolSet(state: *const server.ServerState) tool_set_contract.ToolSet {
     if (state.host_tools.tools.len > 0) return state.host_tools.toolSet();
+    return nativeToolSet(state.cfg.allow_native_tools);
+}
+
+fn nativeToolSet(allow_native_tools: bool) tool_set_contract.ToolSet {
     if (comptime host_target.is_wasm) return tool_set_contract.empty;
-    return if (state.cfg.allow_native_tools) builtin_tools.advertisement_set else tool_set_contract.empty;
+    return if (allow_native_tools) builtin_tools.advertisement_set else tool_set_contract.empty;
 }
 
 fn hostToolProvider(state: *server.ServerState) ?tool_dispatch.HostToolProvider {
@@ -916,7 +920,7 @@ pub fn runSubagentChild(
     defer ctx.deinitPublishedToolCalls();
     var child_projection = state.cfg.mode_registry.buildModelToolProjection(
         alloc,
-        builtin_tools.advertisement_set,
+        activeToolSet(state),
         captured_mode,
         .{
             .permission_mode = admission.permission_mode,
@@ -956,6 +960,13 @@ pub fn runSubagentChild(
         .project_context = state.context_snapshot.modelVisibleBytes(),
         .lifecycle_view = state.lifecycle_view,
     }, turn, message, admission, cancel);
+}
+
+test "ACP native tool gate keeps the native set empty" {
+    try std.testing.expectEqual(@as(usize, 0), nativeToolSet(false).registry.tools.len);
+    if (comptime !host_target.is_wasm) {
+        try std.testing.expect(nativeToolSet(true).registry.tools.len > 0);
+    }
 }
 
 fn refreshProjectContext(
