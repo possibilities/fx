@@ -17,6 +17,7 @@ test {
     _ = @import("core/app/app_session_runtime.zig");
     _ = @import("core/app/input_approval_runtime.zig");
     _ = @import("core/app/input_interrupt_runtime.zig");
+    _ = @import("core/cli/cli_ask.zig");
     _ = @import("core/cli/cli_surface.zig");
     _ = @import("core/config/config_runtime.zig");
     _ = @import("core/auth/auth_runtime.zig");

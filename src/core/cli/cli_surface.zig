@@ -158,6 +158,7 @@ pub const LaunchModifiers = struct {
     no_default_skills: bool = false,
     prompt_files: system_prompt_files.Request = .{},
     effective_system_prompt: ?[]u8 = null,
+    effective_system_prompt_replaces_base: bool = false,
     selected_native_tools: [][]u8 = &.{},
 
     pub fn deinit(self: *LaunchModifiers, alloc: Allocator) void {
@@ -189,14 +190,19 @@ pub const LaunchModifiers = struct {
 
     /// The resolved shape of this launch: the controls that decide how the
     /// agent behaves. Identity is chosen separately and is deliberately absent.
-    pub fn shapeDeclaration(self: LaunchModifiers) shape_authority.Declaration {
+    pub fn shapeDeclaration(
+        self: LaunchModifiers,
+        resolved_system_prompt: []const u8,
+        acp_mcp_enabled: bool,
+    ) shape_authority.Declaration {
         return .{
-            .system_prompt = self.effective_system_prompt,
-            .system_prompt_replaces_base = self.prompt_files.replacement_path != null or
-                self.prompt_files.state_replaces_base,
+            .system_prompt = resolved_system_prompt,
+            .system_prompt_replaces_base = self.effective_system_prompt_replaces_base,
             .skill_roots = self.invocation_skill_roots,
             .default_skills_enabled = !self.no_default_skills,
+            .saved_directories_enabled = !self.saved_directories_suppressed,
             .mcp_config_path = self.mcp_config_path,
+            .acp_mcp_enabled = acp_mcp_enabled,
             .native_tools_enabled = self.allow_native_tools,
             .selected_tools = self.selected_native_tools,
             .permissions_path = if (self.permission_policy) |policy| policy.path else null,
@@ -204,15 +210,37 @@ pub const LaunchModifiers = struct {
         };
     }
 
-    pub fn shapeIdentity(self: LaunchModifiers) shape_authority.Identity {
-        return shape_authority.derive(self.shapeDeclaration());
+    pub fn shapeIdentity(
+        self: LaunchModifiers,
+        resolved_system_prompt: []const u8,
+        acp_mcp_enabled: bool,
+    ) shape_authority.Identity {
+        return shape_authority.derive(self.shapeDeclaration(
+            resolved_system_prompt,
+            acp_mcp_enabled,
+        ));
     }
 
     /// The operator's name for this shape. A shape root names itself; otherwise
     /// the declaration decides between the default and a flag-built custom one.
-    pub fn shapeLabel(self: LaunchModifiers) []const u8 {
+    pub fn shapeLabel(self: LaunchModifiers, acp_mcp_enabled: bool) []const u8 {
         if (self.shape_home) |home| return shape_authority.labelFromRoot(home);
-        return shape_authority.labelForDeclaration(self.shapeDeclaration());
+        return if (self.hasShapeModifiers() or !acp_mcp_enabled)
+            shape_authority.custom_label
+        else
+            shape_authority.default_label;
+    }
+
+    fn hasShapeModifiers(self: LaunchModifiers) bool {
+        return self.effective_system_prompt != null or
+            self.invocation_skill_roots.len > 0 or
+            self.no_default_skills or
+            self.saved_directories_suppressed or
+            self.mcp_config_path != null or
+            !self.allow_native_tools or
+            self.selected_native_tools.len > 0 or
+            self.permission_policy != null or
+            !self.project_instructions_enabled;
     }
 
     pub fn skillRootPolicy(self: LaunchModifiers, default_policy: skill_contract.RootPolicy) skill_contract.RootPolicy {
@@ -1580,6 +1608,14 @@ fn runNonInteractiveWithDeps(
                 try writeStderr(deps, "usage: fx acp [--model <id>] [--effort <name>] [--log-file <path>] [--no-acp-mcp]\n");
                 return .handled_failure;
             };
+            const acp_prompt_policy = promptPolicyWithLaunchModifiers(
+                cfg.prompt_policy,
+                global_args.modifiers,
+            );
+            const acp_shape_declaration = global_args.modifiers.shapeDeclaration(
+                acp_prompt_policy.system_prompt,
+                acp_opts.allow_acp_mcp,
+            );
             var selected_tools = try tool_selection.resolve(
                 alloc,
                 cfg.tool_selection_catalog,
@@ -1597,7 +1633,7 @@ fn runNonInteractiveWithDeps(
                 .provider_set = cfg.provider_set,
                 .process_provider = cfg.process_provider,
                 .secret_store = cfg.secret_store,
-                .prompt_policy = promptPolicyWithLaunchModifiers(cfg.prompt_policy, global_args.modifiers),
+                .prompt_policy = acp_prompt_policy,
                 .ignored_list_entries = cfg.ignored_list_entries,
                 .max_list_entries = cfg.max_list_entries,
                 .max_read_file_bytes = cfg.max_read_file_bytes,
@@ -1626,8 +1662,8 @@ fn runNonInteractiveWithDeps(
                 .native_tool_set = selected_tools.tool_set,
                 .history_home_override = global_args.modifiers.history_home,
                 .identity_home = global_args.modifiers.identity_home,
-                .shape = global_args.modifiers.shapeIdentity(),
-                .shape_label = global_args.modifiers.shapeLabel(),
+                .shape = shape_authority.derive(acp_shape_declaration),
+                .shape_label = global_args.modifiers.shapeLabel(acp_opts.allow_acp_mcp),
             });
             return .handled_success;
         },
@@ -3855,9 +3891,12 @@ fn workflowConfigWithLaunchModifiers(
     result.skill_root_policy = modifiers.skillRootPolicy(cfg.skill_root_policy);
     result.saved_directories_suppressed = modifiers.saved_directories_suppressed;
     result.history_home = app_history_home.forSelection(modifiers.history_home, modifiers.state_home);
-    result.shape = modifiers.shapeIdentity();
-    result.shape_label = modifiers.shapeLabel();
     result.prompt_policy = promptPolicyWithLaunchModifiers(result.prompt_policy, modifiers);
+    const declaration = modifiers.shapeDeclaration(result.prompt_policy.system_prompt, true);
+    result.shape_declaration = declaration;
+    result.shape = shape_authority.derive(declaration);
+    result.shape_label = modifiers.shapeLabel(true);
+    result.shape_label_from_root = modifiers.shape_home != null;
     return result;
 }
 
@@ -4023,6 +4062,8 @@ fn prepareSystemPromptFiles(
     switch (result) {
         .prompt => |prompt| {
             modifiers.effective_system_prompt = prompt;
+            modifiers.effective_system_prompt_replaces_base =
+                prompt_files.replacement_path != null or prompt_files.state_replaces_base;
             return true;
         },
         .failure => |failure| {
@@ -5433,6 +5474,7 @@ test "ACP command routes parsed options and launch config through the injected r
     const Capture = struct {
         expected: Config,
         expected_skill_roots: []const []const u8,
+        expected_shape: shape_authority.Identity,
         calls: usize = 0,
         config_matches: bool = false,
         launch_matches: bool = false,
@@ -5498,7 +5540,9 @@ test "ACP command routes parsed options and launch config through the injected r
                 !cfg.allow_acp_mcp and
                 !cfg.project_instructions_enabled and
                 cfg.effort_override.?.eql(types.ReasoningEffort.literal("high")) and
-                cfg.home_override == null;
+                cfg.home_override == null and
+                cfg.shape.?.eql(self.expected_shape) and
+                std.mem.eql(u8, cfg.shape_label, shape_authority.custom_label);
         }
     };
 
@@ -5542,7 +5586,22 @@ test "ACP command routes parsed options and launch config through the injected r
     cfg.provider_set.gateway.permission_reviewer = test_builtin_gateway.permission_reviewer.provider;
     var expected = cfg;
     expected.prompt_policy.system_prompt = "ACP_FILE_SYSTEM_PROMPT";
-    var capture = Capture{ .expected = expected, .expected_skill_roots = &expected_skill_roots };
+    const expected_shape = shape_authority.derive(.{
+        .system_prompt = expected.prompt_policy.system_prompt,
+        .system_prompt_replaces_base = true,
+        .skill_roots = &expected_skill_roots,
+        .default_skills_enabled = false,
+        .saved_directories_enabled = false,
+        .acp_mcp_enabled = false,
+        .native_tools_enabled = false,
+        .permissions_path = policy_path,
+        .project_instructions_enabled = false,
+    });
+    var capture = Capture{
+        .expected = expected,
+        .expected_skill_roots = &expected_skill_roots,
+        .expected_shape = expected_shape,
+    };
     cfg.acp_runner = .{ .context = &capture, .run_fn = Capture.run };
     const result = try runIfRequestedWithDeps(
         alloc,
@@ -7592,4 +7651,38 @@ test "shape identity and history selectors compose as three independent axes" {
     }) |invalid| {
         try std.testing.expectError(invalid.expected, parseGlobalLaunchArgs(alloc, invalid.args));
     }
+}
+
+test "resolved shape projection includes the base prompt and surface suppressions" {
+    const cfg = testConfig();
+    const base = workflowConfigWithLaunchModifiers(cfg, .{});
+    const expected_base = shape_authority.derive(.{
+        .system_prompt = cfg.prompt_policy.system_prompt,
+    });
+    try std.testing.expect(base.shape.?.eql(expected_base));
+    try std.testing.expect(!base.shape.?.eql(shape_authority.defaultIdentity()));
+    try std.testing.expectEqualStrings(shape_authority.default_label, base.shape_label);
+
+    const without_saved_directories = workflowConfigWithLaunchModifiers(cfg, .{
+        .saved_directories_suppressed = true,
+    });
+    const expected_without_saved = shape_authority.derive(.{
+        .system_prompt = cfg.prompt_policy.system_prompt,
+        .saved_directories_enabled = false,
+    });
+    try std.testing.expect(without_saved_directories.shape.?.eql(expected_without_saved));
+    try std.testing.expect(!without_saved_directories.shape.?.eql(base.shape.?));
+    try std.testing.expectEqualStrings(
+        shape_authority.custom_label,
+        without_saved_directories.shape_label,
+    );
+
+    const without_acp_mcp = shape_authority.derive(
+        (LaunchModifiers{}).shapeDeclaration(cfg.prompt_policy.system_prompt, false),
+    );
+    try std.testing.expect(!without_acp_mcp.eql(base.shape.?));
+    try std.testing.expectEqualStrings(
+        shape_authority.custom_label,
+        (LaunchModifiers{}).shapeLabel(false),
+    );
 }

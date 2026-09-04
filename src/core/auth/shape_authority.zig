@@ -64,8 +64,12 @@ pub const Declaration = struct {
     /// Invocation skill roots, in selection order.
     skill_roots: []const []const u8 = &.{},
     default_skills_enabled: bool = true,
+    /// Whether saved additional directories remain available to the launch.
+    saved_directories_enabled: bool = true,
     /// The MCP configuration file backing this shape, when one was selected.
     mcp_config_path: ?[]const u8 = null,
+    /// Whether an ACP client may contribute its own MCP servers.
+    acp_mcp_enabled: bool = true,
     native_tools_enabled: bool = true,
     /// Explicitly selected native tools, in selection order.
     selected_tools: []const []const u8 = &.{},
@@ -79,7 +83,9 @@ pub fn isDefault(declaration: Declaration) bool {
     return declaration.system_prompt == null and
         declaration.skill_roots.len == 0 and
         declaration.default_skills_enabled and
+        declaration.saved_directories_enabled and
         declaration.mcp_config_path == null and
+        declaration.acp_mcp_enabled and
         declaration.native_tools_enabled and
         declaration.selected_tools.len == 0 and
         declaration.permissions_path == null and
@@ -93,7 +99,9 @@ pub fn derive(declaration: Declaration) Identity {
     updateFlag(&hash, "prompt_replaces_base", declaration.system_prompt_replaces_base);
     updateList(&hash, "skills", declaration.skill_roots);
     updateFlag(&hash, "default_skills", declaration.default_skills_enabled);
+    updateFlag(&hash, "saved_directories", declaration.saved_directories_enabled);
     updateOptional(&hash, "mcp", declaration.mcp_config_path);
+    updateFlag(&hash, "acp_mcp", declaration.acp_mcp_enabled);
     updateFlag(&hash, "native_tools", declaration.native_tools_enabled);
     updateList(&hash, "tools", declaration.selected_tools);
     updateOptional(&hash, "permissions", declaration.permissions_path);
@@ -197,7 +205,9 @@ test "each shape input changes the derived identity" {
         .{ .system_prompt = "be terse", .system_prompt_replaces_base = true },
         .{ .skill_roots = &.{"/shapes/review"} },
         .{ .default_skills_enabled = false },
+        .{ .saved_directories_enabled = false },
         .{ .mcp_config_path = "/shapes/review/.fx/mcp.json" },
+        .{ .acp_mcp_enabled = false },
         .{ .native_tools_enabled = false },
         .{ .selected_tools = &.{"read"} },
         .{ .permissions_path = "/shapes/review/permissions.json" },

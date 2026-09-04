@@ -661,11 +661,16 @@ const App = struct {
         return null;
     }
 
-    /// Resolves the shape once, while the launch controls still own their
-    /// paths, and copies the label into storage that outlives them.
-    fn adoptShape(self: *Self, modifiers: *const cli_surface.LaunchModifiers) void {
-        self.shape = modifiers.shapeIdentity();
-        const label = modifiers.shapeLabel();
+    /// Resolves the shape once the launch layer has composed the effective
+    /// prompt and canonicalized every path, while the launch controls still
+    /// own their storage. The label is copied so it outlives those controls.
+    fn adoptShape(
+        self: *Self,
+        modifiers: *const cli_surface.LaunchModifiers,
+        resolved_system_prompt: []const u8,
+    ) void {
+        self.shape = modifiers.shapeIdentity(resolved_system_prompt, true);
+        const label = modifiers.shapeLabel(true);
         const length = @min(label.len, self.shape_label_storage.len);
         @memcpy(self.shape_label_storage[0..length], label[0..length]);
         self.shape_label_len = @intCast(length);
@@ -731,7 +736,10 @@ const App = struct {
         app.profile_home = launch.modifiers.state_home;
         app.identity_home = launch.modifiers.identity_home;
         app.history_home = launch.modifiers.history_home;
-        app.adoptShape(&launch.modifiers);
+        app.adoptShape(
+            &launch.modifiers,
+            launch.modifiers.effective_system_prompt orelse builtin_context.prompt_policy.system_prompt,
+        );
         app.mcp.setProfileHome(app.profile_home);
         app.mcp.setSelectedConfigPath(launch.modifiers.mcp_config_path);
         app.auth.setProfileHome(app.profile_home);
@@ -3999,6 +4007,20 @@ test "interactive and resumed launch prompts transfer into the app policy" {
             app.promptPolicy().system_prompt,
         );
     }
+}
+
+test "interactive default shape hashes the built-in system prompt content" {
+    var app = App{ .alloc = std.testing.allocator };
+    const modifiers: cli_surface.LaunchModifiers = .{};
+
+    app.adoptShape(&modifiers, builtin_context.prompt_policy.system_prompt);
+
+    const expected = shape_authority.derive(.{
+        .system_prompt = builtin_context.prompt_policy.system_prompt,
+    });
+    try std.testing.expect(app.shape.?.eql(expected));
+    try std.testing.expect(!app.shape.?.eql(shape_authority.defaultIdentity()));
+    try std.testing.expectEqualStrings(shape_authority.default_label, app.shapeLabel());
 }
 
 test "lightweight local commands do not request early threaded io" {

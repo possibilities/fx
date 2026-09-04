@@ -256,6 +256,11 @@ pub const Config = struct {
     /// The shape this run is running, recorded on the session it writes.
     shape: ?shape_authority.Identity = null,
     shape_label: []const u8 = shape_authority.default_label,
+    /// The resolved declaration behind `shape`. It is retained through option
+    /// parsing so ask's own `--system` can replace the last unresolved input
+    /// before the authoritative digest is recorded.
+    shape_declaration: ?shape_authority.Declaration = null,
+    shape_label_from_root: bool = false,
     additional_directories: []const []const u8 = &.{},
     saved_directories_suppressed: bool = false,
 };
@@ -1242,6 +1247,22 @@ fn askErrorNotice(err: anyerror) ?[]const u8 {
     };
 }
 
+fn withAskSystemPrompt(cfg: Config, system_prompt: []const u8) Config {
+    var result = cfg;
+    result.prompt_policy.system_prompt = system_prompt;
+    if (cfg.shape_declaration) |declaration| {
+        var resolved = declaration;
+        resolved.system_prompt = system_prompt;
+        resolved.system_prompt_replaces_base = true;
+        result.shape_declaration = resolved;
+        result.shape = shape_authority.derive(resolved);
+        if (!cfg.shape_label_from_root) {
+            result.shape_label = shape_authority.custom_label;
+        }
+    }
+    return result;
+}
+
 fn runWithDeps(alloc: Allocator, args: []const [:0]const u8, cfg: Config, deps: RunDeps) !u8 {
     var interrupt_scope = try headless_interrupt.Scope.install(
         deps.install_headless_interrupt,
@@ -1325,7 +1346,7 @@ fn runWithDeps(alloc: Allocator, args: []const [:0]const u8, cfg: Config, deps: 
 
     var effective_cfg = cfg;
     if (options.system_prompt_override) |sp| {
-        effective_cfg.prompt_policy.system_prompt = sp;
+        effective_cfg = withAskSystemPrompt(cfg, sp);
     }
 
     const output_mode = selectOutputMode(
@@ -4289,6 +4310,36 @@ test "ask usage and recovery dependencies keep selected shape and history author
     const deps = agentRuntimeDeps(&ctx);
     try std.testing.expect(deps.shape.?.eql(shape));
     try std.testing.expectEqualStrings("reviewer", deps.shape_label);
+}
+
+test "ask system override is included in the final shape identity" {
+    var cfg = testConfig();
+    const base_declaration = shape_authority.Declaration{
+        .system_prompt = cfg.prompt_policy.system_prompt,
+        .saved_directories_enabled = false,
+        .acp_mcp_enabled = false,
+    };
+    cfg.shape_declaration = base_declaration;
+    cfg.shape = shape_authority.derive(base_declaration);
+
+    const overridden = withAskSystemPrompt(cfg, "ASK_SYSTEM_OVERRIDE");
+    var expected_declaration = base_declaration;
+    expected_declaration.system_prompt = "ASK_SYSTEM_OVERRIDE";
+    expected_declaration.system_prompt_replaces_base = true;
+    const expected_identity = shape_authority.derive(expected_declaration);
+
+    try std.testing.expectEqualStrings(
+        "ASK_SYSTEM_OVERRIDE",
+        overridden.prompt_policy.system_prompt,
+    );
+    try std.testing.expect(overridden.shape.?.eql(expected_identity));
+    try std.testing.expect(!overridden.shape.?.eql(cfg.shape.?));
+    try std.testing.expectEqualStrings(shape_authority.custom_label, overridden.shape_label);
+
+    cfg.shape_label = "reviewer";
+    cfg.shape_label_from_root = true;
+    const named = withAskSystemPrompt(cfg, "NAMED_SHAPE_OVERRIDE");
+    try std.testing.expectEqualStrings("reviewer", named.shape_label);
 }
 
 fn testMissingKeyStartup(alloc: Allocator, _: oauth_transport.Provider, _: host.SecretStore, default_model: []const u8, default_agent_step_limit: usize) !app_lifecycle.StartupState {
