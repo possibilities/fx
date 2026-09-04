@@ -339,12 +339,12 @@ pub fn loadStartupStateWithAuthMode(
     auth_mode: credentials.AuthMode,
 ) !StartupState {
     const workspace_root = try io_mod.realpathAlloc(alloc, ".");
-    return loadStartupStateFromOwnedWorkspace(alloc, transport, secret_store, workspace_root, default_model, default_agent_step_limit, auth_mode, null, .refresh_if_needed);
+    return loadStartupStateFromOwnedWorkspace(alloc, transport, secret_store, workspace_root, default_model, default_agent_step_limit, auth_mode, null, null, .refresh_if_needed);
 }
 
 pub fn loadStartupStateWithoutCredentials(alloc: Allocator, default_model: []const u8, default_agent_step_limit: usize) !StartupState {
     const workspace_root = try io_mod.realpathAlloc(alloc, ".");
-    return loadStartupStateFromOwnedWorkspace(alloc, oauth_transport.unavailable_provider, host.unavailable_secret_store, workspace_root, default_model, default_agent_step_limit, .local, null, null);
+    return loadStartupStateFromOwnedWorkspace(alloc, oauth_transport.unavailable_provider, host.unavailable_secret_store, workspace_root, default_model, default_agent_step_limit, .local, null, null, null);
 }
 
 pub fn loadEmbeddedStartupState(
@@ -364,6 +364,7 @@ pub fn loadEmbeddedStartupState(
         default_agent_step_limit,
         .local,
         home_dir,
+        null,
         null,
     );
 }
@@ -415,7 +416,7 @@ pub fn loadCatalogStartupStateWithAuthMode(
     auth_mode: credentials.AuthMode,
 ) !StartupState {
     const workspace_root = try io_mod.realpathAlloc(alloc, ".");
-    return loadStartupStateFromOwnedWorkspace(alloc, oauth_transport.unavailable_provider, secret_store, workspace_root, default_model, default_agent_step_limit, auth_mode, null, .stored);
+    return loadStartupStateFromOwnedWorkspace(alloc, oauth_transport.unavailable_provider, secret_store, workspace_root, default_model, default_agent_step_limit, auth_mode, null, null, .stored);
 }
 
 pub fn loadCatalogStartupStateFromHome(
@@ -434,8 +435,38 @@ pub fn loadCatalogStartupStateFromHome(
         default_agent_step_limit,
         .local,
         home_dir,
+        home_dir,
         .stored,
     );
+}
+
+pub fn loadCatalogStartupStateFromHomes(
+    alloc: Allocator,
+    state_home: []const u8,
+    authorization_home: []const u8,
+    default_model: []const u8,
+    default_agent_step_limit: usize,
+) !StartupState {
+    const workspace_root = try io_mod.realpathAlloc(alloc, ".");
+    var state = try loadStartupStateFromOwnedWorkspace(
+        alloc,
+        oauth_transport.unavailable_provider,
+        host.unavailable_secret_store,
+        workspace_root,
+        default_model,
+        default_agent_step_limit,
+        .local,
+        state_home,
+        authorization_home,
+        .stored,
+    );
+    if (state.credential) |*credential| {
+        if (credential.needsRefreshAt(io_mod.milliTimestamp())) {
+            credential.deinit(alloc);
+            state.credential = null;
+        }
+    }
+    return state;
 }
 
 pub fn loadStartupStatus(
@@ -520,7 +551,7 @@ pub fn applyWorkspaceLaunch(
 
 fn loadStartupStateForWorkspace(alloc: Allocator, workspace_root: []const u8, default_model: []const u8, default_agent_step_limit: usize) !StartupState {
     const owned_workspace_root = try alloc.dupe(u8, workspace_root);
-    return loadStartupStateFromOwnedWorkspace(alloc, oauth_transport.unavailable_provider, host.unavailable_secret_store, owned_workspace_root, default_model, default_agent_step_limit, .local, null, null);
+    return loadStartupStateFromOwnedWorkspace(alloc, oauth_transport.unavailable_provider, host.unavailable_secret_store, owned_workspace_root, default_model, default_agent_step_limit, .local, null, null, null);
 }
 
 const CredentialLoadMode = credentials.LoadMode;
@@ -534,6 +565,7 @@ fn loadStartupStateFromOwnedWorkspace(
     default_agent_step_limit: usize,
     auth_mode: credentials.AuthMode,
     profile_home: ?[]const u8,
+    authorization_home: ?[]const u8,
     credential_mode: ?CredentialLoadMode,
 ) !StartupState {
     var state = StartupState{
@@ -572,7 +604,8 @@ fn loadStartupStateFromOwnedWorkspace(
     state.credential_source_preference = settings.credential_source;
     if (auth_mode == .local) {
         if (credential_mode) |mode| {
-            const resolution = if (profile_home) |home_dir|
+            const credential_home = authorization_home orelse profile_home;
+            const resolution = if (credential_home) |home_dir|
                 try credentials.resolveForProviderFromHome(
                     alloc,
                     transport,
@@ -675,13 +708,28 @@ pub fn bootstrapInteractiveApp(cfg: BootstrapConfig) !StartupState {
     cfg.shell.layout = minimalLayout();
     try cfg.shell.initBacking(cfg.alloc);
 
-    var state = if (cfg.profile_home) |home_dir|
-        try loadCatalogStartupStateFromHome(
+    const borrowed_authorization_home =
+        try credentials.readOnlyAuthorizationHomeFromEnvironment(
             cfg.alloc,
-            home_dir,
-            cfg.default_model,
-            cfg.default_agent_step_limit,
-        )
+            cfg.profile_home,
+        );
+    defer if (borrowed_authorization_home) |home| cfg.alloc.free(home);
+    var state = if (cfg.profile_home) |home_dir|
+        if (borrowed_authorization_home) |authorization_home|
+            try loadCatalogStartupStateFromHomes(
+                cfg.alloc,
+                home_dir,
+                authorization_home,
+                cfg.default_model,
+                cfg.default_agent_step_limit,
+            )
+        else
+            try loadCatalogStartupStateFromHome(
+                cfg.alloc,
+                home_dir,
+                cfg.default_model,
+                cfg.default_agent_step_limit,
+            )
     else
         try loadCatalogStartupStateWithAuthMode(
             cfg.alloc,
@@ -1284,19 +1332,30 @@ fn configuredProviderSelection(
     default_model: []const u8,
     settings: *const config_runtime.Settings,
 ) !model_provider.ProviderSelection {
-    const provider = settings.provider orelse .gateway;
+    const provider = (try processProviderOverride()) orelse settings.provider orelse .gateway;
     const model = settings.models.get(provider) orelse switch (provider) {
         .gateway => default_model,
-        .codex => return error.CodexModelNotSelected,
-        .grok => return error.GrokModelNotSelected,
+        .codex => processModelOverride() orelse return error.CodexModelNotSelected,
+        .grok => processModelOverride() orelse return error.GrokModelNotSelected,
     };
     return .{ .provider = provider, .model = model };
 }
 
-fn initialModelId(default_model: []const u8, configured: ?[]const u8) []const u8 {
-    const model = io_mod.getenv("FX_MODEL") orelse return configured orelse default_model;
+fn processProviderOverride() !?model_provider.ProviderId {
+    const raw = io_mod.getenv("FX_PROVIDER") orelse return null;
+    const value = std.mem.trim(u8, raw, " \t\r\n");
+    if (value.len == 0) return error.InvalidProviderOverride;
+    return model_provider.parse(value) orelse error.InvalidProviderOverride;
+}
+
+fn processModelOverride() ?[]const u8 {
+    const model = io_mod.getenv("FX_MODEL") orelse return null;
     const trimmed = std.mem.trim(u8, model, " \t\r\n");
-    return if (trimmed.len > 0) trimmed else configured orelse default_model;
+    return if (trimmed.len > 0) trimmed else null;
+}
+
+fn initialModelId(default_model: []const u8, configured: ?[]const u8) []const u8 {
+    return processModelOverride() orelse configured orelse default_model;
 }
 
 test "startup provider chooses only its provider-scoped model" {
@@ -1327,13 +1386,42 @@ test "startup provider chooses only its provider-scoped model" {
     try std.testing.expectEqualStrings("grok-model", grok.model);
 }
 
+test "FX_PROVIDER selects one process provider and FX_MODEL supplies its missing profile model" {
+    {
+        var env = try TestEnv.install(std.testing.allocator, &.{
+            .{ .key = "FX_PROVIDER", .value = "  CODEX  " },
+            .{ .key = "FX_MODEL", .value = "  gpt-process  " },
+        });
+        defer env.deinit();
+
+        const selection = try configuredProviderSelection(
+            "gateway-default",
+            &config_runtime.Settings{},
+        );
+        try std.testing.expectEqual(model_provider.ProviderId.codex, selection.provider);
+        try std.testing.expectEqualStrings("gpt-process", selection.model);
+    }
+
+    {
+        var env = try TestEnv.install(std.testing.allocator, &.{
+            .{ .key = "FX_PROVIDER", .value = "unknown" },
+            .{ .key = "FX_MODEL", .value = "gpt-process" },
+        });
+        defer env.deinit();
+
+        try std.testing.expectError(
+            error.InvalidProviderOverride,
+            configuredProviderSelection("gateway-default", &config_runtime.Settings{}),
+        );
+    }
+}
+
 fn loadInitialModel(alloc: Allocator, default_model: []const u8, configured: ?[]const u8) ![]u8 {
     return alloc.dupe(u8, initialModelId(default_model, configured));
 }
 
 fn hasProcessModelOverride() bool {
-    const model = io_mod.getenv("FX_MODEL") orelse return false;
-    return std.mem.trim(u8, model, " \t\r\n").len > 0;
+    return processModelOverride() != null;
 }
 
 fn loadStartupStatusModel(alloc: Allocator, default_model: []const u8, configured: ?[]const u8) !StartupStatusModel {
@@ -2093,6 +2181,45 @@ test "startup credential modes select a refresh policy, never a narrower source 
     try std.testing.expectEqualStrings("refresh_if_needed", modes[1].name);
 }
 
+test "selected state loads settings locally while borrowing only a stored credential" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "state/.fx");
+    try tmp.dir.createDirPath(std.testing.io, "authorization/.fx");
+    try writeFixtureFile(
+        tmp.dir,
+        "state/.fx/settings.json",
+        "{\"provider\":\"codex\",\"codex_model\":\"state-model\",\"effort\":\"low\"}\n",
+    );
+    try writePrivateFixtureFile(
+        tmp.dir,
+        "authorization/.fx/chatgpt-auth.json",
+        "{\"version\":1,\"access_token\":\"borrowed-token\",\"refresh_token\":\"borrowed-refresh\",\"expires_at_ms\":4000000000000,\"account_id\":\"borrowed-account\"}\n",
+    );
+
+    const state_home = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "state");
+    defer std.testing.allocator.free(state_home);
+    const authorization_home = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "authorization");
+    defer std.testing.allocator.free(authorization_home);
+    var env = try TestEnv.install(std.testing.allocator, &.{});
+    defer env.deinit();
+
+    var state = try loadCatalogStartupStateFromHomes(
+        std.testing.allocator,
+        state_home,
+        authorization_home,
+        "gateway-default",
+        12,
+    );
+    defer state.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(model_provider.ProviderId.codex, state.provider);
+    try std.testing.expectEqualStrings("state-model", state.selected_model);
+    try std.testing.expect(state.effort.eql(types.ReasoningEffort.literal("low")));
+    try std.testing.expectEqual(credentials.Source.chatgpt_subscription, state.credential.?.source);
+    try std.testing.expectEqualStrings("borrowed-token", state.apiKey().?);
+}
+
 test "loadStartupState applies core env overrides" {
     var env = try TestEnv.install(std.testing.allocator, &.{
         .{ .key = "FX_MODEL", .value = "  env-model  " },
@@ -2436,6 +2563,15 @@ test "credential onboarding can be skipped independently from Keychain" {
 
 fn writeFixtureFile(dir: std.Io.Dir, sub_path: []const u8, text: []const u8) !void {
     var file = try dir.createFile(io_mod.getIo(), sub_path, .{ .truncate = true });
+    defer file.close(io_mod.getIo());
+    try file.writeStreamingAll(io_mod.getIo(), text);
+}
+
+fn writePrivateFixtureFile(dir: std.Io.Dir, sub_path: []const u8, text: []const u8) !void {
+    var file = try dir.createFile(io_mod.getIo(), sub_path, .{
+        .truncate = true,
+        .permissions = std.Io.File.Permissions.fromMode(0o600),
+    });
     defer file.close(io_mod.getIo());
     try file.writeStreamingAll(io_mod.getIo(), text);
 }

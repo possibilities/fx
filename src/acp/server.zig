@@ -368,7 +368,22 @@ fn prepareConfiguredCredential(
             state.cfg.chatgpt_session_store,
         );
     }
+    const borrowed_authorization_home =
+        try credentials.readOnlyAuthorizationHomeFromEnvironment(
+            alloc,
+            state.cfg.home_override,
+        );
+    defer if (borrowed_authorization_home) |home| alloc.free(home);
     if (state.cfg.home_override) |home| {
+        if (borrowed_authorization_home) |authorization_home| {
+            const resolution = try credentials.resolveReadOnlyForProviderFromHome(
+                alloc,
+                provider,
+                preferred,
+                authorization_home,
+            );
+            return resolution.credential;
+        }
         return auth_runtime.prepareCredentialFromHome(
             alloc,
             state.cfg.gateway_provider.oauth_transport,
@@ -1879,6 +1894,12 @@ fn loadConfiguredStartupState(state: *const ServerState, alloc: Allocator) !app_
             state.cfg.default_agent_step_limit,
         );
     }
+    const borrowed_authorization_home =
+        try credentials.readOnlyAuthorizationHomeFromEnvironment(
+            alloc,
+            state.cfg.home_override,
+        );
+    defer if (borrowed_authorization_home) |home| alloc.free(home);
     if (state.cfg.home_override) |home_dir| {
         const workspace_root = state.cfg.workspace_root_override orelse ".";
         var startup = try app_lifecycle.loadEmbeddedStartupState(
