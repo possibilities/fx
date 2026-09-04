@@ -494,6 +494,11 @@ pub const Runtime = struct {
             null,
         ) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
+            error.CredentialStorageUnavailable,
+            error.CredentialTemporarilyUnavailable,
+            error.CredentialRefreshPersistenceUncertain,
+            error.CredentialAuthorityChanged,
+            => return error.CodexCredentialBrokerCredentialUnavailable,
         }) orelse return error.CodexCredentialBrokerCredentialUnavailable;
         defer credential.deinit(alloc);
         if (credential.source != .chatgpt_subscription) {
