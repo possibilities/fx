@@ -8,13 +8,11 @@ const input_limit_rejection = @import("../input/input_limit_rejection.zig");
 const question_ui = @import("../../ui/footer/question_ui.zig");
 const question_freeform_layout = @import("../../ui/footer/question_freeform_layout.zig");
 const input_interrupt_runtime = @import("input_interrupt_runtime.zig");
-const input_queue_runtime = @import("input_queue_runtime.zig");
 const hooks = @import("../hooks/hooks.zig");
 
 pub fn QuestionRuntime(comptime App: type) type {
     return struct {
         const interrupt = input_interrupt_runtime.InterruptRuntime(App);
-        const queue_rt = input_queue_runtime.Runtime(App);
 
         const AttentionResolutionObserver = struct {
             app: *App,
@@ -75,28 +73,21 @@ pub fn QuestionRuntime(comptime App: type) type {
                     return .consumed;
                 },
                 .cancelled => {
-                    try cancelQuestionPrompt(app, .open);
+                    try cancelQuestionPrompt(app);
                     return .consumed;
                 },
                 .limit_exceeded => return .limit_exceeded,
             }
         }
 
-        pub fn cancelQuestionPrompt(
-            app: *App,
-            comptime presentation: input_queue_runtime.ReviewPresentation,
-        ) !void {
+        pub fn cancelQuestionPrompt(app: *App) !void {
             const route_recovery = isRouteRecoveryPrompt(app);
             const mcp_elicitation = isMcpElicitationPrompt(app);
             const attention_kind = currentAttentionKind(app);
             interrupt.traceInterruptRequested(app, "input_question");
             if (!route_recovery) {
-                if (comptime @hasField(App, "queued_prompt_review")) {
-                    if (comptime presentation == .open) {
-                        _ = queue_rt.requestCancelAndOpen(app);
-                    } else {
-                        _ = app.worker.requestInteractiveCancel();
-                    }
+                if (comptime @hasDecl(@TypeOf(app.worker), "requestInteractiveCancel")) {
+                    app.worker.requestInteractiveCancel();
                 } else {
                     app.worker.requestCancel();
                 }

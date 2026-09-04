@@ -13,7 +13,6 @@ const approval_screen = @import("../../ui/approval_screen.zig");
 const approval_ui = @import("../../ui/footer/approval_ui.zig");
 const types = @import("../shared/types.zig");
 const input_interrupt_runtime = @import("input_interrupt_runtime.zig");
-const input_queue_runtime = @import("input_queue_runtime.zig");
 const app_session_runtime = @import("app_session_runtime.zig");
 const app_render_runtime = @import("app_render_runtime.zig");
 const session_permission_state = @import("../permissions/session_permission_state.zig");
@@ -28,7 +27,6 @@ const ToolPermissionDecision = types.ToolPermissionDecision;
 pub fn ApprovalRuntime(comptime App: type) type {
     return struct {
         const interrupt = input_interrupt_runtime.InterruptRuntime(App);
-        const queue_rt = input_queue_runtime.Runtime(App);
 
         const AttentionResolutionObserver = struct {
             app: *App,
@@ -517,10 +515,7 @@ pub fn ApprovalRuntime(comptime App: type) type {
             return true;
         }
 
-        pub fn cancelApprovalOperation(
-            app: *App,
-            comptime presentation: input_queue_runtime.ReviewPresentation,
-        ) !void {
+        pub fn cancelApprovalOperation(app: *App) !void {
             if (app_session_runtime.Runtime(App).subagentHost(app)) |host| {
                 if (try host.pendingApprovalRequest(app.alloc)) |loaded| {
                     var pending = loaded;
@@ -544,9 +539,6 @@ pub fn ApprovalRuntime(comptime App: type) type {
             if (!already_cancelled) {
                 debug_trace.logf("input", "cancel approval operation queued={d}", .{app.worker.queuedPromptCount()});
                 interrupt.traceInterruptRequested(app, "input_approval");
-            }
-            if (comptime @hasField(App, "queued_prompt_review") and presentation == .open) {
-                _ = queue_rt.pauseAndOpenAfterModalCancel(app);
             }
             app.worker.cancelApprovalTurn();
 

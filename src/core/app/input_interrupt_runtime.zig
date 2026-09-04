@@ -1,9 +1,7 @@
 const std = @import("std");
 const debug_trace = @import("../shared/debug_trace.zig");
 const worker_runtime = @import("../agent/worker_runtime.zig");
-const session_runtime = @import("../session/session.zig");
 const shell_runtime = @import("../../ui/shell_runtime.zig");
-const input_queue_runtime = @import("input_queue_runtime.zig");
 
 const CancellationTarget = enum {
     none,
@@ -47,16 +45,11 @@ test "cancellation target distinguishes agent turns and manual compaction" {
 
 pub fn InterruptRuntime(comptime App: type) type {
     return struct {
-        const queue_rt = input_queue_runtime.Runtime(App);
-
         pub fn hasActiveOperation(app: *App) bool {
             return activeCancellationTarget(app) != .none;
         }
 
-        pub fn cancelActiveOperation(
-            app: *App,
-            comptime presentation: input_queue_runtime.ReviewPresentation,
-        ) !void {
+        pub fn cancelActiveOperation(app: *App) !void {
             if (activeCancellationTarget(app) == .context_compaction) {
                 if (comptime !@hasDecl(
                     @TypeOf(app.worker),
@@ -83,21 +76,32 @@ pub fn InterruptRuntime(comptime App: type) type {
             const tool_active = activeToolStatusCount(app) > 0;
             debug_trace.logf("input", "cancel active operation queued={d}", .{app.worker.queuedPromptCount()});
             traceInterruptRequested(app, "input_active_stream");
-            const queue_review_started = if (comptime @hasField(App, "queued_prompt_review"))
-                if (comptime presentation == .open)
-                    queue_rt.requestCancelAndOpen(app)
-                else
-                    app.worker.requestInteractiveCancel()
-            else blk: {
+            if (comptime @hasDecl(@TypeOf(app.worker), "requestInteractiveCancel")) {
+                app.worker.requestInteractiveCancel();
+            } else {
                 app.worker.requestCancel();
-                break :blk false;
-            };
+            }
             app.pacer.clear(app.alloc);
             if (comptime @hasDecl(App, "playCancelSound")) app.playCancelSound();
-            if (!tool_active) {
-                try app.writeDomainNotice(session_runtime.interrupted_turn_notice, true);
+            if (tool_active) {
+                _ = try shell_runtime.presentActiveToolCancellation(
+                    app.alloc,
+                    &app.shell,
+                );
+            } else {
+                if (comptime @hasField(App, "metrics")) {
+                    try shell_runtime.writeTurnCancellation(
+                        app.alloc,
+                        &app.shell,
+                        &app.metrics,
+                        true,
+                    );
+                }
             }
-            if (tool_active and !queue_review_started) return;
+            if (tool_active) {
+                app.shell.render_requests.request(.footer);
+                return;
+            }
             app.stream = .{};
             app.shell.render_requests.request(.footer);
         }
@@ -186,7 +190,7 @@ test "interactive connectivity wait maps try later to recovery pause" {
     try std.testing.expect(!app.worker.pause_requested);
 }
 
-test "hidden interrupt pauses queued work without opening the human editor" {
+test "interactive interrupt cancels without a native queue editor" {
     const FakeWorker = struct {
         cancel_requested: bool = false,
 
@@ -198,9 +202,8 @@ test "hidden interrupt pauses queued work without opening the human editor" {
             return 1;
         }
 
-        pub fn requestInteractiveCancel(self: *@This()) bool {
+        pub fn requestInteractiveCancel(self: *@This()) void {
             self.cancel_requested = true;
-            return true;
         }
     };
     const FakePrompt = struct {
@@ -232,7 +235,6 @@ test "hidden interrupt pauses queued work without opening the human editor" {
         stream: FakeStream = .{ .active = true },
         approval_prompt: FakePrompt = .{},
         question_prompt: FakePrompt = .{},
-        queued_prompt_review: struct { visible: bool = false } = .{},
         shell: FakeShell = .{},
         pacer: FakePacer = .{},
         notice_written: bool = false,
@@ -243,10 +245,9 @@ test "hidden interrupt pauses queued work without opening the human editor" {
     };
 
     var app = FakeApp{};
-    try InterruptRuntime(FakeApp).cancelActiveOperation(&app, .hidden);
+    try InterruptRuntime(FakeApp).cancelActiveOperation(&app);
     try std.testing.expect(app.worker.cancel_requested);
-    try std.testing.expect(!app.queued_prompt_review.visible);
     try std.testing.expect(!app.stream.active);
-    try std.testing.expect(app.notice_written);
+    try std.testing.expect(!app.notice_written);
     try std.testing.expect(app.shell.render_requests.requested);
 }
