@@ -1161,11 +1161,7 @@ pub fn Runtime(comptime App: type) type {
             }
             dismissActiveMenusThenRedraw(app);
             if (comptime @hasDecl(App, "editComposerWithExternalEditor")) {
-                if (try app.editComposerWithExternalEditor(max_input_len)) {
-                    if (comptime @hasField(App, "queued_prompt_review")) {
-                        queue_rt.markVisibleSelectionDirty(app);
-                    }
-                }
+                _ = try app.editComposerWithExternalEditor(max_input_len);
             }
             return true;
         }
