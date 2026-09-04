@@ -241,6 +241,7 @@ fn freeStrings(alloc: Allocator, values: [][]u8) void {
 test "captured admission owns independent authority slices" {
     const alloc = std.testing.allocator;
     var snapshot = try captureAdmission(alloc, .{
+        .root_id = "01J00000000000000000000000",
         .parent_id = "01J00000000000000000000000",
         .source_id = "01J00000000000000000000000",
         .model = "test/model",
@@ -248,5 +249,9 @@ test "captured admission owns independent authority slices" {
         .tool_names = &.{"read_file"},
     });
     defer snapshot.deinit(alloc);
+    try std.testing.expectEqualStrings(
+        "01J00000000000000000000000",
+        snapshot.root_id,
+    );
     try std.testing.expectEqualStrings("read_file", snapshot.tool_names[0]);
 }

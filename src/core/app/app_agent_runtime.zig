@@ -35,6 +35,7 @@ const subagent_agent_adapter = @import("../subagent/agent_adapter.zig");
 const subagent_authority = @import("../subagent/authority.zig");
 const subagent_domain = @import("../subagent/domain.zig");
 const subagent_execution = @import("../subagent/execution.zig");
+const subagent_model_contract = @import("../subagent/model_contract.zig");
 const subagent_tool_host = @import("../subagent/tool_host.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const text_utils = @import("../shared/text_utils.zig");
@@ -3548,16 +3549,7 @@ fn nestedHostOptions(
     };
 }
 
-fn nestedResultChildIdAlloc(alloc: Allocator, encoded: []const u8) ![]u8 {
-    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, encoded, .{});
-    defer parsed.deinit();
-    const child_id = parsed.value.object.get("child_id") orelse
-        return error.TestUnexpectedResult;
-    if (child_id != .string) return error.TestUnexpectedResult;
-    return alloc.dupe(u8, child_id.string);
-}
-
-test "nested host ADE observation keeps root parent through delayed discovery" {
+test "managed child ADE observation keeps root parent through delayed discovery" {
     const alloc = std.testing.allocator;
     const root_id = "01J00000000000000000000000";
     const next_root_id = "01J00000000000000000000001";
@@ -3609,6 +3601,7 @@ test "nested host ADE observation keeps root parent through delayed discovery" {
         .client = &client,
         .edited_path = edited_path,
         .expected_root_id = root_id,
+        .expected_parent_id = root_id,
     };
     const subagent_host = try subagent_tool_host.Runtime.create(
         alloc,
@@ -3620,48 +3613,42 @@ test "nested host ADE observation keeps root parent through delayed discovery" {
     defer subagent_host.deinit();
     defer delayed_sink.release.store(true, .release);
 
-    var parent_command = try subagent_domain.validateCommand(alloc, .{ .create = .{
-        .name = "parent-child",
-        .mode = .persistent,
+    var request = try subagent_model_contract.validateRequest(alloc, .{ .message = .{
+        .agent = "observer-child",
+        .message = "observe one edited path",
     } });
-    defer parent_command.deinit(alloc);
-    const parent_result = try subagent_host.execute(
-        alloc,
-        &parent_command,
-        nestedHostOptions(root_id, "create-parent-child"),
-    );
-    defer alloc.free(parent_result);
-    const parent_id = try nestedResultChildIdAlloc(alloc, parent_result);
-    defer alloc.free(parent_id);
-    authority.parent_id = parent_id;
-    runner.expected_parent_id = parent_id;
+    defer request.deinit(alloc);
+    const ManagedCall = struct {
+        host: *subagent_tool_host.Runtime,
+        alloc: Allocator,
+        request: *subagent_model_contract.Request,
+        options: subagent_tool_host.ExecuteOptions,
+        result: ?subagent_tool_host.ManagedExecutionResult = null,
+        failure: ?anyerror = null,
 
-    var nested_command = try subagent_domain.validateCommand(alloc, .{ .create = .{
-        .name = "nested-child",
-        .mode = .persistent,
-    } });
-    defer nested_command.deinit(alloc);
-    const nested_result = try subagent_host.execute(
-        alloc,
-        &nested_command,
-        nestedHostOptions(parent_id, "create-nested-child"),
-    );
-    defer alloc.free(nested_result);
-    const nested_id = try nestedResultChildIdAlloc(alloc, nested_result);
-    defer alloc.free(nested_id);
-    authority.nested_id = nested_id;
-
-    var send_command = try subagent_domain.validateCommand(alloc, .{ .message = .{ .send = .{
-        .id = nested_id,
-        .content = "observe one edited path",
-    } } });
-    defer send_command.deinit(alloc);
-    const send_result = try subagent_host.execute(
-        alloc,
-        &send_command,
-        nestedHostOptions(parent_id, "message-nested-child"),
-    );
-    defer alloc.free(send_result);
+        fn run(self: *@This()) void {
+            self.result = self.host.executeManaged(
+                self.alloc,
+                self.request,
+                self.options,
+            ) catch |err| {
+                self.failure = err;
+                return;
+            };
+        }
+    };
+    var managed_call = ManagedCall{
+        .host = subagent_host,
+        .alloc = alloc,
+        .request = &request,
+        .options = nestedHostOptions(root_id, "message-observer-child"),
+    };
+    const managed_thread = try std.Thread.spawn(.{}, ManagedCall.run, .{&managed_call});
+    var managed_thread_joined = false;
+    defer if (!managed_thread_joined) {
+        delayed_sink.release.store(true, .release);
+        managed_thread.join();
+    };
 
     const delivery_deadline = io_mod.milliTimestamp() + 5_000;
     while (!delayed_sink.entered.load(.acquire) and
@@ -3672,10 +3659,12 @@ test "nested host ADE observation keeps root parent through delayed discovery" {
     if (!delayed_sink.entered.load(.acquire)) return error.TestUnexpectedResult;
     client.reportSessionChanged(next_root_id);
     delayed_sink.release.store(true, .release);
-    try std.testing.expectEqual(
-        subagent_execution.ChildResult.idle,
-        try subagent_host.owner.join(nested_id),
-    );
+    managed_thread.join();
+    managed_thread_joined = true;
+    if (managed_call.failure) |err| return err;
+    const managed_result = managed_call.result orelse return error.TestUnexpectedResult;
+    defer alloc.free(managed_result.body);
+    try std.testing.expect(managed_result.success);
 
     const serialization_deadline = io_mod.milliTimestamp() + 5_000;
     while (!delayed_sink.delivered.load(.acquire) and
@@ -3737,15 +3726,11 @@ test "nested host ADE observation keeps root parent through delayed discovery" {
         lifecycle_context.get("parent_session_id").?.string,
     );
     try std.testing.expectEqualStrings(
-        nested_id,
-        lifecycle_context.get("session_id").?.string,
-    );
-    try std.testing.expectEqualStrings(
         lifecycle_context.get("parent_session_id").?.string,
         discovery_context.get("parent_session_id").?.string,
     );
     try std.testing.expectEqualStrings(
-        nested_id,
+        lifecycle_context.get("session_id").?.string,
         discovery_context.get("session_id").?.string,
     );
 }
