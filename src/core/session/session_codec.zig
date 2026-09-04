@@ -41,26 +41,7 @@ pub const RecoveryToolState = enum {
 
 /// The shape an instance was running when a turn was produced: the operator's
 /// label for it, and the digest of the declaration behind that label.
-pub const ShapeAuthority = struct {
-    id: []u8,
-    identity: shape_authority.Identity,
-
-    pub fn deinit(self: *ShapeAuthority, alloc: Allocator) void {
-        alloc.free(self.id);
-        self.* = undefined;
-    }
-
-    pub fn dupe(self: ShapeAuthority, alloc: Allocator) !ShapeAuthority {
-        return .{
-            .id = try alloc.dupe(u8, self.id),
-            .identity = self.identity,
-        };
-    }
-
-    pub fn eql(self: ShapeAuthority, other: ShapeAuthority) bool {
-        return self.identity.eql(other.identity);
-    }
-};
+pub const ShapeAuthority = shape_authority.Reference;
 
 /// The shape and credential in effect for a session. Shape and identity are
 /// selected independently at launch, so neither one alone identifies what
@@ -738,7 +719,7 @@ fn writeState(writer: *std.Io.Writer, state: DurableSessionState) !void {
     }
     if (state.provenance) |provenance| {
         try writer.writeAll(",\"provenance\":");
-        try writeProvenance(writer, provenance);
+        try writeSessionProvenance(writer, provenance);
     }
     try writer.writeByte('}');
 }
@@ -763,7 +744,7 @@ fn writeShapeAuthorityFields(writer: *std.Io.Writer, shape: ShapeAuthority) !voi
     try writeJsonString(writer, &hex);
 }
 
-fn writeProvenance(writer: *std.Io.Writer, provenance: SessionProvenance) !void {
+pub fn writeSessionProvenance(writer: *std.Io.Writer, provenance: SessionProvenance) !void {
     try writer.writeByte('{');
     try writeShapeAuthorityFields(writer, provenance.shape);
     try writer.writeAll(",\"credential_source\":");
@@ -1069,7 +1050,7 @@ fn decodeStateImpl(alloc: Allocator, source: *std.Io.Reader, limits: DecodeLimit
                 .allocate = .alloc_always,
                 .parse_numbers = false,
             });
-            provenance = try parseProvenance(alloc, value);
+            provenance = try parseSessionProvenance(alloc, value);
         } else return error.InvalidSessionFormat;
     }
     errdefer if (usage) |*snapshot| snapshot.deinit(alloc);
@@ -1211,7 +1192,7 @@ fn parseCredentialSourceField(object: std.json.ObjectMap) !?types.CredentialSour
     };
 }
 
-fn parseProvenance(alloc: Allocator, value: std.json.Value) !SessionProvenance {
+pub fn parseSessionProvenance(alloc: Allocator, value: std.json.Value) !SessionProvenance {
     const object = try exactObject(value, &.{
         "shape_id",
         "shape_identity",

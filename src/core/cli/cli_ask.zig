@@ -47,6 +47,8 @@ const permissions = @import("../permissions/permissions.zig");
 const session_runtime = @import("../session/session.zig");
 const command_replay_store = @import("../session/command_replay_store.zig");
 const session_codec = @import("../session/session_codec.zig");
+const credential_authority = @import("../auth/credential_authority.zig");
+const shape_authority = @import("../auth/shape_authority.zig");
 const session_usage = @import("../session/session_usage.zig");
 const usage_report = @import("../session/usage_report.zig");
 const session_store = @import("../session/session_store.zig");
@@ -245,6 +247,15 @@ pub const Config = struct {
     mode_registry: mode_registry.Registry,
     load_mcp_runtime: mcp_runtime.LoadRuntimeFn,
     context_limit_overrides: []const config_runtime.context_limits.Override = &.{},
+    /// The root owning sessions and usage for this run. Null keeps them with
+    /// the ambient home, which is where a plain `fx ask` has always put them.
+    history_home: ?[]const u8 = null,
+    /// An already-validated profile whose credential this run borrows, read
+    /// only. Resolving it is the launch surface's job; by here it is settled.
+    borrowed_authorization_home: ?[]const u8 = null,
+    /// The shape this run is running, recorded on the session it writes.
+    shape: ?shape_authority.Identity = null,
+    shape_label: []const u8 = shape_authority.default_label,
     additional_directories: []const []const u8 = &.{},
     saved_directories_suppressed: bool = false,
 };
@@ -839,7 +850,10 @@ const AskContext = struct {
     }
 
     fn initializeSessionStores(self: *AskContext) !void {
-        var store = session_store.Store.init(self.alloc, self.workspace_root) catch |err| {
+        var store = (if (self.cfg.history_home) |home|
+            session_store.Store.initFromHome(self.alloc, home, self.workspace_root)
+        else
+            session_store.Store.init(self.alloc, self.workspace_root)) catch |err| {
             if (err == error.OutOfMemory or self.requested_resume != null) return err;
             debug_trace.logf(
                 "session",
@@ -1139,6 +1153,18 @@ fn freshAskState(
         var value = permission_state;
         value.deinit(ctx.alloc);
     }
+    const provenance: ?session_codec.SessionProvenance = if (ctx.cfg.shape) |identity| .{
+        .shape = .{
+            .id = try ctx.alloc.dupe(u8, ctx.cfg.shape_label),
+            .identity = identity,
+        },
+        .credential_source = ctx.credential_source,
+        .credential_identity = if (ctx.credential_source) |source|
+            credential_authority.derive(source, ctx.account_id)
+        else
+            null,
+    } else null;
+    errdefer if (provenance) |stored| ctx.alloc.free(stored.shape.id);
     return .{
         .id = id,
         .origin_workspace_root = origin,
@@ -1151,6 +1177,7 @@ fn freshAskState(
         .total_input_tokens = 0,
         .total_output_tokens = 0,
         .permission_state = permission_state,
+        .provenance = provenance,
     };
 }
 
@@ -1459,6 +1486,21 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
             cfg.default_agent_step_limit,
         );
     defer startup.deinit(alloc);
+    // A borrowed profile is read only by contract, so a credential that is due
+    // for refresh is dropped rather than rewritten into a profile this run does
+    // not own. Doing this here keeps `ask` on the same rule as every surface.
+    if (cfg.borrowed_authorization_home) |authorization_home| {
+        const borrowed = try credentials.resolveReadOnlyForProviderFromHome(
+            alloc,
+            startup.provider,
+            startup.credential_source_preference,
+            authorization_home,
+        );
+        if (startup.credential) |*existing| existing.deinit(alloc);
+        startup.credential = borrowed.credential;
+        startup.stored_key_status = borrowed.stored_key_status;
+        startup.fx_login_status = borrowed.fx_login_status;
+    }
     try checkHeadlessCancellation(options.deps);
 
     var permission_mode = toCorePermissionMode(startup.permission_mode);
@@ -1552,6 +1594,16 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
     ctx.session.setConversationLanguageFromUserMessage(owned_prompt);
     if (options.save_session) {
         try ctx.checkCancellation();
+        // The session is created before the credential is routed, so seed the
+        // authority it will run under from the one startup already resolved.
+        // Routing may refresh that credential's token; it never changes the
+        // account behind it, and the account is what provenance records.
+        if (ctx.credential_source == null) {
+            if (startup.credential) |credential| {
+                ctx.credential_source = credential.source;
+                ctx.account_id = credential.accountId();
+            }
+        }
         try options.deps.initialize_session_stores(&ctx);
         try ctx.checkCancellation();
         if (startup.model_source == .process_override) {

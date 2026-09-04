@@ -214,6 +214,7 @@ pub fn build(b: *std.Build) void {
             "shape identity and history selectors compose as three independent axes",
             "potentially sent recovery rejects a turn begun under a different shape",
             "an explicit history root wins and otherwise the profile home owns history",
+            "usage generations carry the shape that made them and fail closed on a mismatch",
         },
     });
     const run_fxnk_gate_tests = b.addRunArtifact(fxnk_gate_tests);

@@ -3,6 +3,8 @@ const io_mod = @import("../shared/io.zig");
 const session = @import("session.zig");
 const session_replay = @import("session_replay.zig");
 const Allocator = std.mem.Allocator;
+const shape_authority = @import("../auth/shape_authority.zig");
+const shared_types = @import("../shared/types.zig");
 
 const paths = @import("session_store_paths.zig");
 const types = @import("session_store_types.zig");
@@ -924,6 +926,8 @@ fn parseIndexedSummary(alloc: Allocator, value: std.json.Value) !SessionSummary 
     const preview = try indexedOptionalStringDup(alloc, root.get("preview"));
     errdefer if (preview) |preview_text| alloc.free(preview_text);
     const language = session.ConversationLanguage.fromSlice(try indexedString(root.get("conversation_language"))) catch return error.InvalidSessionIndex;
+    const shape = try indexedShape(alloc, root);
+    errdefer if (shape) |stored| alloc.free(stored.id);
 
     return .{
         .id = id,
@@ -937,6 +941,8 @@ fn parseIndexedSummary(alloc: Allocator, value: std.json.Value) !SessionSummary 
         .conversation_language = language,
         .history_len = try indexedUsize(root.get("history_len")),
         .has_managed_children = (try indexedOptionalBool(root.get("has_managed_children"))) orelse false,
+        .shape = shape,
+        .credential_source = try indexedCredentialSource(root),
     };
 }
 
@@ -960,6 +966,9 @@ const IndexedSummaryView = struct {
     conversation_language: session.ConversationLanguage,
     history_len: usize,
     has_managed_children: bool = false,
+    shape_id: ?JsonStringToken = null,
+    shape_identity: ?shape_authority.Identity = null,
+    credential_source: ?shared_types.CredentialSource = null,
 
     fn deinit(self: *IndexedSummaryView, alloc: Allocator) void {
         self.id.deinit(alloc);
@@ -967,6 +976,7 @@ const IndexedSummaryView = struct {
         if (self.origin_workspace_root) |value| value.deinit(alloc);
         if (self.title) |value| value.deinit(alloc);
         if (self.preview) |value| value.deinit(alloc);
+        if (self.shape_id) |value| value.deinit(alloc);
         self.* = undefined;
     }
 
@@ -987,6 +997,13 @@ const IndexedSummaryView = struct {
         errdefer if (title) |value| alloc.free(value);
         const preview = if (self.preview) |value| try alloc.dupe(u8, value.text) else null;
         errdefer if (preview) |value| alloc.free(value);
+        // A label without its digest is provenance this listing cannot trust,
+        // so both travel together or neither does.
+        const shape: ?shape_authority.Reference = if (self.shape_id) |label| shape: {
+            const identity = self.shape_identity orelse break :shape null;
+            break :shape .{ .id = try alloc.dupe(u8, label.text), .identity = identity };
+        } else null;
+        errdefer if (shape) |stored| alloc.free(stored.id);
         return .{
             .id = id,
             .workspace_root = workspace_root,
@@ -999,6 +1016,8 @@ const IndexedSummaryView = struct {
             .conversation_language = self.conversation_language,
             .history_len = self.history_len,
             .has_managed_children = self.has_managed_children,
+            .shape = shape,
+            .credential_source = self.credential_source,
         };
     }
 };
@@ -1126,6 +1145,10 @@ fn readIndexedSummaryView(
     var conversation_language: ?session.ConversationLanguage = null;
     var history_len: ?usize = null;
     var has_managed_children: bool = false;
+    var shape_id: ?JsonStringToken = null;
+    errdefer if (shape_id) |value| value.deinit(alloc);
+    var shape_identity: ?shape_authority.Identity = null;
+    var credential_source: ?shared_types.CredentialSource = null;
 
     while (true) {
         const token = try scanner.nextAlloc(alloc, .alloc_if_needed);
@@ -1159,6 +1182,27 @@ fn readIndexedSummaryView(
                     history_len = try readJsonUsize(scanner);
                 } else if (std.mem.eql(u8, key.text, "has_managed_children")) {
                     has_managed_children = try readJsonBool(scanner);
+                } else if (std.mem.eql(u8, key.text, "shape_id")) {
+                    const label = try readJsonString(scanner, alloc);
+                    shape_authority.validateLabel(label.text) catch {
+                        label.deinit(alloc);
+                        return error.InvalidSessionIndex;
+                    };
+                    replaceJsonStringToken(alloc, &shape_id, label);
+                } else if (std.mem.eql(u8, key.text, "shape_identity")) {
+                    const hex = try readJsonString(scanner, alloc);
+                    defer hex.deinit(alloc);
+                    var bytes: [32]u8 = undefined;
+                    _ = std.fmt.hexToBytes(&bytes, hex.text) catch
+                        return error.InvalidSessionIndex;
+                    const canonical = std.fmt.bytesToHex(bytes, .lower);
+                    if (!std.mem.eql(u8, &canonical, hex.text)) return error.InvalidSessionIndex;
+                    shape_identity = .{ .bytes = bytes };
+                } else if (std.mem.eql(u8, key.text, "credential_source")) {
+                    const source = try readJsonString(scanner, alloc);
+                    defer source.deinit(alloc);
+                    credential_source = shared_types.parseRuntimeCredentialSource(source.text) orelse
+                        return error.InvalidSessionIndex;
                 } else {
                     try scanner.skipValue();
                 }
@@ -1189,12 +1233,16 @@ fn readIndexedSummaryView(
         .conversation_language = parsed_conversation_language,
         .history_len = parsed_history_len,
         .has_managed_children = has_managed_children,
+        .shape_id = shape_id,
+        .shape_identity = shape_identity,
+        .credential_source = credential_source,
     };
     id = null;
     workspace_root = null;
     origin_workspace_root = null;
     title = null;
     preview = null;
+    shape_id = null;
     return result;
 }
 
@@ -1693,7 +1741,43 @@ fn writeIndexedSummaryJson(writer: *std.Io.Writer, summary: SessionSummary) !voi
     } else {
         try writer.writeAll("null");
     }
+    // Provenance is written only when a session recorded it, so an index built
+    // from sessions that predate it stays byte-identical to what it was.
+    if (summary.shape) |shape| {
+        try writer.writeAll(",\"shape_id\":");
+        try std.json.Stringify.value(shape.id, .{}, writer);
+        try writer.writeAll(",\"shape_identity\":");
+        const hex = std.fmt.bytesToHex(shape.identity.bytes, .lower);
+        try std.json.Stringify.value(&hex, .{}, writer);
+    }
+    if (summary.credential_source) |source| {
+        try writer.writeAll(",\"credential_source\":");
+        try std.json.Stringify.value(@tagName(source), .{}, writer);
+    }
     try writer.writeByte('}');
+}
+
+/// Reads one stored shape reference from an index entry. A label without its
+/// digest, or a digest that is not exactly 32 lower-case hex bytes, is not a
+/// shape this listing will show: provenance it cannot trust is dropped rather
+/// than displayed as though the session had been read correctly.
+fn indexedShape(alloc: Allocator, root: std.json.ObjectMap) !?shape_authority.Reference {
+    const label_value = root.get("shape_id") orelse return null;
+    const identity_value = root.get("shape_identity") orelse return error.InvalidSessionIndex;
+    if (label_value != .string or identity_value != .string) return error.InvalidSessionIndex;
+    shape_authority.validateLabel(label_value.string) catch return error.InvalidSessionIndex;
+    var bytes: [32]u8 = undefined;
+    _ = std.fmt.hexToBytes(&bytes, identity_value.string) catch return error.InvalidSessionIndex;
+    const canonical = std.fmt.bytesToHex(bytes, .lower);
+    if (!std.mem.eql(u8, &canonical, identity_value.string)) return error.InvalidSessionIndex;
+    return .{ .id = try alloc.dupe(u8, label_value.string), .identity = .{ .bytes = bytes } };
+}
+
+fn indexedCredentialSource(root: std.json.ObjectMap) !?shared_types.CredentialSource {
+    const value = root.get("credential_source") orelse return null;
+    if (value != .string) return error.InvalidSessionIndex;
+    return shared_types.parseRuntimeCredentialSource(value.string) orelse
+        return error.InvalidSessionIndex;
 }
 
 /// Frees every summary and the backing list.
@@ -1713,6 +1797,8 @@ pub fn cloneSessionSummary(alloc: Allocator, source: SessionSummary) !SessionSum
     errdefer if (title) |value| alloc.free(value);
     const preview = if (source.preview) |value| try alloc.dupe(u8, value) else null;
     errdefer if (preview) |value| alloc.free(value);
+    const shape = if (source.shape) |value| try value.dupe(alloc) else null;
+    errdefer if (shape) |stored| alloc.free(stored.id);
     return .{
         .id = id,
         .workspace_root = workspace_root,
@@ -1725,6 +1811,8 @@ pub fn cloneSessionSummary(alloc: Allocator, source: SessionSummary) !SessionSum
         .conversation_language = source.conversation_language,
         .history_len = source.history_len,
         .has_managed_children = source.has_managed_children,
+        .shape = shape,
+        .credential_source = source.credential_source,
     };
 }
 

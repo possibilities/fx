@@ -95,6 +95,7 @@ const expected_names = [_][]const u8{
     "core.cli.cli_surface.test.shape identity and history selectors compose as three independent axes",
     "core.agent.runtime.orchestrator.test.potentially sent recovery rejects a turn begun under a different shape",
     "core.app.app_history_home.test.an explicit history root wins and otherwise the profile home owns history",
+    "core.session.session_usage.test.usage generations carry the shape that made them and fail closed on a mismatch",
 };
 
 fn isExpected(name: []const u8) bool {

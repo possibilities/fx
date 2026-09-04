@@ -27,6 +27,7 @@ const login_flow = @import("../auth/login_flow.zig");
 const oauth_transport = @import("../auth/oauth_transport.zig");
 const provider_catalog = @import("../auth/provider_catalog.zig");
 const shape_authority = @import("../auth/shape_authority.zig");
+const app_history_home = @import("../app/app_history_home.zig");
 const secret = @import("../auth/secret.zig");
 const output_contracts = @import("../output/output_contracts.zig");
 const prompt_policy = @import("../config/prompt_policy.zig");
@@ -149,6 +150,11 @@ pub const LaunchModifiers = struct {
     history_home: ?[]u8 = null,
     /// The MCP configuration file backing this launch's shape.
     mcp_config_path: ?[]u8 = null,
+    /// How many leading invocation skill roots the operator asked for with
+    /// `--skills-dir`. A shape root contributes its own skills through the same
+    /// transport, but it is not a `--skills-dir` request and must not be judged
+    /// as one by the launch surfaces that refuse those.
+    requested_skill_root_count: usize = 0,
     skill_directories: [][]u8 = &.{},
     no_default_skills: bool = false,
     prompt_files: system_prompt_files.Request = .{},
@@ -224,7 +230,7 @@ pub const LaunchModifiers = struct {
     }
 
     pub fn hasInvocationSkillRoots(self: LaunchModifiers) bool {
-        return self.invocation_skill_roots.len > 0;
+        return self.requested_skill_root_count > 0;
     }
 
     pub fn takeInvocationSkillRoots(self: *LaunchModifiers) [][]u8 {
@@ -698,6 +704,7 @@ fn parseGlobalLaunchArgs(
     // A shape root carries its whole definition: the conventional prompt is
     // composed later, and its skills and MCP configuration are adopted here.
     // Each is optional, so a root holding only a prompt stays valid.
+    const requested_skill_root_count = skill_roots.items.len;
     if (shape_home) |home| {
         if (mcp_config_path == null) {
             const candidate = try profile_paths.mcpConfigPath(alloc, home);
@@ -755,6 +762,7 @@ fn parseGlobalLaunchArgs(
             .identity_home = identity_home,
             .history_home = history_home,
             .mcp_config_path = mcp_config_path,
+            .requested_skill_root_count = requested_skill_root_count,
             .skill_directories = skill_directory_slice,
             .no_default_skills = no_default_skills,
             .prompt_files = .{
@@ -774,6 +782,47 @@ fn canonicalizeStateHome(alloc: Allocator, path: []const u8) ![]u8 {
     const stat = try dir.stat(io_mod.getIo());
     if (stat.kind != .directory) return error.NotDir;
     return canonical;
+}
+
+/// Resolves the profile this launch borrows a credential from, applying the
+/// same rule everywhere: `--identity` stands alone, the environment form still
+/// needs an explicit state root, and naming both is refused.
+fn borrowedAuthorizationHome(alloc: Allocator, modifiers: LaunchModifiers) !?[]u8 {
+    return credentials.borrowedAuthorizationHomeFromLaunch(
+        alloc,
+        modifiers.state_home,
+        modifiers.identity_home,
+    );
+}
+
+fn writeBorrowedAuthorizationFailure(deps: RunDeps, err: anyerror) !void {
+    try writeStderr(deps, switch (err) {
+        error.ConflictingAuthorizationHome => "fx: --identity cannot be combined with FX_AUTH_READ_ONLY_HOME; choose one\n",
+        error.ReadOnlyAuthorizationHomeRequiresStateDirectory => "fx: FX_AUTH_READ_ONLY_HOME requires --state-dir\n",
+        else => "fx: --identity must name an existing profile directory\n",
+    });
+}
+
+/// Opens the session store for the history root this launch selected. Reading
+/// a history from somewhere other than where the same launch would write it is
+/// never right, so every session command resolves it the one way.
+fn openHistoryStore(
+    alloc: Allocator,
+    modifiers: LaunchModifiers,
+    workspace_root: []const u8,
+    mode: enum { read_only, writable },
+) !session_store.Store {
+    const home = app_history_home.forSelection(modifiers.history_home, modifiers.state_home);
+    return switch (mode) {
+        .read_only => if (home) |selected|
+            session_store.Store.initReadOnlyFromHome(alloc, selected, workspace_root)
+        else
+            session_store.Store.initReadOnly(alloc, workspace_root),
+        .writable => if (home) |selected|
+            session_store.Store.initFromHome(alloc, selected, workspace_root)
+        else
+            session_store.Store.init(alloc, workspace_root),
+    };
 }
 
 fn regularFileExists(path: []const u8) bool {
@@ -1534,7 +1583,14 @@ fn runNonInteractiveWithDeps(
         },
         .ask => |rest| {
             try writeMcpProfileWarningIfPresent(alloc, cfg, deps);
-            const exit_code = try cli_ask.run(alloc, rest, workflowConfigWithLaunchModifiers(cfg, global_args.modifiers), cfg.context_registry, cfg.tool_set);
+            const borrowed = borrowedAuthorizationHome(alloc, global_args.modifiers) catch |err| {
+                try writeBorrowedAuthorizationFailure(deps, err);
+                return .handled_failure;
+            };
+            defer if (borrowed) |home| alloc.free(home);
+            var ask_cfg = workflowConfigWithLaunchModifiers(cfg, global_args.modifiers);
+            ask_cfg.borrowed_authorization_home = borrowed;
+            const exit_code = try cli_ask.run(alloc, rest, ask_cfg, cfg.context_registry, cfg.tool_set);
             return if (exit_code == 0) .handled_success else .handled_failure;
         },
         .acp => |rest| {
@@ -1983,9 +2039,11 @@ fn runNonInteractiveWithDeps(
 
                 const workspace_root = try io_mod.realpathAlloc(alloc, ".");
                 defer alloc.free(workspace_root);
-                var store = session_store.Store.init(
+                var store = openHistoryStore(
                     alloc,
+                    global_args.modifiers,
                     workspace_root,
+                    .writable,
                 ) catch |err| {
                     try writeLookupFailure(
                         alloc,
@@ -2034,7 +2092,12 @@ fn runNonInteractiveWithDeps(
                 const workspace_root = try io_mod.realpathAlloc(alloc, ".");
                 defer alloc.free(workspace_root);
 
-                var store = session_store.Store.init(alloc, workspace_root) catch |err| {
+                var store = openHistoryStore(
+                    alloc,
+                    global_args.modifiers,
+                    workspace_root,
+                    .writable,
+                ) catch |err| {
                     try writeLookupFailure(alloc, deps, "session", err, migration.format);
                     return .handled_failure;
                 };
@@ -2071,7 +2134,12 @@ fn runNonInteractiveWithDeps(
             const workspace_root = try io_mod.realpathAlloc(alloc, ".");
             defer alloc.free(workspace_root);
 
-            var store = session_store.Store.initReadOnly(alloc, workspace_root) catch |err| {
+            var store = openHistoryStore(
+                alloc,
+                global_args.modifiers,
+                workspace_root,
+                .read_only,
+            ) catch |err| {
                 try writeLookupFailure(alloc, deps, "session", err, opts.format);
                 return .handled_failure;
             };
@@ -2131,7 +2199,12 @@ fn runNonInteractiveWithDeps(
             const workspace_root = try io_mod.realpathAlloc(alloc, ".");
             defer alloc.free(workspace_root);
 
-            var store = session_store.Store.initReadOnly(alloc, workspace_root) catch |err| {
+            var store = openHistoryStore(
+                alloc,
+                global_args.modifiers,
+                workspace_root,
+                .read_only,
+            ) catch |err| {
                 try writeLookupFailure(alloc, deps, "sessions", err, opts.format);
                 return .handled_failure;
             };
@@ -3799,6 +3872,9 @@ fn workflowConfigWithLaunchModifiers(
     result.additional_directories = modifiers.additional_directories;
     result.skill_root_policy = modifiers.skillRootPolicy(cfg.skill_root_policy);
     result.saved_directories_suppressed = modifiers.saved_directories_suppressed;
+    result.history_home = app_history_home.forSelection(modifiers.history_home, modifiers.state_home);
+    result.shape = modifiers.shapeIdentity();
+    result.shape_label = modifiers.shapeLabel();
     result.prompt_policy = promptPolicyWithLaunchModifiers(result.prompt_policy, modifiers);
     return result;
 }

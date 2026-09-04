@@ -289,6 +289,9 @@ pub fn Runtime(comptime App: type) type {
                     app.alloc,
                     app_history_home.forApp(app) orelse shared_io.getenv("HOME"),
                 );
+                if (comptime @hasField(App, "shape")) {
+                    app.session.usage.setShape(app.shape, app.shapeLabel());
+                }
             }
 
             var selected_model = startup.takeSelectedModel();

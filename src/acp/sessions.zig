@@ -73,6 +73,7 @@ pub fn handleNewLibfxSession(
             historyHome(state) orelse io_mod.getenv("HOME"),
         );
     }
+    session_rt.usage.setShape(state.cfg.shape, state.cfg.shape_label);
 
     state.active_session = .{
         .session_id = session_id,
@@ -278,6 +279,7 @@ pub fn handleNewSession(state: *server.ServerState, alloc: Allocator, msg: *json
         alloc,
         historyHome(state) orelse io_mod.getenv("HOME"),
     );
+    session_rt.usage.setShape(state.cfg.shape, state.cfg.shape_label);
     if (writable.state.usage) |usage| {
         try session_rt.usage.restore(
             alloc,
@@ -691,6 +693,7 @@ fn handleRestoreSession(
         alloc,
         historyHome(state) orelse io_mod.getenv("HOME"),
     );
+    session_rt.usage.setShape(state.cfg.shape, state.cfg.shape_label);
     try session_rt.restoreWithPermissionState(
         alloc,
         writable.state.conversation_language,

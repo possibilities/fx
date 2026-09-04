@@ -972,6 +972,17 @@ pub const SessionListSnapshot = struct {
             try out.writer.print(",\"created_at_ms\":{d},\"updated_at_ms\":{d},\"history_len\":{d}", .{ entry.created_at_ms, entry.updated_at_ms, entry.history_len });
             try out.writer.writeAll(",\"conversation_language\":");
             try std.json.Stringify.value(entry.conversation_language.view(), .{}, &out.writer);
+            if (entry.shape) |shape| {
+                try out.writer.writeAll(",\"shape\":");
+                try std.json.Stringify.value(shape.id, .{}, &out.writer);
+                try out.writer.writeAll(",\"shape_identity\":");
+                const hex = std.fmt.bytesToHex(shape.identity.bytes, .lower);
+                try std.json.Stringify.value(&hex, .{}, &out.writer);
+            }
+            if (entry.credential_source) |source| {
+                try out.writer.writeAll(",\"credential_source\":");
+                try std.json.Stringify.value(@tagName(source), .{}, &out.writer);
+            }
             try out.writer.writeByte('}');
         }
         try out.writer.writeAll("]}");
@@ -992,9 +1003,31 @@ fn writeSessionListDetails(
         try writer.writeAll(" | ");
         try writeTerminalSafe(writer, alloc, label);
     }
+    if (entry.shape) |shape| {
+        // Shape and account are chosen independently, so a listing that named
+        // only one of them would not say what produced this history.
+        try writer.writeAll(" | ");
+        try writeTerminalSafe(writer, alloc, shape.id);
+        if (credentialSourceLabel(entry.credential_source)) |source| {
+            try writer.writeAll(" @ ");
+            try writer.writeAll(source);
+        }
+    }
     try writer.writeAll(" | updated ");
     try writeUtcTimestamp(writer, entry.updated_at_ms);
     try writer.writeByte('\n');
+}
+
+/// Names the account origin a session ran under, in the operator's words
+/// rather than the credential enum's.
+fn credentialSourceLabel(source: ?types.CredentialSource) ?[]const u8 {
+    const value = source orelse return null;
+    return switch (value) {
+        .chatgpt_subscription => "codex",
+        .grok_subscription => "grok",
+        .ai_gateway_api_key, .fx_login, .stored_key, .vercel_oidc_token => "gateway",
+        .host_managed => "host",
+    };
 }
 
 fn sessionLanguageLabel(tag: []const u8) ?[]const u8 {

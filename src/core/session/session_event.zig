@@ -42,6 +42,9 @@ pub const SessionStarted = struct {
     preferences: session_codec.DurableSessionPreferences,
     usage: ?session_usage.Snapshot = null,
     subagent_child: bool = false,
+    /// The shape and credential that created this session. The event log is the
+    /// authority, so provenance that is not here is not durable.
+    provenance: ?session_codec.SessionProvenance = null,
 
     fn deinit(self: *SessionStarted, alloc: Allocator) void {
         alloc.free(self.id);
@@ -49,6 +52,7 @@ pub const SessionStarted = struct {
         alloc.free(self.workspace_root);
         self.preferences.deinit(alloc);
         if (self.usage) |*usage| usage.deinit(alloc);
+        if (self.provenance) |*provenance| provenance.deinit(alloc);
         self.* = undefined;
     }
 };
@@ -933,6 +937,11 @@ fn applyDelta(
                 try session_usage.dupeSnapshotOwned(alloc, snapshot)
             else
                 null;
+            errdefer if (next.usage) |*snapshot| snapshot.deinit(alloc);
+            next.provenance = if (payload.provenance) |provenance|
+                try provenance.dupe(alloc)
+            else
+                null;
             errdefer if (next.usage) |*usage| usage.deinit(alloc);
             try session_codec.validateState(next);
             state.* = next;
@@ -1156,6 +1165,10 @@ fn writePayload(writer: *std.Io.Writer, event: Event) !void {
             if (payload.subagent_child) {
                 try writer.writeAll(",\"subagent_child\":true");
             }
+            if (payload.provenance) |provenance| {
+                try writer.writeAll(",\"provenance\":");
+                try session_codec.writeSessionProvenance(writer, provenance);
+            }
             try writer.writeByte('}');
         },
         .preferences_changed => |payload| {
@@ -1251,7 +1264,7 @@ fn parsePayload(alloc: Allocator, kind: Kind, value: std.json.Value) !Event {
     return switch (kind) {
         .session_started => blk: {
             const source = try requireObject(value);
-            if (source.count() < 6 or source.count() > 8) {
+            if (source.count() < 6 or source.count() > 9) {
                 return error.InvalidEventFrame;
             }
             try rejectUnknownKeys(source, &.{
@@ -1263,6 +1276,7 @@ fn parsePayload(alloc: Allocator, kind: Kind, value: std.json.Value) !Event {
                 "preferences",
                 "usage",
                 "subagent_child",
+                "provenance",
             });
             const object = source;
             const id = try dupeString(alloc, object, "id");
@@ -1294,6 +1308,17 @@ fn parsePayload(alloc: Allocator, kind: Kind, value: std.json.Value) !Event {
                     return error.InvalidEventFrame
             else
                 false;
+            const provenance = if (object.get("provenance")) |provenance_value|
+                session_codec.parseSessionProvenance(alloc, provenance_value) catch |err| switch (err) {
+                    error.OutOfMemory => return error.OutOfMemory,
+                    else => return error.InvalidEventFrame,
+                }
+            else
+                null;
+            errdefer if (provenance) |stored| {
+                var owned = stored;
+                owned.deinit(alloc);
+            };
             break :blk .{ .session_started = .{
                 .id = id,
                 .created_at_ms = try requireI64(object, "created_at_ms"),
@@ -1305,6 +1330,7 @@ fn parsePayload(alloc: Allocator, kind: Kind, value: std.json.Value) !Event {
                 .preferences = preferences,
                 .usage = usage,
                 .subagent_child = subagent_child,
+                .provenance = provenance,
             } };
         },
         .preferences_changed => blk: {

@@ -2263,6 +2263,7 @@ fn createNativeSession(
             .preferences = initial_state.preferences,
             .usage = initial_state.usage orelse synthesized_usage.?,
             .subagent_child = initial_state.subagent_child,
+            .provenance = initial_state.provenance,
         } },
     };
     const line = try session_event.encodeFrame(alloc, envelope);
@@ -4074,6 +4075,7 @@ fn writeManifestProjection(
         .checkpoint_seq = loaded.checkpoint_seq,
         .checkpoint_sha256 = loaded.checkpoint_sha256,
         .preferences = loaded.state.preferences,
+        .provenance = loaded.state.provenance,
     };
     const bytes = try session_projection.encodeManifest(alloc, manifest);
     defer alloc.free(bytes);

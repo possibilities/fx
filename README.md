@@ -220,6 +220,47 @@ setting, session, history, skill, MCP entry, and authentication action remains
 owned by `--state-dir`. Fx rejects this authorization override when no
 `--state-dir` is selected.
 
+`--state-dir` sets three things at once: where the agent's shape comes from,
+which account it uses, and where its history is written. Each is also selectable
+on its own, so one common history can hold work from several agents and
+accounts:
+
+```bash
+fx --shape ~/shapes/reviewer                  # prompt, skills, MCP from that root
+fx --identity ~/fx-work                       # borrow that profile's credential
+fx --history-dir ~/fx-history                 # own sessions, history, and usage
+fx --mcp-config ~/shapes/reviewer/servers.json
+```
+
+`--shape <dir>` reads `<dir>/.fx/SYSTEM.md` or `<dir>/.fx/SYSTEM_APPEND.md`,
+adds `<dir>/.fx/skills` as a skill root, and uses `<dir>/.fx/mcp.json` when it
+exists. It moves no credentials and no sessions, and its conventional prompt
+wins over `--state-dir`'s. `--mcp-config <file>` selects that configuration
+directly; MCP credentials stay with the profile home either way.
+
+`--identity <dir>` borrows one already-valid credential from that profile under
+the same read-only contract as `FX_AUTH_READ_ONLY_HOME`: Fx does not refresh,
+replace, or delete it, and a credential due for refresh is declined rather than
+rewritten. Unlike the environment form, which still requires `--state-dir`, the
+flag stands on its own; naming both is refused.
+
+`--history-dir <dir>` owns sessions, prompt history, and usage. Without it,
+history stays with the profile home, so `--state-dir` isolates all three exactly
+as before.
+
+Every session records the shape and account that created it, and `fx sessions`
+names them:
+
+```
+ - review the parser
+   id=fnGq6VphbKjL | 1 turn | reviewer @ codex | updated 2026-09-04 15:17:53 UTC
+```
+
+The stored label is for reading; a content digest stored beside it decides
+whether two sessions are the same shape. `fx sessions --json` reports both as
+`shape` and `shape_identity`. A turn that may already have reached the provider
+refuses to resume under a different shape or a different account.
+
 An explicit state directory can also carry one conventional system prompt for
 interactive, resumed, and ACP sessions and their in-process children.
 `<path>/.fx/SYSTEM.md` replaces Fx's built-in prompt, while

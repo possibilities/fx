@@ -33,6 +33,27 @@ pub const Identity = struct {
     }
 };
 
+/// A stored shape reference: the operator's label plus the digest that is the
+/// authority. The label exists so a history reads back in words; two records
+/// are the same shape when their digests match, never when their labels do.
+pub const Reference = struct {
+    id: []u8,
+    identity: Identity,
+
+    pub fn deinit(self: *Reference, alloc: std.mem.Allocator) void {
+        alloc.free(self.id);
+        self.* = undefined;
+    }
+
+    pub fn dupe(self: Reference, alloc: std.mem.Allocator) !Reference {
+        return .{ .id = try alloc.dupe(u8, self.id), .identity = self.identity };
+    }
+
+    pub fn eql(self: Reference, other: Reference) bool {
+        return self.identity.eql(other.identity);
+    }
+};
+
 /// The resolved shape inputs, in the form the launch layer already holds them.
 /// Every field is borrowed for the duration of the call.
 pub const Declaration = struct {
@@ -239,4 +260,14 @@ test "stored labels reject control characters and overlong names" {
     try std.testing.expectError(error.InvalidShapeLabel, validateLabel("bad\nname"));
     try std.testing.expectError(error.InvalidShapeLabel, validateLabel("n" ** 65));
     try std.testing.expectError(error.InvalidShapeLabel, validateLabel(&.{ 0xff, 0xfe }));
+}
+
+test "a stored reference compares by digest, never by label" {
+    const identity = derive(.{ .system_prompt = "review carefully" });
+    const other = derive(.{ .system_prompt = "build quickly" });
+    const named = Reference{ .id = @constCast("reviewer"), .identity = identity };
+    const renamed = Reference{ .id = @constCast("review"), .identity = identity };
+    const relabelled = Reference{ .id = @constCast("reviewer"), .identity = other };
+    try std.testing.expect(named.eql(renamed));
+    try std.testing.expect(!named.eql(relabelled));
 }

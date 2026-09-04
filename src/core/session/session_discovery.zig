@@ -568,6 +568,12 @@ pub fn classifySchemaV3Candidate(
         display.origin_workspace_root = null;
     }
 
+    const shape = if (manifest.provenance) |provenance|
+        try provenance.shape.dupe(alloc)
+    else
+        null;
+    errdefer if (shape) |stored| alloc.free(stored.id);
+
     return .{
         .summary = .{
             .id = id,
@@ -580,6 +586,11 @@ pub fn classifySchemaV3Candidate(
             .updated_at_ms = manifest.updated_at_ms,
             .conversation_language = manifest.conversation_language,
             .history_len = history_len,
+            .shape = shape,
+            .credential_source = if (manifest.provenance) |provenance|
+                provenance.credential_source
+            else
+                null,
         },
         .storage = .schema_v3,
         .projection_state = projection_state,
@@ -638,6 +649,11 @@ pub fn summaryFromState(
     errdefer alloc.free(workspace_root);
     var display = try session_display_metadata.deriveFromHistory(alloc, state.history);
     errdefer display.deinit(alloc);
+    const shape = if (state.provenance) |provenance|
+        try provenance.shape.dupe(alloc)
+    else
+        null;
+    errdefer if (shape) |value| alloc.free(value.id);
 
     return .{
         .id = id,
@@ -650,6 +666,11 @@ pub fn summaryFromState(
         .updated_at_ms = state.updated_at_ms,
         .conversation_language = state.conversation_language,
         .history_len = state.history.len,
+        .shape = shape,
+        .credential_source = if (state.provenance) |provenance|
+            provenance.credential_source
+        else
+            null,
     };
 }
 
