@@ -457,6 +457,21 @@ const UpgradeRelaunchArguments = struct {
         if (launch.modifiers.state_home) |home| {
             try result.appendPair(alloc, "--state-dir", home);
         }
+        // Shape, identity, and history are separate authorities: dropping any
+        // of them across an upgrade silently reverts the agent's definition,
+        // the account it bills, or where its history lands, mid-session.
+        if (launch.modifiers.shape_home) |home| {
+            try result.appendPair(alloc, "--shape", home);
+        }
+        if (launch.modifiers.identity_home) |home| {
+            try result.appendPair(alloc, "--identity", home);
+        }
+        if (launch.modifiers.history_home) |home| {
+            try result.appendPair(alloc, "--history-dir", home);
+        }
+        if (launch.modifiers.mcp_config_path) |path| {
+            try result.appendPair(alloc, "--mcp-config", path);
+        }
         if (launch.modifiers.permission_policy) |policy| {
             try result.appendPair(alloc, "--permissions-file", policy.path);
         }
@@ -470,7 +485,11 @@ const UpgradeRelaunchArguments = struct {
         if (launch.modifiers.no_default_skills) {
             try result.append(alloc, "--no-default-skills");
         }
-        for (invocation_skill_roots) |root| {
+        const requested_roots = @min(
+            launch.modifiers.requested_skill_root_count,
+            invocation_skill_roots.len,
+        );
+        for (invocation_skill_roots[0..requested_roots]) |root| {
             try result.appendPair(alloc, "--skills-dir", root);
         }
         if (!launch.modifiers.project_instructions_enabled) {
@@ -857,8 +876,10 @@ const TestCapture = struct {
     replace_error: std.process.ReplaceError = error.InvalidExe,
     replace_calls: usize = 0,
     replace_arg_count: usize = 0,
-    replace_arg_bufs: [32][256]u8 = undefined,
-    replace_arg_lens: [32]usize = [_]usize{0} ** 32,
+    // Headroom over the longest relaunch this suite builds: every launch
+    // control, all three authority axes, and the selected MCP configuration.
+    replace_arg_bufs: [48][256]u8 = undefined,
+    replace_arg_lens: [48]usize = [_]usize{0} ** 48,
     fail_unexpected_format: bool = false,
 
     fn init(run_result: cli_surface.RunResult) TestCapture {
@@ -1278,10 +1299,17 @@ test "app entry preserves every launch control across an upgrade relaunch" {
     const selected_tools = try alloc.alloc([]u8, 2);
     selected_tools[0] = try alloc.dupe(u8, "terminal:exec");
     selected_tools[1] = try alloc.dupe(u8, "read_file");
-    const skill_roots = try alloc.alloc([]u8, 2);
+    // Two roots the operator asked for, then the root a --shape contributed.
+    // Only the first two may be re-emitted; the third is re-derived by --shape.
+    const skill_roots = try alloc.alloc([]u8, 3);
     skill_roots[0] = try alloc.dupe(u8, "/tmp/team skills");
     skill_roots[1] = try alloc.dupe(u8, "/opt/shared-skills");
+    skill_roots[2] = try alloc.dupe(u8, "/tmp/fx-shape/.fx/skills");
     const state_home = try alloc.dupe(u8, "/tmp/fx-state");
+    const shape_home = try alloc.dupe(u8, "/tmp/fx-shape");
+    const identity_home = try alloc.dupe(u8, "/tmp/fx-identity");
+    const history_home = try alloc.dupe(u8, "/tmp/fx-history");
+    const mcp_config_path = try alloc.dupe(u8, "/tmp/fx-shape/.fx/mcp.json");
     const permission_path = try alloc.dupe(u8, "/tmp/fx-policy.json");
     var capture = TestCapture.init(.{ .interactive = .{
         .modifiers = .{
@@ -1295,9 +1323,14 @@ test "app entry preserves every launch control across an upgrade relaunch" {
             .effective_system_prompt = effective_system_prompt,
             .selected_native_tools = selected_tools,
             .invocation_skill_roots = skill_roots,
+            .requested_skill_root_count = 2,
             .no_default_skills = true,
             .project_instructions_enabled = false,
             .state_home = state_home,
+            .shape_home = shape_home,
+            .identity_home = identity_home,
+            .history_home = history_home,
+            .mcp_config_path = mcp_config_path,
             .permission_policy = .{
                 .path = permission_path,
                 .rules = .{},
@@ -1332,6 +1365,14 @@ test "app entry preserves every launch control across an upgrade relaunch" {
         "/tmp/second extra.md",
         "--state-dir",
         "/tmp/fx-state",
+        "--shape",
+        "/tmp/fx-shape",
+        "--identity",
+        "/tmp/fx-identity",
+        "--history-dir",
+        "/tmp/fx-history",
+        "--mcp-config",
+        "/tmp/fx-shape/.fx/mcp.json",
         "--permissions-file",
         "/tmp/fx-policy.json",
         "--tool",
@@ -1359,7 +1400,10 @@ test "app entry preserves every launch control across an upgrade relaunch" {
             " --system-prompt-file '/tmp/base prompt.md'" ++
             " --append-system-prompt-file /tmp/first-extra.md" ++
             " --append-system-prompt-file '/tmp/second extra.md'" ++
-            " --state-dir /tmp/fx-state --permissions-file /tmp/fx-policy.json" ++
+            " --state-dir /tmp/fx-state --shape /tmp/fx-shape" ++
+            " --identity /tmp/fx-identity --history-dir /tmp/fx-history" ++
+            " --mcp-config /tmp/fx-shape/.fx/mcp.json" ++
+            " --permissions-file /tmp/fx-policy.json" ++
             " --tool terminal:exec --tool read_file --no-default-skills" ++
             " --skills-dir '/tmp/team skills' --skills-dir /opt/shared-skills" ++
             " --no-project-instructions resume session-123\n",
