@@ -962,13 +962,16 @@ fn startWorkerThreadForTest(ctx: ?*anyopaque, _: *anyopaque) !void {
 
 const TestApp = struct {
     requested_resume: ?cli_surface.ResumeTarget = null,
+    invocation_skill_roots: [][]u8 = &.{},
     terminal_released: bool = false,
 
     fn init(_: Allocator, launch: *cli_surface.InteractiveLaunch, _: credentials.AuthMode) !TestApp {
         appendInitEvent(launch);
         if (active_capture.?.init_error) |err| return err;
 
-        var app = TestApp{};
+        var app = TestApp{
+            .invocation_skill_roots = launch.modifiers.takeInvocationSkillRoots(),
+        };
         if (launch.requested_resume) |target| {
             app.requested_resume = target;
             launch.requested_resume = null;
@@ -979,6 +982,7 @@ const TestApp = struct {
     fn deinit(self: *TestApp) void {
         self.releaseTerminal();
         if (self.requested_resume) |*target| target.deinit(std.testing.allocator);
+        freeInvocationSkillRoots(std.testing.allocator, self.invocation_skill_roots);
         appendTestEvent("deinit");
         self.* = undefined;
     }

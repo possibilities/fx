@@ -610,6 +610,7 @@ const App = struct {
     mcp: app_mcp_runtime.State = .{},
     skills: skill_runtime.Runtime = .{},
     skill_root_policy: @import("core/skills/skill_contract.zig").RootPolicy = builtin_skills.root_policy,
+    invocation_skill_roots: [][]u8 = &.{},
     context_snapshot: context_contract.GatheredContextSnapshot = .{},
     file_index: file_index_mod.FileIndex = .{},
     context_enabled: bool = true,
@@ -717,6 +718,7 @@ const App = struct {
                 .terminal_title = app.terminalTitle(),
             },
         );
+        app.invocation_skill_roots = launch.modifiers.takeInvocationSkillRoots();
         errdefer app.deinit();
         if (launch.modifiers.permission_policy) |policy| {
             app.permission_engine.replaceRules(
@@ -1075,6 +1077,8 @@ const App = struct {
         self.mcp.deinit(self.alloc);
         self.native_tool_selection.deinit(self.alloc);
         self.skills.deinit(std.heap.c_allocator);
+        for (self.invocation_skill_roots) |path| self.alloc.free(path);
+        if (self.invocation_skill_roots.len > 0) self.alloc.free(self.invocation_skill_roots);
         self.context_snapshot.deinit(self.alloc);
         self.file_index.deinit(std.heap.c_allocator);
         self.lifecycle_runtime.deinit();

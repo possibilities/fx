@@ -131,6 +131,7 @@ pub const ResumeTarget = union(enum) {
 pub const LaunchModifiers = struct {
     context_limit_overrides: []config_runtime.context_limits.Override = &.{},
     additional_directories: [][]u8 = &.{},
+    invocation_skill_roots: [][]u8 = &.{},
     saved_directories_suppressed: bool = false,
     allow_native_tools: bool = true,
     permission_policy: ?config_runtime.LaunchPermissionPolicy = null,
@@ -146,6 +147,8 @@ pub const LaunchModifiers = struct {
         if (self.context_limit_overrides.len > 0) alloc.free(self.context_limit_overrides);
         for (self.additional_directories) |path| alloc.free(path);
         if (self.additional_directories.len > 0) alloc.free(self.additional_directories);
+        for (self.invocation_skill_roots) |path| alloc.free(path);
+        if (self.invocation_skill_roots.len > 0) alloc.free(self.invocation_skill_roots);
         if (self.permission_policy) |*policy| policy.deinit(alloc);
         if (self.state_home) |path| alloc.free(path);
         for (self.skill_directories) |path| alloc.free(path);
@@ -171,9 +174,19 @@ pub const LaunchModifiers = struct {
 
     pub fn skillRootPolicy(self: LaunchModifiers, default_policy: skill_contract.RootPolicy) skill_contract.RootPolicy {
         var policy = default_policy;
-        policy.invocation_roots = self.skill_directories;
+        policy.invocation_roots = self.invocation_skill_roots;
         policy.exclusive_invocation_roots = self.no_default_skills;
         return policy;
+    }
+
+    pub fn hasInvocationSkillRoots(self: LaunchModifiers) bool {
+        return self.invocation_skill_roots.len > 0;
+    }
+
+    pub fn takeInvocationSkillRoots(self: *LaunchModifiers) [][]u8 {
+        const roots = self.invocation_skill_roots;
+        self.invocation_skill_roots = &.{};
+        return roots;
     }
 
     pub fn hasPromptFileModifiers(self: LaunchModifiers) bool {
@@ -428,6 +441,11 @@ fn parseGlobalLaunchArgs(
         for (directories.items) |path| alloc.free(path);
         directories.deinit(alloc);
     }
+    var skill_roots: std.ArrayList([]u8) = .empty;
+    errdefer {
+        for (skill_roots.items) |path| alloc.free(path);
+        skill_roots.deinit(alloc);
+    }
     var suppress_saved = false;
     var allow_native_tools = true;
     var permission_policy: ?config_runtime.LaunchPermissionPolicy = null;
@@ -509,11 +527,11 @@ fn parseGlobalLaunchArgs(
         } else if (std.mem.eql(u8, arg, "--skills-dir")) {
             index += 1;
             if (index >= args.len or args[index].len == 0) return error.MissingSkillsDirectoryValue;
-            try dupeAndAppendPath(alloc, &skill_directories, args[index]);
+            try dupeAndAppendPath(alloc, &skill_roots, args[index]);
         } else if (std.mem.startsWith(u8, arg, "--skills-dir=")) {
             const value = arg["--skills-dir=".len..];
             if (value.len == 0) return error.MissingSkillsDirectoryValue;
-            try dupeAndAppendPath(alloc, &skill_directories, value);
+            try dupeAndAppendPath(alloc, &skill_roots, value);
         } else if (std.mem.eql(u8, arg, "--no-default-skills")) {
             if (no_default_skills) return error.DuplicateDefaultSkillsSuppression;
             no_default_skills = true;
@@ -573,6 +591,11 @@ fn parseGlobalLaunchArgs(
         for (skill_directory_slice) |path| alloc.free(path);
         if (skill_directory_slice.len > 0) alloc.free(skill_directory_slice);
     }
+    const skill_root_slice = try skill_roots.toOwnedSlice(alloc);
+    errdefer {
+        for (skill_root_slice) |path| alloc.free(path);
+        if (skill_root_slice.len > 0) alloc.free(skill_root_slice);
+    }
     const append_slice = try append_paths.toOwnedSlice(alloc);
     errdefer {
         for (append_slice) |path| alloc.free(path);
@@ -584,6 +607,7 @@ fn parseGlobalLaunchArgs(
         .modifiers = .{
             .context_limit_overrides = override_slice,
             .additional_directories = directory_slice,
+            .invocation_skill_roots = skill_root_slice,
             .saved_directories_suppressed = suppress_saved,
             .allow_native_tools = allow_native_tools,
             .permission_policy = permission_policy,
@@ -1246,7 +1270,7 @@ fn runNonInteractiveWithDeps(
         try writeStateHomeUsage(deps);
         return .handled_failure;
     }
-    if (global_args.modifiers.hasSkillDirectories() and
+    if (global_args.modifiers.hasInvocationSkillRoots() and
         !commandSupportsInvocationSkillRoots(parsed_command))
     {
         try writeInvocationSkillRootUsage(deps);
@@ -3639,7 +3663,7 @@ fn prepareSkillDirectories(
     modifiers: *LaunchModifiers,
     deps: RunDeps,
 ) !bool {
-    for (modifiers.skill_directories, 0..) |path, index| {
+    for (modifiers.invocation_skill_roots, 0..) |path, index| {
         const canonical_path = io_mod.realpathAlloc(alloc, path) catch |err| {
             if (err == error.OutOfMemory) return error.OutOfMemory;
             const message = try std.fmt.allocPrint(
@@ -3666,7 +3690,7 @@ fn prepareSkillDirectories(
         dir.close(io_mod.getIo());
 
         alloc.free(path);
-        modifiers.skill_directories[index] = canonical_path;
+        modifiers.invocation_skill_roots[index] = canonical_path;
     }
     return true;
 }
@@ -4374,9 +4398,9 @@ test "global skill modifiers retain ordered roots and reject malformed policy" {
     defer parsed.deinit(std.testing.allocator);
 
     try std.testing.expect(parsed.modifiers.no_default_skills);
-    try std.testing.expectEqual(@as(usize, 2), parsed.modifiers.skill_directories.len);
-    try std.testing.expectEqualStrings("/tmp/first-skills", parsed.modifiers.skill_directories[0]);
-    try std.testing.expectEqualStrings("/tmp/second-skills", parsed.modifiers.skill_directories[1]);
+    try std.testing.expectEqual(@as(usize, 2), parsed.modifiers.invocation_skill_roots.len);
+    try std.testing.expectEqualStrings("/tmp/first-skills", parsed.modifiers.invocation_skill_roots[0]);
+    try std.testing.expectEqualStrings("/tmp/second-skills", parsed.modifiers.invocation_skill_roots[1]);
     try std.testing.expectEqualStrings("ask", parsed.remaining[0]);
 
     try std.testing.expectError(
@@ -4527,9 +4551,9 @@ test "global launch modifiers own ordered invocation skill roots" {
     });
     defer parsed.deinit(std.testing.allocator);
 
-    try std.testing.expectEqual(@as(usize, 2), parsed.modifiers.skill_directories.len);
-    try std.testing.expectEqualStrings("./team skills", parsed.modifiers.skill_directories[0]);
-    try std.testing.expectEqualStrings("/opt/shared-skills", parsed.modifiers.skill_directories[1]);
+    try std.testing.expectEqual(@as(usize, 2), parsed.modifiers.invocation_skill_roots.len);
+    try std.testing.expectEqualStrings("./team skills", parsed.modifiers.invocation_skill_roots[0]);
+    try std.testing.expectEqualStrings("/opt/shared-skills", parsed.modifiers.invocation_skill_roots[1]);
     try std.testing.expectEqualStrings("ask", parsed.remaining[0]);
 }
 
@@ -4548,7 +4572,7 @@ test "invocation skill root canonicalization preserves allocator failure" {
     const alloc = std.testing.allocator;
     const roots = try alloc.alloc([]u8, 1);
     roots[0] = try alloc.dupe(u8, "/tmp");
-    var modifiers = LaunchModifiers{ .skill_directories = roots };
+    var modifiers = LaunchModifiers{ .invocation_skill_roots = roots };
     defer modifiers.deinit(alloc);
 
     var failing = std.testing.FailingAllocator.init(alloc, .{ .fail_index = 0 });
@@ -4589,7 +4613,7 @@ test "workflow launch config preserves ordered invocation skill roots" {
         @constCast("/opt/shared-skills"),
     };
     const workflow_cfg = workflowConfigWithLaunchModifiers(testConfig(), .{
-        .skill_directories = &roots,
+        .invocation_skill_roots = &roots,
     });
 
     try std.testing.expectEqual(@as(usize, 2), workflow_cfg.skill_root_policy.invocation_roots.len);
