@@ -29,6 +29,7 @@ pub const TopLevelKind = enum {
     upgrade,
     replay,
     workspace,
+    structured_inference,
 };
 
 pub const SlashKind = enum {
