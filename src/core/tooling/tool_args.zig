@@ -221,3 +221,19 @@ test "composite object normalization preserves objects and decodes JSON strings"
         normalizeCompositeObjectValue(arena, &invalid),
     );
 }
+
+/// The object a command-bearing tool call's fields live in. The model-facing
+/// request may still be wrapped in a sole `request` object, or may already
+/// have been normalized for internal dispatch; both name the same command
+/// authority, and every reader of a command payload must read the same object
+/// so admission, presentation, and dispatch never disagree about the command.
+/// Anything other than a lone `request` object is the flat payload itself and
+/// fails closed at decode when it is not a command.
+pub fn commandArguments(args: std.json.ObjectMap) std.json.ObjectMap {
+    if (args.count() != 1) return args;
+    const request = args.get("request") orelse return args;
+    return switch (request) {
+        .object => |object| object,
+        else => args,
+    };
+}
