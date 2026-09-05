@@ -5,6 +5,7 @@ import { Socket } from "node:net";
 import { homedir } from "node:os";
 import { isAbsolute, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
+import { CoreOutput } from "./core-output.js";
 import {
   createFxAgent as createWasmAgent,
   createFxTerminal as createWasmTerminal,
@@ -254,8 +255,9 @@ function createNativeCoreRuntime(addon, options) {
   const readyClosed = new Promise((resolve) => readySocket.once("close", resolve));
   let exitedResolve;
   let lineHandler = null;
-  let lineBuffer = "";
-  const decoder = new TextDecoder();
+  const output = new CoreOutput((message, size) => lineHandler(message, size));
+  let draining = false;
+  let outputError;
   let settled = false;
   let fetchState = null;
   let codexSessionState = null;
@@ -265,9 +267,11 @@ function createNativeCoreRuntime(addon, options) {
     codexSessionState?.controller.abort();
     try { addon.abortCoreFetch(core); } catch {}
   };
-  const finish = (code) => {
+  const finish = (code, error) => {
     if (settled) return;
     settled = true;
+    outputError = error;
+    output.close();
     abortHostEffects();
     try { addon.destroyCore(core); } catch {}
     readySocket.destroy();
@@ -442,23 +446,33 @@ function createNativeCoreRuntime(addon, options) {
         const sessionRequest = addon.takeCoreCodexSessionOperation(core);
         if (sessionRequest) void pumpCodexSession(sessionRequest);
       }
-      if (lineHandler) {
-        for (;;) {
-          const chunk = addon.drainCore(core);
-          if (!chunk.length) break;
-          lineBuffer += decoder.decode(chunk, { stream: true });
-          for (;;) {
-            const newline = lineBuffer.indexOf("\n");
-            if (newline < 0) break;
-            const line = lineBuffer.slice(0, newline);
-            lineBuffer = lineBuffer.slice(newline + 1);
-            if (line) void Promise.resolve(lineHandler(JSON.parse(line))).catch(() => finish(1));
-          }
-        }
+      if (addon.coreExitCode(core) !== 0) {
+        finish(1, new Error("native output delivery failed"));
+        return;
       }
-      if (addon.coreExited(core)) finish(addon.coreExitCode(core));
-    } catch {
-      finish(1);
+      void drainOutput();
+    } catch (error) {
+      finish(1, error);
+    }
+  }
+  async function drainOutput() {
+    if (draining || settled) return;
+    draining = true;
+    try {
+      while (!settled) {
+        const chunk = addon.drainCore(core);
+        if (!chunk.length) break;
+        const pending = output.write(chunk);
+        if (pending) await pending;
+      }
+      if (!settled && addon.coreExited(core)) {
+        output.finish();
+        finish(addon.coreExitCode(core));
+      }
+    } catch (error) {
+      finish(1, error);
+    } finally {
+      draining = false;
     }
   }
 
@@ -473,11 +487,15 @@ function createNativeCoreRuntime(addon, options) {
 
   return {
     exited,
+    get error() { return outputError; },
     write(data) { addon.writeCore(core, Buffer.from(data)); },
     closeStdin() { addon.closeCore(core); },
     abortHostEffects,
-    abort() { abortHostEffects(); addon.closeCore(core); },
-    setLineHandler(handler) { lineHandler = handler; drainReady(); },
+    abort(error) {
+      if (error) finish(1, error);
+      else { abortHostEffects(); addon.closeCore(core); }
+    },
+    setLineHandler(handler) { lineHandler = handler; },
   };
 }
 

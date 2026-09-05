@@ -1,4 +1,6 @@
 const std = @import("std");
+const skill_contract = @import("../skills/skill_contract.zig");
+const skill_invocation = @import("../skills/skill_invocation.zig");
 const agent_runtime = @import("../agent/agent_runtime.zig");
 const worker_runtime = @import("../agent/worker_runtime.zig");
 const auth_runtime = @import("../auth/auth_runtime.zig");
@@ -46,8 +48,7 @@ pub const Config = struct {
     provider_set: provider_set.Set,
     system_prompt: []const u8,
     model_prompt_overlay: ?[]const u8 = null,
-    skills_prompt_section: []const u8 = "",
-    explicit_skills_prompt_section: []const u8 = "",
+    skill_catalog: skill_invocation.Catalog = .{ .skills = &.{} },
     advertised_tool_names: []const []const u8 = &.{},
     advertised_functions: []const model_tool_schema.FunctionSchema = &.{},
     custom_tool_guidance: []const u8 = "",
@@ -204,9 +205,12 @@ pub fn run(
         .subagent_id = trace_context.subagent_id,
     };
     defer if (context.refreshed_credential) |*credential| credential.deinit(turn.alloc);
+    const recovery_checkpoint = turn.prepareRecoveryForActiveWork(arena) catch |err| {
+        if (err == error.OutOfMemory) return error.OutOfMemory;
+        turn.setFailureDiagnostic("recovery_admission_failed", @errorName(err)) catch return error.OutOfMemory;
+        return error.ProviderFailed;
+    };
     const history = turn.sessionRuntime().snapshotHistory(arena) catch return error.OutOfMemory;
-    const recovery_checkpoint = turn.snapshotRecoveryCheckpoint(arena) catch
-        return error.OutOfMemory;
     const prompt = worker_runtime.QueuedPrompt{
         .turn_id = trace_context.turn_id,
         .prompt = arena.dupe(u8, message.content) catch return error.OutOfMemory,
@@ -225,7 +229,6 @@ pub fn run(
             null,
         .permission_mode = admission.permission_mode,
         .history = history,
-        .context_history_start = turn.sessionRuntime().contextHistoryStart(),
         .unversioned_history_count = turn.sessionRuntime().unversionedHistoryEnd(),
         .root_user_intent_context = if (message.root_user_intent_context.len > 0)
             arena.dupe(u8, message.root_user_intent_context) catch return error.OutOfMemory
@@ -287,8 +290,7 @@ pub fn run(
         .{
             .system_prompt = child_system_prompt,
             .model_prompt_overlay = config.model_prompt_overlay,
-            .skills_prompt_section = config.skills_prompt_section,
-            .explicit_skills_prompt_section = config.explicit_skills_prompt_section,
+            .skill_catalog = config.skill_catalog,
             .gateway_retry_count = config.tool_context.gateway_retry_count,
             .gateway_chat_url = config.tool_context.gateway_chat_url,
             .advertised_tool_names = child_tool_names,
@@ -367,7 +369,6 @@ fn runtimeDeps(context: *Context) agent_runtime.AgentRuntimeDeps {
     return .{
         .ctx = context,
         .agent_stream_provider = context.config.tool_context.agent_stream_provider,
-        .compaction_route = context.config.tool_context.compaction_route,
         .tool_registry = context.config.tool_context.tool_registry,
         .context_registry = context.config.context_registry,
         .context_enabled = context.config.context_enabled,
@@ -379,6 +380,8 @@ fn runtimeDeps(context: *Context) agent_runtime.AgentRuntimeDeps {
         .append_runtime_context = appendRuntimeContext,
         .append_static_context = appendStaticContext,
         .validate_tool_call = validateToolCall,
+        .snapshot_mcp_definition = snapshotMcpDefinition,
+        .prepare_skill_call = prepareSkillCall,
         .check_tool_availability = checkToolAvailability,
         .request_tool_permission = requestToolPermission,
         .request_prepared_file_mutation_permission = requestPreparedFileMutationPermission,
@@ -390,6 +393,7 @@ fn runtimeDeps(context: *Context) agent_runtime.AgentRuntimeDeps {
         .execute_tool_call = executeToolCall,
         .publish_committed_file_handoff = publishCommittedFileHandoff,
         .propagate_history_turn = propagateHistoryTurn,
+        .commit_context_compaction = .{ .commit = commitContextCompaction },
         .recovery_checkpoint = .{
             .set = setRecoveryCheckpoint,
         },
@@ -593,6 +597,11 @@ test "subagent inherits model capabilities" {
     try std.testing.expectEqual(resolver.resolve_fn, inherited.?.resolve_fn);
 }
 
+fn snapshotMcpDefinition(raw: *anyopaque, arena: Allocator, name: []const u8, known: tool_mcp_runtime.Binding) !tool_mcp_runtime.DefinitionSnapshot {
+    const context: *Context = @ptrCast(@alignCast(raw));
+    return tool_runtime.snapshotMcpDefinition(context.toolContext(), arena, name, known);
+}
+
 fn validateToolCall(raw: *anyopaque, arena: Allocator, call: types.ToolCall) !agent_runtime.ToolCallValidationResult {
     const context: *Context = @ptrCast(@alignCast(raw));
     return tool_runtime.validateToolCall(context.toolContext(), arena, call);
@@ -601,6 +610,11 @@ fn validateToolCall(raw: *anyopaque, arena: Allocator, call: types.ToolCall) !ag
 fn checkToolAvailability(raw: *anyopaque, arena: Allocator, call: types.ToolCall) !?[]const u8 {
     const context: *Context = @ptrCast(@alignCast(raw));
     return tool_runtime.checkToolAvailability(context.toolContext(), arena, call);
+}
+
+fn prepareSkillCall(raw: *anyopaque, arena: Allocator, call: types.ToolCall, locations: ?*const skill_contract.Locations) !skill_contract.CallPreparation {
+    const context: *Context = @ptrCast(@alignCast(raw));
+    return tool_runtime.prepareSkillCall(context.toolContext(), arena, call, locations);
 }
 
 fn admissionContext(
@@ -624,9 +638,11 @@ fn requestToolPermission(
     live: ?agent_runtime.LiveToolAuthority,
     revalidation: ?agent_runtime.LivePermissionRevalidation,
     dynamic_names: []const []const u8,
+    mcp_review_schema_json: ?[]const u8,
 ) !command_admission.PermissionOutcome {
     const context: *Context = @ptrCast(@alignCast(raw));
-    const tool_ctx = admissionContext(context, dynamic_names, review);
+    var tool_ctx = admissionContext(context, dynamic_names, review);
+    tool_ctx.mcp_review_schema_json = mcp_review_schema_json;
     if (revalidation) |request| return switch (request) {
         .action => |action| tool_admission.revalidateLiveActionPermissionOutcome(
             tool_ctx.admissionInputWithLiveAuthority(live),
@@ -687,6 +703,7 @@ fn resolveToolActionDisplayTarget(raw: *anyopaque, arena: Allocator, call: types
         context.config.tool_context.tool_registry,
         context.config.tool_context.workspace_root,
         context.config.tool_context.terminal_client,
+        context.config.tool_context.managed_executions,
         call,
     );
 }
@@ -724,6 +741,16 @@ fn propagateHistoryTurn(raw: *anyopaque, turn: types.HistoryTurn) !void {
         context.output_tokens,
         io_mod.milliTimestamp(),
     );
+}
+
+fn commitContextCompaction(
+    raw: *anyopaque,
+    summary: types.CompactedSummaryHistoryTurn,
+    active_prefix: ?types.AssistantHistoryTurn,
+    retained_from: ?types.ContextHistoryCut,
+) !void {
+    const context: *Context = @ptrCast(@alignCast(raw));
+    try context.turn.commitContextCompaction(summary, active_prefix, retained_from, io_mod.milliTimestamp());
 }
 
 fn setRecoveryCheckpoint(

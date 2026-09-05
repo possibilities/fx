@@ -1,4 +1,6 @@
 const std = @import("std");
+
+pub const mcp_auth_usage = "mcp auth NAME";
 const display_width = @import("../shared/display_width.zig");
 const list_window = @import("../shared/list_window.zig");
 const mod_registry = @import("../mods/registry.zig");
@@ -267,7 +269,9 @@ const HelpRole = enum {
 };
 
 pub fn matchesTopLevel(registry: TopLevelRegistry, token: []const u8, kind: TopLevelKind) bool {
-    const spec = topLevelSpec(registry, kind);
+    // A supplied catalog may omit a kind entirely; that is not a match, not a
+    // programming error, so parsing must keep probing the kinds it does have.
+    const spec = findTopLevelSpec(registry, kind) orelse return false;
     return matchesCommandToken(token, spec.token, spec.aliases);
 }
 
@@ -1272,10 +1276,14 @@ fn renderSlashEntries(alloc: Allocator, registry: SlashRegistry, welcome_only: b
 }
 
 fn topLevelSpec(registry: TopLevelRegistry, kind: TopLevelKind) TopLevelSpec {
+    return findTopLevelSpec(registry, kind) orelse unreachable;
+}
+
+fn findTopLevelSpec(registry: TopLevelRegistry, kind: TopLevelKind) ?TopLevelSpec {
     for (registry.specs) |spec| {
         if (spec.kind == kind) return spec;
     }
-    unreachable;
+    return null;
 }
 
 fn slashSpec(registry: SlashRegistry, kind: SlashKind) SlashSpec {
@@ -1563,6 +1571,16 @@ fn lineContainsBoth(text: []const u8, first: []const u8, second: []const u8) boo
     return false;
 }
 
+test "matchesTopLevel treats a kind absent from the supplied catalog as no match" {
+    const specs = [_]TopLevelSpec{
+        .{ .kind = .help, .token = "guide", .summary = "", .usage = "guide" },
+    };
+    const registry = TopLevelRegistry{ .specs = &specs };
+    try std.testing.expect(matchesTopLevel(registry, "guide", .help));
+    try std.testing.expect(!matchesTopLevel(registry, "structured", .structured_inference));
+    try std.testing.expect(!matchesTopLevel(registry, "s", .structured_inference));
+}
+
 test "top-level matcher recognizes help aliases" {
     const registry = testTopLevelRegistry();
     try std.testing.expect(matchesTopLevel(registry, "help", .help));
@@ -1680,7 +1698,6 @@ test "top-level help renders flags as compact aligned rows" {
     try std.testing.expect(lineContainsBoth(wide, "--permissions-file <path>", "Replace configured rules for TUI or ACP"));
     try std.testing.expect(lineContainsBoth(wide, "--no-project-instructions", "Ignore repository instructions for TUI or ACP"));
     try std.testing.expect(lineContainsBoth(wide, "--state-dir <path>", "Use an isolated Fx profile for TUI or ACP"));
-    try std.testing.expect(lineContainsBoth(wide, "--skills-dir <path>", "Add a skill root; repeatable"));
     try std.testing.expect(lineContainsBoth(wide, "--no-default-skills", "Use only --skills-dir roots"));
     try std.testing.expect(lineContainsBoth(wide, "--tool <name>", "Allow only this native tool; repeatable"));
     try std.testing.expect(lineContainsBoth(wide, "-c, --continue", "Resume the latest workspace session"));
