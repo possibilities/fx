@@ -185,8 +185,9 @@ pub fn permissionTargetForCall(
 
     return switch (target_kind) {
         .command_cwd => blk: {
-            const command = try tool_args.requiredStringArg(args, "command");
-            const cwd = try resolveCommandCwdFromArgs(arena, workspace_root, args);
+            const command_args = tool_args.commandArguments(args);
+            const command = try tool_args.requiredStringArg(command_args, "command");
+            const cwd = try resolveCommandCwdFromArgs(arena, workspace_root, command_args);
             break :blk std.fmt.allocPrint(arena, "{s}::{s}", .{ cwd, command });
         },
         .url => arena.dupe(u8, try tool_args.requiredStringArg(args, "url")),
@@ -223,7 +224,7 @@ pub fn resolveCommandCwdForCallInScope(
     var scratch_state = std.heap.ArenaAllocator.init(alloc);
     defer scratch_state.deinit();
     const scratch = scratch_state.allocator();
-    const args = try tool_args.parseToolArgsObject(scratch, call.arguments_json);
+    const args = tool_args.commandArguments(try tool_args.parseToolArgsObject(scratch, call.arguments_json));
     const cwd = try resolveCommandCwdFromArgsInScope(scratch, scope, args);
     return alloc.dupe(u8, cwd);
 }
@@ -317,7 +318,7 @@ pub fn permissionTargetForCallInScope(
     if (target_kind != .command_cwd) {
         return permissionTargetForCall(arena, scope.primary_directory, call, target_kind);
     }
-    const args = try tool_args.parseToolArgsObject(arena, call.arguments_json);
+    const args = tool_args.commandArguments(try tool_args.parseToolArgsObject(arena, call.arguments_json));
     const command = try tool_args.requiredStringArg(args, "command");
     const cwd = try resolveCommandCwdFromArgsInScope(arena, scope, args);
     return std.fmt.allocPrint(arena, "{s}::{s}", .{ cwd, command });
