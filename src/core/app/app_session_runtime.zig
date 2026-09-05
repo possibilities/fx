@@ -2685,6 +2685,13 @@ pub fn Runtime(comptime App: type) type {
         pub fn ensureCachedSessionTitle(app: *App) !void {
             if (comptime !@hasField(App, "session_title")) return;
             if (app.session_title.items.len > 0) return;
+            if (comptime @hasField(App, "session_persistence")) {
+                if (app.session_persistence.writable != null) {
+                    app.session_persistence.write_mutex.lockUncancelable(io_mod.getIo());
+                    defer app.session_persistence.write_mutex.unlock(io_mod.getIo());
+                    return ensureCachedSessionTitleLocked(app);
+                }
+            }
             var display = session_display_metadata.deriveFromHistory(
                 app.alloc,
                 app.session.agent.history.items,
@@ -2694,12 +2701,6 @@ pub fn Runtime(comptime App: type) type {
             };
             defer display.deinit(app.alloc);
             if (!display.present) return;
-            if (comptime @hasField(App, "session_persistence")) {
-                if (app.session_persistence.writable != null) {
-                    try persistActiveSessionTitle(app, display.title);
-                    return;
-                }
-            }
             try setCachedSessionTitle(app, display.title);
         }
 
@@ -2755,12 +2756,23 @@ pub fn Runtime(comptime App: type) type {
             try publishSessionTitle(app, title);
         }
 
-        /// The derived first-turn title for a caller that already holds the
-        /// session write mutex with a writable session: the history commit
-        /// installs it in place, so the manifest rename must not lock again.
+        /// The first-turn title for a caller that already holds the session
+        /// write mutex with a writable session. Upstream's conversation layer
+        /// commits the derived title itself when the first turn lands, so a
+        /// title already in the manifest is adopted rather than re-derived;
+        /// only a conversation without one is named here, in place, because
+        /// the manifest rename must not lock again.
         fn ensureCachedSessionTitleLocked(app: *App) !void {
             if (comptime !@hasField(App, "session_title")) return;
             if (app.session_title.items.len > 0) return;
+            {
+                const loaded = &app.session_persistence.writable.?;
+                if (try loaded.conversationTitle(app.alloc)) |stored| {
+                    defer app.alloc.free(stored);
+                    try publishSessionTitle(app, stored);
+                    return;
+                }
+            }
             var display = session_display_metadata.deriveFromHistory(
                 app.alloc,
                 app.session.agent.history.items,
@@ -9787,7 +9799,7 @@ test "generated title committed before first history remains authoritative in th
     );
 }
 
-test "derived legacy resume title is not exposed as durable native metadata" {
+test "a saved session's derived title is durable native metadata until a generated title replaces it" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -9819,7 +9831,9 @@ test "derived legacy resume title is not exposed as durable native metadata" {
         "legacy resume title from saved history",
         Runtime(TestApp).cachedSessionTitle(&app).?,
     );
-    try std.testing.expect(Runtime(TestApp).durableCachedSessionTitle(&app) == null);
+    // Upstream's conversation storage records the derived title in the
+    // manifest itself, so a resumed session's derived title is durable.
+    try expectActiveTitleDurable(&app, "legacy resume title from saved history");
 
     try Runtime(TestApp).applyGeneratedSessionTitle(&app, "Committed native title");
     try std.testing.expectEqualStrings(
