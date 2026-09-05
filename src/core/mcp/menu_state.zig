@@ -1,4 +1,5 @@
 const std = @import("std");
+const health = @import("health.zig");
 const text_utils = @import("../shared/text_utils.zig");
 
 pub const Section = enum {
@@ -43,6 +44,17 @@ pub const Action = enum {
     trust_reset,
     insert_preview,
 };
+
+pub fn serverActionAvailable(action: Action, server: *const health.ServerSnapshot) bool {
+    return switch (action) {
+        .authenticate => server.transport == .http and server.authentication == .required and server.connection != .connecting,
+        .logout => server.transport == .http and server.authentication == .authenticated,
+        .remove => server.source == .profile,
+        .trust_approve => server.workspace_admission == .pending,
+        .trust_reject => server.source == .workspace and server.workspace_admission != .rejected,
+        else => true,
+    };
+}
 
 pub const Request = struct {
     generation: u64,
@@ -130,6 +142,18 @@ const Transition = struct {
     effect: ?Effect = null,
 };
 
+test "server selection stays coherent through details navigation" {
+    var state: State = .{};
+    _ = apply(&state, .{ .open = 3 });
+    _ = apply(&state, .show_details);
+    _ = apply(&state, .{ .move = .{ .delta = 1, .item_count = 3, .visible_count = 3 } });
+    try std.testing.expectEqual(@as(usize, 1), state.selected_server_index);
+    _ = apply(&state, .back);
+    try std.testing.expectEqual(state.selected_server_index, state.selected_index);
+    _ = apply(&state, .show_details);
+    try std.testing.expectEqual(@as(usize, 1), state.selected_server_index);
+}
+
 fn reduce(current: State, event: Event) Transition {
     var state = current;
     const effect = apply(&state, event);
@@ -177,7 +201,7 @@ pub fn apply(next: *State, event: Event) ?Effect {
                     next.selected_index - 1;
             }
             clampSelection(next, move.item_count, move.visible_count);
-            if (next.section == .servers and next.screen == .browse) {
+            if (next.section == .servers) {
                 next.selected_server_index = next.selected_index;
             }
             break :blk null;

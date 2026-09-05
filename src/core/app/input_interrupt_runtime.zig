@@ -46,10 +46,24 @@ test "cancellation target distinguishes agent turns and manual compaction" {
 pub fn InterruptRuntime(comptime App: type) type {
     return struct {
         pub fn hasActiveOperation(app: *App) bool {
+            if (comptime @hasField(App, "auth")) {
+                if (comptime @hasDecl(@TypeOf(app.auth), "providerPreparationPending")) {
+                    if (app.auth.providerPreparationPending()) return true;
+                }
+            }
             return activeCancellationTarget(app) != .none;
         }
 
         pub fn cancelActiveOperation(app: *App) !void {
+            if (comptime @hasField(App, "auth")) {
+                if (comptime @hasDecl(@TypeOf(app.auth), "cancelProviderPreparation")) {
+                    if (app.auth.cancelProviderPreparation()) {
+                        if (comptime @hasDecl(App, "cancelPendingSubmission")) _ = App.cancelPendingSubmission(app);
+                        app.shell.render_requests.request(.footer);
+                        return;
+                    }
+                }
+            }
             if (activeCancellationTarget(app) == .context_compaction) {
                 if (comptime !@hasDecl(
                     @TypeOf(app.worker),
