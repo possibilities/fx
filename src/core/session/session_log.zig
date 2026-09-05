@@ -1993,6 +1993,9 @@ pub const LoadedWritableSession = struct {
     conversation_writer: ConversationWriter,
     log: WritableSessionDir,
     freshly_started: bool = false,
+    /// A title committed through the rename path before the first history
+    /// turn; the derived first-turn title must not replace it.
+    title_committed: bool = false,
     child_capability: ?*session_child_store.SessionChildCapability = null,
     position: CommitPosition,
     migration_source_schema_version: ?u8 = null,
@@ -2087,6 +2090,7 @@ pub const LoadedWritableSession = struct {
             manifest_file,
             encoded,
         );
+        self.title_committed = true;
         return true;
     }
 
@@ -2196,7 +2200,7 @@ pub const LoadedWritableSession = struct {
     }
 
     fn writeFirstConversationTitle(self: *LoadedWritableSession, alloc: Allocator, turn: session.HistoryTurn) void {
-        if (!self.freshly_started) return;
+        if (!self.freshly_started or self.title_committed) return;
         var display = session_display_metadata.deriveFromHistory(alloc, &.{turn}) catch return;
         defer display.deinit(alloc);
         if (!display.present) return;
