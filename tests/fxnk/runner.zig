@@ -3,6 +3,17 @@ const std = @import("std");
 
 const expected_names = [_][]const u8{
     "acp.sessions.test.ACP restore rejects MCP servers when host capability is disabled",
+    "core.tooling.tool_admission.test.wrapped shell commands preserve exact normalized admission authority",
+    "core.tooling.tool_admission.test.automatic review trace preserves the typed unavailable cause without action text",
+    "core.slash_commands.command_specs.test.matchesTopLevel treats a kind absent from the supplied catalog as no match",
+    "core.slash_commands.command_specs.test.top-level help renders flags as compact aligned rows",
+    "core.cli.cli_surface.test.CLI surface uses the supplied command catalog for parsing usage and help",
+    "core.cli.cli_surface.test.ACP command resolves selected native tools in invocation order",
+    "core.app.app_entry_runtime.test.app entry preserves ordered native tool selection across upgrade relaunch",
+    "core.app.app_entry_runtime.test.app entry relaunches only after teardown with the validated handoff",
+    "acp.prompt.test.ACP native tool gate keeps the native set empty",
+    "core.tooling.tool_selection.test.native tool selections resolve aliases and preserve flag order",
+    "acp.types.test.writeAgentMessageChunk produces valid json",
     "builtins.hooks.ade_events.test.ADE feed serializes a main turn as one versioned JSON line",
     "builtins.hooks.ade_events.test.ADE feed serializes native session metadata as a generic raw event",
     "builtins.hooks.ade_events.test.ADE feed serializes an additive Git root discovery record",

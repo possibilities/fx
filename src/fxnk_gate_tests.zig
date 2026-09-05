@@ -3,6 +3,8 @@
 // compiling and discovering the complete native test graph for every edit.
 test {
     _ = @import("acp/sessions.zig");
+    _ = @import("acp/types.zig");
+    _ = @import("acp/prompt.zig");
     _ = @import("builtins/hooks/ade_events.zig");
     _ = @import("builtins/hooks/ade_git_roots.zig");
     _ = @import("builtins/hooks/lifecycle_state.zig");
@@ -37,6 +39,9 @@ test {
     _ = @import("core/skills/skill_runtime.zig");
     _ = @import("core/subagent/approval_registry.zig");
     _ = @import("core/tooling/tool_runtime.zig");
+    _ = @import("core/tooling/tool_selection.zig");
+    _ = @import("core/tooling/tool_admission.zig");
+    _ = @import("core/slash_commands/command_specs.zig");
     _ = @import("gateway/responses_protocol.zig");
     _ = @import("tools/skills/skill_search.zig");
     _ = @import("napi_session_store.zig");

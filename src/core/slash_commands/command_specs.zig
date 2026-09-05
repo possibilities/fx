@@ -1575,7 +1575,7 @@ test "matchesTopLevel treats a kind absent from the supplied catalog as no match
     const specs = [_]TopLevelSpec{
         .{ .kind = .help, .token = "guide", .summary = "", .usage = "guide" },
     };
-    const registry = TopLevelRegistry{ .specs = &specs };
+    const registry = TopLevelRegistry{ .specs = &specs, .description = "", .interactive_hint = "" };
     try std.testing.expect(matchesTopLevel(registry, "guide", .help));
     try std.testing.expect(!matchesTopLevel(registry, "structured", .structured_inference));
     try std.testing.expect(!matchesTopLevel(registry, "s", .structured_inference));
@@ -1697,7 +1697,7 @@ test "top-level help renders flags as compact aligned rows" {
     try std.testing.expect(lineContainsBoth(wide, "--no-native-tools", "Disable native tools for TUI or ACP"));
     try std.testing.expect(lineContainsBoth(wide, "--permissions-file <path>", "Replace configured rules for TUI or ACP"));
     try std.testing.expect(lineContainsBoth(wide, "--no-project-instructions", "Ignore repository instructions for TUI or ACP"));
-    try std.testing.expect(lineContainsBoth(wide, "--state-dir <path>", "Use an isolated Fx profile for TUI or ACP"));
+    try std.testing.expect(lineContainsBoth(wide, "--state-dir <path>", "Use an isolated Fx profile and prompt for TUI or ACP"));
     try std.testing.expect(lineContainsBoth(wide, "--no-default-skills", "Use only --skills-dir roots"));
     try std.testing.expect(lineContainsBoth(wide, "--tool <name>", "Allow only this native tool; repeatable"));
     try std.testing.expect(lineContainsBoth(wide, "-c, --continue", "Resume the latest workspace session"));
