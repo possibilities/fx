@@ -3164,6 +3164,9 @@ fn createNativeSession(
         .conversation_writer = conversation_writer,
         .log = writable.*,
         .freshly_started = true,
+        // A converted history already carries its derived title; the first
+        // new turn must not replace it with a derivation of its own.
+        .title_committed = display.present,
         .position = position,
     };
     writable.* = undefined;

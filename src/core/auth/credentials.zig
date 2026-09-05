@@ -484,8 +484,14 @@ pub fn resolveForProviderWithStore(
 ) !Resolution {
     if (provider != .gateway) {
         const source = provider_catalog.find(provider).login_source;
+        // An unavailable subscription store is the provider source failing to
+        // load, reported like every other load failure so the diagnostic names
+        // the saved credential rather than the API-key store.
         if (provider == .codex) switch (chatgpt_store) {
-            .profile => |configured_home| if (configured_home == null) try requireSourceStorage(source),
+            .profile => |configured_home| if (configured_home == null) requireSourceStorage(source) catch |err| {
+                debug_trace.logf("auth", "provider source storage unavailable source={t} err={s}", .{ source, @errorName(err) });
+                return .{ .failure = .{ .source = source, .err = err } };
+            },
             .host => {},
         };
         const credential = (if (provider == .codex)
