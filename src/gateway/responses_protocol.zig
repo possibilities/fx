@@ -1591,15 +1591,21 @@ test "Responses finalization checks correlation types and rejects unmatched fina
     }
 }
 
-test "Responses finalization retains cancellation and terminal requirements" {
+test "Responses finalization requires a terminal and honors one read under cancellation" {
     var stream = ToolRecordTest.init(std.testing.allocator);
     defer stream.deinit();
     try stream.apply(ToolRecordTest.start);
     try stream.apply(ToolRecordTest.finalized);
     try std.testing.expectError(error.StreamIncomplete, stream.finish());
     stream.cancelled.store(true, .seq_cst);
-    try std.testing.expectError(error.Cancelled, stream.apply(ToolRecordTest.terminal));
+    try std.testing.expectError(error.Cancelled, stream.apply(ToolRecordTest.finalized));
     try std.testing.expectError(error.Cancelled, stream.finish());
+    // A terminal event read after cancellation is still the provider's
+    // authoritative outcome and completes the stream.
+    try stream.apply(ToolRecordTest.terminal);
+    const completion = try stream.finish();
+    defer stream.freeCompletion(completion);
+    try std.testing.expectEqual(@as(usize, 1), completion.tool_calls.len);
 }
 
 test "Responses rejects malformed supplied output indexes without requiring omitted metadata" {
