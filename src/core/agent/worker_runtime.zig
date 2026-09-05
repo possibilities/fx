@@ -307,11 +307,14 @@ pub const CommandOutputChunk = struct {
 
 pub const SteeringPresentationSnapshot = struct {
     messages: [][]u8 = &.{},
+    pending_feedback: [][]u8 = &.{},
     waits_for_tool: bool = false,
 
     pub fn deinit(self: *SteeringPresentationSnapshot, alloc: std.mem.Allocator) void {
         for (self.messages) |message| alloc.free(message);
         if (self.messages.len > 0) alloc.free(self.messages);
+        for (self.pending_feedback) |message| alloc.free(message);
+        if (self.pending_feedback.len > 0) alloc.free(self.pending_feedback);
         self.* = .{};
     }
 };
@@ -1454,6 +1457,25 @@ pub const WorkerRuntime = struct {
         }
         var snapshot: SteeringPresentationSnapshot = .{
             .waits_for_tool = steering_count > 0 and self.hasActiveToolBoundaryLocked(),
+        };
+        errdefer snapshot.deinit(alloc);
+        snapshot.pending_feedback = pending: {
+            var count: usize = 0;
+            for (self.worker_events.items) |event| {
+                if (event == .append_user_feedback) count += 1;
+            }
+            if (count == 0) break :pending &.{};
+            const feedback = try alloc.alloc([]u8, count);
+            errdefer alloc.free(feedback);
+            var written: usize = 0;
+            errdefer for (feedback[0..written]) |message| alloc.free(message);
+            for (self.worker_events.items) |event| {
+                if (event == .append_user_feedback) {
+                    feedback[written] = try alloc.dupe(u8, event.append_user_feedback);
+                    written += 1;
+                }
+            }
+            break :pending feedback;
         };
         if (steering_count == 0) return snapshot;
 
@@ -4286,6 +4308,61 @@ test "immediate steering is visible while the provider cutoff settles" {
     try std.testing.expectEqualStrings("first", snapshot.messages[0]);
     try std.testing.expectEqualStrings("second", snapshot.messages[1]);
     try std.testing.expect(!snapshot.waits_for_tool);
+}
+
+test "steering presentation survives queue to feedback transfer without duplicate input" {
+    const alloc = std.testing.allocator;
+    var runtime = WorkerRuntime{};
+    defer runtime.deinit(alloc);
+    try std.testing.expect(runtime.beginDirectProcessing(41));
+    try runtime.admitInteractivePrompt(alloc, try makePrompt(alloc, "same text", "model"));
+    try runtime.admitInteractivePrompt(alloc, try makePrompt(alloc, "same text", "model"));
+
+    var queued = try runtime.snapshotSteeringPresentation(alloc);
+    defer queued.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 2), queued.messages.len);
+    try std.testing.expectEqual(@as(usize, 0), queued.pending_feedback.len);
+
+    const guidance = try expectContinuedSteering(try runtime.takeSteeringBoundary(alloc, 41, .cancelled));
+    defer {
+        for (guidance) |message| alloc.free(message);
+        alloc.free(guidance);
+    }
+    var consumed = try runtime.snapshotSteeringPresentation(alloc);
+    defer consumed.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 0), consumed.messages.len);
+    try std.testing.expectEqual(@as(usize, 2), consumed.pending_feedback.len);
+    for (consumed.pending_feedback) |message| try std.testing.expectEqualStrings("same text", message);
+
+    var events = runtime.takeEvents();
+    defer freeEventList(alloc, &events);
+    var drained = try runtime.snapshotSteeringPresentation(alloc);
+    defer drained.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 0), drained.pending_feedback.len);
+    try std.testing.expectEqual(@as(usize, 2), events.items.len);
+    runtime.finishProcessing();
+}
+
+test "steering snapshot allocation failure preserves queue and feedback ownership" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, struct {
+        fn run(alloc: std.mem.Allocator) !void {
+            const backing = std.testing.allocator;
+            var runtime = WorkerRuntime{};
+            defer runtime.deinit(backing);
+            try std.testing.expect(runtime.beginDirectProcessing(41));
+            try runtime.pushEvent(backing, .{ .append_user_feedback = @constCast("earlier") });
+            try runtime.admitInteractivePrompt(backing, try makePrompt(backing, "later", "model"));
+            var snapshot = runtime.snapshotSteeringPresentation(alloc) catch |err| {
+                try std.testing.expectEqual(@as(usize, 1), runtime.queuedPromptCount());
+                try std.testing.expectEqual(@as(usize, 1), runtime.worker_events.items.len);
+                return err;
+            };
+            defer snapshot.deinit(alloc);
+            try std.testing.expectEqualStrings("earlier", snapshot.pending_feedback[0]);
+            try std.testing.expectEqualStrings("later", snapshot.messages[0]);
+            runtime.finishProcessing();
+        }
+    }.run, .{});
 }
 
 test "tool-blocked steering snapshot owns visible messages in admission order" {
