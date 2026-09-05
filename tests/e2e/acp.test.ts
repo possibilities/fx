@@ -7323,7 +7323,7 @@ describe("acp: model-independent", () => {
         const promptText = acpPromptText(gateway.requests[0]!.body);
         expect(promptText).toContain("invocation ACP fixture");
         expect(promptText).toContain(
-          '<skill_content name="acp-invocation" resource="SKILL.md"',
+          `<skill_content name="acp-invocation" location="${skillDirectory}" resource="SKILL.md" complete="true">`,
         );
         expect(promptText).toContain(skillBody);
         expect(client.stderr).toBe("");
