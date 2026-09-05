@@ -38,6 +38,8 @@ import {
   startDynamicFakeGateway,
   startFakeGateway,
   terminalFixtureShell,
+  TmuxSession,
+  tmuxAvailable,
 } from "./tmux-helpers";
 import {
   MODERN_HTTP_TOOL_RESULT,
@@ -202,6 +204,7 @@ function fakeGatewayEnv(
     FX_GATEWAY_CHAT_URL: gateway.chatUrl,
     FX_MODEL: FAKE_GATEWAY_MODEL,
     FX_AUTO_UPGRADE: "0",
+    FX_MCP_PROTOCOL_VERSION: "2026-07-28",
   };
 }
 
@@ -242,6 +245,26 @@ function acpTaggedBlock(body: string, tag: string): string {
   const end = text.indexOf(`</${tag}>`, start);
   if (start < 0 || end < 0) throw new Error(`Missing <${tag}> block`);
   return text.slice(start, end + tag.length + 3);
+}
+
+function acpSkillLocations(body: string, name: string): string[] {
+  return acpTaggedBlock(body, "available_skills").split("\n")
+    .filter((line) => line.startsWith(`- ${name}: `))
+    .map((line) => {
+      const start = line.lastIndexOf(" (location: ");
+      if (start < 0 || !line.endsWith(")")) throw new Error("Malformed skill location");
+      return line.slice(start + " (location: ".length, -1);
+    });
+}
+
+function acpSkillPath(body: string, location: string): string {
+  const match = /^skill:[0-9a-f]{16}:(\d+)\/(.+)$/.exec(location);
+  if (!match) throw new Error(`Invalid scoped skill location: ${location}`);
+  const prefix = `Root ${match[1]}: `;
+  const root = acpTaggedBlock(body, "available_skills").split("\n")
+    .find((line) => line.startsWith(prefix));
+  if (!root) throw new Error(`Missing root for ${location}`);
+  return join(root.slice(prefix.length), decodeURIComponent(match[2]!));
 }
 
 function acpToolResultText(body: string, callId: string): string {
@@ -1004,7 +1027,7 @@ async function runPromptBlocks(
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     const msg = await client.readLine(Math.min(30_000, Math.max(1_000, deadline - Date.now()))) as any;
-    if (msg.id === promptId && msg.result) {
+    if (msg.id === promptId && (msg.result !== undefined || msg.error !== undefined)) {
       promptResult = msg;
       break;
     }
@@ -1961,7 +1984,7 @@ describe("acp: model-independent", () => {
             id: FAKE_GATEWAY_MODEL,
             type: "language",
             tags: ["tool-use"],
-            context_window: 256_000,
+            context_window: 2_000_000,
             max_tokens: 64_000,
           }],
         },
@@ -1977,6 +2000,7 @@ describe("acp: model-independent", () => {
 
         const result = await runPrompt(client, submitted, 60_000);
 
+        expect(result.promptResult.error, JSON.stringify(result.promptResult)).toBeUndefined();
         expect(result.promptResult.result.stopReason).toBe("end_turn");
         expect(gateway.requests).toHaveLength(1);
         expect(gateway.modelRequests).toHaveLength(1);
@@ -2886,7 +2910,7 @@ describe("acp: model-independent", () => {
       try {
         client = await AcpClient.create({
           cwd: root.workspace,
-          env: fakeGatewayEnv(root, gateway),
+          env: { ...fakeGatewayEnv(root, gateway), FX_MCP_PROTOCOL_VERSION: undefined },
         });
         await client.request("initialize", { protocolVersion: 1 }, 1);
         const created = await client.request(
@@ -2909,13 +2933,15 @@ describe("acp: model-independent", () => {
           "call_legacy_http",
           `${LEGACY_REMOTE_TOOL_RESULT}:new`,
         );
+        expect(newFixture.requests.find((entry) => entry.message)?.message?.method).toBe("initialize");
+        expect(newFixture.requests.some((entry) => entry.message?.method === "server/discover")).toBe(false);
         client.endStdin();
         expect(await client.waitForExit()).toBe(0);
         expect(newFixture.deleteCalls).toBe(1);
 
         client = await AcpClient.create({
           cwd: root.workspace,
-          env: fakeGatewayEnv(root, gateway),
+          env: { ...fakeGatewayEnv(root, gateway), FX_MCP_PROTOCOL_VERSION: undefined },
         });
         await client.request("initialize", { protocolVersion: 1 }, 10);
         client.send({
@@ -2948,7 +2974,7 @@ describe("acp: model-independent", () => {
 
         client = await AcpClient.create({
           cwd: root.workspace,
-          env: fakeGatewayEnv(root, gateway),
+          env: { ...fakeGatewayEnv(root, gateway), FX_MCP_PROTOCOL_VERSION: undefined },
         });
         await client.request("initialize", { protocolVersion: 1 }, 20);
         client.send({
@@ -5277,7 +5303,7 @@ describe("acp: model-independent", () => {
           env: { HOME: root.home },
           timeoutMs: TIMEOUT,
         });
-        expect(detail.code).toBe(0);
+        expect(detail.code, detail.stdout + detail.stderr).toBe(0);
         expect(JSON.parse(detail.stdout).history_len).toBe(1);
         await client.close();
 
@@ -7198,17 +7224,31 @@ describe("acp: model-independent", () => {
   );
 
   test(
-    "ACP binds an explicitly invoked skill into the prompt",
+    "ACP delivers complete explicit skill and required reference content",
     async () => {
       const root = createIsolatedRoot("fx-acp-explicit-skill-");
       const skillDirectory = join(root.workspace, "skills", "acp-explicit");
-      const skillBody = "ACP_EXPLICIT_SKILL_BODY";
-      mkdirSync(skillDirectory, { recursive: true });
+      const skillBody = "ACP_EXPLICIT_SKILL_BODY\n" +
+        "Required ACP instruction.\n".repeat(1200) + "ACP_EXPLICIT_SKILL_TAIL";
+      const referenceBody = "ACP_REFERENCE_BODY\n" +
+        "Required reference instruction.\n".repeat(1000) + "ACP_REFERENCE_TAIL";
+      const referenceCallId = "acp_required_skill_reference";
+      mkdirSync(join(skillDirectory, "references"), { recursive: true });
       writeFileSync(
         join(skillDirectory, "SKILL.md"),
-        `---\nname: acp-explicit\ndescription: explicit ACP fixture\n---\n\n${skillBody}\n`,
+        `---\nname: acp-explicit\ndescription: explicit ACP fixture\n---\n\nRead references/required.md before substantive work.\n${skillBody}\n`,
       );
+      writeFileSync(join(skillDirectory, "references", "required.md"), referenceBody);
       const gateway = startFakeGateway([
+        (body) => {
+          const locations = acpSkillLocations(body, "acp-explicit");
+          expect(locations).toHaveLength(1);
+          expect(acpSkillPath(body, locations[0]!)).toBe(skillDirectory);
+          return fakeGatewayToolCall(referenceCallId, "skill", {
+            location: locations[0],
+            resource: "references/required.md",
+          });
+        },
         finalText("ACP explicit skill complete"),
       ]);
       try {
@@ -7219,21 +7259,26 @@ describe("acp: model-independent", () => {
         await startCodeSession(client);
         const result = await runPrompt(
           client,
-          "$acp-explicit apply the selected skill.",
+          "Apply $acp-explicit and read its required reference.",
           TIMEOUT,
         );
 
         expect(result.promptResult.error).toBeUndefined();
         expect(result.promptResult.result.stopReason).toBe("end_turn");
-        expect(gateway.requests).toHaveLength(1);
+        expect(gateway.requests).toHaveLength(2);
         const promptText = acpPromptText(gateway.requests[0]!.body);
         expect(promptText).toContain(
           "Explicitly invoked skill content for this query:",
         );
         expect(promptText).toContain(
-          '<skill_content name="acp-explicit" resource="SKILL.md"',
+          `<skill_content name="acp-explicit" location="${skillDirectory}" resource="SKILL.md" complete="true">`,
         );
         expect(promptText).toContain(skillBody);
+        const reference = acpToolResultText(gateway.requests[1]!.body, referenceCallId);
+        expect(reference).toContain('resource="references/required.md" complete="true"');
+        expect(reference).toContain(referenceBody);
+        expect(reference).not.toContain("<tool_result_preview");
+        expect(JSON.stringify(result.messages)).toContain("ACP explicit skill complete");
         expect(client.stderr).toBe("");
       } finally {
         await client?.close();
@@ -7245,9 +7290,9 @@ describe("acp: model-independent", () => {
   );
 
   test(
-    "ACP ranks a natural skill match before bounded catalog omission",
+    "ACP preserves skill identities by shortening descriptions independently of the request",
     async () => {
-      const root = createIsolatedRoot("fx-acp-routed-skill-");
+      const root = createIsolatedRoot("fx-acp-skill-catalog-");
       const distractorDescription =
         "Synthetic unrelated metadata repeated to consume the bounded catalog while remaining harmless. ".repeat(4);
       for (const name of ["aaa-one", "aaa-two", "aaa-three"]) {
@@ -7264,7 +7309,10 @@ describe("acp: model-independent", () => {
         join(targetDirectory, "SKILL.md"),
         "---\nname: system-design-method\ndescription: Use when designing a system architecture with bounded retries and recovery\n---\n\nTARGET_BODY\n",
       );
-      const gateway = startFakeGateway([finalText("ACP routed skill complete")]);
+      const gateway = startFakeGateway([
+        finalText("ACP catalog checked"),
+        finalText("ACP catalog checked again"),
+      ]);
       try {
         client = await AcpClient.create({
           cwd: root.workspace,
@@ -7272,23 +7320,34 @@ describe("acp: model-independent", () => {
           env: fakeGatewayEnv(root, gateway),
         });
         await startCodeSession(client);
-        const result = await runPrompt(
-          client,
+        const prompts = [
           "Design a system architecture with bounded retries and recovery.",
-          TIMEOUT,
-        );
+          "Design a system architecture with bounded retries and recovery.\n" +
+            "Additional project context.\n".repeat(200),
+        ];
+        const catalogs: string[] = [];
+        for (const [index, prompt] of prompts.entries()) {
+          const result = await runPrompt(client, prompt, TIMEOUT);
 
-        expect(result.promptResult.error).toBeUndefined();
-        expect(result.promptResult.result.stopReason).toBe("end_turn");
-        expect(gateway.requests).toHaveLength(1);
-        const available = acpTaggedBlock(
-          gateway.requests[0]!.body,
-          "available_skills",
-        );
-        expect(available).toContain("<name>system-design-method</name>");
-        expect(available).toContain("Use when designing a system architecture");
-        expect(available).not.toContain("<name>aaa-three</name>");
-        expect(JSON.stringify(result.messages)).toContain("skill catalog omitted");
+          expect(result.promptResult.error).toBeUndefined();
+          expect(result.promptResult.result.stopReason).toBe("end_turn");
+          const body = gateway.requests[index]!.body;
+          const available = acpTaggedBlock(body, "available_skills");
+          expect(Buffer.byteLength(available)).toBeLessThanOrEqual(1024);
+          for (const name of ["aaa-one", "aaa-two", "aaa-three", "system-design-method"]) {
+            const locations = acpSkillLocations(body, name);
+            expect(locations).toHaveLength(1);
+            expect(acpSkillPath(body, locations[0]!)).toBe(join(root.workspace, "skills", name));
+          }
+          expect(available).not.toContain(distractorDescription);
+          expect(available).not.toContain("Omitted skills:");
+          if (index === 0) {
+            expect(JSON.stringify(result.messages)).toContain("skill catalog shortened");
+          }
+          catalogs.push(available.replace(/skill:[0-9a-f]{16}:/g, "skill:turn:"));
+        }
+        expect(gateway.requests).toHaveLength(2);
+        expect(catalogs[1]).toBe(catalogs[0]);
         expect(client.stderr).toBe("");
       } finally {
         await client?.close();
@@ -7402,17 +7461,19 @@ describe("acp: model-independent", () => {
         expect(promptText).toContain(
           '<skill_discovery_warning skipped_candidate_count="1" incomplete_root_count="0" missing_from_incomplete_roots="0" />',
         );
-        expect(available).toContain("<name>acp-valid-skill</name>");
-        expect(available).toContain(validDirectory);
+        const locations = acpSkillLocations(gateway.requests[0]!.body, "acp-valid-skill");
+        expect(locations).toHaveLength(1);
+        expect(acpSkillPath(gateway.requests[0]!.body, locations[0]!)).toBe(validDirectory);
         expect(available).not.toContain("acp-malformed-neighbor");
         expect(available).not.toContain(malformedBody);
 
         const skillSchema = request.tools.find((tool) => tool.name === "skill");
         expect(skillSchema).toBeDefined();
         expect(skillSchema?.inputSchema.type).toBe("object");
-        expect(skillSchema?.inputSchema.properties.name.type).toBe("string");
+        expect(skillSchema?.inputSchema.properties.name).toBeUndefined();
         expect(skillSchema?.inputSchema.properties.location.type).toBe("string");
-        expect(skillSchema?.inputSchema.required).toEqual(["name"]);
+        expect(skillSchema?.inputSchema.properties.resource.type).toBe("string");
+        expect(skillSchema?.inputSchema.required).toEqual(["location"]);
 
         const diagnosticNotices = result.messages.filter((message: any) =>
           message.method === "session/update" &&
@@ -8853,3 +8914,81 @@ describe.skipIf(!HAS_API_KEY)("acp: model-backed protocol", () => {
     TIMEOUT,
   );
 });
+
+test.skipIf(!tmuxAvailable())(
+  "ACP load replays canonical messages after compaction without exposing the handoff",
+  async () => {
+    const root = createIsolatedRoot("fx-acp-compacted-history-");
+    const gateway = startFakeGateway([
+      fakeShellRun("saved-history-effect", "printf 'ACP_SAVED_TOOL_OUTPUT\\n' >> replay-effects.txt; printf 'ACP_SAVED_TOOL_OUTPUT\\n'"),
+      finalText("ACP_EARLIER_VISIBLE_RESPONSE"),
+      finalText("ACP_MIDDLE_VISIBLE_RESPONSE"),
+      finalText("ACP_LATEST_VISIBLE_RESPONSE"),
+      finalText("ACP_INTERNAL_HANDOFF: continue the task."),
+    ]);
+    let tui: TmuxSession | null = null;
+    let localClient: AcpClient | null = null;
+    try {
+      tui = await TmuxSession.create({ cwd: root.workspace, env: fakeGatewayEnv(root, gateway) });
+      await tui.waitForComposer(TIMEOUT);
+      for (const [prompt, answer] of [
+        ["Earlier ACP request", "ACP_EARLIER_VISIBLE_RESPONSE"],
+        ["Middle ACP request", "ACP_MIDDLE_VISIBLE_RESPONSE"],
+        ["Latest ACP request", "ACP_LATEST_VISIBLE_RESPONSE"],
+      ]) {
+        await tui.sendText(prompt!);
+        await tui.waitForText(answer!, TIMEOUT);
+        await tui.waitForComposer(TIMEOUT);
+      }
+      await tui.sendText("/compact");
+      await tui.waitForText("Context compacted.", TIMEOUT);
+      await tui.sendText("/quit");
+      expect(await tui.waitForSessionEnd(TIMEOUT)).toBe(true);
+      await tui.kill();
+      tui = null;
+      const ids = readdirSync(join(root.home, ".fx", "sessions"), { withFileTypes: true })
+        .filter((entry) => entry.isDirectory()).map((entry) => entry.name);
+      expect(ids).toHaveLength(1);
+      const eventsPath = join(root.home, ".fx", "sessions", ids[0]!, "events.jsonl");
+      const savedEvents = readFileSync(eventsPath);
+      expect(readFileSync(join(root.workspace, "replay-effects.txt"), "utf8")).toBe("ACP_SAVED_TOOL_OUTPUT\n");
+      expect(gateway.requests).toHaveLength(5);
+      localClient = await AcpClient.create({ cwd: root.workspace, env: fakeGatewayEnv(root, gateway) });
+      await localClient.request("initialize", { protocolVersion: 1 }, 70);
+      for (const requestId of [71, 72]) {
+        localClient.send({ jsonrpc: "2.0", id: requestId, method: "session/load", params: { sessionId: ids[0], mcpServers: [] } });
+        const updates: unknown[] = [];
+        while (true) {
+          const message = await localClient.readLine() as any;
+          if (message.id === requestId) {
+            expect(message.error).toBeUndefined();
+            break;
+          }
+          updates.push(message);
+        }
+        const visible = JSON.stringify(updates);
+        const info = (updates as any[]).find((message) =>
+          message.params?.update?.sessionUpdate === "session_info_update"
+        );
+        expect(info?.params.update.title).toBe("Earlier ACP request");
+        expect(visible).toContain("ACP_EARLIER_VISIBLE_RESPONSE");
+        expect(visible).toContain("ACP_MIDDLE_VISIBLE_RESPONSE");
+        expect(visible).toContain("ACP_LATEST_VISIBLE_RESPONSE");
+        expect(visible).toContain("ACP_SAVED_TOOL_OUTPUT");
+        expect(visible).not.toContain("ACP_INTERNAL_HANDOFF");
+        expect(visible.indexOf("ACP_EARLIER_VISIBLE_RESPONSE")).toBeLessThan(visible.indexOf("ACP_MIDDLE_VISIBLE_RESPONSE"));
+        expect(visible.indexOf("ACP_MIDDLE_VISIBLE_RESPONSE")).toBeLessThan(visible.indexOf("ACP_LATEST_VISIBLE_RESPONSE"));
+        expect(readFileSync(eventsPath)).toEqual(savedEvents);
+        expect(readFileSync(join(root.workspace, "replay-effects.txt"), "utf8")).toBe("ACP_SAVED_TOOL_OUTPUT\n");
+        expect(gateway.requests).toHaveLength(5);
+        expect(localClient.stderr).toBe("");
+      }
+    } finally {
+      await tui?.kill();
+      await localClient?.close();
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  },
+  TIMEOUT * 2,
+);

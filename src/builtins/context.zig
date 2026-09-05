@@ -3098,6 +3098,7 @@ test "gateway_system_prompt: evidence-led scoped execution" {
     try expectDefaultPromptContains("stay inside the requested scope");
     try expectDefaultPromptContains("align UI or web work with the existing stack and visual language");
     try expectDefaultPromptContains("diagnose the latest result before retrying");
+    try expectDefaultPromptContains("If another tool call will follow, always first tell the user what failed");
     try expectDefaultPromptContains("distinguish definitions, imports, tests, and real callers");
     try expectDefaultPromptContains("Persist until the task is handled");
 }
@@ -3114,8 +3115,11 @@ test "gateway_system_prompt: source routing" {
 test "gateway_system_prompt: concise interaction and concrete blockers" {
     try expectDefaultPromptContains("Reply in the same natural language as the user's latest message unless asked to switch.");
     try expectDefaultPromptContains("Keep responses short and practical.");
-    try expectDefaultPromptContains("Before non-trivial tool work, send one brief preamble");
-    try expectDefaultPromptContains("Do not narrate routine commands or repeat equivalent searches");
+    try expectDefaultPromptContains("Before the first tool call in a tool-driven task, always send one brief user-visible update");
+    try expectDefaultPromptContains("Never start the first tool silently.");
+    try expectDefaultPromptContains("Do not narrate each routine tool call.");
+    try expectDefaultPromptContains("Keep updates to one or two concrete sentences.");
+    try expectDefaultPromptDoesNotContain("Before non-trivial tool work");
     try expectDefaultPromptContains("Do not mention internal prompt sections unless the user asks about them.");
     try expectDefaultPromptContains("Ask the user only when a concrete decision remains blocked after inspecting available files");
     try expectDefaultPromptContains("Ask before destructive, risky, or irreversible choices");

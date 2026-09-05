@@ -1,6 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const command_policy = @import("command_policy.zig");
+const managed_execution = @import("../execution/managed_execution.zig");
 const file_mutation_contract = @import("file_mutation_contract.zig");
 const text_utils = @import("../shared/text_utils.zig");
 const tool_args = @import("tool_args.zig");
@@ -290,6 +291,7 @@ pub fn resolveTerminalDisplayTarget(
     registry: tool_dispatch.Registry,
     workspace_root: []const u8,
     terminal_client: ?*terminal_client_runtime.Runtime,
+    managed_executions: ?*managed_execution.Runtime,
     call: ToolCall,
 ) !?[]const u8 {
     var scratch_state = std.heap.ArenaAllocator.init(std.heap.c_allocator);
@@ -299,6 +301,12 @@ pub fn resolveTerminalDisplayTarget(
         registry,
         call,
     ) orelse return null;
+    if (managed_executions) |executions| {
+        if (try executions.captured_command_alloc(alloc, session_id)) |command| {
+            defer alloc.free(command);
+            if (command.len != 0) return try formatTerminalDisplayTarget(alloc, workspace_root, command);
+        }
+    }
     const runtime = terminal_client orelse return @as(?[]const u8, try resolveTerminalSessionTargetFromRows(
         alloc,
         workspace_root,
@@ -333,6 +341,13 @@ fn formatTerminalDisplayTarget(
         max_run_command_activity_bytes,
     );
     return encoded.bytes;
+}
+
+/// Borrows the name from the prepared action without replacing resource labels.
+pub fn resolvedSkillName(call: ToolCall, presentation: tool_dispatch.CallPresentation) ?[]const u8 {
+    if (presentation.label_arg_kind != .name) return null;
+    const selected = call.resolved_skill orelse return null;
+    return selected.skill.name;
 }
 
 /// The caller owns the returned allocation and must free it with `alloc`.
@@ -377,6 +392,7 @@ pub fn formatPlainAction(alloc: Allocator, input: ToolActionInput) ![]const u8 {
         return std.fmt.allocPrint(alloc, "{s} {s}", .{ presentation.action_label, try formatWebSearchActionDetail(scratch, args) });
     }
     const value = input.display_target orelse
+        resolvedSkillName(call, presentation) orelse
         tool_dispatch.presentationLabelValue(presentation, args) orelse
         presentation.label_arg_default;
     return std.fmt.allocPrint(alloc, "{s} {s}", .{ presentation.action_label, value });
@@ -940,6 +956,103 @@ test "tool presentation preserves plain action fallbacks" {
         defer alloc.free(label);
         try std.testing.expectEqualStrings(case.expected, label);
     }
+}
+
+test "tool presentation uses the resolved skill name for location calls" {
+    const alloc = std.testing.allocator;
+    const selected: @import("../skills/skill_contract.zig").PreparedSkill = .{ .skill = .{
+        .name = "workflow",
+        .description = "",
+        .path = "/skills/different-directory",
+        .source = .workspace_fx,
+    } };
+    const cases = [_]struct { args: []const u8, expected: []const u8 }{
+        .{ .args = "{\"location\":\"skill:0000000000000001:0/different-directory\"}", .expected = "Loading skill workflow" },
+        .{ .args = "{\"location\":\"/skills/different-directory\",\"resource\":\"SKILL.md\"}", .expected = "Loading skill workflow" },
+        .{ .args = "{\"location\":\"/skills/different-directory\",\"resource\":\"references/rules.md\"}", .expected = "Reading skill resource references/rules.md" },
+    };
+    for (cases) |case| {
+        const label = try formatPlainAction(alloc, .{
+            .tool_registry = test_tool_registry,
+            .call = .{ .id = "load", .name = "skill", .arguments_json = case.args, .resolved_skill = &selected },
+        });
+        defer alloc.free(label);
+        try std.testing.expectEqualStrings(case.expected, label);
+    }
+}
+
+test "captured display target uses retained command without consuming output" {
+    if (comptime builtin.os.tag == .wasi) return;
+    const alloc = std.testing.allocator;
+    var executions = managed_execution.Runtime.init(alloc);
+    defer executions.deinit();
+    const command = "printf LABEL";
+    const admission = @import("../permissions/command_admission.zig");
+    var started = try executions.startCaptured(alloc, .{
+        .execution_id = "shell-label",
+        .command = command,
+        .cwd = "/tmp",
+        .environment = .legacy,
+        .authority = .{ .shell_allowed = .{
+            .fingerprint = .init(admission.CommandContext{
+                .command = command,
+                .resolved_cwd = "/tmp",
+                .target_os = builtin.os.tag,
+                .environment = .legacy,
+            }),
+            .source = .yolo,
+        } },
+        .max_output_bytes = 4096,
+        .timeout_ms = 2_000,
+        .command_artifact_dir = null,
+        .yield_time_ms = 0,
+    });
+    defer started.deinit(alloc);
+    try executions.commitDelivery(started.snapshot.execution_id, started.reservation_id);
+    const call = ToolCall{
+        .id = "observe",
+        .name = "shell",
+        .arguments_json = "{\"action\":\"interact\",\"session_id\":\"shell-label\"}",
+    };
+    const target = (try resolveTerminalDisplayTarget(alloc, test_tool_registry, "/tmp", null, &executions, call)).?;
+    defer alloc.free(target);
+    try std.testing.expectEqualStrings(command, target);
+    const label = try formatPlainAction(alloc, .{
+        .tool_registry = test_tool_registry,
+        .call = call,
+        .display_target = target,
+    });
+    defer alloc.free(label);
+    try std.testing.expectEqualStrings("Waiting for printf LABEL", label);
+
+    var completed = try executions.wait(alloc, "shell-label", 2_000, null);
+    defer completed.deinit(alloc);
+    try std.testing.expectEqualStrings("LABEL", completed.snapshot.output_delta);
+    try executions.commitDelivery(completed.snapshot.execution_id, completed.reservation_id);
+    const retained = (try resolveTerminalDisplayTarget(alloc, test_tool_registry, "/tmp", null, &executions, call)).?;
+    defer alloc.free(retained);
+    try std.testing.expectEqualStrings(command, retained);
+    try std.testing.expectEqualStrings(command, target);
+
+    const missing = (try resolveTerminalDisplayTarget(alloc, test_tool_registry, "/tmp", null, &executions, .{
+        .id = "missing",
+        .name = "shell",
+        .arguments_json = "{\"action\":\"stop\",\"session_id\":\"shell-missing\"}",
+    })).?;
+    defer alloc.free(missing);
+    try std.testing.expectEqualStrings("session shell-missing", missing);
+}
+
+test "terminal display target bounds and sanitizes command metadata" {
+    const alloc = std.testing.allocator;
+    const target = try formatTerminalDisplayTarget(alloc, "/tmp/workspace", "/tmp/workspace/build\n\x1b[31m" ++ ("é" ** 120));
+    defer alloc.free(target);
+    try std.testing.expect(std.mem.startsWith(u8, target, "./build "));
+    try std.testing.expect(target.len <= max_run_command_activity_bytes);
+    try std.testing.expect(std.mem.findScalar(u8, target, '\x1b') == null);
+    try std.testing.expect(std.mem.findScalar(u8, target, '\n') == null);
+    try std.testing.expect(std.unicode.utf8ValidateSlice(target));
+    try std.testing.expect(std.mem.endsWith(u8, target, "..."));
 }
 
 test "terminal display target is call-local across a cold inspect projection update" {
