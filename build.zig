@@ -133,6 +133,7 @@ pub fn build(b: *std.Build) void {
             "ACP native tool gate keeps the native set empty",
             "native tool selections resolve aliases and preserve flag order",
             "writeAgentMessageChunk produces valid json",
+            "pinned ChatGPT account rejects a swapped selected-profile session before refresh side effects",
             "global system prompt file modifiers preserve replacement and append order",
             "ACP command routes parsed options and launch config through the injected runner",
             "app entry preserves every launch control across an upgrade relaunch",
