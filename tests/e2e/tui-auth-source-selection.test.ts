@@ -4449,6 +4449,83 @@ for (const scenario of ["replace", "conflict", "invalid-index"] as const) {
   }, 60_000);
 }
 
+test("provider SSE framing preserves saved and resumed answers", async () => {
+  const prefix = "CONTROL_PREFIX\n", answer = "EXPECTED_FINAL";
+  for (const provider of ["gateway", "codex", "grok"] as const) for (const mode of ["no-space", "multiline", "invalid"]) {
+    const profile = mkdtempSync(join(tmpdir(), "fx-sse-framing-"));
+    const native = provider !== "gateway";
+    const model = native ? "fixture-model" : FAKE_GATEWAY_MODEL;
+    const event = (text: string) => native
+      ? { type: "response.output_text.delta", output_index: 0, content_index: 0, delta: text }
+      : { type: "text-delta", id: "answer", delta: text };
+    const terminal = native
+      ? { type: "response.completed", response: { status: "completed" } }
+      : { type: "finish", finishReason: { unified: mode === "invalid" ? "tool-calls" : "stop" } };
+    const frame = (value: object) => "data: " + JSON.stringify(value) + "\n\n";
+    let wire = frame(event(prefix));
+    if (mode === "invalid") {
+      const input = { path: "read-me.txt" };
+      writeFileSync(join(profile, "read-me.txt"), "not admitted");
+      if (native) {
+        const item = { type: "function_call", id: "fc_read", call_id: "read", name: "read_file", arguments: JSON.stringify(input) };
+        wire += frame({ type: "response.output_item.added", output_index: 1, item });
+        wire += frame({ type: "response.output_item.done", output_index: 1, item });
+      } else wire += frame({ type: "tool-call", toolCallId: "read", toolName: "read_file", input });
+      wire += "data: {invalid-json}\n\n";
+    } else if (mode === "no-space") wire += "data:" + JSON.stringify(event(answer)) + "\n\n";
+    else wire += JSON.stringify(event(answer), null, 2).split("\n").map(line => "data: " + line).join("\n") + "\n\n";
+    wire += frame(terminal);
+    if (mode === "multiline") wire = "\ufeff" + wire.replaceAll("\n", "\r\n");
+    const replies = [new Response(wire, { headers: { "content-type": "text/event-stream" } }), native
+      ? fakeGatewaySse([event("RESUME_OK"), { type: "response.completed", response: { status: "completed" } }])
+      : fakeGatewayFinalText("RESUME_OK")];
+    const gateway = startFakeGateway(native ? [] : replies);
+    const direct = provider === "codex" ? startFakeCodexToolLoop({ model, responses: replies })
+      : provider === "grok" ? startFakeGrokToolLoop({ model, responses: replies }) : null;
+    try {
+      if (provider === "codex") writeSeededChatGptLogin(profile, direct!.accessToken);
+      else if (provider === "grok") writeSeededGrokLogin(profile, direct!.accessToken);
+      mkdirSync(join(profile, ".fx"), { recursive: true });
+      writeFileSync(join(profile, ".fx", "settings.json"), JSON.stringify({ provider, [native ? provider + "_model" : "model"]: model }));
+      const env = {
+        HOME: profile, AI_GATEWAY_API_KEY: "fixture", VERCEL_OIDC_TOKEN: undefined, FX_MODEL: native ? undefined : model,
+        FX_DISABLE_KEYCHAIN: "1", FX_AUTO_UPGRADE: "0", FX_SOUND: "0",
+        FX_GATEWAY_BASE_URL: gateway.baseUrl, FX_E2E_GATEWAY_MODELS_URL: gateway.baseUrl + "/coding-agent/v1/models",
+        FX_GATEWAY_CHAT_URL: gateway.chatUrl, FX_E2E_GATEWAY_CHAT_URL: gateway.chatUrl,
+        FX_E2E_OPENAI_CODEX_RESPONSES_URL: direct?.responsesUrl, FX_E2E_OPENAI_CODEX_MODELS_URL: direct?.modelsUrl,
+        FX_E2E_XAI_GROK_RESPONSES_URL: direct?.responsesUrl, FX_E2E_XAI_GROK_MODELS_URL: direct?.modelsUrl,
+        FX_E2E_XAI_GROK_MODALITIES_URL: direct && "modalitiesUrl" in direct ? direct.modalitiesUrl : undefined,
+      };
+      const first = await runFx(["ask", "--json", "--auto", "Report the supplied answer."], { cwd: profile, env, timeoutMs: TIMEOUT });
+      const output = JSON.parse(first.stdout);
+      expect(first.signal).toBeNull();
+      expect(direct ? direct.bodies.length : gateway.requests.length).toBe(1);
+      if (mode === "invalid") {
+        expect(first.code, first.stdout + first.stderr).toBe(1);
+        expect(output.error).toBe(provider === "gateway" ? "InvalidGatewaySseEvent" : provider === "codex" ? "InvalidOpenAICodexSseEvent" : "InvalidXaiGrokSseEvent");
+        expect(output.tool_calls).toEqual([]);
+      } else {
+        expect(first.code, first.stdout + first.stderr).toBe(0);
+        expect(first.stderr).toBe("");
+        expect(output.output).toBe(prefix + answer);
+        const detail = await runFx(["session", "--json", "--id", output.session_id], { cwd: profile, env });
+        expect(detail.code).toBe(0);
+        expect(JSON.parse(detail.stdout).history[0].assistant).toBe(prefix + answer);
+        const resumed = await runFx(["ask", "--json", "--auto", "--resume-id", output.session_id, "Recall the prior answer."], { cwd: profile, env, timeoutMs: TIMEOUT });
+        expect(resumed.code, resumed.stdout + resumed.stderr).toBe(0);
+        expect(resumed.stderr).toBe("");
+        expect(direct ? direct.bodies.length : gateway.requests.length).toBe(2);
+        const replay = direct ? direct.bodies[1] : gateway.requests[1].body;
+        expect(replay).toContain(JSON.stringify(prefix + answer));
+      }
+      if (native) expect(gateway.requests).toHaveLength(0);
+    } finally {
+      direct?.stop(); gateway.stop();
+      rmSync(profile, { recursive: true, force: true });
+    }
+  }
+}, 60_000);
+
 test("direct providers reconcile final text before saving or releasing tools", async () => {
   const prefix = "COMMENTARY_ITEM\n", answer = "FINAL_ANSWER_ITEM";
   for (const provider of ["codex", "grok"] as const) for (const mode of ["streamed", "final-only", "mixed", "terminal-only", "conflict"]) {
