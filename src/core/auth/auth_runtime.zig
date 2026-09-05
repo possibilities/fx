@@ -327,7 +327,7 @@ pub fn refreshCredentialForAccountFromHome(
 ) !?credentials.Credential {
     if (!credentials.sourceRefreshable(source)) return null;
 
-    var credential = (loadCredentialForRefreshFromHome(alloc, transport, source, mode, home) catch |err| {
+    var credential = (loadCredentialForRefreshFromHome(alloc, transport, source, mode, expected_account_id, home) catch |err| {
         debug_trace.logf(
             "auth",
             "isolated credential refresh provider failed source={t} mode={t} err={s}",
@@ -354,6 +354,7 @@ fn loadCredentialForRefreshFromHome(
     transport: oauth_transport.Provider,
     source: credentials.Source,
     mode: CredentialRefreshMode,
+    expected_account_id: ?[]const u8,
     home: []const u8,
 ) !?credentials.Credential {
     return switch (source) {
@@ -361,9 +362,24 @@ fn loadCredentialForRefreshFromHome(
             .if_needed => credentials.loadFxLoginCredentialFromHome(alloc, transport, home),
             .force => credentials.refreshFxLoginCredentialFromHome(alloc, transport, home),
         },
+        // The selected profile is one more session store: the pinned account is
+        // checked against the saved session before any OAuth refresh or write
+        // beneath that profile, exactly as for the ambient and host stores.
         .chatgpt_subscription => switch (mode) {
-            .if_needed => credentials.loadSourceFromHome(alloc, transport, source, home),
-            .force => credentials.refreshChatGptCredentialFromHome(alloc, transport, home),
+            .if_needed => credentials.loadChatGptCredentialForAccountFromStore(
+                alloc,
+                transport,
+                .if_needed,
+                expected_account_id,
+                .{ .profile = home },
+            ),
+            .force => credentials.loadChatGptCredentialForAccountFromStore(
+                alloc,
+                transport,
+                .force,
+                expected_account_id,
+                .{ .profile = home },
+            ),
         },
         .grok_subscription => switch (mode) {
             .if_needed => credentials.loadSourceFromHome(alloc, transport, source, home),
@@ -371,6 +387,60 @@ fn loadCredentialForRefreshFromHome(
         },
         else => null,
     };
+}
+
+test "pinned ChatGPT account rejects a swapped selected-profile session before refresh side effects" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "state/.fx");
+    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "state");
+    defer alloc.free(home);
+    const session_bytes =
+        "{\"version\":1,\"access_token\":\"access-b\",\"refresh_token\":\"refresh-b\"," ++
+        "\"expires_at_ms\":0,\"account_id\":\"account-b\"}\n";
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "state/.fx/chatgpt-auth.json",
+        .data = session_bytes,
+    });
+
+    const Fixture = struct {
+        oauth_calls: usize = 0,
+
+        fn execute(
+            raw: ?*anyopaque,
+            _: Allocator,
+            _: oauth_transport.Request,
+        ) !oauth_transport.Response {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.oauth_calls += 1;
+            return error.UnexpectedOAuthRequest;
+        }
+    };
+    var fixture: Fixture = .{};
+    const transport: oauth_transport.Provider = .{
+        .context = @ptrCast(&fixture),
+        .execute_fn = Fixture.execute,
+    };
+
+    try std.testing.expectError(
+        error.ChatGptAccountChanged,
+        refreshCredentialForAccountFromHome(
+            transport,
+            alloc,
+            .chatgpt_subscription,
+            .force,
+            "account-a",
+            home,
+        ),
+    );
+    try std.testing.expectEqual(@as(usize, 0), fixture.oauth_calls);
+
+    var file = try tmp.dir.openFile(std.testing.io, "state/.fx/chatgpt-auth.json", .{});
+    defer file.close(std.testing.io);
+    const remaining = try io_mod.readFileToEnd(alloc, &file, 4096);
+    defer alloc.free(remaining);
+    try std.testing.expectEqualStrings(session_bytes, remaining);
 }
 
 fn loadCredentialForRefresh(
