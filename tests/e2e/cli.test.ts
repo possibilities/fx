@@ -5400,7 +5400,7 @@ describe("cli: launch permission policy", () => {
           {
             args: ["--permissions-file", valid, "status"],
             message:
-              "--permissions-file is only supported for interactive, resume, and ACP launches",
+              "--permissions-file is only supported for interactive, resume, ask, and ACP launches",
             hidden: "InvalidPermissionPolicy",
           },
         ];
@@ -5481,12 +5481,12 @@ describe("cli: workspace access", () => {
       );
 
       const unsupportedProjectInstructionGate = await runFx(
-        ["--no-project-instructions", "ask", "hello"],
+        ["--no-project-instructions", "models"],
         { env: enabled },
       );
       expect(unsupportedProjectInstructionGate.code).toBe(1);
       expect(unsupportedProjectInstructionGate.stderr).toContain(
-        "--no-project-instructions is only supported for interactive, resume, and ACP launches",
+        "--no-project-instructions is only supported for interactive, resume, ask, and ACP launches",
       );
 
       const missingSkillsRoot = await runFx(["--skills-dir"], { env: enabled });
@@ -5505,12 +5505,12 @@ describe("cli: workspace access", () => {
       );
 
       const unsupportedSkillPolicy = await runFx(
-        ["--no-default-skills", "ask", "hello"],
+        ["--no-default-skills", "models"],
         { env: enabled },
       );
       expect(unsupportedSkillPolicy.code).toBe(1);
       expect(unsupportedSkillPolicy.stderr).toContain(
-        "--skills-dir and --no-default-skills are only supported for interactive, resume, and ACP launches",
+        "--no-default-skills is only supported for interactive, resume, ask, and ACP launches",
       );
 
       const missingNativeTool = await runFx(["--tool"], { env: enabled });
@@ -5556,12 +5556,12 @@ describe("cli: workspace access", () => {
       );
 
       const unsupportedNativeToolSelection = await runFx(
-        ["--tool", "read_file", "ask", "hello"],
+        ["--tool", "read_file", "models"],
         { env: enabled },
       );
       expect(unsupportedNativeToolSelection.code).toBe(1);
       expect(unsupportedNativeToolSelection.stderr).toContain(
-        "--tool is only supported for interactive, resume, and ACP launches",
+        "--tool is only supported for interactive, resume, ask, and ACP launches",
       );
     },
     TIMEOUT,
