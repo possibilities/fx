@@ -2983,8 +2983,6 @@ fn makeQueuedPrompt(alloc: Allocator) !worker_runtime.QueuedPrompt {
 }
 
 test "queued fresh prompt closes only a still-paused turn before provider execution" {
-    const session_codec = @import("../session/session_codec.zig");
-    const session_store = @import("../session/session_store.zig");
     const Probe = struct {
         app: *FakeApp,
         returned: std.atomic.Value(bool) = .init(false),
