@@ -187,46 +187,6 @@ pub fn Runtime(comptime App: type) type {
             return app.auth.selectForProvider(app.alloc, provider, preferred);
         }
 
-        fn prepareProviderCredential(
-            app: *App,
-            provider: model_provider.ProviderId,
-            preferred: ?credentials.Source,
-        ) !?credentials.Credential {
-            const borrowed_home = try borrowedAuthorizationHome(app);
-            defer if (borrowed_home) |home| app.alloc.free(home);
-            if (borrowed_home) |home| {
-                var resolution = try credentials.resolveReadOnlyForProviderFromHome(
-                    app.alloc,
-                    provider,
-                    preferred,
-                    home,
-                );
-                if (resolution.failure) |failure| {
-                    if (resolution.credential) |*credential| credential.deinit(app.alloc);
-                    return failure.err;
-                }
-                const credential = resolution.credential;
-                resolution.credential = null;
-                return credential;
-            }
-            if (app_profile_runtime.explicitHome(app)) |profile_home| {
-                return auth_runtime.prepareCredentialFromHome(
-                    app.alloc,
-                    app.auth.oauthTransport(),
-                    provider,
-                    preferred,
-                    profile_home,
-                );
-            }
-            return auth_runtime.prepareCredential(
-                app.alloc,
-                app.auth.oauthTransport(),
-                app.auth.secretStore(),
-                provider,
-                preferred,
-            );
-        }
-
         pub fn restoreSessionCredential(app: *App, previous_provider: model_provider.ProviderId) !void {
             // Hydration can run before App.init returns, so it must not start background tasks.
             const provider = provider_runtime.provider(app);
