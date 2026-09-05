@@ -152,7 +152,7 @@ pub fn Runtime(comptime App: type) type {
             if (hostManagesAuth(app) or model_provider.authorizesCredential(provider, app.auth.credentialSource())) return .unchanged;
             var preferred: ?credentials.Source = null;
             if (provider == .gateway and !host_target.is_wasm) {
-                var settings = try config_runtime.loadMergedSettings(app.alloc, app.workspace_root);
+                var settings = try app_profile_runtime.loadMergedSettings(app);
                 defer settings.deinit(app.alloc);
                 preferred = settings.credential_source;
             }
@@ -185,46 +185,6 @@ pub fn Runtime(comptime App: type) type {
                 return .missing;
             }
             return app.auth.selectForProvider(app.alloc, provider, preferred);
-        }
-
-        fn prepareProviderCredential(
-            app: *App,
-            provider: model_provider.ProviderId,
-            preferred: ?credentials.Source,
-        ) !?credentials.Credential {
-            const borrowed_home = try borrowedAuthorizationHome(app);
-            defer if (borrowed_home) |home| app.alloc.free(home);
-            if (borrowed_home) |home| {
-                var resolution = try credentials.resolveReadOnlyForProviderFromHome(
-                    app.alloc,
-                    provider,
-                    preferred,
-                    home,
-                );
-                if (resolution.failure) |failure| {
-                    if (resolution.credential) |*credential| credential.deinit(app.alloc);
-                    return failure.err;
-                }
-                const credential = resolution.credential;
-                resolution.credential = null;
-                return credential;
-            }
-            if (app_profile_runtime.explicitHome(app)) |profile_home| {
-                return auth_runtime.prepareCredentialFromHome(
-                    app.alloc,
-                    app.auth.oauthTransport(),
-                    provider,
-                    preferred,
-                    profile_home,
-                );
-            }
-            return auth_runtime.prepareCredential(
-                app.alloc,
-                app.auth.oauthTransport(),
-                app.auth.secretStore(),
-                provider,
-                preferred,
-            );
         }
 
         pub fn restoreSessionCredential(app: *App, previous_provider: model_provider.ProviderId) !void {
@@ -1551,7 +1511,7 @@ pub fn Runtime(comptime App: type) type {
             defer candidate.deinit(app.alloc);
             if (comptime @hasDecl(@TypeOf(app.auth), "beginProviderPreparation") and @hasDecl(App, "providerCatalog") and !host_target.is_wasm) {
                 const catalog_provider = app.providerCatalog(.gateway) orelse return false;
-                var settings = config_runtime.loadMergedSettings(app.alloc, app.workspace_root) catch |err| {
+                var settings = app_profile_runtime.loadMergedSettings(app) catch |err| {
                     debug_trace.logf("auth", "team preparation settings failed err={s}", .{@errorName(err)});
                     try app.writeDomainNotice(.{ .topic = "auth", .tone = .@"error", .body = "Could not load provider preferences. The current team is unchanged." }, true);
                     return false;

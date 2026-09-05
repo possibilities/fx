@@ -56,6 +56,8 @@ pub fn cloneSessionSummary(
     errdefer if (title) |value| alloc.free(value);
     const preview = if (source.preview) |value| try alloc.dupe(u8, value) else null;
     errdefer if (preview) |value| alloc.free(value);
+    const shape = if (source.shape) |value| try value.dupe(alloc) else null;
+    errdefer if (shape) |stored| alloc.free(stored.id);
     return .{
         .id = id,
         .workspace_root = workspace_root,
@@ -69,6 +71,8 @@ pub fn cloneSessionSummary(
         .history_len = source.history_len,
         .has_checkpoint = source.has_checkpoint,
         .has_managed_children = source.has_managed_children,
+        .shape = shape,
+        .credential_source = source.credential_source,
     };
 }
 
@@ -170,11 +174,18 @@ test "summary clone owns every string" {
         .updated_at_ms = 2,
         .conversation_language = .literal("en"),
         .history_len = 3,
+        .shape = .{ .id = @constCast("reviewer"), .identity = .{ .bytes = @splat(7) } },
+        .credential_source = .fx_login,
     });
     defer clone.deinit(alloc);
     try std.testing.expectEqualStrings("session", clone.id);
     try std.testing.expectEqualStrings("Title", clone.title.?);
     try std.testing.expectEqualStrings("Preview", clone.preview.?);
+    // Provenance survives every listing clone: the label is owned and the
+    // digest and credential origin ride along unchanged.
+    try std.testing.expectEqualStrings("reviewer", clone.shape.?.id);
+    try std.testing.expect(clone.shape.?.identity.eql(.{ .bytes = @splat(7) }));
+    try std.testing.expect(clone.credential_source.? == .fx_login);
 }
 
 test "summary pages filter and preserve append cursor order" {

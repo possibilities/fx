@@ -2,14 +2,16 @@ const std = @import("std");
 const io_mod = @import("../shared/io.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const session = @import("session.zig");
+const shape_authority = @import("../auth/shape_authority.zig");
 const session_codec = @import("session_codec.zig");
 const session_layout = @import("session_layout.zig");
 const session_store = @import("session_store.zig");
 const summary_codec = @import("session_summary_codec.zig");
+const types = @import("../shared/types.zig");
 
 const Allocator = std.mem.Allocator;
 const Sha256 = std.crypto.hash.sha2.Sha256;
-const magic = "fx-resume-catalog-v1\n";
+const magic = "fx-resume-catalog-v2\n";
 const file_name = ".resume-catalog";
 const max_bytes = 64 * 1024 * 1024;
 const max_records = 100_000;
@@ -47,6 +49,11 @@ const Summary = struct {
     language: []const u8,
     has_checkpoint: bool,
     has_managed_children: bool,
+    /// Shape and credential provenance ride along so a listing served from
+    /// the cache reports the same authority as one read from the manifest.
+    shape_id: ?[]const u8 = null,
+    shape_identity: ?shape_authority.Identity = null,
+    credential_source: ?types.CredentialSource = null,
 
     fn from(source: *const session_store.SessionSummary) Summary {
         return .{
@@ -61,10 +68,14 @@ const Summary = struct {
             .language = source.conversation_language.view(),
             .has_checkpoint = source.has_checkpoint,
             .has_managed_children = source.has_managed_children,
+            .shape_id = if (source.shape) |shape| shape.id else null,
+            .shape_identity = if (source.shape) |shape| shape.identity else null,
+            .credential_source = source.credential_source,
         };
     }
 
     fn clone(self: Summary, alloc: Allocator, id: []const u8) !session_store.SessionSummary {
+        if ((self.shape_id == null) != (self.shape_identity == null)) return error.InvalidCatalogCache;
         return summary_codec.cloneSessionSummary(alloc, .{
             .id = @constCast(id),
             .workspace_root = if (self.workspace_root) |value| @constCast(value) else null,
@@ -78,6 +89,11 @@ const Summary = struct {
             .conversation_language = try session.ConversationLanguage.fromSlice(self.language),
             .has_checkpoint = self.has_checkpoint,
             .has_managed_children = self.has_managed_children,
+            .shape = if (self.shape_id) |label| .{
+                .id = @constCast(label),
+                .identity = self.shape_identity.?,
+            } else null,
+            .credential_source = self.credential_source,
         });
     }
 };
@@ -305,6 +321,8 @@ test "catalog cache round trips owned rows and ignores incomplete observations" 
             .updated_at_ms = 2,
             .history_len = 3,
             .conversation_language = .literal("en"),
+            .shape = .{ .id = @constCast("reviewer"), .identity = .{ .bytes = @splat(9) } },
+            .credential_source = .fx_login,
         }) } },
         .{ .fingerprint = @splat(2), .value = .{ .excluded = try alloc.dupe(u8, "private") } },
         .{ .fingerprint = null, .value = .{ .excluded = try alloc.dupe(u8, "temporary-failure") } },
@@ -321,6 +339,9 @@ test "catalog cache round trips owned rows and ignores incomplete observations" 
     defer visible.deinit(alloc);
     try std.testing.expectEqualStrings("Saved title", visible.value.visible.title.?);
     try std.testing.expectEqual(@as(usize, 3), visible.value.visible.history_len);
+    try std.testing.expectEqualStrings("reviewer", visible.value.visible.shape.?.id);
+    try std.testing.expect(visible.value.visible.shape.?.identity.eql(.{ .bytes = @splat(9) }));
+    try std.testing.expect(visible.value.visible.credential_source.? == .fx_login);
     try std.testing.expect((try loaded.reuse(alloc, "visible", @splat(3))) == null);
     var excluded = (try loaded.reuse(alloc, "private", @splat(2))).?;
     defer excluded.deinit(alloc);

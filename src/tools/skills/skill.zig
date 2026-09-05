@@ -194,46 +194,6 @@ fn loadSelected(ctx: tool_dispatch.DispatchContext, input: *const Input, prepare
     return skill_invocation.loadWholeByLocation(ctx.allocator, catalog, skill.path, input.resource, ctx.context_limits, ctx.max_tool_result_bytes, ctx.cancel_flag);
 }
 
-pub fn execute(arena: Allocator, workspace_root: []const u8, skills_dir: []const u8, args_json: []const u8) ![]u8 {
-    const result = try executeForSession(arena, workspace_root, skills_dir, args_json);
-    return skill_invocation.takeModelOutput(arena, result);
-}
-
-pub fn executeForSession(
-    arena: Allocator,
-    workspace_root: []const u8,
-    skills_dir: []const u8,
-    args_json: []const u8,
-) !skill_invocation.ExecuteResult {
-    const args = try tool_args.parseToolArgsObject(arena, args_json);
-    const name = try tool_args.requiredStringArg(args, "name");
-    const location = if (args.get("location")) |value| blk: {
-        if (value != .string) return error.InvalidToolArguments;
-        break :blk value.string;
-    } else null;
-    const resource = if (args.get("resource")) |value| blk: {
-        if (value != .string) return error.InvalidToolArguments;
-        break :blk value.string;
-    } else null;
-    const offset = if (args.get("offset")) |value| blk: {
-        if (value != .integer or value.integer < 0) return error.InvalidToolArguments;
-        break :blk std.math.cast(usize, value.integer) orelse return error.InvalidToolArguments;
-    } else 0;
-    return loadByIdentity(
-        arena,
-        workspace_root,
-        skills_dir,
-        null,
-        builtin_skills.root_policy,
-        name,
-        location,
-        resource,
-        offset,
-        .{},
-        tool_result_limits.default_max_tool_result_bytes,
-    );
-}
-
 fn loadByIdentity(
     alloc: Allocator,
     workspace_root: []const u8,
