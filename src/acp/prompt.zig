@@ -3769,11 +3769,7 @@ test "ACP recovery dependencies and config keep selected shape authority" {
     const config = buildAgentConfig(
         &state,
         &state.active_session.?,
-        .{
-            .skills_prompt_section = "",
-            .explicit_skills_prompt_section = "",
-            .custom_tool_guidance = "",
-        },
+        .{ .custom_tool_guidance = "" },
         false,
     );
     try std.testing.expect(config.shape.?.eql(shape));
