@@ -1236,7 +1236,7 @@ test "app entry relaunches only after teardown with the validated handoff" {
     try std.testing.expect(std.mem.find(
         u8,
         capture.stderr.written(),
-        "fx --resume session-123",
+        "fx resume session-123",
     ) != null);
     try expectEvents(&.{
         "init:none",
@@ -1428,7 +1428,7 @@ test "app entry preserves ordered native tool selection across upgrade relaunch"
     try std.testing.expect(std.mem.find(
         u8,
         capture.stderr.written(),
-        "fx --tool terminal:exec --tool read_file --resume session-123",
+        "fx --tool terminal:exec --tool read_file resume session-123",
     ) != null);
 }
 
