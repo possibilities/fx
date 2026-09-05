@@ -2984,6 +2984,22 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
         `┋ ${SPLIT_NEW_USER_PROMPT}`,
       );
       expect(cutoffPane).toMatch(/Thinking|Generating/);
+      const tapeFrames = readTapeFrames(tapePath);
+      const enterIndex = findEnterAfterSubmittedPrompt(tapeFrames, SPLIT_NEW_USER_PROMPT);
+      const firstOutput = tapeFrames.slice(enterIndex + 1).find((frame) => frame.kind === 1)!;
+      expect(firstOutput).toBeDefined();
+      const framesRoot = join(root, "steering-frames");
+      execFileSync(FX_BIN, ["replay", tapePath, "--frames-dir", framesRoot], { encoding: "utf8" });
+      const firstGrid = readFileSync(
+        join(framesRoot, "frames", `${String(firstOutput.index).padStart(4, "0")}.grid.txt`),
+        "utf8",
+      );
+      const firstRows = firstGrid.split(/\r?\n/);
+      const submittedRow = firstRows.findIndex((row) => row.includes(SPLIT_NEW_USER_PROMPT));
+      const activityRow = firstRows.findIndex((row) => /Thinking|Generating/.test(row));
+      expect(submittedRow).toBeGreaterThanOrEqual(0);
+      expect(firstRows[submittedRow]).toContain("┃");
+      expect(submittedRow).toBeLessThan(activityRow);
       await waitForCondition(
         () => firstResponse.cancelled,
         "visible assistant steering cancellation",
