@@ -17,6 +17,7 @@ const builtin_tools = @import("../builtins/tools.zig");
 const credentials = @import("../core/auth/credentials.zig");
 const secret = @import("../core/auth/secret.zig");
 const auth_runtime = @import("../core/auth/auth_runtime.zig");
+const codex_credential_broker = @import("../core/auth/codex_credential_broker.zig");
 const model_provider = @import("../core/config/model_provider.zig");
 const debug_trace = @import("../core/shared/debug_trace.zig");
 const gateway_provider = @import("../core/gateway/gateway_provider.zig");
@@ -965,6 +966,39 @@ fn flushActiveSessionUsage(state: *ServerState) !void {
     active.session_rt.usage.markClean(usage_snapshot);
 }
 
+/// The credential broker is a POSIX descriptor service. A WebAssembly host has
+/// no inherited descriptor to serve, so it composes the inert twin instead of
+/// the native one.
+const CodexCredentialBrokerHost = if (host_target.is_wasm) struct {
+    fn start(_: Allocator, _: Config) !@This() {
+        return .{};
+    }
+
+    fn deinit(_: *@This()) void {}
+} else struct {
+    runtime: codex_credential_broker.Runtime = .{},
+
+    fn start(alloc: Allocator, cfg: Config) !@This() {
+        var activation = try codex_credential_broker.Activation.prepare(
+            cfg.codex_credential_fd,
+        );
+        defer activation.deinit();
+        var self: @This() = .{};
+        _ = try self.runtime.start(alloc, &activation, .{
+            .transport = cfg.gateway_provider.oauth_transport,
+            .secret_store = cfg.secret_store,
+            .auth_mode = cfg.auth_mode,
+            .profile_home = cfg.home_override,
+            .borrowed_authorization = cfg.identity_home != null,
+        });
+        return self;
+    }
+
+    fn deinit(self: *@This()) void {
+        self.runtime.deinit();
+    }
+};
+
 pub fn run(alloc: Allocator, cfg: Config) !void {
     return runWithTransport(alloc, cfg, jsonrpc.Reader.init(), jsonrpc.Writer.init());
 }
@@ -979,6 +1013,10 @@ pub fn runWithTransport(
         try debug_trace.configure(.{ .file_path = path });
     }
 
+    // All-or-none, and before the server answers initialize: an ACP host that
+    // passed a credential descriptor is served a live broker or no Fx at all.
+    var codex_credential_host = try CodexCredentialBrokerHost.start(alloc, cfg);
+    defer codex_credential_host.deinit();
     var state = ServerState{
         .alloc = alloc,
         .cfg = cfg,

@@ -24,6 +24,7 @@ test {
     _ = @import("core/cli/cli_surface.zig");
     _ = @import("core/config/config_runtime.zig");
     _ = @import("core/auth/auth_runtime.zig");
+    _ = @import("core/auth/codex_credential_broker.zig");
     _ = @import("core/auth/shape_authority.zig");
     _ = @import("core/control/work_control.zig");
     _ = @import("core/hosts/native_external_editor.zig");

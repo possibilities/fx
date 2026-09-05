@@ -108,6 +108,7 @@
   "verification_scenarios": [
     {"name": "verify-ade-event-feed", "argv": ["bun", "test", "--max-concurrency", "1", "./ade-event-feed.test.ts"], "test_file": "ade-event-feed.test.ts"},
     {"name": "verify-auto-mode-reliability", "argv": ["bun", "test", "--max-concurrency", "1", "./auto-mode-reliability.test.ts"], "test_file": "auto-mode-reliability.test.ts"},
+    {"name": "verify-codex-credential-broker", "argv": ["bun", "test", "--max-concurrency", "1", "./codex-credential-broker.test.ts"], "test_file": "codex-credential-broker.test.ts", "requires_tmux": false},
     {"name": "verify-oauth-keychain-migration", "argv": ["bun", "test", "--max-concurrency", "1", "./oauth-keychain-migration.test.ts"], "test_file": "oauth-keychain-migration.test.ts", "allow_keychain": true},
     {"name": "verify-tui-auth-source-selection", "argv": ["bun", "test", "--max-concurrency", "1", "./tui-auth-source-selection.test.ts"], "test_file": "tui-auth-source-selection.test.ts"},
     {"name": "verify-tui-composer-edit-contracts", "argv": ["bun", "test", "--max-concurrency", "1", "./tui-composer-edit-contracts.test.ts"], "test_file": "tui-composer-edit-contracts.test.ts"},

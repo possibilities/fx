@@ -68,6 +68,8 @@ pub const Config = struct {
     permission_rules_override: ?types.PermissionRuleSet = null,
     skill_root_policy: skill_contract.RootPolicy = .{ .managed_root_source = null },
     allow_acp_mcp: bool = true,
+    /// The inherited Codex credential channel, when the launch selected one.
+    codex_credential_fd: ?u8 = null,
     allow_native_tools: bool = true,
     project_instructions_enabled: bool = true,
     native_tool_set: ?tool_set_contract.ToolSet = null,
