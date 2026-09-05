@@ -1144,6 +1144,8 @@ pub const ProviderPreparation = struct {
     transport: oauth_transport.Provider,
     secret_store: host.SecretStore,
     host_managed: bool,
+    /// Selected Fx profile home; credential preparation reads only that profile.
+    profile_home: ?[]u8 = null,
     thread: ?std.Thread = null,
     cancel_requested: std.atomic.Value(bool) = .init(false),
     done: std.atomic.Value(bool) = .init(false),
@@ -1165,6 +1167,7 @@ pub const ProviderPreparation = struct {
         self.input.candidate = null;
         self.input.models_path = "";
         errdefer self.deinit();
+        if (runtime.profile_home) |home| self.profile_home = try alloc.dupe(u8, home);
         self.input.models_path = try alloc.dupe(u8, input.models_path);
         if (input.primary_model) |value| self.input.primary_model = try alloc.dupe(u8, value);
         if (input.preferred_model) |value| self.input.preferred_model = try alloc.dupe(u8, value);
@@ -1180,13 +1183,22 @@ pub const ProviderPreparation = struct {
             self.credential = candidate;
             self.input.candidate = null;
         } else if (!self.host_managed) {
-            self.credential = prepareCredential(
-                self.alloc,
-                .{ .context = self, .execute_fn = executeCancellable },
-                self.secret_store,
-                self.input.target(),
-                self.input.preferred_source,
-            ) catch |err| {
+            self.credential = (if (self.profile_home) |home|
+                prepareCredentialFromHome(
+                    self.alloc,
+                    .{ .context = self, .execute_fn = executeCancellable },
+                    self.input.target(),
+                    self.input.preferred_source,
+                    home,
+                )
+            else
+                prepareCredential(
+                    self.alloc,
+                    .{ .context = self, .execute_fn = executeCancellable },
+                    self.secret_store,
+                    self.input.target(),
+                    self.input.preferred_source,
+                )) catch |err| {
                 self.failure = err;
                 return;
             };
@@ -1239,6 +1251,7 @@ pub const ProviderPreparation = struct {
         };
         if (self.input.primary_model) |value| self.alloc.free(value);
         if (self.input.preferred_model) |value| self.alloc.free(value);
+        if (self.profile_home) |home| self.alloc.free(home);
         self.alloc.free(self.input.models_path);
         const alloc = self.alloc;
         alloc.destroy(self);
@@ -1954,7 +1967,7 @@ pub const Runtime = struct {
         auth_mode: credentials.AuthMode,
     ) void {
         comptime {
-            if (std.meta.fields(Self).len != 31) {
+            if (std.meta.fields(Self).len != 32) {
                 @compileError("update Runtime.initInto for the changed field set");
             }
         }
