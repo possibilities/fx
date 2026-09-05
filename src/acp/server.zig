@@ -958,6 +958,8 @@ const CodexCredentialBrokerHost = if (host_target.is_wasm) struct {
             .transport = cfg.gateway_provider.oauth_transport,
             .secret_store = cfg.secret_store,
             .auth_mode = cfg.auth_mode,
+            .profile_home = cfg.home_override,
+            .borrowed_authorization = cfg.identity_home != null,
         });
         return self;
     }

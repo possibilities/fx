@@ -829,6 +829,8 @@ const App = struct {
             .transport = self.auth.oauthTransport(),
             .secret_store = self.auth.secretStore(),
             .auth_mode = self.auth.authMode(),
+            .profile_home = self.profile_home,
+            .borrowed_authorization = self.identity_home != null,
         });
     }
 
