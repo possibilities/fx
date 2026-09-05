@@ -959,7 +959,7 @@ pub fn composeFooterFrame(
             alloc,
             shell.layout.cols,
             ctx.ctrl_c_pending,
-            ctx.mcp_menu.state,
+            ctx.mcp_menu,
         )
     else if (input.show_picker and input.picker_kind == .help)
         try input_presentation.composeHelpMenuHintRow(alloc, shell.layout.cols, ctx.ctrl_c_pending)

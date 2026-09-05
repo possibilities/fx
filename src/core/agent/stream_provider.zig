@@ -131,6 +131,7 @@ pub const DynamicFunctionTool = struct {
     name: []const u8,
     description: []const u8,
     input_schema: std.json.Value,
+    mcp_binding: ?types.McpToolBinding = null,
 };
 
 pub const ToolSelection = struct {

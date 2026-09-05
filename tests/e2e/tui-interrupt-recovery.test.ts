@@ -63,6 +63,96 @@ afterEach(async () => {
 
 describe.skipIf(SKIP)("tui: interrupt recovery", () => {
   test(
+    "immediate prompt after cancellation keeps thinking visible and remains cancellable",
+    async () => {
+      root = realpathSync(mkdtempSync(join(tmpdir(), "fx-cancel-next-prompt-")));
+      const home = join(root, "home");
+      const workspace = join(root, "workspace");
+      const stderrPath = join(root, "stderr.log");
+      const tracePath = join(root, "trace.log");
+      const tapePath = join(root, "render.fxtape");
+      mkdirSync(join(home, ".fx"), { recursive: true });
+      mkdirSync(workspace, { recursive: true });
+      writeFileSync(join(home, ".fx", "settings.json"), "{}");
+      writeFileSync(join(workspace, "probe.txt"), "CANCEL_FOLLOW_UP_READ\n");
+
+      const held: HoldState = { started: false, cancelled: false, cancelCount: 0, released: false };
+      const followUp: HoldState = { started: false, cancelled: false, cancelCount: 0, released: false };
+      gateway = startFakeGateway([
+        () => heldUntilReleasedResponse(held, ""),
+        fakeGatewayToolCall("read-probe", "read_file", { path: "probe.txt" }),
+        () => heldUntilReleasedResponse(followUp, ""),
+        fakeGatewayFinalText("CANCEL_NEXT_PROMPT_COMPLETE"),
+      ]);
+      session = await TmuxSession.create({
+        cwd: workspace,
+        stderrPath,
+        width: 103,
+        height: 29,
+        isolated: true,
+        env: {
+          HOME: home,
+          AI_GATEWAY_API_KEY: "fake-cancel-next-prompt-key",
+          VERCEL_OIDC_TOKEN: undefined,
+          FX_AUTO_UPGRADE: "0",
+          FX_GATEWAY_BASE_URL: gateway.baseUrl,
+          FX_GATEWAY_CHAT_URL: gateway.chatUrl,
+          FX_E2E_GATEWAY_CHAT_URL: gateway.chatUrl,
+          FX_MODEL: FAKE_GATEWAY_MODEL,
+          FX_TRACE_SCOPES: `${TRACE_SCOPES},input`,
+          FX_TRACE_LOG: tracePath,
+          FX_RECORD: tapePath,
+        },
+      });
+      await session.waitForComposer(TIMEOUT);
+      await session.sendText("Hold this response.");
+      await waitForCondition(() => held.started, "first request start");
+      await session.waitForText("Thinking", TIMEOUT);
+
+      session.sendKeysImmediate(["C-c", "o", "k", "Enter"]);
+      await waitForCondition(() => followUp.started, "follow-up request after tool completion");
+      await session.waitForText("Thinking", TIMEOUT);
+      const activeGrid = await session.capturePaneGrid();
+      expect(activeGrid.join("\n")).toContain("Read probe.txt");
+      expect(activeGrid.join("\n")).toContain("Thinking");
+      expect(gateway.requests[1]!.body).toContain("<turn_aborted>");
+      expect(gateway.requests[1]!.body).not.toContain("<user_steering>");
+      expect(countOccurrences(readTrace(tracePath), "event=worker_begin")).toBe(2);
+
+      await session.sendKeys("C-o");
+      await session.waitForText("Full detail", TIMEOUT);
+      await session.sendKeys("C-o");
+      await session.waitForText("Thinking", TIMEOUT);
+      await session.sendKeys("C-c");
+      await waitForCondition(() => followUp.cancelled, "follow-up cancellation");
+      await waitForCondition(
+        () => countOccurrences(readTrace(tracePath), "event=interrupt_persisted") === 2,
+        "both cancellations persisted",
+      );
+      await session.sendText("Finish the check.");
+      await session.waitForText("CANCEL_NEXT_PROMPT_COMPLETE", TIMEOUT);
+      await waitForCondition(
+        () => countOccurrences(readTrace(tracePath), "finish processing queued=") === 3,
+        "final prompt completion",
+      );
+      const scrollback = await session.captureFullScrollback();
+      expect(scrollback).toContain("Read probe.txt");
+      expect(countOccurrences(scrollback, "What can fx do differently?")).toBe(2);
+      expect((await session.capturePaneGrid()).join("\n")).not.toContain("Thinking");
+      expect(gateway.requests).toHaveLength(4);
+      expect(held.cancelCount).toBe(1);
+      expect(followUp.cancelCount).toBe(1);
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+      expect(session.isPaneAlive()).toBe(true);
+      const replay = Bun.spawnSync([join(import.meta.dir, "../../zig-out/bin/fx"), "replay", tapePath]);
+      expect(replay.exitCode).toBe(0);
+      expect(replay.stdout.toString()).toContain("CANCEL_NEXT_PROMPT_COMPLETE");
+      expect(replay.stdout.toString()).not.toContain("Thinking");
+    },
+    TIMEOUT * 2,
+  );
+
+  test(
     "submitted text interrupts a tool-free response and continues immediately",
     async () => {
       root = realpathSync(mkdtempSync(join(tmpdir(), "fx-text-steering-")));
@@ -319,7 +409,13 @@ describe.skipIf(SKIP)("tui: interrupt recovery", () => {
         join(sessionRoot, sessionIds[0]!, "events.jsonl"),
         "utf8",
       );
-      expect(countOccurrences(events, '"kind":"interrupted"')).toBe(1);
+      const interruptedEvents = events
+        .trim()
+        .split("\n")
+        .filter(Boolean)
+        .map((line) => JSON.parse(line) as { event: Record<string, unknown> })
+        .filter((record) => record.event.interrupted !== undefined);
+      expect(interruptedEvents).toHaveLength(1);
       for (const chunk of PARTIAL_CHUNKS) {
         expect(events).toContain(chunk.trim());
       }
@@ -596,7 +692,7 @@ function providerPortableResponse(text: string): Response {
   return fakeGatewayFinalText(text);
 }
 
-function heldUntilReleasedResponse(state: HoldState): Response {
+function heldUntilReleasedResponse(state: HoldState, text = "ACTIVE_RESPONSE_HELD\n"): Response {
   const encoder = new TextEncoder();
   let timer: ReturnType<typeof setInterval> | undefined;
   let closed = false;
@@ -604,8 +700,8 @@ function heldUntilReleasedResponse(state: HoldState): Response {
     new ReadableStream<Uint8Array>({
       start(controller) {
         state.started = true;
-        controller.enqueue(encoder.encode(
-          'data: {"type":"text-delta","id":"held","delta":"ACTIVE_RESPONSE_HELD\\n"}\n\n',
+        if (text) controller.enqueue(encoder.encode(
+          `data: ${JSON.stringify({ type: "text-delta", id: "held", delta: text })}\n\n`,
         ));
         timer = setInterval(() => {
           if (!closed) controller.enqueue(encoder.encode(": held-response\n\n"));
