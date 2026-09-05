@@ -399,10 +399,16 @@ test "pinned ChatGPT account rejects a swapped selected-profile session before r
     const session_bytes =
         "{\"version\":1,\"access_token\":\"access-b\",\"refresh_token\":\"refresh-b\"," ++
         "\"expires_at_ms\":0,\"account_id\":\"account-b\"}\n";
-    try tmp.dir.writeFile(std.testing.io, .{
-        .sub_path = "state/.fx/chatgpt-auth.json",
-        .data = session_bytes,
-    });
+    var auth_file = try tmp.dir.createFile(
+        std.testing.io,
+        "state/.fx/chatgpt-auth.json",
+        .{
+            .truncate = true,
+            .permissions = std.Io.File.Permissions.fromMode(0o600),
+        },
+    );
+    try auth_file.writeStreamingAll(std.testing.io, session_bytes);
+    auth_file.close(std.testing.io);
 
     const Fixture = struct {
         oauth_calls: usize = 0,
