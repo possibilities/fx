@@ -171,7 +171,6 @@ pub fn build(b: *std.Build) void {
             "strict authenticated request decoding preserves opaque turn ids",
             "request decoding rejects partial authority and extra parameters",
             "success responses carry correlated authoritative snapshots",
-            "hidden interrupt pauses queued work without opening the human editor",
             "ADE edited path reporting requires successful committed mutation results",
             "ADE terminal mutation completion requires exit-zero proof for durable starts",
             "ADE durable terminal start classifies the declared working directory",
