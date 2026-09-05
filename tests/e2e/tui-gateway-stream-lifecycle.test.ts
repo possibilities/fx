@@ -1969,7 +1969,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
   );
 
   test(
-    "provider route recovery counts down, times out a silent head, and recovers",
+    "provider route recovery counts down and accepts slow response headers",
     async () => {
       root = realpathSync(mkdtempSync(join(tmpdir(), "fx-tui-route-recovery-")));
       const home = join(root, "home");
@@ -1985,9 +1985,8 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
         retryAfterUnavailable(4),
         async () => {
           await Bun.sleep(35_000);
-          return fakeGatewayFinalText("late response must be ignored");
+          return fakeGatewayFinalText(finalText);
         },
-        fakeGatewayFinalText(finalText),
       ], {
         models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
       });
@@ -2035,15 +2034,10 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       expect(narrowPane).not.toContain("▲");
 
       await session.resizeWindow(72, 24);
-      await waitForCondition(
-        () => queuedGateway.requests.length === 3,
-        "retry after silent response head timeout",
-        TIMEOUT * 2,
-      );
-      await session.waitForText(finalText, TIMEOUT);
+      await session.waitForText(finalText, TIMEOUT * 2);
       const scrollback = await session.captureFullScrollback();
 
-      expect(queuedGateway.requests.length).toBe(3);
+      expect(queuedGateway.requests.length).toBe(2);
       expect(scrollback).not.toContain("System");
       expect(scrollback).not.toContain("Attempt 1 failed. Retrying route.");
       expect(scrollback).not.toContain("✓ recovered");
@@ -2091,11 +2085,15 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
     async () => {
       const originalPrompt = "Preserve this interactive prompt.";
       const finalText = "Interactive recovery completed.";
+      const continued: HoldState = { started: false, cancelled: false };
       const { queuedGateway, stderrPath } = await launchRouteRecoveryTui(
         "fx-tui-recovery-continue-",
         [
           ...Array.from({ length: 10 }, () => retryAfterUnavailable(0)),
-          fakeGatewayFinalText(finalText),
+          () => heldGatewayResponse(continued, [], [
+            { type: "text-delta", id: "answer_1", delta: finalText },
+            { type: "finish", finishReason: { unified: "stop", raw: "stop" } },
+          ]),
         ],
       );
 
@@ -2105,6 +2103,9 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       expect(queuedGateway.requests).toHaveLength(10);
 
       await session!.sendText("/continue");
+      await waitForCondition(() => continued.started, "continued paused response");
+      await session!.waitForText("Thinking", TIMEOUT);
+      continued.release?.();
       try {
         await session!.waitForText(finalText, TIMEOUT);
       } catch (err) {
@@ -2170,6 +2171,79 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
     },
     TIMEOUT * 2,
   );
+
+  for (const outcome of ["finish", "cancel"] as const) {
+    test(
+      `reopened recovery shows progress before response text and can ${outcome}`,
+      async () => {
+        const interrupted: HoldState = { started: false, cancelled: false };
+        const resumed: HoldState = { started: false, cancelled: false };
+        const prompt = "Read before.txt, then report the result.";
+        const finalText = "Reopened recovery completed once.";
+        const { queuedGateway, stderrPath } = await launchRouteRecoveryTui(
+          "fx-tui-recovery-progress-",
+          [
+            fakeGatewayToolCall("read_before_resume", "read_file", { path: "before.txt" }),
+            () => heldGatewayResponse(interrupted),
+            () => heldGatewayResponse(resumed, [], [
+              { type: "text-delta", id: "answer_1", delta: finalText },
+              { type: "finish", finishReason: { unified: "stop", raw: "stop" } },
+            ]),
+          ],
+        );
+        writeFileSync(join(root!, "workspace", "before.txt"), "Completed read survives restart.\n");
+        await session!.sendText(prompt);
+        await waitForCondition(() => interrupted.started, "checkpointed response");
+        await session!.kill();
+        session = null;
+        const resumedStderr = join(root!, "resumed-stderr.log");
+        session = await TmuxSession.create({
+          cmd: `${FX_BIN} --resume-last`,
+          cwd: join(root!, "workspace"),
+          width: 100,
+          height: 32,
+          stderrPath: resumedStderr,
+          env: {
+            HOME: join(root!, "home"),
+            AI_GATEWAY_API_KEY: "fake-route-recovery-key",
+            FX_AUTO_UPGRADE: "0",
+            FX_PERMISSION_MODE: "auto",
+            FX_GATEWAY_BASE_URL: queuedGateway.baseUrl,
+            FX_GATEWAY_CHAT_URL: queuedGateway.chatUrl,
+            FX_E2E_GATEWAY_CHAT_URL: queuedGateway.chatUrl,
+            FX_E2E_GATEWAY_MODELS_URL: `${queuedGateway.baseUrl}/coding-agent/v1/models`,
+            FX_MODEL: MODEL,
+          },
+        });
+        await session.waitForComposer(TIMEOUT);
+        await session.sendText("/continue");
+        await waitForCondition(() => resumed.started, "admitted resumed response");
+        await session.waitForText("Thinking", TIMEOUT);
+        for (let attempt = 0; attempt < 3; attempt++) await session.sendText("/continue");
+        await session.waitForText("wait for the current response to finish", TIMEOUT);
+        expect(queuedGateway.requests).toHaveLength(3);
+        expect(await session.capturePane()).toContain("Thinking");
+
+        if (outcome === "finish") {
+          resumed.release?.();
+          await session.waitForText(finalText, TIMEOUT);
+        } else {
+          await session.sendKeys("Escape");
+          await session.waitForText("What can fx do differently?", TIMEOUT);
+        }
+        await session.waitForPane((pane) => !pane.includes("Thinking") && hasEmptyComposer(pane), TIMEOUT);
+        const scrollback = await session.captureFullScrollback();
+        expect(scrollback.split(prompt).length - 1).toBe(1);
+        expect(scrollback.split("└ Read before.txt").length - 1).toBe(1);
+        expect(scrollback.split(finalText).length - 1).toBe(outcome === "finish" ? 1 : 0);
+        expect(queuedGateway.requests).toHaveLength(3);
+        expect(session.isAlive()).toBe(true);
+        expect(readFileSync(stderrPath, "utf8")).toBe("");
+        expect(readFileSync(resumedStderr, "utf8")).toBe("");
+      },
+      TIMEOUT * 2,
+    );
+  }
 
   test(
     "paused tool lifecycle admits resumed tools on the same turn",
@@ -2244,7 +2318,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       for (const request of queuedGateway.requests.slice(1)) {
         const retryRequest = JSON.parse(request.body);
         expect(retryRequest).not.toHaveProperty("fast");
-        expect(retryRequest.providerOptions?.gateway).toBeUndefined();
+        expect(retryRequest.providerOptions?.gateway).toEqual({ caching: "auto" });
       }
       expect(readFileSync(stderrPath, "utf8")).toBe("");
     },
@@ -2432,10 +2506,10 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       });
       const secondRequest = JSON.parse(queuedGateway.requests[1]!.body);
       expect(secondRequest).not.toHaveProperty("fast");
-      expect(secondRequest.providerOptions?.gateway).toBeUndefined();
+      expect(secondRequest.providerOptions?.gateway).toEqual({ caching: "auto" });
       const finalRequest = JSON.parse(queuedGateway.requests[3]!.body);
       expect(finalRequest).not.toHaveProperty("fast");
-      expect(finalRequest.providerOptions?.gateway).toBeUndefined();
+      expect(finalRequest.providerOptions?.gateway).toEqual({ caching: "auto" });
       expect(scrollback).toContain(finalText);
       expect(scrollback).toMatch(TURN_SUMMARY_WITH_TOKENS);
       expect(scrollback).not.toContain("✓ recovered");
@@ -2569,14 +2643,14 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
         () =>
           existsSync(sessionsRoot) &&
           readdirSync(sessionsRoot).some((entry) =>
-            existsSync(join(sessionsRoot, entry, "checkpoint.json")),
+            existsSync(join(sessionsRoot, entry, "events.jsonl")),
           ),
-        "session checkpoint",
+        "session event log",
       );
       const sessionId = readdirSync(sessionsRoot).find((entry) =>
-        existsSync(join(sessionsRoot, entry, "checkpoint.json")),
+        existsSync(join(sessionsRoot, entry, "events.jsonl")),
       );
-      if (!sessionId) throw new Error("session checkpoint was not found");
+      if (!sessionId) throw new Error("session event log was not found");
 
       const readSavedSession = () =>
         execFileSync(FX_BIN, ["session", "--id", sessionId, "--json"], {
