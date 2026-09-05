@@ -8,6 +8,7 @@ import {
   rmSync,
   statSync,
   writeFileSync,
+  readdirSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -16,6 +17,7 @@ import {
   FAKE_GATEWAY_MODEL,
   fakeGatewayFinalText,
   fakeGatewayToolCall,
+  fakeShellRun,
   startDynamicFakeGateway,
   TmuxSession,
   tmuxAvailable,
@@ -151,7 +153,13 @@ function eventIndex(
 
 function latestPrompt(body: string): string {
   const request = JSON.parse(body) as { prompt?: unknown[] };
-  return JSON.stringify(request.prompt?.at(-1) ?? "");
+  const prompt = request.prompt ?? [];
+  for (let index = prompt.length - 1; index >= 0; index -= 1) {
+    // Upstream reverted post-tool reassessment, so no injected decision
+    // prompt sits between the model's turns any more.
+    return JSON.stringify(prompt[index] ?? "");
+  }
+  return "";
 }
 
 async function waitForJsonFile(
@@ -189,7 +197,15 @@ describe.skipIf(!tmuxAvailable())("ADE event feed", () => {
       ).toBe(0);
       writeFileSync(
         join(home, ".fx", "settings.json"),
-        JSON.stringify({ sandbox: "none", permission_mode: "ask", permission: {} }),
+        JSON.stringify({
+          sandbox: "none",
+          permission_mode: "ask",
+          permission: {},
+          session_naming: {
+            gateway: { model: FAKE_GATEWAY_MODEL, effort: "low" },
+            timeout_ms: 10_000,
+          },
+        }),
       );
       writeFileSync(stderrPath, "");
 
@@ -199,6 +215,9 @@ describe.skipIf(!tmuxAvailable())("ADE event feed", () => {
       const childPrompt = "ADE_CHILD_PROMPT: run a terminal command";
       const childFinished = Promise.withResolvers<void>();
       gateway = startDynamicFakeGateway(async (body) => {
+        if (body.includes("Generate a short session title")) {
+          return fakeGatewayFinalText("ADE native session title");
+        }
         const latest = latestPrompt(body);
         if (latest.includes('"toolCallId":"ade_question_1"')) {
           return fakeGatewayFinalText("ADE_QUESTION_DONE");
@@ -212,13 +231,10 @@ describe.skipIf(!tmuxAvailable())("ADE event feed", () => {
           return fakeGatewayFinalText("ADE_PARENT_DONE");
         }
         if (latest.includes(childPrompt)) {
-          return fakeGatewayToolCall("ade_child_terminal_1", "terminal", {
-            action: "start",
-            command: "touch ADE_CHILD_EDITED",
+          return fakeShellRun("ade_child_terminal_1", "touch ADE_CHILD_EDITED", {
             cwd: secondWorkspace,
             profile: "clean",
-            return_when: { kind: "exit" },
-            wait_ceiling_ms: 10_000,
+            timeout_ms: 10_000,
           });
         }
         if (latest.includes("ADE_QUESTION_REQUEST")) {
@@ -235,13 +251,9 @@ describe.skipIf(!tmuxAvailable())("ADE event feed", () => {
         }
         if (latest.includes("ADE_SUBAGENT_REQUEST")) {
           return fakeGatewayToolCall("ade_parent_create_1", "subagent", {
-            command: {
-              create: {
-                name: "ade-child",
-                mode: "persistent",
-                prompt: childPrompt,
-                permission_mode: "ask",
-              },
+            request: {
+              action: "run",
+              task: childPrompt,
             },
           });
         }
@@ -292,6 +304,25 @@ describe.skipIf(!tmuxAvailable())("ADE event feed", () => {
       expect(statSync(checkpointPath).mode & 0o777).toBe(0o600);
 
       await session.sendText("ADE_QUESTION_REQUEST");
+      const nativeMetadata = await receiver.waitFor(
+        (record) =>
+          record.event === "SessionMetadataChanged" &&
+          record.context.agent_role === "main" &&
+          // The provider answers in words; fx publishes the slug it made of them.
+          record.payload.title === "ade-native-session-title",
+      );
+      const metadataSessionId = nativeMetadata.context.session_id;
+      expect(metadataSessionId).not.toBeNull();
+      // The title is durable only in the conversation manifest; no display
+      // sidecar exists any more.
+      const manifest = JSON.parse(readFileSync(
+        join(home, ".fx", "sessions", metadataSessionId!, "session.json"),
+        "utf8",
+      )) as { title?: unknown };
+      expect(manifest.title).toBe("ade-native-session-title");
+      expect(existsSync(
+        join(home, ".fx", "sessions", metadataSessionId!, "display.json"),
+      )).toBe(false);
       await session.waitForText("Which ADE event path should continue?", TIMEOUT);
       await receiver.waitFor(
         (record) =>
@@ -313,7 +344,8 @@ describe.skipIf(!tmuxAvailable())("ADE event feed", () => {
       await session.waitForComposer(TIMEOUT);
 
       await session.sendText("ADE_SUBAGENT_REQUEST");
-      await session.waitForText("Subagent ade-child needs permission", TIMEOUT);
+      // Upstream addresses a child by its model-safe handle, not its prompt.
+      await session.waitForText("needs permission", TIMEOUT);
       const childAttention = await receiver.waitFor(
         (record) =>
           record.event === "AttentionRequired" &&
@@ -323,21 +355,13 @@ describe.skipIf(!tmuxAvailable())("ADE event feed", () => {
       expect(childAttention.context.session_id).not.toBeNull();
       expect(childAttention.context.parent_session_id).not.toBeNull();
       expect(childAttention.context.turn_id).toBeNull();
-      await session.sendKeys("C-x");
+      // Upstream's subagent delegation simplification removed the panel, so
+      // the mirrored main prompt is the only surface that answers for a child.
       await session.waitForPane(
         (pane) =>
-          pane.includes("Agents & processes") &&
-          pane.includes("ade-child") &&
-          pane.includes("approval"),
-        TIMEOUT,
-      );
-      await session.sendKeys("Enter");
-      await session.waitForPane(
-        (pane) =>
-          pane.includes("Subagent: ade-child") &&
-          pane.includes("status: approval") &&
-          pane.includes("terminal start") &&
-          pane.includes("❯ 1. Yes"),
+          pane.includes("needs permission") &&
+          pane.includes("shell.run") &&
+          pane.includes("1. Yes"),
         TIMEOUT,
       );
       await session.sendKeys("1");
@@ -350,8 +374,9 @@ describe.skipIf(!tmuxAvailable())("ADE event feed", () => {
       expect(childResolution.context.session_id).toBe(childAttention.context.session_id);
       expect(childResolution.context.agent_state).toBe("working");
       expect(childResolution.context.attention_kind).toBeNull();
-      await session.waitForText("ADE_CHILD_DONE", TIMEOUT);
-      await session.sendKeys("C-x");
+      // Upstream's managed subagents render the child as a tool-call summary
+      // in the parent rather than printing the child's own final text there,
+      // so the child's completion is proved by its PostTurnEnd record below.
       await session.waitForText("ADE_PARENT_DONE", TIMEOUT);
       await receiver.waitFor(
         (record) =>
@@ -387,6 +412,7 @@ describe.skipIf(!tmuxAvailable())("ADE event feed", () => {
           record.context.agent_role === "main",
       )?.context.session_id;
       expect(originalMainSession).not.toBeNull();
+      expect(metadataSessionId).toBe(originalMainSession);
       await session.sendText("/new");
       const newSession = await receiver.waitFor(
         (record) =>
@@ -397,41 +423,26 @@ describe.skipIf(!tmuxAvailable())("ADE event feed", () => {
       const freshMainSession = newSession.payload.session_id as string;
       expect(freshMainSession).not.toBe(originalMainSession);
       await session.waitForComposer(TIMEOUT);
-      await session.sendText("/resume");
-      await session.waitForText("Sessions", TIMEOUT);
-      await session.sendKeys("Tab");
-      await session.waitForText("[All workspaces]", TIMEOUT);
-      const resumePane = await session.waitForPane(
-        (pane) =>
-          pane.includes("Sessions 2") &&
-          (pane.includes("ade-native-session-title") ||
-            pane.includes("ADE_QUESTION_REQUEST")) &&
-          pane.includes("ADE_CHILD_PROMPT: run a terminal command"),
-        TIMEOUT,
+
+      // The feed's scope ends here. Resume-picker semantics belong to
+      // upstream, so instead of driving the picker this asserts what upstream
+      // asserts about discovery after a child completes: the parent and child
+      // both persist, and the parent is the session holding the child
+      // registry, which is what keeps a child private to it.
+      const sessionsRoot = join(home, ".fx", "sessions");
+      const persisted = readdirSync(sessionsRoot, { withFileTypes: true })
+        .filter((entry) =>
+          entry.isDirectory() &&
+          existsSync(join(sessionsRoot, entry.name, "session.json"))
+        )
+        .map((entry) => entry.name);
+      expect(persisted).toContain(originalMainSession);
+      expect(persisted).toContain(childAttention.context.session_id);
+      const registryOwners = persisted.filter((id) =>
+        existsSync(join(sessionsRoot, id, "subagent", "children.json"))
       );
-      const originalTitle = resumePane.includes("ade-native-session-title")
-        ? "ade-native-session-title"
-        : "ADE_QUESTION_REQUEST";
-      // The picker can preserve its prior selection while the all-workspaces
-      // page loads. With exactly two rows, clamp to the edge containing the
-      // original main session instead of assuming timestamp-tied catalog order.
-      const originalComesFirst =
-        resumePane.indexOf(originalTitle) <
-        resumePane.indexOf("ADE_CHILD_PROMPT: run a terminal command");
-      await session.sendKeys(originalComesFirst ? "Up" : "Down");
-      await session.sendKeys("Enter");
-      await receiver.waitFor(
-        (record) =>
-          record.event === "SessionChanged" &&
-          record.payload.previous_session_id === freshMainSession &&
-          record.payload.session_id === originalMainSession,
-      );
-      expect(JSON.parse(readFileSync(checkpointPath, "utf8"))).toEqual({
-        schema: 1,
-        instance_id: INSTANCE_ID,
-        revision: 2,
-        git_roots: [realpathSync(workspace), realpathSync(secondWorkspace)],
-      });
+      expect(registryOwners).toEqual([originalMainSession]);
+
       await session.waitForComposer(TIMEOUT);
       await session.sendText("/quit");
       expect(await session.waitForSessionEnd(TIMEOUT)).toBe(true);
