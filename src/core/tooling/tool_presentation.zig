@@ -170,8 +170,10 @@ pub fn runCommandCompletedActionLabel(
 ) !?[]const u8 {
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, call.arguments_json, .{});
     defer parsed.deinit();
-    if (parsed.value != .object or !isCapturedCommandCall(registry, call, parsed.value.object)) return null;
-    const command = tool_args.optionalStringArg(parsed.value.object, "command") orelse return null;
+    if (parsed.value != .object) return null;
+    const args = tool_args.commandArguments(parsed.value.object);
+    if (!isCapturedCommandCall(registry, call, args)) return null;
+    const command = tool_args.optionalStringArg(args, "command") orelse return null;
     return if (try tool_dispatch.matchRunCommandCompatibility(registry, command)) |matched|
         matched.tool.completed_action_label
     else
@@ -188,7 +190,9 @@ pub fn formatRunCommandActivity(
     defer scratch_state.deinit();
     const scratch = scratch_state.allocator();
 
-    const args = tool_args.parseToolArgsObject(scratch, call.arguments_json) catch return null;
+    const args = tool_args.commandArguments(
+        tool_args.parseToolArgsObject(scratch, call.arguments_json) catch return null,
+    );
     if (!isCapturedCommandCall(registry, call, args)) return null;
     const command = tool_args.optionalStringArg(args, "command") orelse return null;
     const detail = (try formatRunCommandDetailBounded(
@@ -410,8 +414,9 @@ pub fn formatPermissionLabel(alloc: Allocator, registry: tool_dispatch.Registry,
     const args = tool_args.parseToolArgsObject(scratch, call.arguments_json) catch {
         return try alloc.dupe(u8, call.name);
     };
-    if (isCapturedCommandCall(registry, call, args)) {
-        const command = tool_args.optionalStringArg(args, "command") orelse
+    const command_args = tool_args.commandArguments(args);
+    if (isCapturedCommandCall(registry, call, command_args)) {
+        const command = tool_args.optionalStringArg(command_args, "command") orelse
             return try alloc.dupe(u8, call.name);
         return formatRunCommandPermissionLabel(alloc, command);
     }
