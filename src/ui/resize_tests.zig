@@ -2385,6 +2385,7 @@ test "entry-bound shimmer is suppressed when footer banner covers its row" {
     try expectGridNotContains(&h, "Overlay should fit");
 
     ctx.steering_messages = &.{"pending steering"};
+    ctx.steering_waits_for_tool = true;
     h.frame_redraw = true;
     try renderTestFooterWithContext(&h, &approval, &h.frame_redraw, ctx);
     try h.flush();
@@ -2410,6 +2411,7 @@ test "footer banner keeps a gap after entry-bound activity" {
     var ctx = defaultFooterContext(&input);
     setToolActivity(&ctx, status_id, "Overlay should be hidden by banner");
     ctx.steering_messages = &.{"pending steering"};
+    ctx.steering_waits_for_tool = true;
     h.frame_redraw = true;
     try renderTestFooterWithContext(&h, &approval, &h.frame_redraw, ctx);
     try h.flush();
@@ -2448,6 +2450,7 @@ test "footer banner reserves blank row after bottom entry-bound activity" {
     var ctx = defaultFooterContext(&input);
     setToolActivity(&ctx, status_id, "Creating project");
     ctx.steering_messages = &.{"pending steering"};
+    ctx.steering_waits_for_tool = true;
     h.frame_redraw = true;
     try renderTestFooterWithContext(&h, &approval, &h.frame_redraw, ctx);
     try h.flush();
@@ -2496,6 +2499,7 @@ test "banner-suppressed overlay restore keeps reserved footer gap" {
     try std.testing.expect(!h.shell.shimmer_active);
 
     ctx.steering_messages = &.{"pending steering"};
+    ctx.steering_waits_for_tool = true;
     h.frame_redraw = true;
     try renderTestFooterWithContext(&h, &approval, &h.frame_redraw, ctx);
     try h.flush();
@@ -4308,6 +4312,7 @@ test "render engine preserves transcript footer activity behavior" {
     try std.testing.expectEqual(status_row, try findRowContaining(&h, "Writing render-engine-plan"));
 
     ctx.steering_messages = &.{"pending steering"};
+    ctx.steering_waits_for_tool = true;
     setToolActivity(&ctx, status_id, "Overlay hidden by banner");
     h.frame_redraw = true;
     try renderTestFooterWithContext(&h, &approval, &h.frame_redraw, ctx);

@@ -694,6 +694,70 @@ describe("cli: status", () => {
     TIMEOUT,
   );
 
+  for (const scenario of [
+    { name: "automatic Gateway", provider: "gateway", source: undefined, help: MISSING_AUTH_MESSAGE },
+    { name: "Gateway with a stale Codex preference", provider: "gateway", source: "chatgpt_subscription", help: MISSING_AUTH_MESSAGE },
+    { name: "Gateway with a stale Grok preference", provider: "gateway", source: "grok_subscription", help: MISSING_AUTH_MESSAGE },
+    { name: "an exact Gateway login", provider: "gateway", source: "fx_login", help: "fx login is selected but unavailable. Run fx login to reconnect; no other credential was selected." },
+    { name: "Codex", provider: "codex", source: undefined, help: "fx needs a Codex subscription login for this model. Run fx login codex." },
+    { name: "Grok", provider: "grok", source: undefined, help: "fx needs a Grok subscription login for this model. Run fx login grok." },
+  ]) {
+    test(
+      `status and doctor respect ${scenario.name} when credentials are missing`,
+      async () => {
+        const root = mkdtempSync(join(tmpdir(), "fx-e2e-provider-diagnostics-"));
+        try {
+          const home = join(root, "home");
+          const workspace = join(root, "workspace");
+          mkdirSync(join(home, ".fx"), { recursive: true });
+          mkdirSync(workspace);
+          const settingsPath = join(home, ".fx", "settings.json");
+          const settings = JSON.stringify({
+            provider: scenario.provider,
+            models: { [scenario.provider]: "test-model" },
+            credential_source: scenario.source,
+          });
+          writeFileSync(settingsPath, settings);
+          const options = {
+            cwd: realpathSync(workspace),
+            env: { ...NO_GATEWAY_AUTH, HOME: realpathSync(home), FX_DISABLE_KEYCHAIN: "1" },
+          };
+
+          for (const command of ["status", "doctor"]) {
+            const text = await runFx([command], options);
+            const json = await runFx([command, "--json"], options);
+            expect(text.code).toBe(0);
+            expect(json.code).toBe(0);
+            expect(text.stderr).toBe("");
+            expect(json.stderr).toBe("");
+            expect(text.stdout).toContain(scenario.help);
+            const value = JSON.parse(json.stdout);
+            expect(value.auth).toBe("missing");
+            expect(value.auth_refreshable).toBe(false);
+            if (command === "status") {
+              expect(value.auth_help).toBe(scenario.help);
+            } else {
+              expect(value.checks).toContainEqual({
+                name: "auth", status: "fail", detail: scenario.help,
+              });
+            }
+          }
+
+          const ask = await runFx(["ask", "--json", "--no-save", "Say hello."], options);
+          expect(ask.code).toBe(1);
+          expect(JSON.parse(ask.stdout).error).toBe("MissingCredentials");
+          expect(ask.stderr).toContain(
+            scenario.provider === "gateway" ? MISSING_AUTH_MESSAGE : scenario.help,
+          );
+          expect(readFileSync(settingsPath, "utf8")).toBe(settings);
+        } finally {
+          rmSync(root, { recursive: true, force: true });
+        }
+      },
+      TIMEOUT,
+    );
+  }
+
   test(
     "status and doctor share fx login source, team, and refreshability",
     async () => {
