@@ -4,6 +4,8 @@ import { fileURLToPath } from "node:url";
 
 const repoRoot = fileURLToPath(new URL("../..", import.meta.url));
 const scripts = [
+  "test-core-output.mjs",
+  "test-core-output-pressure.mjs",
   "test-native-core-ready.mjs",
   "test-native-core-misuse.mjs",
   "test-native-core-workers.mjs",
@@ -16,6 +18,8 @@ const scripts = [
   "test-agent-transport-retry.mjs",
   "test-native-core-stream.mjs",
   "test-native-core-fetch-failure.mjs",
+  "test-native-core-image-framing.mjs",
+  "test-native-host-tool-frame-limit.mjs",
   "test-native-core-cancel-before-fetch.mjs",
   "test-native-core-cancel.mjs",
   "test-native-host-tool-late-settle.mjs",
