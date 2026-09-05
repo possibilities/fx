@@ -15,6 +15,7 @@ const expected_names = [_][]const u8{
     "core.tooling.tool_selection.test.native tool selections resolve aliases and preserve flag order",
     "acp.types.test.writeAgentMessageChunk produces valid json",
     "core.auth.auth_runtime.test.pinned ChatGPT account rejects a swapped selected-profile session before refresh side effects",
+    "core.app.app_session_runtime.test.resume handoff owns the exact non-pristine session id",
     "builtins.hooks.ade_events.test.ADE feed serializes a main turn as one versioned JSON line",
     "builtins.hooks.ade_events.test.ADE feed serializes native session metadata as a generic raw event",
     "builtins.hooks.ade_events.test.ADE feed serializes an additive Git root discovery record",
