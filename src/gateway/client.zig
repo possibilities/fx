@@ -7,6 +7,7 @@ const debug_trace = @import("../core/shared/debug_trace.zig");
 const io_mod = @import("../core/shared/io.zig");
 const types = @import("../core/shared/types.zig");
 const json_comparison = @import("json_comparison.zig");
+const sse = @import("sse.zig");
 
 pub fn isRetryableGatewayError(err: anyerror) bool {
     return err == error.HttpConnectionClosing or
@@ -2939,82 +2940,6 @@ fn parseOptionalNullableBillingInteger(
         null;
 }
 
-const SseLineRead = union(enum) {
-    line: []const u8,
-    read_failed,
-    eof,
-};
-
-const SseEventRead = union(enum) {
-    data: []const u8,
-    done,
-    ignored,
-    read_failed,
-    eof,
-};
-
-const SseEventReader = struct {
-    pending_line: std.ArrayList(u8) = .empty,
-    max_line_bytes: usize,
-
-    fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
-        self.pending_line.deinit(alloc);
-    }
-
-    fn releaseLine(self: *@This()) void {
-        self.pending_line.clearRetainingCapacity();
-    }
-
-    fn next(self: *@This(), alloc: std.mem.Allocator, reader: anytype) !SseEventRead {
-        const line = switch (try self.readLine(alloc, reader)) {
-            .line => |line| line,
-            .read_failed => return .read_failed,
-            .eof => return .eof,
-        };
-
-        const trimmed = std.mem.trimEnd(u8, line, "\r");
-        if (trimmed.len == 0) return .ignored;
-        if (trimmed[0] == ':') return .ignored;
-
-        if (std.mem.eql(u8, trimmed, "DONE")) return .done;
-
-        const data_prefix = "data: ";
-        if (!std.mem.startsWith(u8, trimmed, data_prefix)) return .ignored;
-
-        const json_text = trimmed[data_prefix.len..];
-        if (std.mem.eql(u8, json_text, "[DONE]")) return .done;
-        return .{ .data = json_text };
-    }
-
-    fn readLine(self: *@This(), alloc: std.mem.Allocator, reader: anytype) !SseLineRead {
-        while (true) {
-            const fragment = reader.takeDelimiter('\n') catch |err| switch (err) {
-                error.StreamTooLong => {
-                    const buffered = reader.buffered();
-                    if (buffered.len == 0) return error.GatewaySseReadStalled;
-                    if (buffered.len > self.max_line_bytes - self.pending_line.items.len) {
-                        return error.GatewaySseEventTooLarge;
-                    }
-                    try self.pending_line.appendSlice(alloc, buffered);
-                    reader.tossBuffered();
-                    continue;
-                },
-                error.ReadFailed => return .read_failed,
-            } orelse {
-                if (self.pending_line.items.len > 0) return .{ .line = self.pending_line.items };
-                return .eof;
-            };
-
-            if (fragment.len > self.max_line_bytes - self.pending_line.items.len) {
-                return error.GatewaySseEventTooLarge;
-            }
-            if (self.pending_line.items.len == 0) return .{ .line = fragment };
-            try self.pending_line.appendSlice(alloc, fragment);
-            return .{ .line = self.pending_line.items };
-        }
-    }
-};
-
 fn captureGenerationMetadata(
     alloc: std.mem.Allocator,
     root: std.json.Value,
@@ -3046,7 +2971,7 @@ fn captureGenerationMetadata(
 
 fn consumeSseStream(
     alloc: std.mem.Allocator,
-    reader: anytype,
+    reader: *std.Io.Reader,
     callback_ctx: *anyopaque,
     on_content_chunk: StreamCallback,
     on_tool_start: ?ToolStartCallback,
@@ -3087,7 +3012,7 @@ pub fn consumeGatewaySseStream(
 
 fn consumeSseStreamTraced(
     alloc: std.mem.Allocator,
-    reader: anytype,
+    reader: *std.Io.Reader,
     callback_ctx: *anyopaque,
     on_content_chunk: StreamCallback,
     on_tool_start: ?ToolStartCallback,
@@ -3133,7 +3058,7 @@ fn consumeSseStreamTraced(
     defer if (provider_failure_detail) |detail| alloc.free(detail);
     var data_event_count: usize = 0;
 
-    var event_reader = SseEventReader{ .max_line_bytes = max_sse_event_line_bytes };
+    var event_reader = sse.Reader{ .max_event_bytes = max_sse_event_line_bytes };
     defer event_reader.deinit(alloc);
 
     while (true) {
@@ -3142,17 +3067,13 @@ fn consumeSseStreamTraced(
             break;
         }
 
-        const event = try event_reader.next(alloc, reader);
-        defer event_reader.releaseLine();
-
-        const json_text = switch (event) {
-            .data => |json_text| json_text,
-            .done => {
-                traceSseTermination(resolved_model_trace, "done_without_finish", finish_reason_holder);
+        const payload = event_reader.next(alloc, reader, cancel_flag) catch |err| switch (err) {
+            error.EventTooLarge => return error.GatewaySseEventTooLarge,
+            error.Cancelled => {
+                traceSseTermination(resolved_model_trace, "cancellation", finish_reason_holder);
                 break;
             },
-            .ignored => continue,
-            .read_failed => {
+            error.ReadFailed => {
                 if (cancel_flag.load(.seq_cst)) {
                     traceSseTermination(resolved_model_trace, "cancellation", finish_reason_holder);
                     break;
@@ -3160,18 +3081,23 @@ fn consumeSseStreamTraced(
                 traceSseTermination(resolved_model_trace, "read_failure", finish_reason_holder);
                 return error.ReadFailed;
             },
-            .eof => {
-                traceSseTermination(resolved_model_trace, "eof_without_finish", finish_reason_holder);
-                break;
-            },
+            else => return err,
         };
+        const json_text = payload orelse {
+            traceSseTermination(resolved_model_trace, "eof_without_finish", finish_reason_holder);
+            break;
+        };
+        if (std.mem.eql(u8, json_text, "[DONE]")) {
+            traceSseTermination(resolved_model_trace, "done_without_finish", finish_reason_holder);
+            break;
+        }
         data_event_count += 1;
 
         defer _ = event_arena.reset(.retain_capacity);
         const root = std.json.parseFromSliceLeaky(std.json.Value, event_arena.allocator(), json_text, .{}) catch |err| {
             if (err == error.OutOfMemory) return err;
             traceMalformedSseEvent(json_text.len);
-            continue;
+            return error.InvalidGatewaySseEvent;
         };
         traceParsedSseEvent(alloc, root, json_text.len);
         if (root != .object) continue;
@@ -3642,6 +3568,52 @@ test "SSE text capture keeps arena capacity proportional to the retained respons
     try std.testing.expect(arena.queryCapacity() <= output_bytes * 4);
 }
 
+test "provider framing assembles Gateway data fields" {
+    for ([_][]const u8{
+        "data:{\"type\":\"text-delta\",\"delta\":\"EXPECTED_FINAL\"}\n\n",
+        "data: {\"type\":\"text-delta\",\ndata: \"delta\":\"EXPECTED_FINAL\"}\n\n",
+    }) |answer| {
+        const payload = try std.mem.concat(std.testing.allocator, u8, &.{
+            "data: {\"type\":\"text-delta\",\"delta\":\"CONTROL_PREFIX\\n\"}\n\n",
+            answer,
+            "data: {\"type\":\"finish\",\"finishReason\":{\"unified\":\"stop\"}}\n\n",
+        });
+        defer std.testing.allocator.free(payload);
+        var reader = std.Io.Reader.fixed(payload);
+        var cancelled = std.atomic.Value(bool).init(false);
+        const Noop = struct {
+            fn chunk(_: *anyopaque, _: []const u8) void {}
+        };
+        var completion = try consumeSseStream(std.testing.allocator, &reader, undefined, Noop.chunk, null, &cancelled);
+        defer deinitGatewayCompletion(std.testing.allocator, &completion);
+        try std.testing.expectEqualStrings("CONTROL_PREFIX\nEXPECTED_FINAL", completion.content.?);
+    }
+}
+
+test "provider framing rejects malformed Gateway JSON" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(root);
+    const path = try std.fs.path.join(alloc, &.{ root, "malformed-sse.log" });
+    defer alloc.free(path);
+    debug_trace.resetForTest();
+    defer debug_trace.resetForTest();
+    try debug_trace.configureForTestWithScopes(alloc, path, "sse");
+    var reader = std.Io.Reader.fixed("data: {not-json}\n\ndata: {\"type\":\"finish\",\"finishReason\":{\"unified\":\"stop\"}}\n\n");
+    var cancelled = std.atomic.Value(bool).init(false);
+    const Noop = struct {
+        fn chunk(_: *anyopaque, _: []const u8) void {}
+    };
+    try std.testing.expectError(error.InvalidGatewaySseEvent, consumeSseStream(std.testing.allocator, &reader, undefined, Noop.chunk, null, &cancelled));
+    debug_trace.shutdown();
+    const trace = try readTraceFileForTest(alloc, path);
+    defer alloc.free(trace);
+    try std.testing.expect(std.mem.find(u8, trace, "event type=invalid") != null);
+    try std.testing.expect(std.mem.find(u8, trace, "not-json") == null);
+}
+
 test "consumeSseStream preserves provider finish_reason" {
     const payload =
         "data: {\"type\":\"text-delta\",\"id\":\"t1\",\"delta\":\"Hola\"}\n" ++
@@ -3999,26 +3971,13 @@ test "consumeSseStream treats done before finish as framing only" {
 }
 
 test "consumeSseStream propagates read failure before finish" {
-    const FailingReader = struct {
-        calls: usize = 0,
-
-        fn takeDelimiter(self: *@This(), _: u8) error{ StreamTooLong, ReadFailed }!?[]const u8 {
-            self.calls += 1;
-            return error.ReadFailed;
-        }
-
-        fn buffered(_: *@This()) []const u8 {
-            return "";
-        }
-
-        fn tossBuffered(_: *@This()) void {}
-    };
-
     const Noop = struct {
         fn chunk(_: *anyopaque, _: []const u8) void {}
     };
 
-    var reader = FailingReader{};
+    var reader = std.Io.Reader.failing;
+    var failure_buffer: [1]u8 = undefined;
+    reader.buffer = &failure_buffer;
     var cancel_flag = std.atomic.Value(bool).init(false);
 
     try std.testing.expectError(
@@ -4058,18 +4017,9 @@ test "consumeSseStream traces every terminal cause" {
     var eof_reader = std.Io.Reader.fixed("");
     _ = try consumeSseStream(alloc, &eof_reader, undefined, Noop.chunk, null, &active_flag);
 
-    const FailingReader = struct {
-        fn takeDelimiter(_: *@This(), _: u8) error{ StreamTooLong, ReadFailed }!?[]const u8 {
-            return error.ReadFailed;
-        }
-
-        fn buffered(_: *@This()) []const u8 {
-            return "";
-        }
-
-        fn tossBuffered(_: *@This()) void {}
-    };
-    var failing_reader = FailingReader{};
+    var failing_reader = std.Io.Reader.failing;
+    var failure_buffer: [1]u8 = undefined;
+    failing_reader.buffer = &failure_buffer;
     try std.testing.expectError(
         error.ReadFailed,
         consumeSseStream(alloc, &failing_reader, undefined, Noop.chunk, null, &active_flag),
@@ -5480,7 +5430,7 @@ test "consumeSseStream preserves consolidated tool calls across the transport bu
     }
 }
 
-test "SseEventReader rejects an over-limit event explicitly" {
+test "provider framing rejects an over-limit event explicitly" {
     const alloc = std.testing.allocator;
     const payload = try consolidatedToolCallSseForTest(alloc, 1024);
     defer alloc.free(payload);
@@ -5488,12 +5438,13 @@ test "SseEventReader rejects an over-limit event explicitly" {
     var source = std.Io.Reader.fixed(payload);
     var transfer_buffer: [64]u8 = undefined;
     var buffered = source.limited(.unlimited, &transfer_buffer);
-    var event_reader = SseEventReader{ .max_line_bytes = 512 };
+    var event_reader = sse.Reader{ .max_event_bytes = 512 };
     defer event_reader.deinit(alloc);
+    const cancelled = std.atomic.Value(bool).init(false);
 
     try std.testing.expectError(
-        error.GatewaySseEventTooLarge,
-        event_reader.next(alloc, &buffered.interface),
+        error.EventTooLarge,
+        event_reader.next(alloc, &buffered.interface, &cancelled),
     );
 }
 
@@ -5620,33 +5571,15 @@ test "consumeSseStream frees streamed state on cancellation after a start" {
 }
 
 test "consumeSseStream frees streamed state on read failure" {
-    const FailingReader = struct {
-        index: usize = 0,
-
-        fn takeDelimiter(self: *@This(), _: u8) error{ StreamTooLong, ReadFailed }!?[]const u8 {
-            const lines = [_][]const u8{
-                "data: {\"type\":\"tool-input-start\",\"id\":\"failed\",\"toolName\":\"read_file\"}",
-                "data: {\"type\":\"tool-input-delta\",\"id\":\"failed\",\"delta\":\"{\\\"path\\\":\\\"partial\\\"}\"}",
-            };
-            if (self.index < lines.len) {
-                const line = lines[self.index];
-                self.index += 1;
-                return line;
-            }
-            return error.ReadFailed;
-        }
-
-        fn buffered(_: *@This()) []const u8 {
-            return "";
-        }
-
-        fn tossBuffered(_: *@This()) void {}
-    };
     const Noop = struct {
         fn chunk(_: *anyopaque, _: []const u8) void {}
     };
 
-    var reader = FailingReader{};
+    const payload = "data: {\"type\":\"tool-input-start\",\"id\":\"failed\",\"toolName\":\"read_file\"}\n\n" ++
+        "data: {\"type\":\"tool-input-delta\",\"id\":\"failed\",\"delta\":\"{\\\"path\\\":\\\"partial\\\"}\"}\n\n";
+    var reader = std.Io.Reader.failing;
+    reader.buffer = @constCast(payload);
+    reader.end = payload.len;
     var cancel_flag = std.atomic.Value(bool).init(false);
     try std.testing.expectError(
         error.ReadFailed,
@@ -5719,7 +5652,6 @@ test "consumeSseStream unfiltered trace excludes all payload keys and values" {
     try debug_trace.configureForTest(alloc, trace_path);
 
     const payload =
-        "data: {malformed-json-FX_MALFORMED_SENTINEL}\n\n" ++
         "data: {\"type\":\"FX_UNKNOWN_TYPE_SENTINEL\",\"FX_DYNAMIC_KEY_SENTINEL\":\"FX_UNKNOWN_VALUE_SENTINEL\"}\n\n" ++
         "data: {\"type\":\"text-delta\",\"id\":\"text\",\"delta\":\"FX_MODEL_TEXT_SENTINEL\"}\n\n" ++
         "data: {\"type\":\"tool-input-start\",\"id\":\"safe_call\",\"toolName\":\"read_file\"}\n\n" ++
@@ -5749,7 +5681,6 @@ test "consumeSseStream unfiltered trace excludes all payload keys and values" {
     const trace = try readTraceFileForTest(alloc, trace_path);
     defer alloc.free(trace);
     inline for (.{
-        "event type=invalid",
         "event type=unknown",
         "event type=text-delta",
         "event type=tool-input-start",
@@ -5764,7 +5695,6 @@ test "consumeSseStream unfiltered trace excludes all payload keys and values" {
         try std.testing.expect(std.mem.find(u8, trace, metadata) != null);
     }
     inline for (.{
-        "FX_MALFORMED_SENTINEL",
         "FX_UNKNOWN_TYPE_SENTINEL",
         "FX_DYNAMIC_KEY_SENTINEL",
         "FX_UNKNOWN_VALUE_SENTINEL",

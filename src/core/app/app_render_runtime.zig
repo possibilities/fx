@@ -136,11 +136,14 @@ const RenderReconciliation = union(enum) {
 
 const SteeringProjection = struct {
     messages: [][]u8 = &.{},
+    pending_feedback: [][]u8 = &.{},
     waits_for_tool: bool = false,
 
     fn deinit(self: *SteeringProjection, alloc: std.mem.Allocator) void {
         for (self.messages) |message| alloc.free(message);
         if (self.messages.len > 0) alloc.free(self.messages);
+        for (self.pending_feedback) |message| alloc.free(message);
+        if (self.pending_feedback.len > 0) alloc.free(self.pending_feedback);
         self.* = .{};
     }
 };
@@ -287,6 +290,58 @@ fn pendingPromptActivityVisible(app: anytype) bool {
     return pending.phase != .awaiting_auth;
 }
 
+fn buildPendingSteeringCardProjection(
+    alloc: std.mem.Allocator,
+    shell: *const transcript_runtime.TranscriptRuntime,
+    steering: SteeringProjection,
+    checkpoint: ?*build_checkpoint.BuildCheckpoint,
+) !?PendingCardProjection {
+    const queued_count = if (steering.waits_for_tool) 0 else steering.messages.len;
+    var index = steering.pending_feedback.len + queued_count;
+    if (index == 0) return null;
+
+    var card_bytes: std.ArrayList(u8) = .empty;
+    defer card_bytes.deinit(alloc);
+    var row_count: u16 = 0;
+    const row_limit = @max(shell.layout.content_bottom, 1);
+    while (index > 0 and row_count < row_limit) {
+        index -= 1;
+        const message = if (index < steering.pending_feedback.len)
+            steering.pending_feedback[index]
+        else
+            steering.messages[index - steering.pending_feedback.len];
+        const gap: u16 = @intFromBool(card_bytes.items.len > 0);
+        const remaining_rows = row_limit - row_count -| gap;
+        if (remaining_rows == 0) break;
+        const card = try user_message_card.buildUserPromptCardTailForTerminalPresentationInterruptible(
+            alloc,
+            message,
+            &.{},
+            shell.layout.cols,
+            &.{},
+            remaining_rows,
+            checkpoint,
+        );
+        defer alloc.free(card);
+        if (card.len == 0) continue;
+        if (gap > 0) try card_bytes.insert(alloc, 0, '\n');
+        try card_bytes.insertSlice(alloc, 0, card);
+        row_count += @as(u16, @intCast(std.mem.count(u8, card, "\n"))) + gap;
+    }
+    if (row_count == 0) return null;
+    const leading_rows = pendingCardLeadingAdvanceRows(
+        @min(@max(shell.cursor_row, 1), shell.layout.content_bottom),
+        shell.cursor_col,
+        shell.layout.content_bottom,
+    );
+    return .{
+        .bytes = try pendingCardTerminalWireBytes(alloc, card_bytes.items),
+        .row_count = row_count +| leading_rows,
+        .paint_row_count = row_count,
+        .leading_advance_rows = leading_rows,
+    };
+}
+
 fn pendingCardTerminalWireBytes(
     alloc: std.mem.Allocator,
     logical: []const u8,
@@ -347,6 +402,8 @@ fn buildSteeringProjection(comptime App: type, app: *App) !SteeringProjection {
         projection.waits_for_tool = snapshot.waits_for_tool;
         projection.messages = snapshot.messages;
         snapshot.messages = &.{};
+        projection.pending_feedback = snapshot.pending_feedback;
+        snapshot.pending_feedback = &.{};
     }
     return projection;
 }
@@ -1160,6 +1217,10 @@ pub fn Runtime(comptime App: type) type {
                 try buildPendingCardProjection(App, app, presentation_shell, checkpoint)
             else
                 null;
+            const pending_submission_card = pending_card != null;
+            if (pending_card == null and !render_reconciliation.alternate_screen_owns_rendering) {
+                pending_card = try buildPendingSteeringCardProjection(app.alloc, presentation_shell, steering, checkpoint);
+            }
             defer if (pending_card) |*card| card.deinit(app.alloc);
 
             var attempt_invalidations = snapshot.invalidations;
@@ -1732,7 +1793,7 @@ pub fn Runtime(comptime App: type) type {
                 .animation_visible = frame_ctx.activity_result.painted,
                 .yolo_warning_visible = !render_reconciliation.alternate_screen_owns_rendering and
                     footer_frame.composed.danger_status_visible,
-                .pending_prompt_presented = pending_paint_ctx != null,
+                .pending_prompt_presented = pending_submission_card and pending_paint_ctx != null,
             };
         }
 
@@ -2478,6 +2539,52 @@ test "pending prompt projection waits for a paintable terminal width" {
     )).?;
     defer projection.deinit(alloc);
     try std.testing.expect(projection.paint_row_count > 0);
+}
+
+test "pending steering cards preserve feedback order and tool waiting placement" {
+    const alloc = std.testing.allocator;
+    var shell = transcript_runtime.TranscriptRuntime{
+        .layout = .{
+            .cols = 40,
+            .rows = 12,
+            .content_bottom = 8,
+            .divider_top_row = 9,
+            .input_row = 10,
+            .divider_bottom_row = 11,
+            .hint_row = 12,
+        },
+        .cursor_row = 3,
+        .cursor_col = 1,
+    };
+    defer shell.deinit(alloc);
+    var feedback = [_][]u8{@constCast("accepted earlier")};
+    var queued = [_][]u8{@constCast("accepted later")};
+    var steering = SteeringProjection{ .messages = &queued, .pending_feedback = &feedback };
+    var card = (try buildPendingSteeringCardProjection(alloc, &shell, steering, null)).?;
+    defer card.deinit(alloc);
+    const first = std.mem.find(u8, card.bytes, "accepted earlier").?;
+    const second = std.mem.find(u8, card.bytes, "accepted later").?;
+    try std.testing.expect(first < second);
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, card.bytes, "┃"));
+    try std.testing.expect(std.mem.find(u8, card.bytes, "┋") == null);
+
+    steering.waits_for_tool = true;
+    var waiting = (try buildPendingSteeringCardProjection(alloc, &shell, steering, null)).?;
+    defer waiting.deinit(alloc);
+    try std.testing.expect(std.mem.find(u8, waiting.bytes, "accepted earlier") != null);
+    try std.testing.expect(std.mem.find(u8, waiting.bytes, "accepted later") == null);
+    steering.pending_feedback = &.{};
+    try std.testing.expect((try buildPendingSteeringCardProjection(alloc, &shell, steering, null)) == null);
+
+    steering.waits_for_tool = false;
+    shell.layout.content_bottom = 1;
+    var clipped = (try buildPendingSteeringCardProjection(alloc, &shell, steering, null)).?;
+    defer clipped.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 1), clipped.paint_row_count);
+    for ([_]u16{ 1, 2 }) |cols| {
+        shell.layout.cols = cols;
+        try std.testing.expect((try buildPendingSteeringCardProjection(alloc, &shell, steering, null)) == null);
+    }
 }
 
 test "pending prompt uses the canonical user turn boundary" {
