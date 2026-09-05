@@ -4192,7 +4192,7 @@ fn writeWorkspaceModifierUsage(deps: RunDeps) !void {
 fn writeNativeToolModifierUsage(deps: RunDeps) !void {
     try writeStderr(
         deps,
-        "fx: --no-native-tools is only supported for interactive, resume, and ACP launches\n",
+        "fx: --no-native-tools is only supported for interactive, resume, ask, and ACP launches\n",
     );
 }
 

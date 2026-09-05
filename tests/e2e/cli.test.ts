@@ -524,7 +524,7 @@ With --prompt-permissions, JSON and quiet requests may prompt on stderr only whe
         expect(result.code).toBe(1);
         expect(result.stdout).toBe("");
         expect(result.stderr).toBe(
-          "usage: fx acp [--model <id>] [--effort <name>] [--log-file <path>]\n",
+          "usage: fx acp [--model <id>] [--effort <name>] [--log-file <path>] [--no-acp-mcp]\n",
         );
       }
     },
@@ -3171,6 +3171,15 @@ describe("cli: models", () => {
               context_window: 272000,
             },
             {
+              slug: "gpt-5.6-luna",
+              visibility: "list",
+              supported_in_api: true,
+              supported_reasoning_levels: [{ effort: "medium" }],
+              additional_speed_tiers: [],
+              input_modalities: ["text"],
+              context_window: 272000,
+            },
+            {
               slug: "gpt-5.4-mini",
               visibility: "list",
               supported_in_api: true,
@@ -3210,12 +3219,17 @@ describe("cli: models", () => {
         expect(result.code).toBe(0);
         expect(result.stderr).toBe("");
         const json = JSON.parse(result.stdout.trim());
-        expect(json.ids).toEqual(["gpt-5.6-sol", "gpt-5.4-mini"]);
+        expect(json.ids).toEqual(["gpt-5.6-sol", "gpt-5.6-luna", "gpt-5.4-mini"]);
         expect(json.models).toEqual([
           {
             id: "gpt-5.6-sol",
             source: "Codex subscription",
             reasoning_efforts: ["high", "future-tier", "low"],
+          },
+          {
+            id: "gpt-5.6-luna",
+            source: "Codex subscription",
+            reasoning_efforts: ["medium"],
           },
           {
             id: "gpt-5.4-mini",
@@ -5449,12 +5463,12 @@ describe("cli: workspace access", () => {
       );
 
       const unsupportedNativeToolGate = await runFx(
-        ["--no-native-tools", "ask", "hello"],
+        ["--no-native-tools", "models"],
         { env: enabled },
       );
       expect(unsupportedNativeToolGate.code).toBe(1);
       expect(unsupportedNativeToolGate.stderr).toContain(
-        "--no-native-tools is only supported for interactive, resume, and ACP launches",
+        "--no-native-tools is only supported for interactive, resume, ask, and ACP launches",
       );
 
       const duplicateProjectInstructionGate = await runFx(
