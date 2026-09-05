@@ -146,16 +146,23 @@ pub fn callUsesCommandAuthority(
     const tool = registry.lookup(call.name) orelse return false;
     if (tool.executor_kind == .run_command) return true;
     const expected_action = tool.captured_command_action orelse return false;
-    const args = try tool_args.parseToolArgsObject(arena, call.arguments_json);
-    // The model-facing request may still be wrapped, or may already have been
-    // normalized for internal dispatch. Both name the same command authority,
-    // and a narrowed tool selection admits the wrapped form directly.
-    const arguments = if (args.get("request")) |request| switch (request) {
-        .object => |object| object,
-        else => args,
-    } else args;
+    const arguments = commandArguments(try tool_args.parseToolArgsObject(arena, call.arguments_json));
     const action = tool_args.optionalStringArg(arguments, "action") orelse return false;
     return std.mem.eql(u8, action, expected_action);
+}
+
+/// The model-facing request may still be wrapped, or may already have been
+/// normalized for internal dispatch. Both name the same command authority, and
+/// a narrowed tool selection admits the wrapped form directly. Admission and
+/// execution must read one payload, so command text, working directory,
+/// terminal mode, and profile come from the same object that selected the
+/// authority; a wrapper must never turn an admitted command into a stall.
+fn commandArguments(args: std.json.ObjectMap) std.json.ObjectMap {
+    const request = args.get("request") orelse return args;
+    return switch (request) {
+        .object => |object| object,
+        else => args,
+    };
 }
 
 fn isRunCommandCall(input: Input, arena: Allocator, call: ToolCall) !bool {
@@ -2015,7 +2022,7 @@ pub fn runCommandContext(
     call: ToolCall,
 ) !command_admission.CommandContext {
     if (!try isRunCommandCall(input, arena, call)) return error.NotRunCommand;
-    const args = try tool_args.parseToolArgsObject(arena, call.arguments_json);
+    const args = commandArguments(try tool_args.parseToolArgsObject(arena, call.arguments_json));
     const command = try tool_args.requiredStringArg(args, "command");
     const execution_mode: command_admission.CommandExecutionMode =
         if (tool_args.optionalBoolArg(args, "tty") orelse false) .tty else .captured;
@@ -5234,6 +5241,43 @@ test "automatic clean TTY command requires reviewed shell authority" {
             allowed.source,
         ),
         .direct_only => return error.TestExpectedShellAllowed,
+    }
+}
+
+test "wrapped shell commands preserve exact normalized admission authority" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var worker: WorkerRuntime = .{};
+    defer worker.deinit(alloc);
+    var input = testInputWithClassifier(&worker, permission_auto_classifier.Classifier.disabled());
+    input.tool_registry = .{ .tools = &.{test_builtin_tools.terminalExecOnlySpec()} };
+
+    for ([_][]const u8{
+        "{\"action\":\"run\",\"command\":\"pwd\",\"cwd\":\"/tmp\",\"profile\":\"clean\"}",
+        "{\"action\":\"run\",\"command\":\"printf different\",\"cwd\":\"/\",\"profile\":\"user\"}",
+        "{\"action\":\"run\",\"command\":\"pwd\",\"cwd\":\"/tmp\",\"tty\":true,\"shell\":{\"kind\":\"executable\",\"path\":\"/bin/bash\",\"clean_start\":true}}",
+    }) |arguments| {
+        const flat = ToolCall{ .id = "flat", .name = "shell", .arguments_json = arguments };
+        const wrapped = ToolCall{
+            .id = "wrapped",
+            .name = "shell",
+            .arguments_json = try std.fmt.allocPrint(arena, "{{\"request\":{s}}}", .{arguments}),
+        };
+        try std.testing.expect(try callUsesCommandAuthority(input.tool_registry, arena, flat));
+        try std.testing.expect(try callUsesCommandAuthority(input.tool_registry, arena, wrapped));
+        const flat_context = try runCommandContext(input, arena, flat);
+        const wrapped_context = try runCommandContext(input, arena, wrapped);
+        try std.testing.expectEqualStrings(flat_context.command, wrapped_context.command);
+        try std.testing.expectEqualStrings(flat_context.resolved_cwd, wrapped_context.resolved_cwd);
+        try std.testing.expectEqual(flat_context.execution_mode, wrapped_context.execution_mode);
+        try std.testing.expect(command_admission.AdmissionFingerprint.init(flat_context).eql(
+            command_admission.AdmissionFingerprint.init(wrapped_context),
+        ));
+        try std.testing.expect((try permissionStateKeyForCall(input, arena, flat)).eql(
+            try permissionStateKeyForCall(input, arena, wrapped),
+        ));
     }
 }
 
