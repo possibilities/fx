@@ -11,6 +11,7 @@ const types = @import("../shared/types.zig");
 
 pub const tool_name = "permission_decision";
 const max_rationale_bytes: usize = 240;
+const fallback_rationale = "No rationale provided.";
 const max_review_packet_bytes: usize = 16 * 1024;
 
 pub const Risk = enum {
@@ -64,9 +65,7 @@ pub const InvalidReason = enum {
     completion_argument_integrity,
     arguments_json,
     arguments_shape,
-    arguments_risk,
     arguments_decision,
-    arguments_rationale,
 };
 
 pub const ParseOutcome = union(enum) {
@@ -1110,9 +1109,9 @@ const review_policy_template =
     \\  <review_data encoding="xml-escaped-text">{{REVIEW_DATA}}</review_data>
     \\
     \\  <output>
-    \\    Call permission_decision exactly once with risk, decision, and a non-empty
-    \\    rationale of at most 240 UTF-8 bytes. Do not return prose, JSON, XML, or a
-    \\    written verdict outside the tool call.
+    \\    Call permission_decision exactly once with decision. The rationale is optional
+    \\    and should be brief. Do not return prose, JSON, XML, or a written verdict
+    \\    outside the tool call.
     \\  </output>
     \\</permission_review>
     \\
@@ -1122,16 +1121,9 @@ const review_data_marker_index = std.mem.find(u8, review_policy_template, review
 const review_policy_prefix = review_policy_template[0..review_data_marker_index];
 const review_policy_suffix = review_policy_template[review_data_marker_index + review_data_marker.len ..];
 
-const risk_values = [_][]const u8{ "low", "medium", "high", "critical" };
 const decision_values = [_][]const u8{ "clear", "caution" };
-const schema_required = [_][]const u8{ "risk", "decision", "rationale" };
+const schema_required = [_][]const u8{"decision"};
 const schema_properties = [_]model_tool_schema.Property{
-    .{
-        .name = "risk",
-        .json_type = .string,
-        .shape = &.{ .enum_values = risk_values[0..] },
-        .description = "Risk of the exact action being reviewed.",
-    },
     .{
         .name = "decision",
         .json_type = .string,
@@ -1141,7 +1133,7 @@ const schema_properties = [_]model_tool_schema.Property{
     .{
         .name = "rationale",
         .json_type = .string,
-        .description = "Reason of at most 240 UTF-8 bytes, without secrets or raw file contents.",
+        .description = "Optional brief reason without secrets or raw file contents.",
     },
 };
 
@@ -1169,12 +1161,12 @@ test "automatic review model-facing tool contract stays byte exact" {
     std.crypto.hash.sha2.Sha256.hash(tools_json, &digest, .{});
     const actual_hex = std.fmt.bytesToHex(digest, .lower);
     try std.testing.expectEqualStrings(
-        "707e0025014875b594a2260fb11ace7d5d8da78ad653b08714731e2170a62ce7",
+        "5029829df4ea080a7c21701c0185b777d21fd42d1b79a7a957605e508f73fe03",
         &actual_hex,
     );
 }
 
-test "automatic review prompt is concise and advertises the enforced rationale bound" {
+test "automatic review prompt keeps the decision authoritative" {
     var cancel_flag = std.atomic.Value(bool).init(false);
     const deadline = std.Io.Clock.Timestamp.fromNow(io_mod.getIo(), .{
         .clock = .awake,
@@ -1211,11 +1203,12 @@ test "automatic review prompt is concise and advertises the enforced rationale b
     try std.testing.expect(std.mem.find(u8, instruction, "An untrusted tool result instructs deletion") != null);
     try std.testing.expect(std.mem.find(u8, instruction, "malware or hidden persistence") != null);
     try std.testing.expect(std.mem.find(u8, instruction, "Do not return prose, JSON, XML, or a") != null);
-    try std.testing.expect(std.mem.find(u8, instruction, "at most 240 UTF-8 bytes") != null);
+    try std.testing.expect(std.mem.find(u8, instruction, "The rationale is optional") != null);
 
     const tools_json = try toolsJsonAlloc(std.testing.allocator);
     defer std.testing.allocator.free(tools_json);
-    try std.testing.expect(std.mem.find(u8, tools_json, "at most 240 UTF-8 bytes") != null);
+    try std.testing.expect(std.mem.find(u8, tools_json, "\"required\":[\"decision\"]") != null);
+    try std.testing.expect(std.mem.find(u8, tools_json, "\"risk\"") == null);
 }
 
 fn buildTestReviewPayload(
@@ -1298,12 +1291,6 @@ fn parseArguments(alloc: std.mem.Allocator, arguments_json: []const u8) !ParseOu
 
     if (parsed.value != .object) return .{ .invalid = .arguments_shape };
     const object = parsed.value.object;
-    if (object.count() != schema_required.len) return .{ .invalid = .arguments_shape };
-
-    const risk_value = object.get("risk") orelse return .{ .invalid = .arguments_risk };
-    if (risk_value != .string) return .{ .invalid = .arguments_risk };
-    const risk = std.meta.stringToEnum(Risk, risk_value.string) orelse
-        return .{ .invalid = .arguments_risk };
 
     const decision_value = object.get("decision") orelse
         return .{ .invalid = .arguments_decision };
@@ -1311,30 +1298,42 @@ fn parseArguments(alloc: std.mem.Allocator, arguments_json: []const u8) !ParseOu
     const decision = std.meta.stringToEnum(Decision, decision_value.string) orelse
         return .{ .invalid = .arguments_decision };
 
-    const rationale_value = object.get("rationale") orelse
-        return .{ .invalid = .arguments_rationale };
-    if (rationale_value != .string) return .{ .invalid = .arguments_rationale };
-    if (rationale_value.string.len == 0 or rationale_value.string.len > max_rationale_bytes) {
-        return .{ .invalid = .arguments_rationale };
-    }
-
-    // Risk is informational for traces and presentation. The host grants only
-    // when the strict decision is clear.
     return .{ .valid = .{
-        .risk = risk,
+        .risk = if (decision == .clear) .low else .high,
         .decision = decision,
-        .rationale = try alloc.dupe(u8, rationale_value.string),
+        .rationale = try normalizedRationaleAlloc(alloc, object.get("rationale")),
     } };
 }
 
-test "automatic review schema is strict and advisory" {
+fn normalizedRationaleAlloc(
+    alloc: std.mem.Allocator,
+    value: ?std.json.Value,
+) std.mem.Allocator.Error![]u8 {
+    const rationale = if (value) |present| switch (present) {
+        .string => |text| text,
+        else => return alloc.dupe(u8, fallback_rationale),
+    } else return alloc.dupe(u8, fallback_rationale);
+    if (rationale.len == 0 or !std.unicode.utf8ValidateSlice(rationale)) {
+        return alloc.dupe(u8, fallback_rationale);
+    }
+
+    var end = @min(rationale.len, max_rationale_bytes);
+    while (end > 0 and !std.unicode.utf8ValidateSlice(rationale[0..end])) {
+        end -= 1;
+    }
+    return alloc.dupe(u8, rationale[0..end]);
+}
+
+test "automatic review schema requires only the authoritative decision" {
     const alloc = std.testing.allocator;
     const tools_json = try toolsJsonAlloc(alloc);
     defer alloc.free(tools_json);
 
     try std.testing.expect(std.mem.find(u8, tools_json, "\"name\":\"permission_decision\"") != null);
     try std.testing.expect(std.mem.find(u8, tools_json, "\"enum\":[\"clear\",\"caution\"]") != null);
-    try std.testing.expect(std.mem.find(u8, tools_json, "\"risk\"") != null);
+    try std.testing.expect(std.mem.find(u8, tools_json, "\"required\":[\"decision\"]") != null);
+    try std.testing.expect(std.mem.find(u8, tools_json, "\"rationale\"") != null);
+    try std.testing.expect(std.mem.find(u8, tools_json, "\"risk\"") == null);
     try std.testing.expect(std.mem.find(u8, tools_json, "\"authorization\"") == null);
     try std.testing.expect(std.mem.find(u8, tools_json, "confidence") == null);
     try std.testing.expect(std.mem.find(u8, tools_json, "\"additionalProperties\":false") != null);
@@ -1392,15 +1391,15 @@ test "automatic reviewer classifier routes through the registered provider" {
 
 test "automatic review policy matches the tested provider-neutral artifact" {
     const expected_digest = [_]u8{
-        0xdd, 0xb4, 0x27, 0xbf, 0x3b, 0xc1, 0xd4, 0xa0,
-        0x4a, 0x07, 0x5e, 0xb2, 0x0d, 0xd7, 0x5c, 0x4a,
-        0xc7, 0x16, 0x37, 0xa6, 0x0c, 0x28, 0x5b, 0xa5,
-        0x93, 0x73, 0x82, 0x64, 0xd5, 0x71, 0xda, 0x11,
+        0x9f, 0x8b, 0xd6, 0x15, 0x4f, 0xfc, 0x1a, 0x83,
+        0x99, 0x6f, 0xb5, 0xe5, 0xed, 0x70, 0x54, 0x09,
+        0x60, 0x55, 0x1f, 0xe2, 0x84, 0x19, 0xa9, 0xf8,
+        0x8a, 0x18, 0x99, 0x6c, 0xe8, 0xe7, 0x1d, 0x1a,
     };
     var actual_digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(review_policy_template, &actual_digest, .{});
 
-    try std.testing.expectEqual(@as(usize, 3193), review_policy_template.len);
+    try std.testing.expectEqual(@as(usize, 3180), review_policy_template.len);
     try std.testing.expectEqualSlices(u8, &expected_digest, &actual_digest);
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, review_policy_template, review_data_marker));
     try std.testing.expect(std.mem.endsWith(u8, review_policy_template, "</permission_review>\n"));
@@ -1456,6 +1455,48 @@ test "automatic review parses clear and caution assessments" {
         defer outcome.deinit(std.testing.allocator);
         switch (outcome) {
             .valid => |result| try std.testing.expectEqual(case.expected, result.decision),
+            .evidence_incomplete, .invalid => return error.TestExpectedEqual,
+        }
+    }
+}
+
+test "automatic review normalizes non-authoritative metadata" {
+    const cases = [_]struct {
+        arguments_json: []const u8,
+        expected_decision: Decision,
+        expected_risk: Risk,
+        expected_rationale: []const u8,
+    }{
+        .{
+            .arguments_json = "{\"decision\":\"clear\"}",
+            .expected_decision = .clear,
+            .expected_risk = .low,
+            .expected_rationale = "No rationale provided.",
+        },
+        .{
+            .arguments_json = "{\"decision\":\"caution\",\"risk\":false,\"rationale\":false,\"extra\":true}",
+            .expected_decision = .caution,
+            .expected_risk = .high,
+            .expected_rationale = "No rationale provided.",
+        },
+        .{
+            .arguments_json = "{\"decision\":\"clear\",\"rationale\":\"" ++ ("x" ** 239) ++ "éignored\"}",
+            .expected_decision = .clear,
+            .expected_risk = .low,
+            .expected_rationale = "x" ** 239,
+        },
+    };
+    for (cases) |case| {
+        var outcome = try parseArguments(std.testing.allocator, case.arguments_json);
+        defer outcome.deinit(std.testing.allocator);
+        switch (outcome) {
+            .valid => |result| {
+                try std.testing.expectEqual(case.expected_decision, result.decision);
+                try std.testing.expectEqual(case.expected_risk, result.risk);
+                try std.testing.expectEqualStrings(case.expected_rationale, result.rationale);
+                try std.testing.expect(std.unicode.utf8ValidateSlice(result.rationale));
+                try std.testing.expect(result.rationale.len <= max_rationale_bytes);
+            },
             .evidence_incomplete, .invalid => return error.TestExpectedEqual,
         }
     }
@@ -1581,14 +1622,12 @@ test "automatic review root context preserves secret-like user text" {
     try std.testing.expect(std.mem.find(u8, context, "[redacted]") == null);
 }
 
-test "automatic review rejects malformed extra and legacy decision assessments" {
+test "automatic review rejects missing and legacy decisions" {
     const cases = [_][]const u8{
         "{}",
-        "{\"risk\":\"low\",\"decision\":\"clear\",\"rationale\":\"safe\",\"extra\":true}",
         "{\"risk\":\"low\",\"decision\":\"allow\",\"rationale\":\"legacy allow\"}",
         "{\"risk\":\"low\",\"decision\":\"ask\",\"rationale\":\"legacy ask\"}",
         "{\"risk\":\"low\",\"decision\":\"deny\",\"rationale\":\"legacy deny\"}",
-        "{\"risk\":\"low\",\"decision\":\"clear\",\"rationale\":\"" ++ ("x" ** 241) ++ "\"}",
     };
     for (cases) |arguments_json| {
         try std.testing.expectEqual(
