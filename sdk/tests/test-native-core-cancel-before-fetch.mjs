@@ -69,6 +69,7 @@ let delayedCancel;
 let lateCore;
 let latePublications = 0;
 let hostFetches = 0;
+let catalogFetches = 0;
 let delayPublication = true;
 let followingUp = false;
 const delayedAddon = {
@@ -104,7 +105,14 @@ const agent = await createFxAgent({
   nativeAddon: delayedAddon,
   apiKey: "late-cancel-key",
   model: "native/test-model",
-  fetch(_input, { signal }) {
+  fetch(_input, { signal, method }) {
+    if (method === "GET") {
+      catalogFetches++;
+      return Promise.resolve(Response.json({
+        object: "list",
+        data: [{ id: "native/test-model", type: "language", tags: ["tool-use"] }],
+      }));
+    }
     hostFetches++;
     if (!followingUp) {
       return new Promise((_, reject) => {
@@ -131,6 +139,7 @@ try {
   assert.equal(result.stopReason, "cancelled");
   assert.equal(latePublications, 1, "the fetch must publish after the idle abort");
   assert.equal(hostFetches, 0, "a cancelled turn must not start a late host request");
+  assert.equal(catalogFetches, 0, "a cancelled turn must not start a late catalog request");
   followingUp = true;
   const followup = agent.prompt("continue after cancellation");
   let text = "";
@@ -138,6 +147,7 @@ try {
   assert.equal((await followup.result).stopReason, "end_turn");
   assert.equal(text, "recovered");
   assert.equal(hostFetches, 1);
+  assert.equal(catalogFetches, 1);
   console.log("native late-publication cancellation passed: cancelled before host fetch and follow-up recovered");
 } finally {
   clearTimeout(timer);
