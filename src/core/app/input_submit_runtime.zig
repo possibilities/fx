@@ -403,6 +403,9 @@ pub fn SubmitRuntime(comptime App: type) type {
         }
 
         pub fn clearPendingSubmissionForSessionTransition(app: *App) void {
+            if (comptime @hasField(App, "auth")) {
+                if (comptime @hasDecl(@TypeOf(app.auth), "cancelProviderPreparation")) _ = app.auth.cancelProviderPreparation();
+            }
             if (comptime !@hasField(App, "submission")) {
                 app.worker.clearQueuedPrompts(std.heap.c_allocator, &.{});
                 return;
