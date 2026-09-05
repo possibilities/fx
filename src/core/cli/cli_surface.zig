@@ -4155,11 +4155,11 @@ test "ACP command resolves selected native tools in invocation order" {
             const selected = cfg.native_tool_set orelse return;
             self.selected_matches =
                 selected.order.len == 2 and
-                std.mem.eql(u8, selected.order[0], "terminal") and
+                std.mem.eql(u8, selected.order[0], "shell") and
                 std.mem.eql(u8, selected.order[1], "read_file") and
                 std.mem.eql(
                     u8,
-                    selected.registry.lookup("terminal").?.description,
+                    selected.registry.lookup("shell").?.description,
                     test_builtin_tools.terminalExecOnlySpec().description,
                 );
         }
