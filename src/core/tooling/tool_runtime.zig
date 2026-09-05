@@ -963,7 +963,6 @@ test "ADE terminal root tracking follows only filesystem-write classification" {
     const fingerprint = command_admission.AdmissionFingerprint{
         .command = "touch edited.txt",
         .resolved_cwd = "/tmp/workspace",
-        .background = false,
         .target_os = builtin.os.tag,
     };
     try std.testing.expect(commandAuthorityIsFilesystemWriting(
