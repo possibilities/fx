@@ -7,6 +7,7 @@ const io_mod = @import("../core/shared/io.zig");
 const types = @import("../core/shared/types.zig");
 const gateway_client = @import("client.zig");
 const responses_protocol = @import("responses_protocol.zig");
+const sse_stream = @import("sse.zig");
 const model_tool_schema = @import("../core/tooling/model_tool_schema.zig");
 
 const Allocator = std.mem.Allocator;
@@ -434,90 +435,9 @@ fn failureKind(status: std.http.Status) stream_provider.FailureKind {
     };
 }
 
-const SseReader = struct {
-    pending_line: std.ArrayList(u8) = .empty,
-    aggregate_bytes: usize = 0,
-
-    const Line = struct {
-        bytes: []const u8,
-        wire_bytes: usize,
-    };
-
-    fn deinit(self: *SseReader, alloc: Allocator) void {
-        self.pending_line.deinit(alloc);
-    }
-
-    fn release(self: *SseReader) void {
-        self.pending_line.clearRetainingCapacity();
-    }
-
-    fn next(self: *SseReader, alloc: Allocator, reader: anytype) !?[]const u8 {
-        while (true) {
-            const line = try self.readLine(alloc, reader) orelse return null;
-            self.aggregate_bytes = responses_protocol.checkedAccumulatedSize(
-                self.aggregate_bytes,
-                line.wire_bytes,
-                max_sse_aggregate_bytes,
-            ) catch return error.XaiGrokResourceLimitExceeded;
-            const trimmed = std.mem.trim(u8, line.bytes, " \t\r");
-            if (trimmed.len == 0 or trimmed[0] == ':') {
-                self.release();
-                continue;
-            }
-            if (!std.mem.startsWith(u8, trimmed, "data:")) {
-                self.release();
-                continue;
-            }
-            const data = std.mem.trim(u8, trimmed["data:".len..], " \t");
-            if (std.mem.eql(u8, data, "[DONE]")) return null;
-            return data;
-        }
-    }
-
-    fn readLine(self: *SseReader, alloc: Allocator, reader: anytype) !?Line {
-        while (true) {
-            const fragment = reader.takeDelimiter('\n') catch |err| switch (err) {
-                error.StreamTooLong => {
-                    const buffered = reader.buffered();
-                    if (buffered.len == 0) return error.XaiGrokSseReadStalled;
-                    if (buffered.len > max_sse_line_bytes - self.pending_line.items.len) {
-                        return error.XaiGrokSseEventTooLarge;
-                    }
-                    try self.pending_line.appendSlice(alloc, buffered);
-                    reader.tossBuffered();
-                    continue;
-                },
-                error.ReadFailed => return error.ReadFailed,
-            } orelse {
-                if (self.pending_line.items.len > 0) {
-                    return .{
-                        .bytes = self.pending_line.items,
-                        .wire_bytes = self.pending_line.items.len,
-                    };
-                }
-                return null;
-            };
-            if (fragment.len > max_sse_line_bytes - self.pending_line.items.len) {
-                return error.XaiGrokSseEventTooLarge;
-            }
-            if (self.pending_line.items.len == 0) {
-                return .{
-                    .bytes = fragment,
-                    .wire_bytes = fragment.len + 1,
-                };
-            }
-            try self.pending_line.appendSlice(alloc, fragment);
-            return .{
-                .bytes = self.pending_line.items,
-                .wire_bytes = self.pending_line.items.len + 1,
-            };
-        }
-    }
-};
-
 fn consumeSse(
     alloc: Allocator,
-    reader: anytype,
+    reader: *std.Io.Reader,
     callback_ctx: *anyopaque,
     on_content_chunk: stream_provider.StreamCallback,
     on_tool_start: ?stream_provider.ToolStartCallback,
@@ -528,7 +448,7 @@ fn consumeSse(
 ) !types.ModelCompletion {
     var reducer = responses_protocol.Reducer.init(alloc);
     defer reducer.deinit(alloc);
-    var sse: SseReader = .{};
+    var sse: sse_stream.Reader = .{ .max_event_bytes = max_sse_line_bytes, .max_total_bytes = max_sse_aggregate_bytes };
     defer sse.deinit(alloc);
     const callbacks = responses_protocol.StreamCallbacks{
         .context = callback_ctx,
@@ -546,8 +466,8 @@ fn consumeSse(
         .tool_arguments_bytes = max_tool_arguments_bytes,
         .provider_state_bytes = max_provider_state_bytes,
     };
-    while (try sse.next(alloc, reader)) |json_text| {
-        defer sse.release();
+    while (sse.next(alloc, reader, cancel_flag) catch |err| return mapReducerError(err)) |json_text| {
+        if (std.mem.eql(u8, json_text, "[DONE]")) break;
         if (reducer.applyJson(
             alloc,
             json_text,
@@ -563,6 +483,8 @@ fn consumeSse(
 
 fn mapReducerError(err: anyerror) anyerror {
     return switch (err) {
+        error.EventTooLarge => error.XaiGrokSseEventTooLarge,
+        error.StreamTooLarge => error.XaiGrokResourceLimitExceeded,
         error.InvalidEvent => error.InvalidXaiGrokSseEvent,
         error.ResponseFailed => error.XaiGrokResponseFailed,
         error.StreamIncomplete => error.XaiGrokStreamIncomplete,
@@ -1099,7 +1021,7 @@ fn buildEventCountSse(alloc: Allocator, event_count: usize) ![]u8 {
 
 fn buildIgnoredAggregateSse(alloc: Allocator, wire_bytes: usize) ![]u8 {
     const mixed_ignored_and_data = ": keepalive\n\nretry: 1000\ndata: {}\n\n";
-    const terminal = "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\n";
+    const terminal = "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\n\n";
     if (wire_bytes < mixed_ignored_and_data.len + terminal.len) return error.NoSpaceLeft;
     var out: std.Io.Writer.Allocating = .init(alloc);
     errdefer out.deinit();
@@ -1171,21 +1093,23 @@ fn buildProviderStateSse(alloc: Allocator, provider_state_bytes: usize) ![]u8 {
 
 test "xAI Grok SSE reader accepts the exact line bound and rejects one beyond" {
     inline for (.{ max_sse_line_bytes, max_sse_line_bytes + 1 }) |line_bytes| {
-        const bytes = try std.testing.allocator.alloc(u8, line_bytes + 1);
+        const bytes = try std.testing.allocator.alloc(u8, line_bytes + 2);
         defer std.testing.allocator.free(bytes);
         @memcpy(bytes[0.."data: ".len], "data: ");
         @memset(bytes["data: ".len..line_bytes], 'a');
         bytes[line_bytes] = '\n';
+        bytes[line_bytes + 1] = '\n';
         var reader: std.Io.Reader = .fixed(bytes);
-        var sse: SseReader = .{};
+        var sse: sse_stream.Reader = .{ .max_event_bytes = max_sse_line_bytes };
         defer sse.deinit(std.testing.allocator);
+        const cancelled = std.atomic.Value(bool).init(false);
         if (line_bytes == max_sse_line_bytes) {
-            const value = (try sse.next(std.testing.allocator, &reader)).?;
+            const value = (try sse.next(std.testing.allocator, &reader, &cancelled)).?;
             try std.testing.expectEqual(max_sse_line_bytes - "data: ".len, value.len);
         } else {
             try std.testing.expectError(
-                error.XaiGrokSseEventTooLarge,
-                sse.next(std.testing.allocator, &reader),
+                error.EventTooLarge,
+                sse.next(std.testing.allocator, &reader, &cancelled),
             );
         }
     }
