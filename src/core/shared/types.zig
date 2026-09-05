@@ -1,5 +1,6 @@
 const std = @import("std");
 const text_utils = @import("text_utils.zig");
+const skill_contract = @import("../skills/skill_contract.zig");
 
 pub const Layout = struct {
     rows: u16,
@@ -692,6 +693,7 @@ pub const ProviderResultIdentityFailure = enum {
 pub const ToolArgumentIntegrity = enum {
     valid,
     malformed_json,
+    non_object_json,
 
     pub fn classifySerialized(
         alloc: std.mem.Allocator,
@@ -704,6 +706,33 @@ pub const ToolArgumentIntegrity = enum {
         defer parsed.deinit();
         return .valid;
     }
+
+    pub fn classifyFunctionInput(
+        alloc: std.mem.Allocator,
+        serialized: []const u8,
+    ) std.mem.Allocator.Error!ToolArgumentIntegrity {
+        const integrity = try classifySerialized(alloc, serialized);
+        if (integrity != .valid) return integrity;
+        // A complete JSON root is nonempty; only an object can start with '{'.
+        return if (std.mem.trimStart(u8, serialized, " \t\r\n")[0] == '{') .valid else .non_object_json;
+    }
+};
+
+/// Identifies the server and catalog offered to one model step.
+pub const McpToolBinding = struct {
+    runtime_generation: u64,
+    connection_generation: u64,
+    catalog_generation: u64,
+    auth_generation: u64,
+    authority_id: u64 = 0,
+    definition_digest: [32]u8 = .{0} ** 32,
+
+    /// Transport renewal may change epochs without changing the advertised action.
+    pub fn sameDefinition(self: McpToolBinding, other: McpToolBinding) bool {
+        return self.runtime_generation == other.runtime_generation and
+            self.authority_id == other.authority_id and
+            std.mem.eql(u8, &self.definition_digest, &other.definition_digest);
+    }
 };
 
 pub const ToolCall = struct {
@@ -715,6 +744,8 @@ pub const ToolCall = struct {
     provider_result: ?[]const u8 = null,
     final_identity: FinalToolIdentity = .valid,
     provenance: ToolExecutionProvenance = .fx_local,
+    /// Borrowed only for this action. Copies and durable/provider encodings omit it.
+    resolved_skill: ?*const skill_contract.PreparedSkill = null,
 };
 
 pub const WebSearchProgress = union(enum) {
@@ -813,6 +844,8 @@ pub const CommittedFilePresentation = struct {
 };
 
 pub const PersistedToolResult = struct {
+    tool_images: []ToolImage = &.{},
+    tool_image_handle: ?[]u8 = null,
     tool_call_id: []u8,
     tool_name: []u8,
     status: PersistedToolStatus,
@@ -974,6 +1007,8 @@ test "persisted deferred tool result classifier is exact" {
 }
 
 pub const ToolResultMemory = struct {
+    tool_images: []const ToolImage = &.{},
+    tool_image_handle: ?[]const u8 = null,
     output_handle: ?[]const u8 = null,
     preview: ?[]const u8 = null,
     output_bytes: usize = 0,
@@ -1021,6 +1056,46 @@ pub const ExecutionMemory = struct {
     }
 };
 
+/// Image bytes returned by a tool; never a grant to read a user file.
+pub const ToolImage = struct {
+    data: []u8,
+    mime_type: []u8,
+};
+
+pub fn freeToolImages(alloc: std.mem.Allocator, images: []const ToolImage) void {
+    for (images) |image| {
+        alloc.free(image.data);
+        alloc.free(image.mime_type);
+    }
+    alloc.free(images);
+}
+
+pub fn dupeToolImages(alloc: std.mem.Allocator, images: []const ToolImage) ![]ToolImage {
+    const copies = try alloc.alloc(ToolImage, images.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (copies[0..initialized]) |image| {
+            alloc.free(image.data);
+            alloc.free(image.mime_type);
+        }
+        alloc.free(copies);
+    }
+    for (images, 0..) |image, index| {
+        const data = try alloc.dupe(u8, image.data);
+        errdefer alloc.free(data);
+        copies[index] = .{ .data = data, .mime_type = try alloc.dupe(u8, image.mime_type) };
+        initialized += 1;
+    }
+    return copies;
+}
+
+/// A cut in the active context, not a second persisted history.
+pub const ContextHistoryCut = struct {
+    turns: usize = 0,
+    tool_steps: usize = 0,
+    steering: usize = 0,
+};
+
 pub const ImageAttachment = struct {
     id: usize = 0,
     path: []u8,
@@ -1037,9 +1112,10 @@ pub const UserTurn = struct {
     work_id: ?[]u8 = null,
 };
 
-pub const ChatCachePolicy = enum {
-    default,
-    no_cache,
+/// Provider-returned phase for stateless assistant-message replay.
+pub const AssistantMessagePhase = enum {
+    commentary,
+    final_answer,
 };
 
 pub const ChatMessage = struct {
@@ -1052,10 +1128,11 @@ pub const ChatMessage = struct {
     /// Provider-owned opaque response items needed only for stateless within-turn continuation.
     /// The value is a validated JSON array and is never sent across provider routes.
     provider_state_json: ?[]const u8 = null,
+    /// Borrowed phase metadata for the same current-turn continuation.
+    assistant_phase: ?AssistantMessagePhase = null,
     tool_result_status: ?PersistedToolStatus = null,
     tool_result_memory: ?ToolResultMemory = null,
     permission_feedback: bool = false,
-    cache_policy: ChatCachePolicy = .default,
 };
 
 pub const Usage = struct {
@@ -1146,6 +1223,7 @@ pub const ProviderFailureCause = enum {
 pub const ModelCompletion = struct {
     content: ?[]const u8 = null,
     tool_calls: []const ToolCall = &.{},
+    assistant_phase: ?AssistantMessagePhase = null,
     generation_id: ?[]const u8 = null,
     billing: ?ProviderBilling = null,
     /// Gateway generation or resolved-model metadata was malformed or conflicting.
@@ -1459,9 +1537,25 @@ test "ProviderFinishReason accepts only the canonical provider domain" {
     try std.testing.expectEqual(ProviderFinishReason.content_filter, ProviderFinishReason.parse_legacy("content_filter").?);
 }
 
+pub const ConversationIdentity = struct {
+    pub const max_bytes: usize = 256;
+    pub const Failure = enum { empty, too_long, invalid_utf8 };
+
+    pub fn invalidReason(value: []const u8) ?Failure {
+        if (value.len == 0) return .empty;
+        if (value.len > max_bytes) return .too_long;
+        if (!std.unicode.utf8ValidateSlice(value)) return .invalid_utf8;
+        return null;
+    }
+};
+
 pub const AuthoritativeToolAdmission = union(enum) {
     admitted,
     reject_malformed_identity: FinalToolIdentity,
+    reject_unstorable_identity: struct {
+        field: enum { id, name, provisional_id },
+        reason: ConversationIdentity.Failure,
+    },
     reject_malformed_provider_result: ProviderResultIdentityFailure,
     reject_malformed_provider_arguments,
     reject_duplicate_identity,
@@ -1473,7 +1567,7 @@ pub fn authoritativeToolAdmission(completion: ModelCompletion) AuthoritativeTool
     }
 
     for (completion.tool_calls) |call| {
-        const final_identity = if (call.final_identity == .valid and call.id.len == 0)
+        const final_identity = if (call.final_identity == .valid and std.mem.trim(u8, call.id, " \t\r\n").len == 0)
             FinalToolIdentity.empty
         else
             call.final_identity;
@@ -1497,6 +1591,20 @@ pub fn authoritativeToolAdmission(completion: ModelCompletion) AuthoritativeTool
     }
 
     for (completion.tool_calls) |call| {
+        if (ConversationIdentity.invalidReason(call.id)) |reason| {
+            return .{ .reject_unstorable_identity = .{ .field = .id, .reason = reason } };
+        }
+        if (ConversationIdentity.invalidReason(call.name)) |reason| {
+            return .{ .reject_unstorable_identity = .{ .field = .name, .reason = reason } };
+        }
+        if (call.provisional_id) |id| {
+            if (ConversationIdentity.invalidReason(id)) |reason| {
+                return .{ .reject_unstorable_identity = .{ .field = .provisional_id, .reason = reason } };
+            }
+        }
+    }
+
+    for (completion.tool_calls) |call| {
         if (call.provenance == .provider_executed and
             call.argument_integrity == .malformed_json)
         {
@@ -1511,6 +1619,72 @@ pub fn authoritativeToolAdmission(completion: ModelCompletion) AuthoritativeTool
     }
 
     return .admitted;
+}
+
+test "authoritative tool admission rejects blank current call ids" {
+    for ([_][]const u8{ "", " ", "\t\r\n" }) |id| {
+        const calls = [_]ToolCall{.{ .id = id, .name = "read_file", .arguments_json = "{}" }};
+        try std.testing.expectEqualDeep(
+            AuthoritativeToolAdmission{ .reject_malformed_identity = .empty },
+            authoritativeToolAdmission(.{ .tool_calls = &calls }),
+        );
+    }
+}
+
+test "authoritative tool admission rejects unstorable names" {
+    const oversized = [_]u8{'n'} ** 257;
+    const cases = [_]struct { value: []const u8, reason: ConversationIdentity.Failure }{
+        .{ .value = "", .reason = .empty },
+        .{ .value = &oversized, .reason = .too_long },
+        .{ .value = "\xff", .reason = .invalid_utf8 },
+    };
+    for ([_]ToolExecutionProvenance{ .fx_local, .provider_executed }) |provenance| {
+        for (cases) |case| {
+            const calls = [_]ToolCall{.{ .id = "call", .name = case.value, .arguments_json = "{}", .provenance = provenance, .provider_result = "result" }};
+            try std.testing.expectEqualDeep(
+                AuthoritativeToolAdmission{ .reject_unstorable_identity = .{ .field = .name, .reason = case.reason } },
+                authoritativeToolAdmission(.{ .tool_calls = &calls }),
+            );
+        }
+    }
+}
+
+test "authoritative tool admission rejects unstorable correlation identities" {
+    const oversized = [_]u8{'i'} ** 257;
+    const cases = [_]struct { value: []const u8, reason: ConversationIdentity.Failure }{
+        .{ .value = &oversized, .reason = .too_long },
+        .{ .value = "\xff", .reason = .invalid_utf8 },
+    };
+    for (cases) |case| {
+        const calls = [_]ToolCall{.{ .id = case.value, .name = "read_file", .arguments_json = "{}" }};
+        try std.testing.expectEqualDeep(
+            AuthoritativeToolAdmission{ .reject_unstorable_identity = .{ .field = .id, .reason = case.reason } },
+            authoritativeToolAdmission(.{ .tool_calls = &calls }),
+        );
+        const provisional = [_]ToolCall{.{ .id = "call", .name = "read_file", .arguments_json = "{}", .provisional_id = case.value }};
+        try std.testing.expectEqualDeep(
+            AuthoritativeToolAdmission{ .reject_unstorable_identity = .{ .field = .provisional_id, .reason = case.reason } },
+            authoritativeToolAdmission(.{ .tool_calls = &provisional }),
+        );
+    }
+    const empty_provisional = [_]ToolCall{.{ .id = "call", .name = "read_file", .arguments_json = "{}", .provisional_id = "" }};
+    try std.testing.expectEqualDeep(
+        AuthoritativeToolAdmission{ .reject_unstorable_identity = .{ .field = .provisional_id, .reason = .empty } },
+        authoritativeToolAdmission(.{ .tool_calls = &empty_provisional }),
+    );
+}
+
+test "authoritative tool admission preserves bounded canonical identity formats" {
+    const boundary = [_]u8{'i'} ** 256;
+    const unicode_boundary = "é" ** 128;
+    for ([_][]const u8{ &boundary, unicode_boundary, "functions.read_file:0", "unknown/tool" }) |identity| {
+        for ([_]ToolExecutionProvenance{ .fx_local, .provider_executed }) |provenance| {
+            const calls = [_]ToolCall{.{ .id = identity, .name = identity, .provisional_id = identity, .arguments_json = "{}", .provenance = provenance, .provider_result = "result" }};
+            try std.testing.expectEqual(AuthoritativeToolAdmission.admitted, authoritativeToolAdmission(.{ .tool_calls = &calls }));
+            try std.testing.expectEqualStrings(identity, calls[0].id);
+            try std.testing.expectEqualStrings(identity, calls[0].name);
+        }
+    }
 }
 
 test "authoritative tool admission rejects duplicate final ids across provenance" {
@@ -2335,7 +2509,12 @@ fn dupePersistedToolResult(alloc: std.mem.Allocator, result: PersistedToolResult
     else
         null;
     errdefer if (command_output_replay) |replay| freeCommandOutputReplay(alloc, replay);
+    const tool_image_handle = if (result.tool_image_handle) |handle| try alloc.dupe(u8, handle) else null;
+    errdefer if (tool_image_handle) |handle| alloc.free(handle);
+    const tool_images = try dupeToolImages(alloc, result.tool_images);
     return .{
+        .tool_images = tool_images,
+        .tool_image_handle = tool_image_handle,
         .tool_call_id = tool_call_id,
         .tool_name = tool_name,
         .status = result.status,
@@ -2359,6 +2538,8 @@ fn freePersistedToolResult(alloc: std.mem.Allocator, result: PersistedToolResult
     alloc.free(result.tool_call_id);
     alloc.free(result.tool_name);
     alloc.free(result.output);
+    freeToolImages(alloc, result.tool_images);
+    if (result.tool_image_handle) |handle| alloc.free(handle);
     if (result.output_handle) |handle| alloc.free(handle);
     if (result.preview) |preview| alloc.free(preview);
     freePermissionFeedback(alloc, result.permission_feedback);
@@ -2460,7 +2641,8 @@ fn dupeFileEvidence(alloc: std.mem.Allocator, file: FileEvidence) !FileEvidence 
     };
 }
 
-fn freeFileEvidence(alloc: std.mem.Allocator, file: FileEvidence) void {
+/// Frees one entry's owned strings, not its containing slice.
+pub fn freeFileEvidence(alloc: std.mem.Allocator, file: FileEvidence) void {
     alloc.free(file.path);
     if (file.new_path) |new_path| alloc.free(new_path);
     alloc.free(file.tool_call_id);
@@ -2510,6 +2692,39 @@ test "dupeToolCall preserves argument integrity" {
     defer freeToolCall(std.testing.allocator, copy);
 
     try std.testing.expectEqual(ToolArgumentIntegrity.malformed_json, copy.argument_integrity);
+}
+
+test "dupeToolCall drops action scoped skill bindings" {
+    const skill: skill_contract.PreparedSkill = .{ .skill = .{ .name = "workflow", .description = "", .path = "/skills/workflow", .source = .global_fx } };
+    const source: ToolCall = .{ .id = "skill", .name = "skill", .arguments_json = "{\"location\":\"/skills/workflow\"}", .resolved_skill = &skill };
+    const copy = try dupeToolCall(std.testing.allocator, source);
+    defer freeToolCall(std.testing.allocator, copy);
+    try std.testing.expect(copy.resolved_skill == null);
+    try std.testing.expectEqualStrings(source.arguments_json, copy.arguments_json);
+}
+
+test "function input classification distinguishes syntax from object shape" {
+    const cases = [_]struct { input: []const u8, expected: ToolArgumentIntegrity }{
+        .{ .input = "{}", .expected = .valid },
+        .{ .input = " \n{\"nested\":[1,null,{}]}\t", .expected = .valid },
+        .{ .input = "[]", .expected = .non_object_json },
+        .{ .input = "42", .expected = .non_object_json },
+        .{ .input = "null", .expected = .non_object_json },
+        .{ .input = "true", .expected = .non_object_json },
+        .{ .input = "\"text\"", .expected = .non_object_json },
+        .{ .input = "", .expected = .malformed_json },
+        .{ .input = "{} trailing", .expected = .malformed_json },
+        .{ .input = "{\"a\":1,\"a\":2}", .expected = .malformed_json },
+    };
+    for (cases) |case| {
+        try std.testing.expectEqual(case.expected, try ToolArgumentIntegrity.classifyFunctionInput(std.testing.allocator, case.input));
+        try std.testing.expectEqual(case.expected, try ToolArgumentIntegrity.classifyFunctionInput(std.testing.allocator, case.input));
+        if (case.expected == .non_object_json) {
+            try std.testing.expectEqual(ToolArgumentIntegrity.valid, try ToolArgumentIntegrity.classifySerialized(std.testing.allocator, case.input));
+        }
+    }
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    try std.testing.expectError(error.OutOfMemory, ToolArgumentIntegrity.classifyFunctionInput(failing.allocator(), "{\"path\":\"file\"}"));
 }
 
 test "ToolArgumentIntegrity accepts complete serialized JSON roots" {
