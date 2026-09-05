@@ -84,25 +84,25 @@ const mockFetch = async (_url, init) => {
     secondRequestBody = JSON.parse(new TextDecoder().decode(init.body));
     return new Response(new ReadableStream({
       start(controller) {
-        controller.enqueue(encoded.encode(`data: {"type":"text-delta","delta":"${steeringAnswer}"}\n`));
-        controller.enqueue(encoded.encode('data: {"type":"finish","finishReason":{"unified":"stop"},"usage":{"inputTokens":{"total":1},"outputTokens":{"total":2}}}\n'));
-        controller.enqueue(encoded.encode("data: [DONE]\n"));
+        controller.enqueue(encoded.encode(`data: {"type":"text-delta","delta":"${steeringAnswer}"}\n\n`));
+        controller.enqueue(encoded.encode('data: {"type":"finish","finishReason":{"unified":"stop"},"usage":{"inputTokens":{"total":1},"outputTokens":{"total":2}}}\n\n'));
+        controller.enqueue(encoded.encode("data: [DONE]\n\n"));
         controller.close();
       },
     }), { status: 200, headers: { "content-type": "text/event-stream" } });
   }
   return new Response(new ReadableStream({
     async start(controller) {
-      controller.enqueue(encoded.encode('data: {"type":"text-delta","delta":"hello"}\n'));
+      controller.enqueue(encoded.encode('data: {"type":"text-delta","delta":"hello"}\n\n'));
       streamStartedAt = performance.now();
       const interval = setInterval(() => {
-        controller.enqueue(encoded.encode('data: {"type":"text-delta","delta":"."}\n'));
+        controller.enqueue(encoded.encode('data: {"type":"text-delta","delta":"."}\n\n'));
       }, 20);
       await firstStreamRelease;
       clearInterval(interval);
-      controller.enqueue(encoded.encode('data: {"type":"text-delta","delta":" world"}\n'));
-      controller.enqueue(encoded.encode('data: {"type":"finish","finishReason":{"unified":"stop"},"usage":{"inputTokens":{"total":1},"outputTokens":{"total":2}}}\n'));
-      controller.enqueue(encoded.encode("data: [DONE]\n"));
+      controller.enqueue(encoded.encode('data: {"type":"text-delta","delta":" world"}\n\n'));
+      controller.enqueue(encoded.encode('data: {"type":"finish","finishReason":{"unified":"stop"},"usage":{"inputTokens":{"total":1},"outputTokens":{"total":2}}}\n\n'));
+      controller.enqueue(encoded.encode("data: [DONE]\n\n"));
       controller.close();
       streamFinishedAt = performance.now();
     },
