@@ -162,7 +162,7 @@ describe.skipIf(SKIP_TMUX)("tui: fresh-session commands", () => {
           tools: Array<{ name: string }>;
         };
         expect(request.tools.map((tool) => tool.name)).toEqual([
-          "terminal",
+          "shell",
           "read_file",
         ]);
         expect(readFileSync(stderrPath, "utf8")).toBe("");
