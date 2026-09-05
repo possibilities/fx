@@ -123,6 +123,15 @@ function startCodexFixture() {
             context_window: 272000,
           },
           {
+            slug: "gpt-5.6-luna",
+            visibility: "list",
+            supported_in_api: true,
+            supported_reasoning_levels: [{ effort: "medium" }],
+            additional_speed_tiers: [],
+            input_modalities: ["text"],
+            context_window: 272000,
+          },
+          {
             slug: "gpt-5.4-mini",
             visibility: "list",
             supported_in_api: true,
@@ -227,7 +236,7 @@ describe("structured subscription inference", () => {
         credential_source: "chatgpt_subscription",
         catalog_provider: "codex",
         catalog_protocol: "chatgpt-codex-models",
-        catalog_client_version: "0.148.0",
+        catalog_client_version: "0.153.0",
         model: "gpt-5.6-sol",
         effort: "high",
         effort_index: 1,
@@ -247,7 +256,7 @@ describe("structured subscription inference", () => {
         "POST /responses",
       ]);
       const catalogRequest = codex.requests[0]!;
-      expect(catalogRequest.search).toBe("?client_version=0.148.0");
+      expect(catalogRequest.search).toBe("?client_version=0.153.0");
       expect(catalogRequest.authorization).toBe(`Bearer ${root.token}`);
       expect(catalogRequest.accountId).toBe("acct_structured_e2e");
       const providerRequest = codex.requests[1]!;

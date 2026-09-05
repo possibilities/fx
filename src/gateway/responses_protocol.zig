@@ -788,8 +788,17 @@ pub const Reducer = struct {
             else => return error.InvalidEvent,
         };
         defer parsed.deinit();
-        if (parsed.value != .object) return false;
-        const event_type = stringField(parsed.value.object, "type") orelse return false;
+        // An event that cannot name a terminal is never one; cancellation is
+        // observed on it before it is dropped, so a cancelled stream stops at
+        // the next event rather than at the event limit.
+        if (parsed.value != .object) {
+            if (cancel_flag.load(.seq_cst)) return error.Cancelled;
+            return false;
+        }
+        const event_type = stringField(parsed.value.object, "type") orelse {
+            if (cancel_flag.load(.seq_cst)) return error.Cancelled;
+            return false;
+        };
         if (cancel_flag.load(.seq_cst) and !isProviderTerminalEvent(event_type)) {
             return error.Cancelled;
         }

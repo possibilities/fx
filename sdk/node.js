@@ -345,7 +345,11 @@ function createNativeCoreRuntime(addon, options) {
     let adapterSettled = false;
     let responseBytes;
     const releaseState = () => {
-      if (codexSessionState === state) codexSessionState = null;
+      if (codexSessionState !== state) return;
+      codexSessionState = null;
+      // Mirror the fetch pump: a request queued while this operation was in
+      // flight is picked up on the next tick without waiting for a wake byte.
+      queueMicrotask(drainReady);
     };
     const settleOperation = () => {
       operationSettled = true;
