@@ -14,13 +14,10 @@ const catalog_poll_ms: u64 = 25;
 const e2e_models_url_env = "FX_E2E_GATEWAY_MODELS_URL";
 const e2e_timeout_ms_env = "FX_E2E_GATEWAY_CATALOG_TIMEOUT_MS";
 
-pub const Context = struct {
-    transport: host_stream_provider.Transport,
-};
-
-pub fn provider(context: *Context) model_catalog.Provider {
+/// Borrows the host transport for the lifetime of the provider.
+pub fn provider(transport: *host_stream_provider.Transport) model_catalog.Provider {
     return .{
-        .context = context,
+        .context = transport,
         .fetch_fn = fetch,
         .provider_id = .gateway,
     };
@@ -31,7 +28,7 @@ fn fetch(
     alloc: Allocator,
     input: model_catalog.FetchInput,
 ) Allocator.Error!model_catalog.ProviderResult {
-    const context: *Context = @ptrCast(@alignCast(raw.?));
+    const transport: *host_stream_provider.Transport = @ptrCast(@alignCast(raw.?));
     if (input.cancel_flag) |flag| {
         if (flag.load(.seq_cst)) return .{ .failure = .{ .category = .cancellation } };
     }
@@ -64,15 +61,15 @@ fn fetch(
     }
     std.json.Stringify.value(headers.items, .{}, &headers_json.writer) catch return error.OutOfMemory;
 
-    const handle = context.transport.open("GET", url, headers_json.writer.buffered(), &.{}) catch
+    const handle = transport.open("GET", url, headers_json.writer.buffered(), &.{}) catch
         return .{ .failure = .{ .category = .transport, .retryable = true } };
-    defer context.transport.close(handle);
+    defer transport.close(handle);
 
     var status_code: u16 = 0;
     while (true) {
         if (cancelled(input.cancel_flag)) return .{ .failure = .{ .category = .cancellation } };
         if (deadlineExpired(deadline)) return .{ .failure = .{ .category = .transport, .retryable = true } };
-        const status_result = context.transport.status(handle, &status_code);
+        const status_result = transport.status(handle, &status_code);
         if (status_result == 1) break;
         if (status_result == -2) return .{ .failure = .{ .category = .cancellation } };
         if (status_result < 0) return .{ .failure = .{ .category = .transport, .retryable = true } };
@@ -88,7 +85,7 @@ fn fetch(
     while (true) {
         if (cancelled(input.cancel_flag)) return .{ .failure = .{ .category = .cancellation } };
         if (deadlineExpired(deadline)) return .{ .failure = .{ .category = .transport, .retryable = true } };
-        const count = context.transport.next(handle, &chunk);
+        const count = transport.next(handle, &chunk);
         if (count == -3) {
             io_mod.sleep(catalog_poll_ms * std.time.ns_per_ms);
             continue;

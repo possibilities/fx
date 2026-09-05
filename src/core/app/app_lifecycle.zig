@@ -971,21 +971,12 @@ pub fn closeFullTranscript(
         "close_full_transcript restore={s}",
         .{@tagName(primary_restore)},
     );
-    const primary_recovery = if (primary_restore == .changed_resized)
-        try shell.prepareRestoredPrimaryTranscriptRecovery(alloc)
-    else
-        null;
-    defer if (primary_recovery) |bytes| alloc.free(bytes);
     if (terminal.fullTranscriptScreenActive()) {
         try leaveFullTranscriptScreen(terminal, shell, metrics);
     }
     try setFullTranscriptProjection(alloc, shell, .inline_mode);
     switch (primary_restore) {
         .changed => {},
-        .changed_resized => if (primary_recovery) |bytes| {
-            try writeLifecycleTerminalBytes(shell, metrics, bytes);
-            shell.repaintRestoredPrimaryTranscriptAfterResize();
-        },
         .exact => shell.retainRestoredPrimaryTranscript(),
         .resized => shell.repaintRestoredPrimaryTranscriptAfterResize(),
     }
@@ -1664,9 +1655,10 @@ test "full transcript transitions own terminal and projection together" {
     try closeFullTranscript(alloc, &terminal, &shell, &metrics);
     try std.testing.expect(shell.transcript_band_dirty);
     try std.testing.expect(shell.render_requests.hasReason(.transcript));
-    try std.testing.expect(!shell.terminal_reset_pending);
+    try std.testing.expect(shell.terminal_reset_pending);
     try std.testing.expectEqual(@as(?i32, null), shell.resize_history_row_delta);
     shell.layout.cols -= 1;
+    shell.terminal_reset_pending = false;
     shell.transcript_band_dirty = false;
     shell.render_requests.clearReason(.transcript);
 
