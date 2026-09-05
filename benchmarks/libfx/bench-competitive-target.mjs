@@ -24,6 +24,7 @@ const nativeFetch = globalThis.fetch.bind(globalThis);
 const rows = [];
 let active = null;
 let requestCount = 0;
+let catalogRequests = 0;
 let cleanup = async () => {};
 let runTurn;
 
@@ -36,6 +37,13 @@ function bodyBytes(body) {
 
 globalThis.fetch = async (input, init = {}) => {
   const isPrompt = String(init.method ?? input?.method ?? "GET").toUpperCase() === "POST";
+  if (target === "libfx" && !isPrompt) {
+    if ((init.method ?? "GET") !== "GET" || String(input) !== "https://ai-gateway.vercel.sh/coding-agent/v1/models") {
+      throw new Error("unexpected non-prompt libfx benchmark request");
+    }
+    catalogRequests += 1;
+    return Response.json({ object: "list", data: [{ id: "fake/model", type: "language", context_window: 1_000_000, max_tokens: 4096 }] });
+  }
   if (isPrompt) {
     requestCount += 1;
     if (active) {
@@ -169,6 +177,7 @@ try {
     }
     if (index >= 0) rows.push(row);
   }
+  if (target === "libfx" && catalogRequests !== 1) throw new Error("libfx must reuse model metadata across benchmark prompts");
 } finally {
   active = null;
   await cleanup();
@@ -183,6 +192,7 @@ process.stdout.write(`${JSON.stringify({
   warmups,
   samples,
   request_count: requestCount,
+  catalog_fetches: catalogRequests,
   import_ms: importedAt - importAt,
   initialize_ms: initializedAt - importedAt,
   rows: rows.map((row) => ({
