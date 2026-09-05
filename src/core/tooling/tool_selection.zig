@@ -141,18 +141,18 @@ test "native tool selections resolve aliases and preserve flag order" {
     defer resolved.deinit(std.testing.allocator);
 
     try std.testing.expectEqual(@as(usize, 2), resolved.tool_set.registry.tools.len);
-    try std.testing.expectEqualStrings("terminal", resolved.tool_set.order[0]);
+    try std.testing.expectEqualStrings("shell", resolved.tool_set.order[0]);
     try std.testing.expectEqualStrings("read_file", resolved.tool_set.order[1]);
     try std.testing.expectEqual(@as(usize, 1), resolved.tool_set.read_only_tool_names.len);
     try std.testing.expectEqualStrings("read_file", resolved.tool_set.read_only_tool_names[0]);
     try std.testing.expectEqualStrings(
         builtin_tools.terminalExecOnlySpec().description,
-        resolved.tool_set.registry.lookup("terminal").?.description,
+        resolved.tool_set.registry.lookup("shell").?.description,
     );
 
     try std.testing.expect(validate(catalog, &.{"missing"}).? == .unknown);
     try std.testing.expect(validate(catalog, &.{ "read_file", "read_file" }).? == .duplicate);
-    try std.testing.expect(validate(catalog, &.{ "terminal", "terminal:exec" }).? == .conflict);
+    try std.testing.expect(validate(catalog, &.{ "shell", "terminal:exec" }).? == .conflict);
 }
 
 fn checkNativeToolResolutionAllocationFailures(alloc: Allocator) !void {

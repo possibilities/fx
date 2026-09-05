@@ -792,6 +792,7 @@ pub fn Runtime(comptime App: type) type {
                 skillsMenuActive(app) or
                 modelMenuActive(app) or
                 sessionMenuActive(app) or
+                mcpMenuActive(app) or
                 helpMenuActive(app);
             var authentication_active = false;
             if (comptime runtime_profile.allows(App, .native_auth)) {
@@ -1496,15 +1497,7 @@ pub fn Runtime(comptime App: type) type {
                         return;
                     }
                     if (provider_picker_rt.hasQuery(app)) {
-                        if (app.stream.active) {
-                            try app.writeDomainNotice(.{
-                                .topic = "provider",
-                                .tone = .neutral,
-                                .body = "Provider switching is unavailable until active and queued work finishes.",
-                            }, true);
-                            app.shell.render_requests.request(.footer);
-                            return;
-                        }
+                        if (try app_auth_runtime.Runtime(App).reject_provider_picker_if_busy(app)) return;
                         if (try provider_picker_rt.submit(app)) return;
                     }
                     if (completion_rt.hasModelQuery(app)) {
@@ -1874,7 +1867,9 @@ pub fn Runtime(comptime App: type) type {
                     mcpMenuProjection(app).itemCount() > 0)
                 {
                     _ = applyMcpMenuEvent(app, .show_details);
-                } else if (state.screen == .browse and state.section != .servers) {
+                } else if (state.screen == .browse and state.section != .servers and
+                    mcpMenuProjection(app).itemCount() > 0)
+                {
                     if (try app.mcp.prepareMenuArguments(app.alloc)) {
                         app.input_runtime.inputResetState().clearCurrent(app.alloc);
                         app.shell.render_requests.request(.footer);
@@ -1885,7 +1880,7 @@ pub fn Runtime(comptime App: type) type {
                     }
                 } else if (state.screen == .details) {
                     const server = mcpMenuProjection(app).selectedServer() orelse return true;
-                    if (server.authentication == .required) {
+                    if (mcp_menu_state.serverActionAvailable(.authenticate, server)) {
                         try authenticateMcpMenuServer(app);
                     }
                 } else if (state.screen == .confirm) {
@@ -1924,6 +1919,9 @@ pub fn Runtime(comptime App: type) type {
                         )) {
                             .inserted => {
                                 if (comptime @hasDecl(App, "closeMcpMenu")) app.closeMcpMenu();
+                                if (comptime @hasDecl(App, "presentProjectMcpPrompt")) {
+                                    if (projectMcpPromptOwnsInput(app)) try app.presentProjectMcpPrompt();
+                                }
                             },
                             .limit_exceeded => try input_limit_feedback.report(
                                 App,
@@ -1986,6 +1984,10 @@ pub fn Runtime(comptime App: type) type {
                     !(app.mcp.menu.screen == .browse and
                         app.mcp.menu.section == .servers and
                         (action == .trust_approve_all or action == .trust_reset))) return true;
+                if (app.mcp.menu.screen == .details) {
+                    const server = mcpMenuProjection(app).selectedServer() orelse return true;
+                    if (!mcp_menu_state.serverActionAvailable(action, server)) return true;
+                }
                 _ = applyMcpMenuEvent(app, .{ .show_confirmation = action });
             }
             return true;
@@ -2026,7 +2028,7 @@ pub fn Runtime(comptime App: type) type {
             if (comptime @hasField(App, "mcp")) {
                 if (app.mcp.menu.screen == .details) {
                     const server = mcpMenuProjection(app).selectedServer() orelse return true;
-                    if (server.workspace_admission == .pending) {
+                    if (mcp_menu_state.serverActionAvailable(.trust_approve, server)) {
                         const effect = applyMcpMenuEvent(
                             app,
                             .{ .request_action = .trust_approve },
@@ -2900,7 +2902,7 @@ pub fn Runtime(comptime App: type) type {
                     _ = disarmEscapeClear(app);
                     return;
                 }
-                if (cancelCompactCommandMenu(app) or cancelMcpMenu(app) or cancelSettingsMenu(app) or cancelHelpMenu(app) or cancelModelMenu(app) or cancelSkillsMenu(app) or cancelSessionMenu(app)) {
+                if (cancelCompactCommandMenu(app) or (try cancelMcpMenu(app)) or cancelSettingsMenu(app) or cancelHelpMenu(app) or cancelModelMenu(app) or cancelSkillsMenu(app) or cancelSessionMenu(app)) {
                     _ = disarmEscapeClear(app);
                     app.shell.render_requests.request(.footer);
                     return;
@@ -2921,7 +2923,7 @@ pub fn Runtime(comptime App: type) type {
                 _ = disarmEscapeClear(app);
                 return;
             }
-            if (cancelCompactCommandMenu(app) or cancelMcpMenu(app) or cancelSettingsMenu(app) or cancelHelpMenu(app) or cancelModelMenu(app) or cancelSkillsMenu(app) or cancelSessionMenu(app)) {
+            if (cancelCompactCommandMenu(app) or (try cancelMcpMenu(app)) or cancelSettingsMenu(app) or cancelHelpMenu(app) or cancelModelMenu(app) or cancelSkillsMenu(app) or cancelSessionMenu(app)) {
                 _ = disarmEscapeClear(app);
                 app.shell.render_requests.request(.footer);
                 return;
@@ -2988,9 +2990,10 @@ pub fn Runtime(comptime App: type) type {
             return closeHelpMenu(app, true);
         }
 
-        fn cancelMcpMenu(app: *App) bool {
+        fn cancelMcpMenu(app: *App) !bool {
             if (!mcpMenuActive(app)) return false;
             if (comptime @hasField(App, "mcp")) {
+                debug_trace.logf("mcp", "MCP menu escape screen={s} filter={}", .{ @tagName(app.mcp.menu.screen), app.mcp.menu.filter_active });
                 if (app.mcp.menu.filter_active) {
                     _ = applyMcpMenuEvent(app, .clear_filter);
                     return true;
@@ -3009,6 +3012,9 @@ pub fn Runtime(comptime App: type) type {
             if (comptime @hasDecl(App, "closeMcpMenu")) app.closeMcpMenu();
             app.input_runtime.inputResetState().clearCurrent(app.alloc);
             paste_blocks.clearBlocks(app.alloc, &app.input_runtime.entities.pasted_blocks);
+            if (comptime @hasDecl(App, "presentProjectMcpPrompt")) {
+                if (projectMcpPromptOwnsInput(app)) try app.presentProjectMcpPrompt();
+            }
             return true;
         }
 

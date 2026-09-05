@@ -952,27 +952,51 @@ pub fn resetVisualEpoch(self: anytype, alloc: Allocator, welcome: []const u8) !v
     std.debug.assert(welcome.len > 0);
     try self.assertCanMutateTranscript();
 
-    const pinned_count = lifecyclePinCount(self);
     var replacement_entries: std.ArrayList(TranscriptEntry) = .empty;
-    errdefer {
-        for (replacement_entries.items) |*entry| entry.deinit(alloc);
-        replacement_entries.deinit(alloc);
-    }
-    try replacement_entries.ensureTotalCapacity(alloc, pinned_count + 1);
+    errdefer replacement_entries.deinit(alloc);
+    try replacement_entries.ensureTotalCapacity(alloc, self.entries.items.len + 1);
 
+    // Staging borrows retained payloads until publication; only the new welcome
+    // belongs to this scope on failure.
     const welcome_copy = try alloc.dupe(u8, welcome);
-    replacement_entries.appendAssumeCapacity(.{ .raw_bytes = .{
-        .id = self.next_entry_id,
-        .created_at_ms = io_mod.milliTimestamp(),
-        .bytes = welcome_copy,
-        .class = .welcome,
-    } });
-
+    errdefer alloc.free(welcome_copy);
+    var replaced_welcome = false;
+    var hidden_count: usize = 0;
+    var pinned_count: usize = 0;
     for (self.entries.items) |entry| {
-        if (entry != .raw_bytes or !entry.raw_bytes.lifecycle_pinned) continue;
-        replacement_entries.appendAssumeCapacity(
-            try cloneEntryForSnapshot(alloc, entry),
-        );
+        if (entry == .raw_bytes and entry.raw_bytes.class == .welcome) {
+            if (!replaced_welcome) {
+                replacement_entries.appendAssumeCapacity(.{ .raw_bytes = .{
+                    .id = entry.raw_bytes.id,
+                    .created_at_ms = entry.raw_bytes.created_at_ms,
+                    .bytes = welcome_copy,
+                    .class = .welcome,
+                } });
+                replaced_welcome = true;
+            }
+            continue;
+        }
+        const pinned = switch (entry) {
+            .raw_bytes => |raw| raw.lifecycle_pinned,
+            .semantic_notice => |notice| notice.pending_replacement,
+            else => false,
+        };
+        var retained = entry;
+        if (pinned) {
+            pinned_count += 1;
+        } else {
+            retained.hideInline();
+            hidden_count += 1;
+        }
+        replacement_entries.appendAssumeCapacity(retained);
+    }
+    if (!replaced_welcome) {
+        replacement_entries.appendAssumeCapacity(.{ .raw_bytes = .{
+            .id = self.next_entry_id,
+            .created_at_ms = io_mod.milliTimestamp(),
+            .bytes = welcome_copy,
+            .class = .welcome,
+        } });
     }
 
     const cols: u16 = if (self.layout.cols > 0) self.layout.cols else 80;
@@ -997,15 +1021,18 @@ pub fn resetVisualEpoch(self: anytype, alloc: Allocator, welcome: []const u8) !v
     replacement_transcript = .empty;
     self.transcript_cache_origin_untrimmed = rendered_start == 0;
 
-    for (old_entries.items) |*entry| entry.deinit(alloc);
+    for (old_entries.items) |*entry| {
+        if (entry.* == .raw_bytes and entry.raw_bytes.class == .welcome) entry.deinit(alloc);
+    }
     old_entries.deinit(alloc);
     old_transcript.deinit(alloc);
-    for (self.folded_command_blocks.items) |*block| block.deinit(alloc);
-    self.folded_command_blocks.clearRetainingCapacity();
-    for (self.command_output_blocks.items) |*block| block.deinit(alloc);
-    self.command_output_blocks.clearRetainingCapacity();
+    debug_trace.logf(
+        "transcript.visual_epoch_reset",
+        "clear display retained={d} hidden={d} pinned={d}",
+        .{ self.entries.items.len - 1, hidden_count, pinned_count },
+    );
 
-    self.next_entry_id +%= 1;
+    if (!replaced_welcome) self.next_entry_id +%= 1;
     self.last_rendered_cols = cols;
     if (comptime @hasDecl(@TypeOf(self.*), "closeFullTranscriptState")) {
         self.closeFullTranscriptState();
@@ -1194,6 +1221,7 @@ pub fn replaceSemanticNoticeAtomic(
     shadow.entries.items[entry_index] = .{ .semantic_notice = .{
         .id = entry_id,
         .created_at_ms = created_at_ms,
+        .inline_hidden = previous.semantic_notice.inline_hidden,
         .topic = owned.topic,
         .tone = owned.tone,
         .body = owned.body,
@@ -2034,6 +2062,7 @@ pub fn cloneEntryForSnapshot(alloc: Allocator, entry: TranscriptEntry) !Transcri
         .raw_bytes => |raw| .{ .raw_bytes = .{
             .id = raw.id,
             .created_at_ms = raw.created_at_ms,
+            .inline_hidden = raw.inline_hidden,
             .bytes = try alloc.dupe(u8, raw.bytes),
             .class = raw.class,
             .lifecycle_pinned = raw.lifecycle_pinned,
@@ -2048,6 +2077,7 @@ pub fn cloneEntryForSnapshot(alloc: Allocator, entry: TranscriptEntry) !Transcri
             break :blk .{ .semantic_notice = .{
                 .id = notice.id,
                 .created_at_ms = notice.created_at_ms,
+                .inline_hidden = notice.inline_hidden,
                 .topic = owned.topic,
                 .tone = owned.tone,
                 .body = owned.body,
@@ -2062,6 +2092,7 @@ pub fn cloneEntryForSnapshot(alloc: Allocator, entry: TranscriptEntry) !Transcri
             break :blk .{ .user_turn = .{
                 .id = user.id,
                 .created_at_ms = user.created_at_ms,
+                .inline_hidden = user.inline_hidden,
                 .turn = turn,
                 .skill_tokens = skill_tokens,
             } };
@@ -2073,22 +2104,26 @@ pub fn cloneEntryForSnapshot(alloc: Allocator, entry: TranscriptEntry) !Transcri
             break :blk .{ .assistant_turn = .{
                 .id = assistant.id,
                 .created_at_ms = assistant.created_at_ms,
+                .inline_hidden = assistant.inline_hidden,
                 .segments = segments,
             } };
         },
         .assistant_table => |assistant| .{ .assistant_table = .{
             .id = assistant.id,
             .created_at_ms = assistant.created_at_ms,
+            .inline_hidden = assistant.inline_hidden,
             .table = try assistant.table.clone(alloc),
         } },
         .assistant_code_block => |assistant| .{ .assistant_code_block = .{
             .id = assistant.id,
             .created_at_ms = assistant.created_at_ms,
+            .inline_hidden = assistant.inline_hidden,
             .block = try assistant.block.clone(alloc),
         } },
         .assistant_thematic_rule => |assistant| .{ .assistant_thematic_rule = .{
             .id = assistant.id,
             .created_at_ms = assistant.created_at_ms,
+            .inline_hidden = assistant.inline_hidden,
         } },
     };
 }
@@ -2172,6 +2207,7 @@ pub fn cloneToolDetailForSnapshot(alloc: Allocator, source: ToolDetailRecord) !T
         .command_process_presentation = source.command_process_presentation,
         .outcome = source.outcome,
         .fallback_disposition = source.fallback_disposition,
+        .origin = source.origin,
         .lifecycle_id = lifecycle_id,
         .presentation_group_id = source.presentation_group_id,
         .command_output_entry_id = source.command_output_entry_id,
@@ -2405,27 +2441,6 @@ pub fn appendRawTranscriptEntryClassified(
     rollback_entry = false;
     try enforceStructuredRetention(self, alloc, entry_id);
     return entry_id;
-}
-
-pub fn releaseStartupResumeViewEntry(
-    self: anytype,
-    alloc: Allocator,
-    entry_id: u32,
-) !bool {
-    try self.assertCanMutateTranscript();
-    const entry_index = rawEntryIndex(self, entry_id) orelse return false;
-
-    var removed = self.entries.orderedRemove(entry_index);
-    errdefer {
-        self.entries.insertAssumeCapacity(entry_index, removed);
-    }
-
-    try rebuildTranscriptCacheFromEntries(self, alloc, "startup resume view release");
-    self.recomputeCursorFromTranscript();
-    requestTranscriptPaint(self);
-
-    removed.deinit(alloc);
-    return true;
 }
 
 pub fn updateRawBytesEntry(
@@ -2725,7 +2740,7 @@ pub fn tailAssistantSegments(self: anytype) ?*AssistantTurnSegments {
     if (self.entries.items.len == 0) return null;
     const last = &self.entries.items[self.entries.items.len - 1];
     return switch (last.*) {
-        .assistant_turn => |*e| &e.segments,
+        .assistant_turn => |*e| if (e.inline_hidden) null else &e.segments,
         else => null,
     };
 }

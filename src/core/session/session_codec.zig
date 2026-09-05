@@ -1,10 +1,12 @@
 const std = @import("std");
+const image_data = @import("../images/image_data.zig");
 const session = @import("session.zig");
 const session_usage = @import("session_usage.zig");
 const session_permission_state = @import("../permissions/session_permission_state.zig");
 const types = @import("../shared/types.zig");
 const captured_command = @import("../tooling/captured_command.zig");
 const model_provider = @import("../config/model_provider.zig");
+const context_limits = @import("../config/context_limits.zig");
 const credential_authority = @import("../auth/credential_authority.zig");
 const shape_authority = @import("../auth/shape_authority.zig");
 
@@ -108,6 +110,16 @@ pub const RecoveryCheckpoint = struct {
     max_provider_attempts: usize,
     consumed_provider_attempts: usize,
     outstanding_reservation: bool = false,
+
+    /// Borrows the checkpoint's exact user and uncommitted response suffix.
+    pub fn interruptedTurn(self: RecoveryCheckpoint) types.HistoryTurn {
+        return .{ .interrupted = .{
+            .user = self.user,
+            .assistant = if (self.assistant_source.len > 0) self.assistant_source else null,
+            .execution = self.execution,
+            .terminal_reason = .failed,
+        } };
+    }
 
     pub fn deinit(self: *RecoveryCheckpoint, alloc: Allocator) void {
         session.freeUserTurn(alloc, self.user);
@@ -250,6 +262,228 @@ pub const DurableSessionState = struct {
         };
     }
 };
+
+pub const session_metadata_schema_version: u8 = 4;
+pub const max_session_metadata_bytes: usize = 64 * 1024;
+pub const max_session_title_bytes: usize = 240;
+
+pub const SessionMetadata = struct {
+    schema_version: u8 = session_metadata_schema_version,
+    id: []const u8,
+    origin_workspace_root: []const u8,
+    workspace_root: []const u8,
+    created_at_ms: i64,
+    updated_at_ms: i64,
+    conversation_language: []const u8,
+    provider: []const u8,
+    model: []const u8,
+    effort: []const u8,
+    fast_mode: bool,
+    title: ?[]const u8 = null,
+    subagent_child: bool = false,
+    /// The shape and credential that created this conversation. Absent for a
+    /// session written before provenance was recorded, or by a host that
+    /// supplies neither. The manifest is where listings read it without replay.
+    provenance: ?ProvenanceMetadata = null,
+};
+
+/// Manifest form of `SessionProvenance`: hex digests and tag names so the
+/// strict JSON codec carries it without custom parsing.
+pub const ProvenanceMetadata = struct {
+    shape_id: []const u8,
+    shape_identity: []const u8,
+    credential_source: ?[]const u8 = null,
+    credential_identity: ?[]const u8 = null,
+};
+
+/// Stack storage for the hex digests a `ProvenanceMetadata` borrows.
+pub const ProvenanceMetadataBuffers = struct {
+    shape_identity: [Sha256.digest_length * 2]u8 = undefined,
+    credential_identity: [Sha256.digest_length * 2]u8 = undefined,
+
+    pub fn encode(self: *ProvenanceMetadataBuffers, provenance: ?SessionProvenance) ?ProvenanceMetadata {
+        const value = provenance orelse return null;
+        self.shape_identity = std.fmt.bytesToHex(value.shape.identity.bytes, .lower);
+        var credential_identity: ?[]const u8 = null;
+        if (value.credential_identity) |identity| {
+            self.credential_identity = std.fmt.bytesToHex(identity.bytes, .lower);
+            credential_identity = &self.credential_identity;
+        }
+        return .{
+            .shape_id = value.shape.id,
+            .shape_identity = &self.shape_identity,
+            .credential_source = if (value.credential_source) |source| @tagName(source) else null,
+            .credential_identity = credential_identity,
+        };
+    }
+};
+
+fn parseHexDigest(text: []const u8) ![Sha256.digest_length]u8 {
+    if (text.len != Sha256.digest_length * 2) return error.InvalidSessionMetadata;
+    for (text) |byte| {
+        if (!std.ascii.isDigit(byte) and !(byte >= 'a' and byte <= 'f')) return error.InvalidSessionMetadata;
+    }
+    var bytes: [Sha256.digest_length]u8 = undefined;
+    _ = std.fmt.hexToBytes(&bytes, text) catch return error.InvalidSessionMetadata;
+    return bytes;
+}
+
+fn validateProvenanceMetadata(metadata: ProvenanceMetadata) !void {
+    shape_authority.validateLabel(metadata.shape_id) catch return error.InvalidSessionMetadata;
+    _ = try parseHexDigest(metadata.shape_identity);
+    if (metadata.credential_source) |source| {
+        if (std.meta.stringToEnum(types.CredentialSource, source) == null) return error.InvalidSessionMetadata;
+    }
+    if (metadata.credential_identity) |identity| {
+        if (metadata.credential_source == null) return error.InvalidSessionMetadata;
+        _ = try parseHexDigest(identity);
+    }
+}
+
+/// Restores durable provenance from its manifest form. Caller owns the result.
+pub fn parseProvenanceMetadata(alloc: Allocator, metadata: ?ProvenanceMetadata) !?SessionProvenance {
+    const value = metadata orelse return null;
+    try validateProvenanceMetadata(value);
+    const id = try alloc.dupe(u8, value.shape_id);
+    errdefer alloc.free(id);
+    return .{
+        .shape = .{ .id = id, .identity = .{ .bytes = try parseHexDigest(value.shape_identity) } },
+        .credential_source = if (value.credential_source) |source| std.meta.stringToEnum(types.CredentialSource, source).? else null,
+        .credential_identity = if (value.credential_identity) |identity| .{ .bytes = try parseHexDigest(identity) } else null,
+    };
+}
+
+pub const DecodedSessionMetadata = std.json.Parsed(SessionMetadata);
+pub const max_permission_state_bytes: usize = 1024 * 1024;
+pub const max_recovery_checkpoint_bytes: usize = context_limits.emergency_ceiling_bytes;
+
+pub fn encodeSessionMetadata(
+    alloc: Allocator,
+    metadata: SessionMetadata,
+) ![]u8 {
+    try validateSessionMetadata(metadata);
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    errdefer out.deinit();
+    try std.json.Stringify.value(metadata, .{}, &out.writer);
+    if (out.written().len == 0 or out.written().len > max_session_metadata_bytes) {
+        return error.SessionMetadataTooLarge;
+    }
+    return out.toOwnedSlice() catch return error.OutOfMemory;
+}
+
+pub fn decodeSessionMetadata(
+    alloc: Allocator,
+    bytes: []const u8,
+) !DecodedSessionMetadata {
+    if (bytes.len == 0 or bytes.len > max_session_metadata_bytes) {
+        return error.SessionMetadataTooLarge;
+    }
+    var parsed = std.json.parseFromSlice(SessionMetadata, alloc, bytes, .{
+        .allocate = .alloc_always,
+        .ignore_unknown_fields = false,
+        .max_value_len = max_session_metadata_bytes,
+    }) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.InvalidSessionMetadata,
+    };
+    errdefer parsed.deinit();
+    validateSessionMetadata(parsed.value) catch return error.InvalidSessionMetadata;
+    return parsed;
+}
+
+pub fn encodePermissionState(
+    alloc: Allocator,
+    state: session_permission_state.State,
+) ![]u8 {
+    try session_permission_state.validate(state);
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    errdefer out.deinit();
+    try writePermissionState(&out.writer, state);
+    if (out.written().len == 0 or out.written().len > max_permission_state_bytes) {
+        return error.PermissionStateTooLarge;
+    }
+    return out.toOwnedSlice() catch return error.OutOfMemory;
+}
+
+pub fn decodePermissionState(
+    alloc: Allocator,
+    bytes: []const u8,
+) !session_permission_state.State {
+    if (bytes.len == 0 or bytes.len > max_permission_state_bytes) {
+        return error.PermissionStateTooLarge;
+    }
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, bytes, .{
+        .max_value_len = max_permission_state_bytes,
+    }) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.InvalidPermissionState,
+    };
+    defer parsed.deinit();
+    return parsePermissionState(alloc, parsed.value) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.InvalidPermissionState,
+    };
+}
+
+pub fn encodeRecoveryCheckpoint(
+    alloc: Allocator,
+    checkpoint: RecoveryCheckpoint,
+) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    errdefer out.deinit();
+    try writeRecoveryCheckpoint(&out.writer, checkpoint);
+    if (out.written().len == 0 or out.written().len > max_recovery_checkpoint_bytes) {
+        return error.RecoveryCheckpointTooLarge;
+    }
+    return out.toOwnedSlice() catch return error.OutOfMemory;
+}
+
+pub fn decodeRecoveryCheckpoint(
+    alloc: Allocator,
+    bytes: []const u8,
+) !RecoveryCheckpoint {
+    if (bytes.len == 0 or bytes.len > max_recovery_checkpoint_bytes) {
+        return error.RecoveryCheckpointTooLarge;
+    }
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, bytes, .{
+        .max_value_len = max_recovery_checkpoint_bytes,
+    }) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.InvalidRecoveryCheckpoint,
+    };
+    defer parsed.deinit();
+    return parseRecoveryCheckpoint(alloc, parsed.value) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.InvalidRecoveryCheckpoint,
+    };
+}
+
+fn validateSessionMetadata(metadata: SessionMetadata) !void {
+    if (metadata.schema_version != session_metadata_schema_version) {
+        return error.UnsupportedSessionSchema;
+    }
+    try validateSessionId(metadata.id);
+    try validateWorkspaceRoot(metadata.origin_workspace_root);
+    try validateWorkspaceRoot(metadata.workspace_root);
+    if (metadata.created_at_ms < 0 or metadata.updated_at_ms < metadata.created_at_ms) {
+        return error.InvalidSessionMetadata;
+    }
+    try validateConversationLanguageBytes(metadata.conversation_language);
+    if (model_provider.parse(metadata.provider) == null) return error.InvalidSessionMetadata;
+    try validateModel(metadata.model);
+    if (types.ReasoningEffort.parse(metadata.effort) == null) {
+        return error.InvalidSessionMetadata;
+    }
+    if (metadata.title) |title| {
+        if (title.len == 0 or
+            title.len > max_session_title_bytes or
+            !std.unicode.utf8ValidateSlice(title))
+        {
+            return error.InvalidSessionMetadata;
+        }
+    }
+    if (metadata.provenance) |provenance| try validateProvenanceMetadata(provenance);
+}
 
 pub const EncodeSummary = struct {
     encoded_bytes: u64,
@@ -1284,7 +1518,13 @@ fn writeSnapshotLocator(writer: *std.Io.Writer, value: ?[]const u8) !void {
 }
 
 fn writeExecutionMemory(writer: *std.Io.Writer, execution: session.ExecutionMemory) !void {
-    try writer.writeAll("{\"schema_version\":7,\"tool_steps\":[");
+    const has_tool_images = images: {
+        for (execution.tool_steps) |step| {
+            for (step.tool_results) |result| if (result.tool_images.len > 0 or result.tool_image_handle != null) break :images true;
+        }
+        break :images false;
+    };
+    try writer.print("{{\"schema_version\":{d},\"tool_steps\":[", .{@as(u8, if (has_tool_images) 8 else 7)});
     for (execution.tool_steps, 0..) |step, i| {
         if (i > 0) try writer.writeByte(',');
         try writer.writeAll("{\"assistant\":");
@@ -1402,6 +1642,21 @@ fn writePersistedToolResult(writer: *std.Io.Writer, result: session.PersistedToo
         writer,
         result.terminal_action_presentation,
     );
+    if (result.tool_image_handle) |handle| {
+        try writer.writeAll(",\"tool_image_handle\":");
+        try writeDurableBytes(writer, handle);
+    } else if (result.tool_images.len > 0) {
+        try writer.writeAll(",\"tool_images\":[");
+        for (result.tool_images, 0..) |image, index| {
+            if (index > 0) try writer.writeByte(',');
+            try writer.writeAll("{\"type\":\"image\",\"mimeType\":");
+            try std.json.Stringify.value(image.mime_type, .{}, writer);
+            try writer.writeAll(",\"data\":");
+            try std.json.Stringify.value(image.data, .{}, writer);
+            try writer.writeByte('}');
+        }
+        try writer.writeByte(']');
+    }
     try writer.writeByte('}');
 }
 
@@ -1671,7 +1926,7 @@ fn parseExecutionMemory(alloc: Allocator, value: std.json.Value) !session.Execut
         1...4 => try exactObject(value, &.{ "schema_version", "tool_steps", "files" }),
         5 => try exactObject(value, &.{ "schema_version", "tool_steps", "files", "turn_summary" }),
         6 => try exactObject(value, &.{ "schema_version", "tool_steps", "files", "steering", "turn_summary" }),
-        7 => try exactObject(value, &.{ "schema_version", "tool_steps", "files", "steering", "turn_summary" }),
+        7, 8 => try exactObject(value, &.{ "schema_version", "tool_steps", "files", "steering", "turn_summary" }),
         else => return error.InvalidSessionFormat,
     };
     const tool_steps = try parseToolSteps(
@@ -1856,7 +2111,7 @@ fn parseToolCall(alloc: Allocator, value: std.json.Value) !session.ToolCall {
     errdefer alloc.free(name);
     var arguments_json = try parseRequiredDurableBytes(alloc, object, "arguments_json");
     errdefer alloc.free(arguments_json);
-    const argument_integrity = try types.ToolArgumentIntegrity.classifySerialized(alloc, arguments_json);
+    const argument_integrity = try types.ToolArgumentIntegrity.classifyFunctionInput(alloc, arguments_json);
     if (argument_integrity == .malformed_json) {
         const safe_arguments = try alloc.dupe(u8, "{}");
         alloc.free(arguments_json);
@@ -1880,7 +2135,8 @@ fn parseOptionalToolCall(alloc: Allocator, value: std.json.Value) !?session.Tool
         .null => null,
         .object => blk: {
             var call = try parseToolCall(alloc, value);
-            session.repairPersistedInterruptedToolArguments(&call, .schema_v3);
+            errdefer session.freeToolCall(alloc, call);
+            try session.repairPersistedInterruptedToolArguments(alloc, &call, .schema_v3);
             break :blk call;
         },
         else => error.InvalidSessionFormat,
@@ -1901,6 +2157,8 @@ fn parseToolResults(
         alloc.free(result.tool_call_id);
         alloc.free(result.tool_name);
         alloc.free(result.output);
+        types.freeToolImages(alloc, result.tool_images);
+        if (result.tool_image_handle) |handle| alloc.free(handle);
         if (result.output_handle) |handle| alloc.free(handle);
         if (result.preview) |preview| alloc.free(preview);
         types.freePermissionFeedback(alloc, result.permission_feedback);
@@ -1982,7 +2240,7 @@ fn parseToolResult(
         "command_output_replay",
         "command_process_presentation",
     };
-    const v4_keys = &.{
+    const v4_keys = &[_][]const u8{
         "tool_call_id",
         "tool_name",
         "status",
@@ -2005,6 +2263,12 @@ fn parseToolResult(
         2 => try exactVariantObject(value, v2_keys, v2_extended_keys),
         3 => .{ .object = try exactObject(value, v3_keys), .extended = true },
         4, 5, 6, 7 => .{ .object = try exactObject(value, v4_keys), .extended = true },
+        8 => .{ .object = if (value == .object and value.object.contains("tool_images"))
+            try exactObject(value, &(v4_keys.* ++ [_][]const u8{"tool_images"}))
+        else if (value == .object and value.object.contains("tool_image_handle"))
+            try exactObject(value, &(v4_keys.* ++ [_][]const u8{"tool_image_handle"}))
+        else
+            try exactObject(value, v4_keys), .extended = true },
         else => return error.InvalidSessionFormat,
     };
     const object = result_shape.object;
@@ -2012,7 +2276,7 @@ fn parseToolResult(
     errdefer alloc.free(tool_call_id);
     const tool_name = try parseRequiredDurableBytes(alloc, object, "tool_name");
     errdefer alloc.free(tool_name);
-    const output = try parseRequiredDurableBytes(alloc, object, "output");
+    var output = try parseRequiredDurableBytes(alloc, object, "output");
     errdefer alloc.free(output);
     const output_handle = try parseOptionalDurableBytes(
         alloc,
@@ -2064,7 +2328,30 @@ fn parseToolResult(
         )
     else
         null;
+    const tool_image_handle = if (object.get("tool_image_handle")) |value_handle| try parseOptionalDurableBytes(alloc, value_handle) else null;
+    errdefer if (tool_image_handle) |handle| alloc.free(handle);
+    const tool_images = if (object.get("tool_images")) |images| images: {
+        if (images != .array) return error.InvalidSessionFormat;
+        const parsed_images = image_data.parseToolImages(alloc, images.array.items) catch |err| {
+            if (err == error.OutOfMemory) return error.OutOfMemory;
+            const notice = try std.fmt.allocPrint(alloc, "{s}\n[Saved tool image unavailable: {s}]", .{ output, @errorName(err) });
+            alloc.free(output);
+            output = notice;
+            break :images try alloc.alloc(types.ToolImage, 0);
+        };
+        if (parsed_images.len != images.array.items.len) {
+            types.freeToolImages(alloc, parsed_images);
+            const notice = try std.fmt.allocPrint(alloc, "{s}\n[Saved tool image unavailable: unsupported content]", .{output});
+            alloc.free(output);
+            output = notice;
+            break :images try alloc.alloc(types.ToolImage, 0);
+        }
+        break :images parsed_images;
+    } else try alloc.alloc(types.ToolImage, 0);
+    errdefer types.freeToolImages(alloc, tool_images);
     return .{
+        .tool_images = tool_images,
+        .tool_image_handle = tool_image_handle,
         .tool_call_id = tool_call_id,
         .tool_name = tool_name,
         .status = std.meta.stringToEnum(
@@ -2954,6 +3241,83 @@ test "durable state repairs duplicate-key execution and interrupted tool argumen
     const interrupted = decoded.history[1].interrupted.tool_call.?;
     try std.testing.expectEqualStrings("{}", interrupted.arguments_json);
     try std.testing.expectEqual(types.ToolArgumentIntegrity.valid, interrupted.argument_integrity);
+}
+
+test "non-object saved function inputs are repaired without changing recorded outcomes" {
+    const alloc = std.testing.allocator;
+    for ([_][]const u8{ "[]", "42", "null", "true", "\"text\"" }) |arguments| {
+        for ([_]session.PersistedToolStatus{ .success, .failure }) |status| {
+            for (0..3) |native_kind| {
+                var calls = [_]session.ToolCall{.{ .id = "call", .name = "read_file", .arguments_json = arguments }};
+                calls[0].provider_result = if (native_kind == 1) "provider result" else null;
+                var results = [_]session.PersistedToolResult{persistedResultForTest("call", "read_file")};
+                results[0].status = status;
+                results[0].provider_native = native_kind == 2;
+                results[0].output_handle = @constCast("retained-handle");
+                results[0].preview = @constCast("retained-preview");
+                var steps = [_]session.ToolExecutionStep{.{ .tool_calls = &calls, .tool_results = &results }};
+                const turn: session.HistoryTurn = .{ .assistant = .{
+                    .user = .{ .text = @constCast("read") },
+                    .assistant = @constCast("done"),
+                    .execution = .{ .tool_steps = &steps },
+                } };
+                var encoded: std.Io.Writer.Allocating = .init(alloc);
+                defer encoded.deinit();
+                try writeHistoryTurn(&encoded.writer, turn);
+                var parsed = try std.json.parseFromSlice(std.json.Value, alloc, encoded.written(), .{});
+                defer parsed.deinit();
+                const decoded = try parseHistoryTurn(alloc, parsed.value);
+                defer session.freeHistoryTurn(alloc, decoded);
+                const step = decoded.assistant.execution.tool_steps[0];
+                try std.testing.expectEqualStrings(if (native_kind == 0) "{}" else arguments, step.tool_calls[0].arguments_json);
+                try std.testing.expectEqual(if (native_kind == 0) types.ToolExecutionProvenance.fx_local else .provider_executed, step.tool_calls[0].provenance);
+                try std.testing.expectEqual(types.ToolArgumentIntegrity.valid, step.tool_calls[0].argument_integrity);
+                try std.testing.expectEqual(status, step.tool_results[0].status);
+                try std.testing.expectEqualStrings("stale", step.tool_results[0].output);
+                try std.testing.expectEqualStrings("retained-handle", step.tool_results[0].output_handle.?);
+                try std.testing.expectEqualStrings("retained-preview", step.tool_results[0].preview.?);
+                try std.testing.expectEqualStrings(arguments, calls[0].arguments_json);
+                try session.repairPersistedToolArguments(alloc, step.tool_calls, step.tool_results, .schema_v3);
+                try std.testing.expectEqualStrings(if (native_kind == 0) "{}" else arguments, step.tool_calls[0].arguments_json);
+                if (native_kind == 0 and status == .failure and std.mem.eql(u8, arguments, "[]")) {
+                    try std.testing.checkAllAllocationFailures(alloc, checkNonObjectHistoryAllocationFailures, .{parsed.value});
+                }
+            }
+        }
+    }
+}
+
+fn checkNonObjectHistoryAllocationFailures(alloc: Allocator, value: std.json.Value) !void {
+    const decoded = try parseHistoryTurn(alloc, value);
+    defer session.freeHistoryTurn(alloc, decoded);
+    try std.testing.expectEqualStrings("{}", decoded.assistant.execution.tool_steps[0].tool_calls[0].arguments_json);
+    try std.testing.expectEqual(session.PersistedToolStatus.failure, decoded.assistant.execution.tool_steps[0].tool_results[0].status);
+}
+
+test "non-object interrupted inputs repair locally and preserve provider-owned records" {
+    const alloc = std.testing.allocator;
+    for ([_]bool{ false, true }) |native| {
+        var out: std.Io.Writer.Allocating = .init(alloc);
+        defer out.deinit();
+        try writeToolCall(&out.writer, .{
+            .id = "interrupted",
+            .name = "read_file",
+            .arguments_json = "[]",
+            .provider_result = if (native) "provider result" else null,
+        });
+        var parsed = try std.json.parseFromSlice(std.json.Value, alloc, out.written(), .{});
+        defer parsed.deinit();
+        const repaired = (try parseOptionalToolCall(alloc, parsed.value)).?;
+        defer session.freeToolCall(alloc, repaired);
+        try std.testing.expectEqualStrings(if (native) "[]" else "{}", repaired.arguments_json);
+        if (!native) try std.testing.checkAllAllocationFailures(alloc, checkNonObjectInterruptedAllocationFailures, .{parsed.value});
+    }
+}
+
+fn checkNonObjectInterruptedAllocationFailures(alloc: Allocator, value: std.json.Value) !void {
+    const call = (try parseOptionalToolCall(alloc, value)).?;
+    defer session.freeToolCall(alloc, call);
+    try std.testing.expectEqualStrings("{}", call.arguments_json);
 }
 
 test "current history decode rejects ambiguous malformed tool result pairings" {
@@ -4000,6 +4364,29 @@ test "recovery checkpoint round trips while legacy state stays absent" {
     defer legacy_state.deinit(alloc);
     try std.testing.expectEqual(model_provider.ProviderId.gateway, legacy_state.preferences.provider);
     try std.testing.expectEqual(@as(?RecoveryCheckpoint, null), legacy_state.recovery_checkpoint);
+}
+
+test "recovery checkpoint accepts the exact composer byte limit" {
+    const alloc = std.testing.allocator;
+    const prompt = try alloc.alloc(u8, 8 * 1024 * 1024);
+    defer alloc.free(prompt);
+    @memset(prompt, 'x');
+    const checkpoint = RecoveryCheckpoint{
+        .turn_id = 1,
+        .user = .{ .text = prompt },
+        .assistant_source = @constCast(""),
+        .cause = .network_interrupted,
+        .action = .retrying_request,
+        .authority = .{ .provider = .gateway, .model = @constCast("test/model") },
+        .requested_fast_mode = false,
+        .fast_mode = false,
+        .max_provider_attempts = 3,
+        .consumed_provider_attempts = 0,
+    };
+    const encoded = try encodeRecoveryCheckpoint(alloc, checkpoint);
+    defer alloc.free(encoded);
+    try std.testing.expect(encoded.len > prompt.len);
+    try std.testing.expect(encoded.len <= max_recovery_checkpoint_bytes);
 }
 
 test "session permission state round trips while legacy state stays empty" {

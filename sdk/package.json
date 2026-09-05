@@ -33,6 +33,7 @@
     "internal.js",
     "node.js",
     "fx-sdk.js",
+    "core-output.js",
     "mcp.js",
     "skills.js",
     "skills-node.js",

@@ -497,19 +497,8 @@ const App = struct {
             .agent_stream_or_unavailable();
     }
 
-    pub fn fetchProviderCatalog(
-        self: *Self,
-        provider: model_provider.ProviderId,
-        access: credentials.CatalogAccess,
-    ) !model_catalog.ProviderResult {
-        const catalog = self.providerSet().select(provider).model_catalog orelse
-            return error.ModelCatalogUnavailable;
-        return catalog.fetch(self.alloc, .{
-            .access = access,
-            .endpoint = builtin_gateway.models_path,
-            .cancel_flag = &self.worker.worker_cancel_requested,
-            .view = .picker,
-        });
+    pub fn providerCatalog(self: *Self, provider: model_provider.ProviderId) ?model_catalog.Provider {
+        return self.providerSet().select(provider).model_catalog;
     }
 
     pub fn cooperativeTransportPulse(self: *Self) !void {
@@ -802,7 +791,9 @@ const App = struct {
             }
         }
         if (comptime host_profile.durable_sessions) {
-            SessionAppRuntime.primeSessionPicker(&app);
+            if (launch.upgrade_relaunch == null) {
+                SessionAppRuntime.primeSessionPicker(&app);
+            }
         }
         const env_disabled = if (io_mod.getenv("FX_AUTO_UPGRADE")) |val|
             std.mem.eql(u8, val, "0") or std.ascii.eqlIgnoreCase(val, "false")
@@ -1064,12 +1055,14 @@ const App = struct {
     }
 
     fn deinitImpl(self: *App, capture_resume_handoff: bool) ?app_session_runtime.ResumeHandoff {
+        self.auth.stopProviderPreparation();
         // Client.deinit releases the herdr pane (clear agent + label) when enabled.
         self.herdr.deinit();
         if (comptime !host_target.is_wasm) self.work_control.deinit();
         self.stopStream();
 
         self.worker.requestShutdown();
+        SessionAppRuntime.requestPersistenceShutdown(self);
         self.managed_executions.shutdown();
         SessionNamingAppRuntime.requestStop(self);
         self.upgrader.stop();
@@ -1494,11 +1487,8 @@ const App = struct {
         try SessionAppRuntime.resetSession(self);
     }
 
-    pub fn prepareLiveSessionResume(
-        self: *App,
-        log_options: session_log.Options,
-    ) !void {
-        try SessionAppRuntime.prepareLiveSessionResume(self, log_options);
+    pub fn prepareLiveSessionResume(self: *App) !void {
+        try SessionAppRuntime.prepareLiveSessionResume(self);
     }
 
     pub fn finishLiveSessionResume(self: *App) !void {
@@ -1552,10 +1542,6 @@ const App = struct {
 
     pub fn commitStartupResumeReplayAnchor(self: *App) !void {
         try self.flushRequestedFrame();
-    }
-
-    pub fn persistResumeViewAfterFrame(self: *App) void {
-        SessionAppRuntime.persistResumeViewAfterFrame(self);
     }
 
     pub fn flushDirectTerminalShutdownOutcome(self: *App) !void {
@@ -1647,6 +1633,7 @@ const App = struct {
             checkpoint.turn_id,
             false,
         )) return false;
+        WorkerAppRuntime.beginRecoveryPresentation(self);
         WorkerAppRuntime.syncState(
             self,
             app_callbacks.Bindings(App).worker_tool_lifecycle_presenter(self),
@@ -1784,7 +1771,6 @@ const App = struct {
             .account_id = account_id_copy,
             .permission_mode = self.permission_engine.mode,
             .history = history_copy,
-            .context_history_start = self.session.contextHistoryStart(),
             .unversioned_history_count = self.session.unversionedHistoryEnd(),
             .root_user_intent_context = root_user_intent_context,
             .grants = grants_copy,
@@ -1843,7 +1829,6 @@ const App = struct {
             .credential_source = credential.source,
             .account_id = account_id,
             .history = history,
-            .context_history_start = self.session.contextHistoryStart(),
             .unversioned_history_count = self.session.unversionedHistoryEnd(),
         });
         LifecycleAppRuntime.reportPromptWorking(self);
@@ -1985,15 +1970,7 @@ const App = struct {
         generation: u64,
         completion: *const app_mcp_runtime.AuthenticationCompletion,
     ) !void {
-        if (try self.mcp.applyMenuAuthenticationCompletion(
-            self.alloc,
-            generation,
-            completion,
-        )) {
-            self.beginMcpMenuReload(generation) catch |err| {
-                try self.mcp.recordMenuEffectFailure(self.alloc, generation, err);
-            };
-        }
+        _ = try self.mcp.applyMenuAuthenticationCompletion(self.alloc, generation, completion);
         self.shell.render_requests.request(.footer);
     }
 
@@ -2102,12 +2079,12 @@ const App = struct {
         return self.mcp.callTool(arena, name, arguments_json, max_tool_result_bytes, options);
     }
 
-    pub fn searchMcpTools(self: *App, arena: Allocator, request: tool_mcp_runtime.SearchRequest, permission_rules: types.PermissionRuleSet, access: tool_mcp_runtime.Access) !tool_mcp_runtime.SearchResult {
-        return self.mcp.searchTools(arena, request, permission_rules, self.context_limits, access);
+    pub fn searchMcpTools(self: *App, arena: Allocator, request: tool_mcp_runtime.SearchRequest, permission_rules: types.PermissionRuleSet, access: tool_mcp_runtime.Access, cancel_flag: ?*std.atomic.Value(bool)) !tool_mcp_runtime.SearchResult {
+        return self.mcp.searchTools(arena, request, permission_rules, self.context_limits, access, cancel_flag);
     }
 
-    pub fn mcpToolSchemaJson(self: *App, arena: Allocator, name: []const u8, permission_rules: types.PermissionRuleSet, access: tool_mcp_runtime.Access) !?tool_mcp_runtime.ToolSchemaResult {
-        return self.mcp.toolSchema(arena, name, permission_rules, self.context_limits, access);
+    pub fn mcpToolSchemaJson(self: *App, arena: Allocator, name: []const u8, permission_rules: types.PermissionRuleSet, access: tool_mcp_runtime.Access, cancel_flag: ?*std.atomic.Value(bool)) !?tool_mcp_runtime.ToolSchemaResult {
+        return self.mcp.toolSchema(arena, name, permission_rules, self.context_limits, access, cancel_flag);
     }
 
     pub fn listMcpServersAndTools(self: *App, alloc: Allocator) ![]u8 {
@@ -2166,6 +2143,10 @@ const App = struct {
         return self.mcp.renderHealthSummary(alloc);
     }
 
+    pub fn snapshotMcpDefinition(self: *App, alloc: Allocator, name: []const u8, known: tool_mcp_runtime.Binding) !tool_mcp_runtime.DefinitionSnapshot {
+        return self.mcp.snapshotToolDefinition(alloc, name, known, self.permission_engine.rules, self.context_limits, .unrestricted);
+    }
+
     pub fn snapshotMcpToolNames(self: *App, alloc: Allocator) ![][]u8 {
         return self.mcp.snapshotToolNames(alloc, self.permission_engine.rules);
     }
@@ -2220,7 +2201,7 @@ const App = struct {
         permission_mode: types.PermissionMode,
         permission_rules: types.PermissionRuleSet,
     ) !tool_projection.EffectiveToolProjection {
-        return app_mcp_runtime.buildModelToolProjection(&self.mcp, alloc, self.toolAdvertisementSet(), .{
+        return tool_projection.buildModelToolProjectionForSet(alloc, self.toolAdvertisementSet(), .{
             .permission_mode = permission_mode,
             .permission_rules = permission_rules,
             .subagent_available = self.session_persistence.subagent_host != null,
@@ -2361,12 +2342,12 @@ const App = struct {
         return self.describeToolActionDenied(arena, call, display_target, label, advertised_dynamic_tool_names);
     }
 
-    pub fn requestToolPermissionSync(self: *App, arena: Allocator, call: ToolCall, review_turn: permission_auto_classifier.ReviewTurnContext, permission_mode: PermissionMode, local_grants: []const PermissionGrant, live_authority: ?agent_runtime.LiveToolAuthority, revalidation: ?agent_runtime.LivePermissionRevalidation, advertised_dynamic_tool_names: []const []const u8) !command_admission.PermissionOutcome {
-        return AgentAppRuntime.requestToolPermissionSync(self, arena, call, review_turn, permission_mode, local_grants, live_authority, revalidation, advertised_dynamic_tool_names, &ignored_list_entries, max_list_entries, max_read_file_bytes, max_read_file_lines, max_read_file_line_len, max_command_output_bytes, builtin_gateway.retry_count, builtin_gateway.defaultChatUrl());
+    pub fn requestToolPermissionSync(self: *App, arena: Allocator, call: ToolCall, review_turn: permission_auto_classifier.ReviewTurnContext, permission_mode: PermissionMode, local_grants: []const PermissionGrant, live_authority: ?agent_runtime.LiveToolAuthority, revalidation: ?agent_runtime.LivePermissionRevalidation, advertised_dynamic_tool_names: []const []const u8, mcp_review_schema_json: ?[]const u8) !command_admission.PermissionOutcome {
+        return AgentAppRuntime.requestToolPermissionSync(self, arena, call, review_turn, permission_mode, local_grants, live_authority, revalidation, advertised_dynamic_tool_names, mcp_review_schema_json, &ignored_list_entries, max_list_entries, max_read_file_bytes, max_read_file_lines, max_read_file_line_len, max_command_output_bytes, builtin_gateway.retry_count, builtin_gateway.defaultChatUrl());
     }
 
-    pub fn requestToolPermissionSyncWithAdvertised(self: *App, arena: Allocator, call: ToolCall, review_turn: permission_auto_classifier.ReviewTurnContext, permission_mode: PermissionMode, local_grants: []const PermissionGrant, live_authority: ?agent_runtime.LiveToolAuthority, revalidation: ?agent_runtime.LivePermissionRevalidation, advertised_dynamic_tool_names: []const []const u8) !command_admission.PermissionOutcome {
-        return self.requestToolPermissionSync(arena, call, review_turn, permission_mode, local_grants, live_authority, revalidation, advertised_dynamic_tool_names);
+    pub fn requestToolPermissionSyncWithAdvertised(self: *App, arena: Allocator, call: ToolCall, review_turn: permission_auto_classifier.ReviewTurnContext, permission_mode: PermissionMode, local_grants: []const PermissionGrant, live_authority: ?agent_runtime.LiveToolAuthority, revalidation: ?agent_runtime.LivePermissionRevalidation, advertised_dynamic_tool_names: []const []const u8, mcp_review_schema_json: ?[]const u8) !command_admission.PermissionOutcome {
+        return self.requestToolPermissionSync(arena, call, review_turn, permission_mode, local_grants, live_authority, revalidation, advertised_dynamic_tool_names, mcp_review_schema_json);
     }
 
     pub fn requestPreparedFileMutationPermissionSyncWithAdvertised(self: *App, arena: Allocator, call: ToolCall, prepared: *tool_admission.PreparedFileMutationCall, review_turn: permission_auto_classifier.ReviewTurnContext, permission_mode: PermissionMode, local_grants: []const PermissionGrant, live_authority: ?agent_runtime.LiveToolAuthority, advertised_dynamic_tool_names: []const []const u8) !command_admission.PermissionOutcome {
@@ -3233,17 +3214,15 @@ const App = struct {
         switch (try self.mcp.collectMenuCompletion(self.alloc)) {
             .none => {},
             .repaint => RenderAppRuntime.requestActiveSurfaceFrame(self, .footer),
-            .reload => |generation| {
-                self.beginMcpMenuReload(generation) catch |err| {
-                    try self.mcp.recordMenuEffectFailure(self.alloc, generation, err);
-                };
-                RenderAppRuntime.requestActiveSurfaceFrame(self, .footer);
-            },
         }
         SessionNamingAppRuntime.collectFacts(self);
         try app_commands.Handlers(App).collectMcpAuthenticationFacts(self);
         try app_commands.Handlers(App).collectMcpReloadFacts(self);
+        if (try self.mcp.refreshMenuHealth(self.alloc, @intCast(@max(io_mod.milliTimestamp(), 0)))) {
+            RenderAppRuntime.requestActiveSurfaceFrame(self, .footer);
+        }
         if (comptime host_profile.native_auth or host_profile.js_host_auth) {
+            try AuthAppRuntime.collectProviderPreparationFacts(self);
             try AuthAppRuntime.collectSourceInventoryFacts(self);
             try AuthAppRuntime.collectSignInFacts(self);
         }
@@ -4094,11 +4073,11 @@ test "interactive native tool selection controls advertisement and dispatch" {
 
     const selected = app.toolAdvertisementSet();
     try std.testing.expectEqual(@as(usize, 2), selected.order.len);
-    try std.testing.expectEqualStrings("terminal", selected.order[0]);
+    try std.testing.expectEqualStrings("shell", selected.order[0]);
     try std.testing.expectEqualStrings("read_file", selected.order[1]);
     try std.testing.expectEqualStrings(
         builtin_tools.terminalExecOnlySpec().description,
-        app.toolRegistry().lookup("terminal").?.description,
+        app.toolRegistry().lookup("shell").?.description,
     );
 }
 
@@ -4574,6 +4553,9 @@ test {
     _ = @import("core/agent/runtime/prompt_context.zig");
     _ = @import("core/app/app_agent_runtime.zig");
     _ = @import("core/app/app_auth_runtime.zig");
+    _ = auth_runtime;
+    _ = @import("core/auth/auth_transition.zig");
+    _ = @import("core/app/provider_picker_runtime.zig");
     _ = @import("core/workspace/context_contract.zig");
     _ = @import("core/workspace/workspace_access.zig");
     _ = @import("core/workspace/workspace_commands.zig");
@@ -4761,6 +4743,7 @@ test {
     _ = @import("ui/footer/surface_invalidation.zig");
     _ = @import("ui/full_transcript_screen.zig");
     _ = @import("ui/render_engine/frame_fixed_point.zig");
+    _ = @import("ui/render_engine/terminal_diff.zig");
     _ = @import("ui/transcript/runtime.zig");
     _ = @import("ui/transcript/runtime_tests.zig");
     _ = @import("core/agent/worker_runtime.zig");

@@ -167,6 +167,7 @@ pub fn permissionTargetForCall(
     }
 
     if (std.mem.eql(u8, call.name, "skill")) {
+        if (call.resolved_skill) |prepared| return arena.dupe(u8, prepared.skill.name);
         const args = try tool_args.parseToolArgsObject(arena, call.arguments_json);
         return arena.dupe(u8, try tool_args.requiredStringArg(args, "name"));
     }
