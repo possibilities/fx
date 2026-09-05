@@ -63,12 +63,18 @@ const timeout = (label, ms = 5000) => new Promise((_, reject) => {
 let agent;
 try {
   let fetchCalls = 0;
+  let catalogCalls = 0;
   let firstAbortResolve;
   const firstAbort = new Promise((resolveAbort) => { firstAbortResolve = resolveAbort; });
   agent = await createFxAgent({
     nativeAddon: addon,
     backend: "native",
     async fetch(input, init) {
+      if (init.method === "GET") {
+        catalogCalls += 1;
+        return Response.json({ object: "list", data: [{ id: "native/test-model", type: "language" }] });
+      }
+      assert.equal(init.method, "POST");
       fetchCalls += 1;
       const first = fetchCalls === 1;
       if (first) {
@@ -155,6 +161,7 @@ try {
     assert.equal(deltas, 1000);
   }
   assert.equal(requestCount, 23);
+  assert.equal(catalogCalls, 1, "the agent must reuse model metadata across prompts");
   assert.equal(await agent.close(), undefined);
   agent = null;
   console.log("native core stream passed: split terminal tail, matching abort, prompt reuse, and graceful close");
