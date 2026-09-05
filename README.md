@@ -101,6 +101,31 @@ fx session resume --id <id>
 
 Interactive terminal tabs show `fx v<version> | <folder>` using the running binary's version and current workspace folder name, for example `fx v0.0.7 | fx`. Renaming a session or switching models leaves the title unchanged. Resuming from another folder uses that folder's name. Exiting clears the fx-owned title. Noninteractive commands do not emit terminal-title controls.
 
+On the first submitted prompt, fx starts a small naming request alongside the
+main agent and installs the result as the session's native name without
+delaying the turn. The Codex route defaults to `gpt-5.4-mini` at low effort;
+other providers are skipped unless configured. Naming settings are profile
+settings in `~/.fx/settings.json` and are ignored in project `.fx.json` files:
+
+```json
+{
+  "session_naming": {
+    "codex": {
+      "model": "gpt-5.4-mini",
+      "effort": "low"
+    },
+    "timeout_ms": 60000
+  }
+}
+```
+
+Set `codex` to `null` to disable its compiled default. Configure `gateway` or
+`grok` with the same `model` and optional `effort` fields to opt those providers
+in. Before naming, fx removes a leading slash command and its `--flag` tokens,
+expands readable `@path` mentions up to 32 KiB each, and then limits the model
+input to 1600 bytes. Generated names are limited to 64 bytes. `/rename` always
+wins over an in-flight generated result.
+
 Run `/feedback` to open the feedback form at `fx.sh/feedback`. It does not create a diagnostic or change the clipboard.
 
 Run `/trace` to create a private Markdown diagnostic with logs, session context, runtime state, permissions, and recent activity. On macOS, fx copies the `.md` file to the clipboard; on other platforms, it saves the file and prints its path. Review and redact the trace before sharing it.

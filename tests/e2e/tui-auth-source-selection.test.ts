@@ -206,6 +206,12 @@ afterEach(async () => {
   stderrPath = null;
 });
 
+// The fork names each saved session with one best-effort title request on
+// the first prompt; provider-preparation counts look only at the user's turn.
+function isSessionTitleRequest(request: { body?: unknown }): boolean {
+  return String(request.body ?? "").includes("Generate a short session title");
+}
+
 function writeSeededChatGptLogin(
   testHome: string,
   accessToken = chatgptAccessToken(),
@@ -1247,9 +1253,10 @@ for (const provider of ["gateway", "codex", "grok"] as const) {
       unlinkSync(alias);
       await session.sendKeys("Enter");
       await session.waitForText(provider === "gateway" ? "GATEWAY_STORAGE_RECOVERED" : provider === "codex" ? "CHATGPT_DIRECT_RESPONSE" : "GROK_DIRECT_RESPONSE", TIMEOUT);
-      const requests = provider === "gateway" ? gateway.requests : provider === "codex"
+      const requests = (provider === "gateway" ? gateway.requests : provider === "codex"
         ? chatgptOauth.requests.filter((request) => request.path === "/chatgpt/responses")
-        : grok.requests.filter((request) => request.path === "/v1/responses");
+        : grok.requests.filter((request) => request.path === "/v1/responses")
+      ).filter((request) => !isSessionTitleRequest(request));
       expect(requests).toHaveLength(1);
       expect(JSON.stringify(requests[0]!.body)).toContain(prompt);
       if (provider === "gateway") {
@@ -2284,7 +2291,7 @@ tmuxTest(
     await session.sendText("Use the selected subscription for the first prompt.");
     await session.waitForText("CHATGPT_DIRECT_RESPONSE", 10_000);
     const responses = chatgptOauth.requests.filter(
-      (request) => request.path === "/chatgpt/responses",
+      (request) => request.path === "/chatgpt/responses" && !isSessionTitleRequest(request),
     );
     expect(responses).toHaveLength(1);
     expect(responses[0]!.authorization).toBe(`Bearer ${chatgptOauth.accessToken}`);
@@ -2363,8 +2370,12 @@ tmuxTest(
     await session.waitForText("Fast: on", TIMEOUT);
     await session.sendText("Use the Codex subscription directly.");
     await session.waitForText("CHATGPT_DIRECT_RESPONSE", TIMEOUT);
+    // Native session naming also posts to the direct Codex endpoint and can
+    // win the race, so skip its request and read the turn's.
     const directRequest = chatgptOauth.requests.find(
-      (request) => request.path === "/chatgpt/responses",
+      (request) =>
+        request.path === "/chatgpt/responses" &&
+        !request.body?.includes("Generate a short session title"),
     );
     expect(directRequest?.authorization).toBe(`Bearer ${chatgptOauth.accessToken}`);
     const directBody = JSON.parse(directRequest?.body ?? "{}") as {
@@ -7013,7 +7024,9 @@ for (const provider of ["codex", "grok"] as const) {
         expect(JSON.parse(readFileSync(settingsPath, "utf8")).provider).toBe("gateway");
         const direct = provider === "codex" ? chatgptOauth : grok;
         const responsePath = provider === "codex" ? "/chatgpt/responses" : "/v1/responses";
-        const responses = () => direct.requests.filter((request) => request.path === responsePath);
+        const responses = () => direct.requests.filter(
+          (request) => request.path === responsePath && !isSessionTitleRequest(request),
+        );
         if (outcome === "cancel") {
           await session.sendKeys("C-c");
           await session.waitForText("Provider preparation cancelled.", 1500);
@@ -7046,8 +7059,9 @@ for (const provider of ["codex", "grok"] as const) {
             expect(JSON.parse(readFileSync(settingsPath, "utf8")).provider).toBe("gateway");
             await session.sendKeys("Enter");
             await session.waitForText("PREPARATION_GATEWAY_RECOVERY", TIMEOUT);
-            expect(gateway.requests).toHaveLength(1);
-            expect(JSON.stringify(gateway.requests[0]!.body)).toContain("retained café 日本語");
+            const gatewayTurns = gateway.requests.filter((request) => !isSessionTitleRequest(request));
+            expect(gatewayTurns).toHaveLength(1);
+            expect(JSON.stringify(gatewayTurns[0]!.body)).toContain("retained café 日本語");
           }
         }
         const scrollback = await session.captureFullScrollbackEscapes();
@@ -7266,7 +7280,9 @@ tmuxTest("provider preparation resumes a held prompt after explicit provider ret
     await session.sendLiteral("codex");
     await session.sendKeys("Enter");
     await session.waitForText("CHATGPT_DIRECT_RESPONSE", 5000);
-    const requests = chatgptOauth.requests.filter((request) => request.path === "/chatgpt/responses");
+    const requests = chatgptOauth.requests.filter(
+      (request) => request.path === "/chatgpt/responses" && !isSessionTitleRequest(request),
+    );
     expect(requests).toHaveLength(1);
     expect(requests[0]!.body).toContain("Retain this prompt across the explicit provider retry.");
     expect(gateway.requests).toHaveLength(0);
@@ -7299,8 +7315,9 @@ tmuxTest("provider preparation completes existing-key recovery for a held prompt
   await session.sendKeys("Enter");
   await session.waitForText("KEY_RECOVERY_OK", 5000);
   expect(JSON.parse(readFileSync(join(home, ".fx", "settings.json"), "utf8")).provider).toBe("gateway");
-  expect(gateway.requests).toHaveLength(1);
-  expect(JSON.stringify(gateway.requests[0]!.body)).toContain("Use the Gateway after repair.");
+  const gatewayTurns = gateway.requests.filter((request) => !isSessionTitleRequest(request));
+  expect(gatewayTurns).toHaveLength(1);
+  expect(JSON.stringify(gatewayTurns[0]!.body)).toContain("Use the Gateway after repair.");
   expect(gateway.requests[0]!.headers.get("authorization")).toBe(`Bearer ${ENV_TOKEN}`);
   expect(readFileSync(stderrPath, "utf8")).toBe("");
 }, TIMEOUT);

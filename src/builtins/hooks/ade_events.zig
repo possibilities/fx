@@ -23,6 +23,7 @@ const max_record_bytes: usize = 2 * 1024 * 1024;
 const Event = enum {
     fx_started,
     session_changed,
+    session_metadata_changed,
     prompt_queued,
     turn_started,
     pre_tool_use,
@@ -36,6 +37,7 @@ const Event = enum {
         return switch (self) {
             .fx_started => "FxStarted",
             .session_changed => "SessionChanged",
+            .session_metadata_changed => "SessionMetadataChanged",
             .prompt_queued => "PromptQueued",
             .turn_started => "TurnStarted",
             .pre_tool_use => "PreToolUse",
@@ -67,6 +69,7 @@ const Payload = union(Event) {
         previous_session_id: ?[]const u8,
         session_id: ?[]const u8,
     },
+    session_metadata_changed: struct { title: []const u8 },
     prompt_queued,
     turn_started,
     pre_tool_use: struct {
@@ -105,6 +108,7 @@ pub const Client = struct {
     instance_id: []u8 = &.{},
     workspace_root: []u8 = &.{},
     main_session_id: ?[]u8 = null,
+    last_metadata_title: ?[]u8 = null,
     next_sequence: u64 = 1,
     queue: [max_queued_records]?QueuedRecord = @splat(null),
     queue_head: usize = 0,
@@ -226,6 +230,22 @@ pub const Client = struct {
         self.emitLocked(.prompt_queued, self.mainContext(null));
     }
 
+    pub fn reportSessionMetadataChanged(self: *Client, title: []const u8) void {
+        if (!self.enabled or title.len == 0) return;
+        const io = io_mod.getIo();
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        if (self.main_session_id == null) return;
+        if (self.last_metadata_title) |previous| {
+            if (std.mem.eql(u8, previous, title)) return;
+        }
+        const alloc = self.alloc orelse return;
+        const owned_title = alloc.dupe(u8, title) catch return;
+        if (self.last_metadata_title) |previous| alloc.free(previous);
+        self.last_metadata_title = owned_title;
+        self.emitLocked(.{ .session_metadata_changed = .{ .title = owned_title } }, self.mainContext(null));
+    }
+
     pub fn reportTurnStarted(self: *Client, invocation: hooks.Invocation) void {
         self.reportInvocation(.turn_started, invocation);
     }
@@ -309,6 +329,8 @@ pub const Client = struct {
         const previous_session_id = self.main_session_id;
         self.main_session_id = next_session_id;
         const snapshot = self.stateFor(.main, self.main_session_id, null);
+        if (self.last_metadata_title) |title| alloc.free(title);
+        self.last_metadata_title = null;
         self.emitLocked(.{ .session_changed = .{
             .previous_session_id = previous_session_id,
             .session_id = self.main_session_id,
@@ -430,6 +452,7 @@ pub const Client = struct {
         if (self.instance_id.len > 0) alloc.free(self.instance_id);
         if (self.workspace_root.len > 0) alloc.free(self.workspace_root);
         if (self.main_session_id) |session_id| alloc.free(session_id);
+        if (self.last_metadata_title) |title| alloc.free(title);
     }
 
     fn senderMain(self: *Client) void {
@@ -499,6 +522,7 @@ fn recordUpperBound(
             if (value.previous_session_id) |session_id| total +|= escapedUpperBound(session_id);
             if (value.session_id) |session_id| total +|= escapedUpperBound(session_id);
         },
+        .session_metadata_changed => |value| total +|= escapedUpperBound(value.title),
         .pre_tool_use => |value| {
             total +|= escapedUpperBound(value.call_id);
             total +|= escapedUpperBound(value.tool_name);
@@ -731,6 +755,11 @@ fn writePayload(
             try writeOptionalString(writer, value.session_id);
             try writer.writeAll("}");
         },
+        .session_metadata_changed => |value| {
+            try writer.writeAll("{\"title\":");
+            try jsonrpc.writeJsonStr(value.title, writer);
+            try writer.writeAll("}");
+        },
         .pre_tool_use => |value| {
             try writer.writeAll("{\"step_index\":");
             try writer.print("{d}", .{value.step_index});
@@ -900,6 +929,34 @@ test "ADE feed serializes attention resolution with a working snapshot" {
     try std.testing.expectEqualStrings("route_recovery", payload.get("kind").?.string);
 }
 
+test "ADE feed serializes native session metadata as a generic raw event" {
+    var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+    try writeRecord(std.testing.allocator, &output.writer, 8, "instance-3", .{ .session_metadata_changed = .{
+        .title = "Prompt submit session naming",
+    } }, .{
+        .agent_role = .main,
+        .workspace_root = "/tmp/workspace",
+        .session_id = "main-session",
+    });
+
+    var parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        std.testing.allocator,
+        output.written(),
+        .{},
+    );
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings(
+        "SessionMetadataChanged",
+        parsed.value.object.get("event").?.string,
+    );
+    try std.testing.expectEqualStrings(
+        "Prompt submit session naming",
+        parsed.value.object.get("payload").?.object.get("title").?.string,
+    );
+}
+
 test "ADE feed keeps child and parent identities on subagent tool events" {
     var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer output.deinit();
@@ -1009,6 +1066,44 @@ test "ADE session changes publish eagerly before child lifecycle context" {
             const context = parsed.value.object.get("context").?.object;
             try std.testing.expectEqualStrings("working", context.get("agent_state").?.string);
         }
+    }
+}
+
+test "ADE session metadata deduplicates per active session and resets on identity change" {
+    const alloc = std.testing.allocator;
+    var client = Client{
+        .enabled = true,
+        .alloc = alloc,
+        .socket_path = try alloc.dupe(u8, "/tmp/unused-ade.sock"),
+        .instance_id = try alloc.dupe(u8, "instance-4"),
+        .workspace_root = try alloc.dupe(u8, "/tmp/workspace"),
+        .main_session_id = try alloc.dupe(u8, "first-session"),
+    };
+    defer client.deinit();
+
+    client.reportSessionMetadataChanged("Native title");
+    client.reportSessionMetadataChanged("Native title");
+    client.reportSessionChanged("second-session");
+    client.reportSessionMetadataChanged("Native title");
+
+    try std.testing.expectEqual(@as(usize, 3), client.queue_len);
+    const expected_events = [_][]const u8{
+        "SessionMetadataChanged",
+        "SessionChanged",
+        "SessionMetadataChanged",
+    };
+    for (expected_events, 0..) |expected, index| {
+        var parsed = try std.json.parseFromSlice(
+            std.json.Value,
+            alloc,
+            client.queue[index].?.bytes,
+            .{},
+        );
+        defer parsed.deinit();
+        try std.testing.expectEqualStrings(
+            expected,
+            parsed.value.object.get("event").?.string,
+        );
     }
 }
 
