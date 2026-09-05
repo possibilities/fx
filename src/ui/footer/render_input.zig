@@ -577,7 +577,7 @@ pub fn steeringBannerRowsForMessages(
     waits_for_tool: bool,
     width: u16,
 ) u16 {
-    if (messages.len == 0) return 0;
+    if (messages.len == 0 or !waits_for_tool) return 0;
     var rows: u16 = 0;
     for (messages) |message| {
         rows +|= steering_message_layout(message, width, waits_for_tool, max_steering_message_rows).row_count;
@@ -595,14 +595,14 @@ pub fn steeringBannerRows(ctx: RenderContext, width: u16) u16 {
 
 test "steering banner reserves message rows and one composer gap" {
     for ([_]bool{ false, true }) |waiting| {
-        try std.testing.expectEqual(@as(u16, 3), steeringBannerRowsForMessages(&.{"first\nsecond\nthird"}, waiting, 80));
+        try std.testing.expectEqual(@as(u16, if (waiting) 3 else 0), steeringBannerRowsForMessages(&.{"first\nsecond\nthird"}, waiting, 80));
     }
     try std.testing.expectEqual(
         @as(u16, 0),
         steeringBannerRowsForMessages(&.{}, true, 80),
     );
     try std.testing.expectEqual(
-        @as(u16, 3),
+        @as(u16, 0),
         steeringBannerRowsForMessages(&.{ "first", "second" }, false, 80),
     );
     try std.testing.expectEqual(
