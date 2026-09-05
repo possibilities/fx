@@ -108,27 +108,26 @@ try {
   await capture(undefined, "NO_INSTRUCTIONS_REQUEST");
   await capture("HOST_INSTRUCTIONS_ONLY", "HOST_INSTRUCTIONS_REQUEST");
 
-  assert.deepEqual(requestMethods, ["POST", "POST"], "libfx prompts must not fetch model metadata through the host before sending");
-  assert.equal(nativeCatalogRequests, 0, "native libfx prompts must not fetch model metadata before sending");
+  assert.deepEqual(requestMethods, ["GET", "POST", "GET", "POST"], "each agent must resolve model metadata through host fetch before sending");
+  assert.equal(nativeCatalogRequests, 0, "model metadata must not bypass host fetch through native HTTP");
   assert.equal(requestBodies.length, 2);
   const transportStarts = sdkEvents.filter((event) => event.type === "transport.start");
   const transportResponses = sdkEvents.filter((event) => event.type === "transport.response");
-  assert.equal(transportStarts.length, 2, "each prompt must expose transport start timing");
-  assert.equal(transportResponses.length, 2, "each prompt must expose transport response timing");
+  assert.deepEqual(transportStarts.map((event) => [event.method, event.attempt]), [["GET", 1], ["POST", 2], ["GET", 1], ["POST", 2]]);
+  assert.deepEqual(transportResponses.map((event) => event.attempt), [1, 2, 1, 2]);
   for (const event of transportStarts) {
-    assert.equal(event.attempt, 1);
-    assert.equal(event.method, "POST");
-    assert.equal(event.endpoint, "https://ai-gateway.vercel.sh/v3/ai/language-model");
+    assert.equal(event.endpoint, event.method === "GET"
+      ? "https://ai-gateway.vercel.sh/coding-agent/v1/models"
+      : "https://ai-gateway.vercel.sh/v3/ai/language-model");
     assert.equal(event.model, "request-context/model");
   }
   for (const event of transportResponses) {
-    assert.equal(event.attempt, 1);
     assert.equal(event.status, 200);
     assert.ok(event.elapsedMs >= 0);
-    assert.equal(event.requestId, "iad1::request-context");
-    assert.equal(event.generationId, "generation-context");
+    assert.equal(event.requestId, event.attempt === 1 ? null : "iad1::request-context");
+    assert.equal(event.generationId, event.attempt === 1 ? null : "generation-context");
     assert.equal(event.model, "request-context/model");
-    assert.equal(event.provider, "fixture-provider");
+    assert.equal(event.provider, event.attempt === 1 ? null : "fixture-provider");
   }
   assert.doesNotMatch(JSON.stringify(sdkEvents), /request-context-key/, "transport diagnostics must not expose credentials");
   for (const headers of requestHeaders) {
