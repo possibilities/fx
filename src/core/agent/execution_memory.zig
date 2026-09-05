@@ -31,7 +31,13 @@ pub fn makePersistedToolResult(
     else
         null else null;
     errdefer if (command_output_replay) |replay| types.freeCommandOutputReplay(alloc, replay);
+    const tool_image_handle = if (memory) |info| if (info.tool_image_handle) |handle| try alloc.dupe(u8, handle) else null else null;
+    errdefer if (tool_image_handle) |handle| alloc.free(handle);
+    const tool_images = if (memory) |info| if (tool_image_handle == null) try types.dupeToolImages(alloc, info.tool_images) else try alloc.alloc(types.ToolImage, 0) else try alloc.alloc(types.ToolImage, 0);
+    errdefer types.freeToolImages(alloc, tool_images);
     var result: types.PersistedToolResult = .{
+        .tool_images = tool_images,
+        .tool_image_handle = tool_image_handle,
         .tool_call_id = tool_call_id,
         .tool_name = tool_name,
         .status = status,
@@ -465,6 +471,8 @@ pub fn freeTransientPersistedToolResult(
     alloc.free(result.tool_call_id);
     alloc.free(result.tool_name);
     alloc.free(result.output);
+    types.freeToolImages(alloc, result.tool_images);
+    if (result.tool_image_handle) |handle| alloc.free(handle);
     if (result.output_handle) |handle| alloc.free(handle);
     if (result.preview) |preview| alloc.free(preview);
     types.freePermissionFeedback(alloc, result.permission_feedback);
@@ -677,8 +685,7 @@ fn makeFileEvidence(
     errdefer alloc.free(tool_name);
     const model_view_covers_full_file = if (memory) |info|
         (info.model_view_covers_full_file orelse false) and
-            !info.truncated and
-            info.output_handle == null
+            !info.truncated
     else
         false;
     return .{

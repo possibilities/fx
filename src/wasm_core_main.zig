@@ -69,7 +69,7 @@ const js_host_provider_set = provider_set.gateway_only(.{
     .fallback_model_capabilities_fn = vercel_model_policy.capabilitiesForModel,
     .agent_stream = js_host_stream_provider.provider(),
     .cli_model_catalog = .{ .fetch_fn = fetchCliModelCatalog },
-    .model_catalog = null,
+    .model_catalog = js_host_model_catalog.provider,
     .credits = .{ .fetch_fn = fetchCredits },
 });
 
