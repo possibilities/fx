@@ -476,7 +476,7 @@ With --prompt-permissions, JSON and quiet requests may prompt on stderr only whe
         expect(result.code).toBe(1);
         expect(result.stdout).toBe("");
         expect(result.stderr).toBe(
-          "usage: fx acp [--model <id>] [--log-file <path>]\n",
+          "usage: fx acp [--model <id>] [--log-file <path>] [--no-acp-mcp]\n",
         );
       }
     },
