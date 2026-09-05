@@ -50,10 +50,11 @@ pub fn buildRequest(
 ) ![]u8 {
     try request.validatePrompt();
     try validateModel(request.model);
-    if (request.budget) |budget| {
-        if (budget.cancel_flag) |flag| if (flag.load(.seq_cst)) return error.Cancelled;
-        _ = budget.deadline;
-    }
+    const budget: image_attachments.CaptureBudget = if (request.budget) |value|
+        .{ .deadline = value.deadline, .cancel_flag = value.cancel_flag }
+    else
+        .{};
+    try budget.check();
 
     var instructions: std.Io.Writer.Allocating = .init(alloc);
     defer instructions.deinit();
@@ -73,7 +74,7 @@ pub fn buildRequest(
     try writer.writeAll(",\"store\":false,\"stream\":true,\"instructions\":");
     try std.json.Stringify.value(instructions.written(), .{}, writer);
     try writer.writeAll(",\"input\":[");
-    try writeResponsesInput(writer, alloc, request.messages, request.verified_images);
+    try writeResponsesInput(writer, std.heap.c_allocator, request.messages, request.verified_images, budget);
     try writer.writeByte(']');
 
     _ = try responses_protocol.writeTools(writer, alloc, request.tools);
@@ -122,13 +123,14 @@ fn writeResponsesInput(
     alloc: Allocator,
     messages: []const types.ChatMessage,
     images: ?[]const image_attachments.VerifiedSnapshot,
+    budget: image_attachments.CaptureBudget,
 ) !void {
     return responses_protocol.writeInput(writer, alloc, messages, images, .{
         .tool_calls = max_tool_calls,
         .tool_identity_bytes = max_tool_identity_bytes,
         .tool_arguments_bytes = max_tool_arguments_bytes,
         .provider_state_bytes = max_provider_state_bytes,
-    }) catch |err| switch (err) {
+    }, budget) catch |err| switch (err) {
         error.ProviderStateTooLarge => error.OpenAICodexProviderStateTooLarge,
         error.InvalidProviderState => error.InvalidOpenAICodexProviderState,
         error.ToolCallLimitExceeded => error.OpenAICodexToolCallLimitExceeded,

@@ -405,12 +405,22 @@ function taggedBlock(body: string, tag: string): string {
 
 function advertisedSkillLocations(body: string, name: string): string[] {
   const block = taggedBlock(body, "available_skills");
-  const locations: string[] = [];
-  const entryPattern = /<skill>\s*<name>([^<]*)<\/name>[\s\S]*?<location>([^<]*)<\/location>\s*<\/skill>/g;
-  for (const match of block.matchAll(entryPattern)) {
-    if (match[1] === name) locations.push(match[2]!);
-  }
-  return locations;
+  return block.split("\n")
+    .filter((line) => line.startsWith(`- ${name}: `))
+    .map((line) => {
+      const start = line.lastIndexOf(" (location: ");
+      if (start < 0 || !line.endsWith(")")) throw new Error("Malformed skill location");
+      return line.slice(start + " (location: ".length, -1);
+    });
+}
+
+function advertisedSkillPath(body: string, location: string): string {
+  const match = /^skill:[0-9a-f]{16}:(\d+)\/(.+)$/.exec(location);
+  if (!match) throw new Error(`Invalid scoped skill location: ${location}`);
+  const prefix = `Root ${match[1]}: `;
+  const root = taggedBlock(body, "available_skills").split("\n").find((line) => line.startsWith(prefix));
+  if (!root) throw new Error(`Missing root for ${location}`);
+  return join(root.slice(prefix.length), decodeURIComponent(match[2]!));
 }
 
 function toolResultOutput(body: string, callId: string): string {
@@ -457,7 +467,7 @@ function occurrenceCount(text: string, needle: string): number {
 
 function writeMcpFixture(
   root: FixtureRoot,
-  options: { required?: boolean; toolCount?: number; toolDescription?: string } = {},
+  options: { required?: boolean; toolCount?: number; toolDescription?: string; initializeDelayMs?: number } = {},
 ) {
   const toolCount = options.toolCount ?? 1;
   const toolDescription = JSON.stringify(
@@ -488,7 +498,7 @@ function handle(message) {
     return;
   }
   if (message.method === "initialize") {
-    send({
+    const response = {
       jsonrpc: "2.0",
       id: message.id,
       result: {
@@ -497,7 +507,9 @@ function handle(message) {
         serverInfo: { name: "fixture", version: "1.0.0" },
         instructions: "SECRET_SERVER_INSTRUCTION_SENTINEL",
       },
-    });
+    };
+    if (${options.initializeDelayMs ?? 0} > 0) setTimeout(() => send(response), ${options.initializeDelayMs ?? 0});
+    else send(response);
     return;
   }
   if (message.method === "tools/list") {
@@ -529,6 +541,10 @@ function handle(message) {
   }
   if (message.method === "tools/call") {
     appendFileSync(callLogPath, JSON.stringify(message) + "\\n");
+    if (typeof message.params?.arguments?.text !== "string") {
+      send({ jsonrpc: "2.0", id: message.id, result: { isError: true, content: [{ type: "text", text: "server requires string text" }] } });
+      return;
+    }
     send({
       jsonrpc: "2.0",
       id: message.id,
@@ -631,6 +647,144 @@ async function waitForMcpServerReady(
 }
 
 describe("gateway stream lifecycle", () => {
+  test("skill context keeps complete scoped resources visible through saved tool results", async () => {
+    const root = createFixtureRoot("complete-skill-resources");
+    writeLargeSkillCatalog(root.workspace, 48);
+    const malformed = join(root.workspace, ".agents", "skills", "invalid-neighbor");
+    mkdirSync(malformed, { recursive: true });
+    writeFileSync(join(malformed, "SKILL.md"), "---\ndescription: missing name\n---\nINVALID_NEIGHBOR_BODY\n");
+    const directory = join(root.workspace, ".agents", "skills", "z-complete&workflow");
+    mkdirSync(join(directory, "references"), { recursive: true });
+    writeFileSync(join(directory, "SKILL.md"),
+      "---\nname: complete-workflow\ndescription: Complete resource workflow\n---\n" +
+      "Required main instructions.\n".repeat(1100) + "MAIN_RESOURCE_TAIL\n");
+    writeFileSync(join(directory, "references", "rules.txt"),
+      "Required reference instructions.\n".repeat(900) + "REFERENCE_RESOURCE_TAIL\n");
+    const tracePath = join(root.root, "trace.log");
+    let location = "";
+    let index = 0;
+    const gateway = startDynamicFakeGateway((body) => {
+      switch (index++) {
+        case 0: {
+          const locations = advertisedSkillLocations(body, "complete-workflow");
+          expect(locations).toHaveLength(1);
+          location = locations[0]!;
+          expect(advertisedSkillPath(body, location)).toBe(directory);
+          return fakeGatewayToolCall("whole_main", "skill", { location });
+        }
+        case 1:
+          expect(toolResultOutput(body, "whole_main")).toContain("MAIN_RESOURCE_TAIL");
+          expect(toolResultOutput(body, "whole_main")).toContain('complete="true"');
+          expect(toolResultOutput(body, "whole_main")).toContain("skill_discovery_warning");
+          return fakeGatewaySse([
+            { type: "tool-call", toolCallId: "whole_reference", toolName: "skill", input: { location, resource: "references/rules.txt" } },
+            { type: "tool-call", toolCallId: "ordinary_glob", toolName: "glob_files", input: { pattern: "*.txt" } },
+            { type: "tool-call", toolCallId: "stale_skill", toolName: "skill", input: { location: "skill:0000000000000000:0/missing" } },
+            { type: "finish", finishReason: { unified: "tool-calls", raw: "tool_use" } },
+          ]);
+        case 2:
+          expect(toolResultOutput(body, "whole_reference")).toContain("REFERENCE_RESOURCE_TAIL");
+          expect(toolResultOutput(body, "whole_reference")).toContain("skill_discovery_warning");
+          expect(promptText(body)).not.toContain("INVALID_NEIGHBOR_BODY");
+          expect(toolResultOutput(body, "whole_reference")).not.toContain("Read full output");
+          expect(toolResultOutput(body, "stale_skill")).toContain("StaleSkillLocation");
+          return fakeGatewayFinalText("Complete resources received.");
+        case 3:
+          expect(toolResultOutput(body, "whole_main")).toContain("MAIN_RESOURCE_TAIL");
+          expect(toolResultOutput(body, "whole_reference")).toContain("REFERENCE_RESOURCE_TAIL");
+          return fakeGatewayFinalText("Complete resources restored.");
+        case 4:
+          expect(toolResultOutput(body, "whole_main")).toContain("unavailable");
+          expect(toolResultOutput(body, "whole_main")).not.toContain('complete="true"');
+          expect(toolResultOutput(body, "whole_reference")).toContain("REFERENCE_RESOURCE_TAIL");
+          return fakeGatewayFinalText("Missing saved resource reported.");
+        default:
+          return new Response("unexpected request", { status: 500 });
+      }
+    }, { models: [{ id: MODEL, type: "language", tags: ["tool-use"], context_window: 100_000 }] });
+    try {
+      const result = await runFx(["ask", "--auto", "--json", "Inspect the complete resource workflow." + " Keep existing behavior unchanged.".repeat(24)], {
+        cwd: root.workspace, env: fixtureEnv(root, gateway, tracePath), timeoutMs: 30_000,
+      });
+      if (result.code !== 0) throw new Error(`Skill resource flow failed: ${result.stderr}\n${result.stdout}`);
+      expect(result.code).toBe(0);
+      const output = parseAskJson(result.stdout);
+      expect(output.exit_code).toBe(0);
+      expect(output.session_id).not.toBe("");
+      expect(output.tool_calls).toHaveLength(4);
+      expect(output.tool_calls[0]).toEqual({ name: "skill", status: "success" });
+      expect(output.tool_calls.slice(1)).toEqual(expect.arrayContaining([
+        { name: "skill", status: "success" },
+        { name: "glob_files", status: "success" },
+        { name: "skill", status: "error" },
+      ]));
+      expect(gateway.requestCount()).toBe(3);
+      expect(result.stderr).not.toContain("panic");
+      const resume = () => runFx(["ask", "--auto", "--json", "--resume-id", output.session_id, "Continue with the saved context."], {
+        cwd: root.workspace, env: fixtureEnv(root, gateway, tracePath), timeoutMs: 30_000,
+      });
+      const restored = await resume();
+      expect(restored.code).toBe(0);
+      expect(parseAskJson(restored.stdout).tool_calls).toEqual([]);
+      expect(gateway.requestCount()).toBe(4);
+      const resultDirectory = join(root.home, ".fx", "sessions", output.session_id, "tool-results");
+      const mainArtifacts = readdirSync(resultDirectory).filter((name) =>
+        readFileSync(join(resultDirectory, name), "utf8").includes("MAIN_RESOURCE_TAIL"));
+      expect(mainArtifacts).toHaveLength(1);
+      rmSync(join(resultDirectory, mainArtifacts[0]!));
+      const missing = await resume();
+      expect(missing.code).toBe(0);
+      expect(parseAskJson(missing.stdout).tool_calls).toEqual([]);
+      expect(gateway.requestCount()).toBe(5);
+    } finally {
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  }, 45_000);
+
+  test.skipIf(!tmuxAvailable())("explicit skill context survives cancellation and a fresh turn", async () => {
+    const root = createFixtureRoot("skill-cancel-recover");
+    const directory = join(root.workspace, ".agents", "skills", "cancel-workflow");
+    mkdirSync(directory, { recursive: true });
+    writeFileSync(join(directory, "SKILL.md"), "---\nname: cancel-workflow\ndescription: Cancellation fixture\n---\n" + "Required instructions.\n".repeat(1200) + "CANCEL_SKILL_TAIL\n");
+    const held = heldFakeGatewayFinalText();
+    let requestCount = 0;
+    const gateway = startDynamicFakeGateway((body) => {
+      expect(promptText(body)).toContain("CANCEL_SKILL_TAIL");
+      return requestCount++ === 0 ? held.response : fakeGatewayFinalText("SKILL_RECOVERY_COMPLETE");
+    });
+    const stderrPath = join(root.root, "stderr.log");
+    let tui: TmuxSession | null = null;
+    try {
+      tui = await TmuxSession.create({ cwd: root.workspace, env: fixtureEnv(root, gateway, join(root.root, "trace.log")), stderrPath });
+      await tui.waitForComposer(15_000);
+      await tui.sendText("Please use $cancel-workflow for this task.");
+      const deadline = Date.now() + 10_000;
+      while (requestCount === 0 && Date.now() < deadline) await Bun.sleep(25);
+      expect(requestCount).toBe(1);
+      await tui.sendKeys("C-c");
+      await tui.waitForComposer(10_000);
+      await tui.sendText("Please use $cancel-workflow again after cancellation.");
+      await tui.waitForPane((pane) => pane.includes("SKILL_RECOVERY_COMPLETE") && hasEmptyComposer(pane), 15_000);
+      expect(gateway.requests).toHaveLength(2);
+      const first = advertisedSkillLocations(gateway.requests[0]!.body, "cancel-workflow")[0]!;
+      const second = advertisedSkillLocations(gateway.requests[1]!.body, "cancel-workflow")[0]!;
+      expect(first).not.toBe(second);
+      expect(advertisedSkillPath(gateway.requests[0]!.body, first)).toBe(directory);
+      expect(advertisedSkillPath(gateway.requests[1]!.body, second)).toBe(directory);
+      expect(await tui.captureFullScrollback()).toContain("SKILL_RECOVERY_COMPLETE");
+      await tui.sendText("/quit");
+      expect(await tui.waitForSessionEnd(10_000)).toBe(true);
+      tui = null;
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+    } finally {
+      if (tui) await tui.kill();
+      held.dispose();
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  }, 45_000);
+
   test("bounded conditional guidance oracle distinguishes capabilities from ordinary prose", () => {
     const fixture = (
       systemText: string,
@@ -923,6 +1077,8 @@ describe("gateway stream lifecycle", () => {
         expect(gateway.requests).toHaveLength(2);
         for (const request of gateway.requests) {
           expectPermissionModeContext(request.body, mode);
+          expect(JSON.parse(request.body).providerOptions.gateway.caching).toBe("auto");
+          expect(request.body).not.toContain("cacheControl");
           const captured = parseGatewayRequest(request.body);
           expect(findUnavailableCapabilityReferences(captured)).toEqual([]);
           expect(customProviderGuidanceState(captured).guidanceMessageIndices).toEqual([1]);
@@ -944,7 +1100,7 @@ describe("gateway stream lifecycle", () => {
     }
   }, 60_000);
 
-  test("source context limits reach ask with workspace precedence, explicit skill chunks, and CLI off", async () => {
+  test("source context limits reach ask with workspace precedence, complete skill blocking, and CLI off", async () => {
     const root = createFixtureRoot("source-context-limits-ask");
     writeContextLimitFixture(root);
     const tracePath = join(root.root, "trace.log");
@@ -977,7 +1133,7 @@ describe("gateway stream lifecycle", () => {
       expect(limitedJson.output).toContain("CONTEXT_LIMIT_ASK_COMPLETE");
       expect(limited.stderr).toContain("project instruction file");
       expect(limited.stderr).toContain("skill description");
-      expect(limited.stderr).toContain("skill resource");
+      expect(limited.stderr).toContain('name="skill_chunk_bytes" action="blocked"');
       expect(limited.stderr).toContain("source=workspace settings");
       expect(gateway.requestCount()).toBe(1);
       const limitedPrompt = promptText(gateway.requests[0]!.body);
@@ -990,10 +1146,8 @@ describe("gateway stream lifecycle", () => {
       expect(limitedPrompt).toContain("PROJECT_FIRST_LINE");
       expect(limitedPrompt).not.toContain("PROJECT_TAIL_SENTINEL");
       expect(limitedPrompt).toContain("project_instruction_file_bytes");
-      expect(limitedPrompt).toContain(
-        "<skill_content name=\"oversized-context\" resource=\"SKILL.md\" offset=\"0\"",
-      );
-      expect(limitedPrompt).toContain("SKILL_FIRST_LINE");
+      expect(limitedPrompt).not.toContain("<skill_content");
+      expect(limitedPrompt).not.toContain("SKILL_FIRST_LINE");
       expect(limitedPrompt).not.toContain("SKILL_TAIL_SENTINEL");
       expect(limitedPrompt).toContain("skill_chunk_bytes");
 
@@ -1125,11 +1279,11 @@ describe("gateway stream lifecycle", () => {
       );
       expect(prompt).toContain("LINKED_SKILL_SENTINEL");
       expect(prompt).toContain(
-        '<skill_content name="linked-skill" resource="SKILL.md"',
+        '<skill_content name="linked-skill"',
       );
-      expect(prompt).toContain(
-        `<location>${join(root.workspace, ".codex", "skills", "linked-skill")}</location>`,
-      );
+      expect(advertisedSkillLocations(gateway.requests[0]!.body, "linked-skill").map(
+        (location) => advertisedSkillPath(gateway.requests[0]!.body, location),
+      )).toEqual([join(skillsRoot, "linked-skill")]);
       expect(prompt).not.toContain("symlinked rule file");
       expect(result.stderr).not.toContain("symlinked rule file");
     } finally {
@@ -1191,9 +1345,9 @@ describe("gateway stream lifecycle", () => {
         }
         const compactScrollback = await tui.captureFullScrollback();
         expect(compact).not.toContain("project instruction file");
-        expect(compact).not.toContain("skill catalog omitted");
+        expect(compact).not.toContain("skill catalog shortened");
         expect(compactScrollback).not.toContain("project instruction file");
-        expect(compactScrollback).not.toContain("skill catalog omitted");
+        expect(compactScrollback).not.toContain("skill catalog shortened");
         expect(gateway.requestCount()).toBe(1);
         expect(promptText(gateway.requests[0]!.body)).toContain(
           "project_instruction_file_bytes",
@@ -1203,11 +1357,11 @@ describe("gateway stream lifecycle", () => {
         const full = await tui.waitForPane(
           (text) =>
             text.includes("project instruction file") &&
-            text.includes("skill catalog omitted"),
+            text.includes("skill catalog shortened"),
           15_000,
         );
         expect(full.indexOf("project instruction file")).toBeLessThan(
-          full.indexOf("skill catalog omitted"),
+          full.indexOf("skill catalog shortened"),
         );
         expect(full).toContain("● Context:");
         expect(full).not.toContain("[context]");
@@ -1222,11 +1376,11 @@ describe("gateway stream lifecycle", () => {
           (text) =>
             text.includes("CONTEXT_LIMIT_FIRST_COMPLETE") &&
             !text.includes("project instruction file") &&
-            !text.includes("skill catalog omitted"),
+            !text.includes("skill catalog shortened"),
           15_000,
         );
         expect(restored).not.toContain("project instruction file");
-        expect(restored).not.toContain("skill catalog omitted");
+        expect(restored).not.toContain("skill catalog shortened");
 
         await tui.sendText("verify the bounded project context again");
         await tui.waitForText("CONTEXT_LIMIT_SECOND_COMPLETE", 30_000);
@@ -1236,17 +1390,17 @@ describe("gateway stream lifecycle", () => {
         const resizedCompact = await tui.capturePane();
         expect(resizedCompact).toContain("CONTEXT_LIMIT_SECOND_COMPLETE");
         expect(resizedCompact).not.toContain("project instruction file");
-        expect(resizedCompact).not.toContain("skill catalog omitted");
+        expect(resizedCompact).not.toContain("skill catalog shortened");
 
         await tui.sendKeys("C-o");
         const finalFull = await tui.waitForPane(
           (text) =>
             text.includes("project instruction file") &&
-            text.includes("skill catalog omitted"),
+            text.includes("skill catalog shortened"),
           15_000,
         );
         expect(finalFull.split("project instruction file").length - 1).toBe(1);
-        expect(finalFull.split("skill catalog omitted").length - 1).toBe(1);
+        expect(finalFull.split("skill catalog shortened").length - 1).toBe(1);
         await tui.sendKeys("C-o");
 
         expect(readFileSync(stderrPath, "utf8")).toBe("");
@@ -1269,7 +1423,7 @@ describe("gateway stream lifecycle", () => {
         const replay = replayFrames.stdout.toString();
         expect(replay).toContain("CONTEXT_LIMIT_FIRST_COMPLETE");
         expect(replay).toContain("CONTEXT_LIMIT_SECOND_COMPLETE");
-        expect(replay).toContain("skill catalog omitted");
+        expect(replay).toContain("skill catalog shortened");
       } finally {
         if (tui) await tui.kill();
         gateway.stop();
@@ -1663,7 +1817,9 @@ describe("gateway stream lifecycle", () => {
     gateway = startGateway(() => {
       switch (responseIndex++) {
         case 0: {
-          const locations = advertisedSkillLocations(gateway.requests[0]!.body, skillName);
+          const locations = advertisedSkillLocations(gateway.requests[0]!.body, skillName).map(
+            (location) => advertisedSkillPath(gateway.requests[0]!.body, location),
+          );
           if (locations.length !== 2) {
             throw new Error(`Expected two advertised ${skillName} locations, got ${JSON.stringify(locations)}`);
           }
@@ -1735,9 +1891,9 @@ describe("gateway stream lifecycle", () => {
       );
       expect(skillSchema).toBeDefined();
       expect(skillSchema?.inputSchema.type).toBe("object");
-      expect(skillSchema?.inputSchema.properties.name.type).toBe("string");
+      expect(skillSchema?.inputSchema.properties.name).toBeUndefined();
       expect(skillSchema?.inputSchema.properties.location.type).toBe("string");
-      expect(skillSchema?.inputSchema.required).toEqual(["name"]);
+      expect(skillSchema?.inputSchema.required).toEqual(["location"]);
       expect(capabilitySearchSchema).toBeDefined();
       expect(capabilitySearchSchema?.inputSchema.required).toEqual(["query"]);
       expect((capabilitySearchSchema?.inputSchema.properties.query as {
@@ -1752,10 +1908,9 @@ describe("gateway stream lifecycle", () => {
       expect(promptText(gateway.requests[0]!.body)).toContain(
         '<skill_discovery_warning skipped_candidate_count="1" incomplete_root_count="0" missing_from_incomplete_roots="0" />',
       );
-      expect(available).toContain(advertisedA);
-      expect(available).toContain(advertisedB);
-      expect(available).toContain("<description>workspace exact duplicate&#x0a;</description>");
-      expect(available).toContain("<description>managed exact&#x0a;duplicate&#x0a;</description>");
+      expect(advertisedSkillLocations(gateway.requests[0]!.body, skillName)).toHaveLength(2);
+      expect(available).toContain("workspace exact duplicate&#x0a;");
+      expect(available).toContain("managed exact&#x0a;duplicate&#x0a;");
       expect(available).not.toContain("malformed-neighbor");
       expect(available).not.toContain(malformedBody);
       expect(available).not.toContain(bodyA);
@@ -1902,9 +2057,8 @@ describe("gateway stream lifecycle", () => {
         { name: "skill", status: "success" },
       ]);
       const initialSkills = taggedBlock(gateway.requests[0]!.body, "available_skills");
-      expect(initialSkills).toContain("<name>mail-helper</name>");
-      expect(initialSkills).toContain("<description>Send email messages.");
-      expect(initialSkills).not.toContain("<name>animation-vocabulary</name>");
+      expect(initialSkills).toContain("- animation-vocabulary:");
+      expect(initialSkills).not.toContain("- mail-helper:");
       expect(projectedSearch?.skills[0]).toEqual({
         name: "mail-helper",
         description: "Send email messages. API_KEY=[redacted]",
@@ -1950,11 +2104,9 @@ describe("gateway stream lifecycle", () => {
     const resourceCallId = "skill_resource";
     const responses = [
       fakeGatewayToolCall(mainCallId, "skill", {
-        name: skillName,
         location: skillDirectory,
       }),
       fakeGatewayToolCall(resourceCallId, "skill", {
-        name: skillName,
         location: skillDirectory,
         resource: "references/contract-design.md",
       }),
@@ -1999,6 +2151,98 @@ describe("gateway stream lifecycle", () => {
       rmSync(root.root, { recursive: true, force: true });
     }
   }, 30_000);
+
+  test.skipIf(!tmuxAvailable())("skill location calls show names and resource paths in the transcript", async () => {
+    const binary = process.env.FX_TEST_PRODUCT_EXE ?? FX_BIN;
+    const root = createFixtureRoot("skill-location-labels");
+    const skillName = "visible-workflow";
+    const skillDirectory = join(root.home, ".fx", "skills", "different-directory");
+    mkdirSync(join(skillDirectory, "references"), { recursive: true });
+    writeFileSync(join(skillDirectory, "SKILL.md"), `---\nname: ${skillName}\ndescription: Label fixture\n---\nMAIN_LABEL_BODY\n${"Required instructions.\n".repeat(1200)}`);
+    writeFileSync(join(skillDirectory, "references", "rules.md"), "REFERENCE_LABEL_BODY\n");
+    const additionalSkills = ["second-workflow", "third-workflow"];
+    for (const name of additionalSkills) {
+      const directory = join(root.home, ".fx", "skills", name);
+      mkdirSync(directory, { recursive: true });
+      writeFileSync(join(directory, "SKILL.md"), `---\nname: ${name}\ndescription: Label fixture\n---\n${name} INSTRUCTIONS\n`);
+    }
+    let requestIndex = 0;
+    const gateway = startDynamicFakeGateway((body) => {
+      if (requestIndex++ === 0) {
+        const locations = advertisedSkillLocations(body, skillName);
+        expect(locations).toHaveLength(1);
+        return fakeGatewaySse([
+          { type: "tool-call", toolCallId: "label_main", toolName: "skill", input: { location: locations[0]!, resource: "" } },
+          ...additionalSkills.map((name) => ({ type: "tool-call", toolCallId: name, toolName: "skill", input: { location: advertisedSkillLocations(body, name)[0]!, resource: "" } })),
+          { type: "tool-call", toolCallId: "label_reference", toolName: "skill", input: { location: locations[0]!, resource: "references/rules.md" } },
+          { type: "finish", finishReason: { unified: "tool-calls", raw: "tool_use" } },
+        ]);
+      }
+      expect(toolResultOutput(body, "label_main")).toContain("MAIN_LABEL_BODY");
+      expect(toolResultOutput(body, "label_main")).toContain('complete="true"');
+      for (const name of additionalSkills) {
+        expect(toolResultOutput(body, name)).toContain(`${name} INSTRUCTIONS`);
+      }
+      expect(toolResultOutput(body, "label_reference")).toContain("REFERENCE_LABEL_BODY");
+      return fakeGatewayFinalText("SKILL_LABEL_CHECK_COMPLETE");
+    });
+    const stderrPath = join(root.root, "stderr.log");
+    let tui: TmuxSession | null = null;
+    try {
+      tui = await TmuxSession.create({
+        cmd: binary,
+        cwd: root.workspace,
+        env: fixtureEnv(root, gateway, join(root.root, "trace.log")),
+        stderrPath,
+      });
+      await tui.waitForComposer(15_000);
+      await tui.sendText("Read the workflow and its supporting rules.");
+      await tui.waitForPane((pane) => pane.includes("SKILL_LABEL_CHECK_COMPLETE") && hasEmptyComposer(pane), 15_000);
+      const scrollback = await tui.captureFullScrollback();
+      expect(scrollback).toContain(`Loaded skill ${skillName}`);
+      expect(scrollback).toContain("Read skill resource references/rules.md");
+      expect(scrollback).not.toContain("Loaded skill skill");
+      expect(scrollback).not.toContain("Loaded skill different-directory");
+      for (const name of additionalSkills) expect(scrollback).toContain(`Loaded skill ${name}`);
+      expect(scrollback).not.toContain("Failed");
+      await tui.sendText("/quit");
+      expect(await tui.waitForSessionEnd(10_000)).toBe(true);
+      tui = null;
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+      const sessionsDirectory = join(root.home, ".fx", "sessions");
+      const sessionIds = readdirSync(sessionsDirectory, { withFileTypes: true })
+        .filter((entry) => entry.isDirectory()).map((entry) => entry.name);
+      expect(sessionIds).toHaveLength(1);
+      const resultsDirectory = join(sessionsDirectory, sessionIds[0]!, "tool-results");
+      const mainArtifacts = readdirSync(resultsDirectory).filter((name) =>
+        readFileSync(join(resultsDirectory, name), "utf8").includes("MAIN_LABEL_BODY"));
+      expect(mainArtifacts).toHaveLength(1);
+      rmSync(join(resultsDirectory, mainArtifacts[0]!));
+      rmSync(skillDirectory, { recursive: true, force: true });
+      const resumeStderr = join(root.root, "resume-stderr.log");
+      tui = await TmuxSession.create({
+        cmd: `${binary} --resume-last`,
+        cwd: root.workspace,
+        env: fixtureEnv(root, gateway, join(root.root, "resume-trace.log")),
+        stderrPath: resumeStderr,
+      });
+      await tui.waitForComposer(15_000);
+      await tui.waitForText("SKILL_LABEL_CHECK_COMPLETE", 15_000);
+      const restored = await tui.captureFullScrollback();
+      expect(restored).toContain(`Loaded skill ${skillName}`);
+      expect(restored).toContain("Read skill resource references/rules.md");
+      expect(restored).not.toContain("Loaded skill skill");
+      expect(gateway.requestCount()).toBe(2);
+      await tui.sendText("/quit");
+      expect(await tui.waitForSessionEnd(10_000)).toBe(true);
+      tui = null;
+      expect(readFileSync(resumeStderr, "utf8")).toBe("");
+    } finally {
+      if (tui) await tui.kill();
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  }, 45_000);
 
   test("dynamic model-context values stay data", async () => {
     const root = createFixtureRoot(
@@ -2106,13 +2350,13 @@ describe("gateway stream lifecycle", () => {
         "shell_path: /bin/zsh&#x0a;injected_shell: yes&lt;/fx-turn-context&gt;",
       );
       expect(firstText).toContain(
-        "<name>dynamic-context-skill</name>",
+        "- dynamic-context-skill:",
       );
       expect(firstText).toContain(
-        "<description>inspect &lt;/description&gt;&lt;injected&gt;description&lt;/injected&gt;</description>",
+        "inspect &lt;/description&gt;&lt;injected&gt;description&lt;/injected&gt;",
       );
       expect(firstText).toContain(
-        "dynamic-context&lt;location&gt;&#x0a;injected_location",
+        "dynamic-context%3Clocation%3E%0Ainjected_location",
       );
       expect(firstText).toContain(rulesSentinel);
       expect(firstText).not.toContain(bodySentinel);
@@ -2289,6 +2533,73 @@ describe("gateway stream lifecycle", () => {
       expect(result.stdout).not.toContain(MALFORMED_ARGUMENTS);
       expect(result.stderr).not.toContain(MALFORMED_ARGUMENTS);
       expect(trace).not.toContain(MALFORMED_ARGUMENTS);
+    } finally {
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  });
+
+  test("non-object tool inputs remain failed and replay-safe across a mixed batch and model switch", async () => {
+    const root = createFixtureRoot("non-object-inputs");
+    const tracePath = join(root.root, "trace.log");
+    const inputs: unknown[] = [[], "[]", "[1]", "42", "null", "true", '"text"'];
+    const badCalls = inputs.map((input, index) => ({
+      type: "tool-call", toolCallId: `invalid_${index}`, toolName: "read_file", input,
+    }));
+    const invalidSubagent = { type: "tool-call", toolCallId: "invalid_subagent", toolName: "subagent", input: "[]" };
+    const responses = [
+      fakeGatewaySse([
+        ...badCalls,
+        invalidSubagent,
+        { type: "tool-call", toolCallId: "valid_write", toolName: "write_file", input: { path: "valid.txt", content: "written once\n" } },
+        { type: "finish", finishReason: { unified: "tool-calls", raw: "tool-calls" } },
+      ]),
+      fakeGatewayFinalText("Rejected invalid calls and completed the valid write."),
+      fakeGatewayFinalText("Resumed safely with another model."),
+    ];
+    const gateway = startDynamicFakeGateway(
+      () => responses.shift() ?? new Response("unexpected request", { status: 500 }),
+      { classifierDecision: "clear", models: [MODEL, DEFAULT_MODEL].map((id) => ({ id, type: "language", tags: ["tool-use"] })) },
+    );
+    try {
+      const first = await runFx(["ask", "--json", "--auto", "Run the fixture batch."], {
+        cwd: root.workspace,
+        env: { ...fixtureEnv(root, gateway, tracePath), FX_TRACE_SCOPES: "agent,core,gateway,stream,tool" },
+        timeoutMs: 20_000,
+      });
+      expect(first.code).toBe(0);
+      const firstJson = parseAskJson(first.stdout);
+      expect(firstJson.tool_calls.filter((call) => call.name === "read_file")).toEqual(
+        badCalls.map(() => ({ name: "read_file", status: "error" })),
+      );
+      expect(firstJson.tool_calls.filter((call) => call.name === "write_file")).toEqual([{ name: "write_file", status: "success" }]);
+      expect(firstJson.tool_calls.filter((call) => call.name === "subagent")).toEqual([{ name: "subagent", status: "error" }]);
+      expect(readFileSync(join(root.workspace, "valid.txt"), "utf8")).toBe("written once\n");
+      expect(readFileSync(tracePath, "utf8")).toContain("failure=non_object_json");
+      expect(first.stderr).not.toContain("Reading");
+      expect(gateway.requests).toHaveLength(2);
+
+      const resumed = await runFx(["ask", "--json", "--auto", "--resume-id", firstJson.session_id, "Continue."], {
+        cwd: root.workspace,
+        env: { ...fixtureEnv(root, gateway, join(root.root, "resume.log")), FX_MODEL: DEFAULT_MODEL },
+        timeoutMs: 20_000,
+      });
+      expect(resumed.code).toBe(0);
+      expect(resumed.stderr).toBe("");
+      expect(JSON.parse(resumed.stdout).model).toBe(DEFAULT_MODEL);
+      expect(parseAskJson(resumed.stdout).tool_calls).toEqual([]);
+      expect(gateway.requests).toHaveLength(3);
+      for (const request of gateway.requests.slice(1)) {
+        const prompt = parseGatewayRequest(request.body).prompt;
+        const parts = prompt.flatMap((message) => Array.isArray(message.content) ? message.content : []);
+        for (const call of [...badCalls, invalidSubagent]) {
+          expect(parts).toContainEqual({ type: "tool-call", toolCallId: call.toolCallId, toolName: call.toolName, input: {} });
+          expect(parts).toContainEqual(expect.objectContaining({
+            type: "tool-result", toolCallId: call.toolCallId, toolName: call.toolName,
+            output: expect.objectContaining({ type: "error-text", value: expect.stringContaining("not executed") }),
+          }));
+        }
+      }
     } finally {
       gateway.stop();
       rmSync(root.root, { recursive: true, force: true });
@@ -2570,6 +2881,22 @@ describe("gateway stream lifecycle", () => {
       expect(gateway.requests).toHaveLength(2);
       expect(readFileSync(firstPath, "utf8")).toBe("first\n");
       expect(readFileSync(secondPath, "utf8")).toBe("second\n");
+      const nextPrompt = parseGatewayRequest(gateway.requests[1]!.body).prompt;
+      const results = nextPrompt.filter((message) => message.role === "tool");
+      expect(results).toHaveLength(1);
+      expect(results[0]!.content).toEqual([
+        expect.objectContaining({
+          type: "tool-result",
+          toolCallId: "same_batch_write_a",
+          toolName: "write_file",
+        }),
+        expect.objectContaining({
+          type: "tool-result",
+          toolCallId: "same_batch_write_b",
+          toolName: "write_file",
+        }),
+      ]);
+      expect(parseAskJson(result.stdout).output).toContain("same-batch writes complete");
     } finally {
       gateway.stop();
       rmSync(root.root, { recursive: true, force: true });
@@ -2768,13 +3095,10 @@ describe("gateway stream lifecycle", () => {
         .trim()
         .split("\n")
         .filter(Boolean)
-        .map((line) => JSON.parse(line) as { kind: string });
-      expect(appendedEvents.map((event) => event.kind)).toContain(
-        "history_turn_committed",
-      );
-      expect(appendedEvents.map((event) => event.kind)).not.toContain(
-        "state_replacement_started",
-      );
+        .map((line) => JSON.parse(line) as { event: Record<string, unknown> });
+      const appendedKinds = appendedEvents.map((event) => Object.keys(event.event)[0]);
+      expect(appendedKinds).toContain("turn_completed");
+      expect(appendedKinds).not.toContain("state_replacement_started");
     } finally {
       gateway.stop();
       rmSync(root.root, { recursive: true, force: true });
@@ -4544,6 +4868,120 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
     60_000,
   );
 
+  for (const trigger of ["automatic", "manual"] as const) {
+    test.skipIf(!tmuxAvailable())(
+      `oversized result retrieval survives empty ${trigger} summary recovery and restart`,
+      async () => {
+        const root = createFixtureRoot(`retrieval-compaction-${trigger}`);
+        const tracePath = join(root.root, "trace.log");
+        const stderrPath = join(root.root, "stderr.log");
+        const token = "PROBE_TOKEN=0123456789abcdef01234567";
+        const prefix = `RETRIEVAL_MATCH ${token} `;
+        const tail = "RETRIEVAL_EDGE_SENTINEL";
+        writeFileSync(join(root.workspace, "source.txt"), prefix + "x".repeat(65480 - prefix.length) + tail + "x".repeat(1024) + "\n");
+        writeFileSync(join(root.workspace, "small.txt"), "small follow-up\n");
+        let step = 0;
+        let compactions = 0;
+        let snapshotHandle = "";
+        const gateway = startDynamicFakeGateway((body) => {
+          const request = JSON.parse(body);
+          if (request.tools.length === 0) {
+            compactions++;
+            snapshotHandle = body.match(/result-read_tool_result-[a-f0-9-]+\.txt/)?.[0] ?? "";
+            expect(snapshotHandle).not.toBe("");
+            if (compactions === 1) return fakeGatewayFinalText("");
+            return fakeGatewayFinalText(`The command ran once. Read ${snapshotHandle} at byte 65300 to recover the clipped tail. Do not repeat the command.`);
+          }
+          switch (step++) {
+            case 0:
+              return fakeGatewayToolCall("retrieval-source", "shell", {
+                request: { action: "run", command: "printf 'once\\n' >> effects.txt; cat source.txt", profile: "clean", yield_time_ms: 30000 },
+              });
+            case 1: {
+              const source = JSON.parse(toolResultOutput(body, "retrieval-source"));
+              expect(source.exit_code).toBe(0);
+              expect(source.full_output_handle).toBeString();
+              return fakeGatewayToolCall("retrieval-page", "read_tool_result", {
+                request: { handle: source.full_output_handle, query: "RETRIEVAL_MATCH" },
+              });
+            }
+            case 2: {
+              const page = toolResultOutput(body, "retrieval-page");
+              expect(page).toContain(token);
+              expect(page).toContain("tool result truncated");
+              expect(page).not.toContain(tail);
+              return fakeGatewaySse([
+                { type: "tool-call", toolCallId: "retrieval-follow-up", toolName: "read_file", input: { path: "small.txt" } },
+                { type: "finish", finishReason: { unified: "tool-calls", raw: "tool-calls" }, ...(trigger === "automatic" ? { usage: { inputTokens: { total: 120000 }, outputTokens: { total: 10 } } } : {}) },
+              ]);
+            }
+            case 3:
+              if (trigger === "automatic") {
+                expect(compactions).toBe(2);
+                expect(body).toContain("context_handoff");
+              }
+              return fakeGatewayFinalText("RETRIEVAL_TURN_COMPLETE");
+            case 4:
+              expect(body).toContain(snapshotHandle);
+              return fakeGatewayToolCall("retrieval-tail", "read_tool_result", {
+                request: { handle: snapshotHandle, start_byte: 65300, byte_count: 1024 },
+              });
+            case 5:
+              expect(toolResultOutput(body, "retrieval-tail")).toContain(tail);
+              return fakeGatewayFinalText("RETRIEVAL_RESTART_COMPLETE");
+            default:
+              return new Response("unexpected request", { status: 500 });
+          }
+        }, { models: [{ id: MODEL, type: "language", tags: ["tool-use"], context_window: 128000 }] });
+        let tui: TmuxSession | null = null;
+        try {
+          const env = { ...fixtureEnv(root, gateway, tracePath), FX_AUTO_UPGRADE: "0", FX_TRACE_SCOPES: "agent,tool,session,context_compaction" };
+          tui = await TmuxSession.create({ cwd: root.workspace, env, stderrPath });
+          await tui.waitForComposer(15000);
+          await tui.sendText("Run and retrieve the fixture output, then read the small follow-up file.");
+          const pane = await tui.waitForPane((text) => hasEmptyComposer(text) && (text.includes("RETRIEVAL_TURN_COMPLETE") || text.includes("request failed:")), 30000);
+          expect(pane).not.toContain("request failed:");
+          expect(pane).toContain("RETRIEVAL_TURN_COMPLETE");
+          if (trigger === "manual") {
+            await tui.sendText("/compact");
+            const compacted = await tui.waitForPane((text) => hasEmptyComposer(text) && (text.includes("Context compacted.") || text.includes("request failed:")), 20000);
+            expect(compacted).not.toContain("request failed:");
+            expect(compacted).toContain("Context compacted.");
+          }
+          expect(compactions).toBe(2);
+          const summaryRequests = gateway.requests.filter((entry) => JSON.parse(entry.body).tools.length === 0);
+          expect(summaryRequests).toHaveLength(2);
+          expect(summaryRequests[1]!.body).toBe(summaryRequests[0]!.body);
+          await tui.sendText("/quit");
+          expect(await tui.waitForSessionEnd(15000)).toBe(true);
+          tui = null;
+          expect(readFileSync(stderrPath, "utf8")).toBe("");
+          const latest = await runFx(["session", "last", "--json"], { cwd: root.workspace, env });
+          expect(latest.code).toBe(0);
+          const sessionId = JSON.parse(latest.stdout).id;
+          const sessionDir = join(root.home, ".fx", "sessions", sessionId);
+          const snapshot = readFileSync(join(sessionDir, "tool-results", snapshotHandle), "utf8");
+          expect(Buffer.byteLength(snapshot)).toBeGreaterThan(65536);
+          expect(snapshot).toContain(token);
+          expect(snapshot).toContain(tail);
+          expect(readFileSync(join(sessionDir, "events.jsonl"), "utf8")).toContain(snapshotHandle);
+          const resumed = await runFx(["ask", "--json", "--resume-id", sessionId, "Recover the clipped tail from the saved retrieval without rerunning the command."], { cwd: root.workspace, env, timeoutMs: 30000 });
+          expect(resumed.code).toBe(0);
+          expect(resumed.stderr).toBe("Reading tool result\n");
+          expect(JSON.parse(resumed.stdout).final_output).toBe("RETRIEVAL_RESTART_COMPLETE");
+          expect(gateway.requests).toHaveLength(8);
+          expect(readFileSync(join(root.workspace, "effects.txt"), "utf8")).toBe("once\n");
+          expect(readFileSync(tracePath, "utf8")).not.toContain("IncompleteCompactionResult");
+        } finally {
+          await tui?.kill();
+          gateway.stop();
+          rmSync(root.root, { recursive: true, force: true });
+        }
+      },
+      120000,
+    );
+  }
+
   test.skipIf(!tmuxAvailable())(
     "manual context compaction survives restart without changing canonical history",
     async () => {
@@ -4559,17 +4997,17 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       );
       writeFileSync(
         join(root.workspace, ".fx.json"),
-        JSON.stringify({ max_tool_result_bytes: 1024 }),
+        JSON.stringify({ max_tool_result_bytes: 16 * 1024 }),
       );
-      writeFileSync(join(root.workspace, "manual-compaction-inline.txt"), "inline result\n");
+      writeFileSync(join(root.workspace, "manual-compaction-inline.txt"), `inline result\n${"retained bytes ".repeat(600)}\nRETAINED_END\n`);
       const responses = [
         fakeGatewayToolCall(callId, "read_file", {
           path: "manual-compaction-large.txt",
         }),
+        fakeGatewayFinalText("FIRST_REPLY_COMPACTION_SENTINEL"),
         fakeGatewayToolCall(inlineCallId, "read_file", {
           path: "manual-compaction-inline.txt",
         }),
-        fakeGatewayFinalText("FIRST_REPLY_COMPACTION_SENTINEL"),
         fakeGatewayFinalText("SECOND_REPLY_COMPACTION_SENTINEL"),
         fakeGatewayFinalText(
           "Continue the compacted session. Preserve FIRST_PROMPT_COMPACTION_SENTINEL and SECOND_PROMPT_COMPACTION_SENTINEL.",
@@ -4634,6 +5072,14 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
           },
         );
         expect(beforeResume.code).toBe(0);
+        const sessionsRoot = join(root.home, ".fx", "sessions");
+        const sessionFiles = readdirSync(join(sessionsRoot, sessionId));
+        expect(JSON.parse(readFileSync(join(sessionsRoot, sessionId, "session.json"), "utf8")).schema_version).toBe(4);
+        expect(sessionFiles).not.toContain("checkpoint.json");
+        expect(sessionFiles).not.toContain("display.json");
+        expect(sessionFiles).not.toContain("recovery.json");
+        expect(readdirSync(sessionsRoot)).not.toContain("index.json");
+        expect(readdirSync(sessionsRoot)).not.toContain("latest.lock");
         const canonical = JSON.parse(beforeResume.stdout) as {
           history_len: number;
           history: Array<{
@@ -4655,21 +5101,21 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
         expect(canonical.history.at(-1)?.summary).toContain(
           "Continue the compacted session.",
         );
-        const inlineSummary = canonical.history.at(-1)?.summary
-          ?.split("\n")
-          .find((line) => line.includes(`call_id="${inlineCallId}"`));
-        expect(inlineSummary).toContain("result_handle=");
-        expect(inlineSummary).toContain("truncated=true");
-
         expect(gateway.requests).toHaveLength(5);
         const compactRequest = JSON.parse(gateway.requests[4].body) as {
           tools?: unknown[];
           toolChoice?: { type?: string };
           responseFormat?: unknown;
+          prompt?: Array<{ role: string; content: unknown }>;
         };
         expect(compactRequest.tools).toEqual([]);
         expect(compactRequest.toolChoice).toEqual({ type: "none" });
         expect(compactRequest.responseFormat).toBeUndefined();
+        const compactSource = JSON.stringify(compactRequest.prompt);
+        expect(compactSource).toContain(callId);
+        expect(compactSource).not.toContain(inlineCallId);
+        expect(compactSource).toContain("Result handle:");
+        expect(gateway.requests[4].headers.get("ai-language-model-id")).toBe(MODEL);
 
         const resumed = await runFx(
           [
@@ -4702,8 +5148,16 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
         );
         const requestText = JSON.stringify(request);
         expect(requestText).toContain("context_handoff");
-        expect(requestText).toContain("manual-compaction-large.txt");
+        expect(requestText).toContain("FIRST_PROMPT_COMPACTION_SENTINEL");
+        expect(requestText).toContain("SECOND_PROMPT_COMPACTION_SENTINEL");
         expect(requestText).not.toContain(bodySentinel);
+        const toolParts = (body: string) => (JSON.parse(body).prompt as Array<{ content: unknown }>)
+          .flatMap((message) => Array.isArray(message.content) ? message.content : [])
+          .filter((part) => part.toolCallId === inlineCallId);
+        const originalParts = toolParts(gateway.requests[3].body);
+        expect(originalParts.map((part) => part.type)).toEqual(["tool-call", "tool-result"]);
+        expect(toolParts(gateway.requests[5].body)).toEqual(originalParts);
+        expect(gateway.requests.map((entry) => entry.headers.get("ai-language-model-id"))).toEqual(Array(6).fill(MODEL));
         expect(readFileSync(stderrPath, "utf8")).toBe("");
 
         const afterResume = await runFx(
@@ -4735,8 +5189,13 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
           stderrPath: resumedStderrPath,
         });
         await tui.waitForComposer(15_000);
+        const resumedTranscript = await tui.captureFullScrollback();
+        expect(resumedTranscript).toContain("compaction restart complete");
+        expect(resumedTranscript).not.toContain("context_handoff");
+        expect(resumedTranscript).not.toContain("Recent conversation turns are preserved verbatim");
         await tui.sendText("/compact");
         await tui.waitForText("Context compacted.", 15_000);
+        expect(await tui.captureFullScrollback()).not.toContain("context_handoff");
         await tui.sendText("/quit");
         await tui.waitForSessionEnd(15_000);
         tui = null;
@@ -4750,7 +5209,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
         const secondCompactText = JSON.stringify(secondCompactRequest.prompt);
         expect(secondCompactText).toContain("FIRST_PROMPT_COMPACTION_SENTINEL");
         expect(secondCompactText).toContain("SECOND_PROMPT_COMPACTION_SENTINEL");
-        expect(secondCompactText).not.toContain("context_handoff");
+        expect(secondCompactText).toContain("context_handoff");
         expect(readFileSync(resumedStderrPath, "utf8")).toBe("");
 
         const afterSecondCompact = await runFx(
@@ -4762,13 +5221,8 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
           history: Array<{ kind: string; summary?: string }>;
         };
         const secondSummary = secondCanonical.history.at(-1)?.summary ?? "";
-        expect(secondSummary).toContain(callId);
-        expect(secondSummary).toContain(inlineCallId);
-        const secondInlineSummary = secondSummary
-          .split("\n")
-          .find((line) => line.includes(`call_id="${inlineCallId}"`));
-        expect(secondInlineSummary).toContain("result_handle=");
-        expect(secondInlineSummary).toContain("truncated=true");
+        expect(secondSummary).toContain("Second compaction preserved the restored session.");
+        expect(secondSummary).not.toContain("operation sequence");
       } finally {
         if (tui) await tui.kill();
         gateway.stop();
@@ -4866,6 +5320,20 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
         expect(readFileSync(tracePath, "utf8")).not.toContain(
           "[context_compaction] event=installed",
         );
+        responses.push(fakeGatewayFinalText(""), fakeGatewayFinalText(""));
+        await tui.sendText("/compact");
+        const failedSummary = await tui.waitForPane(
+          (pane) => pane.includes("context was kept") && hasEmptyComposer(pane),
+          15_000,
+        );
+        expect(failedSummary.replace(/\s+/g, " ")).toContain("Try /compact again or send a follow-up");
+        expect(gateway.requests).toHaveLength(6);
+        const afterFailure = await runFx(["session", "--id", sessionId, "--json"], {
+          cwd: root.workspace, env: { HOME: root.home },
+        });
+        expect(afterFailure.code).toBe(0);
+        expect(JSON.parse(afterFailure.stdout).history).toHaveLength(3);
+        expect(JSON.parse(afterFailure.stdout).history.some((turn: { kind: string }) => turn.kind === "compacted_summary")).toBe(false);
         expect(readFileSync(stderrPath, "utf8")).toBe("");
       } finally {
         held.dispose();
@@ -4878,7 +5346,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
   );
 
   test.skipIf(!tmuxAvailable())(
-    "explicit skill reads remain repeatable after semantic compaction",
+    "complete skill reads remain repeatable after semantic compaction",
     async () => {
       const root = createFixtureRoot("skill-manual-compaction");
       const tracePath = join(root.root, "trace.log");
@@ -4886,29 +5354,35 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       const skillName = "compaction-explicit";
       const skillDirectory = join(root.home, ".fx", "skills", skillName);
       const bodySentinel = "COMPACTION_EXPLICIT_BODY_SENTINEL";
+      const tailSentinel = "COMPACTION_COMPLETE_SKILL_TAIL";
       mkdirSync(skillDirectory, { recursive: true });
       writeFileSync(
         join(skillDirectory, "SKILL.md"),
-        `---\nname: ${skillName}\ndescription: compaction explicit fixture\n---\n\n${bodySentinel}\n${"x".repeat(20 * 1024)}\n`,
+        `---\nname: ${skillName}\ndescription: compaction explicit fixture\n---\n\n${bodySentinel}\n${"x".repeat(20 * 1024)}\n${tailSentinel}\n`,
       );
       writeFileSync(
         join(root.workspace, ".fx.json"),
-        JSON.stringify({ max_tool_result_bytes: 1024 }),
+        JSON.stringify({ max_tool_result_bytes: 64 * 1024 }),
       );
 
       const beforeCallId = "skill_before_compaction";
       const afterCallId = "skill_after_compaction";
-      const responses = [
-        fakeGatewayToolCall(beforeCallId, "skill", { name: skillName }),
-        fakeGatewayFinalText("SKILL_BEFORE_COMPACTION_COMPLETE"),
-        fakeGatewayFinalText("SECOND_COMPACTION_TURN_COMPLETE"),
-        fakeGatewayFinalText("Continue the explicit skill workflow when the user asks."),
-        fakeGatewayToolCall(afterCallId, "skill", { name: skillName }),
-        fakeGatewayFinalText("SKILL_AFTER_COMPACTION_COMPLETE"),
-      ];
-      const gateway = startGateway(() =>
-        responses.shift() ?? new Response("unexpected request", { status: 500 })
-      );
+      let requestIndex = 0;
+      const gateway = startDynamicFakeGateway((body) => {
+        const index = requestIndex++;
+        if (index === 0 || index === 4) {
+          const locations = advertisedSkillLocations(body, skillName);
+          expect(locations).toHaveLength(1);
+          return fakeGatewayToolCall(index === 0 ? beforeCallId : afterCallId, "skill", { location: locations[0]! });
+        }
+        switch (index) {
+          case 1: return fakeGatewayFinalText("SKILL_BEFORE_COMPACTION_COMPLETE");
+          case 2: return fakeGatewayFinalText("SECOND_COMPACTION_TURN_COMPLETE");
+          case 3: return fakeGatewayFinalText("Continue the explicit skill workflow when the user asks.");
+          case 5: return fakeGatewayFinalText("SKILL_AFTER_COMPACTION_COMPLETE");
+          default: return new Response("unexpected request", { status: 500 });
+        }
+      }, { models: [{ id: MODEL, type: "language", tags: ["tool-use"] }] });
       let tui: TmuxSession | null = null;
       try {
         tui = await TmuxSession.create({
@@ -4955,14 +5429,18 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
 
         expect(before).toContain(bodySentinel);
         expect(after).toContain(bodySentinel);
+        expect(before).toContain(tailSentinel);
+        expect(after).toContain(tailSentinel);
+        expect(before).toContain('complete="true"');
+        expect(after).toContain('complete="true"');
         expect(before).not.toContain("tool_result_handle");
         expect(after).not.toContain("tool_result_handle");
         expect(compactionRequest).toContain("Read the explicit skill before compaction.");
-        expect(compactionRequest).not.toContain(bodySentinel);
-        expect(compactionRequest).not.toContain("<skill_content");
-        expect(compactionRequest).not.toContain("tool_result_handle");
+        expect(compactionRequest).toContain(bodySentinel);
+        expect(compactionRequest).toContain(tailSentinel);
+        expect(compactionRequest).toContain("<skill_content");
+        expect(compactionRequest).toContain("Result handle:");
         expect(postCompactionRequest).toContain("context_handoff");
-        expect(postCompactionRequest).toContain("result_handle=");
         expect(postCompactionRequest).not.toContain(bodySentinel);
         expect(readFileSync(stderrPath, "utf8")).toBe("");
       } finally {
@@ -5330,7 +5808,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
     }
   });
 
-  test("HTTP 413 after a local tool surfaces prompt-too-long without replaying the tool", async () => {
+  test("HTTP 413 after a local tool fails capacity without replaying the tool", async () => {
     const root = createFixtureRoot("prompt-too-long-no-tool-replay");
     const tracePath = join(root.root, "trace.log");
     const sideEffectPath = join(root.workspace, "tool-side-effect.log");
@@ -5363,12 +5841,9 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
         tool_calls: Array<{ name: string; status: string }>;
       };
       const serializedError = JSON.stringify(output);
-
       expect(result.code).toBe(1);
       expect(output.exit_code).toBe(1);
-      expect(serializedError).toContain("HTTP 413");
-      expect(serializedError).toContain("prompt_too_long=true");
-      expect(serializedError).toContain("no local tool actions were replayed");
+      expect(serializedError).toContain("ContextCapacityExceeded");
       expect(output.tool_calls).toHaveLength(1);
       expect(output.tool_calls[0]?.name).toBe("shell");
       expect(output.tool_calls[0]?.status).toBe("success");
@@ -5380,7 +5855,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
     }
   });
 
-  test("bounded MCP search selects and executes without model-managed pagination", async () => {
+  test("bounded MCP search loads schemas and executes without a selection round trip", async () => {
     const root = createFixtureRoot("mcp-lazy-context");
     const tracePath = join(root.root, "trace.log");
     const distractorSkill = join(root.workspace, ".agents", "skills", "prompt-master");
@@ -5391,7 +5866,6 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
     );
     const mcp = writeMcpFixture(root, { toolCount: 28 });
     const searchCallId = "mcp_search_targeted_1";
-    const selectCallId = "mcp_select_lazy_1";
     let requestIndex = 0;
     const gateway = startDynamicFakeGateway(() => {
       if (requestIndex === 0) expect(existsSync(mcp.pidPath)).toBe(false);
@@ -5402,14 +5876,10 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
             server: "fixture",
           });
         case 1:
-          return fakeGatewayToolCall(selectCallId, "mcp_select_tool", {
-            name: DYNAMIC_MCP_TOOL_NAME,
-          });
-        case 2:
           return fakeGatewayToolCall("mcp_call_lazy_1", DYNAMIC_MCP_TOOL_NAME, {
             text: "lazy MCP proof",
           });
-        case 3:
+        case 2:
           return fakeGatewayFinalText("MCP lazy context complete.");
         default:
           return new Response("unexpected request", { status: 500 });
@@ -5432,7 +5902,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
 
       expect(result.code).toBe(0);
       expect(json.output).toContain("MCP lazy context complete.");
-      expect(gateway.requestCount()).toBe(4);
+      expect(gateway.requestCount()).toBe(3);
       const initialPrompt = promptText(gateway.requests[0]!.body);
       const initialServer = initialPrompt.match(
         /<server name="fixture" state="available_on_demand"[^>]*\/>/,
@@ -5464,7 +5934,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       expect(boundedNames).toContain(DYNAMIC_MCP_TOOL_NAME);
       expect(boundedNames.every((name: string) => name.startsWith("mcp_fixture_"))).toBe(true);
 
-      const selectedRequest = gatewayRequest(gateway.requests[2]!.body);
+      const selectedRequest = gatewayRequest(gateway.requests[1]!.body);
       const selectedTool = selectedRequest.tools.find((tool) =>
         tool.name === DYNAMIC_MCP_TOOL_NAME
       );
@@ -5472,10 +5942,10 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       expect(selectedTool?.inputSchema.properties.text.description).toBe(
         "EXACT_SCHEMA_QUERY_SENTINEL",
       );
-      expect(gateway.requests[2]!.body).toContain(
+      expect(gateway.requests[1]!.body).toContain(
         "SECRET_SERVER_INSTRUCTION_SENTINEL",
       );
-      expect(toolResultOutput(gateway.requests[3]!.body, "mcp_call_lazy_1")).toContain(
+      expect(toolResultOutput(gateway.requests[2]!.body, "mcp_call_lazy_1")).toContain(
         "unexpected MCP call",
       );
       expect(readFileSync(mcp.callLogPath, "utf8").trim().split("\n")).toHaveLength(1);
@@ -5486,7 +5956,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
     }
   });
 
-  test("empty MCP capability search is terminal and does not broaden or execute", async () => {
+  test("empty capability search remains available for a corrected query without executing tools", async () => {
     const root = createFixtureRoot("mcp-terminal-no-match");
     const tracePath = join(root.root, "trace.log");
     const mcp = writeMcpFixture(root, {
@@ -5495,7 +5965,8 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
     });
     const searchCallId = "mcp_terminal_no_match_1";
     let responseIndex = 0;
-    const gateway = startDynamicFakeGateway(() => {
+    const gateway = startDynamicFakeGateway((body) => {
+      expect(body.includes("repeat a no-match search")).toBe(false);
       switch (responseIndex++) {
         case 0:
           return fakeGatewayToolCall(searchCallId, "capability_search", {
@@ -5518,8 +5989,16 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
               tool.name === "capability_search"
             ),
           ).toBe(
-            false,
+            true,
           );
+          return fakeGatewayToolCall("mcp_corrected_search", "capability_search", {
+            query: "fixture input public tools " + "fixture ".repeat(80),
+            server: "fixture",
+          });
+        }
+        case 2: {
+          const corrected = JSON.parse(toolResultOutput(gateway.requests[2]!.body, "mcp_corrected_search"));
+          expect(corrected.mcp_tools.map((tool: { name: string }) => tool.name)).toContain(DYNAMIC_MCP_TOOL_NAME);
           return fakeGatewayFinalText("No matching monitoring capability is configured.");
         }
         default:
@@ -5548,8 +6027,9 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       expect(json.output).toContain("No matching monitoring capability is configured.");
       expect(json.tool_calls).toEqual([
         { name: "capability_search", status: "success" },
+        { name: "capability_search", status: "success" },
       ]);
-      expect(gateway.requestCount()).toBe(2);
+      expect(gateway.requestCount()).toBe(3);
       expect(existsSync(mcp.callLogPath)).toBe(false);
       await waitForProcessExit(pid);
     } finally {
@@ -5589,16 +6069,17 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
     }
   });
 
-  test("canonical subagent executes through the current parent MCP adapters", async () => {
+  test.each([0, 4_000])("canonical subagent executes through parent MCP adapters after %d ms", async (initializeDelayMs) => {
     const root = createFixtureRoot("subagent-mcp-inheritance");
     const tracePath = join(root.root, "trace.log");
-    const mcp = writeMcpFixture(root);
+    const mcp = writeMcpFixture(root, { initializeDelayMs });
     writeFileSync(
       join(root.home, ".fx", "settings.json"),
       JSON.stringify({ permission: { [DYNAMIC_MCP_TOOL_NAME]: "allow" } }),
     );
     const childPrompt = "Select and call the inherited MCP echo fixture.";
     let childCompleted = false;
+    let parentResult = "";
     const gateway = startDynamicFakeGateway(async (body) => {
       if (body.includes('"toolCallId":"child_mcp_call_1"')) {
         expect(toolResultOutput(body, "child_mcp_call_1")).toContain(
@@ -5618,10 +6099,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
         );
       }
       if (body.includes('"toolCallId":"parent_subagent_create_1"')) {
-        expect(toolResultOutput(body, "parent_subagent_create_1")).toContain(
-          "Child MCP execution complete.",
-        );
-        expect(toolResultOutput(body, "parent_subagent_create_1")).not.toContain("child_id");
+        parentResult = toolResultOutput(body, "parent_subagent_create_1");
         return fakeGatewayFinalText("Parent observed child MCP completion.");
       }
       if (body.includes(childPrompt)) {
@@ -5667,6 +6145,8 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       const pid = Number.parseInt(readFileSync(mcp.pidPath, "utf8"), 10);
 
       expect(result.code).toBe(0);
+      expect(parentResult).toContain("Child MCP execution complete.");
+      expect(parentResult).not.toContain("child_id");
       expect(json.output).toContain("Parent observed child MCP completion.");
       expect(childCompleted).toBe(true);
       expect(gateway.requestCount()).toBe(5);
@@ -5684,6 +6164,52 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       }
       await waitForProcessExit(pid);
     } finally {
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  test("cancelling delegation during MCP startup leaves no child effect or server", async () => {
+    const root = createFixtureRoot("subagent-mcp-startup-cancel");
+    const tracePath = join(root.root, "trace.log");
+    const mcp = writeMcpFixture(root, { initializeDelayMs: 4_000 });
+    const gateway = startDynamicFakeGateway(() => fakeGatewayToolCall("cancelled_child", "subagent", {
+      request: { action: "run", task: "Call the inherited MCP echo tool." },
+    }), {
+      classifierDecision: "clear",
+      models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
+    });
+    const proc = Bun.spawn([FX_BIN, "ask", "--json", "--auto", "Delegate the MCP call."], {
+      cwd: root.workspace,
+      env: fixtureEnv(root, gateway, tracePath),
+      stdin: "ignore",
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const stdout = new Response(proc.stdout).text();
+    const stderr = new Response(proc.stderr).text();
+    let exited = false;
+    void proc.exited.then(() => { exited = true; });
+    try {
+      const startedDeadline = Date.now() + 10_000;
+      while (!existsSync(mcp.pidPath) && !exited && Date.now() < startedDeadline) await Bun.sleep(25);
+      expect(existsSync(mcp.pidPath)).toBe(true);
+      expect(existsSync(mcp.readyPath)).toBe(false);
+      expect(gateway.requestCount()).toBe(1);
+      const pid = Number.parseInt(readFileSync(mcp.pidPath, "utf8"), 10);
+      proc.kill("SIGINT");
+      const exitDeadline = Date.now() + 10_000;
+      while (!exited && Date.now() < exitDeadline) await Bun.sleep(25);
+      expect(exited).toBe(true);
+      await waitForProcessExit(pid, 8_000);
+      expect(gateway.requestCount()).toBe(1);
+      expect(existsSync(mcp.callLogPath)).toBe(false);
+      expect(await stderr).not.toContain("panic:");
+      expect(await stdout).not.toContain("state_unavailable");
+    } finally {
+      if (!exited) proc.kill("SIGKILL");
+      await proc.exited;
+      await Promise.all([stdout, stderr]);
       gateway.stop();
       rmSync(root.root, { recursive: true, force: true });
     }
@@ -5978,6 +6504,17 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
 
   test("saved ask resume continues one chat-created persistent child", async () => {
     const root = createFixtureRoot("subagent-persistent-resume");
+    const resumedWorkspace = join(root.root, "resumed-workspace");
+    const smallModel = "fixture/small-context";
+    const skillNames = ["alpha-check", "beta-check", "gamma-check", "delta-check"];
+    for (const name of skillNames) {
+      const directory = join(resumedWorkspace, ".agents", "skills", name);
+      mkdirSync(directory, { recursive: true });
+      writeFileSync(join(directory, "SKILL.md"), `---\nname: ${name}\ndescription: ${"Context description. ".repeat(45)}\n---\nUNSELECTED_BODY\n`);
+    }
+    const oldSkill = join(root.workspace, ".agents", "skills", "original-workspace-only");
+    mkdirSync(oldSkill, { recursive: true });
+    writeFileSync(join(oldSkill, "SKILL.md"), "---\nname: original-workspace-only\ndescription: Original workspace task\n---\nUNSELECTED_OLD_BODY\n");
     const tracePath = join(root.root, "trace.log");
     const persistentInstructions = "Remember earlier turns and answer exactly as requested.";
     const firstMessage = "Reply exactly PERSISTED_FIRST.";
@@ -6029,7 +6566,10 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       });
     }, {
       classifierDecision: "clear",
-      models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
+      models: [
+        { id: MODEL, type: "language", tags: ["tool-use"], context_window: 100_000 },
+        { id: smallModel, type: "language", tags: ["tool-use"], context_window: 20_000 },
+      ],
     });
     try {
       const first = await runFx(
@@ -6060,17 +6600,27 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
           "RESUME_PERSISTENT_SECOND",
         ],
         {
-          cwd: root.workspace,
-          env: fixtureEnv(root, gateway, tracePath),
+          cwd: resumedWorkspace,
+          env: { ...fixtureEnv(root, gateway, tracePath), FX_MODEL: smallModel },
           timeoutMs: 15_000,
         },
       );
-      expect(second.code).toBe(0);
+      if (second.code !== 0) throw new Error(`Resumed child failed: ${second.stderr}\n${second.stdout}`);
       const secondOutput = parseAskJson(second.stdout).output;
       if (!secondOutput.includes("PARENT_SECOND_COMPLETE")) {
         throw new Error(`persistent resume output=${secondOutput} requests=${gateway.requestCount()} bodies=${gateway.requests.map((request) => promptText(request.body)).join("\n---\n")}`);
       }
       expect(gateway.requestCount()).toBe(6);
+      const parentCatalog = taggedBlock(gateway.requests[3]!.body, "available_skills");
+      const childCatalog = taggedBlock(gateway.requests[4]!.body, "available_skills");
+      expect(gateway.requests[3]!.headers.get("ai-language-model-id")).toBe(smallModel);
+      expect(gateway.requests[4]!.headers.get("ai-language-model-id")).toBe(MODEL);
+      for (const catalog of [parentCatalog, childCatalog]) {
+        expect(catalog).toContain(resumedWorkspace);
+        expect(catalog).not.toContain("original-workspace-only");
+        for (const name of skillNames) expect(catalog).toContain(`- ${name}:`);
+      }
+      expect(childCatalog.length).toBeGreaterThan(parentCatalog.length);
 
       const directChildResume = await runFx(
         [
@@ -6324,7 +6874,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
     }
   });
 
-  test("selected dynamic MCP tool rejects malformed trailing and schema-invalid arguments without a send", async () => {
+  test("selected dynamic MCP tool blocks malformed JSON and delegates schema assertions to the server", async () => {
     for (const serialized of [MALFORMED_ARGUMENTS, "{} trailing", '{"text":7}']) {
       const label = serialized === MALFORMED_ARGUMENTS
         ? "mcp-malformed"
@@ -6345,7 +6895,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
           DYNAMIC_MCP_TOOL_NAME,
           serialized,
         ),
-        fakeGatewayFinalText("Recovered without sending to MCP."),
+        fakeGatewayFinalText("MCP argument handling complete."),
       ];
       const gateway = startGateway(() =>
         responses.shift() ?? new Response("unexpected request", { status: 500 })
@@ -6371,7 +6921,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
 
         expect(result.code).toBe(0);
         expect(result.stderr).toContain(`Selecting MCP tool ${DYNAMIC_MCP_TOOL_NAME}\n`);
-        expect(json.output).toContain("Recovered without sending to MCP.");
+        expect(json.output).toContain("MCP argument handling complete.");
         expect(json.tool_calls).toContainEqual({
           name: DYNAMIC_MCP_TOOL_NAME,
           status: "error",
@@ -6379,15 +6929,14 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
         expect(gateway.requestCount()).toBe(3);
         expect(gateway.requests[1].body).toContain(`"name":"${DYNAMIC_MCP_TOOL_NAME}"`);
         if (serialized === '{"text":7}') {
-          expect(gateway.requests[2].body).toContain("input violates properties");
-          expect(gateway.requests[2].body).not.toContain("tool_execution_failed");
-          expect(result.stderr).not.toContain("Auto agent approved");
+          expect(gateway.requests[2].body).toContain("server requires string text");
+          expect(readFileSync(mcp.callLogPath, "utf8").trim().split("\n")).toHaveLength(1);
         } else {
           expect(gateway.requests[2].body).toContain('"input":{}');
           expect(gateway.requests[2].body).toContain("tool_execution_failed");
           expect(gateway.requests[2].body).not.toContain(serialized);
+          expect(existsSync(mcp.callLogPath)).toBe(false);
         }
-        expect(existsSync(mcp.callLogPath)).toBe(false);
         expect(result.stderr).not.toContain(serialized);
         expect(trace).not.toContain(serialized);
         await waitForProcessExit(pid);
@@ -6929,6 +7478,215 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       expect(gateway.requestCount()).toBe(11);
       expect(gateway.requests[10]!.body).not.toContain(partialText);
       expectOnlyLeadingSystemMessages(gateway.requests[10]!.body);
+    } finally {
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  });
+
+  test("tool call ids remain canonical in storage and portable on model switch", async () => {
+    const root = createFixtureRoot("portable-call-ids");
+    const tracePath = join(root.root, "trace.log");
+    const ids = ["functions.read_file:0", "c".repeat(256), "call_keep"];
+    writeFileSync(join(root.workspace, "fixture.txt"), "id projection fixture\n");
+    const responses = [
+      fakeGatewaySse([
+        ...ids.map((id) => ({ type: "tool-call", toolCallId: id, toolName: "read_file", input: { path: "fixture.txt" } })),
+        { type: "finish", finishReason: { unified: "tool-calls", raw: "tool-calls" } },
+      ]),
+      fakeGatewayFinalText("Read the fixture."),
+    ];
+    const gateway = startDynamicFakeGateway(() =>
+      responses.shift() ?? new Response("unexpected request", { status: 400 }),
+      { classifierDecision: "clear", models: [MODEL, DEFAULT_MODEL].map((id) => ({ id, type: "language", tags: ["tool-use"] })) },
+    );
+    try {
+      const result = await runFx(["ask", "--json", "--auto", "Read fixture.txt."], {
+        cwd: root.workspace, env: fixtureEnv(root, gateway, tracePath), timeoutMs: 15_000,
+      });
+      expect(result.code).toBe(0);
+      expect(result.signal).toBeNull();
+      const json = parseAskJson(result.stdout);
+      expect(json.tool_calls).toEqual(ids.map(() => ({ name: "read_file", status: "success" })));
+      expect(gateway.requests).toHaveLength(2);
+      const firstParts = JSON.parse(gateway.requests[1]!.body).prompt.flatMap((message: { content: unknown }) => Array.isArray(message.content) ? message.content : []);
+      const wireIds = firstParts.filter((part: { type: string }) => part.type === "tool-call").map((part: { toolCallId: string }) => part.toolCallId);
+      expect(wireIds).toHaveLength(3);
+      expect(new Set(wireIds).size).toBe(3);
+      for (const id of wireIds) {
+        expect(id).toMatch(/^[a-zA-Z0-9_-]{1,64}$/);
+        expect(toolResultOutput(gateway.requests[1]!.body, id)).toContain("id projection fixture");
+      }
+      expect(wireIds[0]).not.toBe(ids[0]);
+      expect(wireIds[1]).not.toBe(ids[1]);
+      expect(wireIds[2]).toBe(ids[2]);
+      const detail = await runFx(["session", "--id", json.session_id, "--json"], {
+        cwd: root.workspace, env: { HOME: root.home },
+      });
+      expect(detail.code).toBe(0);
+      const step = JSON.parse(detail.stdout).history[0].execution.tool_steps[0];
+      expect(step.tool_calls.map((call: { id: string }) => call.id)).toEqual(ids);
+      expect(step.tool_results.map((result: { tool_call_id: string }) => result.tool_call_id)).toEqual(ids);
+
+      responses.push(fakeGatewayFinalText("Resumed without more tools."));
+      const resumed = await runFx(["ask", "--json", "--auto", "--resume-id", json.session_id, "What did you read?"], {
+        cwd: root.workspace,
+        env: { ...fixtureEnv(root, gateway, tracePath), FX_MODEL: DEFAULT_MODEL },
+        timeoutMs: 15_000,
+      });
+      expect(resumed.code).toBe(0);
+      expect(resumed.stderr).toBe("");
+      expect(JSON.parse(resumed.stdout).model).toBe(DEFAULT_MODEL);
+      expect(parseAskJson(resumed.stdout).tool_calls).toEqual([]);
+      expect(gateway.requests).toHaveLength(3);
+      for (const id of wireIds) expect(toolResultOutput(gateway.requests[2]!.body, id)).toContain("id projection fixture");
+    } finally {
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  });
+
+  test("unstorable tool identities reject the batch and preserve earlier saved work", async () => {
+    for (const kind of ["empty-name", "missing-name", "null-name", "long-name", "long-id", "long-provisional"]) {
+      const root = createFixtureRoot(`identity-${kind}`);
+      const tracePath = join(root.root, "trace.log");
+      const invalid: Record<string, unknown> = {
+        type: "tool-call", toolCallId: kind === "long-id" ? "i".repeat(257) : "bad",
+        toolName: "unknown_tool", input: {},
+      };
+      if (kind === "empty-name") invalid.toolName = "";
+      if (kind === "missing-name") delete invalid.toolName;
+      if (kind === "null-name") invalid.toolName = null;
+      if (kind === "long-name") invalid.toolName = "n".repeat(257);
+      const streamed = kind === "long-provisional" ? [
+        { type: "tool-input-start", id: "p".repeat(257), toolName: "unknown_tool" },
+        { type: "tool-input-delta", id: "p".repeat(257), delta: "{}" },
+        { type: "tool-input-end", id: "p".repeat(257) },
+      ] : [];
+      const responses = [
+        fakeGatewayToolCall("prior", "write_file", { path: "prior.txt", content: "settled" }),
+        fakeGatewaySse([
+          ...streamed,
+          { type: "tool-call", toolCallId: "sibling", toolName: "write_file", input: { path: "must-not-exist.txt", content: "unexpected effect" } },
+          invalid,
+          { type: "finish", finishReason: { unified: "tool-calls", raw: "tool_calls" } },
+        ]),
+      ];
+      const gateway = startGateway(() => responses.shift() ?? new Response("unexpected request", { status: 400 }));
+      try {
+        const env = fixtureEnv(root, gateway, tracePath);
+        const result = await runFx(["ask", "--json", "--auto", "Create prior.txt, then must-not-exist.txt."], {
+          cwd: root.workspace, env, timeoutMs: 15_000,
+        });
+        expect(result.code, kind).toBe(1);
+        expect(result.signal).toBeNull();
+        expect(result.stdout).toContain("MalformedAuthoritativeToolIdentity");
+        expect(readFileSync(join(root.workspace, "prior.txt"), "utf8")).toBe("settled");
+        expect(existsSync(join(root.workspace, "must-not-exist.txt"))).toBe(false);
+        expect(gateway.requests).toHaveLength(2);
+        const json = parseAskJson(result.stdout);
+        expect(json.tool_calls).toEqual([{ name: "write_file", status: "success" }]);
+        const detail = await runFx(["session", "--id", json.session_id, "--json"], { cwd: root.workspace, env });
+        expect(detail.code).toBe(0);
+        const history = JSON.parse(detail.stdout).history;
+        expect(history).toHaveLength(1);
+        expect(history[0].execution.tool_steps).toHaveLength(1);
+        expect(history[0].execution.tool_steps[0].tool_calls.map((call: { id: string }) => call.id)).toEqual(["prior"]);
+        const field = kind === "long-id" ? "id" : kind === "long-provisional" ? "provisional_id" : "name";
+        expect(readFileSync(tracePath, "utf8")).toContain(`field=${field} failure=${kind.startsWith("long-") ? "too_long" : "empty"}`);
+
+        responses.push(fakeGatewayFinalText("The prior write is retained."));
+        const resumed = await runFx(["ask", "--json", "--auto", "--resume-id", json.session_id, "What was completed?"], {
+          cwd: root.workspace, env, timeoutMs: 15_000,
+        });
+        expect(resumed.code).toBe(0);
+        expect(parseAskJson(resumed.stdout).tool_calls).toEqual([]);
+        expect(gateway.requests).toHaveLength(3);
+        expect(toolResultOutput(gateway.requests[2]!.body, "prior")).toContain("wrote prior.txt");
+        const parts = JSON.parse(gateway.requests[2]!.body).prompt.flatMap((message: { content: unknown }) => Array.isArray(message.content) ? message.content : []);
+        expect(parts.filter((part: { type: string }) => part.type === "tool-call").map((part: { toolCallId: string }) => part.toolCallId)).toEqual(["prior"]);
+      } finally {
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    }
+  });
+
+  test("blank current tool id is rejected before file execution", async () => {
+    const root = createFixtureRoot("blank-call-id");
+    const tracePath = join(root.root, "trace.log");
+    const gateway = startGateway(() => fakeGatewayToolCall(" \t", "write_file", {
+      path: "must-not-exist.txt", content: "unexpected effect",
+    }));
+    try {
+      const result = await runFx(["ask", "--json", "--auto", "--no-save", "Write the fixture file."], {
+        cwd: root.workspace, env: fixtureEnv(root, gateway, tracePath), timeoutMs: 15_000,
+      });
+      expect(result.code).toBe(1);
+      expect(result.stdout).toContain("MalformedAuthoritativeToolIdentity");
+      expect(parseAskJson(result.stdout).tool_calls).toEqual([]);
+      expect(gateway.requests).toHaveLength(1);
+      expect(existsSync(join(root.workspace, "must-not-exist.txt"))).toBe(false);
+    } finally {
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  });
+
+  test("silent-tool continuation omits blank assistant text and keeps settled results", async () => {
+    const root = createFixtureRoot("blank-continuation");
+    const tracePath = join(root.root, "trace.log");
+    writeFileSync(join(root.workspace, "fixture.txt"), "settled evidence\n");
+    const responses = [
+      fakeGatewayToolCall("read_1", "read_file", { path: "fixture.txt" }),
+      fakeGatewayToolCall("read_2", "read_file", { path: "fixture.txt" }),
+      fakeGatewayFinalText(" \t\r\n"),
+      fakeGatewayFinalText("Finished reading the fixture."),
+    ];
+    const gateway = startGateway(() =>
+      responses.shift() ?? new Response("unexpected request", { status: 400 })
+    );
+    try {
+      const result = await runFx(
+        ["ask", "--json", "--auto", "Read fixture.txt twice, then summarize it."],
+        { cwd: root.workspace, env: fixtureEnv(root, gateway, tracePath), timeoutMs: 15_000 },
+      );
+      expect(result.code).toBe(0);
+      expect(result.signal).toBeNull();
+      expect(result.stderr).toBe("Reading fixture.txt\nReading fixture.txt\n");
+      const json = parseAskJson(result.stdout);
+      expect(json.output).toContain("Finished reading the fixture.");
+      expect(json.tool_calls).toEqual([
+        { name: "read_file", status: "success" },
+        { name: "read_file", status: "success" },
+      ]);
+      expect(gateway.requests).toHaveLength(4);
+      const request = JSON.parse(gateway.requests[3]!.body);
+      const assistants = request.prompt.filter((message: { role: string }) => message.role === "assistant");
+      expect(assistants).toHaveLength(2);
+      expect(assistants.map((message: { content: Array<{ type: string; toolCallId: string }> }) => message.content.map((part) => [part.type, part.toolCallId])))
+        .toEqual([[["tool-call", "read_1"]], [["tool-call", "read_2"]]]);
+      expect(request.prompt.at(-1)).toEqual({
+        role: "user",
+        content: [{ type: "text", text: "Summarize what you just did." }],
+      });
+      for (const id of ["read_1", "read_2"]) {
+        expect(toolResultOutput(gateway.requests[3]!.body, id)).toContain("settled evidence");
+      }
+      responses.push(fakeGatewayFinalText("Resume complete."));
+      const resumed = await runFx(
+        ["ask", "--json", "--auto", "--resume-id", json.session_id, "What did you just read?"],
+        { cwd: root.workspace, env: fixtureEnv(root, gateway, tracePath), timeoutMs: 15_000 },
+      );
+      expect(resumed.code).toBe(0);
+      expect(resumed.stderr).toBe("");
+      expect(parseAskJson(resumed.stdout).tool_calls).toEqual([]);
+      expect(gateway.requests).toHaveLength(5);
+      expect(gateway.requests[4]!.body).toContain("Finished reading the fixture.");
+      for (const id of ["read_1", "read_2"]) {
+        expect(toolResultOutput(gateway.requests[4]!.body, id)).toContain("settled evidence");
+      }
+      expect(readFileSync(tracePath, "utf8")).toContain("injecting continuation after 2 silent tool steps");
     } finally {
       gateway.stop();
       rmSync(root.root, { recursive: true, force: true });
