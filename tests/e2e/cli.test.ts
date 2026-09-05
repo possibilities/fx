@@ -5449,12 +5449,12 @@ describe("cli: workspace access", () => {
       );
 
       const unsupportedNativeToolGate = await runFx(
-        ["--no-native-tools", "ask", "hello"],
+        ["--no-native-tools", "models"],
         { env: enabled },
       );
       expect(unsupportedNativeToolGate.code).toBe(1);
       expect(unsupportedNativeToolGate.stderr).toContain(
-        "--no-native-tools is only supported for interactive, resume, and ACP launches",
+        "--no-native-tools is only supported for interactive, resume, ask, and ACP launches",
       );
 
       const duplicateProjectInstructionGate = await runFx(
