@@ -372,6 +372,8 @@ fn runInteractiveWithDeps(comptime App: type, comptime cooperative: bool, alloc:
         app.takeUpgradeRelaunchRequest()
     else
         null;
+    const broker_relaunch_blocked = !cooperative and
+        launch.modifiers.hasCodexCredentialBrokerActivation();
     const relaunch_skill_roots = try cloneInvocationSkillRootsForRelaunch(
         App,
         alloc,
@@ -394,6 +396,22 @@ fn runInteractiveWithDeps(comptime App: type, comptime cooperative: bool, alloc:
         app.deinit();
         break :blk null;
     } else app.deinitWithResumeHandoff();
+    if (relaunch_request != null and broker_relaunch_blocked) {
+        if (handoff_value) |value| {
+            var handoff = value;
+            handoff.deinit(alloc);
+        }
+        // exec preserves the PID, but the replacement would mint a new broker
+        // nonce and cannot authenticate the existing host channel. Carrying
+        // that secret in argv would expose the authority it protects, so a
+        // fresh host launch is the only valid replacement. Never print a
+        // partial recovery argv that silently omits the credential channel.
+        writeStderr(
+            deps,
+            "fx: upgrade installed; restart from your host to apply it. This session's credential channel cannot survive a restart.\n",
+        );
+        return .{ .exit = 1 };
+    }
     if (relaunch_request) |request| {
         if (handoff_value) |value| {
             var handoff = value;
@@ -1916,8 +1934,24 @@ const BrokerLifecycleTestApp = struct {
     }
 
     fn deinitWithResumeHandoff(self: *BrokerLifecycleTestApp) ?app_session_runtime.ResumeHandoff {
+        const handoff: ?app_session_runtime.ResumeHandoff = if (active_capture.?.resume_handoff_id) |id| blk: {
+            const session_id = std.testing.allocator.dupe(u8, id) catch {
+                self.deinit();
+                return null;
+            };
+            break :blk .{ .session_id = session_id };
+        } else null;
         self.deinit();
-        return null;
+        return handoff;
+    }
+
+    fn takeUpgradeRelaunchRequest(_: *BrokerLifecycleTestApp) ?auto_upgrade.RelaunchRequest {
+        const path = active_capture.?.upgrade_relaunch_path orelse return null;
+        var request = auto_upgrade.RelaunchRequest{
+            .executable_path_len = path.len,
+        };
+        @memcpy(request.executable_path_buf[0..path.len], path);
+        return request;
     }
 };
 
@@ -1994,5 +2028,43 @@ test "app entry starts the Codex credential broker before every other startup ca
         "stderr-attempt",
         "deinit",
         "credential-broker-activation-close",
+    });
+
+    // The upgrade remains installed, but process replacement cannot preserve
+    // the broker's per-instance nonce. Ask the host for a fresh launch and do
+    // not print a recovery command that silently drops credential authority.
+    var relaunch_capture = TestCapture.init(.{ .interactive = .{
+        .modifiers = .{ .codex_credential_fd = 3 },
+    } });
+    defer relaunch_capture.deinit();
+    relaunch_capture.resume_handoff_id = "session-123";
+    relaunch_capture.upgrade_relaunch_path = "/tmp/fx-upgraded";
+    const relaunch_outcome = try runWithDeps(
+        BrokerLifecycleTestApp,
+        alloc,
+        &.{},
+        testConfig(),
+        relaunch_capture.deps(),
+    );
+    try std.testing.expectEqual(@as(u8, 1), relaunch_outcome.exit);
+    try std.testing.expectEqual(@as(usize, 0), relaunch_capture.replace_calls);
+    try std.testing.expectEqualStrings(
+        "fx: upgrade installed; restart from your host to apply it. This session's credential channel cannot survive a restart.\n",
+        relaunch_capture.stderr.written(),
+    );
+    try expectEvents(&.{
+        "credential-broker-prepare",
+        "init:none",
+        "credential-broker-start",
+        "credential-broker-fd-three",
+        "mcp-discovery",
+        "auto-upgrade",
+        "file-index",
+        "worker-thread",
+        "model-cache",
+        "run",
+        "credential-broker-stop",
+        "terminal-release",
+        "deinit",
     });
 }
