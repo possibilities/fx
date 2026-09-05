@@ -1,14 +1,26 @@
 const std = @import("std");
 const builtin = @import("builtin");
+const builtin_mcp = @import("../builtins/mcp.zig");
 const io_mod = @import("../core/shared/io.zig");
 const debug_trace = @import("../core/shared/debug_trace.zig");
 const jsonrpc = @import("jsonrpc.zig");
 const acp_types = @import("types.zig");
 const mcp_servers = @import("mcp_servers.zig");
 const server = @import("server.zig");
+const app_history_home = @import("../core/app/app_history_home.zig");
+const credential_authority = @import("../core/auth/credential_authority.zig");
 const session_codec = @import("../core/session/session_codec.zig");
 const session_display_metadata = @import("../core/session/session_display_metadata.zig");
 const session_store = @import("../core/session/session_store.zig");
+
+/// Sessions, prompt history, and usage follow the selected history root; every
+/// other ACP read keeps the profile home that shaped or authorized this launch.
+fn historyHome(state: *const server.ServerState) ?[]const u8 {
+    return app_history_home.forSelection(
+        state.cfg.history_home_override,
+        state.cfg.home_override,
+    );
+}
 const legacy_background_migration = @import("../core/session/legacy_background_migration.zig");
 const js_host_session_store = @import("../core/session/js_host_session_store.zig");
 const session_runtime = @import("../core/session/session.zig");
@@ -58,9 +70,10 @@ pub fn handleNewLibfxSession(
     if (comptime !host_target.is_wasm) {
         _ = try session_rt.initializeProfileUsage(
             alloc,
-            state.cfg.home_override orelse io_mod.getenv("HOME"),
+            historyHome(state) orelse io_mod.getenv("HOME"),
         );
     }
+    session_rt.usage.setShape(state.cfg.shape, state.cfg.shape_label);
 
     state.active_session = .{
         .session_id = session_id,
@@ -201,6 +214,7 @@ pub fn handleNewSession(state: *server.ServerState, alloc: Allocator, msg: *json
         msg,
         mcp_configs.items.items.len,
     )) return;
+    try appendLaunchMcpConfigs(state, alloc, &mcp_configs);
     if (state.cfg.allow_acp_mcp) try appendProjectMcpConfigs(state, alloc, &mcp_configs);
     retireReducedActiveMcp(state, alloc, mcp_configs.items.items);
     var mcp_preparation = try mcp_servers.prepare(
@@ -208,6 +222,7 @@ pub fn handleNewSession(state: *server.ServerState, alloc: Allocator, msg: *json
         &mcp_configs,
         state.client_elicitation,
         server.legacyUrlCompletionSink(state),
+        state.cfg.home_override,
     );
     defer mcp_preparation.deinit(alloc);
     switch (mcp_preparation) {
@@ -226,7 +241,7 @@ pub fn handleNewSession(state: *server.ServerState, alloc: Allocator, msg: *json
         }
     };
 
-    var store = (if (state.cfg.home_override) |home|
+    var store = (if (historyHome(state)) |home|
         session_store.Store.initFromHome(alloc, home, state.workspace_root)
     else
         session_store.Store.init(alloc, state.workspace_root)) catch
@@ -264,8 +279,9 @@ pub fn handleNewSession(state: *server.ServerState, alloc: Allocator, msg: *json
     defer if (session_rt_owned) session_rt.deinit(alloc);
     _ = try session_rt.initializeProfileUsage(
         alloc,
-        state.cfg.home_override orelse io_mod.getenv("HOME"),
+        historyHome(state) orelse io_mod.getenv("HOME"),
     );
+    session_rt.usage.setShape(state.cfg.shape, state.cfg.shape_label);
     if (writable.state.usage) |usage| {
         try session_rt.usage.restore(
             alloc,
@@ -547,6 +563,7 @@ fn handleRestoreSession(
         msg,
         mcp_configs.items.items.len,
     )) return;
+    try appendLaunchMcpConfigs(state, alloc, &mcp_configs);
     if (state.cfg.allow_acp_mcp) try appendProjectMcpConfigs(state, alloc, &mcp_configs);
     retireReducedActiveMcp(state, alloc, mcp_configs.items.items);
     var mcp_preparation = try mcp_servers.prepare(
@@ -554,6 +571,7 @@ fn handleRestoreSession(
         &mcp_configs,
         state.client_elicitation,
         server.legacyUrlCompletionSink(state),
+        state.cfg.home_override,
     );
     defer mcp_preparation.deinit(alloc);
     switch (mcp_preparation) {
@@ -611,7 +629,7 @@ fn handleRestoreSession(
         }
     }
 
-    var store = (if (state.cfg.home_override) |home|
+    var store = (if (historyHome(state)) |home|
         session_store.Store.initFromHome(alloc, home, state.workspace_root)
     else
         session_store.Store.init(alloc, state.workspace_root)) catch
@@ -675,8 +693,9 @@ fn handleRestoreSession(
     defer if (session_rt_owned) session_rt.deinit(alloc);
     _ = try session_rt.initializeProfileUsage(
         alloc,
-        state.cfg.home_override orelse io_mod.getenv("HOME"),
+        historyHome(state) orelse io_mod.getenv("HOME"),
     );
+    session_rt.usage.setShape(state.cfg.shape, state.cfg.shape_label);
     try session_rt.restoreWithPermissionState(
         alloc,
         writable.state.conversation_language,
@@ -823,6 +842,35 @@ fn appendProjectMcpConfigs(
     );
 }
 
+/// Adds the profile server set selected by the launch shape after any
+/// client-supplied ACP servers. The state profile remains the credential
+/// authority; selecting configuration never moves writable MCP credentials.
+fn appendLaunchMcpConfigs(
+    state: *server.ServerState,
+    alloc: Allocator,
+    configs: *mcp_servers.OwnedServerConfigs,
+) !void {
+    const owned_path = if (state.cfg.mcp_config_path == null)
+        if (state.cfg.home_override) |home|
+            try builtin_mcp.configPathFromHome(alloc, home)
+        else
+            null
+    else
+        null;
+    defer if (owned_path) |path| alloc.free(path);
+    const path = state.cfg.mcp_config_path orelse owned_path orelse return;
+    var profile = try builtin_mcp.loadConfigFromPath(alloc, path);
+    defer {
+        for (profile.items) |*config| config.deinit(alloc);
+        profile.deinit(alloc);
+    }
+    try project_config.appendWorkspaceAfterAcpPrimary(
+        alloc,
+        &configs.items,
+        &profile,
+    );
+}
+
 fn sendPendingRecoveryUpdate(
     state: *server.ServerState,
     alloc: Allocator,
@@ -918,6 +966,7 @@ fn freshAcpState(
     errdefer alloc.free(model);
     const history = try alloc.alloc(types.HistoryTurn, 0);
     errdefer alloc.free(history);
+    const provenance = try acpProvenance(state, alloc);
     return .{
         .id = id,
         .origin_workspace_root = origin,
@@ -934,6 +983,27 @@ fn freshAcpState(
         .history = history,
         .total_input_tokens = 0,
         .total_output_tokens = 0,
+        .provenance = provenance,
+    };
+}
+
+/// The shape and credential in effect for an ACP session, recorded the same way
+/// the interactive surface records it so one history reads back identically.
+fn acpProvenance(
+    state: *server.ServerState,
+    alloc: Allocator,
+) !?session_codec.SessionProvenance {
+    const identity = state.cfg.shape orelse return null;
+    return .{
+        .shape = .{
+            .id = try alloc.dupe(u8, state.cfg.shape_label),
+            .identity = identity,
+        },
+        .credential_source = state.credential_source,
+        .credential_identity = if (state.credential_source) |source|
+            credential_authority.derive(source, state.account_id)
+        else
+            null,
     };
 }
 
@@ -1079,7 +1149,7 @@ pub fn handleListSessions(state: *server.ServerState, alloc: Allocator, msg: *js
             .code = ErrorCode.invalid_params,
             .message = "Invalid params",
         });
-    var store = (if (state.cfg.home_override) |home|
+    var store = (if (historyHome(state)) |home|
         session_store.Store.initReadOnlyFromHome(alloc, home, params.cwd orelse state.workspace_root)
     else
         session_store.Store.initReadOnly(alloc, params.cwd orelse state.workspace_root)) catch {
@@ -1965,6 +2035,47 @@ test "ACP project MCP loading expands workspace environment templates" {
     try std.testing.expectEqualStrings("node", config.command.?);
     try std.testing.expectEqualStrings("fallback", config.args[0]);
     try std.testing.expectEqualStrings("secret-value", config.env[0].value);
+}
+
+test "ACP launch MCP configuration follows the selected profile file" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io_mod.getIo(), "shape/.fx");
+    try tmp.dir.writeFile(io_mod.getIo(), .{
+        .sub_path = "shape/.fx/mcp.json",
+        .data =
+        \\{"mcp":{"client-wins":{"command":"/bin/false"},"shape-only":{"command":"/bin/true"}}}
+        ,
+    });
+    const config_path = try io_mod.dirRealpathAlloc(
+        alloc,
+        tmp.dir,
+        "shape/.fx/mcp.json",
+    );
+    defer alloc.free(config_path);
+    var capture = try tmp.dir.createFile(io_mod.getIo(), "capture.jsonl", .{});
+    defer capture.close(io_mod.getIo());
+
+    var state = server.ServerState{
+        .alloc = alloc,
+        .cfg = acpSessionTestConfig(),
+        .writer = .{ .stdout = capture },
+    };
+    state.cfg.mcp_config_path = config_path;
+    var configs = try mcp_servers.parse(
+        alloc,
+        "{\"mcpServers\":[{\"name\":\"client-wins\",\"command\":\"/bin/echo\",\"args\":[],\"env\":[]}]}",
+    );
+    defer configs.deinit(alloc);
+
+    try appendLaunchMcpConfigs(&state, alloc, &configs);
+
+    try std.testing.expectEqual(@as(usize, 2), configs.items.items.len);
+    try std.testing.expectEqualStrings("client-wins", configs.items.items[0].name);
+    try std.testing.expectEqualStrings("/bin/echo", configs.items.items[0].command.?);
+    try std.testing.expectEqualStrings("shape-only", configs.items.items[1].name);
+    try std.testing.expectEqualStrings("/bin/true", configs.items.items[1].command.?);
 }
 
 test "ACP host-disabled new load and resume skip project MCP effects" {

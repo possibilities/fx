@@ -1194,6 +1194,24 @@ pub const ProviderPreparationIntent = union(enum) {
     },
 };
 
+/// Borrows an already-valid saved credential from a read-only profile home.
+/// The resolution never refreshes or writes there; its failure is the outcome.
+fn readOnlyCredential(
+    alloc: Allocator,
+    provider: model_provider.ProviderId,
+    preferred: ?credentials.Source,
+    home: []const u8,
+) anyerror!?credentials.Credential {
+    var resolution = try credentials.resolveReadOnlyForProviderFromHome(alloc, provider, preferred, home);
+    if (resolution.failure) |failure| {
+        if (resolution.credential) |*credential| credential.deinit(alloc);
+        return failure.err;
+    }
+    const credential = resolution.credential;
+    resolution.credential = null;
+    return credential;
+}
+
 pub const ProviderPreparationInput = struct {
     intent: ProviderPreparationIntent,
     catalog_provider: model_catalog.Provider,
@@ -1202,6 +1220,9 @@ pub const ProviderPreparationInput = struct {
     primary_model: ?[]const u8 = null,
     preferred_model: ?[]const u8 = null,
     candidate: ?credentials.Credential = null,
+    /// Borrow an already-valid saved credential from this profile, read only:
+    /// preparation never refreshes, deletes, or replaces bytes there.
+    read_only_home: ?[]const u8 = null,
 
     pub fn target(self: ProviderPreparationInput) model_provider.ProviderId {
         return switch (self.intent) {
@@ -1242,8 +1263,10 @@ pub const ProviderPreparation = struct {
         self.input.preferred_model = null;
         self.input.candidate = null;
         self.input.models_path = "";
+        self.input.read_only_home = null;
         errdefer self.deinit();
         if (runtime.profile_home) |home| self.profile_home = try alloc.dupe(u8, home);
+        if (input.read_only_home) |home| self.input.read_only_home = try alloc.dupe(u8, home);
         self.input.models_path = try alloc.dupe(u8, input.models_path);
         if (input.primary_model) |value| self.input.primary_model = try alloc.dupe(u8, value);
         if (input.preferred_model) |value| self.input.preferred_model = try alloc.dupe(u8, value);
@@ -1259,7 +1282,9 @@ pub const ProviderPreparation = struct {
             self.credential = candidate;
             self.input.candidate = null;
         } else if (!self.host_managed) {
-            self.credential = (if (self.profile_home) |home|
+            self.credential = (if (self.input.read_only_home) |home|
+                readOnlyCredential(self.alloc, self.input.target(), self.input.preferred_source, home)
+            else if (self.profile_home) |home|
                 prepareCredentialFromHome(
                     self.alloc,
                     .{ .context = self, .execute_fn = executeCancellable },
@@ -1328,6 +1353,7 @@ pub const ProviderPreparation = struct {
         if (self.input.primary_model) |value| self.alloc.free(value);
         if (self.input.preferred_model) |value| self.alloc.free(value);
         if (self.profile_home) |home| self.alloc.free(home);
+        if (self.input.read_only_home) |home| self.alloc.free(home);
         self.alloc.free(self.input.models_path);
         const alloc = self.alloc;
         alloc.destroy(self);

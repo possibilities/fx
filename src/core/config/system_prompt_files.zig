@@ -1,24 +1,111 @@
 const std = @import("std");
 const io_mod = @import("../shared/io.zig");
+const profile_paths = @import("../shared/profile_paths.zig");
 const text_utils = @import("../shared/text_utils.zig");
 
 const Allocator = std.mem.Allocator;
 
 pub const max_custom_bytes: usize = 256 * 1024;
 
+pub const StateConventionResult = union(enum) {
+    bypassed,
+    absent,
+    applied_replacement,
+    applied_append,
+    conflicting,
+    failure: Failure,
+};
+
 pub const Request = struct {
     replacement_path: ?[]u8 = null,
     append_paths: [][]u8 = &.{},
+    state_path: ?[]u8 = null,
+    state_content: ?[]u8 = null,
+    state_replaces_base: bool = false,
 
     pub fn deinit(self: *Request, alloc: Allocator) void {
         if (self.replacement_path) |path| alloc.free(path);
         for (self.append_paths) |path| alloc.free(path);
         if (self.append_paths.len > 0) alloc.free(self.append_paths);
+        if (self.state_path) |path| alloc.free(path);
+        if (self.state_content) |content| alloc.free(content);
         self.* = .{};
     }
 
     pub fn requested(self: Request) bool {
-        return self.replacement_path != null or self.append_paths.len > 0;
+        return self.replacement_path != null or self.append_paths.len > 0 or self.state_content != null;
+    }
+
+    /// Duplicates only invocation-owned paths. Prepared state content is
+    /// process-local and must be rediscovered from --state-dir on relaunch.
+    pub fn cloneForPreparation(self: Request, alloc: Allocator) !Request {
+        std.debug.assert(self.state_path == null and self.state_content == null);
+        var result: Request = .{};
+        errdefer result.deinit(alloc);
+        if (self.replacement_path) |path| {
+            result.replacement_path = try alloc.dupe(u8, path);
+        }
+        if (self.append_paths.len > 0) {
+            const paths = try alloc.alloc([]u8, self.append_paths.len);
+            var initialized: usize = 0;
+            errdefer {
+                for (paths[0..initialized]) |path| alloc.free(path);
+                alloc.free(paths);
+            }
+            for (self.append_paths) |path| {
+                paths[initialized] = try alloc.dupe(u8, path);
+                initialized += 1;
+            }
+            result.append_paths = paths;
+        }
+        return result;
+    }
+
+    /// Adds the selected state root's conventional system prompt to this
+    /// owned request. An explicit replacement is authoritative and bypasses
+    /// discovery; an explicit append remains after the state-derived base.
+    pub fn applyStateConvention(
+        self: *Request,
+        alloc: Allocator,
+        state_home: []const u8,
+    ) !StateConventionResult {
+        if (self.replacement_path != null) return .bypassed;
+
+        var profile_dir = (try openStateProfile(state_home)) orelse return .absent;
+        defer profile_dir.close(io_mod.getIo());
+
+        const presence = try inspectStateConvention(profile_dir);
+        if (presence.replacement and presence.append) return .conflicting;
+        const replaces_base = presence.replacement;
+        const file_name = if (replaces_base)
+            profile_paths.system_prompt_file_name
+        else if (presence.append)
+            profile_paths.system_prompt_append_file_name
+        else
+            return .absent;
+
+        const path = if (replaces_base)
+            try profile_paths.systemPromptPath(alloc, state_home)
+        else
+            try profile_paths.systemPromptAppendPath(alloc, state_home);
+        self.state_path = path;
+        const loaded = try loadOneFromDir(alloc, profile_dir, file_name, path, 0);
+        switch (loaded) {
+            .failure => |failure| return .{ .failure = failure },
+            .content => |content| {
+                errdefer alloc.free(content);
+                const current_presence = try inspectStateConvention(profile_dir);
+                if (current_presence.replacement != presence.replacement or
+                    current_presence.append != presence.append)
+                {
+                    return error.StateConventionChanged;
+                }
+                self.state_content = content;
+                self.state_replaces_base = replaces_base;
+            },
+        }
+
+        return if (replaces_base) .applied_replacement else .applied_append;
     }
 
     pub fn compose(self: Request, alloc: Allocator, base: []const u8) !ComposeResult {
@@ -28,14 +115,14 @@ pub const Request = struct {
             pieces.deinit(alloc);
         }
 
-        var custom_bytes: usize = 0;
+        var custom_bytes: usize = if (self.state_content) |content| content.len else 0;
         if (self.replacement_path) |path| {
             const loaded = try loadOne(alloc, path, custom_bytes);
             switch (loaded) {
                 .failure => |failure| return .{ .failure = failure },
                 .content => |content| {
                     custom_bytes += content.len;
-                    try pieces.append(alloc, content);
+                    try appendOwnedPiece(&pieces, alloc, content);
                 },
             }
         }
@@ -45,7 +132,7 @@ pub const Request = struct {
                 .failure => |failure| return .{ .failure = failure },
                 .content => |content| {
                     custom_bytes += content.len;
-                    try pieces.append(alloc, content);
+                    try appendOwnedPiece(&pieces, alloc, content);
                 },
             }
         }
@@ -53,10 +140,10 @@ pub const Request = struct {
         var out: std.Io.Writer.Allocating = .init(alloc);
         errdefer out.deinit();
         const writer = &out.writer;
-        if (self.replacement_path == null) try writer.writeAll(base);
+        if (self.replacement_path == null and !self.state_replaces_base) try writer.writeAll(base);
+        if (self.state_content) |content| try writePiece(writer, content);
         for (pieces.items) |piece| {
-            if (writer.buffered().len > 0 and piece.len > 0) try writer.writeAll("\n\n");
-            try writer.writeAll(piece);
+            try writePiece(writer, piece);
         }
         return .{ .prompt = try out.toOwnedSlice() };
     }
@@ -84,44 +171,103 @@ const LoadResult = union(enum) {
     failure: Failure,
 };
 
+const StateConventionPresence = struct {
+    replacement: bool = false,
+    append: bool = false,
+};
+
+fn openStateProfile(state_home: []const u8) !?std.Io.Dir {
+    const io = io_mod.getIo();
+    var state_dir = try io_mod.openDirAbsoluteNoFollow(state_home, .{ .iterate = true });
+    defer state_dir.close(io);
+
+    var state_entries = state_dir.iterate();
+    while (try state_entries.next(io)) |entry| {
+        if (std.mem.eql(u8, entry.name, profile_paths.root_dir_name)) {
+            return try state_dir.openDir(io, profile_paths.root_dir_name, .{
+                .iterate = true,
+                .follow_symlinks = false,
+            });
+        }
+    }
+    return null;
+}
+
+fn inspectStateConvention(profile_dir: std.Io.Dir) !StateConventionPresence {
+    const io = io_mod.getIo();
+    var presence: StateConventionPresence = .{};
+    var entries = profile_dir.iterate();
+    while (try entries.next(io)) |entry| {
+        if (std.mem.eql(u8, entry.name, profile_paths.system_prompt_file_name)) {
+            presence.replacement = true;
+        } else if (std.mem.eql(u8, entry.name, profile_paths.system_prompt_append_file_name)) {
+            presence.append = true;
+        }
+        if (presence.replacement and presence.append) break;
+    }
+    return presence;
+}
+
+fn appendOwnedPiece(pieces: *std.ArrayList([]u8), alloc: Allocator, content: []u8) !void {
+    pieces.append(alloc, content) catch |err| {
+        alloc.free(content);
+        return err;
+    };
+}
+
+fn writePiece(writer: *std.Io.Writer, piece: []const u8) !void {
+    if (writer.buffered().len > 0 and piece.len > 0) try writer.writeAll("\n\n");
+    try writer.writeAll(piece);
+}
+
 fn loadOne(alloc: Allocator, path: []const u8, custom_bytes: usize) !LoadResult {
-    if (custom_bytes > max_custom_bytes) return .{ .failure = .{ .path = path, .reason = .too_large } };
+    return loadOneFromDir(alloc, std.Io.Dir.cwd(), path, path, custom_bytes);
+}
+
+fn loadOneFromDir(
+    alloc: Allocator,
+    dir: std.Io.Dir,
+    sub_path: []const u8,
+    display_path: []const u8,
+    custom_bytes: usize,
+) !LoadResult {
+    if (custom_bytes > max_custom_bytes) return .{ .failure = .{ .path = display_path, .reason = .too_large } };
 
     // Inspect the path before opening it so a directory, device, or FIFO cannot
     // be treated as a prompt source (and, in particular, a FIFO cannot block
     // launch while waiting for a writer). Recheck the opened handle below: a
     // path may change between the two operations.
-    const initial_stat = std.Io.Dir.cwd().statFile(io_mod.getIo(), path, .{}) catch
-        return .{ .failure = .{ .path = path, .reason = .unreadable } };
-    if (initial_stat.kind != .file) return .{ .failure = .{ .path = path, .reason = .not_regular_file } };
+    const initial_stat = dir.statFile(io_mod.getIo(), sub_path, .{}) catch
+        return .{ .failure = .{ .path = display_path, .reason = .unreadable } };
+    if (initial_stat.kind != .file) return .{ .failure = .{ .path = display_path, .reason = .not_regular_file } };
 
     var file = io_mod.openExistingReadOnlyRegularFile(
-        std.Io.Dir.cwd(),
-        path,
+        dir,
+        sub_path,
         .follow,
     ) catch |err| switch (err) {
-        error.DurablePathUnsafe => return .{ .failure = .{ .path = path, .reason = .not_regular_file } },
-        else => return .{ .failure = .{ .path = path, .reason = .unreadable } },
+        error.DurablePathUnsafe => return .{ .failure = .{ .path = display_path, .reason = .not_regular_file } },
+        else => return .{ .failure = .{ .path = display_path, .reason = .unreadable } },
     };
     defer file.close(io_mod.getIo());
     const stat = file.stat(io_mod.getIo()) catch
-        return .{ .failure = .{ .path = path, .reason = .unreadable } };
-    if (stat.kind != .file) return .{ .failure = .{ .path = path, .reason = .not_regular_file } };
+        return .{ .failure = .{ .path = display_path, .reason = .unreadable } };
+    if (stat.kind != .file) return .{ .failure = .{ .path = display_path, .reason = .not_regular_file } };
 
     const remaining = max_custom_bytes - custom_bytes;
-    if (stat.size > remaining) return .{ .failure = .{ .path = path, .reason = .too_large } };
+    if (stat.size > remaining) return .{ .failure = .{ .path = display_path, .reason = .too_large } };
     const content = io_mod.readFileToEnd(alloc, &file, remaining + 1) catch |err| switch (err) {
-        error.StreamTooLong => return .{ .failure = .{ .path = path, .reason = .too_large } },
+        error.StreamTooLong => return .{ .failure = .{ .path = display_path, .reason = .too_large } },
         error.OutOfMemory => return error.OutOfMemory,
-        else => return .{ .failure = .{ .path = path, .reason = .unreadable } },
+        else => return .{ .failure = .{ .path = display_path, .reason = .unreadable } },
     };
     if (content.len > remaining) {
         alloc.free(content);
-        return .{ .failure = .{ .path = path, .reason = .too_large } };
+        return .{ .failure = .{ .path = display_path, .reason = .too_large } };
     }
     if (!text_utils.isModelSafeText(content)) {
         alloc.free(content);
-        return .{ .failure = .{ .path = path, .reason = .invalid_text } };
+        return .{ .failure = .{ .path = display_path, .reason = .invalid_text } };
     }
     return .{ .content = content };
 }

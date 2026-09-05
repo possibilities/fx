@@ -554,10 +554,15 @@ pub fn loadRuntime(
     workspace_root: []const u8,
     elicitation_capabilities: elicitation.Capabilities,
     profile_home: ?[]const u8,
+    selected_config_path: ?[]const u8,
 ) !?*mcp_runtime.McpRuntime {
     var profile: std.ArrayList(McpServerConfig) = .empty;
     defer freeConfigs(alloc, &profile);
-    if (profile_home orelse io_mod.getenv("HOME")) |home| {
+    if (selected_config_path) |selected| {
+        // A shape names its own server set. Its credentials still belong to the
+        // profile home, so only the configuration moves.
+        profile = try loadConfigFromPath(alloc, selected);
+    } else if (profile_home orelse io_mod.getenv("HOME")) |home| {
         const config_path = try configPathFromHome(alloc, home);
         defer alloc.free(config_path);
         profile = try loadConfigFromPath(alloc, config_path);
@@ -1340,7 +1345,7 @@ test "built-in MCP runtime returns null when HOME is missing" {
     const home = try TestHome.install(alloc, null);
     defer home.deinit();
 
-    try std.testing.expect(try loadRuntime(alloc, "/", .{}, null) == null);
+    try std.testing.expect(try loadRuntime(alloc, "/", .{}, null, null) == null);
 }
 
 test "MCP config diagnostic treats nonblocking profile states as clear" {
@@ -1399,7 +1404,7 @@ test "MCP config diagnostic preserves the startup parser error" {
         .clear, .warning => return error.TestUnexpectedResult,
         .failed => |err| try std.testing.expectEqual(error.McpConfigInvalidJson, err),
     }
-    try std.testing.expectError(error.McpConfigInvalidJson, loadRuntime(alloc, "/", .{}, null));
+    try std.testing.expectError(error.McpConfigInvalidJson, loadRuntime(alloc, "/", .{}, null, null));
 }
 
 test "MCP config diagnostic propagates allocation failure" {
@@ -1484,7 +1489,7 @@ test "workspace MCP missing environment variable is actionable and secret free" 
     const environment = try TestHome.install(alloc, home_path);
     defer environment.deinit();
 
-    const runtime = try loadRuntime(alloc, workspace_root, .{}, null) orelse
+    const runtime = try loadRuntime(alloc, workspace_root, .{}, null, null) orelse
         return error.TestUnexpectedResult;
     defer {
         runtime.deinit();
@@ -1514,7 +1519,7 @@ test "built-in MCP runtime loads disabled configured servers without spawning" {
     const home = try TestHome.install(alloc, home_path);
     defer home.deinit();
 
-    const runtime = try loadRuntime(alloc, "/", .{}, null) orelse return error.TestUnexpectedResult;
+    const runtime = try loadRuntime(alloc, "/", .{}, null, null) orelse return error.TestUnexpectedResult;
     defer {
         runtime.deinit();
         alloc.destroy(runtime);
@@ -1545,7 +1550,7 @@ test "built-in MCP runtime loads config from the selected profile home" {
     const home = try TestHome.install(alloc, ambient_home);
     defer home.deinit();
 
-    const runtime = try loadRuntime(alloc, "/", .{}, selected_home) orelse
+    const runtime = try loadRuntime(alloc, "/", .{}, selected_home, null) orelse
         return error.TestUnexpectedResult;
     defer {
         runtime.deinit();
@@ -1571,7 +1576,7 @@ test "built-in MCP runtime loading leaves enabled servers disconnected" {
     const home = try TestHome.install(alloc, home_path);
     defer home.deinit();
 
-    const runtime = try loadRuntime(alloc, "/", .{}, null) orelse return error.TestUnexpectedResult;
+    const runtime = try loadRuntime(alloc, "/", .{}, null, null) orelse return error.TestUnexpectedResult;
     defer {
         runtime.deinit();
         alloc.destroy(runtime);
@@ -1642,7 +1647,7 @@ test "built-in MCP runtime reserves active registry names" {
     const home = try TestHome.install(alloc, home_path);
     defer home.deinit();
 
-    const runtime = try loadRuntime(alloc, "/", .{}, null) orelse return error.TestUnexpectedResult;
+    const runtime = try loadRuntime(alloc, "/", .{}, null, null) orelse return error.TestUnexpectedResult;
     defer {
         runtime.deinit();
         alloc.destroy(runtime);

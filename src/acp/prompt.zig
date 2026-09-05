@@ -4,6 +4,7 @@ const std_builtin = @import("builtin");
 const command_admission = @import("../core/permissions/command_admission.zig");
 const auth_runtime = @import("../core/auth/auth_runtime.zig");
 const credentials = @import("../core/auth/credentials.zig");
+const shape_authority = @import("../core/auth/shape_authority.zig");
 const model_provider = @import("../core/config/model_provider.zig");
 const host = @import("../core/hosts/host.zig");
 const host_target = @import("../core/hosts/target.zig");
@@ -998,6 +999,7 @@ fn buildAgentConfig(
 ) agent_runtime.Config {
     return .{
         .system_prompt = state.cfg.prompt_policy.system_prompt,
+        .shape = state.cfg.shape,
         .host_instructions = sections.host_instructions,
         .model_prompt_overlay = state.cfg.prompt_policy.modelPromptOverlay(session.model),
         .skill_catalog = sections.skill_catalog,
@@ -1323,6 +1325,8 @@ fn agentRuntimeDeps(ctx: *AcpContext) agent_runtime.AgentRuntimeDeps {
     const session = if (ctx.state.active_session) |*active| active else unreachable;
     return .{
         .ctx = @ptrCast(ctx),
+        .shape = ctx.state.cfg.shape,
+        .shape_label = ctx.state.cfg.shape_label,
         .agent_stream_provider = server.streamProviderFor(ctx.state, ctx.state.active_session.?.provider),
         .flush_assistant_stream_per_content_chunk = host_target.is_wasm,
         .render_assistant_text = false,
@@ -3743,6 +3747,32 @@ fn initTestAcpState(alloc: Allocator, workspace_root: []const u8, mode: Permissi
             .pending_prompt_id = null,
         },
     };
+}
+
+test "ACP recovery dependencies and config keep selected shape authority" {
+    const alloc = std.testing.allocator;
+    var state = try initTestAcpState(alloc, "/tmp/workspace", .ask);
+    defer state.deinit();
+    const shape = shape_authority.derive(.{ .system_prompt = "review carefully" });
+    state.cfg.shape = shape;
+    state.cfg.shape_label = "reviewer";
+
+    var ctx = AcpContext{
+        .alloc = alloc,
+        .state = &state,
+        .session_id = "session_1",
+    };
+    const deps = agentRuntimeDeps(&ctx);
+    try std.testing.expect(deps.shape.?.eql(shape));
+    try std.testing.expectEqualStrings("reviewer", deps.shape_label);
+
+    const config = buildAgentConfig(
+        &state,
+        &state.active_session.?,
+        .{ .custom_tool_guidance = "" },
+        false,
+    );
+    try std.testing.expect(config.shape.?.eql(shape));
 }
 
 test "stripAnsiAlloc returns the original slice for clean text and strips escapes" {

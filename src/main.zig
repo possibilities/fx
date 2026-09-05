@@ -13,6 +13,7 @@ const api_key_validator = @import("core/auth/api_key_validator.zig");
 const oauth_transport = @import("core/auth/oauth_transport.zig");
 const js_host_auth = @import("core/auth/js_host_auth.zig");
 const credentials = @import("core/auth/credentials.zig");
+const shape_authority = @import("core/auth/shape_authority.zig");
 const secret = @import("core/auth/secret.zig");
 const model_cache_runtime = @import("core/app/model_cache_runtime.zig");
 const usage_dashboard_runtime = @import("core/app/usage_dashboard_runtime.zig");
@@ -543,6 +544,20 @@ const App = struct {
     usage_dashboard: usage_dashboard_runtime.Runtime = usage_dashboard_runtime.Runtime.init(std.heap.c_allocator),
     /// Explicit Fx profile home; child processes continue to inherit real HOME.
     profile_home: ?[]const u8 = null,
+    /// Profile whose credential this launch borrows, read only, without moving
+    /// settings, sessions, or any other write away from the profile home.
+    identity_home: ?[]const u8 = null,
+    /// Root owning sessions, prompt history, and usage when history is kept
+    /// apart from the profile that shapes this instance.
+    history_home: ?[]const u8 = null,
+    /// The shape this instance is running, recorded beside every session it
+    /// writes so one history can be read back by shape and account. Resolved
+    /// once at launch; null only before the launch controls are applied.
+    shape: ?shape_authority.Identity = null,
+    /// Inline storage for the shape's label. A label is bounded, so owning it
+    /// here keeps it alive for the process without a second allocation to free.
+    shape_label_storage: [shape_authority.max_label_bytes]u8 = undefined,
+    shape_label_len: u8 = 0,
     workspace_root: []u8 = &.{},
     workspace_identity: statusline_identity.Runtime = .{},
     workspace_host: WorkspaceHostRuntime = .{},
@@ -601,6 +616,7 @@ const App = struct {
     mcp: app_mcp_runtime.State = .{},
     skills: skill_runtime.Runtime = .{},
     skill_root_policy: @import("core/skills/skill_contract.zig").RootPolicy = builtin_skills.root_policy,
+    invocation_skill_roots: [][]u8 = &.{},
     context_snapshot: context_contract.GatheredContextSnapshot = .{},
     file_index: file_index_mod.FileIndex = .{},
     context_enabled: bool = true,
@@ -631,8 +647,29 @@ const App = struct {
         _: []const u8,
         _: @import("core/mcp/elicitation.zig").Capabilities,
         _: ?[]const u8,
+        _: ?[]const u8,
     ) !?*mcp_runtime_mod.McpRuntime {
         return null;
+    }
+
+    /// Resolves the shape once the launch layer has composed the effective
+    /// prompt and canonicalized every path, while the launch controls still
+    /// own their storage. The label is copied so it outlives those controls.
+    fn adoptShape(
+        self: *Self,
+        modifiers: *const cli_surface.LaunchModifiers,
+        resolved_system_prompt: []const u8,
+    ) void {
+        self.shape = modifiers.shapeIdentity(resolved_system_prompt, true);
+        const label = modifiers.shapeLabel(true);
+        const length = @min(label.len, self.shape_label_storage.len);
+        @memcpy(self.shape_label_storage[0..length], label[0..length]);
+        self.shape_label_len = @intCast(length);
+    }
+
+    pub fn shapeLabel(self: *const Self) []const u8 {
+        if (self.shape_label_len == 0) return shape_authority.default_label;
+        return self.shape_label_storage[0..self.shape_label_len];
     }
 
     pub fn init(
@@ -688,7 +725,14 @@ const App = struct {
             }
         }
         app.profile_home = launch.modifiers.state_home;
+        app.identity_home = launch.modifiers.identity_home;
+        app.history_home = launch.modifiers.history_home;
+        app.adoptShape(
+            &launch.modifiers,
+            launch.modifiers.effective_system_prompt orelse builtin_context.prompt_policy.system_prompt,
+        );
         app.mcp.setProfileHome(app.profile_home);
+        app.mcp.setSelectedConfigPath(launch.modifiers.mcp_config_path);
         app.auth.setProfileHome(app.profile_home);
         app.shell.max_transcript_bytes = max_transcript_bytes;
         if (launch.requested_resume) |target| {
@@ -708,6 +752,7 @@ const App = struct {
                 .terminal_title = app.terminalTitle(),
             },
         );
+        app.invocation_skill_roots = launch.modifiers.takeInvocationSkillRoots();
         errdefer app.deinit();
         if (launch.modifiers.permission_policy) |policy| {
             app.permission_engine.replaceRules(
@@ -1093,6 +1138,8 @@ const App = struct {
         self.mcp.deinit(self.alloc);
         self.native_tool_selection.deinit(self.alloc);
         self.skills.deinit(std.heap.c_allocator);
+        for (self.invocation_skill_roots) |path| self.alloc.free(path);
+        if (self.invocation_skill_roots.len > 0) self.alloc.free(self.invocation_skill_roots);
         self.context_snapshot.deinit(self.alloc);
         self.file_index.deinit(std.heap.c_allocator);
         self.lifecycle_runtime.deinit();
@@ -3966,6 +4013,20 @@ test "interactive and resumed launch prompts transfer into the app policy" {
     }
 }
 
+test "interactive default shape hashes the built-in system prompt content" {
+    var app = App{ .alloc = std.testing.allocator };
+    const modifiers: cli_surface.LaunchModifiers = .{};
+
+    app.adoptShape(&modifiers, builtin_context.prompt_policy.system_prompt);
+
+    const expected = shape_authority.derive(.{
+        .system_prompt = builtin_context.prompt_policy.system_prompt,
+    });
+    try std.testing.expect(app.shape.?.eql(expected));
+    try std.testing.expect(!app.shape.?.eql(shape_authority.defaultIdentity()));
+    try std.testing.expectEqualStrings(shape_authority.default_label, app.shapeLabel());
+}
+
 test "lightweight local commands do not request early threaded io" {
     try std.testing.expect(!needsEarlyThreadedIo(&.{}));
     for ([_][:0]const u8{ "help", "sessions", "tasks", "permissions" }) |command| {
@@ -4570,6 +4631,7 @@ test {
     _ = @import("core/shared/display_width.zig");
     _ = @import("core/cli/doctor_runtime.zig");
     _ = @import("core/auth/login_flow.zig");
+    _ = @import("core/auth/shape_authority.zig");
     _ = @import("core/auth/chatgpt_oauth.zig");
     _ = @import("core/auth/provider_catalog.zig");
     _ = @import("gateway/openai_codex_models.zig");

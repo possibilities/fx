@@ -28,6 +28,8 @@ const text_utils = @import("../shared/text_utils.zig");
 const session_runtime = @import("../session/session.zig");
 const session_catalog = @import("../session/session_catalog.zig");
 const session_codec = @import("../session/session_codec.zig");
+const credential_authority = @import("../auth/credential_authority.zig");
+const app_history_home = @import("app_history_home.zig");
 const js_host_session_store = @import("../session/js_host_session_store.zig");
 const session_event = @import("../session/session_event.zig");
 const session_usage = @import("../session/session_usage.zig");
@@ -1191,11 +1193,8 @@ pub fn Runtime(comptime App: type) type {
             required: bool,
         ) !void {
             if (comptime !runtime_profile.allows(App, .durable_sessions)) return;
-            var store = (if (comptime @hasField(App, "profile_home"))
-                if (app.profile_home) |home_dir|
-                    session_store.Store.initFromHome(app.alloc, home_dir, app.workspace_root)
-                else
-                    session_store.Store.init(app.alloc, app.workspace_root)
+            var store = (if (app_history_home.forApp(app)) |home_dir|
+                session_store.Store.initFromHome(app.alloc, home_dir, app.workspace_root)
             else
                 session_store.Store.init(app.alloc, app.workspace_root)) catch |err| {
                 if (required) return err;
@@ -4674,6 +4673,11 @@ pub fn Runtime(comptime App: type) type {
                 value.deinit(app.alloc);
             }
             const usage = try app.session.usage.snapshot(app.alloc);
+            errdefer {
+                var value = usage;
+                value.deinit(app.alloc);
+            }
+            const provenance = try sessionProvenance(app);
             return .{
                 .id = id,
                 .origin_workspace_root = origin,
@@ -4687,6 +4691,36 @@ pub fn Runtime(comptime App: type) type {
                 .total_output_tokens = 0,
                 .permission_state = permission_state,
                 .usage = usage,
+                .provenance = provenance,
+            };
+        }
+
+        /// The shape and credential in effect, recorded beside the session id so
+        /// one history can be read back by the pair that produced it. Shape is
+        /// resolved once at launch; the credential is whichever one this launch
+        /// resolved, borrowed or its own.
+        fn sessionProvenance(app: *App) !?session_codec.SessionProvenance {
+            if (comptime !@hasField(App, "shape")) return null;
+            const identity = app.shape orelse return null;
+            const label = app.shapeLabel();
+            const credential_source = if (comptime @hasDecl(@TypeOf(app.auth), "credentialSource"))
+                app.auth.credentialSource()
+            else
+                null;
+            const account_id = if (comptime @hasDecl(@TypeOf(app.auth), "accountId"))
+                app.auth.accountId()
+            else
+                null;
+            return .{
+                .shape = .{
+                    .id = try app.alloc.dupe(u8, label),
+                    .identity = identity,
+                },
+                .credential_source = credential_source,
+                .credential_identity = if (credential_source) |source|
+                    credential_authority.derive(source, account_id)
+                else
+                    null,
             };
         }
 

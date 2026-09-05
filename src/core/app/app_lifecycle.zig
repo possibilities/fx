@@ -308,6 +308,9 @@ pub const BootstrapConfig = struct {
     default_agent_step_limit: usize,
     secret_store: host.SecretStore,
     profile_home: ?[]const u8 = null,
+    /// The profile whose credential this launch borrows, selected by
+    /// `--identity`. Settings, sessions, and every write stay where they are.
+    identity_home: ?[]const u8 = null,
     auth_mode: credentials.AuthMode = .local,
     resize_handler: ResizeHandler,
     fx_version: []const u8 = "",
@@ -457,6 +460,40 @@ pub fn loadCatalogStartupStateFromHomes(
         default_agent_step_limit,
         .local,
         state_home,
+        authorization_home,
+        .stored,
+    );
+    if (state.credential) |*credential| {
+        if (credential.needsRefreshAt(io_mod.milliTimestamp())) {
+            credential.deinit(alloc);
+            state.credential = null;
+        }
+    }
+    return state;
+}
+
+/// Loads startup state for a launch that keeps its ambient profile but borrows
+/// another profile's credential. The borrow is read only, so a refresh-due
+/// credential is dropped rather than rewritten into a profile this launch does
+/// not own.
+pub fn loadCatalogStartupStateBorrowingIdentity(
+    alloc: Allocator,
+    secret_store: host.SecretStore,
+    authorization_home: []const u8,
+    default_model: []const u8,
+    default_agent_step_limit: usize,
+    auth_mode: credentials.AuthMode,
+) !StartupState {
+    const workspace_root = try io_mod.realpathAlloc(alloc, ".");
+    var state = try loadStartupStateFromOwnedWorkspace(
+        alloc,
+        oauth_transport.unavailable_provider,
+        secret_store,
+        workspace_root,
+        default_model,
+        default_agent_step_limit,
+        auth_mode,
+        null,
         authorization_home,
         .stored,
     );
@@ -709,9 +746,10 @@ pub fn bootstrapInteractiveApp(cfg: BootstrapConfig) !StartupState {
     try cfg.shell.initBacking(cfg.alloc);
 
     const borrowed_authorization_home =
-        try credentials.readOnlyAuthorizationHomeFromEnvironment(
+        try credentials.borrowedAuthorizationHomeFromLaunch(
             cfg.alloc,
             cfg.profile_home,
+            cfg.identity_home,
         );
     defer if (borrowed_authorization_home) |home| cfg.alloc.free(home);
     var state = if (cfg.profile_home) |home_dir|
@@ -730,6 +768,15 @@ pub fn bootstrapInteractiveApp(cfg: BootstrapConfig) !StartupState {
                 cfg.default_model,
                 cfg.default_agent_step_limit,
             )
+    else if (borrowed_authorization_home) |authorization_home|
+        try loadCatalogStartupStateBorrowingIdentity(
+            cfg.alloc,
+            cfg.secret_store,
+            authorization_home,
+            cfg.default_model,
+            cfg.default_agent_step_limit,
+            cfg.auth_mode,
+        )
     else
         try loadCatalogStartupStateWithAuthMode(
             cfg.alloc,

@@ -8,6 +8,7 @@ const captured_command = @import("../tooling/captured_command.zig");
 const model_provider = @import("../config/model_provider.zig");
 const context_limits = @import("../config/context_limits.zig");
 const credential_authority = @import("../auth/credential_authority.zig");
+const shape_authority = @import("../auth/shape_authority.zig");
 
 const Allocator = std.mem.Allocator;
 const Sha256 = std.crypto.hash.sha2.Sha256;
@@ -40,23 +41,56 @@ pub const RecoveryToolState = enum {
     uncertain,
 };
 
+/// The shape an instance was running when a turn was produced: the operator's
+/// label for it, and the digest of the declaration behind that label.
+pub const ShapeAuthority = shape_authority.Reference;
+
+/// The shape and credential in effect for a session. Shape and identity are
+/// selected independently at launch, so neither one alone identifies what
+/// produced a history; this record keeps the pair beside the session id.
+pub const SessionProvenance = struct {
+    shape: ShapeAuthority,
+    credential_source: ?types.CredentialSource = null,
+    credential_identity: ?credential_authority.Identity = null,
+
+    pub fn deinit(self: *SessionProvenance, alloc: Allocator) void {
+        self.shape.deinit(alloc);
+        self.* = undefined;
+    }
+
+    pub fn dupe(self: SessionProvenance, alloc: Allocator) !SessionProvenance {
+        return .{
+            .shape = try self.shape.dupe(alloc),
+            .credential_source = self.credential_source,
+            .credential_identity = self.credential_identity,
+        };
+    }
+};
+
 pub const TurnAuthority = struct {
     provider: model_provider.ProviderId,
     model: []u8,
     credential_source: ?types.CredentialSource = null,
     credential_identity: ?credential_authority.Identity = null,
+    /// Null only for a turn recorded before shape authority existed.
+    shape: ?ShapeAuthority = null,
 
     pub fn deinit(self: *TurnAuthority, alloc: Allocator) void {
         alloc.free(self.model);
+        if (self.shape) |*value| value.deinit(alloc);
         self.* = undefined;
     }
 
     pub fn dupe(self: TurnAuthority, alloc: Allocator) !TurnAuthority {
+        const model = try alloc.dupe(u8, self.model);
+        errdefer alloc.free(model);
+        const shape = if (self.shape) |value| try value.dupe(alloc) else null;
         return .{
             .provider = self.provider,
-            .model = try alloc.dupe(u8, self.model),
+            .model = model,
             .credential_source = self.credential_source,
             .credential_identity = self.credential_identity,
+            .shape = shape,
         };
     }
 };
@@ -147,6 +181,9 @@ pub const DurableSessionState = struct {
     /// Active control state. It is never projected into model history and a
     /// restored checkpoint requires explicit host authority before any send.
     recovery_checkpoint: ?RecoveryCheckpoint = null,
+    /// The shape and credential in effect. Null only for a session written
+    /// before provenance was recorded, or by a host that supplies neither.
+    provenance: ?SessionProvenance = null,
 
     pub fn deinit(self: *DurableSessionState, alloc: Allocator) void {
         alloc.free(self.id);
@@ -158,6 +195,7 @@ pub const DurableSessionState = struct {
         if (self.last_subagent_work_id) |id| alloc.free(id);
         if (self.usage) |*usage| usage.deinit(alloc);
         if (self.recovery_checkpoint) |*checkpoint| checkpoint.deinit(alloc);
+        if (self.provenance) |*provenance| provenance.deinit(alloc);
         self.* = undefined;
     }
 
@@ -189,6 +227,15 @@ pub const DurableSessionState = struct {
             try checkpoint.dupe(alloc)
         else
             null;
+        errdefer if (recovery_checkpoint) |checkpoint| {
+            var owned = checkpoint;
+            owned.deinit(alloc);
+        };
+        const provenance = if (self.provenance) |value| try value.dupe(alloc) else null;
+        errdefer if (provenance) |value| {
+            var owned = value;
+            owned.deinit(alloc);
+        };
         const permission_state = try session_permission_state.dupe(
             alloc,
             self.permission_state,
@@ -211,6 +258,7 @@ pub const DurableSessionState = struct {
             .subagent_child = self.subagent_child,
             .usage = usage,
             .recovery_checkpoint = recovery_checkpoint,
+            .provenance = provenance,
         };
     }
 };
@@ -233,7 +281,77 @@ pub const SessionMetadata = struct {
     fast_mode: bool,
     title: ?[]const u8 = null,
     subagent_child: bool = false,
+    /// The shape and credential that created this conversation. Absent for a
+    /// session written before provenance was recorded, or by a host that
+    /// supplies neither. The manifest is where listings read it without replay.
+    provenance: ?ProvenanceMetadata = null,
 };
+
+/// Manifest form of `SessionProvenance`: hex digests and tag names so the
+/// strict JSON codec carries it without custom parsing.
+pub const ProvenanceMetadata = struct {
+    shape_id: []const u8,
+    shape_identity: []const u8,
+    credential_source: ?[]const u8 = null,
+    credential_identity: ?[]const u8 = null,
+};
+
+/// Stack storage for the hex digests a `ProvenanceMetadata` borrows.
+pub const ProvenanceMetadataBuffers = struct {
+    shape_identity: [Sha256.digest_length * 2]u8 = undefined,
+    credential_identity: [Sha256.digest_length * 2]u8 = undefined,
+
+    pub fn encode(self: *ProvenanceMetadataBuffers, provenance: ?SessionProvenance) ?ProvenanceMetadata {
+        const value = provenance orelse return null;
+        self.shape_identity = std.fmt.bytesToHex(value.shape.identity.bytes, .lower);
+        var credential_identity: ?[]const u8 = null;
+        if (value.credential_identity) |identity| {
+            self.credential_identity = std.fmt.bytesToHex(identity.bytes, .lower);
+            credential_identity = &self.credential_identity;
+        }
+        return .{
+            .shape_id = value.shape.id,
+            .shape_identity = &self.shape_identity,
+            .credential_source = if (value.credential_source) |source| @tagName(source) else null,
+            .credential_identity = credential_identity,
+        };
+    }
+};
+
+fn parseHexDigest(text: []const u8) ![Sha256.digest_length]u8 {
+    if (text.len != Sha256.digest_length * 2) return error.InvalidSessionMetadata;
+    for (text) |byte| {
+        if (!std.ascii.isDigit(byte) and !(byte >= 'a' and byte <= 'f')) return error.InvalidSessionMetadata;
+    }
+    var bytes: [Sha256.digest_length]u8 = undefined;
+    _ = std.fmt.hexToBytes(&bytes, text) catch return error.InvalidSessionMetadata;
+    return bytes;
+}
+
+fn validateProvenanceMetadata(metadata: ProvenanceMetadata) !void {
+    shape_authority.validateLabel(metadata.shape_id) catch return error.InvalidSessionMetadata;
+    _ = try parseHexDigest(metadata.shape_identity);
+    if (metadata.credential_source) |source| {
+        if (std.meta.stringToEnum(types.CredentialSource, source) == null) return error.InvalidSessionMetadata;
+    }
+    if (metadata.credential_identity) |identity| {
+        if (metadata.credential_source == null) return error.InvalidSessionMetadata;
+        _ = try parseHexDigest(identity);
+    }
+}
+
+/// Restores durable provenance from its manifest form. Caller owns the result.
+pub fn parseProvenanceMetadata(alloc: Allocator, metadata: ?ProvenanceMetadata) !?SessionProvenance {
+    const value = metadata orelse return null;
+    try validateProvenanceMetadata(value);
+    const id = try alloc.dupe(u8, value.shape_id);
+    errdefer alloc.free(id);
+    return .{
+        .shape = .{ .id = id, .identity = .{ .bytes = try parseHexDigest(value.shape_identity) } },
+        .credential_source = if (value.credential_source) |source| std.meta.stringToEnum(types.CredentialSource, source).? else null,
+        .credential_identity = if (value.credential_identity) |identity| .{ .bytes = try parseHexDigest(identity) } else null,
+    };
+}
 
 pub const DecodedSessionMetadata = std.json.Parsed(SessionMetadata);
 pub const max_permission_state_bytes: usize = 1024 * 1024;
@@ -364,6 +482,7 @@ fn validateSessionMetadata(metadata: SessionMetadata) !void {
             return error.InvalidSessionMetadata;
         }
     }
+    if (metadata.provenance) |provenance| try validateProvenanceMetadata(provenance);
 }
 
 pub const EncodeSummary = struct {
@@ -763,6 +882,15 @@ fn validateStateWithPermissionMigration(
                 return error.InvalidDurableField;
             }
         }
+        if (checkpoint.authority.shape) |shape| {
+            shape_authority.validateLabel(shape.id) catch return error.InvalidDurableField;
+        }
+    }
+    if (state.provenance) |provenance| {
+        shape_authority.validateLabel(provenance.shape.id) catch return error.InvalidDurableField;
+        if (provenance.credential_identity != null and provenance.credential_source == null) {
+            return error.InvalidDurableField;
+        }
     }
 }
 
@@ -823,6 +951,44 @@ fn writeState(writer: *std.Io.Writer, state: DurableSessionState) !void {
         try writer.writeAll(",\"recovery_checkpoint\":");
         try writeRecoveryCheckpoint(writer, checkpoint);
     }
+    if (state.provenance) |provenance| {
+        try writer.writeAll(",\"provenance\":");
+        try writeSessionProvenance(writer, provenance);
+    }
+    try writer.writeByte('}');
+}
+
+fn writeCredentialIdentity(
+    writer: *std.Io.Writer,
+    identity: ?credential_authority.Identity,
+) !void {
+    if (identity) |value| {
+        const hex = std.fmt.bytesToHex(value.bytes, .lower);
+        try writeJsonString(writer, &hex);
+    } else {
+        try writer.writeAll("null");
+    }
+}
+
+fn writeShapeAuthorityFields(writer: *std.Io.Writer, shape: ShapeAuthority) !void {
+    try writer.writeAll("\"shape_id\":");
+    try writeJsonString(writer, shape.id);
+    try writer.writeAll(",\"shape_identity\":");
+    const hex = std.fmt.bytesToHex(shape.identity.bytes, .lower);
+    try writeJsonString(writer, &hex);
+}
+
+pub fn writeSessionProvenance(writer: *std.Io.Writer, provenance: SessionProvenance) !void {
+    try writer.writeByte('{');
+    try writeShapeAuthorityFields(writer, provenance.shape);
+    try writer.writeAll(",\"credential_source\":");
+    if (provenance.credential_source) |source| {
+        try writeJsonString(writer, @tagName(source));
+    } else {
+        try writer.writeAll("null");
+    }
+    try writer.writeAll(",\"credential_identity\":");
+    try writeCredentialIdentity(writer, provenance.credential_identity);
     try writer.writeByte('}');
 }
 
@@ -951,11 +1117,10 @@ pub fn writeRecoveryCheckpoint(writer: *std.Io.Writer, checkpoint: RecoveryCheck
         try writer.writeAll("null");
     }
     try writer.writeAll(",\"credential_identity\":");
-    if (checkpoint.authority.credential_identity) |identity| {
-        const hex = std.fmt.bytesToHex(identity.bytes, .lower);
-        try writeJsonString(writer, &hex);
-    } else {
-        try writer.writeAll("null");
+    try writeCredentialIdentity(writer, checkpoint.authority.credential_identity);
+    if (checkpoint.authority.shape) |shape| {
+        try writer.writeByte(',');
+        try writeShapeAuthorityFields(writer, shape);
     }
     try writer.writeByte('}');
     try writer.print(",\"requested_fast_mode\":{s},\"fast_mode\":{s},\"max_provider_attempts\":{d},\"consumed_provider_attempts\":{d},\"outstanding_reservation\":{s}}}", .{
@@ -1050,11 +1215,13 @@ fn decodeStateImpl(alloc: Allocator, source: *std.Io.Reader, limits: DecodeLimit
     var subagent_child_seen = false;
     var recovery_checkpoint: ?RecoveryCheckpoint = null;
     errdefer if (recovery_checkpoint) |*checkpoint| checkpoint.deinit(alloc);
+    var provenance: ?SessionProvenance = null;
+    errdefer if (provenance) |*value| value.deinit(alloc);
     while (try json_reader.peekNextTokenType() != .object_end) {
         const key = try readStringOwned(&json_reader, alloc, 64);
         defer alloc.free(key);
         if (std.mem.eql(u8, key, "context_history_start")) {
-            if (context_seen or permission_state_seen or usage_seen or last_subagent_work_id != null or subagent_child_seen or recovery_checkpoint != null) {
+            if (context_seen or permission_state_seen or usage_seen or last_subagent_work_id != null or subagent_child_seen or recovery_checkpoint != null or provenance != null) {
                 return error.InvalidSessionFormat;
             }
             const raw = try readU64(&json_reader, alloc);
@@ -1062,7 +1229,7 @@ fn decodeStateImpl(alloc: Allocator, source: *std.Io.Reader, limits: DecodeLimit
                 return error.InvalidSessionFormat;
             context_seen = true;
         } else if (std.mem.eql(u8, key, "permission_state")) {
-            if (permission_state_seen or usage_seen or last_subagent_work_id != null or subagent_child_seen or recovery_checkpoint != null) {
+            if (permission_state_seen or usage_seen or last_subagent_work_id != null or subagent_child_seen or recovery_checkpoint != null or provenance != null) {
                 return error.InvalidSessionFormat;
             }
             var arena = std.heap.ArenaAllocator.init(alloc);
@@ -1075,7 +1242,7 @@ fn decodeStateImpl(alloc: Allocator, source: *std.Io.Reader, limits: DecodeLimit
             permission_state = try parsePermissionState(alloc, value);
             permission_state_seen = true;
         } else if (std.mem.eql(u8, key, "usage")) {
-            if (usage_seen or last_subagent_work_id != null or subagent_child_seen or recovery_checkpoint != null) return error.InvalidSessionFormat;
+            if (usage_seen or last_subagent_work_id != null or subagent_child_seen or recovery_checkpoint != null or provenance != null) return error.InvalidSessionFormat;
             const parse_limit = @min(
                 limits.max_value_bytes,
                 session_usage.max_snapshot_bytes,
@@ -1091,15 +1258,15 @@ fn decodeStateImpl(alloc: Allocator, source: *std.Io.Reader, limits: DecodeLimit
             usage = try session_usage.parseSnapshotValue(alloc, value);
             usage_seen = true;
         } else if (std.mem.eql(u8, key, "last_subagent_work_id")) {
-            if (last_subagent_work_id != null or subagent_child_seen or recovery_checkpoint != null) return error.InvalidSessionFormat;
+            if (last_subagent_work_id != null or subagent_child_seen or recovery_checkpoint != null or provenance != null) return error.InvalidSessionFormat;
             last_subagent_work_id = try readStringOwned(&json_reader, alloc, 128);
         } else if (std.mem.eql(u8, key, "subagent_child")) {
-            if (subagent_child_seen or recovery_checkpoint != null) return error.InvalidSessionFormat;
+            if (subagent_child_seen or recovery_checkpoint != null or provenance != null) return error.InvalidSessionFormat;
             subagent_child = try readBool(&json_reader);
             if (!subagent_child) return error.InvalidDurableField;
             subagent_child_seen = true;
         } else if (std.mem.eql(u8, key, "recovery_checkpoint")) {
-            if (recovery_checkpoint != null) return error.InvalidSessionFormat;
+            if (recovery_checkpoint != null or provenance != null) return error.InvalidSessionFormat;
             var arena = std.heap.ArenaAllocator.init(alloc);
             defer arena.deinit();
             const value = try std.json.Value.jsonParse(arena.allocator(), &json_reader, .{
@@ -1108,6 +1275,16 @@ fn decodeStateImpl(alloc: Allocator, source: *std.Io.Reader, limits: DecodeLimit
                 .parse_numbers = false,
             });
             recovery_checkpoint = try parseRecoveryCheckpoint(alloc, value);
+        } else if (std.mem.eql(u8, key, "provenance")) {
+            if (provenance != null) return error.InvalidSessionFormat;
+            var arena = std.heap.ArenaAllocator.init(alloc);
+            defer arena.deinit();
+            const value = try std.json.Value.jsonParse(arena.allocator(), &json_reader, .{
+                .max_value_len = limits.max_value_bytes,
+                .allocate = .alloc_always,
+                .parse_numbers = false,
+            });
+            provenance = try parseSessionProvenance(alloc, value);
         } else return error.InvalidSessionFormat;
     }
     errdefer if (usage) |*snapshot| snapshot.deinit(alloc);
@@ -1138,6 +1315,7 @@ fn decodeStateImpl(alloc: Allocator, source: *std.Io.Reader, limits: DecodeLimit
         .subagent_child = subagent_child,
         .usage = usage,
         .recovery_checkpoint = recovery_checkpoint,
+        .provenance = provenance,
     };
     try validateStateWithPermissionMigration(state, true);
     return state;
@@ -1211,41 +1389,97 @@ pub fn parseRecoveryCheckpoint(alloc: Allocator, value: std.json.Value) !Recover
     };
 }
 
-fn parseTurnAuthority(alloc: Allocator, value: std.json.Value) !TurnAuthority {
+/// Decodes a stored 32-byte authority digest. The canonical round trip rejects
+/// a short, overlong, or upper-case digest rather than accepting a value that
+/// would not compare equal to a freshly derived one.
+fn parseIdentityDigest(comptime Identity: type, value: std.json.Value) !?Identity {
+    return switch (value) {
+        .null => null,
+        .string => |hex| identity: {
+            // Guard the length before decoding: hexToBytes succeeds on any
+            // short even-length input and leaves the rest of the buffer
+            // undefined, which bytesToHex would then read.
+            if (hex.len != Sha256.digest_length * 2) return error.InvalidDurableField;
+            var bytes: [Sha256.digest_length]u8 = undefined;
+            _ = std.fmt.hexToBytes(&bytes, hex) catch return error.InvalidDurableField;
+            const canonical = std.fmt.bytesToHex(bytes, .lower);
+            if (!std.mem.eql(u8, &canonical, hex)) return error.InvalidDurableField;
+            break :identity Identity{ .bytes = bytes };
+        },
+        else => error.InvalidDurableField,
+    };
+}
+
+fn parseShapeAuthority(alloc: Allocator, object: std.json.ObjectMap) !ShapeAuthority {
+    const id = try requireString(object, "shape_id");
+    shape_authority.validateLabel(id) catch return error.InvalidDurableField;
+    const identity = (try parseIdentityDigest(
+        shape_authority.Identity,
+        object.get("shape_identity") orelse return error.InvalidSessionFormat,
+    )) orelse return error.InvalidDurableField;
+    return .{ .id = try alloc.dupe(u8, id), .identity = identity };
+}
+
+fn parseCredentialSourceField(object: std.json.ObjectMap) !?types.CredentialSource {
+    const source = object.get("credential_source") orelse return error.InvalidSessionFormat;
+    return switch (source) {
+        .null => null,
+        .string => |text| types.parseRuntimeCredentialSource(text) orelse
+            return error.InvalidDurableField,
+        else => error.InvalidDurableField,
+    };
+}
+
+pub fn parseSessionProvenance(alloc: Allocator, value: std.json.Value) !SessionProvenance {
     const object = try exactObject(value, &.{
-        "provider",
-        "model",
+        "shape_id",
+        "shape_identity",
         "credential_source",
         "credential_identity",
     });
+    var shape = try parseShapeAuthority(alloc, object);
+    errdefer shape.deinit(alloc);
+    const credential_source = try parseCredentialSourceField(object);
+    const credential_identity = try parseIdentityDigest(
+        credential_authority.Identity,
+        object.get("credential_identity") orelse return error.InvalidSessionFormat,
+    );
+    if (credential_identity != null and credential_source == null) {
+        return error.InvalidDurableField;
+    }
+    return .{
+        .shape = shape,
+        .credential_source = credential_source,
+        .credential_identity = credential_identity,
+    };
+}
+
+fn parseTurnAuthority(alloc: Allocator, value: std.json.Value) !TurnAuthority {
+    const variant = try exactVariantObject(
+        value,
+        &.{ "provider", "model", "credential_source", "credential_identity" },
+        &.{ "provider", "model", "credential_source", "credential_identity", "shape_id", "shape_identity" },
+    );
+    const object = variant.object;
     const provider = model_provider.parse(try requireString(object, "provider")) orelse
         return error.InvalidDurableField;
     const model = try parseDurableBytes(alloc, object.get("model") orelse return error.InvalidSessionFormat);
     errdefer alloc.free(model);
-    const credential_source = if (object.get("credential_source")) |source| switch (source) {
-        .null => null,
-        .string => |text| types.parseRuntimeCredentialSource(text) orelse return error.InvalidDurableField,
-        else => return error.InvalidDurableField,
-    } else return error.InvalidSessionFormat;
-    const credential_identity = if (object.get("credential_identity")) |identity| switch (identity) {
-        .null => null,
-        .string => |hex| identity: {
-            var bytes: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
-            _ = std.fmt.hexToBytes(&bytes, hex) catch return error.InvalidDurableField;
-            const canonical = std.fmt.bytesToHex(bytes, .lower);
-            if (!std.mem.eql(u8, &canonical, hex)) return error.InvalidDurableField;
-            break :identity credential_authority.Identity{ .bytes = bytes };
-        },
-        else => return error.InvalidDurableField,
-    } else return error.InvalidSessionFormat;
+    const credential_source = try parseCredentialSourceField(object);
+    const credential_identity = try parseIdentityDigest(
+        credential_authority.Identity,
+        object.get("credential_identity") orelse return error.InvalidSessionFormat,
+    );
     if (credential_identity != null and credential_source == null) {
         return error.InvalidDurableField;
     }
+    const shape = if (variant.extended) try parseShapeAuthority(alloc, object) else null;
     return .{
         .provider = provider,
         .model = model,
         .credential_source = credential_source,
         .credential_identity = credential_identity,
+        .shape = shape,
     };
 }
 
@@ -4334,32 +4568,173 @@ fn fuzzDurableSessionOptionalFields(_: void, smith: *std.testing.Smith) !void {
     state.deinit(std.testing.allocator);
 }
 
-test "session metadata round trips without conversation or control state" {
-    const alloc = std.testing.allocator;
-    const encoded = try encodeSessionMetadata(alloc, .{
-        .id = "session-1",
-        .origin_workspace_root = "/tmp/origin",
-        .workspace_root = "/tmp/current",
-        .created_at_ms = 10,
-        .updated_at_ms = 20,
-        .conversation_language = "en",
-        .provider = "gateway",
-        .model = "openai/gpt-5.6",
-        .effort = "high",
-        .fast_mode = false,
-        .title = "Compaction work",
-        .subagent_child = false,
-    });
-    defer alloc.free(encoded);
-    try std.testing.expect(std.mem.find(u8, encoded, "history") == null);
-    try std.testing.expect(std.mem.find(u8, encoded, "usage") == null);
-    try std.testing.expect(std.mem.find(u8, encoded, "permission") == null);
-    try std.testing.expect(std.mem.find(u8, encoded, "checkpoint") == null);
+const provenance_test_prefix =
+    "{\"id\":\"session-provenance\",\"origin_workspace_root\":\"/tmp/origin\",\"workspace_root\":\"/tmp/current\"," ++
+    "\"created_at_ms\":1,\"updated_at_ms\":2,\"conversation_language\":\"en\"," ++
+    "\"preferences\":{\"model\":\"openai/gpt-test\",\"effort\":\"auto\",\"fast_mode\":false},\"history\":[]," ++
+    "\"total_input_tokens\":0,\"total_output_tokens\":0";
 
-    var decoded = try decodeSessionMetadata(alloc, encoded);
-    defer decoded.deinit();
-    try std.testing.expectEqualStrings("session-1", decoded.value.id);
-    try std.testing.expectEqualStrings("/tmp/current", decoded.value.workspace_root);
-    try std.testing.expectEqualStrings("openai/gpt-5.6", decoded.value.model);
-    try std.testing.expectEqualStrings("Compaction work", decoded.value.title.?);
+fn decodeProvenanceFixture(alloc: Allocator, trailing: []const u8) !DurableSessionState {
+    const json = try std.mem.concat(alloc, u8, &.{ provenance_test_prefix, trailing, "}" });
+    defer alloc.free(json);
+    var source = std.Io.Reader.fixed(json);
+    return decodeState(alloc, &source, .{});
+}
+
+test "session provenance round trips and stays absent when unrecorded" {
+    const alloc = std.testing.allocator;
+    const identity = shape_authority.derive(.{ .system_prompt = "review carefully" });
+    var state = DurableSessionState{
+        .id = @constCast("session-provenance"),
+        .origin_workspace_root = @constCast("/tmp/origin"),
+        .workspace_root = @constCast("/tmp/current"),
+        .created_at_ms = 1,
+        .updated_at_ms = 2,
+        .conversation_language = session.ConversationLanguage.literal("en"),
+        .preferences = .{
+            .provider = .codex,
+            .model = @constCast("gpt-5.4-mini"),
+            .effort = .auto,
+            .fast_mode = false,
+        },
+        .history = &.{},
+        .total_input_tokens = 0,
+        .total_output_tokens = 0,
+        .provenance = .{
+            .shape = .{ .id = @constCast("reviewer"), .identity = identity },
+            .credential_source = .chatgpt_subscription,
+            .credential_identity = credential_authority.derive(.chatgpt_subscription, "acct_1"),
+        },
+    };
+
+    var encoded: std.Io.Writer.Allocating = .init(alloc);
+    defer encoded.deinit();
+    _ = try encodeState(state, &encoded.writer);
+    var source = std.Io.Reader.fixed(encoded.written());
+    var decoded = try decodeState(alloc, &source, .{});
+    defer decoded.deinit(alloc);
+
+    const restored = decoded.provenance.?;
+    try std.testing.expectEqualStrings("reviewer", restored.shape.id);
+    try std.testing.expect(restored.shape.identity.eql(identity));
+    try std.testing.expectEqual(types.CredentialSource.chatgpt_subscription, restored.credential_source.?);
+    try std.testing.expect(restored.credential_identity.?.eql(
+        credential_authority.derive(.chatgpt_subscription, "acct_1").?,
+    ));
+
+    state.provenance = null;
+    var without: std.Io.Writer.Allocating = .init(alloc);
+    defer without.deinit();
+    _ = try encodeState(state, &without.writer);
+    try std.testing.expect(std.mem.find(u8, without.written(), ",\"provenance\":") == null);
+
+    var legacy = try decodeProvenanceFixture(alloc, "");
+    defer legacy.deinit(alloc);
+    try std.testing.expect(legacy.provenance == null);
+}
+
+test "turn authority carries its shape and reads turns recorded without one" {
+    const alloc = std.testing.allocator;
+    const identity = shape_authority.defaultIdentity();
+    const state = DurableSessionState{
+        .id = @constCast("session-shape"),
+        .origin_workspace_root = @constCast("/tmp/origin"),
+        .workspace_root = @constCast("/tmp/current"),
+        .created_at_ms = 1,
+        .updated_at_ms = 2,
+        .conversation_language = session.ConversationLanguage.literal("en"),
+        .preferences = .{
+            .provider = .codex,
+            .model = @constCast("gpt-5.4-mini"),
+            .effort = .auto,
+            .fast_mode = false,
+        },
+        .history = &.{},
+        .total_input_tokens = 0,
+        .total_output_tokens = 0,
+        .recovery_checkpoint = .{
+            .turn_id = 7,
+            .user = .{ .text = @constCast("keep working") },
+            .assistant_source = @constCast("partial"),
+            .cause = .response_interrupted,
+            .action = .continuing_response,
+            .authority = .{
+                .provider = .codex,
+                .model = @constCast("gpt-5.4-mini"),
+                .credential_source = .chatgpt_subscription,
+                .credential_identity = credential_authority.derive(.chatgpt_subscription, "acct_1"),
+                .shape = .{ .id = @constCast("default"), .identity = identity },
+            },
+            .requested_fast_mode = false,
+            .fast_mode = false,
+            .max_provider_attempts = 3,
+            .consumed_provider_attempts = 1,
+        },
+    };
+
+    var encoded: std.Io.Writer.Allocating = .init(alloc);
+    defer encoded.deinit();
+    _ = try encodeState(state, &encoded.writer);
+    var source = std.Io.Reader.fixed(encoded.written());
+    var decoded = try decodeState(alloc, &source, .{});
+    defer decoded.deinit(alloc);
+    const shape = decoded.recovery_checkpoint.?.authority.shape.?;
+    try std.testing.expectEqualStrings("default", shape.id);
+    try std.testing.expect(shape.identity.eql(identity));
+
+    const legacy_authority =
+        "{\"provider\":\"codex\",\"model\":\"gpt-5.4-mini\",\"credential_source\":\"chatgpt_subscription\"," ++
+        "\"credential_identity\":null}";
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, legacy_authority, .{});
+    defer parsed.deinit();
+    var authority = try parseTurnAuthority(alloc, parsed.value);
+    defer authority.deinit(alloc);
+    try std.testing.expect(authority.shape == null);
+}
+
+test "durable provenance rejects malformed shapes and out-of-order placement" {
+    const alloc = std.testing.allocator;
+    const hex = std.fmt.bytesToHex(shape_authority.defaultIdentity().bytes, .lower);
+    const upper = std.fmt.bytesToHex(shape_authority.defaultIdentity().bytes, .upper);
+
+    const valid = try std.fmt.allocPrint(
+        alloc,
+        ",\"provenance\":{{\"shape_id\":\"default\",\"shape_identity\":\"{s}\"," ++
+            "\"credential_source\":null,\"credential_identity\":null}}",
+        .{&hex},
+    );
+    defer alloc.free(valid);
+    var accepted = try decodeProvenanceFixture(alloc, valid);
+    defer accepted.deinit(alloc);
+    try std.testing.expectEqualStrings("default", accepted.provenance.?.shape.id);
+
+    const rejected = [_][]const u8{
+        // An empty label cannot name a shape.
+        ",\"provenance\":{\"shape_id\":\"\",\"shape_identity\":\"" ++ "00" ** 32 ++ "\",\"credential_source\":null,\"credential_identity\":null}",
+        // A control character would corrupt any listing that prints it.
+        ",\"provenance\":{\"shape_id\":\"bad\\nname\",\"shape_identity\":\"" ++ "00" ** 32 ++ "\",\"credential_source\":null,\"credential_identity\":null}",
+        // A truncated digest would never compare equal to a derived one.
+        ",\"provenance\":{\"shape_id\":\"default\",\"shape_identity\":\"00ff\",\"credential_source\":null,\"credential_identity\":null}",
+        // A shape must always carry a digest.
+        ",\"provenance\":{\"shape_id\":\"default\",\"shape_identity\":null,\"credential_source\":null,\"credential_identity\":null}",
+        // An identity without its source cannot be attributed.
+        ",\"provenance\":{\"shape_id\":\"default\",\"shape_identity\":\"" ++ "00" ** 32 ++ "\",\"credential_source\":null,\"credential_identity\":\"" ++ "11" ** 32 ++ "\"}",
+        // Provenance is the last trailing key; anything after it is malformed.
+        ",\"provenance\":{\"shape_id\":\"default\",\"shape_identity\":\"" ++ "00" ** 32 ++ "\",\"credential_source\":null,\"credential_identity\":null},\"subagent_child\":true",
+    };
+    for (rejected) |trailing| {
+        try std.testing.expect(std.meta.isError(decodeProvenanceFixture(alloc, trailing)));
+    }
+
+    const upper_case = try std.fmt.allocPrint(
+        alloc,
+        ",\"provenance\":{{\"shape_id\":\"default\",\"shape_identity\":\"{s}\"," ++
+            "\"credential_source\":null,\"credential_identity\":null}}",
+        .{&upper},
+    );
+    defer alloc.free(upper_case);
+    try std.testing.expectError(
+        error.InvalidDurableField,
+        decodeProvenanceFixture(alloc, upper_case),
+    );
 }

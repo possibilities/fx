@@ -47,6 +47,8 @@ const permissions = @import("../permissions/permissions.zig");
 const session_runtime = @import("../session/session.zig");
 const command_replay_store = @import("../session/command_replay_store.zig");
 const session_codec = @import("../session/session_codec.zig");
+const credential_authority = @import("../auth/credential_authority.zig");
+const shape_authority = @import("../auth/shape_authority.zig");
 const session_usage = @import("../session/session_usage.zig");
 const usage_report = @import("../session/usage_report.zig");
 const session_store = @import("../session/session_store.zig");
@@ -244,6 +246,29 @@ pub const Config = struct {
     mode_registry: mode_registry.Registry,
     load_mcp_runtime: mcp_runtime.LoadRuntimeFn,
     context_limit_overrides: []const config_runtime.context_limits.Override = &.{},
+    /// The root owning sessions and usage for this run. Null keeps them with
+    /// the ambient home, which is where a plain `fx ask` has always put them.
+    history_home: ?[]const u8 = null,
+    /// An already-validated profile whose credential this run borrows, read
+    /// only. Resolving it is the launch surface's job; by here it is settled.
+    borrowed_authorization_home: ?[]const u8 = null,
+    /// Writable profile authority for MCP OAuth credentials. This follows the
+    /// selected state profile and deliberately never follows borrowed identity.
+    profile_home: ?[]const u8 = null,
+    /// Canonical MCP configuration selected by the launch shape.
+    mcp_config_path: ?[]const u8 = null,
+    /// Invocation-only permission rules, replacing persisted profile rules.
+    permission_rules_override: ?types.PermissionRuleSet = null,
+    /// Whether project instructions may contribute model-visible context.
+    project_instructions_enabled: bool = true,
+    /// The shape this run is running, recorded on the session it writes.
+    shape: ?shape_authority.Identity = null,
+    shape_label: []const u8 = shape_authority.default_label,
+    /// The resolved declaration behind `shape`. It is retained through option
+    /// parsing so ask's own `--system` can replace the last unresolved input
+    /// before the authoritative digest is recorded.
+    shape_declaration: ?shape_authority.Declaration = null,
+    shape_label_from_root: bool = false,
     additional_directories: []const []const u8 = &.{},
     saved_directories_suppressed: bool = false,
 };
@@ -654,6 +679,16 @@ const AskContext = struct {
         self.lifecycle_view = self.lifecycle_runtime.freeze();
     }
 
+    fn initializeUsageAuthority(self: *AskContext, save_session: bool) !void {
+        self.session.usage.setShape(self.cfg.shape, self.cfg.shape_label);
+        if (!save_session) return;
+        _ = try self.session.initializeProfileUsage(
+            self.alloc,
+            self.cfg.history_home orelse io_mod.getenv("HOME"),
+        );
+        self.session.attachProfileUsagePublisher(self.alloc);
+    }
+
     fn dispatchAttentionRequired(self: *AskContext, kind: hooks.AttentionKind) void {
         agent_runtime.dispatchAttentionRequiredCheckpoint(self.lifecycleContext(), .{
             .turn_id = self.active_turn_id,
@@ -832,7 +867,10 @@ const AskContext = struct {
     }
 
     fn initializeSessionStores(self: *AskContext) !void {
-        var store = session_store.Store.init(self.alloc, self.workspace_root) catch |err| {
+        var store = (if (self.cfg.history_home) |home|
+            session_store.Store.initFromHome(self.alloc, home, self.workspace_root)
+        else
+            session_store.Store.init(self.alloc, self.workspace_root)) catch |err| {
             if (err == error.OutOfMemory or self.requested_resume != null) return err;
             debug_trace.logf(
                 "session",
@@ -1129,6 +1167,18 @@ fn freshAskState(
         var value = permission_state;
         value.deinit(ctx.alloc);
     }
+    const provenance: ?session_codec.SessionProvenance = if (ctx.cfg.shape) |identity| .{
+        .shape = .{
+            .id = try ctx.alloc.dupe(u8, ctx.cfg.shape_label),
+            .identity = identity,
+        },
+        .credential_source = ctx.credential_source,
+        .credential_identity = if (ctx.credential_source) |source|
+            credential_authority.derive(source, ctx.account_id)
+        else
+            null,
+    } else null;
+    errdefer if (provenance) |stored| ctx.alloc.free(stored.shape.id);
     return .{
         .id = id,
         .origin_workspace_root = origin,
@@ -1141,6 +1191,7 @@ fn freshAskState(
         .total_input_tokens = 0,
         .total_output_tokens = 0,
         .permission_state = permission_state,
+        .provenance = provenance,
     };
 }
 
@@ -1193,6 +1244,22 @@ fn askErrorNotice(err: anyerror) ?[]const u8 {
         error.ModelImageCapabilityUnavailable => image_attachments.model_image_capability_unavailable_notice,
         else => null,
     };
+}
+
+fn withAskSystemPrompt(cfg: Config, system_prompt: []const u8) Config {
+    var result = cfg;
+    result.prompt_policy.system_prompt = system_prompt;
+    if (cfg.shape_declaration) |declaration| {
+        var resolved = declaration;
+        resolved.system_prompt = system_prompt;
+        resolved.system_prompt_replaces_base = true;
+        result.shape_declaration = resolved;
+        result.shape = shape_authority.derive(resolved);
+        if (!cfg.shape_label_from_root) {
+            result.shape_label = shape_authority.custom_label;
+        }
+    }
+    return result;
 }
 
 fn runWithDeps(alloc: Allocator, args: []const [:0]const u8, cfg: Config, deps: RunDeps) !u8 {
@@ -1278,7 +1345,7 @@ fn runWithDeps(alloc: Allocator, args: []const [:0]const u8, cfg: Config, deps: 
 
     var effective_cfg = cfg;
     if (options.system_prompt_override) |sp| {
-        effective_cfg.prompt_policy.system_prompt = sp;
+        effective_cfg = withAskSystemPrompt(cfg, sp);
     }
 
     const output_mode = selectOutputMode(
@@ -1431,7 +1498,33 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
     defer alloc.free(owned_prompt);
 
     try checkHeadlessCancellation(options.deps);
-    var startup = if (cfg.auth_mode == .host_managed)
+    var startup = if (cfg.profile_home) |profile_home|
+        if (cfg.auth_mode == .host_managed) state: {
+            var state = try app_lifecycle.loadEmbeddedStartupState(
+                alloc,
+                profile_home,
+                ".",
+                cfg.default_model,
+                cfg.default_agent_step_limit,
+            );
+            state.auth_mode = .host_managed;
+            break :state state;
+        } else if (cfg.borrowed_authorization_home) |authorization_home|
+            try app_lifecycle.loadCatalogStartupStateFromHomes(
+                alloc,
+                profile_home,
+                authorization_home,
+                cfg.default_model,
+                cfg.default_agent_step_limit,
+            )
+        else
+            try app_lifecycle.loadCatalogStartupStateFromHome(
+                alloc,
+                profile_home,
+                cfg.default_model,
+                cfg.default_agent_step_limit,
+            )
+    else if (cfg.auth_mode == .host_managed)
         try options.deps.load_startup_state_with_auth_mode(
             alloc,
             cfg.gateway_provider.oauth_transport,
@@ -1449,6 +1542,25 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
             cfg.default_agent_step_limit,
         );
     defer startup.deinit(alloc);
+    // A borrowed profile is read only by contract, so a credential that is due
+    // for refresh is dropped rather than rewritten into a profile this run does
+    // not own. Doing this here keeps `ask` on the same rule as every surface.
+    if (cfg.borrowed_authorization_home) |authorization_home| {
+        const borrowed = try credentials.resolveReadOnlyForProviderFromHome(
+            alloc,
+            startup.provider,
+            startup.credential_source_preference,
+            authorization_home,
+        );
+        if (startup.credential) |*existing| existing.deinit(alloc);
+        startup.credential = borrowed.credential;
+        startup.stored_key_status = borrowed.stored_key_status;
+        startup.fx_login_status = borrowed.fx_login_status;
+        startup.credential_load_failure = if (borrowed.failure) |failure|
+            .{ .source = failure.source, .err = failure.err }
+        else
+            null;
+    }
     try checkHeadlessCancellation(options.deps);
 
     var permission_mode = toCorePermissionMode(startup.permission_mode);
@@ -1494,10 +1606,7 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
     defer if (owned_resumed_model) |model| alloc.free(model);
     var ctx = AskContext.init(alloc, cfg, options.deps, startup.workspace_root);
     defer ctx.deinit();
-    if (options.save_session) {
-        _ = try ctx.session.initializeProfileUsage(alloc, io_mod.getenv("HOME"));
-        ctx.session.attachProfileUsagePublisher(alloc);
-    }
+    try ctx.initializeUsageAuthority(options.save_session);
     ctx.use_process_interrupt_flag = options.deps.install_headless_interrupt;
     try ctx.checkCancellation();
     var presenter: ?ask_presentation.Runtime = null;
@@ -1526,7 +1635,10 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
     ctx.first_call_tool_choice = startup.first_call_tool_choice;
     ctx.permission_mode = permission_mode;
     ctx.mode_id = mode_id;
-    ctx.permission_rules = try takeCorePermissionRules(alloc, &startup);
+    ctx.permission_rules = if (cfg.permission_rules_override) |rules|
+        try types.dupePermissionRuleSet(alloc, rules)
+    else
+        try takeCorePermissionRules(alloc, &startup);
     ctx.context_enabled = startup.context_enabled;
     if (options.output_mode.isTerminal()) {
         presenter = try ask_presentation.Runtime.init(alloc, .{
@@ -1542,6 +1654,16 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
     ctx.session.setConversationLanguageFromUserMessage(owned_prompt);
     if (options.save_session) {
         try ctx.checkCancellation();
+        // The session is created before the credential is routed, so seed the
+        // authority it will run under from the one startup already resolved.
+        // Routing may refresh that credential's token; it never changes the
+        // account behind it, and the account is what provenance records.
+        if (ctx.credential_source == null) {
+            if (startup.credential) |credential| {
+                ctx.credential_source = credential.source;
+                ctx.account_id = credential.accountId();
+            }
+        }
         try options.deps.initialize_session_stores(&ctx);
         try ctx.checkCancellation();
         if (startup.model_source == .process_override) {
@@ -1598,17 +1720,34 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
         else
             false;
         const startup_credential_is_final = startup_matches_final_model and
-            !credentials.sourceRefreshable(startup.credential.?.source);
+            (cfg.borrowed_authorization_home != null or
+                !credentials.sourceRefreshable(startup.credential.?.source));
         const credential: *const credentials.Credential = if (startup_credential_is_final)
             &startup.credential.?
         else routed: {
-            routed_credential = try auth_runtime.prepareCredential(
-                alloc,
-                cfg.gateway_provider.oauth_transport,
-                cfg.secret_store,
-                ctx.provider,
-                if (ctx.provider == .gateway) startup.credential_source_preference else null,
-            );
+            routed_credential = if (cfg.borrowed_authorization_home) |authorization_home|
+                (try credentials.resolveReadOnlyForProviderFromHome(
+                    alloc,
+                    ctx.provider,
+                    if (ctx.provider == .gateway) startup.credential_source_preference else null,
+                    authorization_home,
+                )).credential
+            else if (cfg.profile_home) |profile_home|
+                try auth_runtime.prepareCredentialFromHome(
+                    alloc,
+                    cfg.gateway_provider.oauth_transport,
+                    ctx.provider,
+                    if (ctx.provider == .gateway) startup.credential_source_preference else null,
+                    profile_home,
+                )
+            else
+                try auth_runtime.prepareCredential(
+                    alloc,
+                    cfg.gateway_provider.oauth_transport,
+                    cfg.secret_store,
+                    ctx.provider,
+                    if (ctx.provider == .gateway) startup.credential_source_preference else null,
+                );
             if (routed_credential == null) {
                 return missingCredentialResult(alloc, options, ctx.provider);
             }
@@ -1687,18 +1826,14 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
             .access_scope = ctx.workspace_access.scope(ctx.workspace_root),
             .targets = context_targets,
             .context_limits = ctx.context_limits,
+            .project_instructions_enabled = cfg.project_instructions_enabled,
         });
         try ctx.checkCancellation();
         for (ctx.context_snapshot.notices) |notice| try pushContextNotice(@ptrCast(&ctx), notice);
     }
 
     try ctx.checkCancellation();
-    ctx.mcp = try options.deps.load_mcp_runtime(
-        alloc,
-        startup.workspace_root,
-        ctx.mcp_elicitation_capabilities,
-        null,
-    );
+    ctx.mcp = try loadConfiguredMcpRuntime(&ctx);
     if (ctx.mcp) |mcp| {
         var health_snapshot = try mcp.snapshotHealth(
             alloc,
@@ -1796,6 +1931,7 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
     ctx.retain_external_root_user_turn = current_prompt_is_root_authority;
     options.deps.process_queued_prompt(&ctx.session.agent, &deps, semantic_presentation, ctx.lifecycleContext(), .{
         .system_prompt = cfg.prompt_policy.system_prompt,
+        .shape = cfg.shape,
         .model_prompt_overlay = cfg.prompt_policy.modelPromptOverlay(ctx.model),
         .skill_catalog = .{ .skills = loaded_skills.skills, .diagnostics = loaded_skills.diagnostics },
         .gateway_retry_count = cfg.gateway_retry_count,
@@ -1962,11 +2098,14 @@ fn agentRuntimeDeps(ctx: *AskContext) agent_runtime.AgentRuntimeDeps {
     );
     return .{
         .ctx = @ptrCast(ctx),
+        .shape = ctx.cfg.shape,
+        .shape_label = ctx.cfg.shape_label,
         .agent_stream_provider = ctx.agentStreamProvider(),
         .render_assistant_text = ctx.output_mode.isTerminal(),
         .tool_registry = ctx.toolRegistry(),
         .context_registry = ctx.deps.context_registry,
         .context_enabled = ctx.context_enabled,
+        .project_instructions_enabled = ctx.cfg.project_instructions_enabled,
         .finalize_turn = finalizeTurn,
         .release_agent_terminal_lease = releaseAgentTerminalLease,
         .append_runtime_context = appendRuntimeContext,
@@ -2013,6 +2152,16 @@ fn agentRuntimeDeps(ctx: *AskContext) agent_runtime.AgentRuntimeDeps {
     };
 }
 
+fn loadConfiguredMcpRuntime(ctx: *AskContext) !?*mcp_runtime.McpRuntime {
+    return ctx.deps.load_mcp_runtime(
+        ctx.alloc,
+        ctx.workspace_root,
+        ctx.mcp_elicitation_capabilities,
+        ctx.cfg.profile_home,
+        ctx.cfg.mcp_config_path,
+    );
+}
+
 fn releaseAgentTerminalLease(raw_ctx: *anyopaque, session_id: []const u8) !void {
     const ctx: *AskContext = @ptrCast(@alignCast(raw_ctx));
     return tool_runtime.release_agent_terminal_lease(ctx.toolContext(), session_id);
@@ -2026,13 +2175,24 @@ fn refreshGatewayCredential(
     expected_account_id: ?[]const u8,
 ) !?[]u8 {
     const ctx: *AskContext = @ptrCast(@alignCast(raw_ctx));
-    var refreshed = (try auth_runtime.refreshCredentialForAccount(
-        ctx.cfg.gateway_provider.oauth_transport,
-        ctx.alloc,
-        source,
-        mode,
-        expected_account_id,
-    )) orelse return null;
+    if (ctx.cfg.borrowed_authorization_home != null) return null;
+    var refreshed = (if (ctx.cfg.profile_home) |profile_home|
+        try auth_runtime.refreshCredentialForAccountFromHome(
+            ctx.cfg.gateway_provider.oauth_transport,
+            ctx.alloc,
+            source,
+            mode,
+            expected_account_id,
+            profile_home,
+        )
+    else
+        try auth_runtime.refreshCredentialForAccount(
+            ctx.cfg.gateway_provider.oauth_transport,
+            ctx.alloc,
+            source,
+            mode,
+            expected_account_id,
+        )) orelse return null;
     defer refreshed.deinit(ctx.alloc);
     return try adoptRefreshedAskCredential(ctx, alloc, &refreshed);
 }
@@ -4131,6 +4291,76 @@ fn testConfig() Config {
     };
 }
 
+test "ask usage and recovery dependencies keep selected shape and history authority" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const history_home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(history_home);
+
+    const shape = shape_authority.derive(.{ .system_prompt = "review carefully" });
+    var cfg = testConfig();
+    cfg.history_home = history_home;
+    cfg.shape = shape;
+    cfg.shape_label = "reviewer";
+    cfg.project_instructions_enabled = false;
+
+    var stdout_capture: TestCapture = .{};
+    defer stdout_capture.deinit(alloc);
+    var stderr_capture: TestCapture = .{};
+    defer stderr_capture.deinit(alloc);
+    var ctx = AskContext.init(
+        alloc,
+        cfg,
+        testPromptRunDeps(&stdout_capture, &stderr_capture, testPresentKeyStartup),
+        "/tmp/workspace",
+    );
+    defer ctx.deinit();
+
+    try ctx.initializeUsageAuthority(true);
+    try std.testing.expect(ctx.session.usage.shape.?.eql(shape));
+    try std.testing.expectEqualStrings("reviewer", ctx.session.usage.shape_label);
+    try std.testing.expectEqualStrings(
+        history_home,
+        ctx.session.profile_usage.store.?.home_path,
+    );
+
+    const deps = agentRuntimeDeps(&ctx);
+    try std.testing.expect(deps.shape.?.eql(shape));
+    try std.testing.expectEqualStrings("reviewer", deps.shape_label);
+    try std.testing.expect(!deps.project_instructions_enabled);
+}
+
+test "ask system override is included in the final shape identity" {
+    var cfg = testConfig();
+    const base_declaration = shape_authority.Declaration{
+        .system_prompt = cfg.prompt_policy.system_prompt,
+        .saved_directories_enabled = false,
+        .acp_mcp_enabled = false,
+    };
+    cfg.shape_declaration = base_declaration;
+    cfg.shape = shape_authority.derive(base_declaration);
+
+    const overridden = withAskSystemPrompt(cfg, "ASK_SYSTEM_OVERRIDE");
+    var expected_declaration = base_declaration;
+    expected_declaration.system_prompt = "ASK_SYSTEM_OVERRIDE";
+    expected_declaration.system_prompt_replaces_base = true;
+    const expected_identity = shape_authority.derive(expected_declaration);
+
+    try std.testing.expectEqualStrings(
+        "ASK_SYSTEM_OVERRIDE",
+        overridden.prompt_policy.system_prompt,
+    );
+    try std.testing.expect(overridden.shape.?.eql(expected_identity));
+    try std.testing.expect(!overridden.shape.?.eql(cfg.shape.?));
+    try std.testing.expectEqualStrings(shape_authority.custom_label, overridden.shape_label);
+
+    cfg.shape_label = "reviewer";
+    cfg.shape_label_from_root = true;
+    const named = withAskSystemPrompt(cfg, "NAMED_SHAPE_OVERRIDE");
+    try std.testing.expectEqualStrings("reviewer", named.shape_label);
+}
+
 fn testMissingKeyStartup(alloc: Allocator, _: oauth_transport.Provider, _: host.SecretStore, default_model: []const u8, default_agent_step_limit: usize) !app_lifecycle.StartupState {
     var state = app_lifecycle.StartupState{ .agent_step_limit = default_agent_step_limit };
     errdefer state.deinit(alloc);
@@ -4151,6 +4381,70 @@ fn testPresentKeyStartup(alloc: Allocator, _: oauth_transport.Provider, _: host.
     state.selected_model = try alloc.dupe(u8, default_model);
     state.context_enabled = true;
     return state;
+}
+
+fn testRefreshableCodexStartup(alloc: Allocator, _: oauth_transport.Provider, _: host.SecretStore, default_model: []const u8, default_agent_step_limit: usize) !app_lifecycle.StartupState {
+    var state = app_lifecycle.StartupState{ .agent_step_limit = default_agent_step_limit };
+    errdefer state.deinit(alloc);
+    state.workspace_root = try alloc.dupe(u8, "/tmp/fx-test");
+    state.credential = .{
+        .token = try alloc.dupe(u8, "ambient-token-must-not-run"),
+        .source = .chatgpt_subscription,
+        .account_id = try alloc.dupe(u8, "ambient-account"),
+        .refresh_after_ms = 0,
+    };
+    state.provider = .codex;
+    state.selected_model = try alloc.dupe(u8, default_model);
+    state.context_enabled = false;
+    return state;
+}
+
+test "ask borrowed identity remains final for refreshable provider credentials" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io_mod.getIo(), "identity/.fx");
+    {
+        var file = try tmp.dir.createFile(
+            io_mod.getIo(),
+            "identity/.fx/chatgpt-auth.json",
+            .{ .permissions = std.Io.File.Permissions.fromMode(0o600) },
+        );
+        defer file.close(io_mod.getIo());
+        try file.writeStreamingAll(
+            io_mod.getIo(),
+            "{\"version\":1,\"access_token\":\"identity-token\",\"refresh_token\":\"identity-refresh\",\"expires_at_ms\":4000000000000,\"account_id\":\"identity-account\"}\n",
+        );
+    }
+    const identity_home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "identity");
+    defer alloc.free(identity_home);
+
+    var cfg = testConfig();
+    cfg.borrowed_authorization_home = identity_home;
+    cfg.provider_set.codex = test_builtin_gateway.provider_bundle;
+    var stdout_capture: TestCapture = .{};
+    defer stdout_capture.deinit(alloc);
+    var stderr_capture: TestCapture = .{};
+    defer stderr_capture.deinit(alloc);
+    const deps = testPromptRunDeps(
+        &stdout_capture,
+        &stderr_capture,
+        testRefreshableCodexStartup,
+    );
+
+    const exit_code = try runWithDeps(
+        alloc,
+        &.{ "--json", "--no-save", "hello" },
+        cfg,
+        deps,
+    );
+    try std.testing.expectEqual(@as(u8, 0), exit_code);
+    try std.testing.expectEqualStrings("", stderr_capture.bytes.items);
+    try std.testing.expect(std.mem.find(
+        u8,
+        stdout_capture.bytes.items,
+        "assistant text",
+    ) != null);
 }
 
 fn testMissingKeyAcknowledgedStartup(alloc: Allocator, transport: oauth_transport.Provider, secret_store: host.SecretStore, default_model: []const u8, default_agent_step_limit: usize) !app_lifecycle.StartupState {
@@ -4685,7 +4979,31 @@ fn testNoMcpRuntime(
     _: []const u8,
     _: mcp_elicitation.Capabilities,
     _: ?[]const u8,
+    _: ?[]const u8,
 ) !?*mcp_runtime.McpRuntime {
+    return null;
+}
+
+var test_mcp_authority_calls: usize = 0;
+var test_mcp_authority_expected_profile: ?[]const u8 = null;
+var test_mcp_authority_expected_config: ?[]const u8 = null;
+
+fn testMcpRuntimeAuthority(
+    _: Allocator,
+    _: []const u8,
+    _: mcp_elicitation.Capabilities,
+    profile_home: ?[]const u8,
+    selected_config_path: ?[]const u8,
+) !?*mcp_runtime.McpRuntime {
+    test_mcp_authority_calls += 1;
+    try std.testing.expectEqualStrings(
+        test_mcp_authority_expected_profile orelse return error.TestExpectedEqual,
+        profile_home orelse return error.TestExpectedEqual,
+    );
+    try std.testing.expectEqualStrings(
+        test_mcp_authority_expected_config orelse return error.TestExpectedEqual,
+        selected_config_path orelse return error.TestExpectedEqual,
+    );
     return null;
 }
 
@@ -4709,6 +5027,31 @@ fn testPromptRunDepsWithProcess(stdout_capture: *TestCapture, stderr_capture: *T
     var deps = testPromptRunDeps(stdout_capture, stderr_capture, testPresentKeyStartup);
     deps.process_queued_prompt = process;
     return deps;
+}
+
+test "ask MCP runtime receives selected profile and shape configuration" {
+    const alloc = std.testing.allocator;
+    var stdout_capture: TestCapture = .{};
+    defer stdout_capture.deinit(alloc);
+    var stderr_capture: TestCapture = .{};
+    defer stderr_capture.deinit(alloc);
+    var cfg = testConfig();
+    cfg.profile_home = "/profiles/work";
+    cfg.mcp_config_path = "/shapes/reviewer/.fx/mcp.json";
+    test_mcp_authority_calls = 0;
+    test_mcp_authority_expected_profile = cfg.profile_home;
+    test_mcp_authority_expected_config = cfg.mcp_config_path;
+    var deps = testPromptRunDeps(
+        &stdout_capture,
+        &stderr_capture,
+        testPresentKeyNoContextStartup,
+    );
+    deps.load_mcp_runtime = testMcpRuntimeAuthority;
+
+    var ctx = AskContext.init(alloc, cfg, deps, "/tmp/fx-test");
+    defer ctx.deinit();
+    ctx.mcp = try loadConfiguredMcpRuntime(&ctx);
+    try std.testing.expectEqual(@as(usize, 1), test_mcp_authority_calls);
 }
 
 fn testPermissionRuleSet(alloc: Allocator, permission: []const u8, pattern: []const u8, action: types.PermissionAction) !types.PermissionRuleSet {
@@ -5875,6 +6218,7 @@ fn testLoadMcpRuntimeWithCancellation(
     _: Allocator,
     _: []const u8,
     _: mcp_elicitation.Capabilities,
+    _: ?[]const u8,
     _: ?[]const u8,
 ) !?*mcp_runtime.McpRuntime {
     test_startup_cancellation_mcp_calls += 1;

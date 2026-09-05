@@ -370,12 +370,19 @@ fn classifyConversationCandidate(
     const workspace = try alloc.dupe(u8, metadata.workspace_root);
     errdefer alloc.free(workspace);
     const title = if (metadata.title) |value| try alloc.dupe(u8, value) else null;
+    errdefer if (title) |value| alloc.free(value);
+    var provenance = try session_codec.parseProvenanceMetadata(alloc, metadata.provenance);
+    defer if (provenance) |*value| value.deinit(alloc);
+    const shape = if (provenance) |value| try value.shape.dupe(alloc) else null;
+    errdefer if (shape) |value| alloc.free(value.id);
     return .{
         .summary = .{
             .id = id,
             .workspace_root = workspace,
             .origin_workspace_root = origin,
             .title = title,
+            .shape = shape,
+            .credential_source = if (provenance) |value| value.credential_source else null,
             .created_at_ms = metadata.created_at_ms,
             .updated_at_ms = if (history_len == 0 and !has_checkpoint)
                 metadata.updated_at_ms
@@ -456,10 +463,17 @@ pub fn classifySchemaV3Candidate(
     const workspace_root = try alloc.dupe(u8, manifest.workspace_root);
     errdefer alloc.free(workspace_root);
     var display = try session_display_metadata.readSidecarOrFallback(alloc, session_dir);
+    errdefer display.deinit(alloc);
     if (display.origin_workspace_root) |root| {
         alloc.free(root);
         display.origin_workspace_root = null;
     }
+
+    const shape = if (manifest.provenance) |provenance|
+        try provenance.shape.dupe(alloc)
+    else
+        null;
+    errdefer if (shape) |stored| alloc.free(stored.id);
 
     return .{
         .summary = .{
@@ -473,6 +487,11 @@ pub fn classifySchemaV3Candidate(
             .updated_at_ms = manifest.updated_at_ms,
             .conversation_language = manifest.conversation_language,
             .history_len = history_len,
+            .shape = shape,
+            .credential_source = if (manifest.provenance) |provenance|
+                provenance.credential_source
+            else
+                null,
         },
         .storage = .schema_v3,
         .projection_state = projection_state,
@@ -603,6 +622,11 @@ pub fn summaryFromState(
     errdefer alloc.free(workspace_root);
     var display = try session_display_metadata.deriveFromHistory(alloc, state.history);
     errdefer display.deinit(alloc);
+    const shape = if (state.provenance) |provenance|
+        try provenance.shape.dupe(alloc)
+    else
+        null;
+    errdefer if (shape) |value| alloc.free(value.id);
 
     return .{
         .id = id,
@@ -615,6 +639,11 @@ pub fn summaryFromState(
         .updated_at_ms = state.updated_at_ms,
         .conversation_language = state.conversation_language,
         .history_len = state.history.len,
+        .shape = shape,
+        .credential_source = if (state.provenance) |provenance|
+            provenance.credential_source
+        else
+            null,
     };
 }
 

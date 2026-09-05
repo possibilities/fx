@@ -32,12 +32,16 @@ pub const Manifest = struct {
     checkpoint_seq: ?u64,
     checkpoint_sha256: ?Digest,
     preferences: session_codec.DurableSessionPreferences,
+    /// The shape and credential that created this session, projected here so a
+    /// listing can name them without replaying the whole event log.
+    provenance: ?session_codec.SessionProvenance = null,
 
     pub fn deinit(self: *Manifest, alloc: Allocator) void {
         alloc.free(self.id);
         alloc.free(self.origin_workspace_root);
         alloc.free(self.workspace_root);
         self.preferences.deinit(alloc);
+        if (self.provenance) |*provenance| provenance.deinit(alloc);
         self.* = undefined;
     }
 };
@@ -154,6 +158,10 @@ pub fn encodeManifest(alloc: Allocator, manifest: Manifest) ![]u8 {
     }
     try out.writer.writeAll(",\"preferences\":");
     try writePreferences(&out.writer, manifest.preferences);
+    if (manifest.provenance) |provenance| {
+        try out.writer.writeAll(",\"provenance\":");
+        try session_codec.writeSessionProvenance(&out.writer, provenance);
+    }
     try out.writer.writeByte('}');
 
     if (out.written().len > manifest_max_bytes) return error.ManifestTooLarge;
@@ -192,7 +200,7 @@ pub fn decodeManifest(alloc: Allocator, bytes: []const u8) !Manifest {
         "checkpoint_seq",
         "checkpoint_sha256",
         "preferences",
-    });
+    }, &.{"provenance"});
     if (try requireU64(root, "schema_version") != 3 or
         !std.mem.eql(u8, try requireString(root, "storage_format"), "event_log_v1"))
     {
@@ -212,6 +220,17 @@ pub fn decodeManifest(alloc: Allocator, bytes: []const u8) !Manifest {
         var owned = preferences;
         owned.deinit(alloc);
     }
+    const provenance = if (root.get("provenance")) |provenance_value|
+        session_codec.parseSessionProvenance(alloc, provenance_value) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return error.InvalidManifest,
+        }
+    else
+        null;
+    errdefer if (provenance) |stored| {
+        var owned = stored;
+        owned.deinit(alloc);
+    };
     const manifest = Manifest{
         .id = id,
         .authority_id = try parseIdentifier(try requireString(root, "authority_id")),
@@ -238,6 +257,7 @@ pub fn decodeManifest(alloc: Allocator, bytes: []const u8) !Manifest {
         .checkpoint_sha256 = try optionalDigest(root.get("checkpoint_sha256") orelse
             return error.InvalidManifest),
         .preferences = preferences,
+        .provenance = provenance,
     };
     try validateManifest(manifest);
     return manifest;
@@ -358,7 +378,7 @@ fn decodeCheckpointImpl(alloc: Allocator, bytes: []const u8) !Checkpoint {
         "through_event_id",
         "through_event_log_bytes",
         "state",
-    });
+    }, &.{});
     if (try requireU64(root, "schema_version") != 1) return error.InvalidCheckpoint;
 
     var state_json: std.Io.Writer.Allocating = .init(alloc);
@@ -489,9 +509,9 @@ fn writePreferences(
 fn parsePreferences(alloc: Allocator, value: std.json.Value) !session_codec.DurableSessionPreferences {
     const raw_object = if (value == .object) value.object else return error.InvalidManifest;
     const object = if (raw_object.get("provider") != null)
-        try exactObject(value, &.{ "provider", "model", "effort", "fast_mode" })
+        try exactObject(value, &.{ "provider", "model", "effort", "fast_mode" }, &.{})
     else
-        try exactObject(value, &.{ "model", "effort", "fast_mode" });
+        try exactObject(value, &.{ "model", "effort", "fast_mode" }, &.{});
     const model = try dupeString(alloc, object, "model");
     errdefer alloc.free(model);
     return .{
@@ -506,15 +526,38 @@ fn parsePreferences(alloc: Allocator, value: std.json.Value) !session_codec.Dura
     };
 }
 
-fn exactObject(value: std.json.Value, keys: []const []const u8) !std.json.ObjectMap {
-    if (value != .object or value.object.count() != keys.len) return error.InvalidManifest;
+/// Every required key must be present and nothing unknown may appear. Optional
+/// keys are named rather than merely tolerated, so a manifest written by a
+/// newer Fx is still refused rather than silently half-read.
+fn exactObject(
+    value: std.json.Value,
+    required: []const []const u8,
+    optional: []const []const u8,
+) !std.json.ObjectMap {
+    if (value != .object) return error.InvalidManifest;
+    if (value.object.count() < required.len or
+        value.object.count() > required.len + optional.len)
+    {
+        return error.InvalidManifest;
+    }
+    for (required) |key| {
+        if (!value.object.contains(key)) return error.InvalidManifest;
+    }
     var iterator = value.object.iterator();
     while (iterator.next()) |entry| {
         var known = false;
-        for (keys) |key| {
+        for (required) |key| {
             if (std.mem.eql(u8, entry.key_ptr.*, key)) {
                 known = true;
                 break;
+            }
+        }
+        if (!known) {
+            for (optional) |key| {
+                if (std.mem.eql(u8, entry.key_ptr.*, key)) {
+                    known = true;
+                    break;
+                }
             }
         }
         if (!known) return error.InvalidManifest;

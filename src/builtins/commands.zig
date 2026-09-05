@@ -375,7 +375,23 @@ pub const top_level_flags = [_]TopLevelFlag{
     },
     .{
         .usage = "--state-dir <path>",
-        .description = "Use an isolated Fx profile for TUI or ACP",
+        .description = "Use an isolated Fx profile and prompt for TUI or ACP",
+    },
+    .{
+        .usage = "--shape <path>",
+        .description = "Take prompt, skills, and MCP from this root only",
+    },
+    .{
+        .usage = "--identity <path>",
+        .description = "Borrow this profile's credential, read only",
+    },
+    .{
+        .usage = "--history-dir <path>",
+        .description = "Own sessions, prompt history, and usage here",
+    },
+    .{
+        .usage = "--mcp-config <path>",
+        .description = "Use this MCP configuration file",
     },
     .{
         .usage = "--no-default-skills",

@@ -7,6 +7,8 @@ const session_codec = @import("../../session/session_codec.zig");
 const command_admission = @import("../../permissions/command_admission.zig");
 const permission_auto_classifier = @import("../../permissions/auto_classifier.zig");
 const model_capabilities = @import("../../config/model_capabilities.zig");
+const provider_set = @import("../../gateway/provider_set.zig");
+const shape_authority = @import("../../auth/shape_authority.zig");
 const types = @import("../../shared/types.zig");
 const worker_runtime = @import("../worker_runtime.zig");
 const file_mutation = @import("../../tooling/file_mutation.zig");
@@ -178,6 +180,10 @@ pub const DiffMarkerStyles = struct {
 
 pub const AgentRuntimeDeps = struct {
     ctx: *anyopaque,
+    /// The shape driving this run, recorded on any checkpoint it writes so a
+    /// later launch can refuse to continue a turn a different agent began.
+    shape: ?shape_authority.Identity = null,
+    shape_label: []const u8 = shape_authority.default_label,
     agent_stream_provider: agent_stream_provider.Provider = agent_stream_provider.unavailable_provider,
     flush_assistant_stream_per_content_chunk: bool = false,
     render_assistant_text: bool = true,

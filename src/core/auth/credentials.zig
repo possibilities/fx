@@ -31,6 +31,13 @@ pub fn resolveReadOnlyAuthorizationHome(
 ) !?[]u8 {
     const raw = configured orelse return null;
     if (selected_state_home == null) return error.ReadOnlyAuthorizationHomeRequiresStateDirectory;
+    return try canonicalizeAuthorizationHome(alloc, raw);
+}
+
+/// Validates one borrowed authorization home. Requiring the input to equal its
+/// real path keeps the authorization authority stable and prevents a retained
+/// state root from concealing a redirect through a symlink.
+fn canonicalizeAuthorizationHome(alloc: std.mem.Allocator, raw: []const u8) ![]u8 {
     if (raw.len == 0 or !std.unicode.utf8ValidateSlice(raw) or
         !std.fs.path.isAbsolute(raw) or std.mem.eql(u8, raw, "/"))
     {
@@ -46,6 +53,42 @@ pub fn resolveReadOnlyAuthorizationHome(
         return error.InvalidReadOnlyAuthorizationHome;
     directory.close(io_mod.getIo());
     return canonical;
+}
+
+/// Resolves the profile whose already-valid credential this launch borrows.
+/// The explicit `--identity` selection stands on its own, because a flag on the
+/// command line is the operator naming an account for this run. The
+/// environment form still requires an explicit state root, so an ambient
+/// variable can never redirect a default launch's billing. Naming both is
+/// refused rather than silently preferring one account over the other.
+pub fn resolveBorrowedAuthorizationHome(
+    alloc: std.mem.Allocator,
+    selected_state_home: ?[]const u8,
+    selected_identity_home: ?[]const u8,
+    configured_environment: ?[]const u8,
+) !?[]u8 {
+    if (selected_identity_home) |selected| {
+        if (configured_environment != null) return error.ConflictingAuthorizationHome;
+        return try canonicalizeAuthorizationHome(alloc, selected);
+    }
+    return resolveReadOnlyAuthorizationHome(
+        alloc,
+        selected_state_home,
+        configured_environment,
+    );
+}
+
+pub fn borrowedAuthorizationHomeFromLaunch(
+    alloc: std.mem.Allocator,
+    selected_state_home: ?[]const u8,
+    selected_identity_home: ?[]const u8,
+) !?[]u8 {
+    return resolveBorrowedAuthorizationHome(
+        alloc,
+        selected_state_home,
+        selected_identity_home,
+        io_mod.getenv(read_only_authorization_home_env),
+    );
 }
 
 pub fn readOnlyAuthorizationHomeFromEnvironment(

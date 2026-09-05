@@ -2,6 +2,8 @@ const std = @import("std");
 const session = @import("session.zig");
 const session_codec = @import("session_codec.zig");
 const session_log = @import("session_log.zig");
+const shape_authority = @import("../auth/shape_authority.zig");
+const types = @import("../shared/types.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -68,6 +70,13 @@ pub const SessionSummary = struct {
     history_len: usize,
     has_checkpoint: bool = false,
     has_managed_children: bool = false,
+    /// The shape that created this session. The label is what a listing prints;
+    /// the digest beside it is what decides whether two sessions are the same
+    /// shape. Null for a session written before provenance was recorded.
+    shape: ?shape_authority.Reference = null,
+    /// The credential origin that created it, paired with the shape so a
+    /// listing can separate two accounts running the same agent.
+    credential_source: ?types.CredentialSource = null,
 
     pub fn hasResumableContent(self: SessionSummary) bool {
         return self.history_len != 0 or self.has_checkpoint or self.has_managed_children;
@@ -80,6 +89,7 @@ pub const SessionSummary = struct {
         if (self.origin_workspace_root) |wr| alloc.free(wr);
         if (self.title) |title| alloc.free(title);
         if (self.preview) |preview| alloc.free(preview);
+        if (self.shape) |*shape| shape.deinit(alloc);
         self.* = undefined;
     }
 };

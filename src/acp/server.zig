@@ -4,6 +4,7 @@ const acp_runner = @import("../core/cli/acp_runner.zig");
 const config_runtime = @import("../core/config/config_runtime.zig");
 const io_mod = @import("../core/shared/io.zig");
 const host_target = @import("../core/hosts/target.zig");
+const host_contract = @import("../core/hosts/host.zig");
 const jsonrpc = @import("jsonrpc.zig");
 const acp_types = @import("types.zig");
 const sessions = @import("sessions.zig");
@@ -19,6 +20,7 @@ const codex_credential_broker = @import("../core/auth/codex_credential_broker.zi
 const model_provider = @import("../core/config/model_provider.zig");
 const debug_trace = @import("../core/shared/debug_trace.zig");
 const gateway_provider = @import("../core/gateway/gateway_provider.zig");
+const provider_set = @import("../core/gateway/provider_set.zig");
 const model_catalog = @import("../core/gateway/model_catalog.zig");
 const hooks = @import("../core/hooks/hooks.zig");
 const mcp_runtime = @import("../core/mcp/mcp_runtime.zig");
@@ -26,6 +28,7 @@ const mode_registry = @import("../core/modes/mode_registry.zig");
 const skill_runtime = @import("../core/skills/skill_runtime.zig");
 const session_codec = @import("../core/session/session_codec.zig");
 const session_log = @import("../core/session/session_log.zig");
+const app_history_home = @import("../core/app/app_history_home.zig");
 const session_store = @import("../core/session/session_store.zig");
 const session_runtime = @import("../core/session/session.zig");
 const worker_runtime = @import("../core/agent/worker_runtime.zig");
@@ -43,6 +46,7 @@ const tool_set_contract = @import("../core/tooling/tool_set.zig");
 const permissions = @import("../core/permissions/permissions.zig");
 const host_tool_runtime = @import("../core/tooling/host_tool_runtime.zig");
 const agent_checkpoint = @import("../core/agent/runtime/checkpoint.zig");
+const builtin_gateway = @import("../builtins/gateway.zig");
 
 const Allocator = std.mem.Allocator;
 const ErrorCode = jsonrpc.ErrorCode;
@@ -369,21 +373,22 @@ fn prepareConfiguredCredential(
         );
     }
     const borrowed_authorization_home =
-        try credentials.readOnlyAuthorizationHomeFromEnvironment(
+        try credentials.borrowedAuthorizationHomeFromLaunch(
             alloc,
             state.cfg.home_override,
+            state.cfg.identity_home,
         );
     defer if (borrowed_authorization_home) |home| alloc.free(home);
+    if (borrowed_authorization_home) |authorization_home| {
+        const resolution = try credentials.resolveReadOnlyForProviderFromHome(
+            alloc,
+            provider,
+            preferred,
+            authorization_home,
+        );
+        return resolution.credential;
+    }
     if (state.cfg.home_override) |home| {
-        if (borrowed_authorization_home) |authorization_home| {
-            const resolution = try credentials.resolveReadOnlyForProviderFromHome(
-                alloc,
-                provider,
-                preferred,
-                authorization_home,
-            );
-            return resolution.credential;
-        }
         return auth_runtime.prepareCredentialFromHome(
             alloc,
             state.cfg.gateway_provider.oauth_transport,
@@ -409,6 +414,9 @@ fn refreshConfiguredCredentialForAccount(
     expected_account_id: ?[]const u8,
 ) !?credentials.Credential {
     if (state.cfg.minimal_kernel and source == .chatgpt_subscription) {
+        // Embedded kernels make their host store the sole credential authority;
+        // they must never combine that write-capable store with a borrowed home.
+        std.debug.assert(state.cfg.identity_home == null);
         return auth_runtime.refreshCredentialForAccountWithStore(
             state.cfg.gateway_provider.oauth_transport,
             alloc,
@@ -418,6 +426,14 @@ fn refreshConfiguredCredentialForAccount(
             state.cfg.chatgpt_session_store,
         );
     }
+    const borrowed_authorization_home =
+        try credentials.borrowedAuthorizationHomeFromLaunch(
+            alloc,
+            state.cfg.home_override,
+            state.cfg.identity_home,
+        );
+    defer if (borrowed_authorization_home) |home| alloc.free(home);
+    if (borrowed_authorization_home != null) return null;
     if (state.cfg.home_override) |home| {
         return auth_runtime.refreshCredentialForAccountFromHome(
             state.cfg.gateway_provider.oauth_transport,
@@ -733,7 +749,10 @@ pub fn enableSubagentHost(state: *ServerState) void {
     disableSubagentHost(state);
     const active = if (state.active_session) |*session| session else return;
     if (active.writable == null) return;
-    state.subagent_store = (if (state.cfg.home_override) |home|
+    state.subagent_store = (if (app_history_home.forSelection(
+        state.cfg.history_home_override,
+        state.cfg.home_override,
+    )) |home|
         session_store.Store.initFromHome(state.alloc, home, state.workspace_root)
     else
         session_store.Store.init(state.alloc, state.workspace_root)) catch |err| {
@@ -831,8 +850,11 @@ test "ACP child authority preserves native-tool suppression and allowlisting" {
         .order = builtin_tools.advertisement_set.order[0..1],
         .read_only_tool_names = &.{},
     };
-    var state: ServerState = undefined;
-    state.alloc = alloc;
+    var state = ServerState{
+        .alloc = alloc,
+        .cfg = undefined,
+        .writer = jsonrpc.Writer.init(),
+    };
     state.cfg.allow_native_tools = false;
     state.cfg.native_tool_set = selected;
     state.cfg.mode_registry = .{
@@ -1917,9 +1939,10 @@ fn loadConfiguredStartupState(state: *const ServerState, alloc: Allocator) !app_
         );
     }
     const borrowed_authorization_home =
-        try credentials.readOnlyAuthorizationHomeFromEnvironment(
+        try credentials.borrowedAuthorizationHomeFromLaunch(
             alloc,
             state.cfg.home_override,
+            state.cfg.identity_home,
         );
     defer if (borrowed_authorization_home) |home| alloc.free(home);
     if (state.cfg.home_override) |home_dir| {
@@ -1931,8 +1954,36 @@ fn loadConfiguredStartupState(state: *const ServerState, alloc: Allocator) !app_
             state.cfg.default_model,
             state.cfg.default_agent_step_limit,
         );
+        errdefer startup.deinit(alloc);
         startup.auth_mode = state.cfg.auth_mode;
+        if (borrowed_authorization_home) |authorization_home| {
+            var resolution = try credentials.resolveReadOnlyForProviderFromHome(
+                alloc,
+                startup.provider,
+                startup.credential_source_preference,
+                authorization_home,
+            );
+            if (startup.credential) |*credential| credential.deinit(alloc);
+            startup.credential = resolution.credential;
+            resolution.credential = null;
+            startup.stored_key_status = resolution.stored_key_status;
+            startup.fx_login_status = resolution.fx_login_status;
+            startup.credential_load_failure = if (resolution.failure) |failure|
+                .{ .source = failure.source, .err = failure.err }
+            else
+                null;
+        }
         return startup;
+    }
+    if (borrowed_authorization_home) |authorization_home| {
+        return app_lifecycle.loadCatalogStartupStateBorrowingIdentity(
+            alloc,
+            state.cfg.secret_store,
+            authorization_home,
+            state.cfg.default_model,
+            state.cfg.default_agent_step_limit,
+            state.cfg.auth_mode,
+        );
     }
     return app_lifecycle.loadStartupStateWithAuthMode(
         alloc,
@@ -2028,6 +2079,15 @@ fn handleInitialize(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message
         state.account_id = null;
         state.gateway_team = null;
     } else {
+        const borrowed_authorization_home: ?[]u8 = if (state.cfg.minimal_kernel)
+            null
+        else
+            try credentials.borrowedAuthorizationHomeFromLaunch(
+                alloc,
+                state.cfg.home_override,
+                state.cfg.identity_home,
+            );
+        defer if (borrowed_authorization_home) |home| alloc.free(home);
         var startup_credential = startup.takeCredential();
         defer if (startup_credential) |*credential| credential.deinit(alloc);
         var routed_credential: ?credentials.Credential = null;
@@ -2037,7 +2097,8 @@ fn handleInitialize(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message
         else
             false;
         const startup_credential_is_final = startup_matches_model and
-            !credentials.sourceRefreshable(startup_credential.?.source);
+            (borrowed_authorization_home != null or
+                !credentials.sourceRefreshable(startup_credential.?.source));
         const credential: *credentials.Credential = if (state.provider == .gateway and state.cfg.credential_override != null) override: {
             routed_credential = .{
                 .token = try alloc.dupe(u8, state.cfg.credential_override.?),
@@ -2842,6 +2903,30 @@ test "ACP permission responses map canonical option ids" {
     }
 }
 
+fn acpServerTestConfig() Config {
+    return .{
+        .default_model = "default/model",
+        .default_agent_step_limit = 50,
+        .gateway_retry_count = 0,
+        .gateway_chat_url = "http://127.0.0.1/unused",
+        .gateway_models_path = "/v1/models",
+        .gateway_provider = builtin_gateway.provider,
+        .provider_set = provider_set.gateway_only(builtin_gateway.provider_bundle),
+        .secret_store = host_contract.unavailable_secret_store,
+        .prompt_policy = .{ .system_prompt = "test" },
+        .ignored_list_entries = &.{},
+        .max_list_entries = 0,
+        .max_read_file_bytes = 0,
+        .max_read_file_lines = 0,
+        .max_read_file_line_len = 0,
+        .max_command_output_bytes = 0,
+        .max_tool_result_bytes = 0,
+        .max_history_turns = 0,
+        .context_registry = .{ .default_provider = context_contract.empty_provider },
+        .mode_registry = .{ .default_mode_id = "normal" },
+    };
+}
+
 test "ACP selected profile state loads settings without workspace override" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -2855,14 +2940,84 @@ test "ACP selected profile state loads settings without workspace override" {
     const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "state");
     defer alloc.free(home);
 
-    var state: ServerState = undefined;
+    var state = ServerState{
+        .alloc = alloc,
+        .cfg = acpServerTestConfig(),
+        .writer = jsonrpc.Writer.init(),
+    };
     state.cfg.home_override = home;
-    state.cfg.workspace_root_override = null;
-    state.cfg.default_model = "default/model";
-    state.cfg.default_agent_step_limit = 50;
     var startup = try loadConfiguredStartupState(&state, alloc);
     defer startup.deinit(alloc);
     try std.testing.expectEqualStrings("isolated/model", startup.configured_model);
+}
+
+test "ACP identity remains the only credential authority across routing and refresh" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "state/.fx");
+    try tmp.dir.createDirPath(std.testing.io, "identity/.fx");
+    {
+        var file = try tmp.dir.createFile(std.testing.io, "state/.fx/settings.json", .{});
+        defer file.close(std.testing.io);
+        try file.writeStreamingAll(
+            std.testing.io,
+            "{\"provider\":\"codex\",\"codex_model\":\"isolated/model\"}\n",
+        );
+    }
+    {
+        var file = try tmp.dir.createFile(
+            std.testing.io,
+            "state/.fx/chatgpt-auth.json",
+            .{ .permissions = std.Io.File.Permissions.fromMode(0o600) },
+        );
+        defer file.close(std.testing.io);
+        try file.writeStreamingAll(
+            std.testing.io,
+            "{\"version\":1,\"access_token\":\"state-token\",\"refresh_token\":\"state-refresh\",\"expires_at_ms\":4000000000000,\"account_id\":\"state-account\"}\n",
+        );
+    }
+    {
+        var file = try tmp.dir.createFile(
+            std.testing.io,
+            "identity/.fx/chatgpt-auth.json",
+            .{ .permissions = std.Io.File.Permissions.fromMode(0o600) },
+        );
+        defer file.close(std.testing.io);
+        try file.writeStreamingAll(
+            std.testing.io,
+            "{\"version\":1,\"access_token\":\"identity-token\",\"refresh_token\":\"identity-refresh\",\"expires_at_ms\":4000000000000,\"account_id\":\"identity-account\"}\n",
+        );
+    }
+    const state_home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "state");
+    defer alloc.free(state_home);
+    const identity_home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "identity");
+    defer alloc.free(identity_home);
+
+    var state = ServerState{
+        .alloc = alloc,
+        .cfg = acpServerTestConfig(),
+        .writer = jsonrpc.Writer.init(),
+    };
+    state.cfg.home_override = state_home;
+    state.cfg.identity_home = identity_home;
+
+    var startup = try loadConfiguredStartupState(&state, alloc);
+    defer startup.deinit(alloc);
+    try std.testing.expectEqualStrings("identity-token", startup.apiKey().?);
+    try std.testing.expectEqualStrings("identity-account", startup.credential.?.accountId().?);
+
+    var routed = (try prepareConfiguredCredential(&state, alloc, .codex, null)).?;
+    defer routed.deinit(alloc);
+    try std.testing.expectEqualStrings("identity-token", routed.token);
+    try std.testing.expectEqualStrings("identity-account", routed.accountId().?);
+    try std.testing.expect((try refreshConfiguredCredentialForAccount(
+        &state,
+        alloc,
+        .chatgpt_subscription,
+        .if_needed,
+        "identity-account",
+    )) == null);
 }
 
 test "ACP outbound waiters resolve to deny on cancellation" {
@@ -3223,6 +3378,7 @@ test "ACP publishes an account-bound refreshed Codex token for later prompts" {
         state.active_session.?.session_rt.deinit(alloc);
         secret.zeroAndFree(alloc, state.api_key);
         alloc.free(state.account_id.?);
+        if (state.codex_account_id) |account_id| alloc.free(account_id);
     }
 
     var refreshed = credentials.Credential{

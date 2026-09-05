@@ -3,6 +3,7 @@ const chatgpt_session = @import("../auth/chatgpt_session.zig");
 const config_runtime = @import("../config/config_runtime.zig");
 const process_provider = @import("../execution/process_provider.zig");
 const model_provider = @import("../config/model_provider.zig");
+const shape_authority = @import("../auth/shape_authority.zig");
 const gateway_provider = @import("../gateway/gateway_provider.zig");
 const model_catalog = @import("../gateway/model_catalog.zig");
 const provider_set = @import("../gateway/provider_set.zig");
@@ -47,6 +48,17 @@ pub const Config = struct {
     credential_override: ?[]const u8 = null,
     chatgpt_session_store: chatgpt_session.Store = chatgpt_session.default_store,
     home_override: ?[]const u8 = null,
+    /// The root owning sessions, prompt history, and usage. Null keeps history
+    /// with `home_override`, so `--state-dir` still isolates all three.
+    history_home_override: ?[]const u8 = null,
+    /// The profile whose credential this launch borrows, read only.
+    identity_home: ?[]const u8 = null,
+    /// Canonical profile MCP configuration selected by the launch shape.
+    /// Stored MCP credentials remain with the writable state/profile home.
+    mcp_config_path: ?[]const u8 = null,
+    /// The shape this launch is running, recorded beside every session.
+    shape: ?shape_authority.Identity = null,
+    shape_label: []const u8 = shape_authority.default_label,
     workspace_root_override: ?[]const u8 = null,
     log_file: ?[]const u8 = null,
     context_limit_overrides: []const config_runtime.context_limits.Override = &.{},
