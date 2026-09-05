@@ -6567,6 +6567,7 @@ describe("acp: model-independent", () => {
             FX_GATEWAY_CHAT_URL: gateway.chatUrl,
             FX_MODEL: undefined,
             FX_AUTO_UPGRADE: "0",
+            FX_MCP_PROTOCOL_VERSION: "2026-07-28",
           },
         });
         await client.request("initialize", { protocolVersion: 1 }, 1);
