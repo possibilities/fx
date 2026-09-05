@@ -108,6 +108,7 @@ pub const Locations = struct {
 };
 
 pub const SkillSource = enum {
+    invocation,
     workspace_fx,
     workspace_shared,
     workspace_opencode,
@@ -154,6 +155,10 @@ pub const RootSpec = struct {
 
 /// Borrowed root policy supplied by a product capability owner.
 pub const RootPolicy = struct {
+    /// Absolute roots supplied by this process invocation, in CLI order.
+    invocation_roots: []const []const u8 = &.{},
+    /// When true, invocation roots replace every automatic root.
+    exclusive_invocation_roots: bool = false,
     workspace_roots: []const RootSpec = &.{},
     /// Source identity for the managed install directory passed to discovery.
     /// A null source excludes that directory from the policy.

@@ -560,6 +560,7 @@ const AskContext = struct {
     session_write_mutex: std.Io.Mutex = .init,
     requested_resume: ?ResumeTarget = null,
     seed_model: []const u8 = "",
+    seed_effort: types.ReasoningEffort = .auto,
     command_timeout_ms: ?usize = null,
     session: SessionRuntime,
     skills_dir: []u8 = &.{},
@@ -632,7 +633,7 @@ const AskContext = struct {
         turn_end: bool,
         attention_required: bool,
     ) !void {
-        self.notification_player = notification_sound.Player.init(.{
+        self.notification_player = try notification_sound.Player.init(.{
             .ctx = self,
             .emit = emitAskNotificationBell,
         });
@@ -706,6 +707,8 @@ const AskContext = struct {
     }
 
     fn deinit(self: *AskContext) void {
+        if (self.notification_player) |*player| player.deinit();
+        self.notification_player = null;
         if (self.subagent_host) |subagent_host| subagent_host.deinit();
         self.subagent_host = null;
         self.managed_executions.deinit();
@@ -847,7 +850,7 @@ const AskContext = struct {
         const seed_preferences = session_codec.DurableSessionPreferences{
             .provider = self.provider,
             .model = @constCast(self.seed_model),
-            .effort = self.effort,
+            .effort = self.seed_effort,
             .fast_mode = self.fast_mode,
         };
         var writable = if (self.requested_resume) |target|
@@ -1006,6 +1009,7 @@ const AskContext = struct {
             .session = &self.session,
             .session_allocator = self.alloc,
             .skills_dir = self.skills_dir,
+            .skill_root_policy = self.cfg.skill_root_policy,
             .context_limits = self.context_limits,
             .context_enabled = self.context_enabled,
             .context_registry = self.deps.context_registry,
@@ -1511,6 +1515,7 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
     ctx.model = startup.selected_model;
     ctx.provider = startup.provider;
     ctx.seed_model = startup.configured_model;
+    ctx.seed_effort = toCoreReasoningEffort(startup.configured_effort);
     ctx.requested_resume = options.resume_target;
     ctx.agent_step_limit = startup.agent_step_limit;
     ctx.max_tool_result_bytes = startup.max_tool_result_bytes;
@@ -1544,6 +1549,9 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
         } else if (ctx.requested_resume != null) {
             owned_resumed_model = try alloc.dupe(u8, ctx.model);
             ctx.model = owned_resumed_model.?;
+        }
+        if (startup.effort_source == .process_override) {
+            ctx.effort = toCoreReasoningEffort(startup.effort);
         }
         ctx.session.setConversationLanguageFromUserMessage(owned_prompt);
     }
@@ -1689,6 +1697,7 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
         alloc,
         startup.workspace_root,
         ctx.mcp_elicitation_capabilities,
+        null,
     );
     if (ctx.mcp) |mcp| {
         var health_snapshot = try mcp.snapshotHealth(
@@ -4671,7 +4680,12 @@ fn testPresentKeyNoContextStartup(alloc: Allocator, transport: oauth_transport.P
     return state;
 }
 
-fn testNoMcpRuntime(_: Allocator, _: []const u8, _: mcp_elicitation.Capabilities) !?*mcp_runtime.McpRuntime {
+fn testNoMcpRuntime(
+    _: Allocator,
+    _: []const u8,
+    _: mcp_elicitation.Capabilities,
+    _: ?[]const u8,
+) !?*mcp_runtime.McpRuntime {
     return null;
 }
 
@@ -5857,7 +5871,12 @@ const test_startup_cancellation_context_registry = context_contract.Registry{ .d
     .append_transient_fn = testNoTransientContext,
 } };
 
-fn testLoadMcpRuntimeWithCancellation(_: Allocator, _: []const u8, _: mcp_elicitation.Capabilities) !?*mcp_runtime.McpRuntime {
+fn testLoadMcpRuntimeWithCancellation(
+    _: Allocator,
+    _: []const u8,
+    _: mcp_elicitation.Capabilities,
+    _: ?[]const u8,
+) !?*mcp_runtime.McpRuntime {
     test_startup_cancellation_mcp_calls += 1;
     if (test_startup_cancellation_stage == .during_mcp_load) {
         requestTestHeadlessInterrupt();

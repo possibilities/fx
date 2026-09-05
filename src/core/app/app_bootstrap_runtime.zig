@@ -48,12 +48,20 @@ fn BootstrapDeps(comptime App: type) type {
             config_runtime.ModelSource,
             []const u8,
             types.ReasoningEffort,
+            config_runtime.ConfigSource,
+            types.ReasoningEffort,
             bool,
             bool,
         ) anyerror!void;
         const InitializePersistenceFn = *const fn (*App, bool) anyerror!void;
         const LoadSkillsFn = *const fn (
             Allocator,
+            []const u8,
+            skill_contract.RootPolicy,
+        ) app_runtime_setup.LoadSkillsError!app_runtime_setup.LoadedSkills;
+        const LoadSkillsFromHomeFn = *const fn (
+            Allocator,
+            []const u8,
             []const u8,
             skill_contract.RootPolicy,
         ) app_runtime_setup.LoadSkillsError!app_runtime_setup.LoadedSkills;
@@ -65,6 +73,7 @@ fn BootstrapDeps(comptime App: type) type {
         initialize_persistence: InitializePersistenceFn,
         load_mcp_runtime: mcp_runtime.LoadRuntimeFn,
         load_skills: LoadSkillsFn,
+        load_skills_from_home: LoadSkillsFromHomeFn,
         skill_root_policy: skill_contract.RootPolicy,
         welcome_message: WelcomeMessageFn,
         begin_fresh_persisted_session: BeginFreshPersistedSessionFn,
@@ -100,6 +109,7 @@ pub fn Runtime(comptime App: type) type {
                 .initialize_persistence = initializePersistenceDefault,
                 .load_mcp_runtime = capability_providers.load_mcp_runtime,
                 .load_skills = app_runtime_setup.loadSkills,
+                .load_skills_from_home = app_runtime_setup.loadSkillsFromHome,
                 .skill_root_policy = capability_providers.skill_root_policy,
                 .welcome_message = welcomeMessageDefault,
                 .begin_fresh_persisted_session = beginFreshPersistedSessionDefault,
@@ -128,6 +138,8 @@ pub fn Runtime(comptime App: type) type {
             configured_model: []const u8,
             model_source: config_runtime.ModelSource,
             selected_model: []const u8,
+            configured_effort: types.ReasoningEffort,
+            effort_source: config_runtime.ConfigSource,
             effort: types.ReasoningEffort,
             fast_mode: bool,
             fast_mode_model_bound: bool,
@@ -138,6 +150,8 @@ pub fn Runtime(comptime App: type) type {
                 configured_model,
                 model_source,
                 selected_model,
+                configured_effort,
+                effort_source,
                 effort,
                 fast_mode,
                 fast_mode_model_bound,
@@ -188,6 +202,10 @@ pub fn Runtime(comptime App: type) type {
                     app.secretStore()
                 else
                     host.unavailable_secret_store,
+                .profile_home = if (comptime @hasField(App, "profile_home"))
+                    app.profile_home
+                else
+                    null,
                 .auth_mode = if (comptime @hasDecl(@TypeOf(app.auth), "authMode"))
                     app.auth.authMode()
                 else
@@ -241,7 +259,10 @@ pub fn Runtime(comptime App: type) type {
                 prompt_history_unavailable =
                     (try app.prompt_history.initialize(
                         app.alloc,
-                        shared_io.getenv("HOME"),
+                        if (comptime @hasField(App, "profile_home"))
+                            app.profile_home orelse shared_io.getenv("HOME")
+                        else
+                            shared_io.getenv("HOME"),
                         startup.prompt_history_enabled,
                         startup.prompt_history_store_allowed,
                     )) == .unavailable;
@@ -251,7 +272,10 @@ pub fn Runtime(comptime App: type) type {
             {
                 _ = try app.session.initializeProfileUsage(
                     app.alloc,
-                    shared_io.getenv("HOME"),
+                    if (comptime @hasField(App, "profile_home"))
+                        app.profile_home orelse shared_io.getenv("HOME")
+                    else
+                        shared_io.getenv("HOME"),
                 );
             }
 
@@ -269,6 +293,8 @@ pub fn Runtime(comptime App: type) type {
                 startup.configured_model,
                 startup.model_source,
                 active_model,
+                startup.configured_effort,
+                startup.effort_source,
                 startup.effort,
                 startup.fast_mode,
                 startup.fast_mode_model_bound,
@@ -288,6 +314,9 @@ pub fn Runtime(comptime App: type) type {
             app.auto_upgrade_enabled = startup.auto_upgrade;
             app.upgrader.configure_channel(startup.update_channel);
             app.effort = startup.effort;
+            if (comptime @hasDecl(App, "configureSessionNaming")) {
+                app.configureSessionNaming(startup.takeSessionNamingConfig());
+            }
             app.shell.setCommandOutputRenderPolicy(
                 app_render_runtime.Runtime(App).shellStyles(),
             );
@@ -313,6 +342,7 @@ pub fn Runtime(comptime App: type) type {
                 app.alloc,
                 app.workspace_root,
                 .{ .form = true, .url = true },
+                if (comptime @hasField(App, "profile_home")) app.profile_home else null,
             );
             if (comptime @hasDecl(App, "installInitialMcpRuntime")) {
                 app.installInitialMcpRuntime(profile_mcp);
@@ -320,11 +350,26 @@ pub fn Runtime(comptime App: type) type {
                 app.mcp_runtime = profile_mcp;
             }
 
-            var loaded = try deps.load_skills(
-                std.heap.c_allocator,
-                app.workspace_root,
-                deps.skill_root_policy,
-            );
+            var loaded = if (comptime @hasField(App, "profile_home"))
+                if (app.profile_home) |home_dir|
+                    try deps.load_skills_from_home(
+                        std.heap.c_allocator,
+                        app.workspace_root,
+                        home_dir,
+                        deps.skill_root_policy,
+                    )
+                else
+                    try deps.load_skills(
+                        std.heap.c_allocator,
+                        app.workspace_root,
+                        deps.skill_root_policy,
+                    )
+            else
+                try deps.load_skills(
+                    std.heap.c_allocator,
+                    app.workspace_root,
+                    deps.skill_root_policy,
+                );
             errdefer loaded.deinit(std.heap.c_allocator);
             skill_runtime.traceDiagnostics("interactive_startup", loaded.diagnostics);
             try app.skills.replaceLoaded(std.heap.c_allocator, loaded.dir, loaded.skills, loaded.diagnostics);
@@ -482,10 +527,15 @@ const TestCapture = struct {
     runtime_model: [64]u8 = undefined,
     runtime_model_len: usize = 0,
     configured_effort: types.ReasoningEffort = .auto,
+    configured_effort_source: config_runtime.ConfigSource = .compiled_default,
+    runtime_effort: types.ReasoningEffort = .auto,
     configured_fast_mode: bool = false,
     configured_fast_mode_model_bound: bool = false,
     initialize_required: bool = false,
+    mcp_profile_home: ?[]const u8 = null,
+    skill_profile_home: ?[]const u8 = null,
     load_skills_workspace: []const u8 = "",
+    load_skills_invocation_root_count: usize = 0,
     load_skills_workspace_root_count: usize = 0,
     load_skills_global_root_count: usize = 0,
     transcript_recorded: bool = false,
@@ -565,6 +615,7 @@ const TestApp = struct {
     statusline_session: bool = false,
     workspace_identity: statusline_identity.Runtime = .{},
     requested_resume: ?u8 = null,
+    profile_home: ?[]const u8 = null,
     mcp_runtime: ?*mcp_runtime.McpRuntime = null,
     skills: skill_runtime.Runtime = .{},
     transcript: std.ArrayList(u8) = .empty,
@@ -640,6 +691,7 @@ fn testDeps() BootstrapDeps(TestApp) {
         .initialize_persistence = initializePersistenceForTest,
         .load_mcp_runtime = loadMcpRuntimeForTest,
         .load_skills = loadSkillsForTest,
+        .load_skills_from_home = loadSkillsFromHomeForTest,
         .skill_root_policy = .{
             .workspace_roots = &test_workspace_skill_roots,
             .managed_root_source = .global_fx,
@@ -714,6 +766,8 @@ fn makeStartupState(alloc: Allocator) !app_lifecycle.StartupState {
     state.auto_upgrade = false;
     state.update_channel = .dev;
     state.effort = types.ReasoningEffort.literal("high");
+    state.configured_effort = types.ReasoningEffort.literal("low");
+    state.effort_source = .process_override;
     state.statusline_workspace = true;
     if (active_capture.?.emit_config_diagnostics) {
         const diagnostics = try alloc.alloc(config_runtime.ConfigDiagnostic, 2);
@@ -733,7 +787,13 @@ fn initializePersistenceForTest(
     active_capture.?.initialize_required = required;
 }
 
-fn loadMcpRuntimeForTest(_: Allocator, _: []const u8, _: @import("../mcp/elicitation.zig").Capabilities) !?*mcp_runtime.McpRuntime {
+fn loadMcpRuntimeForTest(
+    _: Allocator,
+    _: []const u8,
+    _: @import("../mcp/elicitation.zig").Capabilities,
+    profile_home: ?[]const u8,
+) !?*mcp_runtime.McpRuntime {
+    active_capture.?.mcp_profile_home = profile_home;
     active_capture.?.recordEvent("load_mcp");
     return null;
 }
@@ -766,6 +826,16 @@ fn loadSkillsForTest(
     return .{ .dir = dir, .skills = &.{}, .diagnostics = diagnostics };
 }
 
+fn loadSkillsFromHomeForTest(
+    alloc: Allocator,
+    workspace_root: []const u8,
+    profile_home: []const u8,
+    policy: skill_contract.RootPolicy,
+) app_runtime_setup.LoadSkillsError!app_runtime_setup.LoadedSkills {
+    active_capture.?.skill_profile_home = profile_home;
+    return loadSkillsForTest(alloc, workspace_root, policy);
+}
+
 fn welcomeMessageForTest(alloc: Allocator) ![]u8 {
     return alloc.dupe(u8, "welcome\n");
 }
@@ -776,6 +846,8 @@ fn configureSessionPreferencesForTest(
     configured_model: []const u8,
     model_source: config_runtime.ModelSource,
     selected_model: []const u8,
+    configured_effort: types.ReasoningEffort,
+    effort_source: config_runtime.ConfigSource,
     effort: types.ReasoningEffort,
     fast_mode: bool,
     fast_mode_model_bound: bool,
@@ -798,7 +870,9 @@ fn configureSessionPreferencesForTest(
         capture.runtime_model[0..capture.runtime_model_len],
         selected_model[0..capture.runtime_model_len],
     );
-    capture.configured_effort = effort;
+    capture.configured_effort = configured_effort;
+    capture.configured_effort_source = effort_source;
+    capture.runtime_effort = effort;
     capture.configured_fast_mode = fast_mode;
     capture.configured_fast_mode_model_bound = fast_mode_model_bound;
 }
@@ -886,8 +960,16 @@ test "app_bootstrap_runtime transfers startup state and starts a fresh session" 
     );
     try std.testing.expectEqualStrings("model-x", capture.runtimeModel());
     try std.testing.expectEqual(
-        types.ReasoningEffort.literal("high"),
+        types.ReasoningEffort.literal("low"),
         capture.configured_effort,
+    );
+    try std.testing.expectEqual(
+        config_runtime.ConfigSource.process_override,
+        capture.configured_effort_source,
+    );
+    try std.testing.expectEqual(
+        types.ReasoningEffort.literal("high"),
+        capture.runtime_effort,
     );
     try std.testing.expect(capture.configured_fast_mode);
     try std.testing.expect(capture.configured_fast_mode_model_bound);
@@ -897,6 +979,7 @@ test "app_bootstrap_runtime transfers startup state and starts a fresh session" 
     );
     try std.testing.expect(!capture.initialize_required);
     try std.testing.expectEqualStrings("/workspace", capture.load_skills_workspace);
+    try std.testing.expectEqual(@as(usize, 0), capture.load_skills_invocation_root_count);
     try std.testing.expectEqual(@as(usize, 1), capture.load_skills_workspace_root_count);
     try std.testing.expectEqual(@as(usize, 1), capture.load_skills_global_root_count);
     const events = capture.eventSlice();
@@ -935,6 +1018,25 @@ test "app_bootstrap_runtime transfers startup state and starts a fresh session" 
     try std.testing.expect(app.transcript_recorded);
     try std.testing.expect(app.shell.render_requests.hasReason(.first_frame));
     try std.testing.expect(app.begin_fresh_called);
+}
+
+test "app_bootstrap_runtime routes selected profile home to TUI capabilities" {
+    const alloc = std.testing.allocator;
+    var capture = TestCapture.init(alloc);
+    var app = TestApp.init(alloc);
+    defer app.deinit();
+    app.profile_home = "/selected-state";
+
+    try runBootstrapForTest(&app, &capture);
+
+    try std.testing.expectEqualStrings(
+        "/selected-state",
+        capture.mcp_profile_home.?,
+    );
+    try std.testing.expectEqualStrings(
+        "/selected-state",
+        capture.skill_profile_home.?,
+    );
 }
 
 test "app_bootstrap_runtime opens onboarding before first frame without a credential" {

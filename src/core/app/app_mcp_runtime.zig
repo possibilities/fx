@@ -938,6 +938,7 @@ fn deinitAuthenticationResult(result: anyerror!mcp_auth.AuthenticationResult) vo
 pub const State = struct {
     lock: std.Io.RwLock = .init,
     runtime: ?*mcp_runtime.McpRuntime = null,
+    profile_home: ?[]const u8 = null,
     pending_reload: ?*PendingReload = null,
     pending_authentication: ?*PendingAuthentication = null,
     pending_menu_operation: ?*PendingMenuOperation = null,
@@ -1658,6 +1659,13 @@ pub const State = struct {
         self.cancelPendingMenuOperation("menu_back");
     }
 
+    pub fn setProfileHome(self: *State, home: ?[]const u8) void {
+        std.debug.assert(self.runtime == null);
+        std.debug.assert(self.pending_reload == null);
+        std.debug.assert(self.pending_authentication == null);
+        self.profile_home = home;
+    }
+
     pub fn installInitial(self: *State, runtime: ?*mcp_runtime.McpRuntime) void {
         std.debug.assert(self.runtime == null);
         self.runtime = runtime;
@@ -2359,7 +2367,7 @@ pub const State = struct {
         if (cancel_requested.load(.acquire)) return error.Cancelled;
         var lease = self.acquire();
         defer if (lease) |*current| current.deinit();
-        const next_authority = preview_workspace_authority(alloc, workspace_root) catch |err| {
+        const next_authority = preview_workspace_authority(alloc, workspace_root, self.profile_home) catch |err| {
             if (lease) |current| {
                 if (current.runtime.revokeWorkspaceExceptNames(&.{})) return error.McpAuthorityReducedReloadFailed;
             }
@@ -2367,7 +2375,7 @@ pub const State = struct {
         };
         defer mcp_contract.freeOwnedStrings(alloc, next_authority);
         const authority_reduced = if (lease) |current| current.runtime.revokeWorkspaceExceptNames(next_authority) else false;
-        const candidate = loader(alloc, workspace_root, elicitation_capabilities) catch |err| {
+        const candidate = loader(alloc, workspace_root, elicitation_capabilities, self.profile_home) catch |err| {
             if (authority_reduced) return error.McpAuthorityReducedReloadFailed;
             return err;
         };
@@ -2398,7 +2406,7 @@ pub const State = struct {
             }
             return .{ .published = try PublishedReload.init(alloc, null, &.{}) };
         }
-        const candidate = try loader(alloc, workspace_root, elicitation_capabilities);
+        const candidate = try loader(alloc, workspace_root, elicitation_capabilities, self.profile_home);
         return self.applyReloadCandidate(alloc, candidate, registry, captured_at_ms, cancel_requested, pending, false, false);
     }
 
@@ -2676,6 +2684,8 @@ const TestReloadMode = enum {
 };
 
 var test_reload_mode: TestReloadMode = .empty;
+var test_reload_profile_home: ?[]const u8 = null;
+var test_reload_preview_profile_home: ?[]const u8 = null;
 
 test "menu selection follows server identity when snapshots reorder" {
     const alloc = std.testing.allocator;
@@ -2698,7 +2708,9 @@ fn loadTestReloadRuntime(
     alloc: Allocator,
     _: []const u8,
     _: elicitation.Capabilities,
+    profile_home: ?[]const u8,
 ) !?*mcp_runtime.McpRuntime {
+    test_reload_profile_home = profile_home;
     switch (test_reload_mode) {
         .parse_failure => return error.McpConfigInvalidJson,
         .empty => return null,
@@ -2749,7 +2761,12 @@ fn loadTestReloadRuntime(
     return runtime;
 }
 
-fn previewTestWorkspaceAuthority(alloc: Allocator, _: []const u8) ![][]u8 {
+fn previewTestWorkspaceAuthority(
+    alloc: Allocator,
+    _: []const u8,
+    profile_home: ?[]const u8,
+) ![][]u8 {
+    test_reload_preview_profile_home = profile_home;
     return alloc.alloc([]u8, 0);
 }
 
@@ -2757,12 +2774,34 @@ fn failPendingReloadSpawn(_: *PendingReload) !std.Thread {
     return error.TestSpawnFailed;
 }
 
-fn expectNoActiveMcpServers(state: *State) !void {
-    var lease = state.acquire() orelse return;
-    defer lease.deinit();
-    var snapshot = try lease.runtime.snapshotHealth(std.testing.allocator, 0);
-    defer snapshot.deinit(std.testing.allocator);
-    try std.testing.expectEqual(@as(usize, 0), snapshot.servers.len);
+test "MCP reload retains the selected profile home" {
+    const alloc = std.testing.allocator;
+    var state: State = .{};
+    defer state.deinit(alloc);
+    state.setProfileHome("/selected-state");
+    test_reload_mode = .empty;
+    test_reload_profile_home = null;
+    test_reload_preview_profile_home = null;
+
+    var outcome = try state.reload(
+        alloc,
+        "/",
+        .{},
+        loadTestReloadRuntime,
+        previewTestWorkspaceAuthority,
+        .{},
+        10,
+    );
+    defer outcome.deinit(alloc);
+
+    try std.testing.expectEqualStrings(
+        "/selected-state",
+        test_reload_profile_home.?,
+    );
+    try std.testing.expectEqualStrings(
+        "/selected-state",
+        test_reload_preview_profile_home.?,
+    );
 }
 
 test "transactional reload retains old runtime and publishes only accepted candidates" {
@@ -2835,6 +2874,14 @@ test "transactional reload retains old runtime and publishes only accepted candi
         .retained_required_failure => return error.TestUnexpectedResult,
     }
     try expectNoActiveMcpServers(&state);
+}
+
+fn expectNoActiveMcpServers(state: *State) !void {
+    var lease = state.acquire() orelse return;
+    defer lease.deinit();
+    var snapshot = try lease.runtime.snapshotHealth(std.testing.allocator, 0);
+    defer snapshot.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 0), snapshot.servers.len);
 }
 
 test "reducing preflight retires workspace authority before strict loader failure" {

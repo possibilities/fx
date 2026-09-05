@@ -82,6 +82,8 @@ Tool calls are expanded by default. Enable `Collapse tool calls` in `/settings`,
 
 Ctrl+L clears the inline display while keeping the conversation available in Ctrl+O. It preserves your draft and conversation context; `/clear` starts a fresh conversation instead.
 
+Press `Ctrl+G` to edit the current prompt with `VISUAL`, falling back to `EDITOR`, even while a response is streaming; drafts containing pasted blocks, images, or skills are left unchanged. When an automatic upgrade is ready, press `Ctrl+T` to reload it.
+
 The status line hides the workspace path and Git branch by default. Enable the `Status line workspace` option in `/settings`, run `/statusline workspace`, or set it in `~/.fx/settings.json`:
 
 ```json
@@ -100,6 +102,31 @@ fx session resume --id <id>
 ```
 
 Interactive terminal tabs show `fx v<version> | <folder>` using the running binary's version and current workspace folder name, for example `fx v0.0.7 | fx`. Renaming a session or switching models leaves the title unchanged. Resuming from another folder uses that folder's name. Exiting clears the fx-owned title. Noninteractive commands do not emit terminal-title controls.
+
+On the first submitted prompt, fx starts a small naming request alongside the
+main agent and installs the result as the session's native name without
+delaying the turn. The Codex route defaults to `gpt-5.4-mini` at low effort;
+other providers are skipped unless configured. Naming settings are profile
+settings in `~/.fx/settings.json` and are ignored in project `.fx.json` files:
+
+```json
+{
+  "session_naming": {
+    "codex": {
+      "model": "gpt-5.4-mini",
+      "effort": "low"
+    },
+    "timeout_ms": 60000
+  }
+}
+```
+
+Set `codex` to `null` to disable its compiled default. Configure `gateway` or
+`grok` with the same `model` and optional `effort` fields to opt those providers
+in. Before naming, fx removes a leading slash command and its `--flag` tokens,
+expands readable `@path` mentions up to 32 KiB each, and then limits the model
+input to 1600 bytes. Generated names are limited to 64 bytes. `/rename` always
+wins over an in-flight generated result.
 
 Run `/feedback` to open the feedback form at `fx.sh/feedback`. It does not create a diagnostic or change the clipboard.
 
@@ -121,7 +148,26 @@ fx ask "explain the changes in this repository"
 
 With `--json`, `output` contains accumulated assistant Markdown across the request. Recovery replaces failed preview text rather than joining separate responses. If recovery pauses before a replacement is accepted, `output` keeps the latest preview. `final_output` contains only a completed final assistant response and is `""` for interrupted, failed, background, or otherwise absent final responses.
 
-Foreground terminal commands run with an explicit finite deadline. fx uses durable terminal sessions for services, watchers, GUI applications, and other long-lived work, and keeps captured foreground output available through an opaque bounded-read handle for the active session or `--no-save` process.
+Customize the system prompt for one model-launching invocation with global
+file options placed before the command:
+
+```bash
+fx --system-prompt-file ./base-prompt.md ask "review this change"
+fx --append-system-prompt-file ./team-rules.md --append-system-prompt-file ./task-rules.md
+```
+
+`--system-prompt-file` replaces the effective base prompt and may be supplied
+once. `--append-system-prompt-file` preserves that base and adds files in CLI
+order, separated by blank lines. The options also apply to interactive and
+resumed sessions, ACP, `pr`, and `issue`. Custom prompt files must be regular
+UTF-8 files without NUL bytes and may contain at most 256 KiB combined. File
+errors stop the launch. For `fx ask`, these options cannot be combined with
+the inline `--system` option.
+
+Foreground terminal commands run with an explicit finite deadline. fx uses
+durable terminal sessions for services, watchers, GUI applications, and other
+long-lived work, and keeps captured foreground output available through an
+opaque bounded-read handle for the active session or `--no-save` process.
 
 Invalid Shell requests return the specific argument problems before any command runs. When the intended repair is unambiguous, the error includes a `retry_with` request for the agent to submit through normal validation and permissions. Repeated equivalent corrections stop the tool loop.
 
@@ -130,6 +176,18 @@ fx starts in `auto` permission mode. Routine understood development actions run 
 JSON and quiet requests stay noninteractive by default. Add `--prompt-permissions` to allow configured approval prompts when stdin is a TTY. Automatic safety review never opens that prompt. Prompt text is written to stderr, so JSON stdout stays parseable and quiet stdout stays empty. Piped or redirected stdin remains noninteractive and fails instead of waiting for approval.
 
 Inside a saved session, `/permissions remember <allow|deny> <tool-name> <arguments-json>` stores an exact confirmed rule without running the action. `/permissions` lists stable rule IDs, and `/permissions revoke <rule-id>` removes a stored rule even when its original workspace or file state has changed.
+
+Use `--permissions-file <path>` before an interactive launch, resume command, or `acp` command to replace profile, workspace, and project permission rules for that process. The file uses the same permission-rule JSON shape as `settings.json`; saved-session exact grants still apply, but cannot override a deny from the launch policy:
+
+```json
+{
+  "bash": {
+    "git *": "allow",
+    "git push *": "deny"
+  },
+  "edit": "deny"
+}
+```
 
 ## Embed fx
 
@@ -141,13 +199,42 @@ fx builds as a native binary or WebAssembly. Applications embedding fx can provi
 | `createFxAgent()` | Embed the agent core in a JavaScript host with `fx-core.wasm`. |
 | `createFxTerminal()` | Embed the interactive terminal with `fx-term.wasm`. |
 
+Interactive TUI and ACP launches can disable Fx-native tools with the global
+`--no-native-tools` option, or select an ordered allowlist with repeatable
+`--tool <name>`. The `terminal:exec` selection exposes only one-shot terminal
+commands, without interactive terminal-session actions. ACP can independently
+reject client-supplied MCP servers with `fx acp --no-acp-mcp`.
+
 The WebAssembly SDK is experimental. See the [WebAssembly SDK](sdk/README.md) and [ACP documentation](https://fx.sh/docs/using-fx/acp).
+
+For a repository-neutral interactive TUI or ACP process, launch Fx with the
+global `--no-project-instructions` option. Fx omits `AGENTS.md`, `CLAUDE.md`,
+and compatible scoped instruction prose for that process while retaining
+runtime context such as the working directory, date, Git state, tool guidance,
+and permission guidance.
+
+Run `fx --state-dir <path>` for an interactive session, or
+`fx --state-dir <path> acp` for ACP, when the agent needs an isolated Fx
+profile. The directory must already exist; Fx keeps its settings,
+authorization, profile instructions, profile-global skills, MCP state,
+memories, usage, prompt history, and sessions beneath `<path>/.fx` while
+terminal tools and MCP processes retain the normal `HOME` environment.
+
+An isolated launch can borrow one already-valid saved credential without
+copying it into that state root. Set `FX_AUTH_READ_ONLY_HOME` to the canonical
+home of another Fx profile and select the process provider with
+`FX_PROVIDER=gateway|codex|grok`. `FX_MODEL` supplies the process model when
+the isolated profile has no model for that provider. The borrowed profile is
+read only: Fx does not refresh, replace, or delete its credential, and every
+setting, session, history, skill, MCP entry, and authentication action remains
+owned by `--state-dir`. Fx rejects this authorization override when no
+`--state-dir` is selected.
 
 ## Extend fx
 
 In the interactive shell, bare `/mcp` opens an inline browser for servers, tools, resources, and prompts without adding anything to the transcript. Resource and prompt content enters the composer only after an explicit Insert action. Direct `/mcp SUBCOMMAND` forms remain available.
 
-Add reusable instructions with [skills](https://fx.sh/docs/capabilities/skills), connect external tools through [MCP](https://fx.sh/docs/capabilities/mcp), or delegate independent work to [subagents](https://fx.sh/docs/capabilities/subagents). Run `fx mcp add NAME COMMAND [ARGS...]` for a local server or `fx mcp add --transport http NAME URL` for Streamable HTTP without opening the interactive shell; the equivalent `/mcp add` forms remain available inside fx. A workspace may also provide Claude-compatible `.mcp.json` with a top-level `mcpServers` object. Pending project servers stay disconnected on every surface until they are approved with `/mcp trust approve <server>` or `fx mcp trust approve <server>`. Interactive fx presents the trust prompt after startup. `fx ask` reports skipped pending servers on stderr, and ACP leaves them unavailable. Repository files cannot persist approval or expose environment-expanded values before approval. `/mcp trust reject <server>` rejects one and `/mcp trust reset` clears the workspace choices. Profile entries win same-name collisions. Profile `~/.fx/mcp.json` accepts `mcpServers` as an alias for `mcp`, while writes always use `mcp` and ambiguous server-like keys produce a visible warning. Project instruction files may link within their scope, and read-only workspace or compatibility skill directories and their primary `SKILL.md` files may link within their owning workspace or home; managed skills, secondary resources, and escaping links remain no-follow. Skills installed via symlinks that resolve outside home or workspace (e.g. Nix store paths) are loaded when their resolved target is inside a directory listed in the `FX_SKILL_SYMLINK_AUTHORITIES` environment variable (colon-separated absolute paths). `fx status` and `fx doctor` report invalid or suspicious trusted MCP profiles without starting their servers.
+Add reusable instructions with [skills](https://fx.sh/docs/capabilities/skills), connect external tools through [MCP](https://fx.sh/docs/capabilities/mcp), observe hosted TUI agents through the [ADE event feed](docs/ade-event-feed.md), or delegate independent work to [subagents](https://fx.sh/docs/capabilities/subagents). Run `fx mcp add NAME COMMAND [ARGS...]` for a local server or `fx mcp add --transport http NAME URL` for Streamable HTTP without opening the interactive shell; the equivalent `/mcp add` forms remain available inside fx. A workspace may also provide Claude-compatible `.mcp.json` with a top-level `mcpServers` object. Pending project servers stay disconnected on every surface until they are approved with `/mcp trust approve <server>` or `fx mcp trust approve <server>`. Interactive fx presents the trust prompt after startup. `fx ask` reports skipped pending servers on stderr, and ACP leaves them unavailable. Repository files cannot persist approval or expose environment-expanded values before approval. `/mcp trust reject <server>` rejects one and `/mcp trust reset` clears the workspace choices. Profile entries win same-name collisions. Profile `~/.fx/mcp.json` accepts `mcpServers` as an alias for `mcp`, while writes always use `mcp` and ambiguous server-like keys produce a visible warning. Project instruction files may link within their scope, and read-only workspace or compatibility skill directories and their primary `SKILL.md` files may link within their owning workspace or home; managed skills, secondary resources, and escaping links remain no-follow. Skills installed via symlinks that resolve outside home or workspace (e.g. Nix store paths) are loaded when their resolved target is inside a directory listed in the `FX_SKILL_SYMLINK_AUTHORITIES` environment variable (colon-separated absolute paths). `fx status` and `fx doctor` report invalid or suspicious trusted MCP profiles without starting their servers.
 
 The `subagent` tool has four operations: `run` delegates one temporary task, `message` creates or continues a named persistent agent, `wait` observes a child, and `stop` cancels its current work. A first message creates the named child immediately; optional instructions set or replace that child's system overlay while preserving fx's trusted base prompt. Child sessions remain private to their saved parent session.
 
@@ -171,6 +258,16 @@ an explicit notice.
 Skills are advertised in a stable catalog sized to the selected model's context window. The default budget is approximately 2% of context, or 8,000 characters when the context size is unknown, with up to 1,024 characters per description. Explicit byte overrides take precedence. When space is limited, fx shortens descriptions before omitting skill identities; `capability_search` can find skills outside that catalog.
 
 Explicit `$skill-name` mentions load the selected instructions before the model starts work. The `skill` tool accepts an advertised `location` and an optional relative `resource`, returning the complete document or a visible failure. Omitting `resource` or passing an empty string reads `SKILL.md`. File and tool-result limits still apply, and an explicit `skill_chunk_bytes` limit blocks a complete read that would exceed it. Existing named, offset-based calls remain supported.
+Load additional skill roots for one invocation with repeatable `--skills-dir`
+flags. Each root contains one directory per skill and is scanned before
+automatically discovered roots:
+
+```bash
+fx --skills-dir ./team-skills --skills-dir /opt/shared-skills ask "Review this change"
+```
+
+Invocation skill roots are not saved, and skill installation continues to use
+`~/.fx/skills`.
 
 ## Documentation
 

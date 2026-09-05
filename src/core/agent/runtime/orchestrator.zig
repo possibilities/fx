@@ -1175,10 +1175,16 @@ fn agentShellWriteLeaseSessionId(
         else => error.InvalidTerminalLeaseTrackingInput,
     };
     if (parsed != .object) return error.InvalidTerminalLeaseTrackingInput;
-    const action = parsed.object.get("action") orelse return error.InvalidTerminalLeaseTrackingInput;
+    // The model-facing request may still be wrapped, or may already have been
+    // normalized for internal dispatch. Both name the same command authority.
+    const arguments = if (parsed.object.get("request")) |wrapped| arguments: {
+        if (wrapped != .object) return error.InvalidTerminalLeaseTrackingInput;
+        break :arguments wrapped.object;
+    } else parsed.object;
+    const action = arguments.get("action") orelse return error.InvalidTerminalLeaseTrackingInput;
     if (action != .string) return error.InvalidTerminalLeaseTrackingInput;
     if (!std.mem.eql(u8, action.string, "write")) return null;
-    const session_id = parsed.object.get("session_id") orelse
+    const session_id = arguments.get("session_id") orelse
         return error.InvalidTerminalLeaseTrackingInput;
     if (session_id != .string or session_id.string.len == 0) {
         return error.InvalidTerminalLeaseTrackingInput;
@@ -2235,6 +2241,7 @@ fn commitSelectedContext(
 fn candidateHasApplicableContextDelta(
     arena: Allocator,
     context_registry: context_contract.Registry,
+    project_instructions_enabled: bool,
     config: Config,
     context_delivery_state: *const context_contract.DeliveryState,
     candidate: tool_preparation.Candidate,
@@ -2247,6 +2254,7 @@ fn candidateHasApplicableContextDelta(
     var selected = try context_registry.selectDefaultApplicableContext(arena, .{
         .workspace_root = config.workspace_root,
         .access_scope = config.access_scope,
+        .project_instructions_enabled = project_instructions_enabled,
         .targets = candidate.applicable_targets,
         .delivered_sources = context_delivery_state.delivered_sources.items,
         .evaluated_endpoints = context_delivery_state.evaluated_endpoints.items,
@@ -3964,6 +3972,9 @@ pub fn processAgentPrompt(
         effective_lifecycle,
     );
     defer finalization.deinit();
+    runtime_lifecycle.dispatchTurnStartedCheckpoint(lifecycle, .{
+        .turn_id = effective_job.turn_id,
+    });
 
     processQueuedPromptInner(deps, semantic_presentation, effective_lifecycle, effective_config, effective_job, &finalization, agent) catch |err| {
         if (finalization.state == .open) {
@@ -7863,6 +7874,7 @@ fn processQueuedPromptLoop(
             var selected = context_registry.selectDefaultApplicableContext(arena, .{
                 .workspace_root = config.workspace_root,
                 .access_scope = config.access_scope,
+                .project_instructions_enabled = deps.project_instructions_enabled,
                 .targets = preparation_batch.applicable_targets.items,
                 .delivered_sources = context_delivery_state.delivered_sources.items,
                 .evaluated_endpoints = context_delivery_state.evaluated_endpoints.items,
@@ -7906,6 +7918,7 @@ fn processQueuedPromptLoop(
                         context_deferred_calls[index] = candidateHasApplicableContextDelta(
                             arena,
                             context_registry,
+                            deps.project_instructions_enabled,
                             config,
                             &context_delivery_state,
                             candidate,

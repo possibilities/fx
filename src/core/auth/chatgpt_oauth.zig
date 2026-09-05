@@ -58,6 +58,7 @@ const BrowserLoginContext = struct {
     redirect_uri: []u8,
     code_verifier: []u8,
     state: []u8,
+    profile_home: ?[]const u8 = null,
     pending_callback: ?browser_callback.Accepted(BrowserCallback) = null,
 
     fn deinit(self: *BrowserLoginContext, alloc: Allocator) void {
@@ -90,8 +91,26 @@ pub fn startSignIn(
     alloc: Allocator,
     transport: oauth_transport.Provider,
 ) !bool {
-    try credentials.requireSignInStorage(.chatgpt_subscription);
-    const browser = try prepareBrowserSignIn(alloc);
+    return startSignInFromOptionalHome(runtime, alloc, transport, null);
+}
+
+pub fn startSignInFromHome(
+    runtime: *login_flow.SignInRuntime,
+    alloc: Allocator,
+    transport: oauth_transport.Provider,
+    home: []const u8,
+) !bool {
+    return startSignInFromOptionalHome(runtime, alloc, transport, home);
+}
+
+fn startSignInFromOptionalHome(
+    runtime: *login_flow.SignInRuntime,
+    alloc: Allocator,
+    transport: oauth_transport.Provider,
+    profile_home: ?[]const u8,
+) !bool {
+    if (profile_home == null) try credentials.requireSignInStorage(.chatgpt_subscription);
+    const browser = try prepareBrowserSignIn(alloc, profile_home);
     return runtime.startPrepared(
         alloc,
         browser.prepared,
@@ -110,7 +129,10 @@ pub fn startSignIn(
     );
 }
 
-fn prepareBrowserSignIn(alloc: Allocator) !PreparedBrowserLogin {
+fn prepareBrowserSignIn(
+    alloc: Allocator,
+    profile_home: ?[]const u8,
+) !PreparedBrowserLogin {
     const configured_issuer = try configuredEndpoint(alloc, e2e_issuer_url_env, issuer_url);
     defer alloc.free(configured_issuer);
     const configured_token_endpoint = try configuredEndpoint(alloc, e2e_token_url_env, token_url);
@@ -148,6 +170,7 @@ fn prepareBrowserSignIn(alloc: Allocator) !PreparedBrowserLogin {
         .redirect_uri = redirect_uri,
         .code_verifier = code_verifier,
         .state = state,
+        .profile_home = profile_home,
     };
     listener_owned = false;
 
@@ -352,12 +375,17 @@ fn completeSignIn(
     return completion;
 }
 
-fn saveSignIn(_: ?*anyopaque, alloc: Allocator, completion: login_flow.SignInCompletion) !void {
+fn saveSignIn(raw: ?*anyopaque, alloc: Allocator, completion: login_flow.SignInCompletion) !void {
+    const context: *BrowserLoginContext = @ptrCast(@alignCast(raw.?));
     const session = switch (completion) {
         .chatgpt => |session| session,
         .vercel, .grok => return error.InvalidSignInCompletion,
     };
-    try chatgpt_session.saveNewSession(alloc, session);
+    if (context.profile_home) |home| {
+        try chatgpt_session.saveNewSessionFromHome(alloc, home, session);
+    } else {
+        try chatgpt_session.saveNewSession(alloc, session);
+    }
 }
 
 fn finishSignIn(raw: ?*anyopaque, alloc: Allocator, saved: bool) void {
@@ -400,6 +428,12 @@ pub fn runLogin(
 
 pub fn logout() !chatgpt_session.DeleteOutcome {
     var mutation = (try chatgpt_session.beginExistingMutation()) orelse return .missing;
+    defer mutation.deinit();
+    return mutation.delete();
+}
+
+pub fn logoutFromHome(home: []const u8) !chatgpt_session.DeleteOutcome {
+    var mutation = (try chatgpt_session.beginExistingMutationFromHome(home)) orelse return .missing;
     defer mutation.deinit();
     return mutation.delete();
 }
@@ -449,6 +483,29 @@ pub fn loadAccessForAccountFromStore(
     // credential before a forced or expiry-driven refresh can send its token
     // or commit a rotated replacement.
     try validateExpectedAccount(session, expected_account_id);
+
+    if (mode == .force or session.expired(io_mod.milliTimestamp())) {
+        try refreshSession(alloc, transport, &mutation, &session);
+    }
+    return takeAccess(&session);
+}
+
+pub fn loadAccessFromHome(
+    alloc: Allocator,
+    transport: oauth_transport.Provider,
+    mode: RefreshMode,
+    home: []const u8,
+) !?Access {
+    if (mode == .stored) {
+        var session = (try chatgpt_session.loadFromHome(alloc, home)) orelse return null;
+        defer session.deinit(alloc);
+        return takeAccess(&session);
+    }
+
+    var mutation = (try chatgpt_session.beginExistingMutationFromHome(home)) orelse return null;
+    defer mutation.deinit();
+    var session = (try mutation.load(alloc)) orelse return null;
+    defer session.deinit(alloc);
 
     if (mode == .force or session.expired(io_mod.milliTimestamp())) {
         try refreshSession(alloc, transport, &mutation, &session);

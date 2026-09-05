@@ -522,9 +522,38 @@ pub fn call(
     };
 }
 
+/// `terminal:exec` may execute permission-admitted one-shot commands but must
+/// never acquire or retain an interactive session, so a run that is still
+/// running when the tool returns is stopped before the result is handed back.
+const RunningPolicy = enum { allow_running, stop_before_return };
+
+pub fn callOneShot(
+    ctx: tool_dispatch.DispatchContext,
+    erased: tool_dispatch.ToolInput,
+) tool_dispatch.DispatchError!tool_dispatch.ToolResult {
+    const input = erased.as(OwnedInput).value;
+    if (input.action != .run or input.tty or
+        input.shell != null or input.yield_time_ms != managed_contract.default_yield_time_ms)
+    {
+        return .{ .failure = try ctx.allocator.dupe(
+            u8,
+            "terminal:exec selection permits only one-shot shell.run requests",
+        ) };
+    }
+    return callRunWithPolicy(ctx, input, .stop_before_return);
+}
+
 fn callRun(
     ctx: tool_dispatch.DispatchContext,
     input: Input,
+) tool_dispatch.DispatchError!tool_dispatch.ToolResult {
+    return callRunWithPolicy(ctx, input, .allow_running);
+}
+
+fn callRunWithPolicy(
+    ctx: tool_dispatch.DispatchContext,
+    input: Input,
+    running_policy: RunningPolicy,
 ) tool_dispatch.DispatchError!tool_dispatch.ToolResult {
     if (input.tty) {
         return callTtyRun(ctx, input);
@@ -589,6 +618,21 @@ fn callRun(
         return runtimeFailure(ctx, err);
     };
     defer prepared.deinit(ctx.allocator);
+    if (running_policy == .stop_before_return and prepared.snapshot.state == .running) {
+        const retained_execution_id = try ctx.allocator.dupe(u8, prepared.snapshot.execution_id);
+        defer ctx.allocator.free(retained_execution_id);
+        runtime.cancelDelivery(
+            prepared.snapshot.execution_id,
+            prepared.reservation_id,
+        ) catch return runtimeFailure(ctx, error.ResultCommitFailed);
+        prepared.deinit(ctx.allocator);
+        const stopped = runtime.stop(
+            ctx.allocator,
+            retained_execution_id,
+            false,
+        ) catch |err| return runtimeFailure(ctx, err);
+        prepared = stopped;
+    }
     return finishPrepared(ctx, runtime, &prepared, .command);
 }
 

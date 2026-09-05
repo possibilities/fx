@@ -15,6 +15,7 @@ const update_target = @import("../upgrade/update_target.zig");
 const notification_sound = @import("../notifications/sound.zig");
 const tool_result_limits = @import("../tooling/tool_result_limits.zig");
 const types = @import("../shared/types.zig");
+const session_naming = @import("../session/session_naming.zig");
 const ui_render = @import("../../ui/render.zig");
 const transcript_presentation = @import("../output/transcript_presentation.zig");
 const shell_runtime = @import("../../ui/shell_runtime.zig");
@@ -46,6 +47,43 @@ const alternate_mouse_tracking_enter = "\x1b[?1000h\x1b[?1006h";
 /// Signal context never mutates them.
 var old_sigterm_action: ?std.posix.Sigaction = null;
 var old_sighup_action: ?std.posix.Sigaction = null;
+
+fn externalInteractiveSignalHandler(_: std.posix.SIG) callconv(.c) void {}
+
+/// Keeps terminal-generated interrupts from terminating fx while inherited
+/// stdio belongs to a child. Caught handlers reset to default across exec, so
+/// the editor still receives its normal SIGINT and SIGQUIT behavior.
+pub const ExternalInteractiveSignalGuard = struct {
+    old_sigint_action: ?std.posix.Sigaction = null,
+    old_sigquit_action: ?std.posix.Sigaction = null,
+
+    pub fn install() ExternalInteractiveSignalGuard {
+        if (!shell_runtime.supports_resize_signal) return .{};
+        const action: std.posix.Sigaction = .{
+            .handler = .{ .handler = externalInteractiveSignalHandler },
+            .mask = std.posix.sigemptyset(),
+            .flags = std.posix.SA.RESTART,
+        };
+        var guard: ExternalInteractiveSignalGuard = .{};
+        var old_sigint: std.posix.Sigaction = undefined;
+        std.posix.sigaction(std.posix.SIG.INT, &action, &old_sigint);
+        guard.old_sigint_action = old_sigint;
+        var old_sigquit: std.posix.Sigaction = undefined;
+        std.posix.sigaction(std.posix.SIG.QUIT, &action, &old_sigquit);
+        guard.old_sigquit_action = old_sigquit;
+        return guard;
+    }
+
+    pub fn deinit(self: ExternalInteractiveSignalGuard) void {
+        if (!shell_runtime.supports_resize_signal) return;
+        if (self.old_sigquit_action) |old| {
+            std.posix.sigaction(std.posix.SIG.QUIT, &old, null);
+        }
+        if (self.old_sigint_action) |old| {
+            std.posix.sigaction(std.posix.SIG.INT, &old, null);
+        }
+    }
+};
 
 /// Restores terminal state, installs the default disposition, and re-raises.
 /// Must remain async-signal-safe: only `write(2)`, `sigaction(2)`, and `raise(3)`.
@@ -145,6 +183,8 @@ pub const StartupState = struct {
     prompt_history_store_allowed: bool = true,
     config_diagnostics: []config_runtime.ConfigDiagnostic = &.{},
     effort: types.ReasoningEffort = .auto,
+    configured_effort: types.ReasoningEffort = .auto,
+    effort_source: config_runtime.ConfigSource = .compiled_default,
     first_call_tool_choice: types.ToolChoice = .auto,
     statusline_context: bool = false,
     statusline_session: bool = false,
@@ -152,6 +192,7 @@ pub const StartupState = struct {
     notification_turn_end: bool = false,
     notification_attention_required: bool = false,
     notification_max: bool = false,
+    session_naming_config: session_naming.Config = .{},
     theme_monitor_enabled: bool = false,
 
     pub fn deinit(self: *StartupState, alloc: Allocator) void {
@@ -161,6 +202,7 @@ pub const StartupState = struct {
         if (self.selected_model.len > 0) alloc.free(self.selected_model);
         if (self.configured_model.len > 0) alloc.free(self.configured_model);
         self.permission_rules.deinit(alloc);
+        self.session_naming_config.deinit(alloc);
         if (self.config_diagnostics.len > 0) {
             for (self.config_diagnostics) |*diagnostic| diagnostic.deinit(alloc);
             alloc.free(self.config_diagnostics);
@@ -204,6 +246,12 @@ pub const StartupState = struct {
     pub fn takeCredential(self: *StartupState) ?credentials.Credential {
         const value = self.credential;
         self.credential = null;
+        return value;
+    }
+
+    pub fn takeSessionNamingConfig(self: *StartupState) session_naming.Config {
+        const value = self.session_naming_config;
+        self.session_naming_config = .{};
         return value;
     }
 
@@ -259,6 +307,7 @@ pub const BootstrapConfig = struct {
     default_model: []const u8,
     default_agent_step_limit: usize,
     secret_store: host.SecretStore,
+    profile_home: ?[]const u8 = null,
     auth_mode: credentials.AuthMode = .local,
     resize_handler: ResizeHandler,
     fx_version: []const u8 = "",
@@ -290,12 +339,12 @@ pub fn loadStartupStateWithAuthMode(
     auth_mode: credentials.AuthMode,
 ) !StartupState {
     const workspace_root = try io_mod.realpathAlloc(alloc, ".");
-    return loadStartupStateFromOwnedWorkspace(alloc, transport, secret_store, workspace_root, default_model, default_agent_step_limit, auth_mode, null, .refresh_if_needed);
+    return loadStartupStateFromOwnedWorkspace(alloc, transport, secret_store, workspace_root, default_model, default_agent_step_limit, auth_mode, null, null, .refresh_if_needed);
 }
 
 pub fn loadStartupStateWithoutCredentials(alloc: Allocator, default_model: []const u8, default_agent_step_limit: usize) !StartupState {
     const workspace_root = try io_mod.realpathAlloc(alloc, ".");
-    return loadStartupStateFromOwnedWorkspace(alloc, oauth_transport.unavailable_provider, host.unavailable_secret_store, workspace_root, default_model, default_agent_step_limit, .local, null, null);
+    return loadStartupStateFromOwnedWorkspace(alloc, oauth_transport.unavailable_provider, host.unavailable_secret_store, workspace_root, default_model, default_agent_step_limit, .local, null, null, null);
 }
 
 pub fn loadEmbeddedStartupState(
@@ -315,6 +364,7 @@ pub fn loadEmbeddedStartupState(
         default_agent_step_limit,
         .local,
         home_dir,
+        null,
         null,
     );
 }
@@ -366,7 +416,57 @@ pub fn loadCatalogStartupStateWithAuthMode(
     auth_mode: credentials.AuthMode,
 ) !StartupState {
     const workspace_root = try io_mod.realpathAlloc(alloc, ".");
-    return loadStartupStateFromOwnedWorkspace(alloc, oauth_transport.unavailable_provider, secret_store, workspace_root, default_model, default_agent_step_limit, auth_mode, null, .stored);
+    return loadStartupStateFromOwnedWorkspace(alloc, oauth_transport.unavailable_provider, secret_store, workspace_root, default_model, default_agent_step_limit, auth_mode, null, null, .stored);
+}
+
+pub fn loadCatalogStartupStateFromHome(
+    alloc: Allocator,
+    home_dir: []const u8,
+    default_model: []const u8,
+    default_agent_step_limit: usize,
+) !StartupState {
+    const workspace_root = try io_mod.realpathAlloc(alloc, ".");
+    return loadStartupStateFromOwnedWorkspace(
+        alloc,
+        oauth_transport.unavailable_provider,
+        host.unavailable_secret_store,
+        workspace_root,
+        default_model,
+        default_agent_step_limit,
+        .local,
+        home_dir,
+        home_dir,
+        .stored,
+    );
+}
+
+pub fn loadCatalogStartupStateFromHomes(
+    alloc: Allocator,
+    state_home: []const u8,
+    authorization_home: []const u8,
+    default_model: []const u8,
+    default_agent_step_limit: usize,
+) !StartupState {
+    const workspace_root = try io_mod.realpathAlloc(alloc, ".");
+    var state = try loadStartupStateFromOwnedWorkspace(
+        alloc,
+        oauth_transport.unavailable_provider,
+        host.unavailable_secret_store,
+        workspace_root,
+        default_model,
+        default_agent_step_limit,
+        .local,
+        state_home,
+        authorization_home,
+        .stored,
+    );
+    if (state.credential) |*credential| {
+        if (credential.needsRefreshAt(io_mod.milliTimestamp())) {
+            credential.deinit(alloc);
+            state.credential = null;
+        }
+    }
+    return state;
 }
 
 pub fn loadStartupStatus(
@@ -451,7 +551,7 @@ pub fn applyWorkspaceLaunch(
 
 fn loadStartupStateForWorkspace(alloc: Allocator, workspace_root: []const u8, default_model: []const u8, default_agent_step_limit: usize) !StartupState {
     const owned_workspace_root = try alloc.dupe(u8, workspace_root);
-    return loadStartupStateFromOwnedWorkspace(alloc, oauth_transport.unavailable_provider, host.unavailable_secret_store, owned_workspace_root, default_model, default_agent_step_limit, .local, null, null);
+    return loadStartupStateFromOwnedWorkspace(alloc, oauth_transport.unavailable_provider, host.unavailable_secret_store, owned_workspace_root, default_model, default_agent_step_limit, .local, null, null, null);
 }
 
 const CredentialLoadMode = credentials.LoadMode;
@@ -465,6 +565,7 @@ fn loadStartupStateFromOwnedWorkspace(
     default_agent_step_limit: usize,
     auth_mode: credentials.AuthMode,
     profile_home: ?[]const u8,
+    authorization_home: ?[]const u8,
     credential_mode: ?CredentialLoadMode,
 ) !StartupState {
     var state = StartupState{
@@ -503,14 +604,25 @@ fn loadStartupStateFromOwnedWorkspace(
     state.credential_source_preference = settings.credential_source;
     if (auth_mode == .local) {
         if (credential_mode) |mode| {
-            const resolution = try credentials.resolveForProvider(
-                alloc,
-                transport,
-                secret_store,
-                mode,
-                state.provider,
-                settings.credential_source,
-            );
+            const credential_home = authorization_home orelse profile_home;
+            const resolution = if (credential_home) |home_dir|
+                try credentials.resolveForProviderFromHome(
+                    alloc,
+                    transport,
+                    mode,
+                    state.provider,
+                    settings.credential_source,
+                    home_dir,
+                )
+            else
+                try credentials.resolveForProvider(
+                    alloc,
+                    transport,
+                    secret_store,
+                    mode,
+                    state.provider,
+                    settings.credential_source,
+                );
             state.credential = resolution.credential;
             state.credential_load_failure = resolution.failure;
             state.stored_key_status = resolution.stored_key_status;
@@ -540,7 +652,9 @@ fn loadStartupStateFromOwnedWorkspace(
     state.auto_upgrade = settings.auto_upgrade orelse true;
     state.update_channel = settings.update_channel orelse .stable;
     state.startup_scrollback = settings.startup_scrollback orelse true;
-    state.effort = settings.effort orelse .auto;
+    state.configured_effort = settings.effort orelse .auto;
+    state.effort = config_runtime.resolveEffort(settings.effort);
+    state.effort_source = detailed.sources.effort;
     state.first_call_tool_choice = settings.first_call_tool_choice orelse .auto;
     state.statusline_context = settings.statusline_context orelse false;
     state.statusline_session = settings.statusline_session orelse false;
@@ -551,6 +665,10 @@ fn loadStartupStateFromOwnedWorkspace(
     state.notification_turn_end = sound_on_override orelse settings.notification_turn_end orelse notification_sound.default_enabled;
     state.notification_attention_required = sound_on_override orelse settings.notification_attention_required orelse notification_sound.default_enabled;
     state.notification_max = max_override orelse settings.notification_max orelse false;
+    state.session_naming_config = try session_naming.resolveConfig(
+        alloc,
+        &settings.session_naming,
+    );
 
     return state;
 }
@@ -590,13 +708,36 @@ pub fn bootstrapInteractiveApp(cfg: BootstrapConfig) !StartupState {
     cfg.shell.layout = minimalLayout();
     try cfg.shell.initBacking(cfg.alloc);
 
-    var state = try loadCatalogStartupStateWithAuthMode(
-        cfg.alloc,
-        cfg.secret_store,
-        cfg.default_model,
-        cfg.default_agent_step_limit,
-        cfg.auth_mode,
-    );
+    const borrowed_authorization_home =
+        try credentials.readOnlyAuthorizationHomeFromEnvironment(
+            cfg.alloc,
+            cfg.profile_home,
+        );
+    defer if (borrowed_authorization_home) |home| cfg.alloc.free(home);
+    var state = if (cfg.profile_home) |home_dir|
+        if (borrowed_authorization_home) |authorization_home|
+            try loadCatalogStartupStateFromHomes(
+                cfg.alloc,
+                home_dir,
+                authorization_home,
+                cfg.default_model,
+                cfg.default_agent_step_limit,
+            )
+        else
+            try loadCatalogStartupStateFromHome(
+                cfg.alloc,
+                home_dir,
+                cfg.default_model,
+                cfg.default_agent_step_limit,
+            )
+    else
+        try loadCatalogStartupStateWithAuthMode(
+            cfg.alloc,
+            cfg.secret_store,
+            cfg.default_model,
+            cfg.default_agent_step_limit,
+            cfg.auth_mode,
+        );
     errdefer state.deinit(cfg.alloc);
 
     state.credential_onboarding_skipped = cfg.auth_mode == .host_managed or credentialOnboardingDisabled();
@@ -735,6 +876,16 @@ fn suspendTerminalForJobControl(
     metrics: *Metrics,
 ) void {
     leaveAlternateScreens(terminal, shell, metrics);
+    suspendForExternalInteractive(terminal, shell, metrics);
+}
+
+/// Restore cooked terminal state before inherited stdio belongs to a child.
+/// The caller must first ensure that no alternate screen remains owned.
+pub fn suspendForExternalInteractive(
+    terminal: *TerminalState,
+    shell: *TranscriptRuntime,
+    metrics: *Metrics,
+) void {
     _ = writeLifecycleTerminalBytes(shell, metrics, normalExitRestoreSequence(io_mod.getenv("TMUX"))) catch {};
     finishLeavingInteractiveMode(terminal, shell, metrics);
 }
@@ -784,6 +935,32 @@ fn resumeTerminalAfterJobControl(
     try enableInteractiveTerminalModes(shell, metrics);
     try shell.requestTerminalReset(metrics);
     shell.render_requests.request(.first_frame);
+}
+
+/// Re-arm interactive terminal state after a child handoff, then request a
+/// full repaint while still reporting the first restore failure.
+pub fn resumeAfterExternalInteractive(
+    terminal: *TerminalState,
+    shell: *TranscriptRuntime,
+    metrics: *Metrics,
+    footer_rows: u16,
+) !void {
+    var first_error: ?anyerror = null;
+    shell.layout = terminal.queryLayout(footer_rows) catch shell.layout;
+    terminal.captureOriginalTermios() catch |err| {
+        first_error = err;
+    };
+    terminal.enableRawMode() catch |err| {
+        if (first_error == null) first_error = err;
+    };
+    enableInteractiveTerminalModes(shell, metrics) catch |err| {
+        if (first_error == null) first_error = err;
+    };
+    shell.requestTerminalReset(metrics) catch |err| {
+        if (first_error == null) first_error = err;
+    };
+    shell.render_requests.request(.first_frame);
+    if (first_error) |err| return err;
 }
 
 fn enableInteractiveTerminalModes(shell: *TranscriptRuntime, metrics: *Metrics) !void {
@@ -1146,19 +1323,30 @@ fn configuredProviderSelection(
     default_model: []const u8,
     settings: *const config_runtime.Settings,
 ) !model_provider.ProviderSelection {
-    const provider = settings.provider orelse .gateway;
+    const provider = (try processProviderOverride()) orelse settings.provider orelse .gateway;
     const model = settings.models.get(provider) orelse switch (provider) {
         .gateway => default_model,
-        .codex => return error.CodexModelNotSelected,
-        .grok => return error.GrokModelNotSelected,
+        .codex => processModelOverride() orelse return error.CodexModelNotSelected,
+        .grok => processModelOverride() orelse return error.GrokModelNotSelected,
     };
     return .{ .provider = provider, .model = model };
 }
 
-fn initialModelId(default_model: []const u8, configured: ?[]const u8) []const u8 {
-    const model = io_mod.getenv("FX_MODEL") orelse return configured orelse default_model;
+fn processProviderOverride() !?model_provider.ProviderId {
+    const raw = io_mod.getenv("FX_PROVIDER") orelse return null;
+    const value = std.mem.trim(u8, raw, " \t\r\n");
+    if (value.len == 0) return error.InvalidProviderOverride;
+    return model_provider.parse(value) orelse error.InvalidProviderOverride;
+}
+
+fn processModelOverride() ?[]const u8 {
+    const model = io_mod.getenv("FX_MODEL") orelse return null;
     const trimmed = std.mem.trim(u8, model, " \t\r\n");
-    return if (trimmed.len > 0) trimmed else configured orelse default_model;
+    return if (trimmed.len > 0) trimmed else null;
+}
+
+fn initialModelId(default_model: []const u8, configured: ?[]const u8) []const u8 {
+    return processModelOverride() orelse configured orelse default_model;
 }
 
 test "startup provider chooses only its provider-scoped model" {
@@ -1189,13 +1377,42 @@ test "startup provider chooses only its provider-scoped model" {
     try std.testing.expectEqualStrings("grok-model", grok.model);
 }
 
+test "FX_PROVIDER selects one process provider and FX_MODEL supplies its missing profile model" {
+    {
+        var env = try TestEnv.install(std.testing.allocator, &.{
+            .{ .key = "FX_PROVIDER", .value = "  CODEX  " },
+            .{ .key = "FX_MODEL", .value = "  gpt-process  " },
+        });
+        defer env.deinit();
+
+        const selection = try configuredProviderSelection(
+            "gateway-default",
+            &config_runtime.Settings{},
+        );
+        try std.testing.expectEqual(model_provider.ProviderId.codex, selection.provider);
+        try std.testing.expectEqualStrings("gpt-process", selection.model);
+    }
+
+    {
+        var env = try TestEnv.install(std.testing.allocator, &.{
+            .{ .key = "FX_PROVIDER", .value = "unknown" },
+            .{ .key = "FX_MODEL", .value = "gpt-process" },
+        });
+        defer env.deinit();
+
+        try std.testing.expectError(
+            error.InvalidProviderOverride,
+            configuredProviderSelection("gateway-default", &config_runtime.Settings{}),
+        );
+    }
+}
+
 fn loadInitialModel(alloc: Allocator, default_model: []const u8, configured: ?[]const u8) ![]u8 {
     return alloc.dupe(u8, initialModelId(default_model, configured));
 }
 
 fn hasProcessModelOverride() bool {
-    const model = io_mod.getenv("FX_MODEL") orelse return false;
-    return std.mem.trim(u8, model, " \t\r\n").len > 0;
+    return processModelOverride() != null;
 }
 
 fn loadStartupStatusModel(alloc: Allocator, default_model: []const u8, configured: ?[]const u8) !StartupStatusModel {
@@ -1802,6 +2019,17 @@ test "terminal keyboard stack restore stays paired with enable policy" {
     try std.testing.expect(std.mem.find(u8, tmux_restore, "\x1b[>4;0m") != null);
 }
 
+test "external interactive signal guard restarts interrupted syscalls" {
+    if (!shell_runtime.supports_resize_signal) return error.SkipZigTest;
+
+    const guard = ExternalInteractiveSignalGuard.install();
+    defer guard.deinit();
+
+    var action: std.posix.Sigaction = undefined;
+    std.posix.sigaction(std.posix.SIG.INT, null, &action);
+    try std.testing.expect(action.flags & std.posix.SA.RESTART != 0);
+}
+
 test "launch scrollback push creates top-of-viewport space" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -1945,9 +2173,49 @@ test "startup credential modes select a refresh policy, never a narrower source 
     try std.testing.expectEqualStrings("refresh_if_needed", modes[1].name);
 }
 
+test "selected state loads settings locally while borrowing only a stored credential" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "state/.fx");
+    try tmp.dir.createDirPath(std.testing.io, "authorization/.fx");
+    try writeFixtureFile(
+        tmp.dir,
+        "state/.fx/settings.json",
+        "{\"provider\":\"codex\",\"codex_model\":\"state-model\",\"effort\":\"low\"}\n",
+    );
+    try writePrivateFixtureFile(
+        tmp.dir,
+        "authorization/.fx/chatgpt-auth.json",
+        "{\"version\":1,\"access_token\":\"borrowed-token\",\"refresh_token\":\"borrowed-refresh\",\"expires_at_ms\":4000000000000,\"account_id\":\"borrowed-account\"}\n",
+    );
+
+    const state_home = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "state");
+    defer std.testing.allocator.free(state_home);
+    const authorization_home = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "authorization");
+    defer std.testing.allocator.free(authorization_home);
+    var env = try TestEnv.install(std.testing.allocator, &.{});
+    defer env.deinit();
+
+    var state = try loadCatalogStartupStateFromHomes(
+        std.testing.allocator,
+        state_home,
+        authorization_home,
+        "gateway-default",
+        12,
+    );
+    defer state.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(model_provider.ProviderId.codex, state.provider);
+    try std.testing.expectEqualStrings("state-model", state.selected_model);
+    try std.testing.expect(state.effort.eql(types.ReasoningEffort.literal("low")));
+    try std.testing.expectEqual(credentials.Source.chatgpt_subscription, state.credential.?.source);
+    try std.testing.expectEqualStrings("borrowed-token", state.apiKey().?);
+}
+
 test "loadStartupState applies core env overrides" {
     var env = try TestEnv.install(std.testing.allocator, &.{
         .{ .key = "FX_MODEL", .value = "  env-model  " },
+        .{ .key = "FX_EFFORT", .value = "  high  " },
         .{ .key = "AI_GATEWAY_API_KEY", .value = "gateway-key" },
         .{ .key = "FX_PERMISSION_MODE", .value = "auto" },
         .{ .key = "FX_MAX_AGENT_STEPS", .value = "37" },
@@ -1967,11 +2235,54 @@ test "loadStartupState applies core env overrides" {
     try std.testing.expectEqualStrings("env-model", state.selected_model);
     try std.testing.expectEqualStrings("default-model", state.configured_model);
     try std.testing.expectEqual(config_runtime.ModelSource.process_override, state.model_source);
+    try std.testing.expect(state.effort.eql(types.ReasoningEffort.literal("high")));
+    try std.testing.expectEqual(config_runtime.ConfigSource.process_override, state.effort_source);
     try std.testing.expect(!state.fast_mode);
     try std.testing.expectEqualStrings("gateway-key", state.apiKey().?);
     try std.testing.expectEqual(credentials.Source.ai_gateway_api_key, state.credential.?.source);
     try std.testing.expectEqual(PermissionMode.auto, state.permission_mode);
     try std.testing.expectEqual(@as(usize, 37), state.agent_step_limit);
+}
+
+test "loadStartupState lets FX_EFFORT win over the configured effort without rewriting it" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
+    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
+
+    const home_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "home");
+    defer std.testing.allocator.free(home_root);
+    const workspace_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "workspace");
+    defer std.testing.allocator.free(workspace_root);
+    try writeFixtureFile(tmp.dir, "home/.fx/settings.json", "{\"effort\":\"low\"}\n");
+
+    {
+        var env = try TestEnv.install(std.testing.allocator, &.{
+            .{ .key = "HOME", .value = home_root },
+            .{ .key = "FX_EFFORT", .value = "high" },
+        });
+        defer env.deinit();
+
+        var state = try loadStartupStateForWorkspace(std.testing.allocator, workspace_root, "default-model", 25);
+        defer state.deinit(std.testing.allocator);
+        try std.testing.expect(state.effort.eql(types.ReasoningEffort.literal("high")));
+        try std.testing.expect(state.configured_effort.eql(types.ReasoningEffort.literal("low")));
+        try std.testing.expectEqual(config_runtime.ConfigSource.process_override, state.effort_source);
+    }
+
+    {
+        var env = try TestEnv.install(std.testing.allocator, &.{
+            .{ .key = "HOME", .value = home_root },
+            .{ .key = "FX_EFFORT", .value = "bogus value" },
+        });
+        defer env.deinit();
+
+        var state = try loadStartupStateForWorkspace(std.testing.allocator, workspace_root, "default-model", 25);
+        defer state.deinit(std.testing.allocator);
+        try std.testing.expect(state.effort.eql(types.ReasoningEffort.literal("low")));
+        try std.testing.expectEqual(config_runtime.ConfigSource.user_global, state.effort_source);
+    }
 }
 
 test "host-managed startup skips every local credential source" {
@@ -2244,6 +2555,15 @@ test "credential onboarding can be skipped independently from Keychain" {
 
 fn writeFixtureFile(dir: std.Io.Dir, sub_path: []const u8, text: []const u8) !void {
     var file = try dir.createFile(io_mod.getIo(), sub_path, .{ .truncate = true });
+    defer file.close(io_mod.getIo());
+    try file.writeStreamingAll(io_mod.getIo(), text);
+}
+
+fn writePrivateFixtureFile(dir: std.Io.Dir, sub_path: []const u8, text: []const u8) !void {
+    var file = try dir.createFile(io_mod.getIo(), sub_path, .{
+        .truncate = true,
+        .permissions = std.Io.File.Permissions.fromMode(0o600),
+    });
     defer file.close(io_mod.getIo());
     try file.writeStreamingAll(io_mod.getIo(), text);
 }

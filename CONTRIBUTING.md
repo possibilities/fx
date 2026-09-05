@@ -119,11 +119,27 @@ duplicate, stale, and unclassified files without running the full PGSO gate.
 
 Config precedence (highest wins):
 
-1. Environment variables such as `FX_MODEL`, `FX_PERMISSION_MODE`, and `FX_MAX_AGENT_STEPS`
+1. Environment variables listed below
 2. `~/.fx/settings.json` → `workspaces["<workspace_path>"]` (profile workspace overrides)
 3. `~/.fx/settings.json` top-level (profile global settings)
 4. `<workspace>/.fx.json` (committed project defaults)
 5. Built-in defaults
+
+Supported user-facing `FX_` environment variables:
+
+| Name | Accepted values | Override or effect |
+| --- | --- | --- |
+| `FX_MODEL` | Non-empty model ID | Overrides the configured model for the current process without saving it. |
+| `FX_EFFORT` | `default`, `auto`, `adaptive`, or a case-sensitive effort name | Overrides the configured effort for the current process without saving it. The three aliases actively select the default effort instead of falling back to the saved setting. |
+| `FX_PERMISSION_MODE` | `ask`, `auto`, or `yolo` | Overrides `permission_mode` for the current process. |
+| `FX_MAX_AGENT_STEPS` | Non-negative integer; `0` is unbounded | Overrides `max_agent_steps` for the current process. |
+| `FX_SOUND` | `0`, `false`, or `off`; `max`; any other non-empty value enables ordinary sounds | Overrides saved notification sound settings for the current process. |
+| `FX_SKIP_ONBOARDING` | Any non-empty value except `0` or `false` | Skips credential onboarding. |
+| `FX_DISABLE_KEYCHAIN` | `1` or `true` | Uses the portable credential file instead of macOS Keychain. |
+| `FX_AUTO_UPGRADE` | `0` or `false` | Disables automatic upgrades for the current process, even when enabled in profile config. |
+| `FX_TRACE` | `1`, `true`, `yes`, or `on` | Writes a diagnostic trace to the default trace log. |
+| `FX_RECORD` | Non-empty tape path | Records terminal output, resizes, and interrupts to a deterministic replay tape. |
+| `FX_SKILL_SYMLINK_AUTHORITIES` | Colon-separated absolute paths without `..` components | Adds trusted roots for skill symlinks that resolve outside the workspace or home directory. |
 
 Project `.fx.json` accepts only repo-safe defaults: `sandbox`, `max_agent_steps`, `max_tool_result_bytes`, and `context`. Profile-owned keys such as `model`, `effort`, `fast_mode`, `slash_menu_categories`, `startup_scrollback`, `prompt_history`, `statusLine`, `skill_match_fuzzy`, `first_call_tool_choice`, `auto_upgrade`, `update_channel`, `permission_mode`, and `permission` are ignored from project config before their values are parsed.
 
@@ -150,6 +166,11 @@ There are two distinct skill categories in `fx`:
 * compatibility roots discovered for other agent installs: `.opencode/skills`, `.codex/skills`, `.claude/skills`, `.agents/skills`, `.claw/skills`, plus their global equivalents
 
 `/skills list` should make that distinction visible to the user.
+
+For an interactive TUI or ACP launch, global `--skills-dir <path>` adds an
+explicit skill root and may be repeated. Pair it with `--no-default-skills` to
+discover only those explicit roots, in flag order. This launch policy never
+changes managed skill storage.
 
 `/skills add` and `/skills install` install full skill directories into the profile-owned `~/.fx/skills` managed root, not just `SKILL.md`. Workspace `.fx/skills` and `skills/` remain discoverable project-local instructions, not managed install targets.
 
@@ -434,7 +455,7 @@ Releases are triggered automatically when the version in `src/main.zig` changes 
 
 The install script and `fx upgrade` fetch binaries from `releases.fx.sh`, backed by the public Vercel Blob CDN. No authentication or external CLI tools are required. The release workflow also publishes binaries to the CDN and updates `latest.txt` automatically.
 
-After CI passes for a push to `main`, the dev release workflow publishes commit-addressed binaries and then updates `dev.json`. Dogfooders opt in with `fx upgrade --channel dev`; the choice is stored in their user settings and applies to manual upgrades, automatic upgrades, and the `ctrl+g` handoff. `fx upgrade --channel stable` returns to tagged releases. Dev publishing does not create tags or GitHub Releases.
+After CI passes for a push to `main`, the dev release workflow publishes commit-addressed binaries and then updates `dev.json`. Dogfooders opt in with `fx upgrade --channel dev`; the choice is stored in their user settings and applies to manual upgrades, automatic upgrades, and the `ctrl+t` handoff. `fx upgrade --channel stable` returns to tagged releases. Dev publishing does not create tags or GitHub Releases.
 
 Release notes are public product copy. Describe user-visible behavior, always spell the product `fx`, and omit contributor attribution, tracker references, repository or website work, delivery infrastructure, CI and test details, branch history, and implementation-only refactors. Use commits and pull requests as research evidence only. Changelog formatting and release-marker rules live in `AGENTS.md`.
 

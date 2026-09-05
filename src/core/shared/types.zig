@@ -1222,6 +1222,8 @@ pub const ProviderFailureCause = enum {
 
 pub const ModelCompletion = struct {
     content: ?[]const u8 = null,
+    /// The provider produced content beyond the caller's capture limit.
+    content_capture_overflowed: bool = false,
     tool_calls: []const ToolCall = &.{},
     assistant_phase: ?AssistantMessagePhase = null,
     generation_id: ?[]const u8 = null,

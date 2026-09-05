@@ -1,6 +1,7 @@
 const std = @import("std");
 const runtime_profile = @import("../hosts/runtime_profile.zig");
 const app_permission_runtime = @import("app_permission_runtime.zig");
+const app_profile_runtime = @import("app_profile_runtime.zig");
 const app_session_runtime = @import("app_session_runtime.zig");
 const io_mod = @import("../shared/io.zig");
 const auth_runtime = @import("../auth/auth_runtime.zig");
@@ -36,6 +37,7 @@ const session_commands = @import("../session/session_commands.zig");
 const usage_recovery = @import("../session/usage_recovery.zig");
 const usage_dashboard_runtime = @import("usage_dashboard_runtime.zig");
 const usage_report = @import("../session/usage_report.zig");
+const profile_usage_runtime = @import("../session/profile_usage_runtime.zig");
 const types = @import("../shared/types.zig");
 const assistant_presentation = @import("../agent/assistant_presentation.zig");
 const worker_runtime = @import("../agent/worker_runtime.zig");
@@ -165,7 +167,7 @@ fn persistUserPreferences(
     patch: config_runtime.UserSettingsPatch,
     runtime_changed: bool,
 ) !void {
-    var attempt = config_runtime.attemptUserPreferences(app.alloc, patch);
+    var attempt = app_profile_runtime.attemptUserPreferences(app, patch);
     defer attempt.deinit(app.alloc);
     switch (attempt) {
         .failure => |failure| try session_commands.reportUserSettingsFailure(
@@ -259,13 +261,23 @@ fn handleWorkspaceCommand(app: anytype, rest: []const u8) !void {
     defer app.worker.releaseTurnStartHold();
 
     var failure_phase: workspace_commands.FailurePhase = .stage;
-    var result = workspace_commands.execute(
-        app.alloc,
-        app.workspace_root,
-        app.workspaceAccess(),
-        action,
-        &failure_phase,
-    ) catch |err| {
+    var result = (if (app_profile_runtime.explicitHome(app)) |profile_home|
+        workspace_commands.executeFromHome(
+            app.alloc,
+            profile_home,
+            app.workspace_root,
+            app.workspaceAccess(),
+            action,
+            &failure_phase,
+        )
+    else
+        workspace_commands.execute(
+            app.alloc,
+            app.workspace_root,
+            app.workspaceAccess(),
+            action,
+            &failure_phase,
+        )) catch |err| {
         const reason = output_contracts.workspaceErrorMessage(err) orelse "workspace update failed";
         const prefix: []const u8 = switch (failure_phase) {
             .stage => "Workspace update rejected",
@@ -1120,7 +1132,7 @@ pub fn Handlers(comptime App: type) type {
         }
 
         fn requestUsageDashboardRefresh(app: *App) !void {
-            const home = io_mod.getenv("HOME") orelse return error.HomeNotSet;
+            const home = app_profile_runtime.home(app) orelse return error.HomeNotSet;
             const availability = try app.session.ensureProfileUsageReadable(
                 app.alloc,
                 home,
@@ -1175,7 +1187,7 @@ pub fn Handlers(comptime App: type) type {
             if (scope == .session) {
                 return app.session.usage.reportSnapshot(app.alloc);
             }
-            const home = io_mod.getenv("HOME") orelse return error.HomeNotSet;
+            const home = app_profile_runtime.home(app) orelse return error.HomeNotSet;
             const availability = try app.session.ensureProfileUsageReadable(
                 app.alloc,
                 home,
@@ -1276,7 +1288,7 @@ pub fn Handlers(comptime App: type) type {
                 return;
             }
             const result = try app.mcpCommandProvider().handle(app.alloc, rest, .{
-                .home = io_mod.getenv("HOME"),
+                .home = app_profile_runtime.home(app),
                 .list_ctx = @ptrCast(app),
                 .summarize_servers = summarizeMcpServers,
                 .list_servers_and_tools = listMcpServersAndTools,
@@ -1356,11 +1368,7 @@ pub fn Handlers(comptime App: type) type {
                     .reject, .reset => true,
                     .approve, .approve_all => false,
                 };
-                var attempt = config_runtime.attemptProjectMcpMutation(
-                    app.alloc,
-                    app.workspace_root,
-                    action,
-                );
+                var attempt = app_profile_runtime.attemptProjectMcpMutation(app, action);
                 defer attempt.deinit(app.alloc);
                 var warning = false;
                 var owned_notice: ?[]u8 = null;
@@ -1767,6 +1775,10 @@ pub fn Handlers(comptime App: type) type {
 
             var result = try provider.executeCommand(app.alloc, command, .{
                 .skills_dir = app.skills.dir,
+                .invocation_skill_roots = if (comptime @hasField(App, "skill_root_policy"))
+                    app.skill_root_policy.invocation_roots
+                else
+                    &.{},
                 .find_ctx = @ptrCast(app),
                 .find_skill = findSkillForProvider,
             });
@@ -1966,7 +1978,7 @@ pub fn Handlers(comptime App: type) type {
         fn commandHandleSettings(ctx: *anyopaque, rest: []const u8) !void {
             const app: *App = @ptrCast(@alignCast(ctx));
             if (std.mem.trim(u8, rest, " \t").len == 0) {
-                var settings = config_runtime.loadMergedSettings(app.alloc, app.workspace_root) catch {
+                var settings = app_profile_runtime.loadMergedSettings(app) catch {
                     try session_commands.Commands(App).handleSettings(app, rest);
                     return;
                 };
@@ -3577,7 +3589,7 @@ fn handleNotificationsCommand(app: anytype, rest: []const u8) !void {
         .notification_attention_required = sound_on,
         .notification_max = max,
     };
-    var attempt = config_runtime.attemptUserPreferences(app.alloc, patch);
+    var attempt = app_profile_runtime.attemptUserPreferences(app, patch);
     defer attempt.deinit(app.alloc);
     switch (attempt) {
         .failure => |failure| try session_commands.reportUserSettingsFailure(
@@ -3664,7 +3676,7 @@ fn persistUserPreferencesSilently(
     patch: config_runtime.UserSettingsPatch,
     runtime_changed: bool,
 ) !void {
-    var attempt = config_runtime.attemptUserPreferences(app.alloc, patch);
+    var attempt = app_profile_runtime.attemptUserPreferences(app, patch);
     defer attempt.deinit(app.alloc);
     switch (attempt) {
         .failure => |failure| try session_commands.reportUserSettingsFailure(
@@ -3745,7 +3757,7 @@ pub fn applySettingsCatalogChange(app: anytype, change: settings_catalog.Change)
                 app,
                 if (enabled) "startup-scrollback on" else "startup-scrollback off",
             );
-            var settings = config_runtime.loadMergedSettings(app.alloc, app.workspace_root) catch return;
+            var settings = app_profile_runtime.loadMergedSettings(app) catch return;
             defer settings.deinit(app.alloc);
             app.input_runtime.settings_menu.startup_scrollback = settings.startup_scrollback orelse true;
         },
@@ -4538,6 +4550,70 @@ test "app_commands exposes active handler API surface" {
     try std.testing.expectEqual(@as(usize, 1), handlers_info.params.len);
     try std.testing.expect(handlers_info.params[0].type.? == *SurfaceOnlyApp);
     try std.testing.expect(handlers_info.return_type.? == command_router.CommandHandlers);
+}
+
+test "state-isolated usage dashboard refresh never reads ambient home" {
+    const FakeSession = struct {
+        profile_usage: profile_usage_runtime.Runtime = .{},
+        ensured_home: ?[]const u8 = null,
+
+        fn ensureProfileUsageReadable(
+            self: *@This(),
+            _: std.mem.Allocator,
+            home_path: ?[]const u8,
+        ) !profile_usage_runtime.InitializeOutcome {
+            self.ensured_home = home_path;
+            return .available;
+        }
+    };
+    const FakeDashboard = struct {
+        requested_home: ?[]const u8 = null,
+
+        fn requestRefresh(
+            self: *@This(),
+            _: usage_dashboard_runtime.Provider,
+            home_path: []const u8,
+            _: i64,
+        ) !bool {
+            self.requested_home = home_path;
+            return true;
+        }
+    };
+    const FakeApp = struct {
+        alloc: std.mem.Allocator,
+        profile_home: ?[]const u8,
+        session: FakeSession = .{},
+        usage_dashboard: FakeDashboard = .{},
+    };
+
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "selected-state");
+    const selected_home = try io_mod.dirRealpathAlloc(
+        alloc,
+        tmp.dir,
+        "selected-state",
+    );
+    defer alloc.free(selected_home);
+    if (io_mod.getenv("HOME")) |ambient_home| {
+        try std.testing.expect(!std.mem.eql(u8, selected_home, ambient_home));
+    }
+
+    var app = FakeApp{
+        .alloc = alloc,
+        .profile_home = selected_home,
+    };
+    try Handlers(FakeApp).requestUsageDashboardRefresh(&app);
+
+    try std.testing.expectEqualStrings(
+        selected_home,
+        app.session.ensured_home.?,
+    );
+    try std.testing.expectEqualStrings(
+        selected_home,
+        app.usage_dashboard.requested_home.?,
+    );
 }
 
 test "credits command renders through the composed provider" {

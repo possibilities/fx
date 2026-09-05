@@ -91,6 +91,10 @@ pub const Owner = struct {
     }
 
     pub fn cancel(self: *Owner, child_id: []const u8) CancelError!void {
+        // Close every copied attention identity before the worker can act on
+        // the cancellation, so no late lifecycle edge is published from the
+        // abandoned approval.
+        self.approvals.closeChildAttention(child_id);
         self.mutex.lockUncancelable(io_mod.getIo());
         defer self.mutex.unlock(io_mod.getIo());
         for (self.slots.items) |slot| {
@@ -118,6 +122,9 @@ pub const Owner = struct {
     }
 
     pub fn deinit(self: *Owner) void {
+        // Retire approval routes and close their attention before shutdown
+        // signals let workers publish terminal lifecycle edges.
+        self.approvals.detachWorkerRoutes();
         self.mutex.lockUncancelable(io_mod.getIo());
         self.closed = true;
         for (self.slots.items) |slot| {

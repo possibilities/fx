@@ -222,6 +222,11 @@ fn loadFromHost(alloc: Allocator, store: js_host_auth.SessionStore) !?Session {
 fn loadFromProfile(alloc: Allocator, configured_home: ?[]const u8) !?Session {
     if (comptime host_target.is_wasm) return null;
     const home = configured_home orelse io_mod.getenv("HOME") orelse return null;
+    return loadFromHome(alloc, home);
+}
+
+pub fn loadFromHome(alloc: Allocator, home: []const u8) !?Session {
+    if (comptime host_target.is_wasm) return null;
     var home_dir = std.Io.Dir.openDirAbsolute(io_mod.getIo(), home, .{ .iterate = true }) catch |err| {
         debug_trace.logf("auth", "ChatGPT session load failed step=open_home err={s}", .{@errorName(err)});
         if (err == error.FileNotFound) return null;
@@ -286,6 +291,17 @@ pub fn saveNewSessionToStore(alloc: Allocator, store: Store, session: Session) !
     try mutation.save(alloc, session);
 }
 
+pub fn saveNewSessionFromHome(
+    alloc: Allocator,
+    home: []const u8,
+    session: Session,
+) !void {
+    if (comptime host_target.is_wasm) return error.ChatGptOAuthUnavailable;
+    var mutation: Mutation = .{ .profile = try beginProfileMutation(home) };
+    defer mutation.deinit();
+    try mutation.save(alloc, session);
+}
+
 pub fn beginExistingMutation() !?Mutation {
     return beginExistingMutationForStore(default_store);
 }
@@ -300,6 +316,11 @@ pub fn beginExistingMutationForStore(store: Store) !?Mutation {
 fn beginExistingProfileMutation(configured_home: ?[]const u8) !?Mutation {
     if (comptime host_target.is_wasm) return null;
     const home = configured_home orelse io_mod.getenv("HOME") orelse return error.HomeNotSet;
+    return beginExistingMutationFromHome(home);
+}
+
+pub fn beginExistingMutationFromHome(home: []const u8) !?Mutation {
+    if (comptime host_target.is_wasm) return null;
     var home_dir = io_mod.VerifiedDir{
         .dir = std.Io.Dir.openDirAbsolute(io_mod.getIo(), home, .{ .iterate = true }) catch |err| return session_presence.storageError(auth_file_name, err),
     };

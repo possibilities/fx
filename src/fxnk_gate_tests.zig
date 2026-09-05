@@ -25,7 +25,7 @@ test {
     _ = @import("core/output/output_contracts.zig");
     _ = @import("core/session/session_naming.zig");
     _ = @import("core/skills/skill_runtime.zig");
-    _ = @import("core/subagent/tool_host.zig");
+    _ = @import("core/subagent/approval_registry.zig");
     _ = @import("core/tooling/tool_runtime.zig");
     _ = @import("tools/skills/skill_search.zig");
     _ = @import("napi_session_store.zig");

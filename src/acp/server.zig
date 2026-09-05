@@ -11,7 +11,6 @@ const prompt_handler = @import("prompt.zig");
 const prompt_test_controls = @import("prompt_test_controls.zig");
 const app_lifecycle = @import("../core/app/app_lifecycle.zig");
 const app_runtime_setup = @import("../core/app/app_runtime_setup.zig");
-const builtin_skills = @import("../builtins/skills.zig");
 const builtin_tools = @import("../builtins/tools.zig");
 const credentials = @import("../core/auth/credentials.zig");
 const secret = @import("../core/auth/secret.zig");
@@ -40,6 +39,7 @@ const web_fetch_runtime = @import("../core/tooling/web_fetch_runtime.zig");
 const web_search_runtime = @import("../core/tooling/web_search_runtime.zig");
 const elicitation = @import("../core/mcp/elicitation.zig");
 const tool_mcp_runtime = @import("../core/tooling/tool_mcp_runtime.zig");
+const tool_set_contract = @import("../core/tooling/tool_set.zig");
 const permissions = @import("../core/permissions/permissions.zig");
 const host_tool_runtime = @import("../core/tooling/host_tool_runtime.zig");
 const agent_checkpoint = @import("../core/agent/runtime/checkpoint.zig");
@@ -263,6 +263,7 @@ pub const ServerState = struct {
     provider: model_provider.ProviderId = .gateway,
     configured_model: []u8 = &.{},
     process_model_override: bool = false,
+    process_effort_override: bool = false,
     permission_mode: types.PermissionMode = .ask,
     permission_rules: types.PermissionRuleSet = .{},
     agent_step_limit: usize = 0,
@@ -270,6 +271,7 @@ pub const ServerState = struct {
     context_limits: config_runtime.context_limits.Values = .{},
     fast_mode: bool = false,
     effort: types.ReasoningEffort = .auto,
+    configured_effort: types.ReasoningEffort = .auto,
     first_call_tool_choice: types.ToolChoice = .auto,
     context_enabled: bool = true,
     active_session: ?ActiveSessionState = null,
@@ -336,11 +338,103 @@ pub const ServerState = struct {
     }
 };
 
+pub fn activeToolSet(state: *const ServerState) tool_set_contract.ToolSet {
+    if (state.host_tools.tools.len > 0) return state.host_tools.toolSet();
+    if (comptime host_target.is_wasm) return tool_set_contract.empty;
+    if (!state.cfg.allow_native_tools) return tool_set_contract.empty;
+    return state.cfg.native_tool_set orelse builtin_tools.advertisement_set;
+}
+
 fn credentialMatchesProvider(
     source: ?types.CredentialSource,
     provider: model_provider.ProviderId,
 ) bool {
     return model_provider.authorizesCredential(provider, source);
+}
+
+fn prepareConfiguredCredential(
+    state: *const ServerState,
+    alloc: Allocator,
+    provider: model_provider.ProviderId,
+    preferred: ?credentials.Source,
+) !?credentials.Credential {
+    if (state.cfg.minimal_kernel and provider == .codex) {
+        return auth_runtime.prepareCredentialWithStore(
+            alloc,
+            state.cfg.gateway_provider.oauth_transport,
+            state.cfg.secret_store,
+            provider,
+            preferred,
+            state.cfg.chatgpt_session_store,
+        );
+    }
+    const borrowed_authorization_home =
+        try credentials.readOnlyAuthorizationHomeFromEnvironment(
+            alloc,
+            state.cfg.home_override,
+        );
+    defer if (borrowed_authorization_home) |home| alloc.free(home);
+    if (state.cfg.home_override) |home| {
+        if (borrowed_authorization_home) |authorization_home| {
+            const resolution = try credentials.resolveReadOnlyForProviderFromHome(
+                alloc,
+                provider,
+                preferred,
+                authorization_home,
+            );
+            return resolution.credential;
+        }
+        return auth_runtime.prepareCredentialFromHome(
+            alloc,
+            state.cfg.gateway_provider.oauth_transport,
+            provider,
+            preferred,
+            home,
+        );
+    }
+    return auth_runtime.prepareCredential(
+        alloc,
+        state.cfg.gateway_provider.oauth_transport,
+        state.cfg.secret_store,
+        provider,
+        preferred,
+    );
+}
+
+fn refreshConfiguredCredentialForAccount(
+    state: *const ServerState,
+    alloc: Allocator,
+    source: credentials.Source,
+    mode: auth_runtime.CredentialRefreshMode,
+    expected_account_id: ?[]const u8,
+) !?credentials.Credential {
+    if (state.cfg.minimal_kernel and source == .chatgpt_subscription) {
+        return auth_runtime.refreshCredentialForAccountWithStore(
+            state.cfg.gateway_provider.oauth_transport,
+            alloc,
+            source,
+            mode,
+            expected_account_id,
+            state.cfg.chatgpt_session_store,
+        );
+    }
+    if (state.cfg.home_override) |home| {
+        return auth_runtime.refreshCredentialForAccountFromHome(
+            state.cfg.gateway_provider.oauth_transport,
+            alloc,
+            source,
+            mode,
+            expected_account_id,
+            home,
+        );
+    }
+    return auth_runtime.refreshCredentialForAccount(
+        state.cfg.gateway_provider.oauth_transport,
+        alloc,
+        source,
+        mode,
+        expected_account_id,
+    );
 }
 
 fn credentialReadyAt(
@@ -449,22 +543,19 @@ pub fn selectCredentialForProvider(
         }
     else blk: {
         const prepared = if (provider == .codex and state.codex_account_id != null)
-            try auth_runtime.refreshCredentialForAccountWithStore(
-                state.cfg.gateway_provider.oauth_transport,
+            try refreshConfiguredCredentialForAccount(
+                state,
                 state.alloc,
                 .chatgpt_subscription,
                 .if_needed,
                 state.codex_account_id,
-                state.cfg.chatgpt_session_store,
             )
         else
-            try auth_runtime.prepareCredentialWithStore(
+            try prepareConfiguredCredential(
+                state,
                 state.alloc,
-                state.cfg.gateway_provider.oauth_transport,
-                state.cfg.secret_store,
                 provider,
                 if (provider == .gateway) state.gateway_source_preference else state.credential_source,
-                state.cfg.chatgpt_session_store,
             );
         break :blk prepared orelse return false;
     };
@@ -499,13 +590,12 @@ pub fn refreshModelCredential(
     expected_account_id: ?[]const u8,
 ) !?[]u8 {
     const state: *ServerState = @ptrCast(@alignCast(raw));
-    var refreshed = (try auth_runtime.refreshCredentialForAccountWithStore(
-        state.cfg.gateway_provider.oauth_transport,
+    var refreshed = (try refreshConfiguredCredentialForAccount(
+        state,
         state.alloc,
         source,
         mode,
         expected_account_id,
-        state.cfg.chatgpt_session_store,
     )) orelse return null;
     defer refreshed.deinit(state.alloc);
 
@@ -643,7 +733,10 @@ pub fn enableSubagentHost(state: *ServerState) void {
     disableSubagentHost(state);
     const active = if (state.active_session) |*session| session else return;
     if (active.writable == null) return;
-    state.subagent_store = session_store.Store.init(state.alloc, state.workspace_root) catch |err| {
+    state.subagent_store = (if (state.cfg.home_override) |home|
+        session_store.Store.initFromHome(state.alloc, home, state.workspace_root)
+    else
+        session_store.Store.init(state.alloc, state.workspace_root)) catch |err| {
         debug_trace.logf("acp", "subagent host store unavailable session={s} err={s}", .{ active.session_id, @errorName(err) });
         return;
     };
@@ -682,6 +775,7 @@ fn resolveSubagentAuthority(
     }
     state.subagent_authority_mutex.lockUncancelable(io_mod.getIo());
     defer state.subagent_authority_mutex.unlock(io_mod.getIo());
+    const tool_set = activeToolSet(state);
     const integrations = if (active.mcp) |mcp|
         mcp.snapshotToolNames(alloc, active.permission_rules)
     else
@@ -697,7 +791,7 @@ fn resolveSubagentAuthority(
             root_id,
             root_id,
             active.permission_rules,
-            state.cfg.mode_registry.toolAllowed(builtin_tools.advertisement_set, active.mode, "mcp_features") and
+            state.cfg.mode_registry.toolAllowed(tool_set, active.mode, "mcp_features") and
                 !permissions.rulesDenyAllTargetsForTool(active.permission_rules, "mcp_features"),
         )
     else
@@ -711,7 +805,7 @@ fn resolveSubagentAuthority(
     return subagent_tool_host.captureHostAuthorityWithMcpView(
         alloc,
         .{
-            .tool_set = builtin_tools.advertisement_set,
+            .tool_set = tool_set,
             .mode = .{
                 .active = .{
                     .registry = state.cfg.mode_registry,
@@ -724,6 +818,57 @@ fn resolveSubagentAuthority(
         active.session_grants,
         permission_state,
         if (mcp_view) |*view| view else null,
+    );
+}
+
+test "ACP child authority preserves native-tool suppression and allowlisting" {
+    const alloc = std.testing.allocator;
+    const modes = [_]mode_registry.ModeSpec{
+        .{ .id = "full", .name = "Full", .permission_mode = .ask },
+    };
+    const selected = tool_set_contract.ToolSet{
+        .registry = .{ .tools = builtin_tools.registry.tools[0..1] },
+        .order = builtin_tools.advertisement_set.order[0..1],
+        .read_only_tool_names = &.{},
+    };
+    var state: ServerState = undefined;
+    state.alloc = alloc;
+    state.cfg.allow_native_tools = false;
+    state.cfg.native_tool_set = selected;
+    state.cfg.mode_registry = .{
+        .default_mode_id = "full",
+        .modes = modes[0..],
+    };
+    state.active_session = .{
+        .session_id = @constCast("root"),
+        .model = @constCast("model"),
+        .mode = "full",
+        .workspace_root = "/tmp/workspace",
+        .api_key = "",
+        .agent_step_limit = 0,
+        .max_tool_result_bytes = 0,
+        .fast_mode = false,
+        .effort = .auto,
+        .first_call_tool_choice = .auto,
+        .permission_mode = .ask,
+        .permission_rules = .{},
+        .session_rt = .{ .max_history_turns = 0 },
+        .cancel_flag = std.atomic.Value(bool).init(false),
+        .pending_prompt_id = null,
+    };
+    state.subagent_authority_mutex = .init;
+
+    var suppressed = try resolveSubagentAuthority(&state, alloc, "root");
+    defer suppressed.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 0), suppressed.tools.len);
+
+    state.cfg.allow_native_tools = true;
+    var allowlisted = try resolveSubagentAuthority(&state, alloc, "root");
+    defer allowlisted.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), allowlisted.tools.len);
+    try std.testing.expectEqualStrings(
+        selected.registry.tools[0].name,
+        allowlisted.tools[0],
     );
 }
 
@@ -1771,18 +1916,23 @@ fn loadConfiguredStartupState(state: *const ServerState, alloc: Allocator) !app_
             state.cfg.default_agent_step_limit,
         );
     }
+    const borrowed_authorization_home =
+        try credentials.readOnlyAuthorizationHomeFromEnvironment(
+            alloc,
+            state.cfg.home_override,
+        );
+    defer if (borrowed_authorization_home) |home| alloc.free(home);
     if (state.cfg.home_override) |home_dir| {
-        if (state.cfg.workspace_root_override) |workspace_root| {
-            var startup = try app_lifecycle.loadEmbeddedStartupState(
-                alloc,
-                home_dir,
-                workspace_root,
-                state.cfg.default_model,
-                state.cfg.default_agent_step_limit,
-            );
-            startup.auth_mode = state.cfg.auth_mode;
-            return startup;
-        }
+        const workspace_root = state.cfg.workspace_root_override orelse ".";
+        var startup = try app_lifecycle.loadEmbeddedStartupState(
+            alloc,
+            home_dir,
+            workspace_root,
+            state.cfg.default_model,
+            state.cfg.default_agent_step_limit,
+        );
+        startup.auth_mode = state.cfg.auth_mode;
+        return startup;
     }
     return app_lifecycle.loadStartupStateWithAuthMode(
         alloc,
@@ -1897,13 +2047,11 @@ fn handleInitialize(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message
         } else if (startup_credential_is_final)
             &startup_credential.?
         else routed: {
-            routed_credential = try auth_runtime.prepareCredentialWithStore(
+            routed_credential = try prepareConfiguredCredential(
+                state,
                 alloc,
-                state.cfg.gateway_provider.oauth_transport,
-                state.cfg.secret_store,
                 state.provider,
                 if (state.provider == .gateway) startup.credential_source_preference else null,
-                state.cfg.chatgpt_session_store,
             );
             if (routed_credential == null) {
                 return state.writer.writeError(alloc, msg.id, .{
@@ -1934,20 +2082,29 @@ fn handleInitialize(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message
     }
 
     state.permission_mode = startup.permission_mode;
-    state.permission_rules = startup.takePermissionRules();
+    state.permission_rules = if (state.cfg.permission_rules_override) |rules|
+        try types.dupePermissionRuleSet(alloc, rules)
+    else
+        startup.takePermissionRules();
     state.agent_step_limit = startup.agent_step_limit;
     state.max_tool_result_bytes = startup.max_tool_result_bytes;
     state.context_limits = startup.context_limits;
     state.context_limits.applyCommandLine(state.cfg.context_limit_overrides);
     state.fast_mode = startup.fast_mode and state.provider == startup.provider and
         (state.cfg.model_override == null or startup.fast_mode_source != .compiled_default);
-    state.effort = startup.effort;
+    state.effort = state.cfg.effort_override orelse startup.effort;
+    state.configured_effort = startup.configured_effort;
+    state.process_effort_override = state.cfg.effort_override != null or
+        startup.effort_source == .process_override;
     state.first_call_tool_choice = startup.first_call_tool_choice;
     state.context_enabled = startup.context_enabled;
 
     if (comptime !host_target.is_wasm) {
         if (!state.cfg.minimal_kernel) {
-            var loaded_skills = try app_runtime_setup.loadSkills(alloc, state.workspace_root, builtin_skills.root_policy);
+            var loaded_skills = if (state.cfg.home_override) |home|
+                try app_runtime_setup.loadSkillsFromHome(alloc, state.workspace_root, home, state.cfg.skill_root_policy)
+            else
+                try app_runtime_setup.loadSkills(alloc, state.workspace_root, state.cfg.skill_root_policy);
             errdefer loaded_skills.deinit(alloc);
             skill_runtime.traceDiagnostics("acp_startup", loaded_skills.diagnostics);
             try state.skills.replaceLoaded(alloc, loaded_skills.dir, loaded_skills.skills, loaded_skills.diagnostics);
@@ -2243,22 +2400,19 @@ fn handleSetConfigOption(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Me
                 }
             else credential: {
                 const prepared = (if (target == .codex and state.codex_account_id != null)
-                    auth_runtime.refreshCredentialForAccountWithStore(
-                        state.cfg.gateway_provider.oauth_transport,
+                    refreshConfiguredCredentialForAccount(
+                        state,
                         alloc,
                         .chatgpt_subscription,
                         .if_needed,
                         state.codex_account_id,
-                        state.cfg.chatgpt_session_store,
                     )
                 else
-                    try auth_runtime.prepareCredentialWithStore(
+                    try prepareConfiguredCredential(
+                        state,
                         alloc,
-                        state.cfg.gateway_provider.oauth_transport,
-                        state.cfg.secret_store,
                         target,
                         if (target == .gateway) state.gateway_source_preference else null,
-                        state.cfg.chatgpt_session_store,
                     )) catch |err| {
                     if (err == error.ChatGptAccountChanged) {
                         return state.writer.writeError(alloc, msg.id, .{
@@ -2686,6 +2840,29 @@ test "ACP permission responses map canonical option ids" {
         defer parsed.deinit();
         try std.testing.expect(parsePermissionDecision(parsed.value) == null);
     }
+}
+
+test "ACP selected profile state loads settings without workspace override" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "state/.fx");
+    {
+        var file = try tmp.dir.createFile(std.testing.io, "state/.fx/settings.json", .{});
+        defer file.close(std.testing.io);
+        try file.writeStreamingAll(std.testing.io, "{\"model\":\"isolated/model\"}\n");
+    }
+    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "state");
+    defer alloc.free(home);
+
+    var state: ServerState = undefined;
+    state.cfg.home_override = home;
+    state.cfg.workspace_root_override = null;
+    state.cfg.default_model = "default/model";
+    state.cfg.default_agent_step_limit = 50;
+    var startup = try loadConfiguredStartupState(&state, alloc);
+    defer startup.deinit(alloc);
+    try std.testing.expectEqualStrings("isolated/model", startup.configured_model);
 }
 
 test "ACP outbound waiters resolve to deny on cancellation" {

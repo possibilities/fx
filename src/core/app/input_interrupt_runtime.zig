@@ -203,3 +203,65 @@ test "interactive connectivity wait maps try later to recovery pause" {
     try std.testing.expect(!InterruptRuntime(FakeApp).pauseActiveRecovery(&app));
     try std.testing.expect(!app.worker.pause_requested);
 }
+
+test "interactive interrupt cancels without a native queue editor" {
+    const FakeWorker = struct {
+        cancel_requested: bool = false,
+
+        pub fn isCancelRequested(self: *const @This()) bool {
+            return self.cancel_requested;
+        }
+
+        pub fn queuedPromptCount(_: *const @This()) usize {
+            return 1;
+        }
+
+        pub fn requestInteractiveCancel(self: *@This()) void {
+            self.cancel_requested = true;
+        }
+    };
+    const FakePrompt = struct {
+        pub fn isActive(_: *const @This()) bool {
+            return false;
+        }
+    };
+    const FakeStream = struct {
+        active: bool = false,
+        chunks: usize = 0,
+        last_activity_kind: ?enum { text } = null,
+    };
+    const FakeRenderRequests = struct {
+        requested: bool = false,
+
+        pub fn request(self: *@This(), _: anytype) void {
+            self.requested = true;
+        }
+    };
+    const FakeShell = struct {
+        render_requests: FakeRenderRequests = .{},
+    };
+    const FakePacer = struct {
+        pub fn clear(_: *@This(), _: std.mem.Allocator) void {}
+    };
+    const FakeApp = struct {
+        alloc: std.mem.Allocator = std.testing.allocator,
+        worker: FakeWorker = .{},
+        stream: FakeStream = .{ .active = true },
+        approval_prompt: FakePrompt = .{},
+        question_prompt: FakePrompt = .{},
+        shell: FakeShell = .{},
+        pacer: FakePacer = .{},
+        notice_written: bool = false,
+
+        pub fn writeDomainNotice(self: *@This(), _: anytype, _: bool) !void {
+            self.notice_written = true;
+        }
+    };
+
+    var app = FakeApp{};
+    try InterruptRuntime(FakeApp).cancelActiveOperation(&app);
+    try std.testing.expect(app.worker.cancel_requested);
+    try std.testing.expect(!app.stream.active);
+    try std.testing.expect(!app.notice_written);
+    try std.testing.expect(app.shell.render_requests.requested);
+}

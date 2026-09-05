@@ -733,6 +733,7 @@ fn assistantMessagePhase(fields: std.json.ObjectMap) ?types.AssistantMessagePhas
 
 pub const Reducer = struct {
     content: std.ArrayList(u8) = .empty,
+    content_capture_overflowed: bool = false,
     provider_state: std.Io.Writer.Allocating,
     provider_state_count: usize = 0,
     tools: std.ArrayList(ToolAccumulator) = .empty,
@@ -740,6 +741,7 @@ pub const Reducer = struct {
     usage: types.Usage = .{},
     generation_id: ?[]u8 = null,
     terminal_seen: bool = false,
+    saw_refusal: bool = false,
     text_parts: std.AutoHashMapUnmanaged(TextKey, TextPart) = .empty,
     last_text_key: ?TextKey = null,
     text_bytes: usize = 0,
@@ -772,7 +774,6 @@ pub const Reducer = struct {
         content_capture_limit: ?usize,
         limits: StreamLimits,
     ) !bool {
-        if (cancel_flag.load(.seq_cst)) return error.Cancelled;
         if (self.terminal_seen) return true;
         self.event_count = try checkedAccumulatedSize(self.event_count, 1, limits.events);
         if (limits.count_json_bytes) {
@@ -789,6 +790,9 @@ pub const Reducer = struct {
         defer parsed.deinit();
         if (parsed.value != .object) return false;
         const event_type = stringField(parsed.value.object, "type") orelse return false;
+        if (cancel_flag.load(.seq_cst) and !isProviderTerminalEvent(event_type)) {
+            return error.Cancelled;
+        }
 
         if (std.mem.eql(u8, event_type, "response.output_item.added")) {
             const output_index = try optional_index(parsed.value.object, "output_index") orelse return false;
@@ -895,7 +899,7 @@ pub const Reducer = struct {
                 self.provider_state_count += 1;
             } else if (std.mem.eql(u8, item_type, "message")) {
                 self.assistant_phase.observe(assistantMessagePhase(item.object));
-                try self.finalize_text_message(alloc, output_index, item.object, callbacks, cancel_flag, content_capture_limit, limits);
+                try self.finalize_text_message(alloc, output_index, item.object, callbacks, content_capture_limit, limits);
             }
         } else if (std.mem.eql(u8, event_type, "response.completed") or
             std.mem.eql(u8, event_type, "response.done") or
@@ -906,7 +910,6 @@ pub const Reducer = struct {
             if (response_value.object.get("output")) |output| {
                 if (output != .array) return error.InvalidEvent;
                 for (output.array.items, 0..) |item, output_index| {
-                    if (cancel_flag.load(.seq_cst)) return error.Cancelled;
                     if (item != .object) continue;
                     const item_type = stringField(item.object, "type") orelse continue;
                     const index = std.math.cast(i64, output_index) orelse return error.ResourceLimitExceeded;
@@ -914,17 +917,22 @@ pub const Reducer = struct {
                         try self.reconcileToolItem(alloc, index, item.object, callbacks, limits);
                     } else if (std.mem.eql(u8, item_type, "message")) {
                         self.assistant_phase.observe(assistantMessagePhase(item.object));
-                        try self.finalize_text_message(alloc, index, item.object, callbacks, cancel_flag, content_capture_limit, limits);
+                        try self.finalize_text_message(alloc, index, item.object, callbacks, content_capture_limit, limits);
                     }
                 }
             }
-            if (cancel_flag.load(.seq_cst)) return error.Cancelled;
+            // A terminal event that has already been read is the authoritative
+            // provider outcome: cancellation after admission is best effort and
+            // never abandons the terminal, its usage, or its generation id.
             self.terminal_seen = true;
-            self.finish_reason = finishReason(
-                stringField(response_value.object, "status"),
-                response_value.object,
-                self.tools.items.len > 0,
-            );
+            self.finish_reason = if (self.saw_refusal)
+                .content_filter
+            else
+                finishReason(
+                    stringField(response_value.object, "status"),
+                    response_value.object,
+                    self.tools.items.len > 0,
+                );
             self.usage = parseUsage(response_value.object);
             if (stringField(response_value.object, "id")) |id| {
                 if (self.generation_id) |prior| alloc.free(prior);
@@ -964,10 +972,17 @@ pub const Reducer = struct {
                 break :blk update.text;
             },
         };
+        if (update.kind == .refusal) self.saw_refusal = true;
         if (suffix.len != 0) {
             if (self.last_text_key) |last| if (update.key.precedes(last)) return error.ResponsesTextConflict;
             const total = try checkedAccumulatedSize(self.text_bytes, suffix.len, limits.aggregate_bytes);
-            try appendCaptured(alloc, &self.content, suffix, capture_limit);
+            try appendCaptured(
+                alloc,
+                &self.content,
+                suffix,
+                capture_limit,
+                &self.content_capture_overflowed,
+            );
             part.digest.update(suffix);
             part.received_bytes += suffix.len; // Bounded by the aggregate total above.
             self.text_bytes = total;
@@ -1005,7 +1020,6 @@ pub const Reducer = struct {
         output_index: i64,
         fields: std.json.ObjectMap,
         callbacks: StreamCallbacks,
-        cancel_flag: *std.atomic.Value(bool),
         capture_limit: ?usize,
         limits: StreamLimits,
     ) !void {
@@ -1013,7 +1027,6 @@ pub const Reducer = struct {
         if (parts != .array) return error.InvalidEvent;
         const identity = try text_identity(fields, "id");
         for (parts.array.items, 0..) |part, content_index| {
-            if (cancel_flag.load(.seq_cst)) return error.Cancelled;
             if (part != .object) return error.InvalidEvent;
             try self.finalize_text_part(alloc, .{
                 .output_index = output_index,
@@ -1045,8 +1058,10 @@ pub const Reducer = struct {
         cancel_flag: *std.atomic.Value(bool),
         limits: StreamLimits,
     ) !types.ModelCompletion {
-        if (cancel_flag.load(.seq_cst)) return error.Cancelled;
-        if (!self.terminal_seen) return error.StreamIncomplete;
+        if (!self.terminal_seen) {
+            if (cancel_flag.load(.seq_cst)) return error.Cancelled;
+            return error.StreamIncomplete;
+        }
 
         const owned_content = if (self.content.items.len > 0)
             try self.content.toOwnedSlice(alloc)
@@ -1092,6 +1107,7 @@ pub const Reducer = struct {
         self.generation_id = null;
         return .{
             .content = owned_content,
+            .content_capture_overflowed = self.content_capture_overflowed,
             .tool_calls = owned_tools,
             .assistant_phase = self.assistant_phase.resolved(),
             .generation_id = generation_id,
@@ -1302,13 +1318,20 @@ test "Responses text finalization preserves append order and bounded sparse inde
     try bounded.expect_emitted("ab");
 }
 
-test "Responses text finalization stops on cancellation within a terminal snapshot" {
+test "Responses text finalization completes a terminal snapshot despite cancellation" {
     var stream = TextRecordTest.init(std.testing.allocator);
     defer stream.deinit();
     stream.cancel_on_content = true;
-    try std.testing.expectError(error.Cancelled, stream.apply("{\"type\":\"response.completed\",\"response\":{\"output\":[{\"type\":\"message\",\"content\":[{\"type\":\"output_text\",\"text\":\"first\"},{\"type\":\"output_text\",\"text\":\"never\"}]}]}}"));
-    try stream.expect_emitted("first");
-    try std.testing.expectError(error.Cancelled, stream.reducer.finish(stream.alloc, &stream.cancelled, stream.limits));
+    try stream.apply("{\"type\":\"response.completed\",\"response\":{\"id\":\"resp_snapshot\",\"status\":\"completed\",\"output\":[{\"type\":\"message\",\"content\":[{\"type\":\"output_text\",\"text\":\"first\"},{\"type\":\"output_text\",\"text\":\"second\"}]}]}}");
+    try stream.expect_emitted("firstsecond");
+    var result = stream_provider.Result{ .completed = .{
+        .completion = try stream.reducer.finish(stream.alloc, &stream.cancelled, stream.limits),
+        .ownership = .owned,
+    } };
+    defer result.deinit(stream.alloc);
+    try std.testing.expectEqualStrings("firstsecond", result.completed.completion.content orelse "");
+    try std.testing.expectEqualStrings("resp_snapshot", result.completed.completion.generation_id.?);
+    try std.testing.expectEqual(types.ProviderFinishReason.stop, result.completed.completion.finish_reason.?);
 }
 
 test "Responses text finalization does not retain uncaptured text" {
@@ -1568,15 +1591,21 @@ test "Responses finalization checks correlation types and rejects unmatched fina
     }
 }
 
-test "Responses finalization retains cancellation and terminal requirements" {
+test "Responses finalization requires a terminal and honors one read under cancellation" {
     var stream = ToolRecordTest.init(std.testing.allocator);
     defer stream.deinit();
     try stream.apply(ToolRecordTest.start);
     try stream.apply(ToolRecordTest.finalized);
     try std.testing.expectError(error.StreamIncomplete, stream.finish());
     stream.cancelled.store(true, .seq_cst);
-    try std.testing.expectError(error.Cancelled, stream.apply(ToolRecordTest.terminal));
+    try std.testing.expectError(error.Cancelled, stream.apply(ToolRecordTest.finalized));
     try std.testing.expectError(error.Cancelled, stream.finish());
+    // A terminal event read after cancellation is still the provider's
+    // authoritative outcome and completes the stream.
+    try stream.apply(ToolRecordTest.terminal);
+    const completion = try stream.finish();
+    defer stream.freeCompletion(completion);
+    try std.testing.expectEqual(@as(usize, 1), completion.tool_calls.len);
 }
 
 test "Responses rejects malformed supplied output indexes without requiring omitted metadata" {
@@ -1658,6 +1687,19 @@ fn appendTool(
     });
 }
 
+fn isProviderTerminalEvent(event_type: []const u8) bool {
+    inline for (.{
+        "response.completed",
+        "response.done",
+        "response.incomplete",
+        "response.failed",
+        "error",
+    }) |candidate| {
+        if (std.mem.eql(u8, event_type, candidate)) return true;
+    }
+    return false;
+}
+
 fn appendToolArguments(
     alloc: std.mem.Allocator,
     arguments: *std.ArrayList(u8),
@@ -1681,11 +1723,13 @@ fn appendCaptured(
     content: *std.ArrayList(u8),
     delta: []const u8,
     limit: ?usize,
+    overflowed: *bool,
 ) !void {
     const remaining = if (limit) |maximum|
         maximum -| @min(maximum, content.items.len)
     else
         delta.len;
+    if (delta.len > remaining) overflowed.* = true;
     try content.appendSlice(alloc, delta[0..@min(delta.len, remaining)]);
 }
 
@@ -1924,6 +1968,192 @@ test "Responses usage projection retains optional cached and reasoning detail" {
     try std.testing.expectEqual(@as(?u64, 5), usage.cache_read_tokens);
     try std.testing.expectEqual(@as(?u64, 2), usage.cache_write_tokens);
     try std.testing.expectEqual(@as(?u64, 3), usage.reasoning_tokens);
+}
+
+test "Responses reducer classifies refusal content as content filter" {
+    const alloc = std.testing.allocator;
+    var reducer = Reducer.init(alloc);
+    defer reducer.deinit(alloc);
+    var cancelled = std.atomic.Value(bool).init(false);
+    var ignored: u8 = 0;
+    const callbacks = StreamCallbacks{
+        .context = &ignored,
+        .on_content = struct {
+            fn emit(_: *anyopaque, _: []const u8) void {}
+        }.emit,
+    };
+    const limits = StreamLimits{
+        .aggregate_bytes = 4096,
+        .events = 8,
+        .tool_calls = 0,
+        .tool_identity_bytes = 0,
+        .tool_arguments_bytes = 0,
+        .provider_state_bytes = 0,
+    };
+    try std.testing.expect(!try reducer.applyJson(
+        alloc,
+        "{\"type\":\"response.refusal.delta\",\"delta\":\"refused\"}",
+        callbacks,
+        &cancelled,
+        1024,
+        limits,
+    ));
+    try std.testing.expect(try reducer.applyJson(
+        alloc,
+        "{\"type\":\"response.completed\",\"response\":{\"id\":\"resp_refused\",\"status\":\"completed\"}}",
+        callbacks,
+        &cancelled,
+        1024,
+        limits,
+    ));
+    const completion = try reducer.finish(alloc, &cancelled, limits);
+    var result = stream_provider.Result{ .completed = .{
+        .completion = completion,
+        .ownership = .owned,
+    } };
+    defer result.deinit(alloc);
+    try std.testing.expectEqual(types.ProviderFinishReason.content_filter, completion.finish_reason.?);
+    try std.testing.expectEqualStrings("refused", completion.content.?);
+    try std.testing.expect(!completion.content_capture_overflowed);
+
+    const capture_limit: usize = 960 * 1024;
+    const split = capture_limit / 2;
+    const captured_bytes = try alloc.alloc(u8, capture_limit + 1);
+    defer alloc.free(captured_bytes);
+    @memset(captured_bytes, 'x');
+
+    var exact = Reducer.init(alloc);
+    defer exact.deinit(alloc);
+    try appendCaptured(
+        alloc,
+        &exact.content,
+        captured_bytes[0..split],
+        capture_limit,
+        &exact.content_capture_overflowed,
+    );
+    try appendCaptured(
+        alloc,
+        &exact.content,
+        captured_bytes[split..capture_limit],
+        capture_limit,
+        &exact.content_capture_overflowed,
+    );
+    exact.terminal_seen = true;
+    var exact_result = stream_provider.Result{ .completed = .{
+        .completion = try exact.finish(alloc, &cancelled, limits),
+        .ownership = .owned,
+    } };
+    defer exact_result.deinit(alloc);
+    try std.testing.expectEqual(
+        capture_limit,
+        exact_result.completed.completion.content.?.len,
+    );
+    try std.testing.expect(!exact_result.completed.completion.content_capture_overflowed);
+
+    var overflow = Reducer.init(alloc);
+    defer overflow.deinit(alloc);
+    try appendCaptured(
+        alloc,
+        &overflow.content,
+        captured_bytes[0..split],
+        capture_limit,
+        &overflow.content_capture_overflowed,
+    );
+    try appendCaptured(
+        alloc,
+        &overflow.content,
+        captured_bytes[split .. capture_limit + 1],
+        capture_limit,
+        &overflow.content_capture_overflowed,
+    );
+    overflow.terminal_seen = true;
+    var overflow_result = stream_provider.Result{ .completed = .{
+        .completion = try overflow.finish(alloc, &cancelled, limits),
+        .ownership = .owned,
+    } };
+    defer overflow_result.deinit(alloc);
+    try std.testing.expectEqual(
+        capture_limit,
+        overflow_result.completed.completion.content.?.len,
+    );
+    try std.testing.expect(overflow_result.completed.completion.content_capture_overflowed);
+}
+
+test "Responses reducer preserves a terminal provider outcome after late cancellation" {
+    const alloc = std.testing.allocator;
+    var reducer = Reducer.init(alloc);
+    defer reducer.deinit(alloc);
+    var cancelled = std.atomic.Value(bool).init(false);
+    var ignored: u8 = 0;
+    const callbacks = StreamCallbacks{
+        .context = &ignored,
+        .on_content = struct {
+            fn emit(_: *anyopaque, _: []const u8) void {}
+        }.emit,
+    };
+    const limits = StreamLimits{
+        .aggregate_bytes = 4096,
+        .events = 4,
+        .tool_calls = 0,
+        .tool_identity_bytes = 0,
+        .tool_arguments_bytes = 0,
+        .provider_state_bytes = 0,
+    };
+    try std.testing.expect(try reducer.applyJson(
+        alloc,
+        "{\"type\":\"response.completed\",\"response\":{\"id\":\"resp_terminal\",\"status\":\"completed\"}}",
+        callbacks,
+        &cancelled,
+        1024,
+        limits,
+    ));
+    cancelled.store(true, .seq_cst);
+    const completion = try reducer.finish(alloc, &cancelled, limits);
+    var result = stream_provider.Result{ .completed = .{
+        .completion = completion,
+        .ownership = .owned,
+    } };
+    defer result.deinit(alloc);
+    try std.testing.expectEqual(types.ProviderFinishReason.stop, completion.finish_reason.?);
+    try std.testing.expectEqualStrings("resp_terminal", completion.generation_id.?);
+}
+
+test "Responses reducer honors an already-read terminal event over cancellation" {
+    const alloc = std.testing.allocator;
+    var reducer = Reducer.init(alloc);
+    defer reducer.deinit(alloc);
+    var cancelled = std.atomic.Value(bool).init(true);
+    var ignored: u8 = 0;
+    const callbacks = StreamCallbacks{
+        .context = &ignored,
+        .on_content = struct {
+            fn emit(_: *anyopaque, _: []const u8) void {}
+        }.emit,
+    };
+    const limits = StreamLimits{
+        .aggregate_bytes = 4096,
+        .events = 4,
+        .tool_calls = 0,
+        .tool_identity_bytes = 0,
+        .tool_arguments_bytes = 0,
+        .provider_state_bytes = 0,
+    };
+    try std.testing.expect(try reducer.applyJson(
+        alloc,
+        "{\"type\":\"response.completed\",\"response\":{\"id\":\"resp_already_read\",\"status\":\"completed\"}}",
+        callbacks,
+        &cancelled,
+        1024,
+        limits,
+    ));
+    const completion = try reducer.finish(alloc, &cancelled, limits);
+    var result = stream_provider.Result{ .completed = .{
+        .completion = completion,
+        .ownership = .owned,
+    } };
+    defer result.deinit(alloc);
+    try std.testing.expectEqual(types.ProviderFinishReason.stop, completion.finish_reason.?);
+    try std.testing.expectEqualStrings("resp_already_read", completion.generation_id.?);
 }
 
 test "Responses protocol owns one subscription billing projection" {

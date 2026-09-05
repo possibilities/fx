@@ -43,6 +43,7 @@ pub const QueuedMessage = struct {
 
 /// Immutable authority captured once for one child turn.
 pub const AdmissionSnapshot = struct {
+    root_id: []u8,
     parent_id: []u8,
     source_id: []u8,
     model: []u8,
@@ -58,6 +59,7 @@ pub const AdmissionSnapshot = struct {
     mcp_view: ?mcp_access.View = null,
 
     pub fn deinit(self: *AdmissionSnapshot, alloc: Allocator) void {
+        alloc.free(self.root_id);
         alloc.free(self.parent_id);
         alloc.free(self.source_id);
         alloc.free(self.model);
@@ -72,6 +74,7 @@ pub const AdmissionSnapshot = struct {
 };
 
 pub const AdmissionInput = struct {
+    root_id: []const u8,
     parent_id: []const u8,
     source_id: []const u8,
     model: []const u8,
@@ -98,6 +101,7 @@ pub fn captureAdmission(
     alloc: Allocator,
     input: AdmissionInput,
 ) AdmissionError!AdmissionSnapshot {
+    validateId(input.root_id) catch return error.InvalidAdmissionItem;
     validateId(input.parent_id) catch return error.InvalidAdmissionItem;
     validateId(input.source_id) catch return error.InvalidAdmissionItem;
     validateBoundedText(input.model, max_model_bytes) catch return error.InvalidModel;
@@ -121,6 +125,8 @@ pub fn captureAdmission(
     session_permission_state.validate(input.permission_state) catch
         return error.InvalidAdmissionItem;
 
+    const root_id = try alloc.dupe(u8, input.root_id);
+    errdefer alloc.free(root_id);
     const parent_id = try alloc.dupe(u8, input.parent_id);
     errdefer alloc.free(parent_id);
     const source_id = try alloc.dupe(u8, input.source_id);
@@ -148,6 +154,7 @@ pub fn captureAdmission(
     errdefer if (mcp_view) |*view| view.deinit(alloc);
     const integration_names = try cloneStrings(alloc, input.integration_names);
     return .{
+        .root_id = root_id,
         .parent_id = parent_id,
         .source_id = source_id,
         .model = model,
@@ -234,6 +241,7 @@ fn freeStrings(alloc: Allocator, values: [][]u8) void {
 test "captured admission owns independent authority slices" {
     const alloc = std.testing.allocator;
     var snapshot = try captureAdmission(alloc, .{
+        .root_id = "01J00000000000000000000000",
         .parent_id = "01J00000000000000000000000",
         .source_id = "01J00000000000000000000000",
         .model = "test/model",

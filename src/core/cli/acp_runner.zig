@@ -10,7 +10,10 @@ const host = @import("../hosts/host.zig");
 const credentials = @import("../auth/credentials.zig");
 const mode_registry = @import("../modes/mode_registry.zig");
 const prompt_policy = @import("../config/prompt_policy.zig");
+const skill_contract = @import("../skills/skill_contract.zig");
+const tool_set_contract = @import("../tooling/tool_set.zig");
 const context_contract = @import("../workspace/context_contract.zig");
+const types = @import("../shared/types.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -38,6 +41,7 @@ pub const Config = struct {
     context_registry: context_contract.Registry,
     mode_registry: mode_registry.Registry,
     model_override: ?[]const u8 = null,
+    effort_override: ?types.ReasoningEffort = null,
     provider_override: ?model_provider.ProviderId = null,
     allowed_providers: std.EnumSet(model_provider.ProviderId) = .initFull(),
     credential_override: ?[]const u8 = null,
@@ -48,10 +52,15 @@ pub const Config = struct {
     context_limit_overrides: []const config_runtime.context_limits.Override = &.{},
     additional_directories: []const []const u8 = &.{},
     saved_directories_suppressed: bool = false,
+    /// Borrowed invocation policy; the server duplicates it during initialize.
+    permission_rules_override: ?types.PermissionRuleSet = null,
+    skill_root_policy: skill_contract.RootPolicy = .{ .managed_root_source = null },
     allow_acp_mcp: bool = true,
     /// The inherited Codex credential channel, when the launch selected one.
     codex_credential_fd: ?u8 = null,
     allow_native_tools: bool = true,
+    project_instructions_enabled: bool = true,
+    native_tool_set: ?tool_set_contract.ToolSet = null,
     minimal_kernel: bool = false,
 };
 

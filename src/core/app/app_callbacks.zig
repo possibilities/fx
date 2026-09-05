@@ -282,6 +282,7 @@ pub fn Bindings(comptime App: type) type {
                 .tool_registry = if (comptime @hasDecl(App, "toolRegistry")) app.toolRegistry() else .{},
                 .context_registry = if (comptime @hasDecl(App, "contextRegistry")) app.contextRegistry() else null,
                 .context_enabled = if (comptime @hasField(App, "context_enabled")) app.context_enabled else false,
+                .project_instructions_enabled = if (comptime @hasField(App, "project_instructions_enabled")) app.project_instructions_enabled else true,
                 .snapshot_root_permission_mode = if (comptime @hasField(App, "permission_engine"))
                     agentSnapshotRootPermissionMode
                 else
@@ -384,13 +385,27 @@ pub fn Bindings(comptime App: type) type {
             expected_account_id: ?[]const u8,
         ) !?[]u8 {
             const app: *App = @ptrCast(@alignCast(raw_ctx));
-            var refreshed = (try auth_runtime.refreshCredentialForAccount(
-                app.auth.oauthTransport(),
-                std.heap.c_allocator,
-                source,
-                mode,
-                expected_account_id,
-            )) orelse return null;
+            const isolated_home: ?[]const u8 = if (comptime @hasField(App, "profile_home"))
+                app.profile_home
+            else
+                null;
+            var refreshed = (if (isolated_home) |home_dir|
+                try auth_runtime.refreshCredentialForAccountFromHome(
+                    app.auth.oauthTransport(),
+                    std.heap.c_allocator,
+                    source,
+                    mode,
+                    expected_account_id,
+                    home_dir,
+                )
+            else
+                try auth_runtime.refreshCredentialForAccount(
+                    app.auth.oauthTransport(),
+                    std.heap.c_allocator,
+                    source,
+                    mode,
+                    expected_account_id,
+                )) orelse return null;
             var owns_refreshed = true;
             defer if (owns_refreshed) refreshed.deinit(std.heap.c_allocator);
             if (app.auth.preparedCredentialChange(refreshed) == .authority) {

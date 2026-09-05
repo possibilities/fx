@@ -1,6 +1,7 @@
 const std = @import("std");
 const build_options = @import("build_options");
 const app_permission_runtime = @import("../app/app_permission_runtime.zig");
+const app_profile_runtime = @import("../app/app_profile_runtime.zig");
 const app_session_runtime = @import("../app/app_session_runtime.zig");
 const auth_runtime = @import("../auth/auth_runtime.zig");
 const collections = @import("../shared/collections.zig");
@@ -138,7 +139,7 @@ fn loadDetailedSettingsForNotice(app: anytype) !config_runtime.DetailedSettings 
     if (comptime @hasDecl(@TypeOf(app.*), "loadDetailedSettingsForNotice")) {
         return app.loadDetailedSettingsForNotice();
     }
-    return config_runtime.loadMergedSettingsDetailed(app.alloc, app.workspace_root);
+    return app_profile_runtime.loadMergedSettingsDetailed(app);
 }
 
 fn postCommitResolutionError(
@@ -325,7 +326,7 @@ pub fn Commands(comptime App: type) type {
                 return;
             }
 
-            var settings = config_runtime.loadMergedSettings(app.alloc, app.workspace_root) catch |err| {
+            var settings = app_profile_runtime.loadMergedSettings(app) catch |err| {
                 try writeSettingsLoadError(app, err);
                 return;
             };
@@ -429,8 +430,8 @@ pub fn Commands(comptime App: type) type {
             const trimmed = std.mem.trim(u8, rest, " \t");
             if (std.ascii.eqlIgnoreCase(trimmed, "off")) {
                 app.prompt_history.disable();
-                var attempt = config_runtime.attemptUserPreferences(
-                    app.alloc,
+                var attempt = app_profile_runtime.attemptUserPreferences(
+                    app,
                     .{ .prompt_history_enabled = false },
                 );
                 defer attempt.deinit(app.alloc);
@@ -458,8 +459,8 @@ pub fn Commands(comptime App: type) type {
             }
 
             if (std.ascii.eqlIgnoreCase(trimmed, "on")) {
-                var attempt = config_runtime.attemptUserPreferences(
-                    app.alloc,
+                var attempt = app_profile_runtime.attemptUserPreferences(
+                    app,
                     .{ .prompt_history_enabled = true },
                 );
                 defer attempt.deinit(app.alloc);
@@ -516,8 +517,8 @@ pub fn Commands(comptime App: type) type {
             };
             defer target.deinit(app.alloc);
 
-            var outcome = config_runtime.addPermissionRule(
-                app.alloc,
+            var outcome = app_profile_runtime.addPermissionRule(
+                app,
                 permission_scope,
                 permissionWorkspaceRoot(app, permission_scope),
                 target.category,
@@ -558,8 +559,8 @@ pub fn Commands(comptime App: type) type {
             };
             defer target.deinit(app.alloc);
 
-            var outcome = config_runtime.removePermissionRule(
-                app.alloc,
+            var outcome = app_profile_runtime.removePermissionRule(
+                app,
                 permission_scope,
                 permissionWorkspaceRoot(app, permission_scope),
                 target.category,
@@ -604,8 +605,8 @@ pub fn Commands(comptime App: type) type {
                 return;
             };
 
-            var outcome = config_runtime.removeAllowlistRules(
-                app.alloc,
+            var outcome = app_profile_runtime.removeAllowlistRules(
+                app,
                 permission_scope,
                 permissionWorkspaceRoot(app, permission_scope),
                 reset_scope,
@@ -798,6 +799,9 @@ pub fn Commands(comptime App: type) type {
             app: *App,
             detailed: *config_runtime.DetailedSettings,
         ) void {
+            if (comptime @hasField(App, "launch_permission_policy_active")) {
+                if (app.launch_permission_policy_active) return;
+            }
             app.permission_state.authority_mutex.lockUncancelable(io_mod.getIo());
             defer app.permission_state.authority_mutex.unlock(io_mod.getIo());
             if (detailed.settings.has_permission_rules) {
@@ -923,7 +927,7 @@ pub fn Commands(comptime App: type) type {
         }
 
         fn writeSettingsStatus(app: *App) !void {
-            var detailed = config_runtime.loadMergedSettingsDetailed(app.alloc, app.workspace_root) catch |err| {
+            var detailed = app_profile_runtime.loadMergedSettingsDetailed(app) catch |err| {
                 try writeSettingsLoadError(app, err);
                 return;
             };
@@ -944,8 +948,8 @@ pub fn Commands(comptime App: type) type {
         }
 
         fn saveStartupScrollbackSetting(app: *App, enabled: bool) !void {
-            var attempt = config_runtime.attemptUserPreferences(
-                app.alloc,
+            var attempt = app_profile_runtime.attemptUserPreferences(
+                app,
                 .{ .startup_scrollback = enabled },
             );
             defer attempt.deinit(app.alloc);
@@ -1064,8 +1068,8 @@ pub fn Commands(comptime App: type) type {
                 break :blk app.persistRuntimePreferences(patch);
             } else blk: {
                 var committed = app_session_runtime.PreferenceCommitResult{};
-                const attempt = config_runtime.attemptUserPreferences(
-                    app.alloc,
+                const attempt = app_profile_runtime.attemptUserPreferences(
+                    app,
                     patch.userSettingsPatch(),
                 );
                 switch (attempt) {
@@ -1647,6 +1651,7 @@ const FakeApp = struct {
     selected_provider: model_provider.ProviderId = .gateway,
     auth: auth_runtime.Runtime = .{},
     permission_engine: permissions.PermissionEngine = .{},
+    launch_permission_policy_active: bool = false,
     permission_state: app_permission_runtime.State = .{},
     session: FakeSession = .{},
     worker: FakeWorker = .{},
@@ -2382,6 +2387,52 @@ test "session_commands handleAllowlist adds lists and removes workspace rules" {
     app.clearTranscript();
     try Commands(FakeApp).handleAllowlist(&app, "view");
     try expectTranscriptContains(&app, "● Allowlist: effective persistent allow rules: (none)");
+}
+
+test "allowlist mutations persist without replacing an active launch permission policy" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(io_mod.getIo(), "home");
+    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
+    const home_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
+    defer alloc.free(home_root);
+    const workspace_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
+    defer alloc.free(workspace_root);
+
+    const home = try SessionCommandTestHome.install(alloc, home_root);
+    defer home.deinit();
+    var app = try FakeApp.init(alloc, workspace_root, "anthropic/claude-opus-4.6");
+    defer app.deinit();
+    var launch_rules = [_]types.PermissionRule{.{
+        .permission = @constCast("bash"),
+        .pattern = @constCast("launch *"),
+        .action = .allow,
+    }};
+    app.permission_engine.replaceRules(
+        alloc,
+        try types.dupePermissionRuleSet(alloc, .{ .rules = &launch_rules }),
+    );
+    app.launch_permission_policy_active = true;
+
+    try Commands(FakeApp).handleAllowlist(&app, "user add command \"ambient *\"");
+    try std.testing.expectEqual(@as(usize, 1), app.permission_engine.rules.rules.len);
+    try expectRule(app.permission_engine.rules.rules[0], "bash", "launch *", .allow);
+
+    var saved = try config_runtime.loadMergedSettingsFromHome(
+        alloc,
+        home_root,
+        workspace_root,
+    );
+    defer saved.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), saved.permission_rules.rules.len);
+    try expectRule(saved.permission_rules.rules[0], "bash", "ambient *", .allow);
+
+    app.clearTranscript();
+    try Commands(FakeApp).handleAllowlist(&app, "view effective");
+    try expectTranscriptContains(&app, "launch *");
+    try std.testing.expect(std.mem.find(u8, app.text(), "ambient *") == null);
 }
 
 test "session_commands allowlist scopes expose and mutate hidden user rules independently" {
