@@ -29,7 +29,6 @@ const command_effect = @import("../shell_command/command_effect.zig");
 const pathing = @import("../workspace/pathing.zig");
 const execution_router = @import("../execution/router.zig");
 const skill_runtime = @import("../skills/skill_runtime.zig");
-const skill_contract = @import("../skills/skill_contract.zig");
 const subagent_authority = @import("../subagent/authority.zig");
 const subagent_domain = @import("../subagent/domain.zig");
 const subagent_model_contract = @import("../subagent/model_contract.zig");
