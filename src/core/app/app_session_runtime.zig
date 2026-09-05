@@ -2777,9 +2777,9 @@ pub fn Runtime(comptime App: type) type {
 
         fn renameActiveConversationLocked(app: *App, title: []const u8) !void {
             const loaded = &app.session_persistence.writable.?;
-            if (!try loaded.renameConversation(app.alloc, title)) {
-                return error.UnsupportedSessionFormat;
-            }
+            // The manifest rename errors on every failure and only ever
+            // reports true; the boolean carries no second outcome.
+            _ = try loaded.renameConversation(app.alloc, title);
         }
 
         fn publishSessionTitle(app: *App, title: []const u8) !void {
