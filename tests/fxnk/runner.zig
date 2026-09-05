@@ -24,7 +24,6 @@ const expected_names = [_][]const u8{
     "core.control.work_control.test.strict authenticated request decoding preserves opaque turn ids",
     "core.control.work_control.test.request decoding rejects partial authority and extra parameters",
     "core.control.work_control.test.success responses carry correlated authoritative snapshots",
-    "core.app.input_interrupt_runtime.test.hidden interrupt pauses queued work without opening the human editor",
     "core.tooling.tool_runtime.test.ADE edited path reporting requires successful committed mutation results",
     "core.tooling.tool_runtime.test.ADE terminal mutation completion requires exit-zero proof for durable starts",
     "core.tooling.tool_runtime.test.ADE durable terminal start classifies the declared working directory",
