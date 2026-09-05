@@ -49,6 +49,9 @@ async function runChild() {
     const isPrompt = (init.method ?? "GET") === "POST";
     if (!isPrompt) {
       nonPromptFetches += 1;
+      if ((init.method ?? "GET") !== "GET" || String(_url) !== "https://ai-gateway.vercel.sh/coding-agent/v1/models") {
+        throw new Error("unexpected non-prompt benchmark request");
+      }
       return fetch(gatewayUrl, init);
     }
     fetchAt ??= performance.now();

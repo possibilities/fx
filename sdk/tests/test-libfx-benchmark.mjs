@@ -38,7 +38,7 @@ for (const backend of ["native", "wasm"]) {
   assert.ok(sample.prompt_to_fetch_ms >= 0);
   assert.ok(sample.first_body_to_first_text_ms >= 0);
   assert.ok(sample.total_ms >= sample.spawn_to_first_stdout_ms);
-  assert.equal(sample.non_prompt_fetches, 0);
+  assert.equal(sample.non_prompt_fetches, 1, "cold samples must count the model catalog lookup");
   assert.ok(sample.request_bytes > 0);
   assert.equal(sample.system_context_bytes, benchmarkInstructionsBytes);
   assert.equal(sample.system_context_overhead_bytes, 0);
@@ -54,6 +54,7 @@ for (const backend of ["native", "wasm"]) {
   const runtimeReport = JSON.parse(runtimeResult.stdout);
   assert.equal(runtimeReport.backend, backend);
   assert.equal(runtimeReport.first_prompt.text, "hello");
+  assert.equal(runtimeReport.non_prompt_fetches, 7, "warm prompts must reuse metadata; each new stream agent resolves it once");
   assert.equal(runtimeReport.warm.prompt_to_first_text_ms.count, 2);
   assert.deepEqual(runtimeReport.streams.map(({ chunks, bytes, samples }) => ({ chunks, bytes, samples })), [
     { chunks: 1, bytes: 1, samples: 1 },
@@ -72,6 +73,7 @@ for (const backend of ["native", "wasm"]) {
   const capacityReport = JSON.parse(capacityResult.stdout);
   assert.equal(capacityReport.backend, backend);
   assert.equal(capacityReport.count, 2);
+  assert.equal(capacityReport.non_prompt_fetches, 3, "the warmup and two measured agents must each resolve metadata once");
   assert.deepEqual(capacityReport.failures, []);
   assert.deepEqual(capacityReport.snapshots.map(({ stage }) => stage), [
     "baseline", "created", "prompted", "closing", "closed", "server_closed",

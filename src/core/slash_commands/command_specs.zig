@@ -1,4 +1,6 @@
 const std = @import("std");
+
+pub const mcp_auth_usage = "mcp auth NAME";
 const display_width = @import("../shared/display_width.zig");
 const list_window = @import("../shared/list_window.zig");
 const mod_registry = @import("../mods/registry.zig");
