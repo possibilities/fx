@@ -929,7 +929,6 @@ pub fn argsAfterGlobalLaunchArgs(args: []const [:0]const u8) []const [:0]const u
             !std.mem.eql(u8, arg, "--no-project-instructions") and
             !std.mem.eql(u8, arg, "--no-default-skills") and
             !std.mem.startsWith(u8, arg, "--system-prompt-file=") and
-            !std.mem.startsWith(u8, arg, "--append-system-prompt-file=") and
             !std.mem.startsWith(u8, arg, "--shape=") and
             !std.mem.startsWith(u8, arg, "--identity=") and
             !std.mem.startsWith(u8, arg, "--history-dir=") and
