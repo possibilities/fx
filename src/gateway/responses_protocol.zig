@@ -925,7 +925,11 @@ pub const Reducer = struct {
             // provider outcome: cancellation after admission is best effort and
             // never abandons the terminal, its usage, or its generation id.
             self.terminal_seen = true;
-            self.finish_reason = if (self.saw_refusal)
+            // A refusal classifies the outcome as filtered only when the
+            // provider produced nothing else to act on; tool calls beside a
+            // refusal part keep upstream's tool-call disposition so the loop
+            // dispatches them instead of reporting a filter block.
+            self.finish_reason = if (self.saw_refusal and self.tools.items.len == 0)
                 .content_filter
             else
                 finishReason(
@@ -1589,6 +1593,19 @@ test "Responses finalization checks correlation types and rejects unmatched fina
         try stream.apply(ToolRecordTest.start);
         try std.testing.expectError(case.failure, stream.apply(case.event));
     }
+}
+
+test "Responses refusal beside a tool call keeps the tool-call disposition" {
+    var stream = ToolRecordTest.init(std.testing.allocator);
+    defer stream.deinit();
+    try stream.apply(ToolRecordTest.start);
+    try stream.apply("{\"type\":\"response.refusal.delta\",\"delta\":\"refused\"}");
+    try stream.apply(ToolRecordTest.finalized);
+    try stream.apply(ToolRecordTest.terminal);
+    const completion = try stream.finish();
+    defer stream.freeCompletion(completion);
+    try std.testing.expectEqual(types.ProviderFinishReason.tool_calls, completion.finish_reason.?);
+    try std.testing.expectEqual(@as(usize, 1), completion.tool_calls.len);
 }
 
 test "Responses finalization requires a terminal and honors one read under cancellation" {
