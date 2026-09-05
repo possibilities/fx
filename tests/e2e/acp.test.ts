@@ -696,6 +696,10 @@ class AcpClient {
         "session/cancel",
         "session/set_mode",
         "session/set_config_option",
+        "_fx/session/steer",
+        "_fx/session/snapshot",
+        "_fx/session/question",
+        "session/close",
       ].includes(outgoing.method) &&
       outgoing.params?.sessionId === undefined
     ) {
@@ -8825,6 +8829,605 @@ describe("acp: model-independent", () => {
         client.endStdin();
         expect(await client.waitForExit()).toBe(0);
         expect(existsSync(target)).toBe(false);
+        expect(client.stderr).toBe("");
+      } finally {
+        await client?.close();
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+});
+
+// The voice-control acceptance suite. It follows the consumer contract's
+// eight steps in order: extension advertisement and identity, mid-turn
+// steering, an idle steer that starts a turn, cancellation, a parent
+// permission, a child approval answered through the parent, a question, and a
+// strictly increasing sequence across all of them.
+describe("acp: voice control", () => {
+  let client: AcpClient;
+
+  afterEach(async () => {
+    if (client) await client.close();
+  });
+
+  function lifecycleRecords(messages: any[]): any[] {
+    return messages
+      .filter(
+        (message: any) =>
+          message.method === "session/update" &&
+          message.params?.update?.sessionUpdate === "_fx/lifecycle",
+      )
+      .map((message: any) => message.params.update);
+  }
+
+  function expectIncreasingSequence(messages: any[]): void {
+    const records = lifecycleRecords(messages);
+    expect(records.length).toBeGreaterThan(0);
+    for (let index = 1; index < records.length; index += 1) {
+      expect(records[index].sequence).toBeGreaterThan(records[index - 1].sequence);
+    }
+  }
+
+  function expectNoBusyAnswer(messages: any[]): void {
+    expect(JSON.stringify(messages)).not.toContain("Session is busy");
+    expect(JSON.stringify(messages)).not.toContain("Prompt already in progress");
+  }
+
+  async function collectUntil(
+    collected: any[],
+    predicate: (message: any) => boolean,
+    label: string,
+    timeoutMs = TIMEOUT,
+  ): Promise<any> {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      let message: any;
+      try {
+        message = await client.readLine(
+          Math.max(100, Math.min(2_000, deadline - Date.now())),
+        );
+      } catch (err) {
+        if (err instanceof AcpReadTimeoutError) continue;
+        throw err;
+      }
+      collected.push(message);
+      if (predicate(message)) return message;
+    }
+    throw new Error(
+      `timed out waiting for ${label}; collected=${JSON.stringify(collected).slice(0, 6000)}`,
+    );
+  }
+
+  async function voiceRequest(
+    collected: any[],
+    method: string,
+    params: object,
+    id: number,
+  ): Promise<any> {
+    client.send({ jsonrpc: "2.0", id, method, params });
+    return await collectUntil(collected, (message: any) => message.id === id, method);
+  }
+
+  function recordsOfEvent(collected: any[], event: string): any[] {
+    return lifecycleRecords(collected).filter((record: any) => record.event === event);
+  }
+
+  test(
+    "voice control advertises the extension and identity in initialize",
+    async () => {
+      const root = createIsolatedRoot("fx-acp-voice-initialize-");
+      const gateway = startFakeGateway([]);
+      try {
+        client = await AcpClient.create({
+          cwd: root.workspace,
+          env: fakeGatewayEnv(root, gateway),
+        });
+        const initialized = await client.request(
+          "initialize",
+          { protocolVersion: 1 },
+          1,
+        ) as any;
+        expect(initialized.error).toBeUndefined();
+        expect(initialized.result.agentCapabilities._fx).toEqual({
+          steer: true,
+          snapshot: true,
+          lifecycle: 1,
+          question: true,
+        });
+        const identity = initialized.result._fx;
+        expect(typeof identity.build_revision).toBe("string");
+        expect(typeof identity.auth).toBe("string");
+        expect(typeof identity.model_source).toBe("string");
+        expect(Array.isArray(identity.connected_providers)).toBe(true);
+        expect(["ask", "auto", "yolo"]).toContain(identity.permission_mode);
+        expect(identity.model).toBe(FAKE_GATEWAY_MODEL);
+        expect(typeof identity.effort).toBe("string");
+
+        const collected: any[] = [];
+        const created = await voiceRequest(collected, "session/new", { mcpServers: [] }, 2);
+        expect(created.error).toBeUndefined();
+        const sessionId = created.result.sessionId as string;
+
+        const status = await voiceRequest(collected, "_fx/status", {}, 3) as any;
+        expect(status.result.model).toBe(FAKE_GATEWAY_MODEL);
+        expect(status.result.build_revision).toBe(identity.build_revision);
+
+        // A session that never did anything opens no feed, so a client that
+        // is not watching for one sees no extra traffic.
+        expect(lifecycleRecords(collected)).toHaveLength(0);
+        const closed = await voiceRequest(collected, "session/close", { sessionId }, 4);
+        expect(closed.error).toBeUndefined();
+        expect(lifecycleRecords(collected)).toHaveLength(0);
+        expect(client.stderr).toBe("");
+      } finally {
+        await client?.close();
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "voice control steers the active turn and reports it in the snapshot",
+    async () => {
+      const root = createIsolatedRoot("fx-acp-voice-steer-");
+      const childTask = "Hold the child until the parent has been steered.";
+      const heldChild = deferred<Response>();
+      let steeredRequestBody: string | null = null;
+      const gateway = startDynamicFakeGateway((body: string) => {
+        const text = acpPromptText(body);
+        if (text.includes(childTask)) return heldChild.promise as any;
+        if (text.includes("VOICE_STEER_B")) {
+          steeredRequestBody = body;
+          return finalText("VOICE_STEER_DONE");
+        }
+        if (body.includes('"toolCallId":"voice_steer_child"')) {
+          return finalText("VOICE_STEER_UNSTEERED");
+        }
+        return fakeGatewayToolCall("voice_steer_child", "subagent", {
+          request: { action: "run", task: childTask },
+        });
+      });
+      try {
+        client = await AcpClient.create({
+          cwd: root.workspace,
+          env: fakeGatewayEnv(root, gateway),
+        });
+        await startCodeSession(client);
+        const collected: any[] = [];
+        const promptId = 7301;
+        sendPrompt(client, promptId, "Start the steerable ACP turn.");
+        const startedRecord = await collectUntil(
+          collected,
+          (message: any) =>
+            message.params?.update?.sessionUpdate === "_fx/lifecycle" &&
+            message.params.update.event === "turn_started" &&
+            message.params.update.agent_role === "main",
+          "the main turn_started",
+        );
+        const turnId = startedRecord.params.update.turn_id as string;
+        expect(typeof turnId).toBe("string");
+        expect(startedRecord.params.update.agent_state).toBe("working");
+        await waitForCondition(
+          "the held child request",
+          () => gateway.requests.length === 2,
+          TIMEOUT,
+        );
+
+        const steered = await voiceRequest(
+          collected,
+          "_fx/session/steer",
+          { text: "VOICE_STEER_B" },
+          7302,
+        );
+        expect(steered.error).toBeUndefined();
+        expect(steered.result.disposition).toBe("steering");
+        expect(steered.result.turnId).toBe(turnId);
+        expect(steered.result.snapshot.active_turn_id).toBe(turnId);
+        expect(steered.result.snapshot.queue).toEqual([
+          {
+            turn_id: expect.any(String),
+            kind: "steering",
+            text: "VOICE_STEER_B",
+            has_images: false,
+            has_skill_bindings: false,
+            has_review_draft: false,
+          },
+        ]);
+
+        const snapshot = await voiceRequest(collected, "_fx/session/snapshot", {}, 7303);
+        expect(snapshot.error).toBeUndefined();
+        expect(snapshot.result.active_turn_id).toBe(turnId);
+        expect(snapshot.result.queue.map((entry: any) => entry.kind)).toEqual(["steering"]);
+        expect(Array.isArray(snapshot.result.children)).toBe(true);
+        expect(snapshot.result.children.map((child: any) => child.phase)).toEqual(["running"]);
+
+        heldChild.resolve(finalText("child complete"));
+        const promptResult = await collectUntil(
+          collected,
+          (message: any) => message.id === promptId,
+          "the prompt response",
+        );
+        expect(promptResult.error).toBeUndefined();
+        expect(promptResult.result.stopReason).toBe("end_turn");
+
+        const ended = recordsOfEvent(collected, "turn_ended").filter(
+          (record: any) => record.agent_role === "main",
+        );
+        expect(ended).toHaveLength(1);
+        expect(ended[0].turn_id).toBe(turnId);
+        expect(ended[0].outcome).toBe("completed");
+        const steeredChunk = collected.find(
+          (message: any) =>
+            message.params?.update?.sessionUpdate === "agent_message_chunk" &&
+            message.params.update.content?.text?.includes("VOICE_STEER_DONE"),
+        );
+        expect(steeredChunk.params.update.turn_id).toBe(turnId);
+        expect(steeredRequestBody).not.toBeNull();
+        expect(steeredRequestBody!).toContain("VOICE_STEER_B");
+        expectIncreasingSequence(collected);
+        expectNoBusyAnswer(collected);
+        expect(client.stderr).toBe("");
+      } finally {
+        heldChild.resolve(finalText("held child cleanup"));
+        await client?.close();
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "voice control queues an idle steer and starts a turn for it",
+    async () => {
+      const root = createIsolatedRoot("fx-acp-voice-idle-steer-");
+      const gateway = startFakeGateway([finalText("VOICE_IDLE_STEER_DONE")]);
+      try {
+        client = await AcpClient.create({
+          cwd: root.workspace,
+          env: fakeGatewayEnv(root, gateway),
+        });
+        await startCodeSession(client);
+        const collected: any[] = [];
+        const steered = await voiceRequest(
+          collected,
+          "_fx/session/steer",
+          { text: "VOICE_IDLE_STEER_C" },
+          7401,
+        );
+        expect(steered.error).toBeUndefined();
+        expect(steered.result.disposition).toBe("queued");
+        const turnId = steered.result.turnId as string;
+        expect(typeof turnId).toBe("string");
+
+        const startedRecord = await collectUntil(
+          collected,
+          (message: any) =>
+            message.params?.update?.sessionUpdate === "_fx/lifecycle" &&
+            message.params.update.event === "turn_started" &&
+            message.params.update.turn_id === turnId,
+          "the queued turn_started",
+        );
+        expect(startedRecord.params.update.agent_state).toBe("working");
+        const endedRecord = await collectUntil(
+          collected,
+          (message: any) =>
+            message.params?.update?.sessionUpdate === "_fx/lifecycle" &&
+            message.params.update.event === "turn_ended" &&
+            message.params.update.turn_id === turnId,
+          "the queued turn_ended",
+        );
+        expect(endedRecord.params.update.outcome).toBe("completed");
+        const opened = lifecycleRecords(collected)[0];
+        expect(opened.event).toBe("fx_started");
+        expect(opened.sequence).toBe(1);
+        expect(opened.agent_role).toBe("main");
+        expect(opened.agent_state).toBe("idle");
+        expect(opened.attention_kind).toBeNull();
+        const chunk = collected.find(
+          (message: any) => message.params?.update?.sessionUpdate === "agent_message_chunk",
+        );
+        expect(chunk.params.update.turn_id).toBe(turnId);
+        expect(chunk.params.update.content.text).toContain("VOICE_IDLE_STEER_DONE");
+
+        const closed = await voiceRequest(collected, "session/close", {}, 7402);
+        expect(closed.error).toBeUndefined();
+        const stopped = await collectUntil(
+          collected,
+          (message: any) =>
+            message.params?.update?.sessionUpdate === "_fx/lifecycle" &&
+            message.params.update.event === "stop",
+          "the terminal stop record",
+        );
+        expect(stopped.params.update.agent_state).toBe("idle");
+        expect(gateway.requests).toHaveLength(1);
+        expect(acpPromptText(gateway.requests[0]!.body)).toContain("VOICE_IDLE_STEER_C");
+        expectIncreasingSequence(collected);
+        expectNoBusyAnswer(collected);
+        expect(client.stderr).toBe("");
+      } finally {
+        await client?.close();
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "voice control reports an interrupted turn and starts a fresh one after cancel",
+    async () => {
+      const root = createIsolatedRoot("fx-acp-voice-cancel-");
+      const held = heldFakeGatewayFinalText();
+      const gateway = startFakeGateway([
+        () => held.response,
+        finalText("VOICE_CANCEL_FOLLOWUP"),
+      ]);
+      try {
+        client = await AcpClient.create({
+          cwd: root.workspace,
+          env: fakeGatewayEnv(root, gateway),
+        });
+        await startCodeSession(client);
+        const collected: any[] = [];
+        const promptId = 7501;
+        sendPrompt(client, promptId, "Hold this turn until cancelled.");
+        const firstStarted = await collectUntil(
+          collected,
+          (message: any) =>
+            message.params?.update?.sessionUpdate === "_fx/lifecycle" &&
+            message.params.update.event === "turn_started",
+          "the first turn_started",
+        );
+        const firstTurnId = firstStarted.params.update.turn_id as string;
+        await waitForCondition(
+          "the held gateway request",
+          () => gateway.requests.length === 1,
+          TIMEOUT,
+        );
+
+        client.send({ jsonrpc: "2.0", id: 7502, method: "session/cancel", params: {} });
+        const interrupted = await collectUntil(
+          collected,
+          (message: any) =>
+            message.params?.update?.sessionUpdate === "_fx/lifecycle" &&
+            message.params.update.event === "turn_ended" &&
+            message.params.update.turn_id === firstTurnId,
+          "the interrupted turn_ended",
+        );
+        expect(interrupted.params.update.outcome).toBe("interrupted");
+        const cancelled = await collectUntil(
+          collected,
+          (message: any) => message.id === promptId,
+          "the cancelled prompt response",
+        );
+        expect(cancelled.result.stopReason).toBe("cancelled");
+        held.dispose();
+
+        const secondId = 7503;
+        sendPrompt(client, secondId, "Run a fresh turn after the cancellation.");
+        const secondStarted = await collectUntil(
+          collected,
+          (message: any) =>
+            message.params?.update?.sessionUpdate === "_fx/lifecycle" &&
+            message.params.update.event === "turn_started" &&
+            message.params.update.turn_id !== firstTurnId,
+          "the second turn_started",
+        );
+        expect(secondStarted.params.update.turn_id).not.toBe(firstTurnId);
+        const finished = await collectUntil(
+          collected,
+          (message: any) => message.id === secondId,
+          "the second prompt response",
+        );
+        expect(finished.result.stopReason).toBe("end_turn");
+        expectIncreasingSequence(collected);
+        expect(client.stderr).toBe("");
+      } finally {
+        held.dispose();
+        await client?.close();
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "voice control raises and clears attention around a parent permission",
+    async () => {
+      const root = createIsolatedRoot("fx-acp-voice-permission-");
+      const marker = join(root.workspace, "voice-approved.txt");
+      writeFileSync(
+        join(root.home, ".fx", "settings.json"),
+        JSON.stringify({ permission: { bash: { "printf *": "ask" } } }),
+      );
+      const gateway = startFakeGateway([
+        fakeShellRun("voice_permission_1", `printf approved > '${marker}'`, {
+          timeout_ms: 600_000,
+        }),
+        finalText("VOICE_PERMISSION_DONE"),
+      ]);
+      try {
+        client = await AcpClient.create({
+          cwd: root.workspace,
+          env: fakeGatewayEnv(root, gateway),
+        });
+        await startCodeSession(client);
+        client.setPermissionOption("allow_once");
+        const result = await runPrompt(client, "Run the approved command.", TIMEOUT);
+        expect(result.promptResult.result.stopReason).toBe("end_turn");
+        const permission = result.messages.find(
+          (message: any) => message.method === "session/request_permission",
+        );
+        expect(permission.params.toolCall.toolCallId).toBe("voice_permission_1");
+        expect(readFileSync(marker, "utf8")).toBe("approved");
+
+        const raised = recordsOfEvent(result.messages, "attention_raised");
+        expect(raised.length).toBeGreaterThan(0);
+        expect(raised[0].agent_role).toBe("main");
+        expect(raised[0].agent_state).toBe("blocked");
+        expect(raised[0].attention_kind).toBe("permission");
+        const cleared = recordsOfEvent(result.messages, "attention_cleared");
+        expect(cleared.length).toBeGreaterThan(0);
+        expect(cleared[0].attention_kind).toBeNull();
+        expect(cleared[0].agent_state).toBe("working");
+        expectIncreasingSequence(result.messages);
+        expect(client.stderr).toBe("");
+      } finally {
+        await client?.close();
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "voice control blocks the parent while a child awaits approval",
+    async () => {
+      const root = createIsolatedRoot("fx-acp-voice-child-approval-");
+      const childTask = "Touch the child marker file.";
+      const marker = join(root.workspace, "voice-child-approved.txt");
+      writeFileSync(
+        join(root.home, ".fx", "settings.json"),
+        JSON.stringify({ permission: { bash: { "printf *": "ask" } } }),
+      );
+      const gateway = startDynamicFakeGateway((body: string) => {
+        const text = acpPromptText(body);
+        if (body.includes('"toolCallId":"voice_child_create"')) {
+          return finalText("VOICE_CHILD_PARENT_DONE");
+        }
+        if (body.includes('"toolCallId":"voice_child_command"')) {
+          return finalText("child command complete");
+        }
+        if (text.includes(childTask)) {
+          return fakeShellRun("voice_child_command", `printf child > '${marker}'`, {
+            timeout_ms: 600_000,
+          });
+        }
+        return fakeGatewayToolCall("voice_child_create", "subagent", {
+          request: { action: "run", task: childTask },
+        });
+      }, { classifierDecision: "caution" });
+      try {
+        client = await AcpClient.create({
+          cwd: root.workspace,
+          env: fakeGatewayEnv(root, gateway),
+        });
+        await startCodeSession(client);
+        client.setPermissionOption("allow_once");
+        const result = await runPrompt(client, "Delegate the child command.", TIMEOUT);
+        expect(result.promptResult.result.stopReason).toBe("end_turn");
+
+        const childChanged = recordsOfEvent(result.messages, "child_changed");
+        expect(childChanged.map((record: any) => record.child.phase)).toContain(
+          "awaiting_approval",
+        );
+        const blocked = childChanged.find(
+          (record: any) => record.child.phase === "awaiting_approval",
+        );
+        expect(blocked.agent_role).toBe("subagent");
+        expect(typeof blocked.child.name).toBe("string");
+        expect(blocked.child.kind).toBe("one_off");
+
+        const parentBlocked = recordsOfEvent(result.messages, "attention_raised").filter(
+          (record: any) => record.agent_role === "main" && record.attention_kind === "permission",
+        );
+        expect(parentBlocked.length).toBeGreaterThan(0);
+        expect(parentBlocked[0].agent_state).toBe("blocked");
+        expect(typeof parentBlocked[0].agent_name).toBe("string");
+
+        const childPermission = result.messages.find(
+          (message: any) =>
+            message.method === "session/request_permission" &&
+            message.params?._fx?.agent_role === "subagent",
+        );
+        expect(childPermission).toBeDefined();
+        expect(typeof childPermission.params._fx.agent_name).toBe("string");
+
+        const clearedRoles = recordsOfEvent(result.messages, "attention_cleared").map(
+          (record: any) => record.agent_role,
+        );
+        expect(clearedRoles).toContain("main");
+        expect(clearedRoles).toContain("subagent");
+        expect(readFileSync(marker, "utf8")).toBe("child");
+        expectIncreasingSequence(result.messages);
+        expect(client.stderr).toBe("");
+      } finally {
+        await client?.close();
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "voice control relays a question and resumes the turn on the answer",
+    async () => {
+      const root = createIsolatedRoot("fx-acp-voice-question-");
+      const gateway = startDynamicFakeGateway((body: string) => {
+        if (body.includes('"toolCallId":"voice_question_1"')) {
+          expect(body).toContain("Child");
+          return finalText("VOICE_QUESTION_DONE");
+        }
+        return fakeGatewayToolCall("voice_question_1", "ask_user_question", {
+          questions: [{
+            header: "Voice control",
+            question: "Which path should continue?",
+            options: [
+              { label: "Main", description: "Continue the main path." },
+              { label: "Child", description: "Continue the child path." },
+            ],
+          }],
+        });
+      });
+      try {
+        client = await AcpClient.create({
+          cwd: root.workspace,
+          env: fakeGatewayEnv(root, gateway),
+        });
+        await startCodeSession(client);
+        const collected: any[] = [];
+        const promptId = 7601;
+        sendPrompt(client, promptId, "Ask the voice control question.");
+        const raised = await collectUntil(
+          collected,
+          (message: any) =>
+            message.params?.update?.sessionUpdate === "_fx/lifecycle" &&
+            message.params.update.event === "question_raised",
+          "the question_raised record",
+        );
+        const question = raised.params.update;
+        expect(question.text).toBe("Which path should continue?");
+        expect(question.options).toEqual(["Main", "Child"]);
+        expect(question.agent_state).toBe("blocked");
+        expect(question.attention_kind).toBe("question");
+        expect(typeof question.question_id).toBe("string");
+
+        const answered = await voiceRequest(
+          collected,
+          "_fx/session/question",
+          { questionId: question.question_id, answer: "Child" },
+          7602,
+        );
+        expect(answered.error).toBeUndefined();
+        expect(answered.result).toBeNull();
+
+        const finished = await collectUntil(
+          collected,
+          (message: any) => message.id === promptId,
+          "the prompt response",
+        );
+        expect(finished.result.stopReason).toBe("end_turn");
+        const cleared = recordsOfEvent(collected, "attention_cleared");
+        expect(cleared.length).toBeGreaterThan(0);
+        expectIncreasingSequence(collected);
         expect(client.stderr).toBe("");
       } finally {
         await client?.close();

@@ -365,16 +365,16 @@ fn writeTerminalSafe(writer: *std.Io.Writer, alloc: Allocator, raw: []const u8) 
     try writer.writeAll(encoded.bytes);
 }
 
-fn gatewayProviderConnected(auth: auth_runtime.StatusSnapshot) bool {
+pub fn gatewayProviderConnected(auth: auth_runtime.StatusSnapshot) bool {
     const source = auth.active_source orelse return auth.gateway_connected;
     return auth.gateway_connected or (source != .chatgpt_subscription and source != .grok_subscription);
 }
 
-fn chatGptProviderConnected(auth: auth_runtime.StatusSnapshot) bool {
+pub fn chatGptProviderConnected(auth: auth_runtime.StatusSnapshot) bool {
     return auth.chatgpt_connected or auth.active_source == .chatgpt_subscription;
 }
 
-fn grokProviderConnected(auth: auth_runtime.StatusSnapshot) bool {
+pub fn grokProviderConnected(auth: auth_runtime.StatusSnapshot) bool {
     return auth.grok_connected or auth.active_source == .grok_subscription;
 }
 
