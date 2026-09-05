@@ -1702,6 +1702,51 @@ describe("lean auto mode reliability", () => {
   );
 
   test(
+    "a valid decision survives an oversized reviewer rationale",
+    async () => {
+      const root = createIsolatedRoot();
+      const marker = join(root.root, "package-command.log");
+      const bin = installRecorder(root, "pnpm", marker);
+      const command = "pnpm dlx react-doctor@0.9.13";
+      const gateway = startGateway(
+        [
+          cleanCommandCall(command, "run_react_doctor"),
+          (body) => {
+            expect(toolResultText(body, "run_react_doctor")).toContain('"exit_code":0');
+            expect(body).not.toContain("review_unavailable");
+            return fakeGatewayFinalText("Reviewer metadata handled normally.");
+          },
+        ],
+        [
+          fakeGatewayToolCall("long_rationale_clear", "permission_decision", {
+            decision: "clear",
+            rationale: "x".repeat(512),
+          }),
+        ],
+      );
+
+      const result = await runFx(
+        ["ask", "--quiet", "--json", "--no-save", "Run React Doctor."],
+        {
+          cwd: root.workspace,
+          env: {
+            ...gatewayEnv(root, gateway),
+            PATH: `${bin}:${process.env.PATH ?? "/usr/bin:/bin"}`,
+          },
+          timeoutMs: TIMEOUT,
+        },
+      );
+
+      expect(result.code, `stdout: ${result.stdout}\nstderr: ${result.stderr}`).toBe(0);
+      expect(gateway.classifierRequests).toHaveLength(1);
+      expect(gateway.requests).toHaveLength(2);
+      expect(readFileSync(marker, "utf8")).toBe("pnpm:dlx react-doctor@0.9.13\n");
+      expect(JSON.parse(result.stdout).output).toContain("Reviewer metadata handled normally.");
+    },
+    TIMEOUT,
+  );
+
+  test(
     "standalone quiet stays silent after repeated advisory cautions",
     async () => {
       const root = createIsolatedRoot();
