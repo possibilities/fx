@@ -6706,8 +6706,11 @@ describe("acp: model-independent", () => {
       writeAcpSession(stateB, root.workspace, "state-b-session", 20);
       writeAcpSession(root.home, root.workspace, "ambient-session", 10);
 
+      // Upstream removed the memory tool. Selected-profile data isolation is
+      // proved by the skill, instruction, and system prompt assertions on the
+      // first request; what remains for a tool call is the operator HOME a
+      // child still sees.
       const gateway = startFakeGateway([
-        fakeGatewayToolCall("state_memory", "memory", { action: "list" }),
         fakeGatewayToolCall("state_home", "shell", {
           request: {
             action: "run",
@@ -6775,7 +6778,7 @@ describe("acp: model-independent", () => {
           TIMEOUT,
         );
         expect(result.promptResult.result.stopReason).toBe("end_turn");
-        expect(gateway.requests).toHaveLength(3);
+        expect(gateway.requests).toHaveLength(2);
         expect(gateway.requests[0]!.body).toContain("SELECTED_PROFILE_SKILL_BODY");
         expect(gateway.requests[0]!.body).toContain("isolated-state-skill");
         expect(gateway.requests[0]!.body).toContain("SELECTED_PROFILE_INSTRUCTIONS");
@@ -6791,11 +6794,7 @@ describe("acp: model-independent", () => {
         expect(gateway.requests[0]!.body).not.toContain(
           "AMBIENT_STATE_SYSTEM_REPLACEMENT",
         );
-        expect(acpToolResultText(gateway.requests[1]!.body, "state_memory"))
-          .toContain("selected state memory");
-        expect(acpToolResultText(gateway.requests[1]!.body, "state_memory"))
-          .not.toContain("ambient memory must not load");
-        expect(acpToolResultText(gateway.requests[2]!.body, "state_home"))
+        expect(acpToolResultText(gateway.requests[1]!.body, "state_home"))
           .toContain(root.home);
 
         await waitForPath(mcpEnvironmentPath);
