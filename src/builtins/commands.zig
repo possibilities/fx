@@ -138,7 +138,7 @@ pub const top_level_specs = [_]TopLevelSpec{
             "Commands:",
             "  fx mcp add NAME COMMAND [ARGS...]",
             "  fx mcp add --transport http NAME URL",
-            "  fx mcp auth NAME",
+            "  fx " ++ command_specs.mcp_auth_usage,
             "  fx mcp list [--connect]",
             "  fx mcp logout NAME",
             "  fx mcp path",
@@ -336,10 +336,6 @@ pub const top_level_flags = [_]TopLevelFlag{
     .{
         .usage = "--no-additional-dirs",
         .description = "Ignore saved additional directories",
-    },
-    .{
-        .usage = "--skills-dir <path>",
-        .description = "Add a skill root; repeatable",
     },
     .{
         .usage = "--no-default-skills",
