@@ -899,7 +899,7 @@ pub const Reducer = struct {
                 self.provider_state_count += 1;
             } else if (std.mem.eql(u8, item_type, "message")) {
                 self.assistant_phase.observe(assistantMessagePhase(item.object));
-                try self.finalize_text_message(alloc, output_index, item.object, callbacks, cancel_flag, content_capture_limit, limits);
+                try self.finalize_text_message(alloc, output_index, item.object, callbacks, content_capture_limit, limits);
             }
         } else if (std.mem.eql(u8, event_type, "response.completed") or
             std.mem.eql(u8, event_type, "response.done") or
@@ -910,7 +910,6 @@ pub const Reducer = struct {
             if (response_value.object.get("output")) |output| {
                 if (output != .array) return error.InvalidEvent;
                 for (output.array.items, 0..) |item, output_index| {
-                    if (cancel_flag.load(.seq_cst)) return error.Cancelled;
                     if (item != .object) continue;
                     const item_type = stringField(item.object, "type") orelse continue;
                     const index = std.math.cast(i64, output_index) orelse return error.ResourceLimitExceeded;
@@ -918,11 +917,13 @@ pub const Reducer = struct {
                         try self.reconcileToolItem(alloc, index, item.object, callbacks, limits);
                     } else if (std.mem.eql(u8, item_type, "message")) {
                         self.assistant_phase.observe(assistantMessagePhase(item.object));
-                        try self.finalize_text_message(alloc, index, item.object, callbacks, cancel_flag, content_capture_limit, limits);
+                        try self.finalize_text_message(alloc, index, item.object, callbacks, content_capture_limit, limits);
                     }
                 }
             }
-            if (cancel_flag.load(.seq_cst)) return error.Cancelled;
+            // A terminal event that has already been read is the authoritative
+            // provider outcome: cancellation after admission is best effort and
+            // never abandons the terminal, its usage, or its generation id.
             self.terminal_seen = true;
             self.finish_reason = if (self.saw_refusal)
                 .content_filter
@@ -1019,7 +1020,6 @@ pub const Reducer = struct {
         output_index: i64,
         fields: std.json.ObjectMap,
         callbacks: StreamCallbacks,
-        cancel_flag: *std.atomic.Value(bool),
         capture_limit: ?usize,
         limits: StreamLimits,
     ) !void {
@@ -1027,7 +1027,6 @@ pub const Reducer = struct {
         if (parts != .array) return error.InvalidEvent;
         const identity = try text_identity(fields, "id");
         for (parts.array.items, 0..) |part, content_index| {
-            if (cancel_flag.load(.seq_cst)) return error.Cancelled;
             if (part != .object) return error.InvalidEvent;
             try self.finalize_text_part(alloc, .{
                 .output_index = output_index,
@@ -1319,13 +1318,20 @@ test "Responses text finalization preserves append order and bounded sparse inde
     try bounded.expect_emitted("ab");
 }
 
-test "Responses text finalization stops on cancellation within a terminal snapshot" {
+test "Responses text finalization completes a terminal snapshot despite cancellation" {
     var stream = TextRecordTest.init(std.testing.allocator);
     defer stream.deinit();
     stream.cancel_on_content = true;
-    try std.testing.expectError(error.Cancelled, stream.apply("{\"type\":\"response.completed\",\"response\":{\"output\":[{\"type\":\"message\",\"content\":[{\"type\":\"output_text\",\"text\":\"first\"},{\"type\":\"output_text\",\"text\":\"never\"}]}]}}"));
-    try stream.expect_emitted("first");
-    try std.testing.expectError(error.Cancelled, stream.reducer.finish(stream.alloc, &stream.cancelled, stream.limits));
+    try stream.apply("{\"type\":\"response.completed\",\"response\":{\"id\":\"resp_snapshot\",\"status\":\"completed\",\"output\":[{\"type\":\"message\",\"content\":[{\"type\":\"output_text\",\"text\":\"first\"},{\"type\":\"output_text\",\"text\":\"second\"}]}]}}");
+    try stream.expect_emitted("firstsecond");
+    var result = stream_provider.Result{ .completed = .{
+        .completion = try stream.reducer.finish(stream.alloc, &stream.cancelled, stream.limits),
+        .ownership = .owned,
+    } };
+    defer result.deinit(stream.alloc);
+    try std.testing.expectEqualStrings("firstsecond", result.completed.completion.content orelse "");
+    try std.testing.expectEqualStrings("resp_snapshot", result.completed.completion.generation_id.?);
+    try std.testing.expectEqual(types.ProviderFinishReason.stop, result.completed.completion.finish_reason.?);
 }
 
 test "Responses text finalization does not retain uncaptured text" {
