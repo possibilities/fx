@@ -158,11 +158,7 @@ pub fn callUsesCommandAuthority(
 /// terminal mode, and profile come from the same object that selected the
 /// authority; a wrapper must never turn an admitted command into a stall.
 fn commandArguments(args: std.json.ObjectMap) std.json.ObjectMap {
-    const request = args.get("request") orelse return args;
-    return switch (request) {
-        .object => |object| object,
-        else => args,
-    };
+    return tool_args.commandArguments(args);
 }
 
 fn isRunCommandCall(input: Input, arena: Allocator, call: ToolCall) !bool {
