@@ -65,7 +65,7 @@ The shared JavaScript Agent wrapper emits bounded `transport.start`, `transport.
 
 The shared Agent checks its current turn's cancellation state before invoking host fetch. A request published after cancellation is aborted through the existing runtime boundary, so an earlier idle abort cannot leave the cancelled turn waiting for a response.
 
-The native kernel installs only the host-stream provider and static model metadata. It does not inherit CLI billing reconciliation, model discovery, credits, search, or compaction providers. Token usage comes from the response stream; generation metadata must not trigger native HTTP requests outside the host's fetch function.
+The native kernel installs host-stream and host model-catalog providers. It does not inherit CLI billing reconciliation, credits, search, or compaction providers. Token usage comes from the response stream; generation metadata must not trigger native HTTP requests outside the host's fetch function.
 
 ## Native module ABI
 
@@ -116,7 +116,7 @@ The runtime thread never reads or mutates JavaScript values or calls Node-API. I
 
 The addon initializes one process-wide `std.Io.Threaded` instance. Atomic state protects one-time initialization when the addon is loaded in multiple Node worker environments. The same initialization installs inherited process-environment access before any runtime thread starts. It does not configure fx product tracing from ambient `FX_TRACE_*` variables; libfx remains silent unless its JavaScript host explicitly requests SDK observability.
 
-Input and output queues have independent `std.Io.Mutex` protection. The input queue also has a condition variable so the ACP reader sleeps while no input is available. Closing input broadcasts the condition and allows the server thread to terminate.
+Input and output queues have independent `std.Io.Mutex` protection and condition variables. The ACP reader sleeps while input is empty. An output writer fills available byte capacity, then sleeps until JavaScript drains space. The JSON-RPC writer lock preserves record ordering across these partial writes. Closing the core closes both queues and wakes their waiters before joining the native thread.
 
 Readiness has no callback queue or pending flag. A full socket already contains a wake, so a nonblocking `EAGAIN` needs no retry. Other write failures shut down the writer so the reader observes EOF and fails the runtime instead of hanging. Writes suppress `SIGPIPE`, and descriptors are close-on-exec. This avoids depending on a thread-safe-function dispatcher's drain/idle race.
 
@@ -149,7 +149,7 @@ host-fetch bridge. Codex is enabled only when the caller supplies a custom
 session store or explicitly opts into an fx profile with `fxProfileSession()`.
 Grok remains unavailable. Browser and WebAssembly cores remain Gateway-only.
 
-The native core also performs no model-catalog lookup while creating or prompting an Agent. It uses the local fallback capability policy for the host-selected model. Initial model-visible system context comes only from the host's explicit `instructions`, including text assembled by the MCP and skills adapters.
+Gateway agent creation does not fetch the model catalog. When a prompt needs model capabilities or context capacity, the shared resolver obtains the catalog through the supplied host fetch and caches its metadata for that agent. Codex authorization is the exception: the authenticated Codex catalog is loaded before native initialization succeeds, so an unavailable catalog or model fails creation. Initial model-visible system context comes only from the host's explicit `instructions`, including text assembled by the MCP and skills adapters.
 
 Host-stream requests do not opt into the Gateway extended-time header. Live paired testing showed that header caused a recurring multi-second pre-header tail for embedded requests. Session identity and affinity headers remain enabled. The shared JavaScript fetch edge retries a thrown host transport error at most once, before any response reaches the Agent. Cancellation prevents the retry, and a second failure keeps the existing rejection behavior.
 
@@ -181,20 +181,26 @@ All untrusted values crossing the native boundary are bounded before allocation 
 | Gateway URL | 16 KiB |
 | Input queue | 8 MiB |
 | Output queue | 8 MiB |
-| Fetch request record | 8 MiB |
+| Encoded output message | 64 MiB |
+| Fetch request body and serialized metadata | 8 MiB before body base64 encoding |
+| Fetch request record | 11,184,812 bytes including body base64 encoding |
 | Fetch response queue | 8 MiB |
 | Gateway error body | 1 MiB |
 | Codex session snapshot | 64 KiB |
 | Codex session revision | 1 KiB |
 | One output drain | 1 MiB |
 | Active runtimes | 64 per process |
-| ACP tool result | 64 KiB |
+| ACP tool result | 64 KiB text; 8 MiB tagged rich result |
 | ACP history | 100 turns |
 | Agent steps | 64 |
 
-Input overflow fails synchronously with `LIBFX_NATIVE_BACKPRESSURE`. Output overflow causes the ACP runtime to exit with a failure status rather than allowing unbounded native memory growth. Limits must remain checked with overflow-safe subtraction before append operations.
+The fetch request budget covers the full model request, including retained history and metadata. Its base64 transfer frame has a separate derived bound; accepting one tool result does not reserve space for later requests.
 
-The JavaScript adapter drains output to quiescence on every readiness callback. Changes that pause notification or consumption must account for the fixed output bound.
+Host tool responses must also fit the 8 MiB input bound after JSON framing, including the trailing newline. A response that exceeds this bound becomes a small tool error so the model can continue and the agent remains usable.
+
+Input overflow fails synchronously with `LIBFX_NATIVE_BACKPRESSURE`. Output queue pressure blocks the writer until space is available; a single message does not need to fit the queue. Allocation failure or an oversized output message permanently fails the output transport, notifies JavaScript, closes input, and shuts down host fetch. Later writes cannot publish a successful response after that failure.
+
+The JavaScript adapter has one ordered output drain. A shared byte-framing parser preserves UTF-8 characters across native drain boundaries, rejects malformed or oversized records, and waits for SDK event admission before consuming another message. Readiness still services fetch cancellation while output is blocked. The unread event queue applies the same limits and cancellation rules on native and WebAssembly backends. Cancelling a turn releases event admission and discards subsequent cancelled-turn updates while transport framing continues, so the next turn starts on a complete record boundary. Destroying the runtime closes output before joining, including worker cleanup without an active JavaScript reader.
 
 ## Argument and handle safety
 

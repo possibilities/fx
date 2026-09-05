@@ -23,6 +23,11 @@ const root = resolve(fileURLToPath(new URL("../..", import.meta.url)));
 const server = createServer((request, response) => {
   request.resume();
   request.on("end", () => {
+    if (request.method === "GET") {
+      response.writeHead(200, { "content-type": "application/json" });
+      response.end(JSON.stringify({ object: "list", data: [{ id: "runtime/model", type: "language" }] }));
+      return;
+    }
     const url = new URL(request.url, "http://localhost");
     const chunks = Number(url.searchParams.get("chunks") ?? 1);
     const bytes = Number(url.searchParams.get("bytes") ?? 5);
@@ -39,6 +44,7 @@ await new Promise((resolveListen) => server.listen(0, "127.0.0.1", resolveListen
 const origin = `http://127.0.0.1:${server.address().port}`;
 const nativeFetch = globalThis.fetch.bind(globalThis);
 let active = null;
+let nonPromptFetches = 0;
 
 function bodyBytes(body) {
   if (typeof body === "string") return new TextEncoder().encode(body).length;
@@ -48,6 +54,10 @@ function bodyBytes(body) {
 }
 
 const tracedFetch = async (input, init = {}) => {
+  if ((init.method ?? "GET") === "GET") {
+    nonPromptFetches += 1;
+    return nativeFetch(`${origin}/models`, init);
+  }
   const sample = active;
   if (sample) {
     sample.fetch_at = performance.now();
@@ -187,6 +197,7 @@ try {
       await runStreamCase(1000, 1),
       await runStreamCase(16, 65_536),
     ],
+    non_prompt_fetches: nonPromptFetches,
   }, null, 2)}\n`);
 } finally {
   await warmAgent?.close().catch(() => {});

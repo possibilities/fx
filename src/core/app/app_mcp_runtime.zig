@@ -14,10 +14,8 @@ const mcp_model_catalog = @import("../mcp/model_catalog.zig");
 const mcp_runtime = @import("../mcp/mcp_runtime.zig");
 const completion_feature = @import("../mcp/features/completion.zig");
 const context_limits = @import("../config/context_limits.zig");
-const tool_projection = @import("../tooling/tool_projection.zig");
 const tool_dispatch = @import("../tooling/tool_dispatch.zig");
 const tool_mcp_runtime = @import("../tooling/tool_mcp_runtime.zig");
-const tool_set = @import("../tooling/tool_set.zig");
 const types = @import("../shared/types.zig");
 const text_utils = @import("../shared/text_utils.zig");
 
@@ -136,12 +134,11 @@ const PendingReload = struct {
     result: ?PendingResult = null,
     policy: ReloadPolicy = .transactional,
     rebuild: bool = true,
-    detached_runtime: ?*mcp_runtime.McpRuntime = null,
     superseded_reload: ?*PendingReload = null,
     superseded_authentication: ?*PendingAuthentication = null,
 
     fn run(self: *PendingReload) void {
-        if (self.policy == .authority_reducing) self.quiesceDetachedAuthority();
+        if (self.policy == .authority_reducing) self.quiesceSupersededWork();
         const outcome = switch (self.policy) {
             .transactional => self.owner.reloadControlled(
                 self.alloc,
@@ -177,7 +174,7 @@ const PendingReload = struct {
         self.done.store(true, .release);
     }
 
-    fn quiesceDetachedAuthority(self: *PendingReload) void {
+    fn quiesceSupersededWork(self: *PendingReload) void {
         // Authentication can hold the lease that a retiring reload is waiting for.
         if (self.superseded_authentication) |task| {
             self.superseded_authentication = null;
@@ -186,10 +183,6 @@ const PendingReload = struct {
         if (self.superseded_reload) |task| {
             self.superseded_reload = null;
             task.deinit();
-        }
-        if (self.detached_runtime) |runtime| {
-            self.detached_runtime = null;
-            destroyRuntime(self.alloc, runtime);
         }
     }
 
@@ -206,7 +199,7 @@ const PendingReload = struct {
 
     fn deinit(self: *PendingReload) void {
         self.join();
-        self.quiesceDetachedAuthority();
+        self.quiesceSupersededWork();
         if (self.result) |*result| switch (result.*) {
             .outcome => |*outcome| outcome.deinit(self.alloc),
             .failed, .cancelled => {},
@@ -218,6 +211,7 @@ const PendingReload = struct {
 
 pub const AuthenticationCompletion = struct {
     server_name: []u8,
+    reconnect_error: ?anyerror = null,
     result: anyerror!mcp_auth.AuthenticationResult,
 
     pub fn deinit(self: *AuthenticationCompletion, alloc: Allocator) void {
@@ -236,6 +230,7 @@ const PendingAuthentication = struct {
     cancel_requested: std.atomic.Value(bool) = .init(false),
     done: std.atomic.Value(bool) = .init(false),
     thread: ?std.Thread = null,
+    reconnect_error: ?anyerror = null,
     result: ?(anyerror!mcp_auth.AuthenticationResult) = null,
 
     fn run(self: *PendingAuthentication) void {
@@ -245,6 +240,13 @@ const PendingAuthentication = struct {
             openUrl,
             &self.cancel_requested,
         );
+        if (self.result.?) |outcome| {
+            if (outcome == .authenticated) {
+                self.lease.runtime.reconnectAuthenticatedServer(self.server_name, &self.cancel_requested) catch |err| {
+                    self.reconnect_error = err;
+                };
+            }
+        } else |_| {}
         self.done.store(true, .release);
     }
 
@@ -489,7 +491,6 @@ const MenuArgumentCompletion = struct {
 
 const MenuActionResult = struct {
     feedback: []u8,
-    reload: bool = false,
 
     fn deinit(self: *MenuActionResult, alloc: Allocator) void {
         alloc.free(self.feedback);
@@ -676,9 +677,9 @@ const PendingMenuOperation = struct {
         else
             try allocMenuText(
                 self.alloc,
-                &.{ "Logged out of MCP server '", server_name, "'." },
+                &.{ "Logged out of MCP server '", server_name, "'. Run /mcp auth ", server_name, " --open to sign in again." },
             );
-        return .{ .feedback = feedback, .reload = result.removed and !result.local_only };
+        return .{ .feedback = feedback };
     }
 
     fn previewTool(self: *PendingMenuOperation) !MenuPreview {
@@ -688,6 +689,7 @@ const PendingMenuOperation = struct {
             self.permission_rules,
             self.limits,
             .unrestricted,
+            &self.cancel_requested,
         )) orelse return error.McpToolNotFound;
         defer schema.deinit(self.alloc);
         const payload = switch (schema) {
@@ -917,11 +919,7 @@ const MenuArgumentForm = struct {
     }
 };
 
-pub const MenuCompletionEffect = union(enum) {
-    none,
-    repaint,
-    reload: u64,
-};
+pub const MenuCompletionEffect = enum { none, repaint };
 
 const SpawnPendingReloadFn = *const fn (*PendingReload) anyerror!std.Thread;
 
@@ -986,6 +984,7 @@ pub const State = struct {
     }
 
     pub fn openMenu(self: *State, alloc: Allocator, captured_at_ms: u64) !void {
+        debug_trace.logf("mcp", "opening MCP menu", .{});
         self.clearMenuOwned(alloc);
         var snapshot = if (self.acquire()) |lease_value| snapshot: {
             var lease = lease_value;
@@ -996,6 +995,53 @@ pub const State = struct {
         self.menu_health = snapshot;
         self.menu = .{};
         _ = mcp_menu_state.apply(&self.menu, .{ .open = snapshot.servers.len });
+    }
+
+    pub fn refreshMenuHealth(self: *State, alloc: Allocator, captured_at_ms: u64) !bool {
+        if (!self.menu.active) return false;
+        if (self.menu_health) |current| {
+            if (captured_at_ms >= current.captured_at_ms and captured_at_ms - current.captured_at_ms < 100) return false;
+        }
+        const snapshot = if (self.acquire()) |lease_value| snapshot: {
+            var lease = lease_value;
+            defer lease.deinit();
+            break :snapshot try lease.runtime.snapshotHealth(alloc, captured_at_ms);
+        } else try emptyHealthSnapshot(alloc, captured_at_ms);
+        return self.replaceMenuHealth(alloc, snapshot);
+    }
+
+    fn replaceMenuHealth(self: *State, alloc: Allocator, next: mcp_health.Snapshot) bool {
+        if (self.menu_health) |*current| {
+            if (mcp_health.sameState(current.*, next)) {
+                current.captured_at_ms = next.captured_at_ms;
+                var unchanged = next;
+                unchanged.deinit(alloc);
+                return false;
+            }
+            if (self.menu.selected_server_index < current.servers.len) {
+                const previous = &current.servers[self.menu.selected_server_index];
+                const selected = for (next.servers, 0..) |server, index| {
+                    if (server.source == previous.source and server.scope == previous.scope and
+                        std.mem.eql(u8, server.identity(), previous.identity())) break index;
+                } else null;
+                self.menu.selected_server_index = selected orelse 0;
+                if (self.menu.section == .servers) self.menu.selected_index = self.menu.selected_server_index;
+                if (selected == null) {
+                    self.cancelPendingMenuOperation("selected_server_removed");
+                    debug_trace.logf("mcp", "closing server-bound menu state because its selected server was removed", .{});
+                    self.menu.pending_generation = null;
+                    if (self.menu.screen != .add) {
+                        self.menu.screen = .browse;
+                        self.menu.section = .servers;
+                        self.menu.selected_index = self.menu.selected_server_index;
+                        self.menu.load_state = .ready;
+                    }
+                }
+            }
+            current.deinit(alloc);
+        }
+        self.menu_health = next;
+        return true;
     }
 
     fn emptyHealthSnapshot(alloc: Allocator, captured_at_ms: u64) !mcp_health.Snapshot {
@@ -1010,6 +1056,7 @@ pub const State = struct {
     }
 
     pub fn closeMenu(self: *State, alloc: Allocator) void {
+        debug_trace.logf("mcp", "closing MCP menu screen={s}", .{@tagName(self.menu.screen)});
         if (mcp_menu_state.apply(&self.menu, .close)) |effect| switch (effect) {
             .cancel => self.cancelPendingMenuOperation("menu_closed"),
             .load_catalog, .load_preview, .complete_argument, .action => {},
@@ -1202,9 +1249,12 @@ pub const State = struct {
         {
             const health = self.menu_health orelse return error.McpRuntimeUnavailable;
             if (operation.request.server_index >= health.servers.len) return error.McpServerNotFound;
+            if (health.servers[operation.request.server_index].runtime_generation != lease.runtime.generation) {
+                return error.McpMenuSelectionChanged;
+            }
             server_name = try alloc.dupe(
                 u8,
-                health.servers[operation.request.server_index].configured_name,
+                health.servers[operation.request.server_index].identity(),
             );
         }
         if (operation.kind == .preview or operation.kind == .completion) switch (operation.request.section) {
@@ -1408,16 +1458,18 @@ pub const State = struct {
             },
             .action => |action_result| {
                 self.menu_feedback = action_result.feedback;
-                const needs_reload = action_result.reload;
                 result = .cancelled;
                 self.returnMenuToServers();
-                if (needs_reload) return .{ .reload = request.generation };
                 _ = mcp_menu_state.apply(
                     &self.menu,
                     .{ .action_succeeded = request.generation },
                 );
             },
             .failed => |err| {
+                if (kind == .catalog and (err == error.McpResourcesUnsupported or err == error.McpPromptsUnsupported)) {
+                    self.completeEmptyMenuCatalog(alloc, request);
+                    return .repaint;
+                }
                 self.menu_feedback = try allocMenuText(
                     alloc,
                     &.{
@@ -1509,14 +1561,13 @@ pub const State = struct {
             break :snapshot try lease.runtime.snapshotHealth(alloc, captured_at_ms);
         } else try emptyHealthSnapshot(alloc, captured_at_ms);
         errdefer snapshot.deinit(alloc);
-        if (self.menu_health) |*previous| previous.deinit(alloc);
-        self.menu_health = snapshot;
+        _ = self.replaceMenuHealth(alloc, snapshot);
     }
 
     pub fn selectedMenuServerName(self: *const State) ?[]const u8 {
         const health = self.menu_health orelse return null;
         if (self.menu.selected_server_index >= health.servers.len) return null;
-        return health.servers[self.menu.selected_server_index].configured_name;
+        return health.servers[self.menu.selected_server_index].identity();
     }
 
     pub fn applyMenuAuthenticationCompletion(
@@ -1537,15 +1588,29 @@ pub const State = struct {
                             &.{
                                 "Authenticated MCP server '",
                                 completion.server_name,
-                                "'; reconnecting…",
+                                "'.",
                             },
                         )
                     else
                         try std.fmt.allocPrint(
                             alloc,
-                            "Authenticated '{s}'; repaired {d} credential entries; reconnecting…",
+                            "Authenticated '{s}'; repaired {d} credential entries.",
                             .{ completion.server_name, authenticated.repaired_entries },
                         );
+                    if (completion.reconnect_error) |err| {
+                        const feedback = try std.fmt.allocPrint(alloc, "{s} Connection failed: {s}. Check /mcp list.", .{ self.menu_feedback.?, @errorName(err) });
+                        alloc.free(self.menu_feedback.?);
+                        self.menu_feedback = feedback;
+                        _ = mcp_menu_state.apply(&self.menu, .{ .effect_failed = generation });
+                    } else {
+                        _ = mcp_menu_state.apply(&self.menu, .{ .action_succeeded = generation });
+                    }
+                    if (self.acquire()) |lease_value| {
+                        var lease = lease_value;
+                        defer lease.deinit();
+                        const snapshot = try lease.runtime.snapshotHealth(alloc, @intCast(@max(io_mod.milliTimestamp(), 0)));
+                        _ = self.replaceMenuHealth(alloc, snapshot);
+                    }
                     return true;
                 },
                 .issuer_mismatch => {
@@ -1712,11 +1777,12 @@ pub const State = struct {
         permission_rules: types.PermissionRuleSet,
         limits: context_limits.Values,
         access: tool_mcp_runtime.Access,
+        cancel_flag: ?*std.atomic.Value(bool),
     ) !tool_mcp_runtime.SearchResult {
         var lease = self.acquire() orelse
             return .{ .model_output = try arena.dupe(u8, "{\"tools\":[],\"count\":0}") };
         defer lease.deinit();
-        return lease.runtime.searchToolsPrepared(arena, request, permission_rules, limits, access);
+        return lease.runtime.searchToolsPrepared(arena, request, permission_rules, limits, access, cancel_flag);
     }
 
     pub fn toolSchema(
@@ -1726,6 +1792,7 @@ pub const State = struct {
         permission_rules: types.PermissionRuleSet,
         limits: context_limits.Values,
         access: tool_mcp_runtime.Access,
+        cancel_flag: ?*std.atomic.Value(bool),
     ) !?tool_mcp_runtime.ToolSchemaResult {
         var lease = self.acquire() orelse return null;
         defer lease.deinit();
@@ -1735,6 +1802,7 @@ pub const State = struct {
             permission_rules,
             limits,
             access,
+            cancel_flag,
         );
     }
 
@@ -1756,6 +1824,12 @@ pub const State = struct {
         );
         defer snapshot.deinit(alloc);
         return mcp_health.renderSummary(alloc, snapshot);
+    }
+
+    pub fn snapshotToolDefinition(self: *State, alloc: Allocator, name: []const u8, known: tool_mcp_runtime.Binding, permission_rules: types.PermissionRuleSet, limits: context_limits.Values, access: tool_mcp_runtime.Access) !tool_mcp_runtime.DefinitionSnapshot {
+        var lease = self.acquire() orelse return .unavailable;
+        defer lease.deinit();
+        return lease.runtime.snapshotToolDefinition(alloc, name, known, permission_rules, limits, access);
     }
 
     pub fn snapshotToolNames(
@@ -1811,7 +1885,7 @@ pub const State = struct {
     ) !?[]u8 {
         var lease = self.acquire() orelse return null;
         defer lease.deinit();
-        try lease.runtime.waitForDiscovery(cancel_flag);
+        try lease.runtime.waitForRequiredDiscovery(cancel_flag);
         return lease.runtime.requiredStartupFailure(alloc, captured_at_ms);
     }
 
@@ -1922,9 +1996,11 @@ pub const State = struct {
         const result = pending.result.?;
         pending.result = null;
         const server_name = pending.server_name;
+        const reconnect_error = pending.reconnect_error;
         pending.lease.deinit();
         pending.alloc.destroy(pending);
         return .{
+            .reconnect_error = reconnect_error,
             .server_name = server_name,
             .result = result,
         };
@@ -2196,10 +2272,9 @@ pub const State = struct {
         if (superseded_authentication) |task| task.cancel_requested.store(true, .release);
         pending.superseded_reload = superseded_reload;
         pending.superseded_authentication = superseded_authentication;
-        pending.detached_runtime = self.runtime;
+        if (self.runtime) |runtime| _ = runtime.revokeWorkspaceExceptNames(&.{});
         self.pending_reload = pending;
         self.pending_authentication = null;
-        self.runtime = null;
         self.lock.unlock(io_mod.getIo());
 
         if (comptime builtin.single_threaded) {
@@ -2212,7 +2287,7 @@ pub const State = struct {
         }
     }
 
-    pub fn retireAuthoritySynchronously(self: *State, alloc: Allocator) void {
+    pub fn retireAuthoritySynchronously(self: *State, _: Allocator) void {
         self.lock.lockUncancelable(io_mod.getIo());
         const pending_reload = self.pending_reload;
         if (pending_reload) |task| task.cancel_requested.store(true, .release);
@@ -2221,14 +2296,13 @@ pub const State = struct {
         const runtime = self.runtime;
         self.pending_reload = null;
         self.pending_authentication = null;
-        self.runtime = null;
         self.lock.unlock(io_mod.getIo());
 
         if (pending_authentication) |task| {
             cancelAndDeinitAuthentication(task, "authority_reduction_sync");
         }
         if (pending_reload) |task| task.deinit();
-        if (runtime) |value| destroyRuntime(alloc, value);
+        if (runtime) |value| _ = value.revokeWorkspaceExceptNames(&.{});
     }
 
     pub fn takeReloadCompletion(self: *State) ?ReloadCompletion {
@@ -2291,137 +2365,21 @@ pub const State = struct {
         pending: ?*PendingReload,
     ) !ReloadOutcome {
         if (cancel_requested.load(.acquire)) return error.Cancelled;
-        const next_authority = preview_workspace_authority(
-            alloc,
-            workspace_root,
-            self.profile_home,
-        ) catch |err| {
-            const detached = try self.detachForReducingReload(cancel_requested, pending);
-            if (detached) |runtime| {
-                destroyRuntime(alloc, runtime);
-                debug_trace.logf(
-                    "mcp",
-                    "authority-reducing reload preflight failed after retirement err={s}",
-                    .{@errorName(err)},
-                );
-                return error.McpAuthorityReducedReloadFailed;
+        var lease = self.acquire();
+        defer if (lease) |*current| current.deinit();
+        const next_authority = preview_workspace_authority(alloc, workspace_root, self.profile_home) catch |err| {
+            if (lease) |current| {
+                if (current.runtime.revokeWorkspaceExceptNames(&.{})) return error.McpAuthorityReducedReloadFailed;
             }
             return err;
         };
         defer mcp_contract.freeOwnedStrings(alloc, next_authority);
-        var authority_reduced = false;
-        var detached_reduced_runtime: ?*mcp_runtime.McpRuntime = null;
-        self.lock.lockUncancelable(io_mod.getIo());
-        if (cancel_requested.load(.acquire) or
-            (pending != null and self.pending_reload != pending.?))
-        {
-            self.lock.unlock(io_mod.getIo());
-            return error.Cancelled;
-        }
-        if (self.runtime) |current| {
-            authority_reduced = current.workspaceAuthorityReducedAgainstNames(
-                next_authority,
-                .all,
-            );
-            if (authority_reduced) {
-                detached_reduced_runtime = current;
-                self.runtime = null;
-            }
-        }
-        self.lock.unlock(io_mod.getIo());
-        if (detached_reduced_runtime) |runtime| {
-            detached_reduced_runtime = null;
-            destroyRuntime(alloc, runtime);
-        }
-
+        const authority_reduced = if (lease) |current| current.runtime.revokeWorkspaceExceptNames(next_authority) else false;
         const candidate = loader(alloc, workspace_root, elicitation_capabilities, self.profile_home) catch |err| {
-            if (authority_reduced) {
-                debug_trace.logf(
-                    "mcp",
-                    "authority-reducing reload failed after retirement err={s}",
-                    .{@errorName(err)},
-                );
-                return error.McpAuthorityReducedReloadFailed;
-            }
+            if (authority_reduced) return error.McpAuthorityReducedReloadFailed;
             return err;
         };
-        var candidate_owned = candidate != null;
-        errdefer if (candidate_owned) destroyRuntime(alloc, candidate.?);
-        if (cancel_requested.load(.acquire)) return error.Cancelled;
-
-        if (!authority_reduced) {
-            if (candidate) |next| {
-                self.lock.lockUncancelable(io_mod.getIo());
-                if (cancel_requested.load(.acquire) or
-                    (pending != null and self.pending_reload != pending.?))
-                {
-                    self.lock.unlock(io_mod.getIo());
-                    return error.Cancelled;
-                }
-                if (self.runtime) |current| {
-                    authority_reduced = current.workspaceAuthorityReducedAgainst(next, .all);
-                    if (authority_reduced) {
-                        detached_reduced_runtime = current;
-                        self.runtime = null;
-                    }
-                }
-                self.lock.unlock(io_mod.getIo());
-            }
-        }
-        if (detached_reduced_runtime) |runtime| destroyRuntime(alloc, runtime);
-
-        var published = if (candidate) |runtime| published: {
-            runtime.connectAllCancellable(registry, cancel_requested);
-            if (cancel_requested.load(.acquire)) return error.Cancelled;
-            var snapshot = try runtime.snapshotHealth(alloc, captured_at_ms);
-            defer snapshot.deinit(alloc);
-            const value = mcp_health.startupDecision(snapshot.servers);
-            if (!authority_reduced and !mcp_health.publishCandidateForDecision(value)) {
-                const failure = (try runtime.requiredStartupFailure(alloc, captured_at_ms)) orelse
-                    try alloc.dupe(u8, "A required MCP server is unavailable.");
-                destroyRuntime(alloc, runtime);
-                candidate_owned = false;
-                return .{ .retained_required_failure = failure };
-            }
-            break :published try PublishedReload.init(
-                alloc,
-                runtime.generation,
-                snapshot.servers,
-            );
-        } else try PublishedReload.init(alloc, null, &.{});
-        errdefer published.deinit(alloc);
-
-        self.lock.lockUncancelable(io_mod.getIo());
-        if (cancel_requested.load(.acquire) or
-            (pending != null and self.pending_reload != pending.?))
-        {
-            self.lock.unlock(io_mod.getIo());
-            return error.Cancelled;
-        }
-        const previous = self.runtime;
-        self.runtime = candidate;
-        self.lock.unlock(io_mod.getIo());
-        candidate_owned = false;
-
-        if (previous) |runtime| destroyRuntime(alloc, runtime);
-        return .{ .published = published };
-    }
-
-    fn detachForReducingReload(
-        self: *State,
-        cancel_requested: *std.atomic.Value(bool),
-        pending: ?*PendingReload,
-    ) !?*mcp_runtime.McpRuntime {
-        self.lock.lockUncancelable(io_mod.getIo());
-        defer self.lock.unlock(io_mod.getIo());
-        if (cancel_requested.load(.acquire) or
-            (pending != null and self.pending_reload != pending.?))
-        {
-            return error.Cancelled;
-        }
-        const runtime = self.runtime;
-        self.runtime = null;
-        return runtime;
+        return self.applyReloadCandidate(alloc, candidate, registry, captured_at_ms, cancel_requested, pending, !authority_reduced, true);
     }
 
     fn reloadAuthorityReducedControlled(
@@ -2437,35 +2395,69 @@ pub const State = struct {
         rebuild: bool,
     ) !ReloadOutcome {
         if (cancel_requested.load(.acquire)) return error.Cancelled;
-        const candidate = if (rebuild)
-            try loader(alloc, workspace_root, elicitation_capabilities, self.profile_home)
-        else
-            null;
-        var candidate_owned = candidate != null;
-        errdefer if (candidate_owned) destroyRuntime(alloc, candidate.?);
-        if (cancel_requested.load(.acquire)) return error.Cancelled;
+        if (!rebuild) {
+            if (self.acquire()) |owned| {
+                var lease = owned;
+                defer lease.deinit();
+                try lease.runtime.drainRetiredServers();
+                var snapshot = try lease.runtime.snapshotHealth(alloc, captured_at_ms);
+                defer snapshot.deinit(alloc);
+                return .{ .published = try PublishedReload.init(alloc, if (snapshot.servers.len == 0) null else lease.runtime.generation, snapshot.servers) };
+            }
+            return .{ .published = try PublishedReload.init(alloc, null, &.{}) };
+        }
+        const candidate = try loader(alloc, workspace_root, elicitation_capabilities, self.profile_home);
+        return self.applyReloadCandidate(alloc, candidate, registry, captured_at_ms, cancel_requested, pending, false, false);
+    }
 
-        var published = if (candidate) |runtime| published: {
+    /// Takes ownership of the unloaded candidate, including all error paths.
+    fn applyReloadCandidate(
+        self: *State,
+        alloc: Allocator,
+        candidate: ?*mcp_runtime.McpRuntime,
+        registry: tool_dispatch.Registry,
+        captured_at_ms: u64,
+        cancel_requested: *std.atomic.Value(bool),
+        pending: ?*PendingReload,
+        retain_on_required_failure: bool,
+        refresh_catalogs: bool,
+    ) !ReloadOutcome {
+        var candidate_owned = candidate != null;
+        defer if (candidate_owned) destroyRuntime(alloc, candidate.?);
+        self.lock.lockSharedUncancelable(io_mod.getIo());
+        const stale = cancel_requested.load(.acquire) or (pending != null and self.pending_reload != pending.?);
+        self.lock.unlockShared(io_mod.getIo());
+        if (stale) return error.Cancelled;
+        if (self.acquire()) |owned| {
+            var lease = owned;
+            defer lease.deinit();
+            if (try lease.runtime.reconcile(candidate, cancel_requested, retain_on_required_failure)) |failure| {
+                return .{ .retained_required_failure = failure };
+            }
+            if (refresh_catalogs) try lease.runtime.reloadCatalogs(cancel_requested);
+            var snapshot = try lease.runtime.snapshotHealth(alloc, captured_at_ms);
+            defer snapshot.deinit(alloc);
+            return .{ .published = try PublishedReload.init(
+                alloc,
+                if (snapshot.servers.len == 0) null else lease.runtime.generation,
+                snapshot.servers,
+            ) };
+        }
+        var published = if (candidate) |runtime| result: {
             runtime.connectAllCancellable(registry, cancel_requested);
             if (cancel_requested.load(.acquire)) return error.Cancelled;
             var snapshot = try runtime.snapshotHealth(alloc, captured_at_ms);
             defer snapshot.deinit(alloc);
-            break :published try PublishedReload.init(
-                alloc,
-                runtime.generation,
-                snapshot.servers,
-            );
+            if (retain_on_required_failure and !mcp_health.publishCandidateForDecision(mcp_health.startupDecision(snapshot.servers))) {
+                return .{ .retained_required_failure = (try runtime.requiredStartupFailure(alloc, captured_at_ms)) orelse try alloc.dupe(u8, "A required MCP server is unavailable.") };
+            }
+            break :result try PublishedReload.init(alloc, runtime.generation, snapshot.servers);
         } else try PublishedReload.init(alloc, null, &.{});
         errdefer published.deinit(alloc);
-
         self.lock.lockUncancelable(io_mod.getIo());
-        if (cancel_requested.load(.acquire) or self.pending_reload != pending) {
-            self.lock.unlock(io_mod.getIo());
-            return error.Cancelled;
-        }
-        std.debug.assert(self.runtime == null);
+        defer self.lock.unlock(io_mod.getIo());
+        if (cancel_requested.load(.acquire) or (pending != null and self.pending_reload != pending.?) or self.runtime != null) return error.Cancelled;
         self.runtime = candidate;
-        self.lock.unlock(io_mod.getIo());
         candidate_owned = false;
         return .{ .published = published };
     }
@@ -2495,23 +2487,6 @@ fn cancelAndDeinitAuthentication(
     );
     pending.cancel_requested.store(true, .release);
     pending.deinit();
-}
-
-pub fn buildModelToolProjection(
-    state: *State,
-    alloc: Allocator,
-    advertisement_set: tool_set.ToolSet,
-    options: tool_projection.Options,
-) !tool_projection.EffectiveToolProjection {
-    var lease = state.acquire();
-    defer if (lease) |*active| active.deinit();
-    var effective = options;
-    effective.mcp_runtime = if (lease) |active| active.runtime else null;
-    return tool_projection.buildModelToolProjectionForSet(
-        alloc,
-        advertisement_set,
-        effective,
-    );
 }
 
 fn destroyRuntime(alloc: Allocator, runtime: *mcp_runtime.McpRuntime) void {
@@ -2672,7 +2647,7 @@ test "MCP menu failures preserve exact menu-owned feedback" {
         &repaired_completion,
     ));
     try std.testing.expectEqualStrings(
-        "Authenticated 'fixture'; repaired 2 credential entries; reconnecting…",
+        "Authenticated 'fixture'; repaired 2 credential entries.",
         repaired_state.menu_feedback.?,
     );
 }
@@ -2711,6 +2686,23 @@ const TestReloadMode = enum {
 var test_reload_mode: TestReloadMode = .empty;
 var test_reload_profile_home: ?[]const u8 = null;
 var test_reload_preview_profile_home: ?[]const u8 = null;
+
+test "menu selection follows server identity when snapshots reorder" {
+    const alloc = std.testing.allocator;
+    var runtime = mcp_runtime.McpRuntime.init(alloc);
+    defer runtime.deinit();
+    try runtime.addServer(.{ .name = try alloc.dupe(u8, "first"), .command = try alloc.dupe(u8, "cmd") });
+    try runtime.addServer(.{ .name = try alloc.dupe(u8, "second"), .command = try alloc.dupe(u8, "cmd") });
+    var state: State = .{};
+    defer state.deinit(alloc);
+    state.menu_health = try runtime.snapshotHealth(alloc, 1);
+    state.menu = .{ .active = true, .section = .servers, .screen = .details, .selected_index = 1, .selected_server_index = 1 };
+    var reordered = try runtime.snapshotHealth(alloc, 200);
+    std.mem.swap(mcp_health.ServerSnapshot, &reordered.servers[0], &reordered.servers[1]);
+    try std.testing.expect(state.replaceMenuHealth(alloc, reordered));
+    try std.testing.expectEqual(@as(usize, 0), state.menu.selected_index);
+    try std.testing.expectEqualStrings("second", state.selectedMenuServerName().?);
+}
 
 fn loadTestReloadRuntime(
     alloc: Allocator,
@@ -2838,7 +2830,7 @@ test "transactional reload retains old runtime and publishes only accepted candi
     switch (rejected) {
         .retained_required_failure => |failure| {
             try std.testing.expect(std.mem.find(u8, failure, "candidate") != null);
-            try std.testing.expect(std.mem.find(u8, failure, "required") != null);
+            try std.testing.expect(std.mem.find(u8, failure, "Required MCP server") != null);
         },
         .published => return error.TestUnexpectedResult,
     }
@@ -2854,23 +2846,20 @@ test "transactional reload retains old runtime and publishes only accepted candi
     switch (degraded) {
         .published => |published| {
             try std.testing.expectEqual(mcp_health.StartupDecision.degraded, published.health);
-            try std.testing.expect(published.generation.? != original_generation);
+            try std.testing.expectEqual(original_generation, published.generation.?);
             try std.testing.expectEqual(@as(usize, 1), published.configured_server_count);
             try std.testing.expectEqual(@as(usize, 1), published.unavailable_server_names.len);
             try std.testing.expectEqualStrings("candidate", published.unavailable_server_names[0]);
         },
         .retained_required_failure => return error.TestUnexpectedResult,
     }
-    try std.testing.expectError(
-        error.McpAuthorityChanged,
-        state.callTool(
-            alloc,
-            "mcp_candidate_echo",
-            "{}",
-            1024,
-            .{ .expected_runtime_generation = original_generation },
-        ),
-    );
+    try std.testing.expectEqual(@as(?tool_mcp_runtime.CallResult, null), try state.callTool(
+        alloc,
+        "mcp_candidate_echo",
+        "{}",
+        1024,
+        .{ .expected_runtime_generation = original_generation },
+    ));
 
     test_reload_mode = .empty;
     var empty = try state.reload(alloc, "/workspace", .{}, loadTestReloadRuntime, previewTestWorkspaceAuthority, .{}, 40);
@@ -2884,7 +2873,15 @@ test "transactional reload retains old runtime and publishes only accepted candi
         },
         .retained_required_failure => return error.TestUnexpectedResult,
     }
-    try std.testing.expect(state.acquire() == null);
+    try expectNoActiveMcpServers(&state);
+}
+
+fn expectNoActiveMcpServers(state: *State) !void {
+    var lease = state.acquire() orelse return;
+    defer lease.deinit();
+    var snapshot = try lease.runtime.snapshotHealth(std.testing.allocator, 0);
+    defer snapshot.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 0), snapshot.servers.len);
 }
 
 test "reducing preflight retires workspace authority before strict loader failure" {
@@ -2916,7 +2913,7 @@ test "reducing preflight retires workspace authority before strict loader failur
             10,
         ),
     );
-    try std.testing.expect(state.acquire() == null);
+    try expectNoActiveMcpServers(&state);
 }
 
 test "project prompt display escapes repository control bytes" {
@@ -3005,7 +3002,7 @@ test "pending reload returns immediately and publishes one completion" {
         .failed => return error.TestUnexpectedResult,
     }
     try std.testing.expect(state.takeReloadCompletion() == null);
-    try std.testing.expect(state.acquire() == null);
+    try expectNoActiveMcpServers(&state);
 }
 
 test "reload thread start failure frees the task and copied workspace root once" {
@@ -3029,7 +3026,7 @@ test "reload thread start failure frees the task and copied workspace root once"
     try std.testing.expect(state.pending_reload == null);
 }
 
-test "authority reduction quiesces superseded tasks before detached runtime retirement" {
+test "authority reduction drains revoked servers without waiting for unrelated runtime leases" {
     if (comptime builtin.single_threaded) return error.SkipZigTest;
     const alloc = std.testing.allocator;
     var state: State = .{};
@@ -3065,12 +3062,15 @@ test "authority reduction quiesces superseded tasks before detached runtime reti
     );
 
     const retirement_deadline = io_mod.milliTimestamp() + 2_000;
-    while (!runtime.retiring.load(.acquire) and
-        io_mod.milliTimestamp() < retirement_deadline)
-    {
+    while (true) {
+        var snapshot = try runtime.snapshotHealth(alloc, 0);
+        const revoked = snapshot.servers.len == 0;
+        snapshot.deinit(alloc);
+        if (revoked) break;
+        if (io_mod.milliTimestamp() >= retirement_deadline) return error.TestWorkspaceAuthorityNotRetired;
         io_mod.sleep(std.time.ns_per_ms);
     }
-    try std.testing.expect(runtime.retiring.load(.acquire));
+    try std.testing.expect(!runtime.retiring.load(.acquire));
 
     const authentication_name = try alloc.dupe(u8, "workspace");
     const authentication = alloc.create(PendingAuthentication) catch |err| {
@@ -3099,12 +3099,9 @@ test "authority reduction quiesces superseded tasks before detached runtime reti
         60,
         false,
     );
-    try std.testing.expect(state.acquire() == null);
+    try expectNoActiveMcpServers(&state);
 
-    try std.testing.expect(state.takeReloadCompletion() == null);
-
-    active_lease.deinit();
-    active_lease_owned = false;
+    try std.testing.expect(!runtime.retiring.load(.acquire));
     var completion: ?ReloadCompletion = null;
     const completion_deadline = io_mod.milliTimestamp() + 2_000;
     while (completion == null and io_mod.milliTimestamp() < completion_deadline) {
@@ -3112,6 +3109,8 @@ test "authority reduction quiesces superseded tasks before detached runtime reti
         completion = state.takeReloadCompletion();
     }
     var loaded = completion orelse return error.TestUnexpectedResult;
+    active_lease.deinit();
+    active_lease_owned = false;
     defer loaded.deinit(alloc);
     switch (loaded) {
         .outcome => |outcome| switch (outcome) {
@@ -3122,7 +3121,7 @@ test "authority reduction quiesces superseded tasks before detached runtime reti
         },
         .failed => return error.TestUnexpectedResult,
     }
-    try std.testing.expect(state.acquire() == null);
+    try expectNoActiveMcpServers(&state);
 }
 
 test "authority reduction thread start failure falls back synchronously" {
@@ -3152,7 +3151,7 @@ test "authority reduction thread start failure falls back synchronously" {
         false,
         failPendingReloadSpawn,
     );
-    try std.testing.expect(state.acquire() == null);
+    try expectNoActiveMcpServers(&state);
     var completion = state.takeReloadCompletion() orelse
         return error.TestUnexpectedResult;
     defer completion.deinit(alloc);
