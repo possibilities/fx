@@ -4,6 +4,8 @@ const model_provider = @import("../core/config/model_provider.zig");
 const model_tool_schema = @import("../core/tooling/model_tool_schema.zig");
 const types = @import("../core/shared/types.zig");
 const image_attachments = @import("../core/images/image_attachments.zig");
+const tool_call_ids = @import("tool_call_ids.zig");
+const json_comparison = @import("json_comparison.zig");
 
 pub const ReplayLimits = struct {
     tool_calls: usize,
@@ -12,15 +14,30 @@ pub const ReplayLimits = struct {
     provider_state_bytes: usize,
 };
 
+/// Verifies captured image files and releases replay/image scratch before returning.
+/// Scratch must be independent of the writer's request-body arena.
 pub fn writeInput(
     writer: *std.Io.Writer,
-    alloc: std.mem.Allocator,
+    scratch_alloc: std.mem.Allocator,
     messages: []const types.ChatMessage,
     verified_images: ?[]const image_attachments.VerifiedSnapshot,
     limits: ReplayLimits,
+    budget: image_attachments.CaptureBudget,
 ) !void {
+    try budget.check();
+    if (verified_images != null and (messages.len != 1 or
+        messages[0].role != .user or messages[0].images.len != 0))
+    {
+        return error.InvalidVerifiedImagePlacement;
+    }
+    for (messages) |message| {
+        if (message.role == .assistant) try validateReplayMessage(scratch_alloc, message, limits);
+    }
+    var ids = try tool_call_ids.Projection.init(scratch_alloc, messages);
+    defer ids.deinit(scratch_alloc);
     var first = true;
-    for (messages, 0..) |message, message_index| {
+    for (messages) |message| {
+        try budget.check();
         switch (message.role) {
             .system => continue,
             .user => {
@@ -34,20 +51,25 @@ pub fn writeInput(
                     first_part = false;
                 };
                 if (verified_images) |images| {
-                    if (message_index == messages.len - 1) {
-                        for (images) |image| {
-                            if (!first_part) try writer.writeByte(',');
-                            try writeInputImage(writer, alloc, image);
-                            first_part = false;
-                        }
+                    for (images) |image| {
+                        if (!first_part) try writer.writeByte(',');
+                        try writeInputImage(writer, image, budget);
+                        first_part = false;
+                    }
+                } else {
+                    for (message.images) |attachment| {
+                        var image = try image_attachments.loadVerifiedSnapshot(scratch_alloc, attachment, budget);
+                        defer image.deinit(scratch_alloc);
+                        if (!first_part) try writer.writeByte(',');
+                        try writeInputImage(writer, image, budget);
+                        first_part = false;
                     }
                 }
                 try writer.writeAll("]}");
             },
             .assistant => {
-                try validateReplayMessage(message, limits);
                 if (message.provider_state_json) |state_json| {
-                    var state = std.json.parseFromSlice(std.json.Value, alloc, state_json, .{}) catch
+                    var state = std.json.parseFromSlice(std.json.Value, scratch_alloc, state_json, .{}) catch
                         return error.InvalidProviderState;
                     defer state.deinit();
                     if (state.value != .array) return error.InvalidProviderState;
@@ -61,12 +83,17 @@ pub fn writeInput(
                     try writeComma(writer, &first);
                     try writer.writeAll("{\"type\":\"message\",\"role\":\"assistant\",\"status\":\"completed\",\"content\":[{\"type\":\"output_text\",\"text\":");
                     try std.json.Stringify.value(content, .{}, writer);
-                    try writer.writeAll(",\"annotations\":[]}]}");
+                    try writer.writeAll(",\"annotations\":[]}]");
+                    if (message.assistant_phase) |phase| {
+                        try writer.writeAll(",\"phase\":");
+                        try std.json.Stringify.value(@tagName(phase), .{}, writer);
+                    }
+                    try writer.writeByte('}');
                 };
                 for (message.tool_calls) |call| {
                     try writeComma(writer, &first);
                     try writer.writeAll("{\"type\":\"function_call\",\"call_id\":");
-                    try std.json.Stringify.value(call.id, .{}, writer);
+                    try std.json.Stringify.value(ids.resolve(call.id), .{}, writer);
                     try writer.writeAll(",\"name\":");
                     try std.json.Stringify.value(call.name, .{}, writer);
                     try writer.writeAll(",\"arguments\":");
@@ -77,16 +104,161 @@ pub fn writeInput(
             .tool => {
                 try writeComma(writer, &first);
                 try writer.writeAll("{\"type\":\"function_call_output\",\"call_id\":");
-                try std.json.Stringify.value(message.tool_call_id orelse "", .{}, writer);
+                try std.json.Stringify.value(ids.resolve(message.tool_call_id orelse ""), .{}, writer);
                 try writer.writeAll(",\"output\":");
-                try std.json.Stringify.value(message.content orelse "", .{}, writer);
+                const tool_images = if (message.tool_result_memory) |memory| memory.tool_images else &.{};
+                if (tool_images.len == 0) {
+                    try std.json.Stringify.value(message.content orelse "", .{}, writer);
+                } else {
+                    const failed = message.tool_result_status == .failure;
+                    const text = if (failed) try std.fmt.allocPrint(scratch_alloc, "Tool error: {s}", .{message.content orelse ""}) else message.content orelse "";
+                    defer if (failed) scratch_alloc.free(text);
+                    try writer.writeByte('[');
+                    if (text.len > 0) {
+                        try writer.writeAll("{\"type\":\"input_text\",\"text\":");
+                        try std.json.Stringify.value(text, .{}, writer);
+                        try writer.writeByte('}');
+                    }
+                    for (tool_images, 0..) |image, index| {
+                        try budget.check();
+                        const url = try std.fmt.allocPrint(scratch_alloc, "data:{s};base64,{s}", .{ image.mime_type, image.data });
+                        defer scratch_alloc.free(url);
+                        if (index > 0 or text.len > 0) try writer.writeByte(',');
+                        try writer.writeAll("{\"type\":\"input_image\",\"image_url\":");
+                        try std.json.Stringify.value(url, .{}, writer);
+                        try writer.writeByte('}');
+                        try budget.check();
+                    }
+                    try writer.writeByte(']');
+                }
                 try writer.writeByte('}');
             },
         }
     }
 }
 
-fn validateReplayMessage(message: types.ChatMessage, limits: ReplayLimits) !void {
+test "Responses request projects long call ids with matching outputs" {
+    const source_id = "c" ** 65;
+    const calls = [_]types.ToolCall{.{ .id = source_id, .name = "read_file", .arguments_json = "{}" }};
+    const images = [_]types.ToolImage{.{ .data = @constCast("cG5n"), .mime_type = @constCast("image/png") }};
+    for ([_]bool{ false, true }) |with_images| {
+        const messages = [_]types.ChatMessage{
+            .{ .role = .assistant, .tool_calls = &calls },
+            .{ .role = .tool, .tool_call_id = source_id, .tool_name = "read_file", .content = "result", .tool_result_memory = if (with_images) .{ .tool_images = &images } else null },
+        };
+        var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
+        defer out.deinit();
+        try out.writer.writeByte('[');
+        try writeInput(&out.writer, std.testing.allocator, &messages, null, .{ .tool_calls = 128, .tool_identity_bytes = 256, .tool_arguments_bytes = 4096, .provider_state_bytes = 4096 }, .{});
+        try out.writer.writeByte(']');
+        const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, out.written(), .{});
+        defer parsed.deinit();
+        const items = parsed.value.array.items;
+        const call_id = items[0].object.get("call_id").?.string;
+        try std.testing.expect(call_id.len <= 64);
+        try std.testing.expectEqualStrings(call_id, items[1].object.get("call_id").?.string);
+        try std.testing.expectEqualStrings(source_id, calls[0].id);
+        if (with_images) {
+            const output = items[1].object.get("output").?.array.items;
+            try std.testing.expectEqual(@as(usize, 2), output.len);
+            try std.testing.expectEqualStrings("result", output[0].object.get("text").?.string);
+            try std.testing.expectEqualStrings("input_image", output[1].object.get("type").?.string);
+            try std.testing.expectEqualStrings("data:image/png;base64,cG5n", output[1].object.get("image_url").?.string);
+        } else {
+            try std.testing.expectEqualStrings("result", items[1].object.get("output").?.string);
+        }
+    }
+}
+
+test "Responses request preserves opaque tool-call identity" {
+    const state = "[{\"type\":\"reasoning\",\"id\":\"rs_1\",\"encrypted_content\":\"opaque\",\"summary\":[]}]";
+    const calls = [_]types.ToolCall{.{ .id = "signed:0", .name = "read_file", .arguments_json = "{}" }};
+    const messages = [_]types.ChatMessage{
+        .{ .role = .assistant, .tool_calls = &calls, .provider_state_json = state },
+        .{ .role = .tool, .tool_call_id = "signed:0", .tool_name = "read_file", .content = "result" },
+    };
+    var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+    try out.writer.writeByte('[');
+    try writeInput(&out.writer, std.testing.allocator, &messages, null, .{ .tool_calls = 128, .tool_identity_bytes = 256, .tool_arguments_bytes = 4096, .provider_state_bytes = 4096 }, .{});
+    try out.writer.writeByte(']');
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, out.written(), .{});
+    defer parsed.deinit();
+    const items = parsed.value.array.items;
+    try std.testing.expectEqualStrings("opaque", items[0].object.get("encrypted_content").?.string);
+    try std.testing.expectEqualStrings("signed:0", items[1].object.get("call_id").?.string);
+    try std.testing.expectEqualStrings("signed:0", items[2].object.get("call_id").?.string);
+    try std.testing.expectEqualStrings(state, messages[0].provider_state_json.?);
+}
+
+test "Responses request preserves assistant commentary phase" {
+    const calls = [_]types.ToolCall{.{
+        .id = "call_1",
+        .name = "read_file",
+        .arguments_json = "{}",
+    }};
+    const messages = [_]types.ChatMessage{
+        .{
+            .role = .assistant,
+            .content = "I will inspect the file first.",
+            .tool_calls = &calls,
+            .assistant_phase = .commentary,
+        },
+        .{
+            .role = .tool,
+            .tool_call_id = "call_1",
+            .tool_name = "read_file",
+            .content = "contents",
+        },
+    };
+    var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+    try out.writer.writeByte('[');
+    try writeInput(&out.writer, std.testing.allocator, &messages, null, .{
+        .tool_calls = 128,
+        .tool_identity_bytes = 256,
+        .tool_arguments_bytes = 4096,
+        .provider_state_bytes = 4096,
+    }, .{});
+    try out.writer.writeByte(']');
+
+    const parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        std.testing.allocator,
+        out.written(),
+        .{},
+    );
+    defer parsed.deinit();
+    const item = parsed.value.array.items[0].object;
+    try std.testing.expectEqualStrings("message", item.get("type").?.string);
+    try std.testing.expectEqualStrings("commentary", item.get("phase").?.string);
+}
+
+test "non-object provider-owned arguments retain their Responses representation" {
+    const calls = [_]types.ToolCall{.{ .id = "native", .name = "native_tool", .arguments_json = "[]", .provenance = .provider_executed, .provider_result = "native result" }};
+    const messages = [_]types.ChatMessage{.{ .role = .assistant, .tool_calls = &calls }};
+    var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+    try writeInput(&out.writer, std.testing.allocator, &messages, null, .{ .tool_calls = 128, .tool_identity_bytes = 256, .tool_arguments_bytes = 4096, .provider_state_bytes = 4096 }, .{});
+    try std.testing.expect(std.mem.find(u8, out.written(), "\"arguments\":\"[]\"") != null);
+}
+
+test "non-object function arguments cannot enter a Responses request" {
+    for ([_][]const u8{ "[]", "42", "null", "true", "\"text\"", "{]" }) |arguments| {
+        const calls = [_]types.ToolCall{.{ .id = "call", .name = "read_file", .arguments_json = arguments }};
+        const messages = [_]types.ChatMessage{.{ .role = .assistant, .tool_calls = &calls }};
+        var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
+        defer out.deinit();
+        try std.testing.expectError(error.InvalidToolArguments, writeInput(&out.writer, std.testing.allocator, &messages, null, .{
+            .tool_calls = 128,
+            .tool_identity_bytes = 256,
+            .tool_arguments_bytes = 4096,
+            .provider_state_bytes = 4096,
+        }, .{}));
+    }
+}
+
+fn validateReplayMessage(alloc: std.mem.Allocator, message: types.ChatMessage, limits: ReplayLimits) !void {
     if (message.provider_state_json) |state_json| {
         if (state_json.len > limits.provider_state_bytes) return error.ProviderStateTooLarge;
     }
@@ -100,23 +272,228 @@ fn validateReplayMessage(message: types.ChatMessage, limits: ReplayLimits) !void
         if (call.arguments_json.len > limits.tool_arguments_bytes) {
             return error.ToolArgumentsTooLarge;
         }
+        if (call.provenance != .provider_executed and
+            try types.ToolArgumentIntegrity.classifyFunctionInput(alloc, call.arguments_json) != .valid)
+        {
+            return error.InvalidToolArguments;
+        }
     }
+}
+
+const ImageInputTest = struct {
+    const limits = ReplayLimits{ .tool_calls = 128, .tool_identity_bytes = 256, .tool_arguments_bytes = 4096, .provider_state_bytes = 4096 };
+
+    fn capture(alloc: std.mem.Allocator, tmp: *std.testing.TmpDir, name: []const u8, bytes: []const u8, id: usize) !types.ImageAttachment {
+        const io_mod = @import("../core/shared/io.zig");
+        try tmp.dir.writeFile(std.testing.io, .{ .sub_path = name, .data = bytes });
+        const path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, name);
+        defer alloc.free(path);
+        const source = [_]types.ImageAttachment{.{ .id = id, .path = @constCast(path), .media_type = @constCast("image/png") }};
+        const owned = try types.dupeImageAttachmentSlice(alloc, &source);
+        defer alloc.free(owned);
+        var attachment = owned[0];
+        errdefer types.freeImageAttachment(alloc, attachment);
+        const snapshot_dir = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+        defer alloc.free(snapshot_dir);
+        try image_attachments.captureImageSnapshot(alloc, &attachment, snapshot_dir);
+        return attachment;
+    }
+
+    fn write(alloc: std.mem.Allocator, writer: *std.Io.Writer, messages: []const types.ChatMessage, verified: ?[]const image_attachments.VerifiedSnapshot) !void {
+        try writer.writeByte('[');
+        try writeInput(writer, alloc, messages, verified, limits, .{});
+        try writer.writeByte(']');
+    }
+};
+
+test "Responses images remain on their owning users across tools and later prompts" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const first = try ImageInputTest.capture(alloc, &tmp, "first.png", "\x89PNG\r\n\x1a\nA", 1);
+    defer types.freeImageAttachment(alloc, first);
+    const second = try ImageInputTest.capture(alloc, &tmp, "second.png", "\x89PNG\r\n\x1a\nB", 2);
+    defer types.freeImageAttachment(alloc, second);
+    const calls = [_]types.ToolCall{.{ .id = "read_1", .name = "read_file", .arguments_json = "{}" }};
+    const tool_images = [_]types.ToolImage{.{ .data = @constCast("cG5n"), .mime_type = @constCast("image/png") }};
+    const messages = [_]types.ChatMessage{
+        .{ .role = .user, .content = "first", .images = &.{first} },
+        .{ .role = .assistant, .tool_calls = &calls },
+        .{ .role = .tool, .tool_call_id = "read_1", .tool_name = "read_file", .content = "read result", .tool_result_memory = .{ .tool_images = &tool_images } },
+        .{ .role = .user, .content = "second", .images = &.{ second, first } },
+        .{ .role = .assistant, .content = "response" },
+        .{ .role = .user, .content = "continue" },
+    };
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    defer out.deinit();
+    try ImageInputTest.write(alloc, &out.writer, &messages, null);
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, out.written(), .{});
+    defer parsed.deinit();
+    const items = parsed.value.array.items;
+    try std.testing.expectEqual(@as(usize, 6), items.len);
+    const first_parts = items[0].object.get("content").?.array.items;
+    const second_parts = items[3].object.get("content").?.array.items;
+    try std.testing.expectEqual(@as(usize, 2), first_parts.len);
+    try std.testing.expectEqual(@as(usize, 3), second_parts.len);
+    try std.testing.expectEqualStrings("data:image/png;base64,iVBORw0KGgpB", first_parts[1].object.get("image_url").?.string);
+    try std.testing.expectEqualStrings("data:image/png;base64,iVBORw0KGgpC", second_parts[1].object.get("image_url").?.string);
+    try std.testing.expectEqualStrings("data:image/png;base64,iVBORw0KGgpB", second_parts[2].object.get("image_url").?.string);
+    const tool_parts = items[2].object.get("output").?.array.items;
+    try std.testing.expectEqual(@as(usize, 2), tool_parts.len);
+    try std.testing.expectEqualStrings("read result", tool_parts[0].object.get("text").?.string);
+    try std.testing.expectEqualStrings("data:image/png;base64,cG5n", tool_parts[1].object.get("image_url").?.string);
+    try std.testing.expectEqual(@as(usize, 1), items[5].object.get("content").?.array.items.len);
+}
+
+test "Responses preverified image input rejects ambiguous message ownership" {
+    const images = [_]image_attachments.VerifiedSnapshot{.{ .bytes = @constCast("verified"), .media_type = "image/png" }};
+    const attachment = types.ImageAttachment{ .path = @constCast("must-not-read"), .media_type = @constCast("image/png") };
+    const cases = [_][]const types.ChatMessage{
+        &.{},
+        &.{.{ .role = .assistant, .content = "not a user" }},
+        &.{ .{ .role = .user, .content = "first" }, .{ .role = .user, .content = "second" } },
+        &.{.{ .role = .user, .content = "mixed", .images = &.{attachment} }},
+    };
+    for (cases) |messages| {
+        var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
+        defer out.deinit();
+        try std.testing.expectError(error.InvalidVerifiedImagePlacement, ImageInputTest.write(std.testing.allocator, &out.writer, messages, &images));
+    }
+}
+
+test "Responses images use captured bytes and reject unavailable snapshots" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const attachment = try ImageInputTest.capture(alloc, &tmp, "source.png", "\x89PNG\r\n\x1a\nA", 1);
+    defer types.freeImageAttachment(alloc, attachment);
+    const messages = [_]types.ChatMessage{.{ .role = .user, .images = &.{attachment} }};
+    try tmp.dir.deleteFile(std.testing.io, "source.png");
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    defer out.deinit();
+    try ImageInputTest.write(alloc, &out.writer, &messages, null);
+    try std.testing.expect(std.mem.find(u8, out.written(), "data:image/png;base64,iVBORw0KGgpB") != null);
+    const snapshot_name = std.fs.path.basename(attachment.snapshot_path.?);
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = snapshot_name, .data = "\x89PNG\r\n\x1a\nB" });
+    try std.testing.expectError(error.ImageSnapshotCorrupt, ImageInputTest.write(alloc, &out.writer, &messages, null));
+    try tmp.dir.deleteFile(std.testing.io, snapshot_name);
+    try std.testing.expectError(error.FileNotFound, ImageInputTest.write(alloc, &out.writer, &messages, null));
+}
+
+test "Responses images release scratch between images and on writer failure" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var bytes: [32 * 1024]u8 = undefined;
+    @memset(&bytes, 'x');
+    @memcpy(bytes[0..8], "\x89PNG\r\n\x1a\n");
+    const attachment = try ImageInputTest.capture(alloc, &tmp, "source.png", &bytes, 1);
+    defer types.freeImageAttachment(alloc, attachment);
+    const messages = [_]types.ChatMessage{.{ .role = .user, .images = &.{ attachment, attachment, attachment } }};
+    var scratch_bytes: [96 * 1024]u8 = undefined;
+    var scratch: std.heap.FixedBufferAllocator = .init(&scratch_bytes);
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    defer out.deinit();
+    try ImageInputTest.write(scratch.allocator(), &out.writer, &messages, null);
+    try std.testing.expectEqual(@as(usize, 0), scratch.end_index);
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, out.written(), .{});
+    defer parsed.deinit();
+    const parts = parsed.value.array.items[0].object.get("content").?.array.items;
+    try std.testing.expectEqual(@as(usize, 3), parts.len);
+    for (parts) |part| {
+        const url = part.object.get("image_url").?.string;
+        const encoded = url["data:image/png;base64,".len..];
+        var decoded: [bytes.len]u8 = undefined;
+        try std.base64.standard.Decoder.decode(&decoded, encoded);
+        try std.testing.expectEqualSlices(u8, &bytes, &decoded);
+    }
+    var small_buffer: [80]u8 = undefined;
+    var small_writer: std.Io.Writer = .fixed(&small_buffer);
+    try std.testing.expectError(error.WriteFailed, ImageInputTest.write(scratch.allocator(), &small_writer, &messages, null));
+    try std.testing.expectEqual(@as(usize, 0), scratch.end_index);
+}
+
+fn expectImageInputAllocations(alloc: std.mem.Allocator, attachment: types.ImageAttachment) !void {
+    var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+    try ImageInputTest.write(alloc, &out.writer, &.{.{ .role = .user, .images = &.{attachment} }}, null);
+}
+
+test "Responses images release verification allocations on failure" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const attachment = try ImageInputTest.capture(alloc, &tmp, "source.png", "\x89PNG\r\n\x1a\nA", 1);
+    defer types.freeImageAttachment(alloc, attachment);
+    try std.testing.checkAllAllocationFailures(alloc, expectImageInputAllocations, .{attachment});
+}
+
+test "Responses image requests obey cancellation and expired deadlines before loading" {
+    var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+    const attachment = types.ImageAttachment{ .path = @constCast("must-not-read"), .media_type = @constCast("image/png") };
+    const messages = [_]types.ChatMessage{.{ .role = .user, .images = &.{attachment} }};
+    var cancelled: std.atomic.Value(bool) = .init(true);
+    try std.testing.expectError(error.Cancelled, writeInput(&out.writer, std.testing.allocator, &messages, null, ImageInputTest.limits, .{ .cancel_flag = &cancelled }));
+    try std.testing.expectError(error.TimedOut, writeInput(&out.writer, std.testing.allocator, &messages, null, ImageInputTest.limits, .{ .deadline = .fromNow(std.testing.io, .{ .clock = .awake, .raw = .fromMilliseconds(-1) }) }));
+    try std.testing.expectEqual(@as(usize, 0), out.written().len);
+}
+
+test "Responses image encoding observes cancellation after partial output" {
+    const Cancel = struct {
+        fn check(raw: *anyopaque) !void {
+            const out: *std.Io.Writer.Allocating = @ptrCast(@alignCast(raw));
+            if (out.written().len > 1024) return error.Cancelled;
+        }
+    };
+    var bytes: [32 * 1024]u8 = undefined;
+    @memset(&bytes, 'x');
+    var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+    try std.testing.expectError(error.Cancelled, writeInputImage(&out.writer, .{ .bytes = &bytes, .media_type = "image/png" }, .{ .test_hook = .{ .ctx = &out, .check = Cancel.check } }));
+    try std.testing.expect(out.written().len > 1024);
+    try std.testing.expect(out.written().len < bytes.len);
+}
+
+test "Responses tool images observe cancellation after bounded image output" {
+    const Cancel = struct {
+        fn check(raw: *anyopaque) !void {
+            const out: *std.Io.Writer.Allocating = @ptrCast(@alignCast(raw));
+            if (out.written().len > 1024) return error.Cancelled;
+        }
+    };
+    var data: [32 * 1024]u8 = undefined;
+    @memset(&data, 'A');
+    const images = [_]types.ToolImage{.{ .data = &data, .mime_type = @constCast("image/png") }};
+    const calls = [_]types.ToolCall{.{ .id = "capture_1", .name = "capture", .arguments_json = "{}" }};
+    const messages = [_]types.ChatMessage{
+        .{ .role = .assistant, .tool_calls = &calls },
+        .{ .role = .tool, .tool_call_id = "capture_1", .tool_name = "capture", .content = "capture", .tool_result_memory = .{ .tool_images = &images } },
+    };
+    var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+    try std.testing.expectError(error.Cancelled, writeInput(&out.writer, std.testing.allocator, &messages, null, ImageInputTest.limits, .{ .test_hook = .{ .ctx = &out, .check = Cancel.check } }));
+    try std.testing.expect(out.written().len > data.len);
 }
 
 fn writeInputImage(
     writer: *std.Io.Writer,
-    alloc: std.mem.Allocator,
     image: image_attachments.VerifiedSnapshot,
+    budget: image_attachments.CaptureBudget,
 ) !void {
-    const encoded_len = std.base64.standard.Encoder.calcSize(image.bytes.len);
-    const encoded = try alloc.alloc(u8, encoded_len);
-    defer alloc.free(encoded);
-    _ = std.base64.standard.Encoder.encode(encoded, image.bytes);
+    try budget.check();
     try writer.writeAll("{\"type\":\"input_image\",\"detail\":\"auto\",\"image_url\":\"data:");
     try writer.writeAll(image.media_type);
     try writer.writeAll(";base64,");
-    try writer.writeAll(encoded);
+    var offset: usize = 0;
+    while (offset < image.bytes.len) {
+        try budget.check();
+        const end = @min(offset + 3 * 1024, image.bytes.len);
+        try std.base64.standard.Encoder.encodeWriter(writer, image.bytes[offset..end]);
+        offset = end;
+    }
     try writer.writeAll("\"}");
+    try budget.check();
 }
 
 fn writeComma(writer: *std.Io.Writer, first: *bool) !void {
@@ -199,15 +576,160 @@ const ToolAccumulator = struct {
     output_index: i64,
     id: []u8,
     name: []u8,
+    item_id: ?[]u8 = null,
     arguments: std.ArrayList(u8) = .empty,
+    arguments_finalized: bool = false,
 
     fn deinit(self: *ToolAccumulator, alloc: std.mem.Allocator) void {
         alloc.free(self.id);
         alloc.free(self.name);
+        if (self.item_id) |id| alloc.free(id);
         self.arguments.deinit(alloc);
         self.* = undefined;
     }
+
+    fn reconcileIdentity(
+        self: *ToolAccumulator,
+        alloc: std.mem.Allocator,
+        fields: std.json.ObjectMap,
+        item_id_key: []const u8,
+        limits: StreamLimits,
+    ) !void {
+        try checkOptionalIdentity(fields, "call_id", self.id);
+        try checkOptionalIdentity(fields, "name", self.name);
+        if (fields.get(item_id_key)) |value| {
+            if (value != .string or value.string.len == 0) return error.InvalidEvent;
+            if (value.string.len > limits.tool_identity_bytes) return error.ToolCallLimitExceeded;
+            if (self.item_id) |id| {
+                if (!std.mem.eql(u8, id, value.string)) return error.ResponsesToolCallConflict;
+            } else {
+                self.item_id = try alloc.dupe(u8, value.string);
+            }
+        }
+    }
+
+    fn finalizeArguments(
+        self: *ToolAccumulator,
+        alloc: std.mem.Allocator,
+        arguments: []const u8,
+        callbacks: StreamCallbacks,
+        limits: StreamLimits,
+    ) !void {
+        if (arguments.len > limits.tool_arguments_bytes) return error.ToolArgumentsTooLarge;
+        if (self.arguments_finalized) {
+            if (!try json_comparison.serializedEqual(alloc, self.arguments.items, arguments)) return error.ResponsesToolCallConflict;
+            return;
+        }
+        const previous_len = self.arguments.items.len;
+        if (std.mem.startsWith(u8, arguments, self.arguments.items)) {
+            const suffix = arguments[previous_len..];
+            try appendToolArguments(alloc, &self.arguments, suffix, limits.tool_arguments_bytes);
+            if (suffix.len > 0) if (callbacks.on_tool_input) |callback| callback(callbacks.context, suffix);
+        } else {
+            try self.arguments.ensureTotalCapacity(alloc, arguments.len);
+            self.arguments.clearRetainingCapacity();
+            self.arguments.appendSliceAssumeCapacity(arguments);
+        }
+        self.arguments_finalized = true;
+    }
 };
+
+fn checkOptionalIdentity(fields: std.json.ObjectMap, key: []const u8, expected: []const u8) !void {
+    if (fields.get(key)) |value| {
+        if (value != .string) return error.InvalidEvent;
+        if (!std.mem.eql(u8, value.string, expected)) return error.ResponsesToolCallConflict;
+    }
+}
+
+fn optional_index(fields: std.json.ObjectMap, name: []const u8) error{InvalidEvent}!?i64 {
+    const value = fields.get(name) orelse return null;
+    if (value != .integer or value.integer < 0) return error.InvalidEvent;
+    return value.integer;
+}
+
+const TextKey = struct {
+    output_index: i64,
+    content_index: i64,
+
+    fn precedes(self: TextKey, other: TextKey) bool {
+        return self.output_index < other.output_index or
+            (self.output_index == other.output_index and self.content_index < other.content_index);
+    }
+};
+
+const TextKind = enum { text, refusal };
+const TextMode = enum { delta, final };
+const TextDigest = std.crypto.hash.sha2.Sha256;
+
+const TextUpdate = struct {
+    key: TextKey,
+    kind: TextKind,
+    item_id_hash: ?[TextDigest.digest_length]u8,
+    text: []const u8,
+    mode: TextMode,
+};
+
+const TextPart = struct {
+    kind: TextKind,
+    item_id_hash: ?[TextDigest.digest_length]u8 = null,
+    received_bytes: usize = 0,
+    digest: TextDigest = .init(.{}),
+    finalized: bool = false,
+
+    // Receipt is independent of capture: capped text cannot validate a final prefix.
+    fn final_suffix(self: *const TextPart, text: []const u8) ![]const u8 {
+        if (text.len < self.received_bytes or
+            (self.finalized and text.len != self.received_bytes)) return error.ResponsesTextConflict;
+        var actual: [TextDigest.digest_length]u8 = undefined;
+        TextDigest.hash(text[0..self.received_bytes], &actual, .{});
+        var prior = self.digest;
+        const expected = prior.finalResult();
+        if (!std.mem.eql(u8, &actual, &expected)) return error.ResponsesTextConflict;
+        return text[self.received_bytes..];
+    }
+};
+
+fn text_key(fields: std.json.ObjectMap) !TextKey {
+    return .{
+        .output_index = try optional_index(fields, "output_index") orelse 0,
+        .content_index = try optional_index(fields, "content_index") orelse 0,
+    };
+}
+
+fn text_identity(fields: std.json.ObjectMap, name: []const u8) !?[TextDigest.digest_length]u8 {
+    const value = fields.get(name) orelse return null;
+    if (value != .string or value.string.len == 0) return error.InvalidEvent;
+    var digest: [TextDigest.digest_length]u8 = undefined;
+    TextDigest.hash(value.string, &digest, .{});
+    return digest;
+}
+
+const AssistantPhaseAccumulator = union(enum) {
+    empty,
+    value: types.AssistantMessagePhase,
+    conflicting,
+
+    fn observe(self: *AssistantPhaseAccumulator, candidate: ?types.AssistantMessagePhase) void {
+        const phase = candidate orelse return;
+        self.* = switch (self.*) {
+            .empty => .{ .value = phase },
+            .value => |current| if (current == phase) .{ .value = current } else .conflicting,
+            .conflicting => .conflicting,
+        };
+    }
+
+    fn resolved(self: AssistantPhaseAccumulator) ?types.AssistantMessagePhase {
+        return switch (self) {
+            .value => |phase| phase,
+            .empty, .conflicting => null,
+        };
+    }
+};
+
+fn assistantMessagePhase(fields: std.json.ObjectMap) ?types.AssistantMessagePhase {
+    const raw = stringField(fields, "phase") orelse return null;
+    return std.meta.stringToEnum(types.AssistantMessagePhase, raw);
+}
 
 pub const Reducer = struct {
     content: std.ArrayList(u8) = .empty,
@@ -218,7 +740,10 @@ pub const Reducer = struct {
     usage: types.Usage = .{},
     generation_id: ?[]u8 = null,
     terminal_seen: bool = false,
-    saw_content_delta: bool = false,
+    text_parts: std.AutoHashMapUnmanaged(TextKey, TextPart) = .empty,
+    last_text_key: ?TextKey = null,
+    text_bytes: usize = 0,
+    assistant_phase: AssistantPhaseAccumulator = .empty,
     event_count: usize = 0,
     aggregate_bytes: usize = 0,
 
@@ -228,6 +753,7 @@ pub const Reducer = struct {
 
     pub fn deinit(self: *Reducer, alloc: std.mem.Allocator) void {
         self.content.deinit(alloc);
+        self.text_parts.deinit(alloc);
         self.provider_state.deinit();
         for (self.tools.items) |*tool| tool.deinit(alloc);
         self.tools.deinit(alloc);
@@ -247,6 +773,7 @@ pub const Reducer = struct {
         limits: StreamLimits,
     ) !bool {
         if (cancel_flag.load(.seq_cst)) return error.Cancelled;
+        if (self.terminal_seen) return true;
         self.event_count = try checkedAccumulatedSize(self.event_count, 1, limits.events);
         if (limits.count_json_bytes) {
             self.aggregate_bytes = try checkedAccumulatedSize(
@@ -255,14 +782,16 @@ pub const Reducer = struct {
                 limits.aggregate_bytes,
             );
         }
-        var parsed = std.json.parseFromSlice(std.json.Value, alloc, json_text, .{}) catch
-            return error.InvalidEvent;
+        var parsed = std.json.parseFromSlice(std.json.Value, alloc, json_text, .{}) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return error.InvalidEvent,
+        };
         defer parsed.deinit();
         if (parsed.value != .object) return false;
         const event_type = stringField(parsed.value.object, "type") orelse return false;
 
         if (std.mem.eql(u8, event_type, "response.output_item.added")) {
-            const output_index = integerField(parsed.value.object, "output_index") orelse return false;
+            const output_index = try optional_index(parsed.value.object, "output_index") orelse return false;
             const item = parsed.value.object.get("item") orelse return false;
             if (item != .object) return false;
             const item_type = stringField(item.object, "type") orelse return false;
@@ -271,18 +800,47 @@ pub const Reducer = struct {
                 const name = stringField(item.object, "name") orelse return false;
                 if (findTool(self.tools.items, output_index) == null) {
                     try appendTool(alloc, &self.tools, output_index, call_id, name, limits);
+                    const tool = &self.tools.items[self.tools.items.len - 1];
+                    try tool.reconcileIdentity(alloc, item.object, "id", limits);
+                    if (item.object.get("arguments")) |value| {
+                        if (value != .string) return error.InvalidEvent;
+                        try appendToolArguments(alloc, &tool.arguments, value.string, limits.tool_arguments_bytes);
+                    }
                     if (callbacks.on_tool_start) |callback| {
                         callback(callbacks.context, call_id, name, null);
                     }
+                } else {
+                    const index = findTool(self.tools.items, output_index).?;
+                    try self.tools.items[index].reconcileIdentity(alloc, item.object, "id", limits);
                 }
+            } else if (std.mem.eql(u8, item_type, "message")) {
+                self.assistant_phase.observe(assistantMessagePhase(item.object));
             }
         } else if (std.mem.eql(u8, event_type, "response.output_text.delta") or
             std.mem.eql(u8, event_type, "response.refusal.delta"))
         {
-            const delta = stringField(parsed.value.object, "delta") orelse return false;
-            self.saw_content_delta = true;
-            callbacks.on_content(callbacks.context, delta);
-            try appendCaptured(alloc, &self.content, delta, content_capture_limit);
+            try self.accept_text(alloc, .{
+                .key = try text_key(parsed.value.object),
+                .kind = if (std.mem.eql(u8, event_type, "response.refusal.delta")) .refusal else .text,
+                .item_id_hash = try text_identity(parsed.value.object, "item_id"),
+                .text = stringField(parsed.value.object, "delta") orelse return error.InvalidEvent,
+                .mode = .delta,
+            }, callbacks, content_capture_limit, limits);
+        } else if (std.mem.eql(u8, event_type, "response.output_text.done") or
+            std.mem.eql(u8, event_type, "response.refusal.done"))
+        {
+            const refusal = std.mem.eql(u8, event_type, "response.refusal.done");
+            try self.accept_text(alloc, .{
+                .key = try text_key(parsed.value.object),
+                .kind = if (refusal) .refusal else .text,
+                .item_id_hash = try text_identity(parsed.value.object, "item_id"),
+                .text = stringField(parsed.value.object, if (refusal) "refusal" else "text") orelse return error.InvalidEvent,
+                .mode = .final,
+            }, callbacks, content_capture_limit, limits);
+        } else if (std.mem.eql(u8, event_type, "response.content_part.done")) {
+            const part = parsed.value.object.get("part") orelse return error.InvalidEvent;
+            if (part != .object) return error.InvalidEvent;
+            try self.finalize_text_part(alloc, try text_key(parsed.value.object), try text_identity(parsed.value.object, "item_id"), part.object, callbacks, content_capture_limit, limits);
         } else if (std.mem.eql(u8, event_type, "response.reasoning_summary_text.delta") or
             std.mem.eql(u8, event_type, "response.reasoning_text.delta"))
         {
@@ -291,37 +849,26 @@ pub const Reducer = struct {
         } else if (std.mem.eql(u8, event_type, "response.reasoning_summary_part.done")) {
             if (callbacks.on_reasoning) |callback| callback(callbacks.context, "\n\n");
         } else if (std.mem.eql(u8, event_type, "response.function_call_arguments.delta")) {
-            const output_index = integerField(parsed.value.object, "output_index") orelse return false;
+            const output_index = try optional_index(parsed.value.object, "output_index") orelse return false;
             const delta = stringField(parsed.value.object, "delta") orelse return false;
             const index = findTool(self.tools.items, output_index) orelse return false;
+            try self.tools.items[index].reconcileIdentity(alloc, parsed.value.object, "item_id", limits);
+            if (self.tools.items[index].arguments_finalized and delta.len > 0) return error.ResponsesToolCallConflict;
             try appendToolArguments(alloc, &self.tools.items[index].arguments, delta, limits.tool_arguments_bytes);
             if (callbacks.on_tool_input) |callback| callback(callbacks.context, delta);
         } else if (std.mem.eql(u8, event_type, "response.function_call_arguments.done")) {
-            const output_index = integerField(parsed.value.object, "output_index") orelse return false;
-            const arguments = stringField(parsed.value.object, "arguments") orelse return false;
-            const index = findTool(self.tools.items, output_index) orelse return false;
-            const previous_len = self.tools.items[index].arguments.items.len;
-            if (std.mem.startsWith(u8, arguments, self.tools.items[index].arguments.items)) {
-                const suffix = arguments[previous_len..];
-                try appendToolArguments(alloc, &self.tools.items[index].arguments, suffix, limits.tool_arguments_bytes);
-                if (suffix.len > 0) if (callbacks.on_tool_input) |callback| callback(callbacks.context, suffix);
-            } else {
-                self.tools.items[index].arguments.clearRetainingCapacity();
-                try appendToolArguments(alloc, &self.tools.items[index].arguments, arguments, limits.tool_arguments_bytes);
-            }
+            const output_index = try optional_index(parsed.value.object, "output_index") orelse return false;
+            const arguments = stringField(parsed.value.object, "arguments") orelse return error.InvalidEvent;
+            const index = findTool(self.tools.items, output_index) orelse return error.ResponsesToolCallConflict;
+            try self.tools.items[index].reconcileIdentity(alloc, parsed.value.object, "item_id", limits);
+            try self.tools.items[index].finalizeArguments(alloc, arguments, callbacks, limits);
         } else if (std.mem.eql(u8, event_type, "response.output_item.done")) {
-            const output_index = integerField(parsed.value.object, "output_index") orelse return false;
+            const output_index = try optional_index(parsed.value.object, "output_index") orelse return false;
             const item = parsed.value.object.get("item") orelse return false;
             if (item != .object) return false;
             const item_type = stringField(item.object, "type") orelse return false;
             if (std.mem.eql(u8, item_type, "function_call")) {
-                if (findTool(self.tools.items, output_index)) |index| {
-                    if (stringField(item.object, "arguments")) |arguments| {
-                        if (self.tools.items[index].arguments.items.len == 0) {
-                            try appendToolArguments(alloc, &self.tools.items[index].arguments, arguments, limits.tool_arguments_bytes);
-                        }
-                    }
-                }
+                try self.reconcileToolItem(alloc, output_index, item.object, callbacks, limits);
             } else if (std.mem.eql(u8, item_type, "reasoning") and
                 stringField(item.object, "encrypted_content") != null)
             {
@@ -346,16 +893,9 @@ pub const Reducer = struct {
                 }
                 try self.provider_state.writer.writeAll(encoded.written());
                 self.provider_state_count += 1;
-            } else if (std.mem.eql(u8, item_type, "message") and !self.saw_content_delta) {
-                if (item.object.get("content")) |parts| if (parts == .array) {
-                    for (parts.array.items) |part| {
-                        if (part != .object) continue;
-                        const text = stringField(part.object, "text") orelse
-                            stringField(part.object, "refusal") orelse continue;
-                        callbacks.on_content(callbacks.context, text);
-                        try appendCaptured(alloc, &self.content, text, content_capture_limit);
-                    }
-                };
+            } else if (std.mem.eql(u8, item_type, "message")) {
+                self.assistant_phase.observe(assistantMessagePhase(item.object));
+                try self.finalize_text_message(alloc, output_index, item.object, callbacks, cancel_flag, content_capture_limit, limits);
             }
         } else if (std.mem.eql(u8, event_type, "response.completed") or
             std.mem.eql(u8, event_type, "response.done") or
@@ -363,6 +903,22 @@ pub const Reducer = struct {
         {
             const response_value = parsed.value.object.get("response") orelse return false;
             if (response_value != .object) return false;
+            if (response_value.object.get("output")) |output| {
+                if (output != .array) return error.InvalidEvent;
+                for (output.array.items, 0..) |item, output_index| {
+                    if (cancel_flag.load(.seq_cst)) return error.Cancelled;
+                    if (item != .object) continue;
+                    const item_type = stringField(item.object, "type") orelse continue;
+                    const index = std.math.cast(i64, output_index) orelse return error.ResourceLimitExceeded;
+                    if (std.mem.eql(u8, item_type, "function_call")) {
+                        try self.reconcileToolItem(alloc, index, item.object, callbacks, limits);
+                    } else if (std.mem.eql(u8, item_type, "message")) {
+                        self.assistant_phase.observe(assistantMessagePhase(item.object));
+                        try self.finalize_text_message(alloc, index, item.object, callbacks, cancel_flag, content_capture_limit, limits);
+                    }
+                }
+            }
+            if (cancel_flag.load(.seq_cst)) return error.Cancelled;
             self.terminal_seen = true;
             self.finish_reason = finishReason(
                 stringField(response_value.object, "status"),
@@ -381,6 +937,106 @@ pub const Reducer = struct {
             return error.ResponseFailed;
         }
         return false;
+    }
+
+    fn accept_text(
+        self: *Reducer,
+        alloc: std.mem.Allocator,
+        update: TextUpdate,
+        callbacks: StreamCallbacks,
+        capture_limit: ?usize,
+        limits: StreamLimits,
+    ) !void {
+        if (self.text_parts.count() >= limits.events and !self.text_parts.contains(update.key)) return error.ResourceLimitExceeded;
+        const entry = try self.text_parts.getOrPut(alloc, update.key);
+        if (!entry.found_existing) entry.value_ptr.* = .{ .kind = update.kind };
+        const part = entry.value_ptr;
+        if (part.kind != update.kind) return error.ResponsesTextConflict;
+        if (update.item_id_hash) |id| {
+            if (part.item_id_hash) |prior| {
+                if (!std.mem.eql(u8, &id, &prior)) return error.ResponsesTextConflict;
+            } else part.item_id_hash = id;
+        }
+        const suffix = switch (update.mode) {
+            .final => try part.final_suffix(update.text),
+            .delta => blk: {
+                if (part.finalized and update.text.len != 0) return error.ResponsesTextConflict;
+                break :blk update.text;
+            },
+        };
+        if (suffix.len != 0) {
+            if (self.last_text_key) |last| if (update.key.precedes(last)) return error.ResponsesTextConflict;
+            const total = try checkedAccumulatedSize(self.text_bytes, suffix.len, limits.aggregate_bytes);
+            try appendCaptured(alloc, &self.content, suffix, capture_limit);
+            part.digest.update(suffix);
+            part.received_bytes += suffix.len; // Bounded by the aggregate total above.
+            self.text_bytes = total;
+            self.last_text_key = update.key;
+        }
+        if (update.mode == .final) part.finalized = true;
+        if (suffix.len != 0) callbacks.on_content(callbacks.context, suffix);
+    }
+
+    fn finalize_text_part(
+        self: *Reducer,
+        alloc: std.mem.Allocator,
+        key: TextKey,
+        item_id_hash: ?[TextDigest.digest_length]u8,
+        fields: std.json.ObjectMap,
+        callbacks: StreamCallbacks,
+        capture_limit: ?usize,
+        limits: StreamLimits,
+    ) !void {
+        const kind = stringField(fields, "type") orelse return error.InvalidEvent;
+        const refusal = std.mem.eql(u8, kind, "refusal");
+        if (!refusal and !std.mem.eql(u8, kind, "output_text")) return;
+        try self.accept_text(alloc, .{
+            .key = key,
+            .kind = if (refusal) .refusal else .text,
+            .item_id_hash = item_id_hash,
+            .text = stringField(fields, if (refusal) "refusal" else "text") orelse return error.InvalidEvent,
+            .mode = .final,
+        }, callbacks, capture_limit, limits);
+    }
+
+    fn finalize_text_message(
+        self: *Reducer,
+        alloc: std.mem.Allocator,
+        output_index: i64,
+        fields: std.json.ObjectMap,
+        callbacks: StreamCallbacks,
+        cancel_flag: *std.atomic.Value(bool),
+        capture_limit: ?usize,
+        limits: StreamLimits,
+    ) !void {
+        const parts = fields.get("content") orelse return error.InvalidEvent;
+        if (parts != .array) return error.InvalidEvent;
+        const identity = try text_identity(fields, "id");
+        for (parts.array.items, 0..) |part, content_index| {
+            if (cancel_flag.load(.seq_cst)) return error.Cancelled;
+            if (part != .object) return error.InvalidEvent;
+            try self.finalize_text_part(alloc, .{
+                .output_index = output_index,
+                .content_index = std.math.cast(i64, content_index) orelse return error.ResourceLimitExceeded,
+            }, identity, part.object, callbacks, capture_limit, limits);
+        }
+    }
+
+    fn reconcileToolItem(
+        self: *Reducer,
+        alloc: std.mem.Allocator,
+        output_index: i64,
+        fields: std.json.ObjectMap,
+        callbacks: StreamCallbacks,
+        limits: StreamLimits,
+    ) !void {
+        const index = findTool(self.tools.items, output_index) orelse return error.ResponsesToolCallConflict;
+        const tool = &self.tools.items[index];
+        try tool.reconcileIdentity(alloc, fields, "id", limits);
+        if (fields.get("arguments")) |value| {
+            if (value != .string) return error.InvalidEvent;
+            try tool.finalizeArguments(alloc, value.string, callbacks, limits);
+        }
     }
 
     pub fn finish(
@@ -418,7 +1074,7 @@ pub const Reducer = struct {
             alloc.free(call.arguments_json);
         };
         for (self.tools.items, 0..) |*tool, index| {
-            const arguments = if (tool.arguments.items.len > 0)
+            const arguments = if (tool.arguments_finalized or tool.arguments.items.len > 0)
                 try tool.arguments.toOwnedSlice(alloc)
             else
                 try alloc.dupe(u8, "{}");
@@ -437,6 +1093,7 @@ pub const Reducer = struct {
         return .{
             .content = owned_content,
             .tool_calls = owned_tools,
+            .assistant_phase = self.assistant_phase.resolved(),
             .generation_id = generation_id,
             .provider_state_json = owned_provider_state,
             .finish_reason = self.finish_reason orelse if (owned_tools.len > 0) .tool_calls else .stop,
@@ -444,6 +1101,537 @@ pub const Reducer = struct {
         };
     }
 };
+
+const ToolRecordTest = struct {
+    alloc: std.mem.Allocator,
+    reducer: Reducer,
+    cancelled: std.atomic.Value(bool) = .init(false),
+    context: u8 = 0,
+    const limits = StreamLimits{ .aggregate_bytes = 64 * 1024, .events = 100, .tool_calls = 4, .tool_identity_bytes = 1024, .tool_arguments_bytes = 4096, .provider_state_bytes = 4096 };
+    const start = "{\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"function_call\",\"id\":\"fc_1\",\"call_id\":\"call_1\",\"name\":\"write_file\",\"arguments\":\"\"}}";
+    const finalized = "{\"type\":\"response.function_call_arguments.done\",\"output_index\":0,\"item_id\":\"fc_1\",\"name\":\"write_file\",\"arguments\":\"{\\\"path\\\":\\\"preview.txt\\\"}\"}";
+    const terminal = "{\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}";
+
+    fn init(alloc: std.mem.Allocator) ToolRecordTest {
+        return .{ .alloc = alloc, .reducer = .init(alloc) };
+    }
+
+    fn deinit(self: *ToolRecordTest) void {
+        self.reducer.deinit(self.alloc);
+    }
+
+    fn apply(self: *ToolRecordTest, event: []const u8) !void {
+        _ = try self.reducer.applyJson(self.alloc, event, .{ .context = &self.context, .on_content = ignore }, &self.cancelled, null, limits);
+    }
+
+    fn finish(self: *ToolRecordTest) !types.ModelCompletion {
+        return self.reducer.finish(self.alloc, &self.cancelled, limits);
+    }
+
+    fn freeCompletion(self: *ToolRecordTest, completion: types.ModelCompletion) void {
+        types.freeToolCallSlice(self.alloc, @constCast(completion.tool_calls));
+        if (completion.content) |value| self.alloc.free(value);
+        if (completion.provider_state_json) |value| self.alloc.free(value);
+        if (completion.generation_id) |value| self.alloc.free(value);
+    }
+
+    fn ignore(_: *anyopaque, _: []const u8) void {}
+};
+
+test "Responses text finalization preserves mixed streamed and final-only items" {
+    var stream = ToolRecordTest.init(std.testing.allocator);
+    defer stream.deinit();
+    try stream.apply("{\"type\":\"response.output_text.delta\",\"output_index\":0,\"content_index\":0,\"item_id\":\"msg_0\",\"delta\":\"COMMENTARY_ITEM\\n\"}");
+    try stream.apply("{\"type\":\"response.output_item.done\",\"output_index\":1,\"item\":{\"type\":\"message\",\"id\":\"msg_1\",\"content\":[{\"type\":\"output_text\",\"text\":\"FINAL_ANSWER_ITEM\"}]}}");
+    try stream.apply(ToolRecordTest.terminal);
+    const completion = try stream.finish();
+    defer stream.freeCompletion(completion);
+    try std.testing.expectEqualStrings("COMMENTARY_ITEM\nFINAL_ANSWER_ITEM", completion.content.?);
+}
+
+const TextRecordTest = struct {
+    alloc: std.mem.Allocator,
+    reducer: Reducer,
+    cancelled: std.atomic.Value(bool) = .init(false),
+    capture_limit: ?usize = null,
+    emitted_bytes: usize = 0,
+    emitted_digest: TextDigest = .init(.{}),
+    cancel_on_content: bool = false,
+    limits: StreamLimits = ToolRecordTest.limits,
+
+    fn init(alloc: std.mem.Allocator) TextRecordTest {
+        return .{ .alloc = alloc, .reducer = .init(alloc) };
+    }
+
+    fn deinit(self: *TextRecordTest) void {
+        self.reducer.deinit(self.alloc);
+    }
+
+    fn content(raw: *anyopaque, bytes: []const u8) void {
+        const self: *TextRecordTest = @ptrCast(@alignCast(raw));
+        self.emitted_bytes += bytes.len;
+        self.emitted_digest.update(bytes);
+        if (self.cancel_on_content) self.cancelled.store(true, .seq_cst);
+    }
+
+    fn apply(self: *TextRecordTest, event: []const u8) !void {
+        _ = try self.reducer.applyJson(self.alloc, event, .{ .context = self, .on_content = content }, &self.cancelled, self.capture_limit, self.limits);
+    }
+
+    fn json(self: *TextRecordTest, event: anytype) !void {
+        var out: std.Io.Writer.Allocating = .init(self.alloc);
+        defer out.deinit();
+        try std.json.Stringify.value(event, .{}, &out.writer);
+        try self.apply(out.written());
+    }
+
+    fn delta(self: *TextRecordTest, item: i64, part: i64, text: []const u8) !void {
+        try self.json(.{ .type = "response.output_text.delta", .output_index = item, .content_index = part, .delta = text });
+    }
+
+    fn final(self: *TextRecordTest, item: i64, part: i64, text: []const u8) !void {
+        try self.json(.{ .type = "response.output_text.done", .output_index = item, .content_index = part, .text = text });
+    }
+
+    fn expect_emitted(self: *const TextRecordTest, expected: []const u8) !void {
+        try std.testing.expectEqual(expected.len, self.emitted_bytes);
+        var actual = self.emitted_digest;
+        var expected_hash: [TextDigest.digest_length]u8 = undefined;
+        TextDigest.hash(expected, &expected_hash, .{});
+        try std.testing.expectEqual(expected_hash, actual.finalResult());
+    }
+
+    fn finish(self: *TextRecordTest, expected: []const u8) !void {
+        try self.apply(ToolRecordTest.terminal);
+        var result = stream_provider.Result{ .completed = .{
+            .completion = try self.reducer.finish(self.alloc, &self.cancelled, self.limits),
+            .ownership = .owned,
+        } };
+        defer result.deinit(self.alloc);
+        const limit = self.capture_limit orelse expected.len;
+        try std.testing.expectEqualStrings(expected[0..@min(expected.len, limit)], result.completed.completion.content orelse "");
+        try self.expect_emitted(expected);
+    }
+};
+
+test "Responses text finalization converges across every final record layer" {
+    for ([_]?usize{ null, 0, 2 }) |capture_limit| {
+        var stream = TextRecordTest.init(std.testing.allocator);
+        defer stream.deinit();
+        stream.capture_limit = capture_limit;
+        try stream.delta(0, 0, "Hel");
+        try stream.final(0, 0, "Hello");
+        try stream.apply("{\"type\":\"response.content_part.done\",\"output_index\":0,\"content_index\":0,\"item_id\":\"msg\",\"part\":{\"type\":\"output_text\",\"text\":\"Hello\"}}");
+        try stream.apply("{\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"id\":\"msg\",\"type\":\"message\",\"content\":[{\"type\":\"output_text\",\"text\":\"Hello\"},{\"type\":\"refusal\",\"refusal\":\"!\"}]}}");
+        try stream.apply("{\"type\":\"response.refusal.done\",\"output_index\":0,\"content_index\":1,\"item_id\":\"msg\",\"refusal\":\"!\"}");
+        try stream.apply("{\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"output\":[{\"type\":\"message\",\"id\":\"msg\",\"content\":[{\"type\":\"output_text\",\"text\":\"Hello\"},{\"type\":\"refusal\",\"refusal\":\"!\"}]}]}}");
+        try stream.finish("Hello!");
+    }
+}
+
+test "Responses text finalization reads terminal-only messages and streamed refusals" {
+    var stream = TextRecordTest.init(std.testing.allocator);
+    defer stream.deinit();
+    try stream.apply("{\"type\":\"response.refusal.delta\",\"output_index\":0,\"delta\":\"No\"}");
+    try stream.apply("{\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"output\":[{\"type\":\"message\",\"content\":[{\"type\":\"refusal\",\"refusal\":\"No.\"}]},{\"type\":\"message\",\"content\":[{\"type\":\"output_text\",\"text\":\" Alternative.\"}]}]}}");
+    try stream.finish("No. Alternative.");
+}
+
+test "Responses text finalization retains item text when the terminal envelope is empty" {
+    var stream = TextRecordTest.init(std.testing.allocator);
+    defer stream.deinit();
+    try stream.delta(0, 0, "accepted");
+    try stream.apply("{\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"id\":\"message\",\"type\":\"message\",\"content\":[{\"type\":\"output_text\",\"text\":\"accepted final\"}]}}");
+    try stream.apply("{\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"output\":[]}}");
+    try stream.finish("accepted final");
+}
+
+test "Responses text finalization rejects contradictory content identity and finality" {
+    for ([_][]const u8{
+        "{\"type\":\"response.output_text.done\",\"text\":\"changed\",\"item_id\":\"a\"}",
+        "{\"type\":\"response.output_text.done\",\"text\":\"he\",\"item_id\":\"a\"}",
+        "{\"type\":\"response.output_text.done\",\"text\":\"hello\",\"item_id\":\"b\"}",
+        "{\"type\":\"response.refusal.done\",\"refusal\":\"hello\",\"item_id\":\"a\"}",
+    }) |final_record| {
+        var stream = TextRecordTest.init(std.testing.allocator);
+        defer stream.deinit();
+        stream.capture_limit = 1;
+        try stream.apply("{\"type\":\"response.output_text.delta\",\"delta\":\"hello\",\"item_id\":\"a\"}");
+        try std.testing.expectError(error.ResponsesTextConflict, stream.apply(final_record));
+        try stream.expect_emitted("hello");
+    }
+    var stream = TextRecordTest.init(std.testing.allocator);
+    defer stream.deinit();
+    try stream.final(0, 0, "done");
+    try std.testing.expectError(error.ResponsesTextConflict, stream.final(0, 0, "done later"));
+    try std.testing.expectError(error.ResponsesTextConflict, stream.delta(0, 0, "later"));
+    try stream.delta(0, 0, "");
+    try stream.finish("done");
+}
+
+test "Responses text finalization rejects malformed supplied correlation" {
+    for ([_][]const u8{
+        "{\"type\":\"response.output_text.delta\",\"output_index\":-1,\"delta\":\"a\"}",
+        "{\"type\":\"response.output_text.delta\",\"content_index\":\"0\",\"delta\":\"a\"}",
+        "{\"type\":\"response.output_text.done\",\"content_index\":null,\"text\":\"a\"}",
+        "{\"type\":\"response.output_text.done\",\"item_id\":7,\"text\":\"a\"}",
+        "{\"type\":\"response.output_text.done\",\"item_id\":\"\",\"text\":\"a\"}",
+        "{\"type\":\"response.output_text.done\",\"text\":7}",
+        "{\"type\":\"response.content_part.done\",\"part\":null}",
+    }) |event| {
+        var stream = TextRecordTest.init(std.testing.allocator);
+        defer stream.deinit();
+        try std.testing.expectError(error.InvalidEvent, stream.apply(event));
+        try stream.expect_emitted("");
+    }
+}
+
+test "Responses text finalization preserves append order and bounded sparse indexes" {
+    var stream = TextRecordTest.init(std.testing.allocator);
+    defer stream.deinit();
+    try stream.delta(0, 0, "a");
+    try stream.final(99_999_999, 99_999_999, "b");
+    try stream.final(0, 0, "a");
+    try std.testing.expectError(error.ResponsesTextConflict, stream.final(1, 0, "late"));
+    try stream.expect_emitted("ab");
+
+    var bounded = TextRecordTest.init(std.testing.allocator);
+    defer bounded.deinit();
+    bounded.limits.events = 2;
+    try std.testing.expectError(error.ResourceLimitExceeded, bounded.apply("{\"type\":\"response.completed\",\"response\":{\"output\":[{\"type\":\"message\",\"content\":[{\"type\":\"output_text\",\"text\":\"a\"},{\"type\":\"output_text\",\"text\":\"b\"},{\"type\":\"output_text\",\"text\":\"c\"}]}]}}"));
+    try bounded.expect_emitted("ab");
+}
+
+test "Responses text finalization stops on cancellation within a terminal snapshot" {
+    var stream = TextRecordTest.init(std.testing.allocator);
+    defer stream.deinit();
+    stream.cancel_on_content = true;
+    try std.testing.expectError(error.Cancelled, stream.apply("{\"type\":\"response.completed\",\"response\":{\"output\":[{\"type\":\"message\",\"content\":[{\"type\":\"output_text\",\"text\":\"first\"},{\"type\":\"output_text\",\"text\":\"never\"}]}]}}"));
+    try stream.expect_emitted("first");
+    try std.testing.expectError(error.Cancelled, stream.reducer.finish(stream.alloc, &stream.cancelled, stream.limits));
+}
+
+test "Responses text finalization does not retain uncaptured text" {
+    const alloc = std.testing.allocator;
+    const text = try alloc.alloc(u8, 32 * 1024);
+    defer alloc.free(text);
+    @memset(text, 'a');
+    var tracked = std.testing.FailingAllocator.init(alloc, .{});
+    var stream = TextRecordTest.init(tracked.allocator());
+    defer stream.deinit();
+    stream.capture_limit = 1;
+    stream.limits.aggregate_bytes = 256 * 1024;
+    try stream.delta(0, 0, text);
+    try std.testing.expect(tracked.allocated_bytes - tracked.freed_bytes < 4096);
+    try stream.final(0, 0, text);
+    try std.testing.expect(tracked.allocated_bytes - tracked.freed_bytes < 4096);
+    try stream.finish(text);
+}
+
+test "Responses text finalization releases state on allocation failure" {
+    const Probe = struct {
+        fn run(alloc: std.mem.Allocator) !void {
+            var stream = TextRecordTest.init(alloc);
+            defer stream.deinit();
+            try stream.apply("{\"type\":\"response.output_text.delta\",\"delta\":\"a\"}");
+            try stream.apply("{\"type\":\"response.output_text.done\",\"text\":\"ab\"}");
+            try stream.apply("{\"type\":\"response.output_text.done\",\"output_index\":1,\"text\":\"cd\"}");
+            try stream.finish("abcd");
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Probe.run, .{});
+}
+
+test "Responses text finalization fuzzes chunking and capture boundaries" {
+    const Probe = struct {
+        fn run(_: void, smith: *std.testing.Smith) !void {
+            var buffer: [260]u8 = undefined;
+            const len: usize = @intCast(smith.slice(buffer[0..256]));
+            for (buffer[0..len]) |*byte| byte.* = 32 + byte.* % 95;
+            const split = if (len == 0) 0 else buffer[0] % (len + 1);
+            @memcpy(buffer[len..][0..4], "tail");
+            var stream = TextRecordTest.init(std.testing.allocator);
+            defer stream.deinit();
+            stream.capture_limit = if (len == 0) 0 else buffer[0] % 17;
+            try stream.delta(0, 0, buffer[0..split]);
+            try stream.final(0, 0, buffer[0..len]);
+            try stream.final(0, 0, buffer[0..len]);
+            try stream.final(1, 0, "tail");
+            try stream.finish(buffer[0 .. len + 4]);
+        }
+    };
+    try std.testing.fuzz({}, Probe.run, .{ .corpus = &.{ "", "a", "two chunks", "capture limit is not receipt progress" } });
+}
+
+test "Responses captures assistant commentary phase" {
+    var stream = ToolRecordTest.init(std.testing.allocator);
+    defer stream.deinit();
+    try stream.apply(
+        "{\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"message\",\"role\":\"assistant\",\"phase\":\"commentary\"}}",
+    );
+    try stream.apply(
+        "{\"type\":\"response.output_text.delta\",\"output_index\":0,\"delta\":\"I will inspect the file first.\"}",
+    );
+    try stream.apply(ToolRecordTest.terminal);
+    const completion = try stream.finish();
+    defer stream.freeCompletion(completion);
+
+    try std.testing.expectEqual(
+        types.AssistantMessagePhase.commentary,
+        completion.assistant_phase.?,
+    );
+}
+
+test "Responses captures assistant phase from terminal output" {
+    var stream = ToolRecordTest.init(std.testing.allocator);
+    defer stream.deinit();
+    try stream.apply(
+        "{\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"output\":[{\"type\":\"message\",\"role\":\"assistant\",\"phase\":\"final_answer\",\"content\":[{\"type\":\"output_text\",\"text\":\"Finished.\"}]}]}}",
+    );
+    const completion = try stream.finish();
+    defer stream.freeCompletion(completion);
+
+    try std.testing.expectEqual(
+        types.AssistantMessagePhase.final_answer,
+        completion.assistant_phase.?,
+    );
+}
+
+test "Responses ignores unknown and conflicting assistant phases" {
+    var unknown = ToolRecordTest.init(std.testing.allocator);
+    defer unknown.deinit();
+    try unknown.apply(
+        "{\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"message\",\"phase\":\"future_phase\"}}",
+    );
+    try unknown.apply(ToolRecordTest.terminal);
+    const unknown_completion = try unknown.finish();
+    defer unknown.freeCompletion(unknown_completion);
+    try std.testing.expect(unknown_completion.assistant_phase == null);
+
+    var conflicting = ToolRecordTest.init(std.testing.allocator);
+    defer conflicting.deinit();
+    try conflicting.apply(
+        "{\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"message\",\"phase\":\"commentary\"}}",
+    );
+    try conflicting.apply(
+        "{\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"message\",\"phase\":\"final_answer\",\"content\":[]}}",
+    );
+    try conflicting.apply(ToolRecordTest.terminal);
+    const conflicting_completion = try conflicting.finish();
+    defer conflicting.freeCompletion(conflicting_completion);
+    try std.testing.expect(conflicting_completion.assistant_phase == null);
+}
+
+test "Responses rejects conflicting completed tool records" {
+    const records = [_][]const u8{
+        "{\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"function_call\",\"call_id\":\"call_1\",\"name\":\"read_file\",\"arguments\":\"{\\\"path\\\":\\\"preview.txt\\\"}\"}}",
+        "{\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"function_call\",\"call_id\":\"other\",\"name\":\"write_file\",\"arguments\":\"{\\\"path\\\":\\\"preview.txt\\\"}\"}}",
+        "{\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"function_call\",\"id\":\"other\",\"call_id\":\"call_1\",\"name\":\"write_file\",\"arguments\":\"{\\\"path\\\":\\\"preview.txt\\\"}\"}}",
+        "{\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"function_call\",\"call_id\":\"call_1\",\"name\":\"write_file\",\"arguments\":\"{\\\"path\\\":\\\"final.txt\\\"}\"}}",
+    };
+    for (records) |event| {
+        var stream = ToolRecordTest.init(std.testing.allocator);
+        defer stream.deinit();
+        try stream.apply(ToolRecordTest.start);
+        try stream.apply(ToolRecordTest.finalized);
+        try std.testing.expectError(error.ResponsesToolCallConflict, stream.apply(event));
+    }
+}
+
+test "Responses completed item replaces progressive arguments" {
+    var stream = ToolRecordTest.init(std.testing.allocator);
+    defer stream.deinit();
+    try stream.apply(ToolRecordTest.start);
+    try stream.apply("{\"type\":\"response.function_call_arguments.delta\",\"output_index\":0,\"delta\":\"{\\\"path\\\":\"}");
+    try stream.apply("{\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"function_call\",\"call_id\":\"call_1\",\"name\":\"write_file\",\"arguments\":\"{\\\"path\\\":\\\"final.txt\\\"}\"}}");
+    try stream.apply(ToolRecordTest.terminal);
+    const completion = try stream.finish();
+    defer stream.freeCompletion(completion);
+    try std.testing.expectEqualStrings("{\"path\":\"final.txt\"}", completion.tool_calls[0].arguments_json);
+}
+
+test "Responses completed response validates supplied tool snapshots" {
+    var stream = ToolRecordTest.init(std.testing.allocator);
+    defer stream.deinit();
+    try stream.apply(ToolRecordTest.start);
+    try stream.apply(ToolRecordTest.finalized);
+    try std.testing.expectError(error.ResponsesToolCallConflict, stream.apply("{\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"output\":[{\"type\":\"function_call\",\"call_id\":\"call_1\",\"name\":\"write_file\",\"arguments\":\"{\\\"path\\\":\\\"final.txt\\\"}\"}]}}"));
+}
+
+test "Responses completed response can finalize progressive arguments within the byte limit" {
+    const alloc = std.testing.allocator;
+    for ([_]usize{ ToolRecordTest.limits.tool_arguments_bytes, ToolRecordTest.limits.tool_arguments_bytes + 1 }) |size| {
+        var stream = ToolRecordTest.init(alloc);
+        defer stream.deinit();
+        try stream.apply(ToolRecordTest.start);
+        try stream.apply("{\"type\":\"response.function_call_arguments.delta\",\"output_index\":0,\"delta\":\"{\"}");
+        const arguments = try alloc.alloc(u8, size);
+        defer alloc.free(arguments);
+        @memset(arguments, ' ');
+        arguments[0] = '{';
+        arguments[size - 1] = '}';
+        const event = try std.json.Stringify.valueAlloc(alloc, .{
+            .type = "response.completed",
+            .response = .{ .status = "completed", .output = .{.{
+                .type = "function_call",
+                .call_id = "call_1",
+                .name = "write_file",
+                .arguments = arguments,
+            }} },
+        }, .{});
+        defer alloc.free(event);
+        if (size > ToolRecordTest.limits.tool_arguments_bytes) {
+            try std.testing.expectError(error.ToolArgumentsTooLarge, stream.apply(event));
+        } else {
+            try stream.apply(event);
+            const completion = try stream.finish();
+            defer stream.freeCompletion(completion);
+            try std.testing.expectEqualStrings(arguments, completion.tool_calls[0].arguments_json);
+        }
+    }
+}
+
+test "Responses finalized arguments cannot receive more deltas" {
+    var stream = ToolRecordTest.init(std.testing.allocator);
+    defer stream.deinit();
+    try stream.apply(ToolRecordTest.start);
+    try stream.apply(ToolRecordTest.finalized);
+    try std.testing.expectError(error.ResponsesToolCallConflict, stream.apply("{\"type\":\"response.function_call_arguments.delta\",\"output_index\":0,\"delta\":\" \"}"));
+}
+
+test "Responses equivalent finalized records retain one accepted argument representation" {
+    var stream = ToolRecordTest.init(std.testing.allocator);
+    defer stream.deinit();
+    try stream.apply(ToolRecordTest.start);
+    try stream.apply(ToolRecordTest.finalized);
+    const equivalent = "{\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"function_call\",\"id\":\"fc_1\",\"call_id\":\"call_1\",\"name\":\"write_file\",\"arguments\":\" { \\\"path\\\" : \\\"preview.txt\\\" } \"}}";
+    try stream.apply(equivalent);
+    try stream.apply(equivalent);
+    try stream.apply(ToolRecordTest.finalized);
+    try stream.apply(ToolRecordTest.terminal);
+    const completion = try stream.finish();
+    defer stream.freeCompletion(completion);
+    try std.testing.expectEqual(@as(usize, 1), completion.tool_calls.len);
+    try std.testing.expectEqualStrings("{\"path\":\"preview.txt\"}", completion.tool_calls[0].arguments_json);
+}
+
+test "Responses final argument evidence does not manufacture an empty object" {
+    const cases = [_]struct { event: []const u8, arguments: []const u8 }{
+        .{ .event = "{\"type\":\"response.function_call_arguments.done\",\"output_index\":0,\"arguments\":\"\"}", .arguments = "" },
+        .{ .event = "{\"type\":\"response.function_call_arguments.done\",\"output_index\":0,\"arguments\":\"[]\"}", .arguments = "[]" },
+        .{ .event = "{\"type\":\"response.function_call_arguments.done\",\"output_index\":0,\"arguments\":\"{]\"}", .arguments = "{]" },
+    };
+    for (cases) |case| {
+        var stream = ToolRecordTest.init(std.testing.allocator);
+        defer stream.deinit();
+        try stream.apply(ToolRecordTest.start);
+        try stream.apply("{\"type\":\"response.function_call_arguments.delta\",\"output_index\":0,\"delta\":\"{\"}");
+        try stream.apply(case.event);
+        try stream.apply(ToolRecordTest.terminal);
+        const completion = try stream.finish();
+        defer stream.freeCompletion(completion);
+        try std.testing.expectEqualStrings(case.arguments, completion.tool_calls[0].arguments_json);
+        try std.testing.expect(try types.ToolArgumentIntegrity.classifyFunctionInput(std.testing.allocator, completion.tool_calls[0].arguments_json) != .valid);
+    }
+}
+
+test "Responses interleaved calls keep independent finalization" {
+    var stream = ToolRecordTest.init(std.testing.allocator);
+    defer stream.deinit();
+    try stream.apply(ToolRecordTest.start);
+    try stream.apply("{\"type\":\"response.output_item.added\",\"output_index\":1,\"item\":{\"type\":\"function_call\",\"id\":\"fc_2\",\"call_id\":\"call_2\",\"name\":\"read_file\",\"arguments\":\"{\"}}");
+    try stream.apply("{\"type\":\"response.function_call_arguments.delta\",\"output_index\":1,\"item_id\":\"fc_2\",\"delta\":\"\\\"path\\\":\\\"second.txt\\\"}\"}");
+    try stream.apply(ToolRecordTest.finalized);
+    try stream.apply("{\"type\":\"response.function_call_arguments.done\",\"output_index\":1,\"item_id\":\"fc_2\",\"name\":\"read_file\",\"arguments\":\"{\\\"path\\\":\\\"second.txt\\\"}\"}");
+    try stream.apply(ToolRecordTest.terminal);
+    const completion = try stream.finish();
+    defer stream.freeCompletion(completion);
+    try std.testing.expectEqual(@as(usize, 2), completion.tool_calls.len);
+    try std.testing.expectEqualStrings("{\"path\":\"preview.txt\"}", completion.tool_calls[0].arguments_json);
+    try std.testing.expectEqualStrings("{\"path\":\"second.txt\"}", completion.tool_calls[1].arguments_json);
+}
+
+test "Responses finalization checks correlation types and rejects unmatched final calls" {
+    const cases = [_]struct { event: []const u8, failure: anyerror }{
+        .{ .event = "{\"type\":\"response.function_call_arguments.done\",\"output_index\":0,\"item_id\":\"other\",\"arguments\":\"{}\"}", .failure = error.ResponsesToolCallConflict },
+        .{ .event = "{\"type\":\"response.function_call_arguments.done\",\"output_index\":0,\"name\":\"read_file\",\"arguments\":\"{}\"}", .failure = error.ResponsesToolCallConflict },
+        .{ .event = "{\"type\":\"response.function_call_arguments.done\",\"output_index\":0,\"item_id\":null,\"arguments\":\"{}\"}", .failure = error.InvalidEvent },
+        .{ .event = "{\"type\":\"response.function_call_arguments.done\",\"output_index\":0,\"arguments\":{}}", .failure = error.InvalidEvent },
+        .{ .event = "{\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"function_call\",\"call_id\":null,\"arguments\":\"{}\"}}", .failure = error.InvalidEvent },
+        .{ .event = "{\"type\":\"response.output_item.done\",\"output_index\":1,\"item\":{\"type\":\"function_call\",\"call_id\":\"call_2\",\"arguments\":\"{}\"}}", .failure = error.ResponsesToolCallConflict },
+    };
+    for (cases) |case| {
+        var stream = ToolRecordTest.init(std.testing.allocator);
+        defer stream.deinit();
+        try stream.apply(ToolRecordTest.start);
+        try std.testing.expectError(case.failure, stream.apply(case.event));
+    }
+}
+
+test "Responses finalization retains cancellation and terminal requirements" {
+    var stream = ToolRecordTest.init(std.testing.allocator);
+    defer stream.deinit();
+    try stream.apply(ToolRecordTest.start);
+    try stream.apply(ToolRecordTest.finalized);
+    try std.testing.expectError(error.StreamIncomplete, stream.finish());
+    stream.cancelled.store(true, .seq_cst);
+    try std.testing.expectError(error.Cancelled, stream.apply(ToolRecordTest.terminal));
+    try std.testing.expectError(error.Cancelled, stream.finish());
+}
+
+test "Responses rejects malformed supplied output indexes without requiring omitted metadata" {
+    const cases = [_][]const u8{
+        "{\"type\":\"response.function_call_arguments.done\",\"output_index\":\"0\",\"arguments\":\"{}\"}",
+        "{\"type\":\"response.output_item.done\",\"output_index\":null,\"item\":{\"type\":\"function_call\",\"arguments\":\"{}\"}}",
+        "{\"type\":\"response.output_item.added\",\"output_index\":-1,\"item\":{\"type\":\"function_call\",\"call_id\":\"bad\",\"name\":\"read_file\"}}",
+        "{\"type\":\"response.function_call_arguments.delta\",\"output_index\":0.0,\"delta\":\"{}\"}",
+    };
+    for (cases) |event| {
+        var stream = ToolRecordTest.init(std.testing.allocator);
+        defer stream.deinit();
+        try stream.apply(ToolRecordTest.start);
+        try stream.apply(ToolRecordTest.finalized);
+        try std.testing.expectError(error.InvalidEvent, stream.apply(event));
+    }
+    var stream = ToolRecordTest.init(std.testing.allocator);
+    defer stream.deinit();
+    try stream.apply(ToolRecordTest.start);
+    try stream.apply(ToolRecordTest.finalized);
+    try stream.apply("{\"type\":\"response.output_item.done\",\"item\":{\"type\":\"function_call\"}}");
+    try stream.apply(ToolRecordTest.terminal);
+    const completion = try stream.finish();
+    defer stream.freeCompletion(completion);
+    try std.testing.expectEqualStrings("{\"path\":\"preview.txt\"}", completion.tool_calls[0].arguments_json);
+}
+
+test "Responses finalization preserves the length finish disposition" {
+    var stream = ToolRecordTest.init(std.testing.allocator);
+    defer stream.deinit();
+    try stream.apply(ToolRecordTest.start);
+    try stream.apply(ToolRecordTest.finalized);
+    try stream.apply("{\"type\":\"response.incomplete\",\"response\":{\"status\":\"incomplete\",\"incomplete_details\":{\"reason\":\"max_output_tokens\"},\"output\":[{\"type\":\"function_call\",\"call_id\":\"call_1\",\"name\":\"write_file\",\"arguments\":\"{\\\"path\\\":\\\"preview.txt\\\"}\"}]}}");
+    const completion = try stream.finish();
+    defer stream.freeCompletion(completion);
+    try std.testing.expectEqual(types.ProviderFinishReason.length, completion.finish_reason);
+}
+
+fn expectToolFinalizationAllocations(alloc: std.mem.Allocator) !void {
+    var stream = ToolRecordTest.init(alloc);
+    defer stream.deinit();
+    try stream.apply(ToolRecordTest.start);
+    try stream.apply("{\"type\":\"response.function_call_arguments.delta\",\"output_index\":0,\"delta\":\"discarded preview\"}");
+    try stream.apply(ToolRecordTest.finalized);
+    try stream.apply("{\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"function_call\",\"id\":\"fc_1\",\"arguments\":\" {\\\"path\\\":\\\"preview.txt\\\"} \"}}");
+    try stream.apply("{\"type\":\"response.output_text.delta\",\"delta\":\"finished\"}");
+    try stream.apply("{\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"status\":\"completed\"}}");
+    const completion = try stream.finish();
+    defer stream.freeCompletion(completion);
+    try std.testing.expectEqualStrings("{\"path\":\"preview.txt\"}", completion.tool_calls[0].arguments_json);
+}
+
+test "Responses finalization releases owned state on allocation failure" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, expectToolFinalizationAllocations, .{});
+}
 
 fn appendTool(
     alloc: std.mem.Allocator,

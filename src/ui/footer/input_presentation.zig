@@ -585,8 +585,9 @@ pub fn composeMcpMenuHintRow(
     alloc: Allocator,
     width: u16,
     ctrl_c_pending: bool,
-    state: mcp_menu_state.State,
+    projection: render_input.McpMenuProjection,
 ) !std.ArrayList(u8) {
+    const state = projection.state;
     if (ctrl_c_pending) {
         var warning: std.ArrayList(u8) = .empty;
         errdefer warning.deinit(alloc);
@@ -597,9 +598,9 @@ pub fn composeMcpMenuHintRow(
     }
 
     const root_variants = [_][]const u8{
-        "↑↓ Navigate  Tab Section  Enter Inspect  A Add  R Reload  C Config  P Approve all  Z Reset  Esc Close",
-        "↑↓ Move  Tab Section  Enter  A Add  R Reload  C Config  P All  Z Reset  Esc",
-        "Tab Enter A R C P Z Esc",
+        "↑↓ Move  Tab Section  Enter Inspect  A Add  R Reload  C Help  Esc Close",
+        "↑↓ Move  Tab Section  Enter  A Add  R Reload  C Help  Esc",
+        "Tab Enter A R C Esc",
     };
     const catalog_variants = [_][]const u8{
         "↑↓ Navigate     Tab Section     Enter Open     / Filter     Esc Back",
@@ -621,11 +622,20 @@ pub fn composeMcpMenuHintRow(
         "Type  Enter Next  Tab Complete  Esc",
         "Enter Tab Esc",
     };
-    const details_variants = [_][]const u8{
-        "Enter Authenticate     A Approve     X Reject     D Remove     L Logout     Esc Back",
-        "Enter Action  A Approve  X Reject  D Remove  L Logout  Esc",
-        "Enter A X D L Esc",
-    };
+    var details: std.ArrayList(u8) = .empty;
+    defer details.deinit(alloc);
+    if (projection.selectedServer()) |server| {
+        const labels = [_]struct { action: mcp_menu_state.Action, label: []const u8 }{
+            .{ .action = .authenticate, .label = "Enter Sign in  " },
+            .{ .action = .trust_approve, .label = "A Approve  " },
+            .{ .action = .trust_reject, .label = "X Reject  " },
+            .{ .action = .remove, .label = "D Remove  " },
+            .{ .action = .logout, .label = "L Logout  " },
+        };
+        for (labels) |item| if (mcp_menu_state.serverActionAvailable(item.action, server)) try details.appendSlice(alloc, item.label);
+    }
+    try details.appendSlice(alloc, "C Help  Esc Back");
+    const details_variants = [_][]const u8{ details.items, "C Help  Esc Back", "C Esc" };
     const confirm_variants = [_][]const u8{
         "Enter Confirm     Esc Cancel",
         "Enter Confirm  Esc",

@@ -77,7 +77,6 @@ const tool_result_errors = @import("../tooling/tool_result_errors.zig");
 const tool_runtime = @import("../tooling/tool_runtime.zig");
 const tool_set_contract = @import("../tooling/tool_set.zig");
 const tool_specs = @import("../tooling/tool_specs.zig");
-const skill_invocation = @import("../skills/skill_invocation.zig");
 const web_fetch_runtime = @import("../tooling/web_fetch_runtime.zig");
 const web_search_runtime = @import("../tooling/web_search_runtime.zig");
 const types = @import("../shared/types.zig");
@@ -264,7 +263,6 @@ fn runAskChild(
         .{
             .permission_mode = admission.permission_mode,
             .permission_rules = admission.rules,
-            .mcp_runtime = ctx.mcp,
             .subagent_available = true,
         },
     ) catch return error.OutOfMemory;
@@ -275,8 +273,7 @@ fn runAskChild(
         .provider_set = ctx.cfg.provider_set,
         .system_prompt = ctx.cfg.prompt_policy.system_prompt,
         .model_prompt_overlay = ctx.cfg.prompt_policy.modelPromptOverlay(admission.model),
-        .skills_prompt_section = ctx.subagent_skills_prompt,
-        .explicit_skills_prompt_section = ctx.subagent_explicit_skills_prompt,
+        .skill_catalog = .{ .skills = ctx.loaded_skills.skills, .diagnostics = ctx.loaded_skills.diagnostics },
         .advertised_tool_names = child_projection.advertised_names,
         .advertised_functions = child_projection.advertised_functions,
         .custom_tool_guidance = child_projection.custom_guidance,
@@ -557,8 +554,7 @@ const AskContext = struct {
     managed_executions: managed_execution.Runtime,
     ephemeral_command_replay: command_replay_store.EphemeralStore,
     subagent_host: ?*subagent_tool_host.Runtime = null,
-    subagent_skills_prompt: []u8 = &.{},
-    subagent_explicit_skills_prompt: []u8 = &.{},
+    loaded_skills: app_runtime_setup.LoadedSkills = .{},
     store: ?session_store.Store = null,
     writable: ?session_store.LoadedWritableSession = null,
     session_write_mutex: std.Io.Mutex = .init,
@@ -722,10 +718,8 @@ const AskContext = struct {
         self.session.usage.configurePublicationSink(null);
         self.session.usage.configureCheckpointSink(null);
         if (self.writable) |*writable| {
-            if (writable.needsFinalStateReplacement(
-                self.session.usage.isDirty(),
-            )) {
-                commitAskStateReplacement(self, writable, false) catch |err| {
+            if (self.session.usage.isDirty()) {
+                flushAskSessionUsage(self, writable) catch |err| {
                     debug_trace.logf(
                         "session",
                         "failed to flush ask session usage err={s}",
@@ -766,8 +760,7 @@ const AskContext = struct {
             freeToolCallRecord(self.alloc, record);
         }
         self.tool_call_records.deinit(self.alloc);
-        if (self.subagent_skills_prompt.len > 0) self.alloc.free(self.subagent_skills_prompt);
-        if (self.subagent_explicit_skills_prompt.len > 0) self.alloc.free(self.subagent_explicit_skills_prompt);
+        self.loaded_skills.deinit(self.alloc);
     }
 
     fn lifecycleContext(self: *AskContext) agent_runtime.LifecycleContext {
@@ -879,9 +872,9 @@ const AskContext = struct {
                 self.alloc,
                 writable.state.conversation_language,
                 writable.state.history,
-                writable.state.context_history_start,
                 writable.state.permission_state,
             );
+            writable.releaseHydrationHistory(self.alloc);
             if (writable.state.usage) |usage| {
                 try self.session.usage.restore(
                     self.alloc,
@@ -987,10 +980,6 @@ const AskContext = struct {
             .max_tool_result_bytes = self.max_tool_result_bytes,
             .api_key = self.api_key,
             .agent_stream_provider = self.agentStreamProvider(),
-            .compaction_route = self.cfg.provider_set.compactionRoute(
-                self.provider,
-                self.credential_source,
-            ),
             .gateway_team = self.gateway_team,
             .credential_source = self.credential_source,
             .account_id = self.account_id,
@@ -1057,6 +1046,7 @@ const AskContext = struct {
             tc.mcp_call_tool = mcpCallTool;
             tc.mcp_search_tools = mcpSearchTools;
             tc.mcp_tool_schema = mcpToolSchemaJson;
+            tc.mcp_snapshot_tool = mcpSnapshotTool;
             tc.mcp_call_feature = mcpCallFeature;
             if (self.mcp_elicitation_capabilities.any()) {
                 tc.mcp_input_responder = .{
@@ -1573,6 +1563,14 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
         alloc.free(owned_prompt);
         owned_prompt = try alloc.dupe(u8, recovery_checkpoint.?.user.text);
         ctx.session.setConversationLanguageFromUserMessage(owned_prompt);
+    } else if (ctx.writable) |*writable| {
+        if (writable.conversation_writer.turn_open) {
+            const checkpoint = writable.state.recovery_checkpoint orelse
+                return error.InvalidRecoveryCheckpoint;
+            const prompt_snapshot_committed = ctx.prompt_snapshot_committed;
+            defer ctx.prompt_snapshot_committed = prompt_snapshot_committed;
+            try propagateHistoryTurn(&ctx, checkpoint.interruptedTurn());
+        }
     }
 
     var routed_credential: ?credentials.Credential = null;
@@ -1667,12 +1665,12 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
     defer types.freeImageAttachmentSlice(alloc, authorized_image_catalog);
 
     try ctx.checkCancellation();
-    var loaded_skills = try options.deps.load_skills(
+    ctx.loaded_skills = try options.deps.load_skills(
         alloc,
         startup.workspace_root,
         cfg.skill_root_policy,
     );
-    defer loaded_skills.deinit(alloc);
+    const loaded_skills = &ctx.loaded_skills;
     try ctx.checkCancellation();
     skill_runtime.traceDiagnostics("ask_startup", loaded_skills.diagnostics);
     ctx.skills_dir = loaded_skills.dir;
@@ -1721,7 +1719,7 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
         if (options.output_mode.isTerminal()) {
             mcp.connectAllCancellable(ctx.toolRegistry(), ctx.cancelFlag());
         } else {
-            mcp.connectRequiredForAsk(ctx.toolRegistry());
+            mcp.connectRequiredForAsk(ctx.toolRegistry(), ctx.cancelFlag());
         }
     }
     try ctx.checkCancellation();
@@ -1744,32 +1742,10 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
     var tool_projection = try buildAskGatewayToolProjection(alloc, ctx.cfg.mode_registry, options.deps.tool_set, ctx.mode_id, .{
         .permission_mode = ctx.permission_mode,
         .permission_rules = ctx.permission_rules,
-        .mcp_runtime = ctx.mcp,
         .subagent_available = ctx.subagent_host != null,
     }, session_child_capability != null);
     defer tool_projection.deinit(alloc);
 
-    const skills_view = skill_runtime.Runtime{
-        .items = loaded_skills.skills,
-        .diagnostics = loaded_skills.diagnostics,
-    };
-    var bounded_skills = try skills_view.buildRoutedSystemPromptSection(alloc, owned_prompt, ctx.context_limits);
-    defer bounded_skills.deinit(alloc);
-    if (bounded_skills.notice) |notice| try pushContextNotice(@ptrCast(&ctx), notice);
-    if (bounded_skills.diagnostic_notice) |notice| try pushContextNotice(@ptrCast(&ctx), notice);
-    const skills_section = bounded_skills.text;
-    var explicit_skills = try skill_invocation.buildExplicitPromptSection(
-        alloc,
-        .{ .skills = loaded_skills.skills, .diagnostics = loaded_skills.diagnostics },
-        owned_prompt,
-        &.{},
-        ctx.context_limits,
-    );
-    defer explicit_skills.deinit(alloc);
-    if (explicit_skills.notice) |notice| try pushContextNotice(@ptrCast(&ctx), notice);
-    if (explicit_skills.diagnostic_notice) |notice| try pushContextNotice(@ptrCast(&ctx), notice);
-    ctx.subagent_skills_prompt = try alloc.dupe(u8, skills_section);
-    ctx.subagent_explicit_skills_prompt = try alloc.dupe(u8, explicit_skills.text);
     const context_history = try ctx.session.snapshotHistory(alloc);
     defer types.freeHistoryTurnSlice(alloc, context_history);
     const root_user_intent_context = try auto_classifier_context.buildCanonicalRootUserContext(
@@ -1796,7 +1772,6 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
         .provider = ctx.provider,
         .permission_mode = ctx.permission_mode,
         .history = context_history,
-        .context_history_start = ctx.session.contextHistoryStart(),
         .unversioned_history_count = ctx.session.unversionedHistoryEnd(),
         .root_user_intent_context = root_user_intent_context,
         .grants = &.{},
@@ -1818,8 +1793,7 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
     options.deps.process_queued_prompt(&ctx.session.agent, &deps, semantic_presentation, ctx.lifecycleContext(), .{
         .system_prompt = cfg.prompt_policy.system_prompt,
         .model_prompt_overlay = cfg.prompt_policy.modelPromptOverlay(ctx.model),
-        .skills_prompt_section = skills_section,
-        .explicit_skills_prompt_section = explicit_skills.text,
+        .skill_catalog = .{ .skills = loaded_skills.skills, .diagnostics = loaded_skills.diagnostics },
         .gateway_retry_count = cfg.gateway_retry_count,
         .gateway_chat_url = cfg.gateway_chat_url,
         .advertised_tool_names = tool_projection.advertised_names,
@@ -1945,8 +1919,6 @@ fn finalizeFreshAuthSession(ctx: *AskContext, result: *PromptRunResult) void {
             ctx.alloc,
             .{ .recovery_checkpoint_cleared = .{} },
             io_mod.milliTimestamp(),
-            .retry_expected_tail,
-            .{},
         ) catch |err| {
             debug_trace.logf(
                 "ask",
@@ -1988,10 +1960,6 @@ fn agentRuntimeDeps(ctx: *AskContext) agent_runtime.AgentRuntimeDeps {
         .ctx = @ptrCast(ctx),
         .agent_stream_provider = ctx.agentStreamProvider(),
         .render_assistant_text = ctx.output_mode.isTerminal(),
-        .compaction_route = ctx.cfg.provider_set.compactionRoute(
-            ctx.provider,
-            ctx.credential_source,
-        ),
         .tool_registry = ctx.toolRegistry(),
         .context_registry = ctx.deps.context_registry,
         .context_enabled = ctx.context_enabled,
@@ -2000,6 +1968,8 @@ fn agentRuntimeDeps(ctx: *AskContext) agent_runtime.AgentRuntimeDeps {
         .append_runtime_context = appendRuntimeContext,
         .append_static_context = appendStaticContext,
         .validate_tool_call = validateToolCall,
+        .snapshot_mcp_definition = snapshotMcpDefinition,
+        .prepare_skill_call = prepareSkillCall,
         .check_tool_availability = checkToolAvailability,
         .request_tool_permission = requestToolPermissionOutcomeWithRequest,
         .request_prepared_file_mutation_permission = requestPreparedFileMutationPermissionOutcomeForRuntime,
@@ -2011,6 +1981,7 @@ fn agentRuntimeDeps(ctx: *AskContext) agent_runtime.AgentRuntimeDeps {
         .execute_tool_call = executeToolCallAuthorized,
         .publish_committed_file_handoff = publishCommittedFileHandoff,
         .propagate_history_turn = propagateHistoryTurn,
+        .commit_context_compaction = .{ .commit = commitContextCompaction },
         .recovery_checkpoint = if (ctx.writable != null)
             .{
                 .set = setRecoveryCheckpoint,
@@ -2119,25 +2090,10 @@ fn persistUsageCheckpoint(
         writable,
         snapshot,
     );
-    if (writable.degradedTail() != null) {
-        var current = try currentAskState(
-            ctx,
-            writable,
-            recovery_checkpoint.timestamp_ms,
-        );
-        defer current.deinit(ctx.alloc);
-        try writable.retryDegradedWithStateReplacement(
-            ctx.alloc,
-            current,
-            .{},
-        );
-    }
     _ = try writable.appendEvent(
         ctx.alloc,
         .{ .usage_checkpointed = .{ .usage = snapshot } },
         recovery_checkpoint.timestamp_ms,
-        .retry_expected_tail,
-        .{ .checkpoint_interval = 0 },
     );
     try store.finishUsageRecoveryCheckpoint(
         writable.active_id,
@@ -2220,6 +2176,11 @@ fn appendStaticContext(raw_ctx: *anyopaque, arena: Allocator, messages: *std.Arr
     if (section.notice) |notice| try pushContextNotice(raw_ctx, notice);
 }
 
+fn snapshotMcpDefinition(raw_ctx: *anyopaque, arena: Allocator, name: []const u8, known: tool_mcp_runtime.Binding) !tool_mcp_runtime.DefinitionSnapshot {
+    const ctx: *AskContext = @ptrCast(@alignCast(raw_ctx));
+    return tool_runtime.snapshotMcpDefinition(ctx.toolContext(), arena, name, known);
+}
+
 fn validateToolCall(raw_ctx: *anyopaque, arena: Allocator, call: ToolCall) !agent_runtime.ToolCallValidationResult {
     const ctx: *AskContext = @ptrCast(@alignCast(raw_ctx));
     if (try ctx.cfg.mode_registry.toolPolicyDeniedJson(arena, ctx.deps.tool_set, ctx.mode_id, call.name)) |reason| {
@@ -2231,6 +2192,11 @@ fn validateToolCall(raw_ctx: *anyopaque, arena: Allocator, call: ToolCall) !agen
 fn checkToolAvailability(raw_ctx: *anyopaque, arena: Allocator, call: ToolCall) !?[]const u8 {
     const ctx: *AskContext = @ptrCast(@alignCast(raw_ctx));
     return tool_runtime.checkToolAvailability(ctx.toolContext(), arena, call);
+}
+
+fn prepareSkillCall(raw_ctx: *anyopaque, arena: Allocator, call: ToolCall, locations: ?*const skill_contract.Locations) !skill_contract.CallPreparation {
+    const ctx: *AskContext = @ptrCast(@alignCast(raw_ctx));
+    return tool_runtime.prepareSkillCall(ctx.toolContext(), arena, call, locations);
 }
 
 fn cliAdmissionContext(
@@ -2291,9 +2257,10 @@ fn requestToolPermissionOutcome(raw_ctx: *anyopaque, arena: Allocator, call: Too
     );
 }
 
-fn requestToolPermissionOutcomeWithRequest(raw_ctx: *anyopaque, arena: Allocator, call: ToolCall, review_turn: permission_auto_classifier.ReviewTurnContext, permission_mode: PermissionMode, local_grants: []const PermissionGrant, live_authority: ?agent_runtime.LiveToolAuthority, revalidation: ?agent_runtime.LivePermissionRevalidation, advertised_dynamic_tool_names: []const []const u8) !command_admission.PermissionOutcome {
+fn requestToolPermissionOutcomeWithRequest(raw_ctx: *anyopaque, arena: Allocator, call: ToolCall, review_turn: permission_auto_classifier.ReviewTurnContext, permission_mode: PermissionMode, local_grants: []const PermissionGrant, live_authority: ?agent_runtime.LiveToolAuthority, revalidation: ?agent_runtime.LivePermissionRevalidation, advertised_dynamic_tool_names: []const []const u8, mcp_review_schema_json: ?[]const u8) !command_admission.PermissionOutcome {
     const ctx: *AskContext = @ptrCast(@alignCast(raw_ctx));
-    const tool_ctx = cliAdmissionContext(ctx, advertised_dynamic_tool_names, review_turn);
+    var tool_ctx = cliAdmissionContext(ctx, advertised_dynamic_tool_names, review_turn);
+    tool_ctx.mcp_review_schema_json = mcp_review_schema_json;
     return finishCliPermissionOutcome(
         ctx,
         tool_ctx,
@@ -2502,6 +2469,7 @@ fn resolveToolActionDisplayTarget(raw_ctx: *anyopaque, arena: Allocator, call: T
         ctx.toolRegistry(),
         ctx.workspace_root,
         &ctx.terminal_client,
+        &ctx.managed_executions,
         call,
     );
 }
@@ -2876,49 +2844,56 @@ fn questionTextForAskCall(alloc: Allocator, call: ToolCall) !?[]u8 {
 
 fn propagateHistoryTurn(raw_ctx: *anyopaque, turn: HistoryTurn) !void {
     const ctx: *AskContext = @ptrCast(@alignCast(raw_ctx));
-    try ctx.session.appendHistoryEntry(ctx.alloc, turn);
+    var prepared = try ctx.session.prepareHistoryEntry(ctx.alloc, turn);
+    var prepared_owned = true;
+    defer if (prepared_owned) types.freeHistoryTurn(ctx.alloc, prepared);
     ctx.session_write_mutex.lockUncancelable(io_mod.getIo());
     defer ctx.session_write_mutex.unlock(io_mod.getIo());
-    const writable = if (ctx.writable) |*value| value else return;
+    const writable = if (ctx.writable) |*value| value else {
+        ctx.session.commitPreparedHistoryEntry(ctx.alloc, prepared);
+        prepared_owned = false;
+        return;
+    };
+    try writable.prepareHistoryTurnForCommit(ctx.alloc, &prepared);
     try subagent_resume_admission.retainExternalRootUserTurn(
         ctx.store,
         ctx.alloc,
         writable,
-        turn,
+        prepared,
         ctx.retain_external_root_user_turn,
     );
 
-    if (writable.degradedTail() != null) {
-        const now_ms = io_mod.milliTimestamp();
-        var current = try currentAskState(ctx, writable, now_ms);
-        defer current.deinit(ctx.alloc);
-        try writable.retryDegradedWithStateReplacement(
-            ctx.alloc,
-            current,
-            .{},
-        );
-    }
-
-    _ = writable.appendEvent(
+    _ = try writable.appendEvent(
         ctx.alloc,
         .{ .history_turn_committed = .{
             .conversation_language = ctx.session.languageSnapshot(),
             .total_input_tokens = writable.state.total_input_tokens,
             .total_output_tokens = writable.state.total_output_tokens,
-            .turn = turn,
+            .turn = prepared,
         } },
         io_mod.milliTimestamp(),
-        .retry_expected_tail,
-        .{},
-    ) catch |err| switch (err) {
-        error.EventFrameTooLarge => {
-            try commitAskStateReplacement(ctx, writable, true);
-            ctx.prompt_snapshot_committed = true;
-            return;
-        },
-        else => return err,
-    };
+    );
+    ctx.session.commitPreparedHistoryEntry(ctx.alloc, prepared);
+    prepared_owned = false;
     ctx.prompt_snapshot_committed = true;
+}
+
+fn commitContextCompaction(
+    raw_ctx: *anyopaque,
+    summary: types.CompactedSummaryHistoryTurn,
+    active_prefix: ?types.AssistantHistoryTurn,
+    retained_from: ?types.ContextHistoryCut,
+) !void {
+    const ctx: *AskContext = @ptrCast(@alignCast(raw_ctx));
+    ctx.session_write_mutex.lockUncancelable(io_mod.getIo());
+    defer ctx.session_write_mutex.unlock(io_mod.getIo());
+    const prepared = try session_runtime.prepareCompactedHistory(ctx.alloc, ctx.session.agent.history.items, summary, retained_from orelse .{ .turns = session_runtime.rawHistoryTurnCount(ctx.session.agent.history.items) });
+    errdefer types.freeHistoryTurnSlice(ctx.alloc, prepared);
+    if (ctx.writable) |*writable| {
+        _ = try writable.commitContextCompaction(ctx.alloc, summary, active_prefix, retained_from, io_mod.milliTimestamp());
+        if (active_prefix != null) ctx.prompt_snapshot_committed = true;
+    }
+    ctx.session.commitCompactedHistory(ctx.alloc, prepared);
 }
 
 fn setRecoveryCheckpoint(
@@ -2930,73 +2905,26 @@ fn setRecoveryCheckpoint(
     defer ctx.session_write_mutex.unlock(io_mod.getIo());
     const writable = if (ctx.writable) |*value| value else return error.SessionPersistenceUnavailable;
     const now_ms = io_mod.milliTimestamp();
-    _ = writable.appendEvent(
+    _ = try writable.appendEvent(
         ctx.alloc,
         .{ .recovery_checkpoint_set = .{ .checkpoint = checkpoint } },
         now_ms,
-        .retry_expected_tail,
-        .{},
-    ) catch |err| switch (err) {
-        error.EventFrameTooLarge => {
-            var current = try currentAskState(ctx, writable, now_ms);
-            defer current.deinit(ctx.alloc);
-            if (current.recovery_checkpoint) |*old| old.deinit(ctx.alloc);
-            current.recovery_checkpoint = try checkpoint.dupe(ctx.alloc);
-            _ = try writable.commitStateReplacement(
-                ctx.alloc,
-                current,
-                .compaction,
-                .retry_expected_tail,
-                .{},
-            );
-        },
-        else => return err,
-    };
+    );
 }
 
-fn currentAskState(
+fn flushAskSessionUsage(
     ctx: *AskContext,
     writable: *session_store.LoadedWritableSession,
-    now_ms: i64,
-) !session_codec.DurableSessionState {
-    var state = try writable.state.dupe(ctx.alloc);
-    errdefer state.deinit(ctx.alloc);
-    const history = try ctx.session.snapshotHistory(ctx.alloc);
-    types.freeHistoryTurnSlice(ctx.alloc, state.history);
-    state.history = history;
-    const permission_state = try ctx.session.snapshotPermissionState(ctx.alloc);
-    state.permission_state.deinit(ctx.alloc);
-    state.permission_state = permission_state;
-    state.conversation_language = ctx.session.languageSnapshot();
-    state.updated_at_ms = now_ms;
-    const usage = try ctx.session.usage.snapshot(ctx.alloc);
-    if (state.usage) |*old| old.deinit(ctx.alloc);
-    state.usage = usage;
-    return state;
-}
-
-fn commitAskStateReplacement(
-    ctx: *AskContext,
-    writable: *session_store.LoadedWritableSession,
-    clear_recovery_checkpoint: bool,
 ) !void {
     const now_ms = io_mod.milliTimestamp();
-    var state = try currentAskState(ctx, writable, now_ms);
-    defer state.deinit(ctx.alloc);
-    if (clear_recovery_checkpoint) {
-        if (state.recovery_checkpoint) |*checkpoint| checkpoint.deinit(ctx.alloc);
-        state.recovery_checkpoint = null;
-    }
-    _ = try writable.commitStateReplacement(
+    var usage = try ctx.session.usage.snapshot(ctx.alloc);
+    defer usage.deinit(ctx.alloc);
+    _ = try writable.appendEvent(
         ctx.alloc,
-        state,
-        .compaction,
-        .retry_expected_tail,
-        .{},
+        .{ .usage_checkpointed = .{ .usage = usage } },
+        now_ms,
     );
-    if (state.usage) |usage| {
-        ctx.session.usage.markClean(usage);
-    }
+    ctx.session.usage.markClean(usage);
 }
 
 fn propagateGrant(_: *anyopaque, _: []const u8, _: []const u8) !void {}
@@ -3350,31 +3278,28 @@ fn onMcpProgress(raw_ctx: *anyopaque, lifecycle_id: types.ToolLifecycleId, text:
 
 fn activateAskMcp(ctx: *AskContext) anyerror!*mcp_runtime.McpRuntime {
     const runtime = ctx.mcp orelse return error.McpRuntimeUnavailable;
-    try runtime.connectDeferredForAsk(ctx.toolRegistry());
+    try runtime.connectDeferredForAsk(ctx.toolRegistry(), ctx.cancelFlag());
     return runtime;
 }
 
 fn mcpHasTool(raw_ctx: *anyopaque, name: []const u8, access: tool_mcp_runtime.Access) bool {
     const ctx: *AskContext = @ptrCast(@alignCast(raw_ctx));
-    const mcp = activateAskMcp(ctx) catch return false;
+    const mcp = ctx.mcp orelse return false;
+    mcp.connectDeferredToolForAsk(ctx.toolRegistry(), name, access, ctx.cancelFlag()) catch return false;
     return mcp.hasToolWithAccess(name, access);
 }
 
 fn mcpValidateTool(raw_ctx: *anyopaque, arena: Allocator, name: []const u8, arguments_json: []const u8, access: tool_mcp_runtime.Access) anyerror!tool_mcp_runtime.ValidationResult {
     const self: *AskContext = @ptrCast(@alignCast(raw_ctx));
-    const runtime = activateAskMcp(self) catch |err| {
-        if (err == error.McpRuntimeUnavailable) return .not_available;
-        return err;
-    };
+    const runtime = self.mcp orelse return .not_available;
+    try runtime.connectDeferredToolForAsk(self.toolRegistry(), name, access, self.cancelFlag());
     return runtime.validateToolArgumentsByNameWithAccess(arena, name, arguments_json, access);
 }
 
 fn mcpCallTool(raw_ctx: *anyopaque, arena: Allocator, name: []const u8, arguments_json: []const u8, max_tool_result_bytes: usize, options: tool_mcp_runtime.CallOptions) anyerror!?tool_mcp_runtime.CallResult {
     const ctx: *AskContext = @ptrCast(@alignCast(raw_ctx));
-    const mcp = activateAskMcp(ctx) catch |err| {
-        if (err == error.McpRuntimeUnavailable) return null;
-        return err;
-    };
+    const mcp = ctx.mcp orelse return null;
+    try mcp.connectDeferredToolForAsk(ctx.toolRegistry(), name, options.access, options.cancel_flag orelse ctx.cancelFlag());
     return mcp.callToolByNameWithOptions(
         arena,
         name,
@@ -3384,16 +3309,31 @@ fn mcpCallTool(raw_ctx: *anyopaque, arena: Allocator, name: []const u8, argument
     );
 }
 
-fn mcpSearchTools(raw_ctx: *anyopaque, arena: Allocator, request: tool_mcp_runtime.SearchRequest, permission_rules: types.PermissionRuleSet, limits: config_runtime.context_limits.Values, access: tool_mcp_runtime.Access) anyerror!tool_mcp_runtime.SearchResult {
+fn mcpSearchTools(raw_ctx: *anyopaque, arena: Allocator, request: tool_mcp_runtime.SearchRequest, permission_rules: types.PermissionRuleSet, limits: config_runtime.context_limits.Values, access: tool_mcp_runtime.Access, cancel_flag: ?*std.atomic.Value(bool)) anyerror!tool_mcp_runtime.SearchResult {
     const ctx: *AskContext = @ptrCast(@alignCast(raw_ctx));
-    const mcp = try activateAskMcp(ctx);
-    return mcp.searchToolsPrepared(arena, request, permission_rules, limits, access);
+    const mcp = ctx.mcp orelse return error.McpRuntimeUnavailable;
+    if (request.server) |server_name| {
+        mcp.connectDeferredServerForAsk(ctx.toolRegistry(), server_name, access, .tools, cancel_flag orelse ctx.cancelFlag()) catch |err| switch (err) {
+            error.McpAuthenticationRequired => {}, // Search renders the observed challenge with named login guidance.
+            else => return err,
+        };
+    } else {
+        try mcp.connectDeferredForAsk(ctx.toolRegistry(), cancel_flag orelse ctx.cancelFlag());
+    }
+    return mcp.searchToolsPrepared(arena, request, permission_rules, limits, access, cancel_flag);
 }
 
-fn mcpToolSchemaJson(raw_ctx: *anyopaque, arena: Allocator, name: []const u8, permission_rules: types.PermissionRuleSet, limits: config_runtime.context_limits.Values, access: tool_mcp_runtime.Access) anyerror!?tool_mcp_runtime.ToolSchemaResult {
+fn mcpSnapshotTool(raw_ctx: *anyopaque, arena: Allocator, name: []const u8, known: tool_mcp_runtime.Binding, permission_rules: types.PermissionRuleSet, limits: config_runtime.context_limits.Values, access: tool_mcp_runtime.Access) anyerror!tool_mcp_runtime.DefinitionSnapshot {
     const ctx: *AskContext = @ptrCast(@alignCast(raw_ctx));
-    const runtime = try activateAskMcp(ctx);
-    return runtime.toolSchemaJsonByNameWithAccess(arena, name, permission_rules, limits, access);
+    const runtime = ctx.mcp orelse return .unavailable;
+    return runtime.snapshotToolDefinition(arena, name, known, permission_rules, limits, access);
+}
+
+fn mcpToolSchemaJson(raw_ctx: *anyopaque, arena: Allocator, name: []const u8, permission_rules: types.PermissionRuleSet, limits: config_runtime.context_limits.Values, access: tool_mcp_runtime.Access, cancel_flag: ?*std.atomic.Value(bool)) anyerror!?tool_mcp_runtime.ToolSchemaResult {
+    const ctx: *AskContext = @ptrCast(@alignCast(raw_ctx));
+    const runtime = ctx.mcp orelse return null;
+    try runtime.connectDeferredToolForAsk(ctx.toolRegistry(), name, access, cancel_flag orelse ctx.cancelFlag());
+    return runtime.toolSchemaJsonByNameWithAccess(arena, name, permission_rules, limits, access, cancel_flag);
 }
 
 fn mcpCallFeature(
@@ -3403,8 +3343,9 @@ fn mcpCallFeature(
     options: tool_mcp_runtime.FeatureCallOptions,
 ) anyerror!tool_mcp_runtime.FeatureResult {
     const ctx: *AskContext = @ptrCast(@alignCast(raw_ctx));
-    const mcp = try activateAskMcp(ctx);
+    const mcp = ctx.mcp orelse return error.McpRuntimeUnavailable;
     if (!options.access.allowsFeatureServer(mcp.generation, request.server_name)) return error.McpServerNotFound;
+    try mcp.connectDeferredServerForAsk(ctx.toolRegistry(), request.server_name, options.access, .features, options.cancel_flag orelse ctx.cancelFlag());
     return mcp.callFeatureForModel(arena, request, options);
 }
 
@@ -4283,6 +4224,10 @@ fn testProcessQueuedPromptPartialThenReadFailed(_: *agent_runtime.Agent, deps: *
 }
 
 fn testProcessQueuedPromptRepeatsSkillDiagnostic(agent: *agent_runtime.Agent, deps: *const agent_runtime.AgentRuntimeDeps, semantic_presentation: ?agent_runtime.SemanticPresentationSink, lifecycle: agent_runtime.LifecycleContext, cfg: agent_runtime.Config, job: worker_runtime.QueuedPrompt) !void {
+    try std.testing.expectEqual(@as(usize, 1), cfg.skill_catalog.skills.len);
+    try std.testing.expectEqualStrings("visible", cfg.skill_catalog.skills[0].name);
+    try std.testing.expectEqual(@as(usize, 1), cfg.skill_catalog.diagnostics.len);
+    try std.testing.expectEqual(@as(usize, 0), cfg.context_limits.skill_catalog_bytes.effectiveBytes());
     const diagnostics = [_]skill_runtime.SkillDiagnostic{.{
         .path = "/tmp/bad-skill/SKILL.md",
         .source = .workspace_shared,
@@ -4292,6 +4237,7 @@ fn testProcessQueuedPromptRepeatsSkillDiagnostic(agent: *agent_runtime.Agent, de
     var notice: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer notice.deinit();
     try skill_runtime.writeDiagnosticSummary(std.testing.allocator, &notice.writer, &diagnostics);
+    try deps.push_context_notice.?(deps.ctx, notice.written());
     try deps.push_context_notice.?(deps.ctx, notice.written());
     try testProcessQueuedPrompt(agent, deps, semantic_presentation, lifecycle, cfg, job);
 }
@@ -4950,7 +4896,7 @@ test "Ask MCP adapters revalidate scoped authority before catalog access" {
     provider.calls = 0;
     try std.testing.expectError(
         error.McpAuthorityChanged,
-        mcpToolSchemaJson(@ptrCast(&ctx), alloc, "mcp_fixture_echo", .{}, .{}, access),
+        mcpToolSchemaJson(@ptrCast(&ctx), alloc, "mcp_fixture_echo", .{}, .{}, access, null),
     );
     try std.testing.expectEqual(@as(usize, 1), provider.calls);
 }
@@ -5801,17 +5747,7 @@ test "fx ask automatic review observes worker cancellation" {
     var review_turn = TestReviewTurn.init("Create cancelled.txt.", call);
     try std.testing.expectError(
         error.Cancelled,
-        requestToolPermissionOutcomeWithRequest(
-            &ctx,
-            arena_state.allocator(),
-            call,
-            review_turn.context(),
-            .auto,
-            &.{},
-            null,
-            null,
-            &.{},
-        ),
+        requestToolPermissionOutcomeWithRequest(&ctx, arena_state.allocator(), call, review_turn.context(), .auto, &.{}, null, null, &.{}, null),
     );
 }
 
@@ -6308,17 +6244,7 @@ test "fx ask auto mode applies automatic clear and caution without a prompt" {
         .arguments_json = "{\"action\":\"run\",\"command\":\"pwd\"}",
     };
     var direct_review = TestReviewTurn.init("Inspect the workspace.", direct_call);
-    const direct = try requestToolPermissionOutcomeWithRequest(
-        &ctx,
-        arena,
-        direct_call,
-        direct_review.context(),
-        .auto,
-        &.{},
-        null,
-        null,
-        &.{},
-    );
+    const direct = try requestToolPermissionOutcomeWithRequest(&ctx, arena, direct_call, direct_review.context(), .auto, &.{}, null, null, &.{}, null);
     try std.testing.expectEqual(
         command_admission.ShellAuthorizationSource.auto_classifier,
         direct.execution_authority.?.run_command.shell_allowed.source,
@@ -6331,17 +6257,7 @@ test "fx ask auto mode applies automatic clear and caution without a prompt" {
         .arguments_json = "{\"action\":\"run\",\"command\":\"touch accepted.txt\"}",
     };
     var accepted_review = TestReviewTurn.init("Create accepted.txt.", accepted_call);
-    const accepted = try requestToolPermissionOutcomeWithRequest(
-        &ctx,
-        arena,
-        accepted_call,
-        accepted_review.context(),
-        .auto,
-        &.{},
-        null,
-        null,
-        &.{},
-    );
+    const accepted = try requestToolPermissionOutcomeWithRequest(&ctx, arena, accepted_call, accepted_review.context(), .auto, &.{}, null, null, &.{}, null);
     switch ((accepted.execution_authority orelse return error.TestExpectedEqual).run_command) {
         .direct_only => return error.TestExpectedShellAllowed,
         .shell_allowed => |authority| try std.testing.expectEqual(
@@ -6358,17 +6274,7 @@ test "fx ask auto mode applies automatic clear and caution without a prompt" {
         .arguments_json = "{\"action\":\"run\",\"command\":\"touch check.txt\"}",
     };
     var check_review = TestReviewTurn.init("Check this command.", check_call);
-    const blocked = try requestToolPermissionOutcomeWithRequest(
-        &ctx,
-        arena,
-        check_call,
-        check_review.context(),
-        .auto,
-        &.{},
-        null,
-        null,
-        &.{},
-    );
+    const blocked = try requestToolPermissionOutcomeWithRequest(&ctx, arena, check_call, check_review.context(), .auto, &.{}, null, null, &.{}, null);
     try std.testing.expectEqual(ToolPermissionDecision.deny, blocked.decision);
     try std.testing.expectEqual(types.ToolPermissionDenialReason.review_caution, blocked.denial_reason.?);
     try std.testing.expectEqual(@as(usize, 3), fake.calls);
@@ -6805,7 +6711,7 @@ test "fx ask auto mode uses automatic allow for external prepared file mutation"
         .arguments_json = arguments_json,
     };
     var review_turn = TestReviewTurn.init("Write hello to desktop-test.txt.", call);
-    const accepted = try requestToolPermissionOutcomeWithRequest(&ctx, arena, call, review_turn.context(), .auto, &.{}, null, null, &.{});
+    const accepted = try requestToolPermissionOutcomeWithRequest(&ctx, arena, call, review_turn.context(), .auto, &.{}, null, null, &.{}, null);
 
     try std.testing.expectEqual(@as(usize, 0), fake.calls);
     try std.testing.expectEqualStrings("", fake.root_text);
@@ -7266,93 +7172,6 @@ test "saved ask allocation failures keep managed borrows owned" {
                 .{ fail_index, @errorName(err) },
             );
             return err;
-        };
-        try std.testing.expect(failing.has_induced_failure);
-        try std.testing.expectEqual(
-            failing.allocated_bytes,
-            failing.freed_bytes,
-        );
-    }
-}
-
-fn exerciseCurrentAskStateAllocation(
-    ctx: *AskContext,
-    writable: *session_store.LoadedWritableSession,
-    alloc: Allocator,
-) !void {
-    const previous_alloc = ctx.alloc;
-    ctx.alloc = alloc;
-    defer ctx.alloc = previous_alloc;
-
-    var state = try currentAskState(ctx, writable, io_mod.milliTimestamp());
-    defer state.deinit(alloc);
-}
-
-test "current ask state releases partial snapshots on allocation failure" {
-    const setup_alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    try tmp.dir.createDirPath(io_mod.getIo(), "home");
-    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
-
-    const home = try io_mod.dirRealpathAlloc(setup_alloc, tmp.dir, "home");
-    defer setup_alloc.free(home);
-    const workspace = try io_mod.dirRealpathAlloc(
-        setup_alloc,
-        tmp.dir,
-        "workspace",
-    );
-    defer setup_alloc.free(workspace);
-    const test_home = try TestAskHome.install(setup_alloc, home);
-    defer test_home.deinit();
-
-    var stdout_capture: TestCapture = .{};
-    defer stdout_capture.deinit(setup_alloc);
-    var stderr_capture: TestCapture = .{};
-    defer stderr_capture.deinit(setup_alloc);
-    var ctx = AskContext.init(
-        setup_alloc,
-        testConfig(),
-        testPromptRunDeps(
-            &stdout_capture,
-            &stderr_capture,
-            testPresentKeyStartup,
-        ),
-        workspace,
-    );
-    defer ctx.deinit();
-    try ctx.initializeSessionStores();
-    try ctx.session.appendAssistantHistoryTurn(
-        setup_alloc,
-        "question",
-        "answer",
-    );
-    const sequence = try ctx.session.usage.reserveInvocation();
-    try ctx.session.usage.finishObservedInvocation(
-        setup_alloc,
-        sequence,
-        1,
-        .observed_generation,
-        "gen_01ARZ3NDEKTSV4RRFFQ69G5FAV",
-        "https://ai-gateway.vercel.sh",
-        null,
-    );
-    const writable = &ctx.writable.?;
-
-    var counting = std.testing.FailingAllocator.init(setup_alloc, .{});
-    try exerciseCurrentAskStateAllocation(&ctx, writable, counting.allocator());
-
-    for (0..counting.alloc_index) |fail_index| {
-        var failing = std.testing.FailingAllocator.init(
-            setup_alloc,
-            .{ .fail_index = fail_index },
-        );
-        exerciseCurrentAskStateAllocation(
-            &ctx,
-            writable,
-            failing.allocator(),
-        ) catch |err| {
-            if (err != error.OutOfMemory) return err;
         };
         try std.testing.expect(failing.has_induced_failure);
         try std.testing.expectEqual(
@@ -8730,6 +8549,89 @@ test "json run with missing API key prints diagnostic then final object" {
     );
 }
 
+test "ordinary resumed ask preserves its user after a retained mid-turn checkpoint" {
+    const Process = struct {
+        fn run(_: *agent_runtime.Agent, deps: *const agent_runtime.AgentRuntimeDeps, _: ?agent_runtime.SemanticPresentationSink, _: agent_runtime.LifecycleContext, _: agent_runtime.Config, job: worker_runtime.QueuedPrompt) !void {
+            if (job.recovery_checkpoint) |checkpoint| {
+                try std.testing.expectEqual(@as(u64, 7), checkpoint.turn_id);
+                try std.testing.expectEqualStrings("original request", job.prompt);
+            }
+            try deps.propagate_history_turn(deps.ctx, .{ .assistant = .{
+                .user = .{ .text = job.prompt },
+                .assistant = @constCast("new answer"),
+            } });
+            try testPushAssistantText(deps, "new answer");
+        }
+    };
+    const alloc = std.testing.allocator;
+    const cases = [_]struct { prompt: [:0]const u8, continue_recovery: bool = false }{
+        .{ .prompt = "different request" },
+        .{ .prompt = "original request" },
+        .{ .prompt = "original request", .continue_recovery = true },
+    };
+    for (cases) |case| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+        defer alloc.free(home);
+        const test_home = try TestAskHome.install(alloc, home);
+        defer test_home.deinit();
+        const session_id = "retained-open-session";
+        var store = try session_store.Store.initFromHome(alloc, home, "/tmp/fx-test");
+        defer store.deinit(alloc);
+        var state = try testAskDurableState(alloc, "/tmp/fx-test", session_id);
+        defer state.deinit(alloc);
+        const old_user = types.UserTurn{ .text = @constCast("original request") };
+        {
+            var writable = try store.startWritableSession(alloc, state);
+            defer writable.deinit(alloc);
+            _ = try writable.commitContextCompaction(alloc, .{
+                .summary = @constCast("<context_handoff>Earlier work completed.</context_handoff>"),
+                .removed_turn_count = 0,
+                .compaction_count = 1,
+            }, .{ .user = old_user, .assistant = @constCast("") }, null, 10);
+            _ = try writable.appendEvent(alloc, .{ .recovery_checkpoint_set = .{ .checkpoint = .{
+                .turn_id = 7,
+                .user = old_user,
+                .assistant_source = @constCast("old partial answer"),
+                .cause = .network_interrupted,
+                .action = .paused,
+                .authority = .{ .provider = .gateway, .model = @constCast("model") },
+                .requested_fast_mode = false,
+                .fast_mode = false,
+                .max_provider_attempts = 3,
+                .consumed_provider_attempts = 1,
+            } } }, 20);
+        }
+
+        var stdout_capture: TestCapture = .{};
+        defer stdout_capture.deinit(alloc);
+        var stderr_capture: TestCapture = .{};
+        defer stderr_capture.deinit(alloc);
+        var deps = testPromptRunDeps(&stdout_capture, &stderr_capture, testPresentKeySavedStartup);
+        deps.initialize_session_stores = initializeSessionStoresDefault;
+        deps.process_queued_prompt = Process.run;
+        const args: []const [:0]const u8 = if (case.continue_recovery)
+            &.{ "--json", "--resume-id", session_id, "--continue-recovery" }
+        else
+            &.{ "--json", "--resume-id", session_id, case.prompt };
+        try std.testing.expectEqual(@as(u8, 0), try runWithDeps(alloc, args, testConfig(), deps));
+
+        var restored = try store.loadReadOnly(alloc, session_id);
+        defer restored.deinit(alloc);
+        try std.testing.expectEqual(@as(usize, if (case.continue_recovery) 2 else 3), restored.history.len);
+        if (!case.continue_recovery) {
+            try std.testing.expect(restored.history[1] == .interrupted);
+            try std.testing.expectEqualStrings("original request", restored.history[1].interrupted.user.text);
+            try std.testing.expectEqualStrings("old partial answer", restored.history[1].interrupted.assistant.?);
+        }
+        const last = restored.history[restored.history.len - 1].assistant;
+        try std.testing.expectEqualStrings(case.prompt, last.user.text);
+        try std.testing.expectEqualStrings("new answer", last.assistant);
+        try std.testing.expect(restored.recovery_checkpoint == null);
+    }
+}
+
 test "recovery continuation checks local checkpoint before credentials" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -8819,7 +8721,7 @@ test "missing API key returns before project context gathering" {
     try std.testing.expectEqual(@as(usize, 0), test_gather_project_context_calls);
 }
 
-test "fx ask emits one discovery warning when catalog truncation and a skill read report it" {
+test "fx ask forwards its catalog and deduplicates repeated discovery warnings" {
     const alloc = std.testing.allocator;
     var stdout_capture: TestCapture = .{};
     defer stdout_capture.deinit(alloc);
@@ -8841,7 +8743,6 @@ test "fx ask emits one discovery warning when catalog truncation and a skill rea
         @as(usize, 1),
         std.mem.count(u8, stderr_capture.bytes.items, "skill discovery warning:"),
     );
-    try std.testing.expect(std.mem.find(u8, stderr_capture.bytes.items, "[context] skill catalog omitted 1 entries") != null);
 }
 
 test "fx ask carries resolved auto mode and initial registry context into the queued prompt" {
