@@ -6992,6 +6992,37 @@ test "visual epoch reset reanchors at row one and preserves viewport reservation
     try std.testing.expect(std.mem.find(u8, emitted, "\x1b[3J") != null);
     try expectGridContains(&h, "welcome after clear");
     try expectGridNotContains(&h, "old visual epoch");
+    try std.testing.expectEqual(@as(usize, 2), h.shell.entries.items.len);
+
+    var projection = try h.shell.buildFullTranscriptProjection(alloc, null);
+    defer projection.deinit(alloc);
+    const full = try full_transcript_screen.renderProjectionViewportSourceInterruptible(
+        alloc,
+        &projection,
+        null,
+        h.shell.layout.cols,
+        64,
+        0,
+        null,
+    );
+    defer alloc.free(full);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, full, "old visual epoch"));
+
+    h.shell.closeFullTranscriptState();
+    try h.driveResize(40, 18, 4, true);
+    try expectGridContains(&h, "welcome after clear");
+    try expectGridNotContains(&h, "old visual epoch");
+    _ = try h.shell.appendRawTranscriptEntryClassified(alloc, "new visual epoch\n", .subagent_status);
+    h.frame_redraw = true;
+    try renderTestFooter(&h, &input, &approval, &h.frame_redraw);
+    try h.flush();
+    try expectGridContains(&h, "new visual epoch");
+    try expectGridNotContains(&h, "old visual epoch");
+
+    try h.driveResize(96, 24, 4, true);
+    try expectGridContains(&h, "new visual epoch");
+    try expectGridNotContains(&h, "old visual epoch");
+    try std.testing.expectEqual(min_rows, h.shell.min_visible_viewport_rows);
 }
 
 test "multi-row replaceable line clears every old visual row on replace" {
@@ -7838,4 +7869,45 @@ test "orphan command output does not leak into current compact rows" {
     try h.driveResize(58, 16, 4, true);
 
     try expectGridOccurrenceCount(&h, "dedupe-command-row", 0);
+}
+
+test "recorded tool rows enter physical history when the viewport advances" {
+    const alloc = std.testing.allocator;
+    var h = try Harness.init(alloc, 60, 12, 4);
+    defer h.deinit();
+    const entry_id = try h.shell.appendRawTranscriptEntryClassified(alloc, "● Wrote receipt.txt\n", .tool_status);
+    try h.shell.attachHistoricalToolDetailWithLifecycle(
+        alloc,
+        entry_id,
+        .{ .id = "saved-write", .name = "write_file", .arguments_json = "{\"path\":\"receipt.txt\"}" },
+        .write,
+        .{
+            .tool_call_id = @constCast("saved-write"),
+            .tool_name = @constCast("write_file"),
+            .status = .success,
+            .output = @constCast("saved result"),
+            .output_bytes = 12,
+            .stored_output_bytes = 12,
+        },
+        .{ .turn_id = 2, .call_id = "saved-write" },
+    );
+    _ = try h.shell.appendRawTranscriptEntry(alloc, "Saved response\n");
+    try h.renderTranscriptFrame();
+    try h.flush();
+    try expectGridContains(&h, "Wrote receipt.txt");
+    try expectGridContains(&h, "Saved response");
+
+    var committed_rows: usize = 0;
+    for (0..16) |i| {
+        var buf: [48]u8 = undefined;
+        _ = try h.shell.appendRawTranscriptEntry(alloc, try std.fmt.bufPrint(&buf, "Continuation row {d}\n", .{i}));
+        try h.renderTranscriptFrame();
+        try h.flush();
+        committed_rows += h.last_frame.committed_scroll_rows;
+        try std.testing.expect(h.last_frame.transcript_history_floor_respected);
+    }
+    try expectGridContains(&h, "Continuation row 15");
+    try std.testing.expect(committed_rows > 0);
+    const anchor = h.shell.transcript_commit_state.stable;
+    try std.testing.expectEqual(anchor.visual_offset, anchor.history_visual_offset);
 }

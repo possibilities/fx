@@ -18,7 +18,10 @@ const scriptDir = fileURLToPath(new URL(".", import.meta.url));
 const encoded = new TextEncoder();
 const events = [];
 let fetchCalls = 0;
-const fetchOnceThenSucceed = async () => {
+const catalogResponse = () => Response.json({ object: "list", data: [{ id: "transport-retry/model", type: "language" }] });
+const fetchOnceThenSucceed = async (_url, init) => {
+  if (init.method === "GET") return catalogResponse();
+  assert.equal(init.method, "POST");
   fetchCalls += 1;
   if (fetchCalls === 1) throw new TypeError("injected host transport failure");
   return new Response(new ReadableStream({
@@ -51,20 +54,20 @@ try {
   assert.equal((await turn.result).stopReason, "end_turn");
   assert.equal(fetchCalls, 2, "libfx must make exactly one bounded retry");
   assert.deepEqual(
-    events.filter((event) => event.type === "transport.start").map((event) => event.attempt),
-    [1, 2],
+    events.filter((event) => event.type === "transport.start").map((event) => [event.method, event.attempt]),
+    [["GET", 1], ["POST", 2], ["POST", 3]],
   );
   assert.deepEqual(
     events.filter((event) => event.type === "transport.error").map((event) => [event.attempt, event.error]),
-    [[1, "TypeError"]],
+    [[2, "TypeError"]],
   );
   assert.deepEqual(
     events.filter((event) => event.type === "transport.retry").map((event) => [event.attempt, event.nextAttempt]),
-    [[1, 2]],
+    [[2, 3]],
   );
   assert.deepEqual(
     events.filter((event) => event.type === "transport.response").map((event) => [event.attempt, event.status]),
-    [[2, 200]],
+    [[1, 200], [3, 200]],
   );
   console.log(`${process.versions.bun ? "Bun" : "Node"} ${backend} Agent transport retry passed`);
 } finally {
@@ -82,6 +85,8 @@ const cancelledAgent = await createFxAgent({
     ? { wasm: await readFile(resolve(scriptDir, "../../zig-out/bin/fx-core.wasm")) }
     : {}),
   fetch: async (_url, init) => {
+    if (init.method === "GET") return catalogResponse();
+    assert.equal(init.method, "POST");
     cancelFetchCalls += 1;
     fetchStartedResolve();
     return new Promise((_, reject) => {
@@ -101,8 +106,8 @@ try {
   await new Promise((resolveWait) => setTimeout(resolveWait, 350));
   assert.equal(cancelFetchCalls, 1, "cancellation must not start a retry");
   assert.deepEqual(
-    cancelEvents.filter((event) => event.type === "transport.start").map((event) => event.attempt),
-    [1],
+    cancelEvents.filter((event) => event.type === "transport.start").map((event) => [event.method, event.attempt]),
+    [["GET", 1], ["POST", 2]],
   );
 } finally {
   await cancelledAgent.close();
@@ -119,7 +124,9 @@ const retryBoundaryAgent = await createFxAgent({
   ...(backend === "wasm"
     ? { wasm: await readFile(resolve(scriptDir, "../../zig-out/bin/fx-core.wasm")) }
     : {}),
-  fetch() {
+  fetch(_url, init) {
+    if (init.method === "GET") return catalogResponse();
+    assert.equal(init.method, "POST");
     retryBoundaryFetchCalls += 1;
     throw new TypeError("injected retry-boundary transport failure");
   },
@@ -138,8 +145,8 @@ try {
   assert.equal((await turn.result).stopReason, "cancelled");
   assert.equal(retryBoundaryFetchCalls, 1, "cancellation from transport.retry must prevent the second fetch");
   assert.deepEqual(
-    retryBoundaryEvents.filter((event) => event.type === "transport.start").map((event) => event.attempt),
-    [1],
+    retryBoundaryEvents.filter((event) => event.type === "transport.start").map((event) => [event.method, event.attempt]),
+    [["GET", 1], ["POST", 2]],
   );
 } finally {
   await retryBoundaryAgent.close();
