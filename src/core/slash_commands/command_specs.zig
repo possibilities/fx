@@ -269,7 +269,9 @@ const HelpRole = enum {
 };
 
 pub fn matchesTopLevel(registry: TopLevelRegistry, token: []const u8, kind: TopLevelKind) bool {
-    const spec = topLevelSpec(registry, kind);
+    // A supplied catalog may omit a kind entirely; that is not a match, not a
+    // programming error, so parsing must keep probing the kinds it does have.
+    const spec = findTopLevelSpec(registry, kind) orelse return false;
     return matchesCommandToken(token, spec.token, spec.aliases);
 }
 
@@ -1274,10 +1276,14 @@ fn renderSlashEntries(alloc: Allocator, registry: SlashRegistry, welcome_only: b
 }
 
 fn topLevelSpec(registry: TopLevelRegistry, kind: TopLevelKind) TopLevelSpec {
+    return findTopLevelSpec(registry, kind) orelse unreachable;
+}
+
+fn findTopLevelSpec(registry: TopLevelRegistry, kind: TopLevelKind) ?TopLevelSpec {
     for (registry.specs) |spec| {
         if (spec.kind == kind) return spec;
     }
-    unreachable;
+    return null;
 }
 
 fn slashSpec(registry: SlashRegistry, kind: SlashKind) SlashSpec {
@@ -1563,6 +1569,16 @@ fn lineContainsBoth(text: []const u8, first: []const u8, second: []const u8) boo
         if (std.mem.find(u8, line, first) != null and std.mem.find(u8, line, second) != null) return true;
     }
     return false;
+}
+
+test "matchesTopLevel treats a kind absent from the supplied catalog as no match" {
+    const specs = [_]TopLevelSpec{
+        .{ .kind = .help, .token = "guide", .summary = "", .usage = "guide" },
+    };
+    const registry = TopLevelRegistry{ .specs = &specs };
+    try std.testing.expect(matchesTopLevel(registry, "guide", .help));
+    try std.testing.expect(!matchesTopLevel(registry, "structured", .structured_inference));
+    try std.testing.expect(!matchesTopLevel(registry, "s", .structured_inference));
 }
 
 test "top-level matcher recognizes help aliases" {
