@@ -6,7 +6,9 @@ import {
   readFileSync,
   realpathSync,
   rmSync,
+  statSync,
   writeFileSync,
+  readdirSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -15,6 +17,7 @@ import {
   FAKE_GATEWAY_MODEL,
   fakeGatewayFinalText,
   fakeGatewayToolCall,
+  fakeShellRun,
   startDynamicFakeGateway,
   TmuxSession,
   tmuxAvailable,
@@ -150,7 +153,25 @@ function eventIndex(
 
 function latestPrompt(body: string): string {
   const request = JSON.parse(body) as { prompt?: unknown[] };
-  return JSON.stringify(request.prompt?.at(-1) ?? "");
+  const prompt = request.prompt ?? [];
+  for (let index = prompt.length - 1; index >= 0; index -= 1) {
+    // Upstream reverted post-tool reassessment, so no injected decision
+    // prompt sits between the model's turns any more.
+    return JSON.stringify(prompt[index] ?? "");
+  }
+  return "";
+}
+
+async function waitForJsonFile(
+  path: string,
+  timeoutMs = TIMEOUT,
+): Promise<unknown> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (existsSync(path)) return JSON.parse(readFileSync(path, "utf8"));
+    await Bun.sleep(25);
+  }
+  throw new Error(`timed out waiting for JSON file ${path}`);
 }
 
 describe.skipIf(!tmuxAvailable())("ADE event feed", () => {
@@ -161,10 +182,19 @@ describe.skipIf(!tmuxAvailable())("ADE event feed", () => {
       root = realpathSync(mkdtempSync(join(tempRoot, "fx-ade-feed-e2e-")));
       const home = join(root, "home");
       const workspace = join(root, "workspace");
+      const secondWorkspace = join(root, "second-workspace");
       const socketPath = join(root, "ade.sock");
+      const checkpointPath = join(root, "git-roots.json");
       const stderrPath = join(root, "stderr.log");
       mkdirSync(join(home, ".fx"), { recursive: true });
       mkdirSync(workspace);
+      mkdirSync(secondWorkspace);
+      expect(Bun.spawnSync(["git", "init", "-q", workspace]).exitCode).toBe(
+        0,
+      );
+      expect(
+        Bun.spawnSync(["git", "init", "-q", secondWorkspace]).exitCode,
+      ).toBe(0);
       writeFileSync(
         join(home, ".fx", "settings.json"),
         JSON.stringify({
@@ -201,10 +231,10 @@ describe.skipIf(!tmuxAvailable())("ADE event feed", () => {
           return fakeGatewayFinalText("ADE_PARENT_DONE");
         }
         if (latest.includes(childPrompt)) {
-          return fakeGatewayToolCall("ade_child_terminal_1", "terminal", {
-            action: "exec",
-            command: "printf ADE_CHILD_TOOL > ade-child.txt",
-            timeout_ms: 600_000,
+          return fakeShellRun("ade_child_terminal_1", "touch ADE_CHILD_EDITED", {
+            cwd: secondWorkspace,
+            profile: "clean",
+            timeout_ms: 10_000,
           });
         }
         if (latest.includes("ADE_QUESTION_REQUEST")) {
@@ -221,13 +251,9 @@ describe.skipIf(!tmuxAvailable())("ADE event feed", () => {
         }
         if (latest.includes("ADE_SUBAGENT_REQUEST")) {
           return fakeGatewayToolCall("ade_parent_create_1", "subagent", {
-            command: {
-              create: {
-                name: "ade-child",
-                mode: "persistent",
-                prompt: childPrompt,
-                permission_mode: "ask",
-              },
+            request: {
+              action: "run",
+              task: childPrompt,
             },
           });
         }
@@ -249,6 +275,7 @@ describe.skipIf(!tmuxAvailable())("ADE event feed", () => {
           FX_AUTO_UPGRADE: "0",
           FX_ADE_SOCKET_PATH: socketPath,
           FX_ADE_INSTANCE_ID: INSTANCE_ID,
+          FX_ADE_CHECKPOINT_PATH: checkpointPath,
           NO_COLOR: "1",
         },
         width: 100,
@@ -257,6 +284,24 @@ describe.skipIf(!tmuxAvailable())("ADE event feed", () => {
       });
       await session.waitForComposer(TIMEOUT);
       await receiver.waitFor((record) => record.event === "FxStarted");
+      const launchRoot = await receiver.waitFor(
+        (record) =>
+          record.event === "GitRootDiscovered" &&
+          record.payload.reason === "launch_directory",
+      );
+      expect(launchRoot.payload).toEqual({
+        git_root: realpathSync(workspace),
+        revision: 1,
+        reason: "launch_directory",
+      });
+      expect(receiver.records[0]?.event).toBe("FxStarted");
+      expect(JSON.parse(readFileSync(checkpointPath, "utf8"))).toEqual({
+        schema: 1,
+        instance_id: INSTANCE_ID,
+        revision: 1,
+        git_roots: [realpathSync(workspace)],
+      });
+      expect(statSync(checkpointPath).mode & 0o777).toBe(0o600);
 
       await session.sendText("ADE_QUESTION_REQUEST");
       const nativeMetadata = await receiver.waitFor(
@@ -299,7 +344,8 @@ describe.skipIf(!tmuxAvailable())("ADE event feed", () => {
       await session.waitForComposer(TIMEOUT);
 
       await session.sendText("ADE_SUBAGENT_REQUEST");
-      await session.waitForText("Subagent ade-child needs permission", TIMEOUT);
+      // Upstream addresses a child by its model-safe handle, not its prompt.
+      await session.waitForText("needs permission", TIMEOUT);
       const childAttention = await receiver.waitFor(
         (record) =>
           record.event === "AttentionRequired" &&
@@ -309,21 +355,13 @@ describe.skipIf(!tmuxAvailable())("ADE event feed", () => {
       expect(childAttention.context.session_id).not.toBeNull();
       expect(childAttention.context.parent_session_id).not.toBeNull();
       expect(childAttention.context.turn_id).toBeNull();
-      await session.sendKeys("C-x");
+      // Upstream's subagent delegation simplification removed the panel, so
+      // the mirrored main prompt is the only surface that answers for a child.
       await session.waitForPane(
         (pane) =>
-          pane.includes("Agents & processes") &&
-          pane.includes("ade-child") &&
-          pane.includes("approval"),
-        TIMEOUT,
-      );
-      await session.sendKeys("Enter");
-      await session.waitForPane(
-        (pane) =>
-          pane.includes("Subagent: ade-child") &&
-          pane.includes("status: approval") &&
-          pane.includes("printf ADE_CHILD_TOOL > ade-child.txt") &&
-          pane.includes("❯ 1. Yes"),
+          pane.includes("needs permission") &&
+          pane.includes("shell.run") &&
+          pane.includes("1. Yes"),
         TIMEOUT,
       );
       await session.sendKeys("1");
@@ -336,14 +374,36 @@ describe.skipIf(!tmuxAvailable())("ADE event feed", () => {
       expect(childResolution.context.session_id).toBe(childAttention.context.session_id);
       expect(childResolution.context.agent_state).toBe("working");
       expect(childResolution.context.attention_kind).toBeNull();
-      await session.waitForText("ADE_CHILD_DONE", TIMEOUT);
-      await session.sendKeys("C-x");
+      // Upstream's managed subagents render the child as a tool-call summary
+      // in the parent rather than printing the child's own final text there,
+      // so the child's completion is proved by its PostTurnEnd record below.
       await session.waitForText("ADE_PARENT_DONE", TIMEOUT);
       await receiver.waitFor(
         (record) =>
           record.event === "PostTurnEnd" &&
           record.context.agent_role === "subagent",
       );
+      const childRoot = await receiver.waitFor(
+        (record) =>
+          record.event === "GitRootDiscovered" &&
+          record.payload.reason === "subagent_terminal_write",
+      );
+      expect(childRoot.context.agent_role).toBe("subagent");
+      expect(childRoot.context.session_id).toBe(childAttention.context.session_id);
+      expect(childRoot.context.parent_session_id).toBe(
+        childAttention.context.parent_session_id,
+      );
+      expect(childRoot.payload).toEqual({
+        git_root: realpathSync(secondWorkspace),
+        revision: 2,
+        reason: "subagent_terminal_write",
+      });
+      expect(JSON.parse(readFileSync(checkpointPath, "utf8"))).toEqual({
+        schema: 1,
+        instance_id: INSTANCE_ID,
+        revision: 2,
+        git_roots: [realpathSync(workspace), realpathSync(secondWorkspace)],
+      });
       await session.waitForComposer(TIMEOUT);
 
       const originalMainSession = receiver.records.find(
@@ -363,35 +423,26 @@ describe.skipIf(!tmuxAvailable())("ADE event feed", () => {
       const freshMainSession = newSession.payload.session_id as string;
       expect(freshMainSession).not.toBe(originalMainSession);
       await session.waitForComposer(TIMEOUT);
-      await session.sendText("/resume");
-      await session.waitForText("Sessions", TIMEOUT);
-      await session.sendKeys("Tab");
-      await session.waitForText("[All workspaces]", TIMEOUT);
-      const resumePane = await session.waitForPane(
-        (pane) =>
-          pane.includes("Sessions 2") &&
-          (pane.includes("ade-native-session-title") ||
-            pane.includes("ADE_QUESTION_REQUEST")) &&
-          pane.includes("ADE_CHILD_PROMPT: run a terminal command"),
-        TIMEOUT,
+
+      // The feed's scope ends here. Resume-picker semantics belong to
+      // upstream, so instead of driving the picker this asserts what upstream
+      // asserts about discovery after a child completes: the parent and child
+      // both persist, and the parent is the session holding the child
+      // registry, which is what keeps a child private to it.
+      const sessionsRoot = join(home, ".fx", "sessions");
+      const persisted = readdirSync(sessionsRoot, { withFileTypes: true })
+        .filter((entry) =>
+          entry.isDirectory() &&
+          existsSync(join(sessionsRoot, entry.name, "session.json"))
+        )
+        .map((entry) => entry.name);
+      expect(persisted).toContain(originalMainSession);
+      expect(persisted).toContain(childAttention.context.session_id);
+      const registryOwners = persisted.filter((id) =>
+        existsSync(join(sessionsRoot, id, "subagent", "children.json"))
       );
-      const originalTitle = resumePane.includes("ade-native-session-title")
-        ? "ade-native-session-title"
-        : "ADE_QUESTION_REQUEST";
-      // The picker can preserve its prior selection while the all-workspaces
-      // page loads. With exactly two rows, clamp to the edge containing the
-      // original main session instead of assuming timestamp-tied catalog order.
-      const originalComesFirst =
-        resumePane.indexOf(originalTitle) <
-        resumePane.indexOf("ADE_CHILD_PROMPT: run a terminal command");
-      await session.sendKeys(originalComesFirst ? "Up" : "Down");
-      await session.sendKeys("Enter");
-      await receiver.waitFor(
-        (record) =>
-          record.event === "SessionChanged" &&
-          record.payload.previous_session_id === freshMainSession &&
-          record.payload.session_id === originalMainSession,
-      );
+      expect(registryOwners).toEqual([originalMainSession]);
+
       await session.waitForComposer(TIMEOUT);
       await session.sendText("/quit");
       expect(await session.waitForSessionEnd(TIMEOUT)).toBe(true);
@@ -506,6 +557,54 @@ describe.skipIf(!tmuxAvailable())("ADE event feed", () => {
     },
     60_000,
   );
+
+  test("keeps the checkpoint current when the ADE socket is unavailable", async () => {
+    const tempRoot = existsSync("/private/tmp") ? "/private/tmp" : tmpdir();
+    root = realpathSync(mkdtempSync(join(tempRoot, "fx-ade-checkpoint-e2e-")));
+    const home = join(root, "home");
+    const workspace = join(root, "workspace");
+    const checkpointPath = join(root, "git-roots.json");
+    const stderrPath = join(root, "stderr.log");
+    mkdirSync(join(home, ".fx"), { recursive: true });
+    mkdirSync(workspace);
+    expect(Bun.spawnSync(["git", "init", "-q", workspace]).exitCode).toBe(0);
+    writeFileSync(
+      join(home, ".fx", "settings.json"),
+      JSON.stringify({ sandbox: "none", permission_mode: "auto", permission: {} }),
+    );
+    writeFileSync(stderrPath, "");
+    gateway = startDynamicFakeGateway(() => fakeGatewayFinalText("unused"));
+
+    session = await TmuxSession.create({
+      cwd: realpathSync(workspace),
+      env: {
+        HOME: realpathSync(home),
+        AI_GATEWAY_API_KEY: "ade-checkpoint-key",
+        VERCEL_OIDC_TOKEN: undefined,
+        FX_GATEWAY_BASE_URL: gateway.baseUrl,
+        FX_GATEWAY_CHAT_URL: gateway.chatUrl,
+        FX_MODEL: FAKE_GATEWAY_MODEL,
+        FX_AUTO_UPGRADE: "0",
+        FX_ADE_SOCKET_PATH: join(root, "missing.sock"),
+        FX_ADE_INSTANCE_ID: "checkpoint-without-socket",
+        FX_ADE_CHECKPOINT_PATH: checkpointPath,
+        NO_COLOR: "1",
+      },
+      width: 100,
+      height: 28,
+      stderrPath,
+    });
+    await session.waitForComposer(TIMEOUT);
+    expect(await waitForJsonFile(checkpointPath)).toEqual({
+      schema: 1,
+      instance_id: "checkpoint-without-socket",
+      revision: 1,
+      git_roots: [realpathSync(workspace)],
+    });
+    await session.sendText("/quit");
+    expect(await session.waitForSessionEnd(TIMEOUT)).toBe(true);
+    expect(readFileSync(stderrPath, "utf8")).toBe("");
+  }, TIMEOUT);
 });
 
 describe("ADE event feed process exclusions", () => {
