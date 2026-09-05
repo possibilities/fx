@@ -7,6 +7,7 @@ const io_mod = @import("../core/shared/io.zig");
 const types = @import("../core/shared/types.zig");
 const gateway_client = @import("client.zig");
 const responses_protocol = @import("responses_protocol.zig");
+const sse_stream = @import("sse.zig");
 const model_tool_schema = @import("../core/tooling/model_tool_schema.zig");
 
 const Allocator = std.mem.Allocator;
@@ -432,66 +433,9 @@ fn failureKind(status: std.http.Status) stream_provider.FailureKind {
     };
 }
 
-const SseReader = struct {
-    pending_line: std.ArrayList(u8) = .empty,
-
-    fn deinit(self: *SseReader, alloc: Allocator) void {
-        self.pending_line.deinit(alloc);
-    }
-
-    fn release(self: *SseReader) void {
-        self.pending_line.clearRetainingCapacity();
-    }
-
-    fn next(self: *SseReader, alloc: Allocator, reader: anytype) !?[]const u8 {
-        while (true) {
-            const line = try self.readLine(alloc, reader) orelse return null;
-            const trimmed = std.mem.trim(u8, line, " \t\r");
-            if (trimmed.len == 0 or trimmed[0] == ':') {
-                self.release();
-                continue;
-            }
-            if (!std.mem.startsWith(u8, trimmed, "data:")) {
-                self.release();
-                continue;
-            }
-            const data = std.mem.trim(u8, trimmed["data:".len..], " \t");
-            if (std.mem.eql(u8, data, "[DONE]")) return null;
-            return data;
-        }
-    }
-
-    fn readLine(self: *SseReader, alloc: Allocator, reader: anytype) !?[]const u8 {
-        while (true) {
-            const fragment = reader.takeDelimiter('\n') catch |err| switch (err) {
-                error.StreamTooLong => {
-                    const buffered = reader.buffered();
-                    if (buffered.len == 0) return error.OpenAICodexSseReadStalled;
-                    if (buffered.len > max_sse_line_bytes - self.pending_line.items.len) {
-                        return error.OpenAICodexSseEventTooLarge;
-                    }
-                    try self.pending_line.appendSlice(alloc, buffered);
-                    reader.tossBuffered();
-                    continue;
-                },
-                error.ReadFailed => return error.ReadFailed,
-            } orelse {
-                if (self.pending_line.items.len > 0) return self.pending_line.items;
-                return null;
-            };
-            if (fragment.len > max_sse_line_bytes - self.pending_line.items.len) {
-                return error.OpenAICodexSseEventTooLarge;
-            }
-            if (self.pending_line.items.len == 0) return fragment;
-            try self.pending_line.appendSlice(alloc, fragment);
-            return self.pending_line.items;
-        }
-    }
-};
-
 fn consumeSse(
     alloc: Allocator,
-    reader: anytype,
+    reader: *std.Io.Reader,
     callback_ctx: *anyopaque,
     on_content_chunk: stream_provider.StreamCallback,
     on_tool_start: ?stream_provider.ToolStartCallback,
@@ -503,7 +447,7 @@ fn consumeSse(
 ) !types.ModelCompletion {
     var reducer = responses_protocol.Reducer.init(alloc);
     defer reducer.deinit(alloc);
-    var sse: SseReader = .{};
+    var sse: sse_stream.Reader = .{ .max_event_bytes = max_sse_line_bytes };
     defer sse.deinit(alloc);
     const callbacks = responses_protocol.StreamCallbacks{
         .context = callback_ctx,
@@ -520,8 +464,8 @@ fn consumeSse(
         .tool_arguments_bytes = limits.tool_arguments_bytes,
         .provider_state_bytes = limits.provider_state_bytes,
     };
-    while (try sse.next(alloc, reader)) |json_text| {
-        defer sse.release();
+    while (sse.next(alloc, reader, cancel_flag) catch |err| return mapReducerError(err)) |json_text| {
+        if (std.mem.eql(u8, json_text, "[DONE]")) break;
         if (reducer.applyJson(
             alloc,
             json_text,
@@ -537,6 +481,7 @@ fn consumeSse(
 
 fn mapReducerError(err: anyerror) anyerror {
     return switch (err) {
+        error.EventTooLarge => error.OpenAICodexSseEventTooLarge,
         error.InvalidEvent => error.InvalidOpenAICodexSseEvent,
         error.ResponseFailed => error.OpenAICodexResponseFailed,
         error.StreamIncomplete => error.OpenAICodexStreamIncomplete,
