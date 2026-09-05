@@ -931,6 +931,9 @@ pub fn runSubagentChild(
 
 test "ACP native tool gate keeps the native set empty" {
     var state: server.ServerState = undefined;
+    // activeToolSet consults the host tool runtime before the native policy,
+    // so the fixture must initialize it rather than read undefined memory.
+    state.host_tools = .{};
     state.cfg.allow_native_tools = false;
     state.cfg.native_tool_set = builtin_tools.advertisement_set;
     try std.testing.expectEqual(

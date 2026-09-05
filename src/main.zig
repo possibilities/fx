@@ -4012,11 +4012,11 @@ test "interactive native tool selection controls advertisement and dispatch" {
 
     const selected = app.toolAdvertisementSet();
     try std.testing.expectEqual(@as(usize, 2), selected.order.len);
-    try std.testing.expectEqualStrings("terminal", selected.order[0]);
+    try std.testing.expectEqualStrings("shell", selected.order[0]);
     try std.testing.expectEqualStrings("read_file", selected.order[1]);
     try std.testing.expectEqualStrings(
         builtin_tools.terminalExecOnlySpec().description,
-        app.toolRegistry().lookup("terminal").?.description,
+        app.toolRegistry().lookup("shell").?.description,
     );
 }
 
