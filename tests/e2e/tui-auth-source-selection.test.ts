@@ -1,5 +1,5 @@
 import { afterEach, expect, test } from "bun:test";
-import { spawn as nodeSpawn } from "node:child_process";
+import { spawn as nodeSpawn, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import {
   chmodSync,
@@ -18,6 +18,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { FX_BIN, REPO_ROOT, runFx, providerVersionTestEnv } from "../evals/eval-helpers";
 import { readTapeFrames } from "./render-lab/tape";
+import { equivalentPngEncodings } from "./fixtures/image-encoding";
 import {
   FAKE_GATEWAY_MODEL,
   fakeGatewayFinalText,
@@ -114,11 +115,11 @@ function startFakeDirectUsageProvider(
 
 function startFakeProviderCompaction(provider: "codex" | "grok") {
   const workingModel = provider === "codex" ? "gpt-5.6-sol" : "grok-4.6";
-  const compactionModel = provider === "codex" ? "gpt-5.6-luna" : "grok-4.5";
   const accessToken = provider === "codex"
     ? chatgptAccessToken()
     : "grok-compaction-token";
   const bodies: string[] = [];
+  const urls: string[] = [];
   const authorizations: Array<string | null> = [];
   const modelOverrides: Array<string | null> = [];
   let workingRequests = 0;
@@ -126,52 +127,37 @@ function startFakeProviderCompaction(provider: "codex" | "grok") {
     hostname: "127.0.0.1",
     port: 0,
     async fetch(request) {
+      urls.push(request.url);
       const path = new URL(request.url).pathname;
       if (path === "/models") {
         return provider === "codex"
           ? Response.json({ models: [
-            { slug: workingModel, visibility: "list", supported_in_api: true, supported_reasoning_levels: [{ effort: "high" }], additional_speed_tiers: [], input_modalities: ["text"], context_window: 200_000 },
-            { slug: compactionModel, visibility: "list", supported_in_api: true, supported_reasoning_levels: [{ effort: "medium" }], additional_speed_tiers: [], input_modalities: ["text"], context_window: 272_000 },
+            { slug: workingModel, visibility: "list", supported_in_api: true, supported_reasoning_levels: [{ effort: "high" }], additional_speed_tiers: [], input_modalities: ["text"], context_window: 1_050_000 },
+            { slug: "gpt-5.6-luna", visibility: "list", supported_in_api: true, supported_reasoning_levels: [{ effort: "medium" }], additional_speed_tiers: [], input_modalities: ["text"], context_window: 272_000 },
             { slug: "gpt-5.4-mini", visibility: "list", supported_in_api: true, supported_reasoning_levels: [{ effort: "low" }], additional_speed_tiers: [], input_modalities: ["text"], context_window: 128_000 },
           ] })
           : Response.json({ data: [
-            grokSubscriptionModel(workingModel, 200_000),
-            grokSubscriptionModel(compactionModel, 500_000),
+            grokSubscriptionModel(workingModel, 1_050_000),
           ] });
       }
       if (path === "/modalities") {
         return Response.json({ models: [
           grokModalityModel(workingModel, false),
-          grokModalityModel(compactionModel, false),
         ] });
       }
       const body = await request.text();
       bodies.push(body);
       authorizations.push(request.headers.get("authorization"));
       modelOverrides.push(request.headers.get("x-grok-model-override"));
-      const model = (JSON.parse(body) as { model?: string }).model;
-      if (model !== compactionModel) workingRequests += 1;
-      if (model !== compactionModel && workingRequests === 1) {
-        const pressure = Array.from(
-          { length: 10_000 },
-          (_, index) => createHash("sha256").update(`${provider}:${index}`).digest("hex"),
-        ).join("");
-        const input = JSON.stringify({
-          action: "exec",
-          command: `printf TOOL_PRESSURE_OK >/dev/null # ${pressure}`,
-          timeout_ms: 600_000,
-        });
-        return new Response(
-          'data: {"type":"response.output_text.delta","delta":"Running the requested pressure fixture."}\n\n' +
-            'data: {"type":"response.output_item.added","output_index":0,"item":{"type":"function_call","call_id":"call_pressure","name":"terminal"}}\n\n' +
-            `data: ${JSON.stringify({ type: "response.function_call_arguments.done", output_index: 0, arguments: input })}\n\n` +
-            'data: {"type":"response.completed","response":{"id":"response-tool","status":"completed","usage":{"input_tokens":7,"output_tokens":3}}}\n\n',
-          { headers: { "content-type": "text/event-stream" } },
-        );
+      const parsed = JSON.parse(body) as { tools?: unknown[] };
+      const compacting = (parsed.tools?.length ?? 0) === 0;
+      if (!compacting) workingRequests += 1;
+      if (!compacting && workingRequests === 2) {
+        return Response.json({ error: { code: "context_length_exceeded", message: "maximum context length exceeded" } }, { status: 400 });
       }
-      const text = model === compactionModel
-        ? "Continue after provider-local compaction."
-        : `${provider.toUpperCase()}_COMPACTION_CONTINUED`;
+      const text = compacting
+        ? "The earlier request established the saved facts."
+        : workingRequests === 1 ? "SAVED_PROVIDER_FACTS" : `${provider.toUpperCase()}_COMPACTION_CONTINUED`;
       return new Response(
         `data: ${JSON.stringify({ type: "response.output_text.delta", delta: text })}\n\n` +
           `data: ${JSON.stringify({ type: "response.completed", response: { id: `response-${bodies.length}`, status: "completed", usage: { input_tokens: 7, output_tokens: 3 } } })}\n\n`,
@@ -185,7 +171,7 @@ function startFakeProviderCompaction(provider: "codex" | "grok") {
     authorizations,
     modelOverrides,
     workingModel,
-    compactionModel,
+    urls,
     responsesUrl: `http://127.0.0.1:${server.port}/responses`,
     modelsUrl: `http://127.0.0.1:${server.port}/models`,
     modalitiesUrl: `http://127.0.0.1:${server.port}/modalities`,
@@ -550,6 +536,7 @@ function startFakeChatGptOAuth(
     unauthorizedResponses?: number;
     rejectRefresh?: boolean;
     beforeRefreshResponse?: () => void | Promise<void>;
+    modelsResponse?: () => Promise<Response | void>;
   } = {},
 ) {
   const accessToken = chatgptAccessToken();
@@ -602,7 +589,8 @@ function startFakeChatGptOAuth(
         });
       }
       if (url.pathname === "/chatgpt/models") {
-        return Response.json({ models });
+        const overridden = await options.modelsResponse?.();
+        return overridden ?? Response.json({ models });
       }
       if (url.pathname === "/chatgpt/responses") {
         responseCount += 1;
@@ -648,6 +636,7 @@ function startFakeGrokOAuth(options: {
   beforeRefreshResponse?: () => void | Promise<void>;
   revokeStatus?: number;
   userinfoSub?: string;
+  modelsResponse?: () => Promise<Response | void>;
 } = {}) {
   const initialAccessToken = "grok-initial-access-token";
   const refreshedAccessToken = "grok-refreshed-access-token";
@@ -748,7 +737,8 @@ function startFakeGrokOAuth(options: {
         return Response.json({ models });
       }
       if (url.pathname === "/v1/models") {
-        return Response.json({ data: subscriptionModels });
+        const overridden = await options.modelsResponse?.();
+        return overridden ?? Response.json({ data: subscriptionModels });
       }
       if (url.pathname === "/v1/responses") {
         responseCalls += 1;
@@ -910,6 +900,9 @@ async function runCodexLoginWithBrowser(
 }
 
 function startFakeCodexToolLoop(options: {
+  responses?: Response[];
+  model?: string;
+  toolCallId?: string;
   toolName?: string;
   toolArguments?: object;
   finalText?: string;
@@ -930,14 +923,15 @@ function startFakeCodexToolLoop(options: {
           { slug: "gpt-5.6-sol", visibility: "list", supported_in_api: true, supported_reasoning_levels: [{ effort: "high" }], additional_speed_tiers: [], input_modalities: inputModalities, context_window: 272000 },
           { slug: "gpt-5.6-luna", visibility: "list", supported_in_api: true, supported_reasoning_levels: [{ effort: "medium" }], additional_speed_tiers: [], input_modalities: ["text"], context_window: 272000 },
           { slug: "gpt-5.4-mini", visibility: "list", supported_in_api: true, supported_reasoning_levels: [{ effort: "low" }], additional_speed_tiers: [], input_modalities: ["text"], context_window: 128000 },
-        ] });
+        ].map((model, index) => index === 0 && options.model ? { ...model, slug: options.model } : model) });
       }
       bodies.push(await request.text());
+      if (options.responses) return options.responses.shift() ?? new Response("unexpected request", { status: 400 });
       if (bodies.length === 1) {
         return new Response(
           'data: {"type":"response.output_item.added","output_index":0,"item":{"type":"reasoning"}}\n\n' +
             'data: {"type":"response.output_item.done","output_index":0,"item":{"id":"rs_tool","type":"reasoning","summary":[],"encrypted_content":"opaque-tool-loop"}}\n\n' +
-            `data: ${JSON.stringify({ type: "response.output_item.added", output_index: 1, item: { type: "function_call", call_id: "call_tool", name: toolName } })}\n\n` +
+            `data: ${JSON.stringify({ type: "response.output_item.added", output_index: 1, item: { type: "function_call", call_id: options.toolCallId ?? "call_tool", name: toolName } })}\n\n` +
             `data: ${JSON.stringify({ type: "response.function_call_arguments.done", output_index: 1, arguments: JSON.stringify(toolArguments) })}\n\n` +
             'data: {"type":"response.completed","response":{"status":"completed","usage":{"input_tokens":5,"output_tokens":2}}}\n\n',
           { headers: { "content-type": "text/event-stream" } },
@@ -1000,6 +994,9 @@ function startFakeCodexCapacityLoop() {
 }
 
 function startFakeGrokToolLoop(options: {
+  responses?: Response[];
+  model?: string;
+  toolCallId?: string;
   toolName?: string;
   toolArguments?: object;
   finalText?: string;
@@ -1015,17 +1012,18 @@ function startFakeGrokToolLoop(options: {
     async fetch(request) {
       const path = new URL(request.url).pathname;
       if (path === "/models") {
-        return Response.json({ data: [grokSubscriptionModel("grok-4.20", 1_000_000)] });
+        return Response.json({ data: [grokSubscriptionModel(options.model ?? "grok-4.20", 1_000_000)] });
       }
       if (path === "/modalities") {
-        return Response.json({ models: [grokModalityModel("grok-4.20", true)] });
+        return Response.json({ models: [grokModalityModel(options.model ?? "grok-4.20", true)] });
       }
       bodies.push(await request.text());
+      if (options.responses) return options.responses.shift() ?? new Response("unexpected request", { status: 400 });
       if (bodies.length === 1) {
         return new Response(
           'data: {"type":"response.output_item.added","output_index":0,"item":{"type":"reasoning"}}\n\n' +
             'data: {"type":"response.output_item.done","output_index":0,"item":{"id":"rs_tool","type":"reasoning","summary":[],"encrypted_content":"opaque-grok-tool-loop"}}\n\n' +
-            `data: ${JSON.stringify({ type: "response.output_item.added", output_index: 1, item: { type: "function_call", call_id: "call_tool", name: toolName } })}\n\n` +
+            `data: ${JSON.stringify({ type: "response.output_item.added", output_index: 1, item: { type: "function_call", call_id: options.toolCallId ?? "call_tool", name: toolName } })}\n\n` +
             `data: ${JSON.stringify({ type: "response.function_call_arguments.done", output_index: 1, arguments: JSON.stringify(toolArguments) })}\n\n` +
             'data: {"type":"response.completed","response":{"status":"completed","usage":{"input_tokens":5,"output_tokens":2}}}\n\n',
           { headers: { "content-type": "text/event-stream" } },
@@ -1267,6 +1265,237 @@ for (const provider of ["gateway", "codex", "grok"] as const) {
   }, TIMEOUT);
 }
 
+for (const provider of ["codex", "grok"] as const) {
+  tmuxTest(`provider recovery switches from ${provider} after logout and preserves the fallback on restart`, async () => {
+    home = mkdtempSync(join(tmpdir(), `fx-logout-fallback-${provider}-`));
+    stderrPath = join(home, "stderr.log");
+    writeFileSync(stderrPath, "");
+    gateway = startFakeGateway([fakeGatewayFinalText("LOGOUT_GATEWAY_RESPONSE")]);
+    chatgptOauth = startFakeChatGptOAuth();
+    const grok = startFakeGrokOAuth();
+    try {
+      writeSeededChatGptLogin(home, chatgptOauth.accessToken);
+      writeSeededGrokLogin(home, grok.initialAccessToken);
+      const settingsPath = join(home, ".fx", "settings.json");
+      writeFileSync(settingsPath, JSON.stringify({
+        provider, models: { gateway: FAKE_GATEWAY_MODEL, codex: "gpt-5.6-sol", grok: "grok-4.6" },
+      }), { mode: 0o600 });
+      const env = { ...chatgptOauth.env, ...grok.env, FX_MODEL: undefined };
+      session = await startFx(home, stderrPath, gateway, undefined, undefined, env);
+      await session.waitForComposer(TIMEOUT);
+      const inactive = provider === "codex" ? "grok" : "codex";
+      await session.sendText(`/logout ${inactive}`);
+      await session.waitForText(`Signed out of ${inactive === "codex" ? "Codex" : "Grok"}.`, TIMEOUT);
+      expect(JSON.parse(readFileSync(settingsPath, "utf8")).provider).toBe(provider);
+      await session.sendText("/logout");
+      await session.waitForText(`Signed out of ${provider === "codex" ? "Codex" : "Grok"}.`, TIMEOUT);
+      await openProviderPicker(session);
+      expect(await session.capturePane()).toContain("vercel · current");
+      expect(existsSync(join(home, ".fx", provider === "codex" ? "chatgpt-auth.json" : "grok-auth.json"))).toBe(false);
+      expect(JSON.parse(readFileSync(settingsPath, "utf8")).provider).toBe("gateway");
+      await session.sendKeys("Escape");
+      await session.sendKeys("C-u");
+      await session.sendText("Use the remaining provider.");
+      await session.waitForText("LOGOUT_GATEWAY_RESPONSE", TIMEOUT);
+      expect(gateway.requests).toHaveLength(1);
+      await session.sendText("/quit");
+      await session.waitForSessionEnd(TIMEOUT);
+      session = null;
+      session = await startFx(home, stderrPath, gateway, undefined, undefined, env);
+      await session.waitForComposer(TIMEOUT);
+      await openProviderPicker(session);
+      expect(await session.capturePane()).toContain("vercel · current");
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+    } finally {
+      grok.stop();
+    }
+  }, 60_000);
+
+  tmuxTest(`provider recovery activates ${provider} sign-in after a cancelled turn`, async () => {
+    home = mkdtempSync(join(tmpdir(), `fx-cancel-login-${provider}-`));
+    stderrPath = join(home, "stderr.log");
+    writeFileSync(stderrPath, "");
+    let release!: () => void;
+    const held = new Promise<void>((resolve) => { release = resolve; });
+    gateway = startFakeGateway([async () => {
+      await held;
+      return fakeGatewayFinalText("CANCELLED_GATEWAY_RESPONSE");
+    }]);
+    chatgptOauth = startFakeChatGptOAuth();
+    const grok = startFakeGrokOAuth();
+    try {
+      session = await startFx(home, stderrPath, gateway, undefined, undefined, {
+        ...chatgptOauth.env, ...grok.env, FX_MODEL: undefined,
+      });
+      await session.waitForComposer(TIMEOUT);
+      await session.sendText("Hold this request until cancelled.");
+      const deadline = Date.now() + TIMEOUT;
+      while (gateway.requests.length === 0) {
+        if (Date.now() > deadline) throw new Error("Gateway request did not start");
+        await Bun.sleep(20);
+      }
+      await session.sendKeys("C-c");
+      await session.waitForText("What can fx do differently?", TIMEOUT);
+      release();
+      await openProviderPicker(session);
+      await session.sendKeys("Down");
+      if (provider === "grok") await session.sendKeys("Down");
+      await session.sendKeys("Enter");
+      if (provider === "codex") await completeDisplayedCodexLogin(session, chatgptOauth);
+      else await completeDisplayedGrokLogin(session, grok);
+      const label = provider === "codex" ? "Codex" : "Grok";
+      const outcome = await session.waitForPane(
+        (pane) => pane.includes(`Switched to ${label} subscription`) ||
+          pane.includes("Subscription sign-in completed, but"),
+        TIMEOUT,
+      );
+      expect(outcome).toContain(`Switched to ${label} subscription`);
+      await session.sendText("Use the subscription immediately after sign-in.");
+      await session.waitForText(provider === "codex" ? "CHATGPT_DIRECT_RESPONSE" : "GROK_DIRECT_RESPONSE", TIMEOUT);
+      expect(gateway.requests).toHaveLength(1);
+      expect(JSON.parse(readFileSync(join(home, ".fx", "settings.json"), "utf8")).provider).toBe(provider);
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+    } finally {
+      release();
+      grok.stop();
+    }
+  }, 60_000);
+}
+
+for (const gatewayState of ["absent", "rejected"] as const) {
+  tmuxTest(`provider recovery uses the remaining subscription when Gateway is ${gatewayState}`, async () => {
+    home = mkdtempSync(join(tmpdir(), "fx-logout-other-subscription-"));
+    stderrPath = join(home, "stderr.log");
+    writeFileSync(stderrPath, "");
+    gateway = startFakeGateway([], { models: () => [] });
+    chatgptOauth = startFakeChatGptOAuth();
+    const grok = startFakeGrokOAuth();
+    try {
+      writeSeededChatGptLogin(home, chatgptOauth.accessToken);
+      writeSeededGrokLogin(home, grok.initialAccessToken);
+      writeFileSync(join(home, ".fx", "settings.json"), JSON.stringify({
+        provider: "codex", models: { codex: "gpt-5.6-sol", grok: "grok-4.6" },
+      }), { mode: 0o600 });
+      session = await startFx(home, stderrPath, gateway, undefined, undefined, {
+        ...chatgptOauth.env, ...grok.env, FX_MODEL: undefined,
+        AI_GATEWAY_API_KEY: gatewayState === "absent" ? undefined : ENV_TOKEN,
+      });
+      await session.waitForComposer(TIMEOUT);
+      await session.sendText("/logout");
+      await session.waitForText("Signed out of Codex.", TIMEOUT);
+      await openProviderPicker(session);
+      expect(await session.capturePane()).toContain("grok · current");
+      await session.sendKeys("Escape");
+      await session.sendKeys("C-u");
+      await session.sendText("Use the remaining subscription.");
+      await session.waitForText("GROK_DIRECT_RESPONSE", TIMEOUT);
+      expect(JSON.parse(readFileSync(join(home, ".fx", "settings.json"), "utf8")).provider).toBe("grok");
+      expect(grok.requests.filter((request) => request.path === "/oauth2/token")).toHaveLength(0);
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+    } finally {
+      grok.stop();
+    }
+  }, 60_000);
+}
+
+tmuxTest("provider recovery stays signed out when no replacement is connected", async () => {
+  home = mkdtempSync(join(tmpdir(), "fx-logout-no-provider-"));
+  stderrPath = join(home, "stderr.log");
+  writeFileSync(stderrPath, "");
+  gateway = startFakeGateway([]);
+  chatgptOauth = startFakeChatGptOAuth();
+  writeSeededChatGptLogin(home, chatgptOauth.accessToken);
+  writeFileSync(join(home, ".fx", "settings.json"), JSON.stringify({
+    provider: "codex", models: { codex: "gpt-5.6-sol" },
+  }), { mode: 0o600 });
+  session = await startFx(home, stderrPath, gateway, undefined, undefined, {
+    ...chatgptOauth.env, FX_MODEL: undefined, AI_GATEWAY_API_KEY: undefined,
+  });
+  await session.waitForComposer(TIMEOUT);
+  await session.sendText("/logout");
+  await session.waitForText("Signed out of Codex.", TIMEOUT);
+  await openProviderPicker(session);
+  const pane = await session.capturePane();
+  expect(pane).not.toContain("codex · current");
+  expect(pane).not.toContain("vercel · current");
+  expect(pane).not.toContain("grok · current");
+  expect(existsSync(join(home, ".fx", "chatgpt-auth.json"))).toBe(false);
+  expect(gateway.requests).toHaveLength(0);
+  expect(readFileSync(stderrPath, "utf8")).toBe("");
+}, 60_000);
+
+tmuxTest("provider recovery refuses active logout before deleting a busy subscription", async () => {
+  home = mkdtempSync(join(tmpdir(), "fx-logout-busy-"));
+  stderrPath = join(home, "stderr.log");
+  writeFileSync(stderrPath, "");
+  gateway = startFakeGateway([]);
+  chatgptOauth = startFakeChatGptOAuth({ responseDelayMs: 10_000 });
+  writeSeededChatGptLogin(home, chatgptOauth.accessToken);
+  const authPath = join(home, ".fx", "chatgpt-auth.json");
+  writeFileSync(join(home, ".fx", "settings.json"), JSON.stringify({
+    provider: "codex", models: { codex: "gpt-5.6-sol" },
+  }), { mode: 0o600 });
+  session = await startFx(home, stderrPath, gateway, undefined, undefined, {
+    ...chatgptOauth.env, FX_MODEL: undefined,
+  });
+  await session.waitForComposer(TIMEOUT);
+  await session.sendText("Keep this response open.");
+  const deadline = Date.now() + TIMEOUT;
+  while (!chatgptOauth.requests.some((request) => request.path === "/chatgpt/responses")) {
+    if (Date.now() > deadline) throw new Error("Codex request did not start");
+    await Bun.sleep(20);
+  }
+  await session.sendText("/logout");
+  const outcome = await session.waitForPane(
+    (pane) => pane.includes("Sign out is unavailable until active and queued work finishes.") ||
+      pane.includes("Signed out of Codex."),
+    TIMEOUT,
+  );
+  expect(outcome).toContain("Sign out is unavailable until active and queued work finishes.");
+  expect(existsSync(authPath)).toBe(true);
+  await session.sendKeys("C-c");
+  await session.waitForText("What can fx do differently?", TIMEOUT);
+  expect(readFileSync(stderrPath, "utf8")).toBe("");
+}, 60_000);
+
+tmuxTest("provider recovery validates a Gateway team after a cancelled turn", async () => {
+  home = mkdtempSync(join(tmpdir(), "fx-cancel-team-selection-"));
+  stderrPath = join(home, "stderr.log");
+  writeFileSync(stderrPath, "");
+  let release!: () => void;
+  const held = new Promise<void>((resolve) => { release = resolve; });
+  gateway = startFakeGateway([
+    async () => { await held; return fakeGatewayFinalText("CANCELLED_TEAM_RESPONSE"); },
+    fakeGatewayFinalText("TEAM_AFTER_CANCEL_RESPONSE"),
+  ]);
+  oauth = startFakeOAuth(LOGIN_TOKEN, undefined, 3600, Infinity, {
+    teams: [{ id: "team_123", slug: "vercel-labs", name: "Vercel Labs" }],
+  });
+  writeSeededFxLogin(home, Date.now() + 60 * 60 * 1000, oauth.issuerUrl, "team_123");
+  try {
+    session = await startFx(home, stderrPath, gateway, oauth.issuerUrl);
+    await session.waitForComposer(TIMEOUT);
+    await session.sendText("Hold this request until cancelled.");
+    const deadline = Date.now() + TIMEOUT;
+    while (gateway.requests.length === 0) {
+      if (Date.now() > deadline) throw new Error("Gateway request did not start");
+      await Bun.sleep(20);
+    }
+    await session.sendKeys("C-c");
+    await session.waitForText("What can fx do differently?", TIMEOUT);
+    release();
+    await selectFxLoginCredential(session);
+    expect(gateway.modelRequests.some((request) =>
+      request.headers.get("authorization") === `Bearer ${LOGIN_TOKEN}`)).toBe(true);
+    await session.sendText("Use the selected Vercel team.");
+    await session.waitForText("TEAM_AFTER_CANCEL_RESPONSE", TIMEOUT);
+    expect(gateway.requests.at(-1)?.headers.get("authorization")).toBe(`Bearer ${LOGIN_TOKEN}`);
+    expect(readFileSync(stderrPath, "utf8")).toBe("");
+  } finally {
+    release();
+  }
+}, 60_000);
+
 tmuxTest("pending Gateway prompt waits for valid saved preferences and a repaired login", async () => {
   home = mkdtempSync(join(tmpdir(), "fx-prompt-preference-retry-"));
   mkdirSync(join(home, ".fx"), { recursive: true, mode: 0o700 });
@@ -1411,6 +1640,110 @@ tmuxTest(
   },
   60_000,
 );
+
+for (const command of ["/provider", "/login", "/setup"]) {
+  tmuxTest(`provider picker retains type-ahead after ${command} Enter`, async () => {
+    home = mkdtempSync(join(tmpdir(), "fx-provider-typeahead-"));
+    stderrPath = join(home, "stderr.log");
+    gateway = startFakeGateway([]);
+    session = await startFx(home, stderrPath, gateway);
+    await session.waitForComposer(TIMEOUT);
+
+    await session.sendLiteral(`${command}\rcodex`);
+    const prefix = command === "/login" ? "/login" : "/provider";
+    await session.waitForPane(
+      (pane) => pane.split("\n").some((line) => line.trim() === `┃ ${prefix} codex`) && /^\s+codex\s*$/m.test(pane),
+      TIMEOUT,
+    );
+    await session.sendKeys("BSpace");
+    await session.waitForPane(
+      (pane) => pane.split("\n").some((line) => line.trim() === `┃ ${prefix} code`),
+      TIMEOUT,
+    );
+    await session.sendKeys("Escape");
+    await session.sendKeys("C-u");
+    await session.sendLiteral("retained draft");
+    await session.waitForText("retained draft", TIMEOUT);
+    expect(gateway.requests).toHaveLength(0);
+    expect(await session.captureFullScrollback()).not.toContain("Authorize with Codex");
+    expect(readFileSync(stderrPath, "utf8")).toBe("");
+  }, TIMEOUT * 2);
+}
+
+tmuxTest("provider picker consumes selection keys while inventory is pending", async () => {
+  home = mkdtempSync(join(tmpdir(), "fx-provider-pending-"));
+  stderrPath = join(home, "stderr.log");
+  gateway = startFakeGateway([]);
+  chatgptOauth = startFakeChatGptOAuth();
+  session = await startFx(home, stderrPath, gateway, undefined, undefined, chatgptOauth.env);
+  await session.waitForComposer(TIMEOUT);
+
+  await session.sendLiteral("/provider\rco\t\r");
+  await session.waitForPane(
+    (pane) => pane.split("\n").some((line) => line.trim() === "┃ /provider co") && /^\s+codex\s*$/m.test(pane),
+    TIMEOUT,
+  );
+  expect(gateway.requests).toHaveLength(0);
+  expect(chatgptOauth.requests).toHaveLength(0);
+  await session.sendKeys("Tab");
+  await session.waitForText("/provider codex", TIMEOUT);
+  await session.sendKeys("Escape");
+  await session.sendKeys("C-u");
+  expect(readFileSync(stderrPath, "utf8")).toBe("");
+}, TIMEOUT * 2);
+
+for (const scenario of [
+  { name: "bare provider", command: "/provider" },
+  { name: "setup alias", command: "/setup" },
+  { name: "login alias", command: "/login" },
+  { name: "typed provider query", command: "/provider " },
+]) {
+  tmuxTest(`first Enter reports busy provider flow for ${scenario.name}`, async () => {
+    home = mkdtempSync(join(tmpdir(), "fx-provider-picker-busy-"));
+    stderrPath = join(home, "stderr.log");
+    let cancelled = false;
+    let heartbeat: ReturnType<typeof setInterval> | undefined;
+    const encoder = new TextEncoder();
+    gateway = startFakeGateway([() => new Response(new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(encoder.encode('data: {"type":"text-delta","delta":"The response remains active.\\n\\n"}\n\n'));
+        heartbeat = setInterval(() => controller.enqueue(encoder.encode(": keep-alive\n\n")), 100);
+      },
+      cancel() {
+        cancelled = true;
+        clearInterval(heartbeat);
+      },
+    }), { headers: { "content-type": "text/event-stream" } })]);
+    try {
+      session = await startFx(home, stderrPath, gateway);
+      await session.waitForComposer(TIMEOUT);
+      await session.sendText("Keep the response active while I inspect provider settings.");
+      await session.waitForText("Generating", TIMEOUT);
+
+      await session.sendText(scenario.command);
+      const notice = "Provider switching is unavailable until active and queued work finishes.";
+      await session.waitForText(notice, TIMEOUT);
+      const scrollback = await session.captureFullScrollback();
+      expect(scrollback.split(notice)).toHaveLength(2);
+      expect(cancelled).toBe(false);
+      expect(gateway.requests).toHaveLength(1);
+
+      await session.sendKeys("C-u");
+      await session.sendKeys("Escape");
+      await session.waitForText("What can fx do differently?", TIMEOUT);
+      await session.sendText(scenario.command.trim());
+      await session.waitForPane(
+        (pane) => pane.includes("vercel") && pane.includes("codex") && pane.includes("grok"),
+        TIMEOUT,
+      );
+      expect(cancelled).toBe(true);
+      expect(gateway.requests).toHaveLength(1);
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+    } finally {
+      clearInterval(heartbeat);
+    }
+  }, TIMEOUT * 2);
+}
 
 tmuxTest(
   "unavailable configured credentials remain recoverable in TUI ask and ACP",
@@ -2116,7 +2449,8 @@ tmuxTest(
     await session.waitForText("Signed out of Codex.", TIMEOUT);
     expect(existsSync(authPath)).toBe(false);
     await session.sendText("/status");
-    await session.waitForText("model_source=Codex subscription", TIMEOUT);
+    await session.waitForText(`model=${gatewayModelBefore}`, TIMEOUT);
+    expect(JSON.parse(readFileSync(settingsPath, "utf8")).provider).toBe("gateway");
     chatgptOauth.setModels([
       { slug: "gpt-5.4-mini", visibility: "list", supported_in_api: true, supported_reasoning_levels: [{ effort: "low" }], additional_speed_tiers: [], input_modalities: ["text"], context_window: 128000 },
       { slug: "gpt-5.6-luna", visibility: "list", supported_in_api: true, supported_reasoning_levels: [{ effort: "medium" }], additional_speed_tiers: [], input_modalities: ["text"], context_window: 272000 },
@@ -4021,6 +4355,389 @@ tmuxTest(
   60_000,
 );
 
+for (const scenario of ["replace", "conflict", "invalid-index"] as const) {
+  test("direct Responses final records " + scenario, async () => {
+    const conflict = scenario !== "replace";
+    for (const provider of ["codex", "grok"] as const) {
+      const profile = mkdtempSync(join(tmpdir(), "fx-" + provider + "-final-record-"));
+      const testGateway = startFakeGateway([]);
+      const completed = { type: "response.completed", response: { status: "completed" } };
+      const item = (id: string, path: string) => ({
+        type: "function_call", id: "fc_" + id, call_id: id, name: "write_file",
+        arguments: JSON.stringify({ path, content: "saved" }),
+      });
+      const prior = item("prior", "prior.txt");
+      const pending = item("pending", "preview.txt");
+      const sibling = item("sibling", "sibling.txt");
+      const final = item("pending", "final.txt");
+      const responses: Response[] = [];
+      if (conflict) responses.push(fakeGatewaySse([
+        { type: "response.output_item.added", output_index: 0, item: { ...prior, arguments: "" } },
+        { type: "response.function_call_arguments.done", output_index: 0, arguments: prior.arguments },
+        { type: "response.output_item.done", output_index: 0, item: prior },
+        completed,
+      ]));
+      const events: object[] = [
+        { type: "response.output_item.added", output_index: 0, item: { ...pending, arguments: "" } },
+        { type: "response.function_call_arguments.delta", output_index: 0, item_id: pending.id, delta: pending.arguments },
+      ];
+      if (conflict) events.push(
+        { type: "response.function_call_arguments.done", output_index: 0, arguments: pending.arguments },
+        { type: "response.output_item.added", output_index: 1, item: { ...sibling, arguments: "" } },
+        { type: "response.function_call_arguments.done", output_index: 1, arguments: sibling.arguments },
+      );
+      events.push(
+        { type: "response.output_item.done", output_index: scenario === "invalid-index" ? "0" : 0, item: final },
+        scenario === "invalid-index" ? completed : { type: "response.completed", response: { status: "completed", output: conflict ? [final, sibling] : [final] } },
+      );
+      responses.push(fakeGatewaySse(events), fakeGatewaySse([
+        { type: "response.output_text.delta", delta: "FINAL_RECORD_OK" }, completed,
+      ]));
+      const model = "fixture-model";
+      const direct = provider === "codex" ? startFakeCodexToolLoop({ responses, model }) : startFakeGrokToolLoop({ responses, model });
+      try {
+        if (provider === "codex") writeSeededChatGptLogin(profile, direct.accessToken);
+        else writeSeededGrokLogin(profile, direct.accessToken);
+        writeFileSync(join(profile, ".fx", "settings.json"), JSON.stringify({ provider, [provider + "_model"]: model }), { mode: 0o600 });
+        const env = {
+          HOME: profile, AI_GATEWAY_API_KEY: "fixture", VERCEL_OIDC_TOKEN: undefined, FX_MODEL: undefined,
+          FX_DISABLE_KEYCHAIN: "1", FX_AUTO_UPGRADE: "0", FX_SOUND: "0",
+          FX_GATEWAY_BASE_URL: testGateway.baseUrl,
+          FX_E2E_GATEWAY_MODELS_URL: testGateway.baseUrl + "/coding-agent/v1/models",
+          FX_E2E_OPENAI_CODEX_RESPONSES_URL: direct.responsesUrl,
+          FX_E2E_OPENAI_CODEX_MODELS_URL: direct.modelsUrl,
+          FX_E2E_XAI_GROK_RESPONSES_URL: direct.responsesUrl,
+          FX_E2E_XAI_GROK_MODELS_URL: direct.modelsUrl,
+          FX_E2E_XAI_GROK_MODALITIES_URL: "modalitiesUrl" in direct ? direct.modalitiesUrl : undefined,
+        };
+        const result = await runFx(["ask", "--json", "--auto", "Create the requested files containing saved."], { cwd: profile, env, timeoutMs: TIMEOUT });
+        expect(result.code, provider + ": " + result.stdout + "\n" + result.stderr).toBe(conflict ? 1 : 0);
+        expect(result.signal).toBeNull();
+        expect(direct.bodies).toHaveLength(2);
+        expect(existsSync(join(profile, "preview.txt"))).toBe(false);
+        expect(existsSync(join(profile, "sibling.txt"))).toBe(false);
+        expect(existsSync(join(profile, "prior.txt"))).toBe(conflict);
+        expect(existsSync(join(profile, "final.txt"))).toBe(!conflict);
+        expect(readFileSync(join(profile, conflict ? "prior.txt" : "final.txt"), "utf8")).toBe("saved");
+        const resultJson = JSON.parse(result.stdout);
+        if (conflict) expect(resultJson.error).toBe(scenario === "invalid-index" ? (provider === "codex" ? "InvalidOpenAICodexSseEvent" : "InvalidXaiGrokSseEvent") : "ResponsesToolCallConflict");
+        else {
+          expect(resultJson.output).toBe("FINAL_RECORD_OK");
+          expect(result.stderr).toBe("Writing final.txt\n");
+        }
+        const detail = await runFx(["session", "--json", "--id", resultJson.session_id], { cwd: profile, env });
+        expect(detail.code).toBe(0);
+        const history = JSON.parse(detail.stdout).history;
+        expect(history).toHaveLength(1);
+        const steps = history[0].execution.tool_steps;
+        expect(steps).toHaveLength(1);
+        expect(steps[0].tool_calls).toHaveLength(1);
+        expect(steps[0].tool_calls[0].id).toBe(conflict ? "prior" : "pending");
+        expect(steps[0].tool_calls[0].arguments_json).toBe(conflict ? prior.arguments : final.arguments);
+        if (conflict) {
+          const resumed = await runFx(["ask", "--json", "--auto", "--resume-id", resultJson.session_id, "Report the completed work without writing more files."], { cwd: profile, env, timeoutMs: TIMEOUT });
+          expect(resumed.code, resumed.stdout + resumed.stderr).toBe(0);
+          expect(resumed.stderr).toBe("");
+          expect(JSON.parse(resumed.stdout).output).toBe("FINAL_RECORD_OK");
+          expect(direct.bodies).toHaveLength(3);
+          const input = JSON.parse(direct.bodies[2]).input;
+          expect(input.filter((entry: { type?: string }) => entry.type === "function_call").map((entry: { call_id: string }) => entry.call_id)).toEqual(["prior"]);
+          expect(input.filter((entry: { type?: string }) => entry.type === "function_call_output").map((entry: { call_id: string }) => entry.call_id)).toEqual(["prior"]);
+        }
+        expect(testGateway.requests).toHaveLength(0);
+      } finally {
+        direct.stop(); testGateway.stop();
+        rmSync(profile, { recursive: true, force: true });
+      }
+    }
+  }, 60_000);
+}
+
+test("direct providers reconcile final text before saving or releasing tools", async () => {
+  const prefix = "COMMENTARY_ITEM\n", answer = "FINAL_ANSWER_ITEM";
+  for (const provider of ["codex", "grok"] as const) for (const mode of ["streamed", "final-only", "mixed", "terminal-only", "conflict"]) {
+    const profile = mkdtempSync(join(tmpdir(), "fx-response-text-"));
+    const model = "fixture-model";
+    const gateway = startFakeGateway([]);
+    const events: object[] = [], items: object[] = [];
+    for (const [index, text] of [prefix, answer].entries()) {
+      const id = "msg_" + index;
+      const part = { type: "output_text", text, annotations: [] };
+      const item = { id, type: "message", role: "assistant", status: "completed", content: [part] };
+      items.push(item);
+      events.push({ type: "response.output_item.added", output_index: index, item: { ...item, status: "in_progress", content: [] } });
+      if (mode === "streamed" || (index === 0 && (mode === "mixed" || mode === "conflict"))) {
+        events.push({ type: "response.output_text.delta", output_index: index, content_index: 0, item_id: id, delta: text });
+      }
+      if (mode === "conflict" && index === 0) {
+        events.push({ type: "response.output_item.added", output_index: 2, item: { type: "function_call", id: "fc_write", call_id: "write", name: "write_file", arguments: JSON.stringify({ path: "must-not-exist.txt", content: "not admitted" }) } });
+        events.push({ type: "response.output_text.done", output_index: 0, content_index: 0, item_id: id, text: "CONFLICTING_FINAL" });
+        break;
+      }
+      if (mode !== "terminal-only") events.push(
+        { type: "response.output_text.done", output_index: index, content_index: 0, item_id: id, text },
+        { type: "response.content_part.done", output_index: index, content_index: 0, item_id: id, part },
+        { type: "response.output_item.done", output_index: index, item },
+      );
+    }
+    events.push({ type: "response.completed", response: { status: "completed", output: items } });
+    const responses = [fakeGatewaySse(events), fakeGatewaySse([
+      { type: "response.output_text.delta", delta: "RESUME_OK" },
+      { type: "response.completed", response: { status: "completed" } },
+    ])];
+    const direct = provider === "codex" ? startFakeCodexToolLoop({ model, responses }) : startFakeGrokToolLoop({ model, responses });
+    try {
+      if (provider === "codex") writeSeededChatGptLogin(profile, direct.accessToken);
+      else writeSeededGrokLogin(profile, direct.accessToken);
+      writeFileSync(join(profile, ".fx", "settings.json"), JSON.stringify({ provider, [provider + "_model"]: model }), { mode: 0o600 });
+      const env = {
+        HOME: profile, AI_GATEWAY_API_KEY: "fixture", VERCEL_OIDC_TOKEN: undefined, FX_MODEL: undefined,
+        FX_DISABLE_KEYCHAIN: "1", FX_AUTO_UPGRADE: "0", FX_SOUND: "0",
+        FX_GATEWAY_BASE_URL: gateway.baseUrl, FX_E2E_GATEWAY_MODELS_URL: gateway.baseUrl + "/coding-agent/v1/models",
+        FX_E2E_OPENAI_CODEX_RESPONSES_URL: direct.responsesUrl, FX_E2E_OPENAI_CODEX_MODELS_URL: direct.modelsUrl,
+        FX_E2E_XAI_GROK_RESPONSES_URL: direct.responsesUrl, FX_E2E_XAI_GROK_MODELS_URL: direct.modelsUrl,
+        FX_E2E_XAI_GROK_MODALITIES_URL: "modalitiesUrl" in direct ? direct.modalitiesUrl : undefined,
+      };
+      const first = await runFx(["ask", "--json", "--auto", "Report both response items."], { cwd: profile, env, timeoutMs: TIMEOUT });
+      const output = JSON.parse(first.stdout);
+      expect(first.signal).toBeNull();
+      expect(direct.bodies).toHaveLength(1);
+      expect(existsSync(join(profile, "must-not-exist.txt"))).toBe(false);
+      if (mode === "conflict") {
+        expect(first.code, first.stdout + first.stderr).toBe(1);
+        expect(output.error).toBe("ResponsesTextConflict");
+        expect(output.tool_calls).toEqual([]);
+      } else {
+        expect(first.code, first.stdout + first.stderr).toBe(0);
+        expect(first.stderr).toBe("");
+        expect(output.output).toBe(prefix + answer);
+        expect(output.final_output).toBe(prefix + answer);
+        const detail = await runFx(["session", "--json", "--id", output.session_id], { cwd: profile, env });
+        expect(detail.code).toBe(0);
+        expect(JSON.parse(detail.stdout).history[0].assistant).toBe(prefix + answer);
+        const resumed = await runFx(["ask", "--json", "--auto", "--resume-id", output.session_id, "Recall the prior answer."], { cwd: profile, env, timeoutMs: TIMEOUT });
+        expect(resumed.code, resumed.stdout + resumed.stderr).toBe(0);
+        expect(resumed.stderr).toBe("");
+        expect(direct.bodies).toHaveLength(2);
+        const replay = JSON.parse(direct.bodies[1]).input.filter((entry: { role?: string }) => entry.role === "assistant");
+        expect(replay.some((entry: { content: Array<{ text?: string }> }) => entry.content.some(part => part.text === prefix + answer))).toBe(true);
+      }
+      expect(gateway.requests).toHaveLength(0);
+    } finally {
+      direct.stop(); gateway.stop();
+      rmSync(profile, { recursive: true, force: true });
+    }
+  }
+}, 60_000);
+
+test("direct providers keep images with their users through tools and resume", async () => {
+  for (const provider of ["codex", "grok"] as const) {
+    const profile = mkdtempSync(join(tmpdir(), "fx-native-image-history-"));
+    const model = "fixture-model";
+    const testGateway = startFakeGateway([]);
+    const terminal = { type: "response.completed", response: { status: "completed", usage: { input_tokens: 50_000, output_tokens: 10 } } };
+    const responses = [
+      fakeGatewaySse([
+        { type: "response.output_item.added", output_index: 0, item: { type: "function_call", call_id: "read_1", name: "read_file", arguments: "" } },
+        { type: "response.function_call_arguments.done", output_index: 0, arguments: JSON.stringify({ path: "fixture.txt" }) },
+        terminal,
+      ]),
+      ...Array.from({ length: 3 }, () => fakeGatewaySse([
+        { type: "response.output_text.delta", delta: "IMAGE_HISTORY_OK" }, terminal,
+      ])),
+    ];
+    const direct = provider === "codex"
+      ? startFakeCodexToolLoop({ responses, model, inputModalities: ["text", "image"] })
+      : startFakeGrokToolLoop({ responses, model });
+    try {
+      if (provider === "codex") writeSeededChatGptLogin(profile, direct.accessToken);
+      else writeSeededGrokLogin(profile, direct.accessToken);
+      writeFileSync(join(profile, ".fx", "settings.json"), JSON.stringify({ provider, [provider + "_model"]: model }), { mode: 0o600 });
+      writeFileSync(join(profile, "fixture.txt"), "fixture text");
+      const firstImage = readFileSync(join(REPO_ROOT, "tests/e2e/fixtures/favicon.png"));
+      const secondImage = readFileSync(join(REPO_ROOT, "tests/e2e/fixtures/placeholder-logo.png"));
+      const firstPath = join(profile, "first.png"), secondPath = join(profile, "second.png");
+      writeFileSync(firstPath, firstImage); writeFileSync(secondPath, secondImage);
+      const firstUrl = "data:image/png;base64," + firstImage.toString("base64");
+      const secondUrl = "data:image/png;base64," + secondImage.toString("base64");
+      const env = {
+        HOME: profile, AI_GATEWAY_API_KEY: "fixture", VERCEL_OIDC_TOKEN: undefined, FX_MODEL: undefined,
+        FX_DISABLE_KEYCHAIN: "1", FX_AUTO_UPGRADE: "0", FX_SOUND: "0",
+        FX_GATEWAY_BASE_URL: testGateway.baseUrl,
+        FX_E2E_GATEWAY_MODELS_URL: testGateway.baseUrl + "/coding-agent/v1/models",
+        FX_E2E_OPENAI_CODEX_RESPONSES_URL: direct.responsesUrl,
+        FX_E2E_OPENAI_CODEX_MODELS_URL: direct.modelsUrl,
+        FX_E2E_XAI_GROK_RESPONSES_URL: direct.responsesUrl,
+        FX_E2E_XAI_GROK_MODELS_URL: direct.modelsUrl,
+        FX_E2E_XAI_GROK_MODALITIES_URL: "modalitiesUrl" in direct ? direct.modalitiesUrl : undefined,
+        FX_TRACE_LOG: join(profile, "trace.log"), FX_TRACE_SCOPES: "context_compaction",
+      };
+      const firstPrompt = "Read fixture.txt, then describe the attached image.";
+      const secondPrompt = "Compare the earlier image with this new image.";
+      const imageOwners = (raw: string): Array<{ text: string; images: string[] }> => JSON.parse(raw).input
+        .filter((entry: { role?: string }) => entry.role === "user")
+        .map((entry: { content: Array<{ type: string; text?: string; image_url?: string }> }) => ({
+          text: entry.content.filter(part => part.type === "input_text").map(part => part.text).join(""),
+          images: entry.content.filter(part => part.type === "input_image").map(part => part.image_url!),
+        }))
+        .filter((entry: { images: string[] }) => entry.images.length > 0);
+      const firstOwner = { text: firstPrompt, images: [firstUrl] };
+      const secondOwner = { text: secondPrompt, images: [secondUrl] };
+      const first = await runFx(["ask", "--json", "--auto", "--image", firstPath, firstPrompt], { cwd: profile, env, timeoutMs: TIMEOUT });
+      expect(first.code, first.stdout + first.stderr).toBe(0);
+      expect(first.signal).toBeNull();
+      const sessionId = JSON.parse(first.stdout).session_id;
+      expect(JSON.parse(first.stdout).tool_calls).toEqual([{ name: "read_file", status: "success" }]);
+      expect(direct.bodies).toHaveLength(2);
+      expect(imageOwners(direct.bodies[0])).toEqual([firstOwner]);
+      expect(imageOwners(direct.bodies[1])).toEqual([firstOwner]);
+      expect(readFileSync(join(profile, "trace.log"), "utf8")).toContain("has_images=true image_baseline=true");
+      unlinkSync(firstPath);
+      const second = await runFx(["ask", "--json", "--auto", "--resume-id", sessionId, "--image", secondPath, secondPrompt], { cwd: profile, env, timeoutMs: TIMEOUT });
+      expect(second.code, second.stdout + second.stderr).toBe(0);
+      expect(second.signal).toBeNull();
+      expect(second.stderr).toBe("");
+      expect(direct.bodies).toHaveLength(3);
+      expect(imageOwners(direct.bodies[2])).toEqual([firstOwner, secondOwner]);
+      const third = await runFx(["ask", "--json", "--auto", "--resume-id", sessionId, "Look again at both earlier images."], { cwd: profile, env, timeoutMs: TIMEOUT });
+      expect(third.code, third.stdout + third.stderr).toBe(0);
+      expect(third.signal).toBeNull();
+      expect(third.stderr).toBe("");
+      expect(direct.bodies).toHaveLength(4);
+      expect(imageOwners(direct.bodies[3])).toEqual([firstOwner, secondOwner]);
+      const detail = await runFx(["session", "--json", "--id", sessionId], { cwd: profile, env });
+      expect(detail.code).toBe(0);
+      const history = JSON.parse(detail.stdout).history;
+      expect(history).toHaveLength(3);
+      expect(history.map((turn: { user: { images?: unknown[] } }) => turn.user.images?.length ?? 0)).toEqual([1, 1, 0]);
+      const imageDir = join(profile, ".fx", "sessions", sessionId, "images");
+      const snapshotName = readdirSync(imageDir).find(name => name.endsWith(".bin") && readFileSync(join(imageDir, name)).equals(firstImage));
+      expect(snapshotName).toBeDefined();
+      writeFileSync(join(imageDir, snapshotName!), secondImage);
+      const rejected = await runFx(["ask", "--json", "--auto", "--resume-id", sessionId, "Inspect the earlier images again."], { cwd: profile, env, timeoutMs: TIMEOUT });
+      expect(rejected.code, rejected.stdout + rejected.stderr).toBe(1);
+      expect(rejected.signal).toBeNull();
+      expect(rejected.stdout + rejected.stderr).toContain("ImageSnapshotCorrupt");
+      expect(direct.bodies).toHaveLength(4);
+      const retained = await runFx(["session", "--json", "--id", sessionId], { cwd: profile, env });
+      expect(retained.code).toBe(0);
+      expect(JSON.parse(retained.stdout).history).toEqual(history);
+      expect(testGateway.requests).toHaveLength(0);
+    } finally {
+      direct.stop(); testGateway.stop();
+      rmSync(profile, { recursive: true, force: true });
+    }
+  }
+}, 60_000);
+
+test("provider context accounting is independent of image encoding size", async () => {
+  const encodings = equivalentPngEncodings();
+  for (const provider of ["gateway", "codex", "grok"] as const) {
+    const estimates: number[] = [];
+    for (const bytes of encodings) {
+      const profile = mkdtempSync(join(tmpdir(), "fx-image-context-"));
+      const model = provider === "gateway" ? "fixture/image" : "fixture-model";
+      const gateway = startFakeGateway([fakeGatewayFinalText("IMAGE_CONTEXT_OK")], {
+        models: [{ id: model, type: "language", tags: ["vision", "file-input", "tool-use"], context_window: 1_000_000 }],
+      });
+      const responses = [fakeGatewaySse([
+        { type: "response.output_text.delta", delta: "IMAGE_CONTEXT_OK" },
+        { type: "response.completed", response: { status: "completed" } },
+      ])];
+      const direct = provider === "codex" ? startFakeCodexToolLoop({ responses, model, inputModalities: ["text", "image"] })
+        : provider === "grok" ? startFakeGrokToolLoop({ responses, model }) : null;
+      try {
+        mkdirSync(join(profile, ".fx"), { recursive: true });
+        if (provider === "codex") writeSeededChatGptLogin(profile, direct!.accessToken);
+        if (provider === "grok") writeSeededGrokLogin(profile, direct!.accessToken);
+        writeFileSync(join(profile, ".fx", "settings.json"), JSON.stringify({ provider, [provider + "_model"]: model }), { mode: 0o600 });
+        const path = join(profile, "image.png"), trace = join(profile, "trace.log");
+        writeFileSync(path, bytes);
+        const result = await runFx(["ask", "--json", "--auto", "--no-save", "--image", path, "Describe the attached image."], {
+          cwd: profile, timeoutMs: TIMEOUT,
+          env: {
+            HOME: profile, AI_GATEWAY_API_KEY: "fixture", VERCEL_OIDC_TOKEN: undefined,
+            FX_MODEL: provider === "gateway" ? model : undefined, FX_DISABLE_KEYCHAIN: "1", FX_AUTO_UPGRADE: "0", FX_SOUND: "0",
+            FX_GATEWAY_BASE_URL: gateway.baseUrl, FX_GATEWAY_CHAT_URL: gateway.chatUrl,
+            FX_E2E_GATEWAY_MODELS_URL: gateway.baseUrl + "/coding-agent/v1/models",
+            FX_E2E_OPENAI_CODEX_RESPONSES_URL: direct?.responsesUrl, FX_E2E_OPENAI_CODEX_MODELS_URL: direct?.modelsUrl,
+            FX_E2E_XAI_GROK_RESPONSES_URL: direct?.responsesUrl, FX_E2E_XAI_GROK_MODELS_URL: direct?.modelsUrl,
+            FX_E2E_XAI_GROK_MODALITIES_URL: direct && "modalitiesUrl" in direct ? direct.modalitiesUrl : undefined,
+            FX_TRACE_LOG: trace, FX_TRACE_SCOPES: "context_compaction",
+          },
+        });
+        expect(result.code, provider + ": " + result.stdout + result.stderr).toBe(0);
+        expect(result.signal).toBeNull();
+        expect(result.stderr).toBe("");
+        expect(JSON.parse(result.stdout).output).toBe("IMAGE_CONTEXT_OK");
+        const bodies = direct?.bodies ?? gateway.requests;
+        expect(bodies).toHaveLength(1);
+        const request = JSON.parse(typeof bodies[0] === "string" ? bodies[0] : bodies[0].body);
+        const parts = (request.input ?? request.prompt).flatMap((message: { content: unknown }) => Array.isArray(message.content) ? message.content : []);
+        const image = parts.find((part: { type?: string }) => part.type === (provider === "gateway" ? "file" : "input_image"));
+        expect(image).toBeDefined();
+        expect(provider === "gateway" ? image.data : image.image_url).toBe((provider === "gateway" ? "" : "data:image/png;base64,") + bytes.toString("base64"));
+        const decision = readFileSync(trace, "utf8");
+        expect(decision).toContain("decision=no_op");
+        expect(decision).toContain("has_images=true image_baseline=false");
+        estimates.push(Number(decision.match(/estimated_tokens=(\d+)/)![1]));
+        if (direct) expect(gateway.requests).toHaveLength(0);
+      } finally {
+        direct?.stop(); gateway.stop();
+        rmSync(profile, { recursive: true, force: true });
+      }
+    }
+    expect(estimates[0]).toBe(estimates[1]);
+  }
+}, 60_000);
+
+test("direct provider tool identities obey the session boundary before execution", async () => {
+  for (const provider of ["codex", "grok"] as const) {
+    for (const bytes of [256, 257]) {
+      const profile = mkdtempSync(join(tmpdir(), `fx-${provider}-identity-`));
+      const testGateway = startFakeGateway([]);
+      const options = { toolCallId: "i".repeat(bytes), toolName: "write_file", toolArguments: { path: "result.txt", content: "saved" } };
+      const direct = provider === "codex" ? startFakeCodexToolLoop(options) : startFakeGrokToolLoop(options);
+      try {
+        if (provider === "codex") writeSeededChatGptLogin(profile, direct.accessToken);
+        else writeSeededGrokLogin(profile, direct.accessToken);
+        const catalog = await (await fetch(direct.modelsUrl)).json();
+        const model = provider === "codex" ? catalog.models[0].slug : catalog.data[0].id;
+        writeFileSync(join(profile, ".fx", "settings.json"), JSON.stringify({ provider, [`${provider}_model`]: model }), { mode: 0o600 });
+        const env = {
+          HOME: profile, AI_GATEWAY_API_KEY: "fixture", VERCEL_OIDC_TOKEN: undefined, FX_MODEL: undefined,
+          FX_DISABLE_KEYCHAIN: "1", FX_AUTO_UPGRADE: "0", FX_SOUND: "0",
+          FX_GATEWAY_BASE_URL: testGateway.baseUrl,
+          FX_E2E_GATEWAY_MODELS_URL: `${testGateway.baseUrl}/coding-agent/v1/models`,
+          FX_E2E_OPENAI_CODEX_RESPONSES_URL: direct.responsesUrl,
+          FX_E2E_OPENAI_CODEX_MODELS_URL: direct.modelsUrl,
+          FX_E2E_XAI_GROK_RESPONSES_URL: direct.responsesUrl,
+          FX_E2E_XAI_GROK_MODELS_URL: direct.modelsUrl,
+          FX_E2E_XAI_GROK_MODALITIES_URL: "modalitiesUrl" in direct ? direct.modalitiesUrl : undefined,
+        };
+        const result = await runFx(["ask", "--json", "--auto", "Create result.txt containing saved."], { cwd: profile, env, timeoutMs: TIMEOUT });
+        const accepted = bytes === 256;
+        expect(result.code, `${provider}/${bytes}: ${result.stdout}\n${result.stderr}`).toBe(accepted ? 0 : 1);
+        expect(result.signal).toBeNull();
+        expect(existsSync(join(profile, "result.txt"))).toBe(accepted);
+        expect(direct.bodies).toHaveLength(accepted ? 2 : 1);
+        expect(testGateway.requests).toHaveLength(0);
+        const json = JSON.parse(result.stdout);
+        expect(json.tool_calls).toEqual(accepted ? [{ name: "write_file", status: "success" }] : []);
+        if (!accepted) expect(json.error).toBe("MalformedAuthoritativeToolIdentity");
+        const detail = await runFx(["session", "--json", "--id", json.session_id], { cwd: profile, env });
+        expect(detail.code).toBe(0);
+        const history = JSON.parse(detail.stdout).history;
+        expect(history).toHaveLength(accepted ? 1 : 0);
+        if (accepted) expect(history[0].execution.tool_steps[0].tool_calls[0].id).toBe(options.toolCallId);
+      } finally {
+        direct.stop(); testGateway.stop();
+        rmSync(profile, { recursive: true, force: true });
+      }
+    }
+  }
+}, 60_000);
+
 test(
   "ChatGPT tool loops round-trip encrypted reasoning without Gateway leakage",
   async () => {
@@ -4534,9 +5251,8 @@ test(
             : { provider, grok_model: direct.workingModel }) + "\n",
           { mode: 0o600 },
         );
-        const result = await runFx(
-          ["ask", "--json", "--yolo", `Run the pressure fixture and continue as requested for ${provider}.`],
-          {
+        const options = {
+            cwd: testHome,
             env: {
               HOME: testHome,
               AI_GATEWAY_API_KEY: "gateway-compaction-sentinel",
@@ -4544,6 +5260,8 @@ test(
               FX_DISABLE_KEYCHAIN: "1",
               FX_AUTO_UPGRADE: "0",
               FX_GATEWAY_BASE_URL: testGateway.baseUrl,
+              FX_TRACE_LOG: join(testHome, "compaction.log"),
+              FX_TRACE_SCOPES: "agent,core,gateway,stream,context_compaction,session",
               FX_E2E_GATEWAY_MODELS_URL: `${testGateway.baseUrl}/coding-agent/v1/models`,
               FX_E2E_OPENAI_CODEX_RESPONSES_URL: direct.responsesUrl,
               FX_E2E_OPENAI_CODEX_MODELS_URL: direct.modelsUrl,
@@ -4552,10 +5270,14 @@ test(
               FX_E2E_XAI_GROK_MODALITIES_URL: direct.modalitiesUrl,
             },
             timeoutMs: 60_000,
-          },
-        );
+          };
+        const catalog = await runFx(["models", "--json"], options);
+        expect(catalog.code, `${catalog.stdout}\n${catalog.stderr}\n${JSON.stringify(direct.urls)}`).toBe(0);
+        const seeded = await runFx(["ask", "--json", "--yolo", "Keep these provider facts."], options);
+        expect(seeded.code).toBe(0);
+        const result = await runFx(["ask", "--json", "--yolo", "--resume-id", JSON.parse(seeded.stdout).session_id, "Continue from those facts."], options);
 
-        expect(result.code, `stdout: ${result.stdout}\nstderr: ${result.stderr}`).toBe(0);
+        expect(result.code, `stdout: ${result.stdout}\nstderr: ${result.stderr}\nrequests=${direct.bodies.length}\n${readFileSync(join(testHome, "compaction.log"), "utf8").split("\n").filter((line) => line.includes("context_compaction")).join("\n")}`).toBe(0);
         expect(JSON.parse(result.stdout).output).toContain(`${provider.toUpperCase()}_COMPACTION_CONTINUED`);
         expect(
           direct.bodies.map((body) => (JSON.parse(body) as { model: string }).model),
@@ -4563,14 +5285,10 @@ test(
             body_lengths: direct.bodies.map((body) => body.length),
           }),
         )
-          .toEqual([direct.workingModel, direct.compactionModel, direct.workingModel]);
-        expect(direct.authorizations).toEqual(Array(3).fill(`Bearer ${direct.accessToken}`));
+          .toEqual(Array(4).fill(direct.workingModel));
+        expect(direct.authorizations).toEqual(Array(4).fill(`Bearer ${direct.accessToken}`));
         if (provider === "grok") {
-          expect(direct.modelOverrides).toEqual([
-            direct.workingModel,
-            direct.compactionModel,
-            direct.workingModel,
-          ]);
+          expect(direct.modelOverrides).toEqual(Array(4).fill(direct.workingModel));
         }
         expect(testGateway.requests).toHaveLength(0);
       } finally {
@@ -5957,6 +6675,76 @@ for (const scenario of [
   );
 }
 
+for (const provider of ["codex", "grok"] as const) {
+  test.skipIf(process.platform === "win32")(`${provider} model discovery ignores a FIFO version cache without a writer`, async () => {
+    home = mkdtempSync(join(tmpdir(), `fx-${provider}-version-fifo-`));
+    const chatgpt = provider === "codex" ? startFakeChatGptOAuth() : undefined;
+    const grok = provider === "grok" ? startFakeGrokOAuth() : undefined;
+    const model = provider === "codex" ? "gpt-5.6-luna" : "grok-4.20";
+    const version = "1.999.1";
+    let releaseRequests = 0;
+    const releases = Bun.serve({
+      hostname: "127.0.0.1",
+      port: 0,
+      fetch() {
+        releaseRequests++;
+        return provider === "codex" ? Response.json({ version }) : new Response(version);
+      },
+    });
+    try {
+      if (chatgpt) writeSeededChatGptLogin(home);
+      else writeSeededGrokLogin(home, grok!.initialAccessToken);
+      writeFileSync(join(home, ".fx/settings.json"), JSON.stringify({
+        provider, models: { [provider]: model },
+      }), { mode: 0o600 });
+      mkdirSync(join(home, ".fx/provider-versions"), { mode: 0o700 });
+      const cachePath = join(home, ".fx/provider-versions", `${provider}.json`);
+      expect(spawnSync("mkfifo", ["-m", "600", cachePath]).status).toBe(0);
+      const env = {
+        HOME: home,
+        PATH: "/usr/bin:/bin",
+        FX_MODEL: undefined,
+        FX_DISABLE_KEYCHAIN: "1",
+        FX_AUTO_UPGRADE: "0",
+        FX_SOUND: "0",
+        ...(chatgpt?.env ?? grok!.env),
+        FX_E2E_CODEX_CLIENT_VERSION: undefined,
+        FX_E2E_GROK_CLIENT_VERSION: undefined,
+        [provider === "codex" ? "FX_E2E_CODEX_VERSION_URL" : "FX_E2E_GROK_VERSION_URL"]:
+          `http://127.0.0.1:${releases.port}/version`,
+      };
+
+      const listed = await runFx(["models", "--json"], { env, timeoutMs: 8000 });
+      expect(listed.timedOut).toBe(false);
+      expect(listed.code, listed.stderr).toBe(0);
+      expect(JSON.parse(listed.stdout).models.map((entry: { id: string }) => entry.id)).toContain(model);
+      expect(listed.stderr).toBe("");
+      expect(releaseRequests).toBe(1);
+      expect(statSync(cachePath).isFIFO()).toBe(true);
+
+      const asked = await runFx(["ask", "--json", "--auto", "--no-save", "Reply briefly."], { env, timeoutMs: 8000 });
+      expect(asked.timedOut).toBe(false);
+      expect(asked.code, asked.stderr).toBe(0);
+      expect(asked.stdout).toContain(provider === "codex" ? "CHATGPT_DIRECT_RESPONSE" : "GROK_DIRECT_RESPONSE");
+      const beforeRepair = releaseRequests;
+      expect(beforeRepair).toBeGreaterThan(1);
+      unlinkSync(cachePath);
+      const repaired = await runFx(["models", "--json"], { env, timeoutMs: 8000 });
+      expect(repaired.code, repaired.stderr).toBe(0);
+      expect(releaseRequests).toBe(beforeRepair + 1);
+      expect(JSON.parse(readFileSync(cachePath, "utf8")).version).toBe(version);
+      const cached = await runFx(["models", "--json"], { env, timeoutMs: 8000 });
+      expect(cached.code, cached.stderr).toBe(0);
+      expect(cached.stdout).toBe(repaired.stdout);
+      expect(releaseRequests).toBe(beforeRepair + 1);
+    } finally {
+      chatgpt?.stop();
+      grok?.stop();
+      releases.stop(true);
+    }
+  }, 30_000);
+}
+
 tmuxTest("Codex discovers upstream versions and refreshes models in an open session without a CLI", async () => {
   home = mkdtempSync(join(tmpdir(), "fx-codex-catalog-version-"));
   stderrPath = join(home, "stderr.log");
@@ -6113,3 +6901,333 @@ test("Grok refreshes upstream versions for catalogs and responses and survives l
     releases.stop(true);
   }
 }, 30_000);
+
+for (const provider of ["codex", "grok"] as const) {
+  for (const outcome of ["success", "failure", "cancel"] as const) {
+    tmuxTest(`provider preparation keeps input responsive through ${provider} ${outcome}`, async () => {
+      home = mkdtempSync(join(tmpdir(), "fx-provider-preparation-"));
+      stderrPath = join(home, "stderr.log");
+      writeFileSync(stderrPath, "");
+      gateway = startFakeGateway([fakeGatewayFinalText("PREPARATION_GATEWAY_RECOVERY")]);
+      let entered = 0;
+      let release!: () => void;
+      const held = new Promise<void>((resolve) => { release = resolve; });
+      const modelsResponse = async () => {
+        entered++;
+        if (entered !== 1) return;
+        await held;
+        if (outcome === "failure") return new Response("unavailable", { status: 503 });
+      };
+      chatgptOauth = startFakeChatGptOAuth({ modelsResponse });
+      const grok = startFakeGrokOAuth({ modelsResponse });
+      try {
+        writeSeededChatGptLogin(home, chatgptOauth.accessToken);
+        writeSeededGrokLogin(home, grok.initialAccessToken);
+        const settingsPath = join(home, ".fx", "settings.json");
+        writeFileSync(settingsPath, JSON.stringify({ provider: "gateway", models: { gateway: FAKE_GATEWAY_MODEL } }));
+        session = await startFx(home, stderrPath, gateway, undefined, join(home, "trace.log"), {
+          ...chatgptOauth.env, ...grok.env, FX_MODEL: undefined, FX_SOUND: "0", FX_TRACE_SCOPES: "auth,prompt,input,provider",
+        });
+        await session.waitForComposer(TIMEOUT);
+        await openProviderPicker(session);
+        await session.sendLiteral(provider);
+        await session.sendKeys("Enter");
+        await session.waitForPane(() => entered === 1, 5000);
+        await session.sendLiteral("retained café 日本語");
+        await session.waitForText("retained café 日本語", 1500);
+        await session.resizeWindow(88, 24);
+        expect(await session.capturePane()).toContain("retained café 日本語");
+        expect(JSON.parse(readFileSync(settingsPath, "utf8")).provider).toBe("gateway");
+        const direct = provider === "codex" ? chatgptOauth : grok;
+        const responsePath = provider === "codex" ? "/chatgpt/responses" : "/v1/responses";
+        const responses = () => direct.requests.filter((request) => request.path === responsePath);
+        if (outcome === "cancel") {
+          await session.sendKeys("C-c");
+          await session.waitForText("Provider preparation cancelled.", 1500);
+          expect(await session.capturePane()).toContain("retained café 日本語");
+          release();
+          await Bun.sleep(100);
+          expect(JSON.parse(readFileSync(settingsPath, "utf8")).provider).toBe("gateway");
+          expect(responses()).toHaveLength(0);
+          await session.sendKeys("C-u");
+          await openProviderPicker(session);
+          await session.sendLiteral(provider);
+          await session.sendKeys("Enter");
+          await session.waitForText(`Switched to ${provider === "codex" ? "Codex" : "Grok"} subscription`, TIMEOUT);
+        } else {
+          await session.sendKeys("Enter");
+          await session.waitForPane(() => readFileSync(join(home!, "trace.log"), "utf8").includes("pending_prompt_adopted"), 3000);
+          expect(gateway.requests).toHaveLength(0);
+          expect(responses()).toHaveLength(0);
+          release();
+          if (outcome === "success") {
+            await session.waitForText(provider === "codex" ? "CHATGPT_DIRECT_RESPONSE" : "GROK_DIRECT_RESPONSE", TIMEOUT);
+            expect(responses()).toHaveLength(1);
+            expect(responses()[0]!.body).toContain("retained café 日本語");
+            expect(gateway.requests).toHaveLength(0);
+            expect(JSON.parse(readFileSync(settingsPath, "utf8")).provider).toBe(provider);
+          } else {
+            await session.waitForText("The target provider catalog could not be validated.", TIMEOUT);
+            expect(gateway.requests).toHaveLength(0);
+            expect(responses()).toHaveLength(0);
+            expect(JSON.parse(readFileSync(settingsPath, "utf8")).provider).toBe("gateway");
+            await session.sendKeys("Enter");
+            await session.waitForText("PREPARATION_GATEWAY_RECOVERY", TIMEOUT);
+            expect(gateway.requests).toHaveLength(1);
+            expect(JSON.stringify(gateway.requests[0]!.body)).toContain("retained café 日本語");
+          }
+        }
+        const scrollback = await session.captureFullScrollbackEscapes();
+        expect(scrollback).not.toContain(chatgptOauth.accessToken);
+        expect(readFileSync(stderrPath, "utf8")).toBe("");
+        await session.sendText("/quit");
+        await session.waitForSessionEnd(3000);
+        session = null;
+      } finally {
+        release();
+        grok.stop();
+      }
+    }, TIMEOUT);
+  }
+}
+
+tmuxTest("provider preparation does not delay double Ctrl+C shutdown", async () => {
+  home = mkdtempSync(join(tmpdir(), "fx-provider-preparation-exit-"));
+  stderrPath = join(home, "stderr.log");
+  writeFileSync(stderrPath, "");
+  gateway = startFakeGateway([]);
+  let entered = false;
+  let release!: () => void;
+  const held = new Promise<void>((resolve) => { release = resolve; });
+  chatgptOauth = startFakeChatGptOAuth({ modelsResponse: async () => { entered = true; await held; } });
+  try {
+    writeSeededChatGptLogin(home, chatgptOauth.accessToken);
+    session = await startFx(home, stderrPath, gateway, undefined, undefined, { ...chatgptOauth.env, FX_SOUND: "0" });
+    await session.waitForComposer(TIMEOUT);
+    await openProviderPicker(session);
+    await session.sendLiteral("codex");
+    await session.sendKeys("Enter");
+    await session.waitForPane(() => entered, 5000);
+    await session.sendKeys("C-c");
+    await session.sendKeys("C-c");
+    await session.waitForSessionEnd(1500);
+    session = null;
+    expect(readFileSync(stderrPath, "utf8")).toBe("");
+  } finally {
+    release();
+  }
+}, TIMEOUT);
+
+for (const outcome of ["cancel", "failure"] as const) {
+  tmuxTest(`provider preparation validates Vercel team before saving through ${outcome}`, async () => {
+    home = mkdtempSync(join(tmpdir(), "fx-team-preparation-"));
+    stderrPath = join(home, "stderr.log");
+    writeFileSync(stderrPath, "");
+    let entered = 0;
+    let release!: () => void;
+    const held = new Promise<void>((resolve) => { release = resolve; });
+    gateway = startFakeGateway([fakeGatewayFinalText("TEAM_PREPARATION_OK")], { models: async () => {
+      entered++;
+      if (entered === 1) {
+        await held;
+        if (outcome === "failure") return new Response("unavailable", { status: 503 });
+      }
+      return [FAKE_GATEWAY_MODEL, "openai/gpt-5.6-sol"].map((id) => ({ id, type: "language", tags: ["tool-use"] }));
+    } });
+    oauth = startFakeOAuth(ACQUIRED_LOGIN_TOKEN, undefined, 3600, Number.POSITIVE_INFINITY, {
+      teams: [{ id: "team_next", slug: "next-team", name: "Next Team" }],
+    });
+    chatgptOauth = startFakeChatGptOAuth();
+    writeSeededFxLogin(home, Date.now() + 3_600_000, oauth.issuerUrl, "team_previous");
+    writeSeededChatGptLogin(home, chatgptOauth.accessToken);
+    const settingsPath = join(home, ".fx", "settings.json");
+    const authPath = join(home, ".fx", "auth.json");
+    writeFileSync(settingsPath, JSON.stringify({ provider: "codex", models: { codex: "gpt-5.6-sol", gateway: "openai/gpt-5.6-sol" } }));
+    const beforeAuth = readFileSync(authPath, "utf8");
+    try {
+      session = await startFx(home, stderrPath, gateway, oauth.issuerUrl, undefined, { ...chatgptOauth.env, FX_MODEL: undefined, FX_SOUND: "0" });
+      await session.waitForComposer(TIMEOUT);
+      const chooseTeam = async () => {
+        await session!.sendKeys("C-u");
+        await openProviderPicker(session!);
+        await session!.sendLiteral("vercel");
+        await session!.sendKeys("Enter");
+        await session!.waitForText("oauth", TIMEOUT);
+        await session!.sendKeys("Enter");
+        await session!.waitForText("next-team", TIMEOUT);
+        await session!.sendKeys("Enter");
+      };
+      await chooseTeam();
+      await session.waitForPane(() => entered === 1, 5000);
+      await session.sendLiteral("team draft");
+      await session.waitForText("team draft", 1500);
+      expect(readFileSync(authPath, "utf8")).toBe(beforeAuth);
+      if (outcome === "cancel") {
+        await session.sendKeys("C-c");
+        await session.waitForText("Provider preparation cancelled.", 1500);
+        release();
+      } else {
+        release();
+        await session.waitForText("could not be validated for AI Gateway", TIMEOUT);
+      }
+      expect(readFileSync(authPath, "utf8")).toBe(beforeAuth);
+      expect(JSON.parse(readFileSync(settingsPath, "utf8")).provider).toBe("codex");
+      await chooseTeam();
+      await session.waitForText("Changed Vercel team to Next Team", TIMEOUT);
+      expect(JSON.parse(readFileSync(authPath, "utf8")).team_id).toBe("team_next");
+      expect(JSON.parse(readFileSync(settingsPath, "utf8")).provider).toBe("gateway");
+      expect(JSON.parse(readFileSync(settingsPath, "utf8")).models.gateway).toBe("openai/gpt-5.6-sol");
+      await session.sendText("Use the validated team.");
+      await session.waitForText("TEAM_PREPARATION_OK", TIMEOUT);
+      expect(gateway.requests).toHaveLength(1);
+      expect(gateway.requests[0]!.headers.get("authorization")).toBe(`Bearer ${LOGIN_TOKEN}`);
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+      await session.captureFullScrollbackEscapes();
+      await session.sendText("/quit");
+      await session.waitForSessionEnd(3000);
+      session = null;
+    } finally { release(); }
+  }, TIMEOUT);
+}
+
+tmuxTest("provider preparation cancellation stops logout fallback", async () => {
+  home = mkdtempSync(join(tmpdir(), "fx-logout-preparation-cancel-"));
+  stderrPath = join(home, "stderr.log");
+  writeFileSync(stderrPath, "");
+  let entered = false;
+  let release!: () => void;
+  const held = new Promise<void>((resolve) => { release = resolve; });
+  gateway = startFakeGateway([], { models: async () => {
+    entered = true;
+    await held;
+    return new Response("unavailable", { status: 503 });
+  } });
+  chatgptOauth = startFakeChatGptOAuth();
+  const grok = startFakeGrokOAuth();
+  try {
+    writeSeededChatGptLogin(home, chatgptOauth.accessToken);
+    writeSeededGrokLogin(home, grok.initialAccessToken);
+    writeFileSync(join(home, ".fx", "settings.json"), JSON.stringify({ provider: "codex", models: { codex: "gpt-5.6-sol" } }));
+    session = await startFx(home, stderrPath, gateway, undefined, undefined, { ...chatgptOauth.env, ...grok.env, FX_MODEL: undefined, FX_SOUND: "0" });
+    await session.waitForComposer(TIMEOUT);
+    await session.sendText("/logout");
+    await session.waitForPane(() => entered, 5000);
+    await session.sendKeys("C-c");
+    await session.waitForText("Provider preparation cancelled.", 1500);
+    release();
+    await Bun.sleep(100);
+    expect(grok.requests.filter((request) => request.path === "/v1/models")).toHaveLength(0);
+    expect(existsSync(join(home, ".fx", "chatgpt-auth.json"))).toBe(false);
+    expect(existsSync(join(home, ".fx", "grok-auth.json"))).toBe(true);
+    expect(readFileSync(stderrPath, "utf8")).toBe("");
+    await session.sendText("/quit");
+    await session.waitForSessionEnd(3000);
+    session = null;
+  } finally { release(); grok.stop(); }
+}, TIMEOUT);
+
+tmuxTest("provider recovery continues after a held prompt and failed catalog", async () => {
+  home = mkdtempSync(join(tmpdir(), "fx-provider-fallback-prompt-"));
+  stderrPath = join(home, "stderr.log");
+  writeFileSync(stderrPath, "");
+  let entered = false;
+  let release!: () => void;
+  const held = new Promise<void>((resolve) => { release = resolve; });
+  gateway = startFakeGateway([], { models: async () => {
+    entered = true;
+    await held;
+    return new Response("unavailable", { status: 503 });
+  } });
+  chatgptOauth = startFakeChatGptOAuth();
+  const grok = startFakeGrokOAuth();
+  try {
+    writeSeededChatGptLogin(home, chatgptOauth.accessToken);
+    writeSeededGrokLogin(home, grok.initialAccessToken);
+    writeFileSync(join(home, ".fx", "settings.json"), JSON.stringify({ provider: "codex", models: { codex: "gpt-5.6-sol" } }));
+    const trace = join(home, "trace.log");
+    session = await startFx(home, stderrPath, gateway, undefined, trace, { ...chatgptOauth.env, ...grok.env, FX_MODEL: undefined, FX_SOUND: "0", FX_TRACE_SCOPES: "auth,provider,input,prompt" });
+    await session.waitForComposer(TIMEOUT);
+    await session.sendText("/logout");
+    await session.waitForPane(() => entered, 5000);
+    await session.sendText("Use the remaining subscription after recovery.");
+    await waitForTrace(trace, "pending_prompt_adopted", 3000);
+    release();
+    await session.waitForText("GROK_DIRECT_RESPONSE", 5000);
+    expect(JSON.parse(readFileSync(join(home, ".fx", "settings.json"), "utf8")).provider).toBe("grok");
+    expect(grok.requests.filter((request) => request.path === "/v1/responses")).toHaveLength(1);
+    expect(gateway.requests).toHaveLength(0);
+    expect(readFileSync(stderrPath, "utf8")).toBe("");
+  } finally { release(); grok.stop(); }
+}, TIMEOUT);
+
+
+tmuxTest("provider preparation resumes a held prompt after explicit provider retry", async () => {
+  home = mkdtempSync(join(tmpdir(), "fx-preparation-explicit-retry-"));
+  stderrPath = join(home, "stderr.log");
+  writeFileSync(stderrPath, "");
+  let entered = 0;
+  let release!: () => void;
+  const held = new Promise<void>((resolve) => { release = resolve; });
+  gateway = startFakeGateway([]);
+  chatgptOauth = startFakeChatGptOAuth({ modelsResponse: async () => {
+    entered++;
+    if (entered === 1) {
+      await held;
+      return new Response("unavailable", { status: 503 });
+    }
+  } });
+  try {
+    writeSeededChatGptLogin(home, chatgptOauth.accessToken);
+    const trace = join(home, "trace.log");
+    session = await startFx(home, stderrPath, gateway, undefined, trace, { ...chatgptOauth.env, FX_MODEL: undefined, FX_SOUND: "0", FX_TRACE_SCOPES: "auth,provider,input,prompt" });
+    await session.waitForComposer(TIMEOUT);
+    await openProviderPicker(session);
+    await session.sendLiteral("codex");
+    await session.sendKeys("Enter");
+    await session.waitForPane(() => entered === 1, 5000);
+    await session.sendText("Retain this prompt across the explicit provider retry.");
+    await waitForTrace(trace, "pending_prompt_adopted", 3000);
+    release();
+    await session.waitForText("The target provider catalog could not be validated.", TIMEOUT);
+    await openProviderPicker(session);
+    await session.sendLiteral("codex");
+    await session.sendKeys("Enter");
+    await session.waitForText("CHATGPT_DIRECT_RESPONSE", 5000);
+    const requests = chatgptOauth.requests.filter((request) => request.path === "/chatgpt/responses");
+    expect(requests).toHaveLength(1);
+    expect(requests[0]!.body).toContain("Retain this prompt across the explicit provider retry.");
+    expect(gateway.requests).toHaveLength(0);
+    expect(readFileSync(stderrPath, "utf8")).toBe("");
+  } finally { release(); }
+}, TIMEOUT);
+
+tmuxTest("provider preparation completes existing-key recovery for a held prompt", async () => {
+  home = mkdtempSync(join(tmpdir(), "fx-preparation-key-recovery-"));
+  stderrPath = join(home, "stderr.log");
+  writeFileSync(stderrPath, "");
+  gateway = startFakeGateway([fakeGatewayFinalText("KEY_RECOVERY_OK")]);
+  chatgptOauth = startFakeChatGptOAuth();
+  writeSeededChatGptLogin(home, chatgptOauth.accessToken);
+  linkSync(join(home, ".fx", "chatgpt-auth.json"), join(home, "auth-alias"));
+  writeFileSync(join(home, ".fx", "settings.json"), JSON.stringify({ provider: "codex", models: { codex: "gpt-5.6-sol" } }));
+  const trace = join(home, "trace.log");
+  session = await startFx(home, stderrPath, gateway, undefined, trace, { ...chatgptOauth.env, FX_MODEL: undefined, FX_SOUND: "0", FX_TRACE_SCOPES: "auth,provider,input,prompt" });
+  await session.waitForComposer(TIMEOUT);
+  await session.sendText("Use the Gateway after repair.");
+  await waitForTrace(trace, "pending_prompt_awaiting_auth", 5000);
+  await openProviderPicker(session);
+  await session.sendLiteral("vercel");
+  await session.sendKeys("Enter");
+  await session.waitForText("api-key", TIMEOUT);
+  await session.sendLiteral("api-key");
+  await session.sendKeys("Enter");
+  await session.waitForText("env", TIMEOUT);
+  await session.sendLiteral("env");
+  await session.sendKeys("Enter");
+  await session.waitForText("KEY_RECOVERY_OK", 5000);
+  expect(JSON.parse(readFileSync(join(home, ".fx", "settings.json"), "utf8")).provider).toBe("gateway");
+  expect(gateway.requests).toHaveLength(1);
+  expect(JSON.stringify(gateway.requests[0]!.body)).toContain("Use the Gateway after repair.");
+  expect(gateway.requests[0]!.headers.get("authorization")).toBe(`Bearer ${ENV_TOKEN}`);
+  expect(readFileSync(stderrPath, "utf8")).toBe("");
+}, TIMEOUT);
