@@ -2515,7 +2515,7 @@ pub fn Runtime(comptime App: type) type {
                 try app.session.appendHistoryEntry(app.alloc, prepared);
             }
             if (snapshot_file_ownership) |ownership| ownership.transfer();
-            ensureCachedSessionTitle(app) catch {};
+            ensureCachedSessionTitleLocked(app) catch {};
             commitJsHostSnapshot(app, "history_turn");
             return .committed;
         }
@@ -2749,13 +2749,38 @@ pub fn Runtime(comptime App: type) type {
             {
                 app.session_persistence.write_mutex.lockUncancelable(io_mod.getIo());
                 defer app.session_persistence.write_mutex.unlock(io_mod.getIo());
-
-                const loaded = &app.session_persistence.writable.?;
-                if (!try loaded.renameConversation(app.alloc, title)) {
-                    return error.UnsupportedSessionFormat;
-                }
+                try renameActiveConversationLocked(app, title);
             }
+            try publishSessionTitle(app, title);
+        }
 
+        /// The derived first-turn title for a caller that already holds the
+        /// session write mutex with a writable session: the history commit
+        /// installs it in place, so the manifest rename must not lock again.
+        fn ensureCachedSessionTitleLocked(app: *App) !void {
+            if (comptime !@hasField(App, "session_title")) return;
+            if (app.session_title.items.len > 0) return;
+            var display = session_display_metadata.deriveFromHistory(
+                app.alloc,
+                app.session.agent.history.items,
+            ) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => return,
+            };
+            defer display.deinit(app.alloc);
+            if (!display.present) return;
+            try renameActiveConversationLocked(app, display.title);
+            try publishSessionTitle(app, display.title);
+        }
+
+        fn renameActiveConversationLocked(app: *App, title: []const u8) !void {
+            const loaded = &app.session_persistence.writable.?;
+            if (!try loaded.renameConversation(app.alloc, title)) {
+                return error.UnsupportedSessionFormat;
+            }
+        }
+
+        fn publishSessionTitle(app: *App, title: []const u8) !void {
             try setCachedSessionTitle(app, title);
             if (comptime @hasDecl(App, "reportSessionMetadataChanged")) {
                 app.reportSessionMetadataChanged(title);
