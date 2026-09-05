@@ -343,7 +343,7 @@ test "writeAgentMessageChunk produces valid json" {
     var out: std.Io.Writer.Allocating = .init(alloc);
     defer out.deinit();
     try writeAgentMessageChunk(&out.writer, "message-1", "Hello world", 41);
-    const expected = "{\"sessionUpdate\":\"agent_message_chunk\",\"messageId\":\"message-1\",\"content\":{\"type\":\"text\",\"text\":\"Hello world\"}}";
+    const expected = "{\"sessionUpdate\":\"agent_message_chunk\",\"messageId\":\"message-1\",\"turn_id\":\"41\",\"content\":{\"type\":\"text\",\"text\":\"Hello world\"}}";
     try std.testing.expectEqualStrings(expected, out.writer.buffered());
 }
 
