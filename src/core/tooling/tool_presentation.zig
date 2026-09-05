@@ -527,7 +527,9 @@ fn runCommandCompatibilitySource(
     registry: tool_dispatch.Registry,
     call: ToolCall,
 ) !?RunCommandCompatibilitySource {
-    const args = tool_args.parseToolArgsObject(alloc, call.arguments_json) catch return null;
+    const args = tool_args.commandArguments(
+        tool_args.parseToolArgsObject(alloc, call.arguments_json) catch return null,
+    );
     if (!isCapturedCommandCall(registry, call, args)) return null;
     const command = tool_args.optionalStringArg(args, "command") orelse return null;
     const matched = (try tool_dispatch.matchRunCommandCompatibility(registry, command)) orelse return null;
@@ -694,6 +696,33 @@ test "run command presentation resolves registered compatibility" {
     const permission = try formatPermissionLabel(alloc, test_tool_registry, call);
     defer alloc.free(permission);
     try std.testing.expectEqualStrings("install_skill npx skills add vercel-labs/agent-skills -g -y", permission);
+}
+
+test "wrapped shell requests present the same command as the flat form" {
+    const alloc = std.testing.allocator;
+    const registry = tool_dispatch.Registry{ .tools = &.{test_builtin_tools.terminalExecOnlySpec()} };
+    const arguments = "{\"action\":\"run\",\"command\":\"printf presented\",\"cwd\":\"/tmp\",\"profile\":\"clean\"}";
+    const flat = ToolCall{ .id = "flat", .name = "shell", .arguments_json = arguments };
+    const wrapped = ToolCall{
+        .id = "wrapped",
+        .name = "shell",
+        .arguments_json = "{\"request\":" ++ arguments ++ "}",
+    };
+
+    const flat_activity = (try formatRunCommandActivity(alloc, registry, "", flat)) orelse
+        return error.TestExpectedEqual;
+    defer alloc.free(flat_activity.detail);
+    const wrapped_activity = (try formatRunCommandActivity(alloc, registry, "", wrapped)) orelse
+        return error.TestExpectedEqual;
+    defer alloc.free(wrapped_activity.detail);
+    try std.testing.expectEqualStrings(flat_activity.detail, wrapped_activity.detail);
+
+    const flat_permission = try formatPermissionLabel(alloc, registry, flat);
+    defer alloc.free(flat_permission);
+    const wrapped_permission = try formatPermissionLabel(alloc, registry, wrapped);
+    defer alloc.free(wrapped_permission);
+    try std.testing.expectEqualStrings(flat_permission, wrapped_permission);
+    try std.testing.expect(std.mem.find(u8, wrapped_permission, "printf presented") != null);
 }
 
 test "run command activity projects line boundaries without changing other bytes" {

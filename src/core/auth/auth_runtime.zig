@@ -3077,14 +3077,26 @@ pub const Runtime = struct {
         if (self.auth_mode == .host_managed or
             model_provider.authorizesCredential(provider, self.credentialSource())) return .unchanged;
 
-        var resolution = credentials.resolveForProvider(
-            alloc,
-            self.oauth_transport,
-            self.secret_store,
-            .stored,
-            provider,
-            preferred,
-        ) catch |err| {
+        // A selected profile is the only credential store this runtime may
+        // consult; the ambient profile and keychain are never a fallback.
+        var resolution = (if (self.profile_home) |home|
+            credentials.resolveForProviderFromHome(
+                alloc,
+                self.oauth_transport,
+                .stored,
+                provider,
+                preferred,
+                home,
+            )
+        else
+            credentials.resolveForProvider(
+                alloc,
+                self.oauth_transport,
+                self.secret_store,
+                .stored,
+                provider,
+                preferred,
+            )) catch |err| {
             if (err == error.OutOfMemory) return error.OutOfMemory;
             return .{ .failed = .{
                 .source = requestedSource(provider, preferred) orelse .fx_login,
@@ -4286,6 +4298,29 @@ test "provider selection preserves failure provenance and prior authority until 
     try std.testing.expectEqual(ProviderCredentialSelection.selected, try runtime.selectForProvider(alloc, .gateway, .stored_key));
     try std.testing.expectEqual(credentials.Source.stored_key, runtime.credentialSource().?);
     try std.testing.expectEqualStrings("loaded-key", runtime.selected_credential.?.token);
+}
+
+test "provider selection beneath a selected profile never reads the ambient store" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "state/.fx");
+    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "state");
+    defer alloc.free(home);
+
+    // The ambient store would happily serve a key; the selected profile holds
+    // none, and only the selected profile may be consulted.
+    var fixture: ApiKeySaveFixture = .{};
+    var runtime: Runtime = .{ .secret_store = fixture.secretStore() };
+    defer runtime.deinit(alloc);
+    runtime.setProfileHome(home);
+
+    switch (try runtime.selectForProvider(alloc, .gateway, .stored_key)) {
+        .selected => return error.TestUnexpectedResult,
+        else => {},
+    }
+    try std.testing.expectEqual(@as(usize, 0), fixture.load_calls);
+    try std.testing.expect(runtime.credentialSource() == null);
 }
 
 test "provider selection leaves compatible expired credentials for deferred refresh" {
