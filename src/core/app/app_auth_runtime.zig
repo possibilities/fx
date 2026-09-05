@@ -128,7 +128,7 @@ pub fn Runtime(comptime App: type) type {
             if (hostManagesAuth(app) or model_provider.authorizesCredential(provider, app.auth.credentialSource())) return .unchanged;
             var preferred: ?credentials.Source = null;
             if (provider == .gateway and !host_target.is_wasm) {
-                var settings = try config_runtime.loadMergedSettings(app.alloc, app.workspace_root);
+                var settings = try app_profile_runtime.loadMergedSettings(app);
                 defer settings.deinit(app.alloc);
                 preferred = settings.credential_source;
             }
@@ -1454,7 +1454,7 @@ pub fn Runtime(comptime App: type) type {
             defer candidate.deinit(app.alloc);
             if (comptime @hasDecl(@TypeOf(app.auth), "beginProviderPreparation") and @hasDecl(App, "providerCatalog") and !host_target.is_wasm) {
                 const catalog_provider = app.providerCatalog(.gateway) orelse return false;
-                var settings = config_runtime.loadMergedSettings(app.alloc, app.workspace_root) catch |err| {
+                var settings = app_profile_runtime.loadMergedSettings(app) catch |err| {
                     debug_trace.logf("auth", "team preparation settings failed err={s}", .{@errorName(err)});
                     try app.writeDomainNotice(.{ .topic = "auth", .tone = .@"error", .body = "Could not load provider preferences. The current team is unchanged." }, true);
                     return false;
