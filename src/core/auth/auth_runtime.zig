@@ -1526,6 +1526,8 @@ pub fn loadStatusSnapshotForProvider(
             .chatgpt_subscription
         else if (provider == .grok)
             .grok_subscription
+        else if (provider == .gateway and !model_provider.authorizesCredential(.gateway, preferred))
+            null
         else
             preferred,
         .stored_key_status = resolution.stored_key_status,
