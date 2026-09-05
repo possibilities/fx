@@ -2418,13 +2418,8 @@ describe("MCP remote authentication lifecycle", () => {
       await Bun.sleep(250);
       const requestsBeforeLogout = auth.requests.length;
 
-      await tui.sendText("/mcp");
-      await tui.waitForText("[Servers]", 10_000);
-      await tui.sendKeys("Enter");
-      await tui.sendKeys("L");
-      await tui.waitForText("Log out of this MCP server?", 5_000);
-      await tui.sendKeys("Enter");
-      await tui.waitForText("Logged out of MCP server 'fixture'.", 10_000);
+      await tui.sendText("/mcp logout fixture");
+      await tui.waitForText("Logged out of MCP server 'fixture'", 10_000);
       await Bun.sleep(250);
       expect(existsSync(credentialPath)).toBe(false);
       expect(readFileSync(ambientCredentialPath, "utf8")).toBe(
