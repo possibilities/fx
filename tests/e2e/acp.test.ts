@@ -6730,6 +6730,7 @@ describe("acp: model-independent", () => {
             FX_GATEWAY_CHAT_URL: gateway.chatUrl,
             FX_MODEL: undefined,
             FX_AUTO_UPGRADE: "0",
+            FX_MCP_PROTOCOL_VERSION: "2026-07-28",
           },
         });
         await client.request("initialize", { protocolVersion: 1 }, 1);
@@ -7754,7 +7755,7 @@ describe("acp: model-independent", () => {
         const promptText = acpPromptText(gateway.requests[0]!.body);
         expect(promptText).toContain("invocation ACP fixture");
         expect(promptText).toContain(
-          '<skill_content name="acp-invocation" resource="SKILL.md"',
+          `<skill_content name="acp-invocation" location="${skillDirectory}" resource="SKILL.md" complete="true">`,
         );
         expect(promptText).toContain(skillBody);
         expect(client.stderr).toBe("");
