@@ -25,6 +25,7 @@ const file_mutation = @import("../tooling/file_mutation.zig");
 const file_mutation_contract = @import("../tooling/file_mutation_contract.zig");
 const command_output_content = @import("../tooling/command_output_content.zig");
 const tool_admission = @import("../tooling/tool_admission.zig");
+const tool_args = @import("../tooling/tool_args.zig");
 const tool_presentation = @import("../tooling/tool_presentation.zig");
 const gateway_error_format = @import("../shared/gateway_error_format.zig");
 const io_mod = @import("../shared/io.zig");
@@ -548,7 +549,7 @@ pub fn Bindings(comptime App: type) type {
                     };
                     defer parsed.deinit();
                     if (parsed.value == .object) {
-                        if (parsed.value.object.get("command")) |command_value| {
+                        if (tool_args.commandArguments(parsed.value.object).get("command")) |command_value| {
                             if (command_value == .string) {
                                 const workspace_root = if (comptime @hasDecl(App, "workspaceHostInfo"))
                                     if (app.workspaceHostInfo()) |info| info.root() else app.workspace_root

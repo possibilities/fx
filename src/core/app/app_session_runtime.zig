@@ -3188,7 +3188,7 @@ pub fn Runtime(comptime App: type) type {
                     };
                     defer parsed.deinit();
                     if (parsed.value != .object) return;
-                    const command_value = parsed.value.object.get("command") orelse return;
+                    const command_value = tool_args.commandArguments(parsed.value.object).get("command") orelse return;
                     if (command_value != .string) return;
                     const display = (tooling_presentation.formatRunCommandDetailBounded(
                         self.projection.alloc,
