@@ -268,11 +268,16 @@ describe.skipIf(!tmuxAvailable())("ADE event feed", () => {
       );
       const metadataSessionId = nativeMetadata.context.session_id;
       expect(metadataSessionId).not.toBeNull();
-      const display = JSON.parse(readFileSync(
-        join(home, ".fx", "sessions", metadataSessionId!, "display.json"),
+      // The title is durable only in the conversation manifest; no display
+      // sidecar exists any more.
+      const manifest = JSON.parse(readFileSync(
+        join(home, ".fx", "sessions", metadataSessionId!, "session.json"),
         "utf8",
       )) as { title?: unknown };
-      expect(display.title).toBe("ade-native-session-title");
+      expect(manifest.title).toBe("ade-native-session-title");
+      expect(existsSync(
+        join(home, ".fx", "sessions", metadataSessionId!, "display.json"),
+      )).toBe(false);
       await session.waitForText("Which ADE event path should continue?", TIMEOUT);
       await receiver.waitFor(
         (record) =>
