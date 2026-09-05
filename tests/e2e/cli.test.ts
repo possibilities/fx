@@ -4831,12 +4831,12 @@ describe("cli: workspace access", () => {
       );
 
       const conflictingTerminalTool = await runFx(
-        ["--tool", "terminal", "--tool", "terminal:exec"],
+        ["--tool", "shell", "--tool", "terminal:exec"],
         { env: enabled },
       );
       expect(conflictingTerminalTool.code).toBe(1);
       expect(conflictingTerminalTool.stderr).toContain(
-        "conflicting native tool selections: terminal and terminal:exec",
+        "conflicting native tool selections: shell and terminal:exec",
       );
 
       const conflictingNativeToolGate = await runFx(
