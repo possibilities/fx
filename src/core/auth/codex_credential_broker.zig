@@ -417,12 +417,14 @@ const Worker = struct {
     fd: std.c.fd_t,
     peer_probe: PeerProbe,
     transport: oauth_transport.Provider,
+    profile_home: ?[]u8 = null,
     oauth_cancel: std.atomic.Value(bool),
     pinned_account_id: []u8,
     frame_deadline_ms: i64 = default_frame_deadline_ms,
     service: Service,
 
     fn deinit(self: *Worker) void {
+        if (self.profile_home) |home| self.alloc.free(home);
         secret.zeroAndFree(self.alloc, self.pinned_account_id);
         self.service.clearSecrets();
         std.crypto.secureZero(u8, @volatileCast(self.service.nonce[0..]));
@@ -461,6 +463,8 @@ pub const StartDeps = struct {
     transport: oauth_transport.Provider,
     secret_store: host.SecretStore,
     auth_mode: credentials.AuthMode,
+    profile_home: ?[]const u8 = null,
+    borrowed_authorization: bool = false,
 };
 
 pub const Runtime = struct {
@@ -482,17 +486,26 @@ pub const Runtime = struct {
         if (deps.auth_mode == .host_managed) {
             return error.CodexCredentialBrokerHostManagedAuth;
         }
-        if (borrowedAuthorizationConfigured()) {
+        if (deps.borrowed_authorization or borrowedAuthorizationConfigured()) {
             return error.CodexCredentialBrokerBorrowedAuth;
         }
 
-        var credential = (auth_runtime.prepareCredential(
-            alloc,
-            deps.transport,
-            deps.secret_store,
-            .codex,
-            null,
-        ) catch |err| switch (err) {
+        var credential = ((if (deps.profile_home) |home|
+            auth_runtime.prepareCredentialFromHome(
+                alloc,
+                deps.transport,
+                .codex,
+                null,
+                home,
+            )
+        else
+            auth_runtime.prepareCredential(
+                alloc,
+                deps.transport,
+                deps.secret_store,
+                .codex,
+                null,
+            )) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             error.CredentialStorageUnavailable,
             error.CredentialTemporarilyUnavailable,
@@ -514,8 +527,16 @@ pub const Runtime = struct {
             account_id,
         ) orelse return error.CodexCredentialBrokerCredentialUnavailable;
 
+        var authority_transferred = false;
         const owned_account_id = try alloc.dupe(u8, account_id);
-        errdefer secret.zeroAndFree(alloc, owned_account_id);
+        errdefer if (!authority_transferred)
+            secret.zeroAndFree(alloc, owned_account_id);
+        const owned_profile_home: ?[]u8 = if (deps.profile_home) |home|
+            try alloc.dupe(u8, home)
+        else
+            null;
+        errdefer if (!authority_transferred)
+            if (owned_profile_home) |home| alloc.free(home);
 
         const worker = try alloc.create(Worker);
         errdefer alloc.destroy(worker);
@@ -524,6 +545,7 @@ pub const Runtime = struct {
             .fd = fd,
             .peer_probe = default_peer_probe,
             .transport = deps.transport,
+            .profile_home = owned_profile_home,
             .oauth_cancel = std.atomic.Value(bool).init(false),
             .pinned_account_id = owned_account_id,
             .service = .{
@@ -536,6 +558,7 @@ pub const Runtime = struct {
                 .pinned_identity = pinned_identity,
             },
         };
+        authority_transferred = true;
         worker.service.provider = .{
             .context = worker,
             .load_fn = loadProductionLease,
@@ -602,16 +625,27 @@ fn loadProductionLease(
     expected_account_id: []const u8,
 ) !?Lease {
     const worker: *Worker = @ptrCast(@alignCast(raw.?));
-    var credential = (try auth_runtime.refreshCredentialForAccount(
-        boundedOAuthProvider(worker),
-        alloc,
-        .chatgpt_subscription,
-        switch (mode) {
-            .stored => .if_needed,
-            .force => .force,
-        },
-        expected_account_id,
-    )) orelse return null;
+    const refresh_mode: auth_runtime.CredentialRefreshMode = switch (mode) {
+        .stored => .if_needed,
+        .force => .force,
+    };
+    var credential = (try if (worker.profile_home) |home|
+        auth_runtime.refreshCredentialForAccountFromHome(
+            boundedOAuthProvider(worker),
+            alloc,
+            .chatgpt_subscription,
+            refresh_mode,
+            expected_account_id,
+            home,
+        )
+    else
+        auth_runtime.refreshCredentialForAccount(
+            boundedOAuthProvider(worker),
+            alloc,
+            .chatgpt_subscription,
+            refresh_mode,
+            expected_account_id,
+        )) orelse return null;
     errdefer credential.deinit(alloc);
 
     const refresh_after_ms = credential.refresh_after_ms orelse
@@ -1506,4 +1540,23 @@ test "Codex credential broker fails closed for host-managed and borrowed authori
         }),
     );
     try std.testing.expect(!runtime.active());
+
+    // The explicit identity axis is the same read-only authority boundary,
+    // even though it deliberately sets no compatibility environment variable.
+    try environ.put(read_only_home_env, "");
+    try std.testing.expect(!borrowedAuthorizationConfigured());
+    const identity_channel = try TestChannel.open();
+    defer closeSocket(identity_channel.consumer_end);
+    var identity_activation = Activation{ .fd = identity_channel.fx_end };
+    try std.testing.expectError(
+        error.CodexCredentialBrokerBorrowedAuth,
+        runtime.start(alloc, &identity_activation, .{
+            .transport = oauth_transport.unavailable_provider,
+            .secret_store = host.unavailable_secret_store,
+            .auth_mode = .local,
+            .borrowed_authorization = true,
+        }),
+    );
+    try std.testing.expect(!runtime.active());
+    try std.testing.expect(!identity_activation.active());
 }

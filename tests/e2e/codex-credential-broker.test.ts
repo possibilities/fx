@@ -1,6 +1,6 @@
 import { afterEach, expect, test } from "bun:test";
 import { spawn as nodeSpawn, type ChildProcess } from "node:child_process";
-import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import net from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -10,14 +10,14 @@ const TIMEOUT = 30_000;
 const ACCOUNT_ID = "acct_broker_e2e";
 const MAX_FRAME_BYTES = 64 * 1024;
 
-function chatGptAccessToken(signature: string): string {
+function chatGptAccessToken(signature: string, accountId = ACCOUNT_ID): string {
   const payload = Buffer.from(JSON.stringify({
-    "https://api.openai.com/auth": { chatgpt_account_id: ACCOUNT_ID },
+    "https://api.openai.com/auth": { chatgpt_account_id: accountId },
   })).toString("base64url");
   return `header.${payload}.${signature}`;
 }
 
-function seedChatGptLogin(home: string, accessToken: string): void {
+function seedChatGptLogin(home: string, accessToken: string, accountId = ACCOUNT_ID): void {
   const fxDir = join(home, ".fx");
   mkdirSync(fxDir, { recursive: true, mode: 0o700 });
   chmodSync(fxDir, 0o700);
@@ -29,7 +29,7 @@ function seedChatGptLogin(home: string, accessToken: string): void {
       access_token: accessToken,
       refresh_token: "chatgpt-refresh-seed",
       expires_at_ms: Date.now() + 60 * 60 * 1000,
-      account_id: ACCOUNT_ID,
+      account_id: accountId,
     }) + "\n",
     { mode: 0o600 },
   );
@@ -43,7 +43,7 @@ function seedChatGptLogin(home: string, accessToken: string): void {
   chmodSync(settingsPath, 0o600);
 }
 
-function startFakeChatGptToken() {
+function startFakeChatGptToken(accountId = ACCOUNT_ID) {
   let rotations = 0;
   const server = Bun.serve({
     hostname: "127.0.0.1",
@@ -52,7 +52,7 @@ function startFakeChatGptToken() {
       await request.text();
       rotations += 1;
       return Response.json({
-        access_token: chatGptAccessToken(`rotated-${rotations}`),
+        access_token: chatGptAccessToken(`rotated-${rotations}`, accountId),
         refresh_token: `chatgpt-refresh-${rotations}`,
         expires_in: 3600,
       });
@@ -113,6 +113,7 @@ async function openInheritedChannel(dir: string) {
 
 class FrameReader {
   private buffer = Buffer.alloc(0);
+  private frames: Buffer[] = [];
   private waiters: Array<(frame: Buffer) => void> = [];
 
   constructor(socket: net.Socket) {
@@ -127,18 +128,30 @@ class FrameReader {
         const frame = this.buffer.subarray(4, 4 + length);
         this.buffer = this.buffer.subarray(4 + length);
         const waiter = this.waiters.shift();
-        if (waiter) waiter(frame);
+        if (waiter) {
+          waiter(frame);
+        } else {
+          this.frames.push(frame);
+        }
       }
     });
   }
 
-  next(timeoutMs = 10_000): Promise<Record<string, any>> {
+  next(timeoutMs = 10_000, label = "frame"): Promise<Record<string, any>> {
+    const queued = this.frames.shift();
+    if (queued) return Promise.resolve(JSON.parse(queued.toString("utf8")));
     return new Promise((resolve, reject) => {
-      const timer = setTimeout(() => reject(new Error("frame timeout")), timeoutMs);
-      this.waiters.push((frame) => {
+      let deliver: (frame: Buffer) => void;
+      const timer = setTimeout(() => {
+        const index = this.waiters.indexOf(deliver);
+        if (index >= 0) this.waiters.splice(index, 1);
+        reject(new Error(`${label} timeout`));
+      }, timeoutMs);
+      deliver = (frame) => {
         clearTimeout(timer);
         resolve(JSON.parse(frame.toString("utf8")));
-      });
+      };
+      this.waiters.push(deliver);
     });
   }
 }
@@ -325,7 +338,7 @@ test("a borrowed credential fails the credential channel closed before start", a
   cleanups.push(() => channel.close());
   const frames = new FrameReader(channel.consumer);
 
-  const fx = nodeSpawn(FX_BIN, ["--codex-credential-fd", "3", "acp"], {
+  const fx = nodeSpawn(FX_BIN, ["--state-dir", home, "--codex-credential-fd", "3", "acp"], {
     cwd: workspace,
     env: { ...brokerEnv(home, token.url), FX_AUTH_READ_ONLY_HOME: borrowed },
     stdio: ["pipe", "pipe", "pipe", channel.fxFd],
@@ -344,4 +357,115 @@ test("a borrowed credential fails the credential channel closed before start", a
   expect(exitCode).not.toBe(0);
   expect(stderr).not.toBe("");
   await expect(frames.next(500)).rejects.toThrow("frame timeout");
+}, TIMEOUT);
+
+test("an explicit identity borrow fails the credential channel closed before start", async () => {
+  const home = makeHome();
+  const identity = makeHome();
+  const workspace = makeWorkspace();
+  seedChatGptLogin(home, chatGptAccessToken("ambient"));
+  seedChatGptLogin(identity, chatGptAccessToken("borrowed"));
+  const token = startFakeChatGptToken();
+  cleanups.push(() => token.stop());
+
+  const channel = await openInheritedChannel(home);
+  cleanups.push(() => channel.close());
+  const frames = new FrameReader(channel.consumer);
+
+  const fx = nodeSpawn(
+    FX_BIN,
+    ["--identity", identity, "--codex-credential-fd", "3", "acp"],
+    {
+      cwd: workspace,
+      env: brokerEnv(home, token.url),
+      stdio: ["pipe", "pipe", "pipe", channel.fxFd],
+    },
+  );
+  trackProcess(fx);
+  await new Promise<void>((resolve) => fx.once("spawn", () => resolve()));
+  channel.releaseFxEnd();
+  let stderr = "";
+  fx.stderr!.on("data", (chunk: Buffer) => {
+    stderr += chunk.toString();
+  });
+
+  const exitCode = await new Promise<number>((resolve) => {
+    fx.on("close", (code) => resolve(code ?? -1));
+  });
+  expect(exitCode).not.toBe(0);
+  expect(stderr).toContain("cannot lease a borrowed read-only credential");
+  await expect(frames.next(500)).rejects.toThrow("frame timeout");
+}, TIMEOUT);
+
+test("a selected state profile owns every credential broker lease and refresh", async () => {
+  const ambientHome = makeHome();
+  const stateHome = makeHome();
+  const workspace = makeWorkspace();
+  const ambientAccount = "acct_broker_ambient";
+  const stateAccount = "acct_broker_state";
+  const ambientToken = chatGptAccessToken("ambient-seed", ambientAccount);
+  const stateToken = chatGptAccessToken("state-seed", stateAccount);
+  seedChatGptLogin(ambientHome, ambientToken, ambientAccount);
+  seedChatGptLogin(stateHome, stateToken, stateAccount);
+  const token = startFakeChatGptToken(stateAccount);
+  cleanups.push(() => token.stop());
+
+  const channel = await openInheritedChannel(stateHome);
+  cleanups.push(() => channel.close());
+  const frames = new FrameReader(channel.consumer);
+  const fx = nodeSpawn(
+    FX_BIN,
+    ["--state-dir", stateHome, "--codex-credential-fd", "3", "acp"],
+    {
+      cwd: workspace,
+      env: brokerEnv(ambientHome, token.url),
+      stdio: ["pipe", "pipe", "pipe", channel.fxFd],
+    },
+  );
+  trackProcess(fx);
+  await new Promise<void>((resolve) => fx.once("spawn", () => resolve()));
+  channel.releaseFxEnd();
+  let stderr = "";
+  fx.stderr!.on("data", (chunk: Buffer) => {
+    stderr += chunk.toString();
+  });
+
+  const hello = await frames.next(10_000, "selected-state hello");
+  const nonce = hello.hello.nonce as string;
+  writeFrame(channel.consumer, {
+    schema: 1,
+    request_id: "1",
+    nonce,
+    method: "codex.credential.resolve",
+    params: { minimum_validity_seconds: 60 },
+  });
+  const resolved = await frames.next(10_000, "selected-state resolve");
+  expect(resolved.ok).toBe(true);
+  expect(resolved.result.account_id).toBe(stateAccount);
+  expect(resolved.result.access_token).toBe(stateToken);
+
+  writeFrame(channel.consumer, {
+    schema: 1,
+    request_id: "2",
+    nonce,
+    method: "codex.credential.refresh",
+    params: { account_id: stateAccount, prior_generation: 1 },
+  });
+  const refreshed = await frames.next(10_000, "selected-state refresh");
+  expect(refreshed.ok).toBe(true);
+  expect(refreshed.result.account_id).toBe(stateAccount);
+  expect(refreshed.result.access_token).toBe(chatGptAccessToken("rotated-1", stateAccount));
+  expect(token.rotations).toBe(1);
+  expect(stderr).toBe("");
+
+  const ambientAuth = JSON.parse(
+    readFileSync(join(ambientHome, ".fx", "chatgpt-auth.json"), "utf8"),
+  );
+  const stateAuth = JSON.parse(
+    readFileSync(join(stateHome, ".fx", "chatgpt-auth.json"), "utf8"),
+  );
+  expect(ambientAuth.access_token).toBe(ambientToken);
+  expect(ambientAuth.account_id).toBe(ambientAccount);
+  expect(stateAuth.access_token).toBe(refreshed.result.access_token);
+  expect(stateAuth.account_id).toBe(stateAccount);
 }, TIMEOUT);
