@@ -74,8 +74,8 @@ const options = (wasm = wasmPath) => ({
   backend: "wasm",
   wasm,
   fetch(input, init) {
-    signals.push(init.signal);
-    return fetch(input, init);
+    signals.push({ method: init.method, signal: init.signal });
+    return fetch(init.method === "GET" ? `http://127.0.0.1:${server.address().port}/models` : input, init);
   },
   apiKey: "wasm-cache-key",
   gatewayChatUrl: `http://127.0.0.1:${server.address().port}/chat`,
@@ -130,7 +130,9 @@ try {
   assert.equal(compileCalls, 5, "a rejected file read must be removed so the next attempt retries");
 
   await Promise.all(agents.map((agent) => agent.close()));
-  assert.ok(signals.every((signal) => signal.aborted));
+  assert.ok(signals.every(({ signal }) => signal instanceof AbortSignal));
+  // Completed catalog reads have already released their abort ownership.
+  assert.ok(signals.filter(({ method }) => method !== "GET").every(({ signal }) => signal.aborted));
   const collect = globalThis.gc ?? (() => globalThis.Bun?.gc(true));
   const deadline = Date.now() + 5000;
   do {
