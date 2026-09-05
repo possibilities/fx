@@ -241,6 +241,7 @@ fn freeStrings(alloc: Allocator, values: [][]u8) void {
 test "captured admission owns independent authority slices" {
     const alloc = std.testing.allocator;
     var snapshot = try captureAdmission(alloc, .{
+        .root_id = "01J00000000000000000000000",
         .parent_id = "01J00000000000000000000000",
         .source_id = "01J00000000000000000000000",
         .model = "test/model",
