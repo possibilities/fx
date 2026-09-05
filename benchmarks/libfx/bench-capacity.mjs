@@ -20,10 +20,18 @@ if (!new Set(["native", "wasm"]).has(backend) || !Number.isInteger(count) || cou
 
 const root = resolve(fileURLToPath(new URL("../..", import.meta.url)));
 let requestCount = 0;
+let catalogRequests = 0;
 let stall = false;
 let stalledRequests = 0;
 let stalledReady;
 const server = createServer((request, response) => {
+  if (request.method === "GET") {
+    catalogRequests += 1;
+    request.resume();
+    response.writeHead(200, { "content-type": "application/json" });
+    response.end(JSON.stringify({ object: "list", data: [{ id: "capacity/model", type: "language" }] }));
+    return;
+  }
   requestCount++;
   request.resume();
   request.on("end", () => {
@@ -84,7 +92,9 @@ const options = {
   backend,
   nativeAddon: resolve(root, "zig-out/lib/libfx.node"),
   wasm: resolve(root, "zig-out/bin/fx-core.wasm"),
-  fetch,
+  fetch(input, init) {
+    return fetch(init.method === "GET" ? `http://127.0.0.1:${server.address().port}/models` : input, init);
+  },
   apiKey: "capacity-benchmark-key",
   gatewayChatUrl: `http://127.0.0.1:${server.address().port}/chat`,
   model: "capacity/model",
@@ -182,6 +192,7 @@ try {
     runtime_version: process.versions.bun ?? process.version,
     backend,
     count,
+    non_prompt_fetches: catalogRequests,
     failures,
     snapshots,
   }, null, 2)}\n`);
