@@ -6,6 +6,7 @@ const agent_stream_provider = @import("../core/agent/stream_provider.zig");
 const debug_trace = @import("../core/shared/debug_trace.zig");
 const io_mod = @import("../core/shared/io.zig");
 const types = @import("../core/shared/types.zig");
+const json_comparison = @import("json_comparison.zig");
 
 pub fn isRetryableGatewayError(err: anyerror) bool {
     return err == error.HttpConnectionClosing or
@@ -743,7 +744,7 @@ const ConnectionSetupTiming = struct {
 };
 
 const ResponseHeadTiming = struct {
-    timeout_ms: i64 = 30_000,
+    timeout_ms: i64 = 120_000,
 };
 
 test "connection setup keeps the production timeout" {
@@ -755,7 +756,7 @@ test "connection setup keeps the production timeout" {
 test "response head wait keeps the production timeout" {
     const timing = ResponseHeadTiming{};
 
-    try std.testing.expectEqual(@as(i64, 30_000), timing.timeout_ms);
+    try std.testing.expectEqual(@as(i64, 120_000), timing.timeout_ms);
 }
 
 const ConnectionSetupEpoch = struct {
@@ -2098,6 +2099,21 @@ test "connected request watch disarms timeout at response head" {
     try std.testing.expect(watch.finish() == null);
 }
 
+test "production response head wait accepts slow headers and still expires" {
+    var watch = ConnectedRequestWatch.init(.{});
+    try std.testing.expect(watch.arm_response_head() == null);
+    const now = std.Io.Clock.Timestamp.now(io_mod.getIo(), .awake);
+    const slow_headers = std.Io.Clock.Timestamp{
+        .clock = .awake,
+        .raw = now.raw.addDuration(.fromSeconds(36)),
+    };
+    try std.testing.expect(!watch.response_head_expired(slow_headers));
+    try std.testing.expect(watch.response_head_expired(watch.response_head_deadline));
+    try std.testing.expect(watch.commit_response_head() == null);
+    try std.testing.expect(!watch.response_head_expired(watch.response_head_deadline));
+    try std.testing.expect(watch.finish() == null);
+}
+
 fn resolveE2eGatewayUrl(env_name: []const u8, default_url: []const u8) ![]const u8 {
     return selectE2eGatewayUrl(io_mod.getenv(env_name), default_url);
 }
@@ -2380,54 +2396,6 @@ fn findStreamedToolInput(records: []const SseStreamedToolInput, id: []const u8) 
     return null;
 }
 
-fn jsonValuesEqual(lhs: std.json.Value, rhs: std.json.Value) bool {
-    if (std.meta.activeTag(lhs) != std.meta.activeTag(rhs)) return false;
-    return switch (lhs) {
-        .null => true,
-        .bool => |value| value == rhs.bool,
-        .integer => |value| value == rhs.integer,
-        .float => |value| value == rhs.float,
-        .number_string => |value| std.mem.eql(u8, value, rhs.number_string),
-        .string => |value| std.mem.eql(u8, value, rhs.string),
-        .array => |values| blk: {
-            if (values.items.len != rhs.array.items.len) break :blk false;
-            for (values.items, rhs.array.items) |left, right| {
-                if (!jsonValuesEqual(left, right)) break :blk false;
-            }
-            break :blk true;
-        },
-        .object => |fields| blk: {
-            if (fields.count() != rhs.object.count()) break :blk false;
-            var iterator = fields.iterator();
-            while (iterator.next()) |field| {
-                const right = rhs.object.get(field.key_ptr.*) orelse break :blk false;
-                if (!jsonValuesEqual(field.value_ptr.*, right)) break :blk false;
-            }
-            break :blk true;
-        },
-    };
-}
-
-fn serializedJsonEqual(
-    alloc: std.mem.Allocator,
-    lhs: []const u8,
-    rhs: []const u8,
-) std.mem.Allocator.Error!bool {
-    if (std.mem.eql(u8, lhs, rhs)) return true;
-
-    var left = std.json.parseFromSlice(std.json.Value, alloc, lhs, .{}) catch |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
-        else => return false,
-    };
-    defer left.deinit();
-    var right = std.json.parseFromSlice(std.json.Value, alloc, rhs, .{}) catch |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
-        else => return false,
-    };
-    defer right.deinit();
-    return jsonValuesEqual(left.value, right.value);
-}
-
 fn findEquivalentEndedStreamedToolInput(
     alloc: std.mem.Allocator,
     records: []const SseStreamedToolInput,
@@ -2439,7 +2407,7 @@ fn findEquivalentEndedStreamedToolInput(
     for (records, 0..) |record, i| {
         if (record.state != .ended) continue;
         if (!std.mem.eql(u8, record.name.items, final_name)) continue;
-        if (try serializedJsonEqual(alloc, record.arguments.items, final_arguments)) return i;
+        if (try json_comparison.serializedEqual(alloc, record.arguments.items, final_arguments)) return i;
     }
     return null;
 }

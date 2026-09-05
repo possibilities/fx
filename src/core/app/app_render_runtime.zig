@@ -976,9 +976,6 @@ pub fn Runtime(comptime App: type) type {
                     render_requests.animation_next_deadline_ms,
                 },
             );
-            if (comptime @hasDecl(App, "persistResumeViewAfterFrame")) {
-                app.persistResumeViewAfterFrame();
-            }
         }
 
         fn attemptRequestedFrame(
@@ -1435,7 +1432,7 @@ pub fn Runtime(comptime App: type) type {
                     else
                         footer_frame.paint.preserve_scrollback,
                     .reset_terminal = shouldResetPhysicalTerminal(
-                        false,
+                        render_reconciliation.alternate_screen_owns_rendering,
                         app.shell.terminal_reset_pending,
                     ),
                 });
@@ -1622,7 +1619,9 @@ pub fn Runtime(comptime App: type) type {
             try build_checkpoint.poll(checkpoint);
             if (footer_frame.paint.reset_terminal) {
                 if (comptime @hasField(App, "terminal")) {
-                    app.terminal.clearTmuxScreenAndHistory(app.alloc);
+                    if (app.terminal.alternate_screen_owner == .none) {
+                        app.terminal.clearTmuxScreenAndHistory(app.alloc);
+                    }
                 }
             }
             var frame_shell = SurfaceFrameShell.init(
@@ -2734,13 +2733,13 @@ test "core.app_render_runtime rejects prepared transcript outside final plan ban
 }
 
 noinline fn shouldResetPhysicalTerminal(
-    child_view_active: bool,
+    alternate_screen_active: bool,
     main_reset_pending: bool,
 ) bool {
-    return !child_view_active and main_reset_pending;
+    return !alternate_screen_active and main_reset_pending;
 }
 
-test "core.app_render_runtime child presentation cannot reset primary scrollback" {
+test "core.app_render_runtime alternate presentation cannot reset primary scrollback" {
     try std.testing.expect(!shouldResetPhysicalTerminal(true, true));
     try std.testing.expect(!shouldResetPhysicalTerminal(true, false));
     try std.testing.expect(!shouldResetPhysicalTerminal(false, false));
@@ -3352,7 +3351,6 @@ const CoordinatorTestApp = struct {
 
     pub fn resolvedModelCapabilities(self: *CoordinatorTestApp, model: []const u8) model_capabilities.Capabilities {
         var fallback = model_capabilities.Capabilities{
-            .prompt_caching = true,
             .context_window = 1_000_000,
         };
         if (self.intrinsic_fast_model) |intrinsic_model| {
@@ -5140,7 +5138,7 @@ test "core.app_render_runtime full transcript defers repaint until its page is r
     ));
 }
 
-test "core.app_render_runtime changed resized full transcript close preserves primary history without full replay" {
+test "core.app_render_runtime full transcript resize defers history reset until primary restoration" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -5194,21 +5192,34 @@ test "core.app_render_runtime changed resized full transcript close preserves pr
         .hint_row = 18,
     };
     try app.shell.requestTerminalResetAfterResize(&app.metrics, null);
+    var read_offset = try file.length(io_mod.getIo());
     try app.shell.writeTranscript(
         alloc,
         &app.metrics,
         "new output while review is open\n",
         true,
     );
+    for (0..100_000) |_| {
+        try app.shell.prewarmFullTranscriptPage(null, null);
+        _ = try app.shell.pollFullTranscriptPageLoad();
+        if (app.shell.fullTranscriptPreparedForOpen()) break;
+        std.Thread.yield() catch std.atomic.spinLoopHint();
+    }
+    try std.testing.expect(app.shell.fullTranscriptPreparedForOpen());
+    app.shell.render_requests.request(.transcript);
     try Runtime(CoordinatorTestApp).flushRequestedFrame(&app);
+    const resize_bytes = try readCoordinatorFrameBytes(alloc, file, &read_offset);
+    defer alloc.free(resize_bytes);
+    try std.testing.expect(app.terminal.fullTranscriptScreenActive());
+    try std.testing.expect(resize_bytes.len > 0);
+    try std.testing.expect(std.mem.find(u8, resize_bytes, "\x1b[3J") == null);
 
-    var read_offset = try file.length(io_mod.getIo());
     try app_lifecycle.closeFullTranscript(app.alloc, &app.terminal, &app.shell, &app.metrics);
     try Runtime(CoordinatorTestApp).flushRequestedFrame(&app);
     const close_bytes = try readCoordinatorFrameBytes(alloc, file, &read_offset);
     defer alloc.free(close_bytes);
 
-    try std.testing.expect(std.mem.find(u8, close_bytes, "\x1b[3J") == null);
+    try std.testing.expect(std.mem.find(u8, close_bytes, "\x1b[3J") != null);
     try std.testing.expect(close_bytes.len < 16 * 1024);
     try std.testing.expect(try coordinatorGridContains(
         app.shell.shadow_vt.?.*,
