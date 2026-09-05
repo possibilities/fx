@@ -22,7 +22,9 @@ const Allocator = std.mem.Allocator;
 const max_drain_bytes = 1024 * 1024;
 const max_input_bytes = 8 * 1024 * 1024;
 const max_output_bytes = 8 * 1024 * 1024;
+const max_output_message_bytes = 64 * 1024 * 1024;
 const max_fetch_request_bytes = 8 * 1024 * 1024;
+const max_fetch_request_frame_bytes = std.base64.standard.Encoder.calcSize(max_fetch_request_bytes);
 const max_fetch_response_bytes = 8 * 1024 * 1024;
 const max_api_key_bytes = 64 * 1024;
 const max_model_bytes = 1024;
@@ -145,23 +147,47 @@ const InputQueue = struct {
 
 const OutputQueue = struct {
     mutex: std.Io.Mutex = .init,
+    wake: std.Io.Condition = .init,
     bytes: std.ArrayList(u8) = .empty,
     offset: usize = 0,
     ready: ?*ReadyNotifier = null,
+    closed: bool = false,
+    failed: bool = false,
 
     fn write(self: *OutputQueue, alloc: Allocator, data: []const u8) !void {
         const io = io_mod.getIo();
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
-        const queued = self.bytes.items.len - self.offset;
-        if (data.len > max_output_bytes or queued > max_output_bytes - data.len) return error.OutputQueueFull;
-        if (self.offset > 0) {
-            std.mem.copyForwards(u8, self.bytes.items[0..queued], self.bytes.items[self.offset..]);
-            self.bytes.items.len = queued;
-            self.offset = 0;
+        errdefer |err| if (err != error.OutputClosed) {
+            self.failed = true;
+            self.wake.broadcast(io);
+            self.ready.?.notify();
+        };
+        if (data.len > max_output_message_bytes) return error.OutputMessageTooLarge;
+        var written: usize = 0;
+        while (written < data.len) {
+            if (self.failed) return error.OutputFailed;
+            if (self.closed) return error.OutputClosed;
+            const queued = self.bytes.items.len - self.offset;
+            if (queued == max_output_bytes) {
+                self.wake.waitUncancelable(io, &self.mutex);
+                continue;
+            }
+            if (self.offset > 0) {
+                std.mem.copyForwards(u8, self.bytes.items[0..queued], self.bytes.items[self.offset..]);
+                self.bytes.items.len = queued;
+                self.offset = 0;
+            }
+            const len = @min(data.len - written, max_output_bytes - queued);
+            const needed = queued + len;
+            if (needed > self.bytes.capacity) {
+                const capacity = @min(max_output_bytes, @max(needed, self.bytes.capacity + self.bytes.capacity / 2 + 8));
+                try self.bytes.ensureTotalCapacityPrecise(alloc, capacity);
+            }
+            self.bytes.appendSliceAssumeCapacity(data[written..][0..len]);
+            written += len;
+            if (queued == 0) self.ready.?.notify();
         }
-        try self.bytes.appendSlice(alloc, data);
-        if (queued == 0) self.ready.?.notify();
     }
 
     fn drain(self: *OutputQueue, destination: []u8) usize {
@@ -177,14 +203,24 @@ const OutputQueue = struct {
             self.bytes.clearRetainingCapacity();
             self.offset = 0;
         }
+        self.wake.broadcast(io);
         return len;
     }
 
-    fn available(self: *OutputQueue) usize {
+    fn available(self: *OutputQueue) !usize {
         const io = io_mod.getIo();
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
+        if (self.failed) return error.OutputFailed;
         return self.bytes.items.len - self.offset;
+    }
+
+    fn close(self: *OutputQueue) void {
+        const io = io_mod.getIo();
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        self.closed = true;
+        self.wake.broadcast(io);
     }
 
     fn deinit(self: *OutputQueue, alloc: Allocator) void {
@@ -228,25 +264,40 @@ const FetchBridge = struct {
             .applied => {},
             else => unreachable,
         }
-        self.response_offset = 0;
-        self.response.clearRetainingCapacity();
+        if (body.len > max_fetch_request_bytes or method.len > max_fetch_request_bytes or
+            url.len > max_fetch_request_bytes or headers.len > max_fetch_request_bytes)
+            return error.HostStreamBackpressure;
+        var request: struct {
+            handle: fetch_state.Handle,
+            method: []const u8,
+            url: []const u8,
+            headers: []const u8,
+            body: []const u8,
+        } = .{
+            .handle = handle,
+            .method = method,
+            .url = url,
+            .headers = headers,
+            .body = "",
+        };
+        var metadata: std.Io.Writer.Discarding = .init(&.{});
+        try std.json.Stringify.value(request, .{}, &metadata.writer);
+        // Charge raw bytes and JSON metadata before the bridge's base64 expansion.
+        if (metadata.fullCount() > max_fetch_request_bytes - body.len) return error.HostStreamBackpressure;
         var writer: std.Io.Writer.Allocating = .init(std.heap.c_allocator);
         defer writer.deinit();
         const encoded_body = std.base64.standard.Encoder.calcSize(body.len);
         const body_base64 = try std.heap.c_allocator.alloc(u8, encoded_body);
         defer std.heap.c_allocator.free(body_base64);
         _ = std.base64.standard.Encoder.encode(body_base64, body);
-        try std.json.Stringify.value(.{
-            .handle = handle,
-            .method = method,
-            .url = url,
-            .headers = headers,
-            .body = body_base64,
-        }, .{}, &writer.writer);
+        request.body = body_base64;
+        try std.json.Stringify.value(request, .{}, &writer.writer);
         const bytes = writer.writer.buffered();
-        if (bytes.len > max_fetch_request_bytes) return error.HostStreamBackpressure;
+        if (bytes.len > max_fetch_request_frame_bytes) return error.HostStreamBackpressure;
         self.request.clearRetainingCapacity();
         try self.request.appendSlice(std.heap.c_allocator, bytes);
+        self.response_offset = 0;
+        self.response.clearRetainingCapacity();
         self.phase = decision.phase;
         self.advance_handle();
         self.wake.broadcast(io);
@@ -446,7 +497,12 @@ const Runtime = struct {
     fn writeOutput(context: ?*anyopaque, bytes: []const u8) !void {
         const self: *Runtime = @ptrCast(@alignCast(context.?));
         self.output.write(self.alloc, bytes) catch |err| {
-            self.exit_code.store(1, .seq_cst);
+            if (err != error.OutputClosed) {
+                self.exit_code.store(1, .seq_cst);
+                self.input.close();
+                self.fetch.shutdown();
+                self.ready.notify();
+            }
             return err;
         };
     }
@@ -461,6 +517,7 @@ const Runtime = struct {
             .auth_strategy = .vercel,
             .fallback_model_capabilities_fn = builtin_gateway.provider_bundle.fallback_model_capabilities_fn,
             .agent_stream = host_stream_provider.provider(&self.stream_context),
+            .model_catalog = @import("gateway/host_model_catalog.zig").provider(&self.stream_context.transport),
         });
         acp_server.runWithTransport(
             self.alloc,
@@ -502,6 +559,7 @@ const Runtime = struct {
     }
 
     fn closeInput(self: *Runtime) void {
+        self.output.close();
         self.input.close();
     }
 
@@ -889,7 +947,9 @@ fn drainCore(env: c.napi_env, info: c.napi_callback_info) callconv(.c) c.napi_va
     const handle = runtimeHandleArg(env, info, &argv) orelse return null;
     const runtime = lockRuntime(env, handle) orelse return null;
     defer unlockRuntime(handle);
-    const len = @min(runtime.output.available(), max_drain_bytes);
+    const available = runtime.output.available() catch
+        return throw(env, "LIBFX_NATIVE_IO", "native output delivery failed");
+    const len = @min(available, max_drain_bytes);
     var value: c.napi_value = undefined;
     var data: ?*anyopaque = null;
     if (!statusOk(env, c.napi_create_buffer(env, len, &data, &value), "could not allocate output Buffer")) return null;
