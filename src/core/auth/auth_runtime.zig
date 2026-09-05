@@ -9,6 +9,7 @@ const host_target = @import("../hosts/target.zig");
 const login_flow = @import("login_flow.zig");
 const oauth = @import("oauth.zig");
 const model_provider = @import("../config/model_provider.zig");
+const model_catalog = @import("../gateway/model_catalog.zig");
 const provider_catalog = @import("provider_catalog.zig");
 const provider_picker_catalog = @import("provider_picker_catalog.zig");
 const oauth_transport = @import("oauth_transport.zig");
@@ -799,6 +800,278 @@ const PromptCredentialRefreshTask = struct {
     }
 };
 
+pub const ProviderPreparationIntent = union(enum) {
+    provider: struct {
+        target: model_provider.ProviderId,
+        allow_login: bool,
+        origin: auth_transition.ProviderSwitchIntent,
+        fallback: ?model_provider.ProviderId = null,
+    },
+    team: struct {
+        index: usize,
+        activate_gateway: bool,
+    },
+};
+
+pub const ProviderPreparationInput = struct {
+    intent: ProviderPreparationIntent,
+    catalog_provider: model_catalog.Provider,
+    models_path: []const u8,
+    preferred_source: ?credentials.Source = null,
+    primary_model: ?[]const u8 = null,
+    preferred_model: ?[]const u8 = null,
+    candidate: ?credentials.Credential = null,
+
+    pub fn target(self: ProviderPreparationInput) model_provider.ProviderId {
+        return switch (self.intent) {
+            .provider => |request| request.target,
+            .team => .gateway,
+        };
+    }
+};
+
+/// Owns the preparation inputs and outcome until the event loop consumes it.
+/// Provider capabilities must outlive the task. Only the worker writes results;
+/// the main thread reads them after the release/acquire completion and join.
+pub const ProviderPreparation = struct {
+    alloc: Allocator,
+    input: ProviderPreparationInput,
+    transport: oauth_transport.Provider,
+    secret_store: host.SecretStore,
+    host_managed: bool,
+    thread: ?std.Thread = null,
+    cancel_requested: std.atomic.Value(bool) = .init(false),
+    done: std.atomic.Value(bool) = .init(false),
+    credential: ?credentials.Credential = null,
+    catalog: ?model_catalog.ProviderResult = null,
+    failure: ?anyerror = null,
+
+    fn start(alloc: Allocator, runtime: *const Runtime, input: ProviderPreparationInput) !*ProviderPreparation {
+        const self = try alloc.create(ProviderPreparation);
+        self.* = .{
+            .alloc = alloc,
+            .input = input,
+            .transport = runtime.oauth_transport,
+            .secret_store = runtime.secret_store,
+            .host_managed = runtime.isHostManaged(),
+        };
+        self.input.primary_model = null;
+        self.input.preferred_model = null;
+        self.input.candidate = null;
+        self.input.models_path = "";
+        errdefer self.deinit();
+        self.input.models_path = try alloc.dupe(u8, input.models_path);
+        if (input.primary_model) |value| self.input.primary_model = try alloc.dupe(u8, value);
+        if (input.preferred_model) |value| self.input.preferred_model = try alloc.dupe(u8, value);
+        if (input.candidate) |candidate| self.input.candidate = try candidate.clone(alloc);
+        self.thread = try std.Thread.spawn(.{}, run, .{self});
+        return self;
+    }
+
+    fn run(self: *ProviderPreparation) void {
+        defer self.done.store(true, .release);
+        if (self.cancel_requested.load(.seq_cst)) return;
+        if (self.input.candidate) |candidate| {
+            self.credential = candidate;
+            self.input.candidate = null;
+        } else if (!self.host_managed) {
+            self.credential = prepareCredential(
+                self.alloc,
+                .{ .context = self, .execute_fn = executeCancellable },
+                self.secret_store,
+                self.input.target(),
+                self.input.preferred_source,
+            ) catch |err| {
+                self.failure = err;
+                return;
+            };
+            if (self.credential == null) return;
+        }
+        if (self.cancel_requested.load(.seq_cst)) return;
+        const access: credentials.CatalogAccess = if (self.host_managed)
+            .host_managed
+        else
+            credentials.catalogAccessForCredentialAndAccount(
+                self.credential.?.source,
+                self.credential.?.token,
+                self.credential.?.gatewayTeam(),
+                self.credential.?.accountId(),
+            );
+        self.catalog = self.input.catalog_provider.fetch(self.alloc, .{
+            .access = access,
+            .endpoint = self.input.models_path,
+            .cancel_flag = &self.cancel_requested,
+            .view = .picker,
+        }) catch |err| {
+            self.failure = err;
+            return;
+        };
+    }
+
+    fn executeCancellable(raw: ?*anyopaque, alloc: Allocator, request: oauth_transport.Request) !oauth_transport.Response {
+        const self: *ProviderPreparation = @ptrCast(@alignCast(raw.?));
+        var bounded = request;
+        bounded.cancel_flag = &self.cancel_requested;
+        return self.transport.execute(alloc, bounded);
+    }
+
+    pub fn requestCancel(self: *ProviderPreparation) void {
+        if (!self.cancel_requested.swap(true, .seq_cst)) {
+            debug_trace.logf("auth", "provider preparation cancelled target={t}", .{self.input.target()});
+        }
+    }
+
+    pub fn deinit(self: *ProviderPreparation) void {
+        if (self.thread) |thread| {
+            self.requestCancel();
+            thread.join();
+        }
+        if (self.credential) |*credential| credential.deinit(self.alloc);
+        if (self.input.candidate) |*credential| credential.deinit(self.alloc);
+        if (self.catalog) |*result| switch (result.*) {
+            .catalog => |*catalog| model_catalog.freeModelCatalog(self.alloc, catalog),
+            .failure => {},
+        };
+        if (self.input.primary_model) |value| self.alloc.free(value);
+        if (self.input.preferred_model) |value| self.alloc.free(value);
+        self.alloc.free(self.input.models_path);
+        const alloc = self.alloc;
+        alloc.destroy(self);
+    }
+};
+
+const PreparationTestCatalog = struct {
+    entered: std.atomic.Value(bool) = .init(false),
+    release: std.atomic.Value(bool) = .init(false),
+    cancelled: std.atomic.Value(bool) = .init(false),
+
+    fn provider(self: *PreparationTestCatalog) model_catalog.Provider {
+        return .{ .context = self, .fetch_fn = fetch };
+    }
+
+    fn fetch(raw: ?*anyopaque, alloc: Allocator, input: model_catalog.FetchInput) Allocator.Error!model_catalog.ProviderResult {
+        const self: *PreparationTestCatalog = @ptrCast(@alignCast(raw.?));
+        self.entered.store(true, .release);
+        while (!self.release.load(.acquire)) {
+            if (input.cancel_flag.?.load(.seq_cst)) {
+                self.cancelled.store(true, .release);
+                return .{ .failure = .{ .category = .cancellation } };
+            }
+            io_mod.sleep(std.time.ns_per_ms);
+        }
+        var catalog: std.ArrayList(model_catalog.ModelCatalogEntry) = .empty;
+        errdefer model_catalog.freeModelCatalog(alloc, &catalog);
+        const id = try alloc.dupe(u8, "test/prepared");
+        errdefer alloc.free(id);
+        const model_type = try alloc.dupe(u8, "language");
+        errdefer alloc.free(model_type);
+        try catalog.append(alloc, .{ .id = id, .model_type = model_type });
+        return .{ .catalog = catalog };
+    }
+};
+
+fn waitForPreparationTest(flag: *const std.atomic.Value(bool)) !void {
+    const deadline = io_mod.milliTimestamp() + 5000;
+    while (!flag.load(.acquire)) {
+        if (io_mod.milliTimestamp() >= deadline) return error.TestUnexpectedResult;
+        io_mod.sleep(std.time.ns_per_ms);
+    }
+}
+
+test "provider preparation owns inputs and transfers its result once" {
+    const alloc = std.testing.allocator;
+    var runtime: Runtime = .{};
+    defer runtime.deinit(alloc);
+    var catalog: PreparationTestCatalog = .{};
+    var candidate: credentials.Credential = .{ .source = .ai_gateway_api_key, .token = try alloc.dupe(u8, "original-key") };
+    const preferred = try alloc.dupe(u8, "test/prepared");
+    try runtime.beginProviderPreparation(alloc, .{
+        .intent = .{ .provider = .{ .target = .gateway, .allow_login = false, .origin = .manual } },
+        .catalog_provider = catalog.provider(),
+        .models_path = "/models",
+        .candidate = candidate,
+        .preferred_model = preferred,
+    });
+    candidate.deinit(alloc);
+    alloc.free(preferred);
+    try waitForPreparationTest(&catalog.entered);
+    try std.testing.expect(runtime.takeProviderPreparation() == null);
+    catalog.release.store(true, .release);
+    try waitForPreparationTest(&runtime.provider_preparation.?.done);
+    const prepared = runtime.takeProviderPreparation().?;
+    defer prepared.deinit();
+    try std.testing.expectEqualStrings("original-key", prepared.credential.?.token);
+    try std.testing.expectEqualStrings("test/prepared", prepared.input.preferred_model.?);
+    try std.testing.expectEqualStrings("test/prepared", prepared.catalog.?.catalog.items[0].id);
+    try std.testing.expect(!runtime.providerPreparationPending());
+    try std.testing.expect(runtime.takeProviderPreparation() == null);
+    try std.testing.expect(runtime.credentialSource() == null);
+}
+
+test "provider preparation cancellation reaches blocked transport and teardown joins it" {
+    const alloc = std.testing.allocator;
+    var runtime: Runtime = .{};
+    defer runtime.deinit(alloc);
+    var catalog: PreparationTestCatalog = .{};
+    const candidate: credentials.Credential = .{ .source = .ai_gateway_api_key, .token = @constCast("key") };
+    try runtime.beginProviderPreparation(alloc, .{
+        .intent = .{ .provider = .{ .target = .gateway, .allow_login = false, .origin = .manual } },
+        .catalog_provider = catalog.provider(),
+        .models_path = "/models",
+        .candidate = candidate,
+    });
+    try waitForPreparationTest(&catalog.entered);
+    try std.testing.expect(runtime.cancelProviderPreparation());
+    runtime.stopProviderPreparation();
+    try std.testing.expect(catalog.cancelled.load(.acquire));
+    try std.testing.expect(!runtime.providerPreparationPending());
+    runtime.stopProviderPreparation();
+}
+
+test "provider preparation retains cancellation when a result wins the transport race" {
+    const alloc = std.testing.allocator;
+    var runtime: Runtime = .{};
+    defer runtime.deinit(alloc);
+    var catalog: PreparationTestCatalog = .{};
+    catalog.release.store(true, .release);
+    try runtime.beginProviderPreparation(alloc, .{
+        .intent = .{ .provider = .{ .target = .gateway, .allow_login = false, .origin = .manual } },
+        .catalog_provider = catalog.provider(),
+        .models_path = "/models",
+        .candidate = .{ .source = .ai_gateway_api_key, .token = @constCast("key") },
+    });
+    try waitForPreparationTest(&runtime.provider_preparation.?.done);
+    try std.testing.expect(runtime.cancelProviderPreparation());
+    const prepared = runtime.takeProviderPreparation().?;
+    defer prepared.deinit();
+    try std.testing.expect(prepared.cancel_requested.load(.seq_cst));
+    try std.testing.expect(prepared.catalog.? == .catalog);
+    try std.testing.expect(runtime.credentialSource() == null);
+}
+
+test "provider preparation is invalidated by a credential authority change" {
+    const alloc = std.testing.allocator;
+    var runtime: Runtime = .{};
+    defer runtime.deinit(alloc);
+    var catalog: PreparationTestCatalog = .{};
+    try runtime.beginProviderPreparation(alloc, .{
+        .intent = .{ .provider = .{ .target = .gateway, .allow_login = false, .origin = .manual } },
+        .catalog_provider = catalog.provider(),
+        .models_path = "/models",
+        .candidate = .{ .source = .ai_gateway_api_key, .token = @constCast("old-key") },
+    });
+    try waitForPreparationTest(&catalog.entered);
+    var replacement: credentials.Credential = .{ .source = .stored_key, .token = try alloc.dupe(u8, "replacement-key") };
+    defer replacement.deinit(alloc);
+    _ = runtime.adoptCredential(alloc, &replacement);
+    try waitForPreparationTest(&runtime.provider_preparation.?.done);
+    const prepared = runtime.takeProviderPreparation().?;
+    defer prepared.deinit();
+    try std.testing.expect(prepared.cancel_requested.load(.seq_cst));
+    try std.testing.expectEqual(credentials.Source.stored_key, runtime.credentialSource().?);
+    try std.testing.expectEqualStrings("replacement-key", runtime.selected_credential.?.token);
+}
+
 const InventoryRefreshTask = struct {
     alloc: Allocator,
     thread: ?std.Thread = null,
@@ -1331,6 +1604,7 @@ pub const Runtime = struct {
     api_key_save: ApiKeySaveRuntime = .{},
     inventory_refresh_task: ?*InventoryRefreshTask = null,
     prompt_credential_refresh_task: ?*PromptCredentialRefreshTask = null,
+    provider_preparation: ?*ProviderPreparation = null,
 
     pub fn init(
         validator: api_key_validator.Provider,
@@ -1373,7 +1647,7 @@ pub const Runtime = struct {
         auth_mode: credentials.AuthMode,
     ) void {
         comptime {
-            if (std.meta.fields(Self).len != 30) {
+            if (std.meta.fields(Self).len != 31) {
                 @compileError("update Runtime.initInto for the changed field set");
             }
         }
@@ -1408,9 +1682,11 @@ pub const Runtime = struct {
         storage.api_key_save = .{};
         storage.inventory_refresh_task = null;
         storage.prompt_credential_refresh_task = null;
+        storage.provider_preparation = null;
     }
 
     pub fn deinit(self: *Self, alloc: Allocator) void {
+        self.stopProviderPreparation();
         if (self.inventory_refresh_task) |task| task.deinit();
         self.inventory_refresh_task = null;
         if (self.prompt_credential_refresh_task) |task| task.deinit();
@@ -1579,6 +1855,37 @@ pub const Runtime = struct {
         self.stored_key_status = stored_key_status;
         self.fx_login_status = fx_login_status;
         self.onboarding_skipped = onboarding_skipped;
+    }
+
+    pub fn beginProviderPreparation(self: *Self, alloc: Allocator, input: ProviderPreparationInput) !void {
+        if (self.provider_preparation != null) return error.ProviderPreparationInProgress;
+        self.cancelPromptCredentialRefresh();
+        self.provider_preparation = try ProviderPreparation.start(alloc, self, input);
+    }
+
+    pub fn providerPreparationPending(self: *const Self) bool {
+        return self.provider_preparation != null;
+    }
+
+    pub fn cancelProviderPreparation(self: *Self) bool {
+        const task = self.provider_preparation orelse return false;
+        task.requestCancel();
+        return true;
+    }
+
+    pub fn takeProviderPreparation(self: *Self) ?*ProviderPreparation {
+        const task = self.provider_preparation orelse return null;
+        if (!task.done.load(.acquire)) return null;
+        if (task.thread) |thread| thread.join();
+        task.thread = null;
+        self.provider_preparation = null;
+        return task;
+    }
+
+    pub fn stopProviderPreparation(self: *Self) void {
+        const task = self.provider_preparation orelse return;
+        self.provider_preparation = null;
+        task.deinit();
     }
 
     pub fn skipOnboarding(self: *Self) void {
@@ -2288,6 +2595,7 @@ pub const Runtime = struct {
         credential: *credentials.Credential,
     ) auth_transition.CredentialChange {
         const change = self.preparedCredentialChange(credential.*);
+        if (change == .authority) _ = self.cancelProviderPreparation();
         self.cancelPromptCredentialRefresh();
         const source = credential.source;
         if (self.selected_credential) |*selected| selected.deinit(alloc);
@@ -2512,6 +2820,9 @@ pub const Runtime = struct {
     }
 
     fn clearTeamSelection(self: *Self, alloc: Allocator) void {
+        if (self.provider_preparation) |task| {
+            if (task.input.intent == .team) task.requestCancel();
+        }
         if (self.team_selection) |*selection| selection.deinit(alloc);
         self.team_selection = null;
         self.team_query.clearRetainingCapacity();
