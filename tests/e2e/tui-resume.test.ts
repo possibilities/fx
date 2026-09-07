@@ -4341,7 +4341,7 @@ test.skipIf(!tmuxAvailable())(
 );
 
 test.skipIf(!tmuxAvailable())(
-  "context-withheld scoped tools remain explicitly not run after resume",
+  "instruction refresh stays neutral after resume",
   async () => {
     const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-tui-resume-deferred-tools-")));
     const home = join(root, "home");
@@ -4454,9 +4454,9 @@ test.skipIf(!tmuxAvailable())(
 
     function expectDeferredPresentation(scrollback: string): void {
       expect(scrollback).toContain("1 failed");
-      expect(scrollback).toContain("1 command not run");
+      expect(scrollback).not.toContain("command not run");
       expect(scrollback).not.toContain("1 deferred");
-      expect(scrollback).toContain(`Not run — project instructions changed: ${command}`);
+      expect(scrollback).toContain(`Reading project instructions before continuing: ${command}`);
       expect(scrollback).not.toContain("Not executed");
       expect(scrollback).not.toContain("├ terminal");
       expect(scrollback).not.toContain("└ terminal");
@@ -4512,16 +4512,16 @@ test.skipIf(!tmuxAvailable())(
       await active.sendKeys("C-o");
       const detail = await active.waitForPane(
         (pane) =>
-          pane.includes(`Not run — project instructions changed: ${command}`) &&
+          pane.includes(`Reading project instructions before continuing: ${command}`) &&
           pane.includes("ordinary-failure-control"),
         TIMEOUT,
       );
-      expect(countOccurrences(detail, "Not run — project instructions changed:")).toBe(1);
+      expect(countOccurrences(detail, "Reading project instructions before continuing:")).toBe(1);
       expect(detail).not.toContain("Not executed");
       expect(detail).not.toContain('{"path":"nested/input.txt"}');
       expect(detail).not.toContain(JSON.stringify({ command, cwd: "nested" }));
       expect(detail).toContain(failureCommand);
-      expect(detail).toContain("1 command not run");
+      expect(detail).not.toContain("command not run");
       expect(detail).not.toContain("1 deferred");
       expect(detail).toContain("1 failed");
       expect(readFileSync(resumeStderrPath, "utf8")).toBe("");
@@ -6807,6 +6807,67 @@ test.skipIf(!tmuxAvailable())(
     }
   },
   120_000,
+);
+
+test.skipIf(!tmuxAvailable())(
+  "latest and picker resume preserve conversations beside incomplete session creation",
+  async () => {
+    const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-resume-incomplete-creation-")));
+    const home = join(root, "home"), workspace = join(root, "workspace");
+    mkdirSync(home); mkdirSync(workspace);
+    const gateway = startFakeGateway([
+      fakeGatewayFinalText("PUBLICATION_SAVED_HISTORY"),
+      fakeGatewayFinalText("LATEST_CONTINUATION_SAVED"),
+      fakeGatewayFinalText("PICKER_CONTINUATION_SAVED"),
+    ]);
+    const env = gatewayEnv(home, gateway);
+    let active: TmuxSession | null = null;
+    try {
+      const seed = await runFx(["ask", "--json", "Save the conversation."], { cwd: workspace, env });
+      expect(seed.code).toBe(0);
+      const id = JSON.parse(seed.stdout).session_id;
+      const sessions = join(home, ".fx", "sessions");
+      const eventsPath = join(sessions, id, "events.jsonl");
+      const before = readFileSync(eventsPath);
+      const metadata = JSON.parse(readFileSync(join(sessions, id, "session.json"), "utf8"));
+      const remnants: Array<[string, string]> = [];
+      for (const failedId of ["temporary-start", "metadata-start", "creating+unpublished"]) {
+        const directory = join(sessions, failedId);
+        mkdirSync(directory, { mode: 0o700 });
+        writeFileSync(join(directory, "session.lock"), "", { mode: 0o600 });
+        const path = join(directory, failedId === "metadata-start" ? "session.json" : ".session.json.tmp.0123456789abcdef0123456789abcdef");
+        const content = failedId === "metadata-start" ? JSON.stringify({ ...metadata, id: failedId }) : "partial metadata";
+        writeFileSync(path, content, { mode: 0o600 });
+        remnants.push([path, content]);
+      }
+      for (const [flag, reply] of [["-c", "LATEST_CONTINUATION_SAVED"], ["-r", "PICKER_CONTINUATION_SAVED"]] as const) {
+        const stderrPath = join(root, `${flag}.stderr`);
+        active = await TmuxSession.create({ cmd: `${shellQuote(FX_BIN)} ${flag}`, cwd: workspace, env, stderrPath, remainOnExit: true });
+        if (flag === "-r") {
+          await active.waitForText("Sessions 1", TIMEOUT);
+          await active.sendKeys("Enter");
+        }
+        await active.waitForText("PUBLICATION_SAVED_HISTORY", TIMEOUT);
+        await active.waitForStableComposer(TIMEOUT);
+        await active.sendText("Continue the saved conversation without tools.");
+        await active.waitForPane((pane) => pane.includes(reply) && hasEmptyComposer(pane), TIMEOUT);
+        const events = readFileSync(eventsPath, "utf8").trim().split("\n").map((line) => JSON.parse(line).event);
+        expect(events.filter((event) => event.assistant?.text === reply)).toHaveLength(1);
+        expect(readFileSync(eventsPath).subarray(0, before.length).equals(before)).toBe(true);
+        expect(await active.captureFullScrollback()).not.toContain("FileNotFound");
+        await active.sendText("/quit");
+        await active.waitForPane(() => paneExitMatches(active!.paneStatus(), 0), TIMEOUT);
+        expect(readFileSync(stderrPath, "utf8")).toBe("");
+        await active.kill(); active = null;
+      }
+      expect(gateway.requests).toHaveLength(3);
+      expect(gateway.requests[2]!.body).toContain("LATEST_CONTINUATION_SAVED");
+      for (const [path, bytes] of remnants) expect(readFileSync(path, "utf8")).toBe(bytes);
+    } finally {
+      await active?.kill(); gateway.stop(); rmSync(root, { recursive: true, force: true });
+    }
+  },
+  TIMEOUT * 3,
 );
 
 test.skipIf(!tmuxAvailable())(
