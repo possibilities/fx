@@ -28,6 +28,16 @@ import {
 
 const TIMEOUT = 30_000;
 
+function runDiagnostics(result: Awaited<ReturnType<typeof runFx>>, stage: string): string {
+  return JSON.stringify({
+    stage,
+    stdout: result.stdout,
+    stderr: result.stderr,
+    signal: result.signal,
+    timedOut: result.timedOut,
+  });
+}
+
 function savedFileHashes(root: string): Record<string, string> {
   const hashes: Record<string, string> = {};
   function visit(directory: string, prefix = "") {
@@ -318,7 +328,7 @@ describe("session recovery", () => {
         const created = await runFx(["ask", "--json", "--full-access", "Save one command result."], {
           cwd: fixture.workspace, env: gatewayEnv(fixture, gateway), timeoutMs: TIMEOUT,
         });
-        expect(created.code).toBe(0);
+        expect(created.code, runDiagnostics(created, "seed saved command")).toBe(0);
         const id = JSON.parse(created.stdout).session_id;
         const source = join(fixture.home, ".fx", "sessions", id);
         const eventPath = join(source, "events.jsonl");
@@ -348,7 +358,7 @@ describe("session recovery", () => {
         const recovered = await runFx(["session", "recover", id, "--json"], {
           cwd: fixture.workspace, env: gatewayEnv(fixture, gateway), timeoutMs: TIMEOUT,
         });
-        expect(recovered.code).toBe(0);
+        expect(recovered.code, runDiagnostics(recovered, "recover saved command")).toBe(0);
         expect(recovered.stderr).toBe("");
         const result = JSON.parse(recovered.stdout);
         expect(result).toMatchObject({ kind: "session_recovery", source_id: id, status: "recovered" });
@@ -379,7 +389,7 @@ describe("session recovery", () => {
           env: { ...gatewayEnv(fixture, gateway), FX_TRACE_LOG: tracePath, FX_TRACE_SCOPES: "tool,session,agent" },
           timeoutMs: TIMEOUT,
         });
-        expect(continued.code).toBe(0);
+        expect(continued.code, runDiagnostics(continued, "continue recovered command")).toBe(0);
         expect(JSON.parse(readFileSync(join(target, "session.json"), "utf8")).title).toBe(metadata.title);
         expect(JSON.parse(continued.stdout)).toMatchObject({ output: "RECOVERED_CONTINUATION_SAVED", tool_calls: [{ name: "read_tool_result", status: "success" }] });
         expect(gateway.requests).toHaveLength(4);
@@ -396,7 +406,7 @@ describe("session recovery", () => {
         const inspected = await runFx(["session", "--id", result.recovered_id, "--json"], {
           cwd: fixture.workspace, env: gatewayEnv(fixture, gateway), timeoutMs: TIMEOUT,
         });
-        expect(inspected.code).toBe(0);
+        expect(inspected.code, runDiagnostics(inspected, "inspect recovered command")).toBe(0);
         expect(inspected.stderr).toBe("");
         expect(inspected.stdout).toContain("RECOVERED_CONTINUATION_SAVED");
       } finally {
