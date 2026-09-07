@@ -137,6 +137,8 @@ pub fn build(b: *std.Build) void {
             "resume handoff owns the exact non-pristine session id",
             "provider selection beneath a selected profile never reads the ambient store",
             "session_commands selected profile status never reads ambient credential preferences",
+            "catalog cache round trips owned rows and ignores incomplete observations",
+            "summary clone owns every string",
             "native session checkpoint-only history leaves first real title uncommitted",
             "resume menu retains account provenance in clipped titles",
             "global system prompt file modifiers preserve replacement and append order",

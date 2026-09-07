@@ -30,6 +30,8 @@ test {
     _ = @import("core/notifications/sound.zig");
     _ = @import("core/output/output_contracts.zig");
     _ = @import("core/session/session_commands.zig");
+    _ = @import("core/session/session_catalog_cache.zig");
+    _ = @import("core/session/session_summary_codec.zig");
     _ = @import("core/session/session_log.zig");
     _ = @import("core/session/session_naming.zig");
     _ = @import("core/skills/skill_runtime.zig");
