@@ -1205,13 +1205,17 @@ fn openConversationWritableSession(
         .through_event_id = randomIdentifier(),
         .through_event_log_bytes = conversation_writer.committed_bytes,
     };
-    const result = LoadedWritableSession{
+    var result = LoadedWritableSession{
         .active_id = active_id,
         .state = state,
         .conversation_writer = conversation_writer,
         .log = writable.*,
         .position = position,
     };
+    const existing_title = try result.conversationTitle(alloc);
+    defer if (existing_title) |title| alloc.free(title);
+    result.title_committed = existing_title != null or
+        session_display_metadata.hasPromptCandidate(state.history);
     writable.* = undefined;
     return result;
 }
@@ -2432,8 +2436,8 @@ pub const LoadedWritableSession = struct {
     conversation_writer: ConversationWriter,
     log: WritableSessionDir,
     freshly_started: bool = false,
-    /// A title committed through the rename path before the first history
-    /// turn; the derived first-turn title must not replace it.
+    /// Existing metadata or prompt history owns the title. A resumed session
+    /// containing only checkpoints remains eligible for its first real prompt.
     title_committed: bool = false,
     child_capability: ?*session_child_store.SessionChildCapability = null,
     position: CommitPosition,
@@ -2639,7 +2643,7 @@ pub const LoadedWritableSession = struct {
     }
 
     fn writeFirstConversationTitle(self: *LoadedWritableSession, alloc: Allocator, turn: session.HistoryTurn) void {
-        if (!self.freshly_started or self.title_committed) return;
+        if (self.title_committed or !session_display_metadata.hasPromptCandidate(&.{turn})) return;
         var display = session_display_metadata.deriveFromHistory(alloc, &.{turn}) catch return;
         defer display.deinit(alloc);
         if (!display.present) return;
@@ -3610,6 +3614,8 @@ fn createNativeSession(
         initial_state.history,
     );
     defer display.deinit(alloc);
+    const has_initial_title = display.present and
+        session_display_metadata.hasPromptCandidate(initial_state.history);
     var conversation_writer = try createConversationStorage(alloc, &writable.dir, .{
         .id = initial_state.id,
         .origin_workspace_root = initial_state.origin_workspace_root,
@@ -3621,7 +3627,7 @@ fn createNativeSession(
         .model = initial_state.preferences.model,
         .effort = initial_state.preferences.effort.label(),
         .fast_mode = initial_state.preferences.fast_mode,
-        .title = if (display.present) display.title else null,
+        .title = if (has_initial_title) display.title else null,
         .subagent_child = initial_state.subagent_child,
     });
     errdefer conversation_writer.deinit();
@@ -3658,7 +3664,7 @@ fn createNativeSession(
         .freshly_started = true,
         // A converted history already carries its derived title; the first
         // new turn must not replace it with a derivation of its own.
-        .title_committed = display.present,
+        .title_committed = has_initial_title,
         .position = position,
     };
     writable.* = undefined;
@@ -4887,6 +4893,47 @@ test "cache-free writable resume continues the conversation sequence" {
     defer loaded.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 2), loaded.history.len);
     try std.testing.expectEqualStrings("second answer", loaded.history[1].assistant.assistant);
+}
+
+test "native session checkpoint-only history derives a title after reopening unless explicitly named" {
+    const alloc = std.testing.allocator;
+    for ([_]?[]const u8{ null, "Explicit recovered title" }) |explicit_title| {
+        var temp = try TempRoot.init(alloc);
+        defer temp.deinit(alloc);
+        var initial = try testState(alloc, "checkpoint-title", 10);
+        defer initial.deinit(alloc);
+        session.freeHistoryTurnSlice(alloc, initial.history);
+        initial.history = try alloc.alloc(session.HistoryTurn, 1);
+        initial.history[0] = .{ .compacted_summary = .{
+            .summary = try alloc.dupe(u8, "<context_handoff>recovered work</context_handoff>"),
+            .removed_turn_count = 0,
+            .compaction_count = 1,
+        } };
+        {
+            var loaded = try temp.root.startConversationSession(alloc, initial, .{});
+            defer loaded.deinit(alloc);
+            try std.testing.expect(!loaded.title_committed);
+            try std.testing.expect(try loaded.conversationTitle(alloc) == null);
+            if (explicit_title) |title| _ = try loaded.renameConversation(alloc, title);
+        }
+        var resumed = try temp.root.resumeForWrite(alloc, initial.id, .{});
+        defer resumed.deinit(alloc);
+        try std.testing.expect(!resumed.freshly_started);
+        try std.testing.expectEqual(explicit_title != null, resumed.title_committed);
+        _ = try resumed.appendEvent(alloc, .{ .history_turn_committed = .{
+            .conversation_language = .literal("en"),
+            .total_input_tokens = 1,
+            .total_output_tokens = 1,
+            .turn = .{ .assistant = .{
+                .user = .{ .text = @constCast("first real recovery prompt") },
+                .assistant = @constCast("finished recovery"),
+            } },
+        } }, 20);
+        const title = (try resumed.conversationTitle(alloc)).?;
+        defer alloc.free(title);
+        try std.testing.expectEqualStrings(explicit_title orelse "first real recovery prompt", title);
+        try std.testing.expect(resumed.title_committed);
+    }
 }
 
 test "cache-free metadata changes rewrite metadata without conversation records" {
