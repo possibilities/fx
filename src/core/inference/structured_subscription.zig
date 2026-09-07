@@ -375,6 +375,17 @@ pub fn infer(
             provenance,
         );
     }
+    if (completion.finish_reason == .provider_error) {
+        const kind: stream_provider.FailureKind = if (completion.provider_failure_cause) |cause| switch (cause) {
+            .rate_limited => .rate_limited,
+            .non_retryable => .provider_error,
+        } else .server_error;
+        return terminalize(alloc, &entry, request_digest, .provider_failed, null, .{
+            .stage = "provider",
+            .code = providerFailureCode(kind),
+            .retryable = providerFailureRetryable(kind),
+        }, provenance);
+    }
     if (completion.finish_reason == .content_filter) {
         return terminalize(
             alloc,
@@ -852,6 +863,9 @@ const TestMode = enum {
     refusal,
     schema_failure,
     provider_failure,
+    terminal_rate_limit,
+    terminal_rejection,
+    terminal_server_error,
     cancel_after_admission,
 };
 
@@ -960,6 +974,17 @@ const TestRuntime = struct {
                 },
             } },
             .provider_failure => .{ .failed = .{ .kind = .unavailable } },
+            .terminal_rate_limit, .terminal_rejection, .terminal_server_error => .{ .completed = .{
+                .completion = .{
+                    .generation_id = "resp_provider_failure",
+                    .finish_reason = .provider_error,
+                    .provider_failure_cause = switch (self.mode) {
+                        .terminal_rate_limit => .rate_limited,
+                        .terminal_rejection => .non_retryable,
+                        else => null,
+                    },
+                },
+            } },
         };
     }
 
@@ -1094,6 +1119,9 @@ test "structured subscription inference durably classifies refusal schema and pr
         .{ .leaf = "refusal", .key = "refusal-key", .mode = .refusal, .expected = "refused" },
         .{ .leaf = "schema", .key = "schema-key", .mode = .schema_failure, .expected = "schema_failed" },
         .{ .leaf = "provider", .key = "provider-key", .mode = .provider_failure, .expected = "provider_failed" },
+        .{ .leaf = "rate", .key = "rate-key", .mode = .terminal_rate_limit, .expected = "provider_failed" },
+        .{ .leaf = "rejection", .key = "rejection-key", .mode = .terminal_rejection, .expected = "provider_failed" },
+        .{ .leaf = "server", .key = "server-key", .mode = .terminal_server_error, .expected = "provider_failed" },
     };
     for (cases) |case| {
         const state_root = try testStateRoot(alloc, tmp, case.leaf);
@@ -1114,6 +1142,16 @@ test "structured subscription inference durably classifies refusal schema and pr
         const status = try terminalStatus(alloc, first);
         defer alloc.free(status);
         try std.testing.expectEqualStrings(case.expected, status);
+        if (case.mode == .terminal_rate_limit or case.mode == .terminal_rejection or case.mode == .terminal_server_error) {
+            const code = switch (case.mode) {
+                .terminal_rate_limit => "provider_rate_limited",
+                .terminal_rejection => "provider_error",
+                else => "provider_server_error",
+            };
+            try std.testing.expect(std.mem.find(u8, first, code) != null);
+            try std.testing.expect(std.mem.find(u8, first, "resp_provider_failure") != null);
+            try std.testing.expect(std.mem.find(u8, first, if (case.mode == .terminal_rejection) "\"retryable\":false" else "\"retryable\":true") != null);
+        }
         const replay = try infer(alloc, state_root, request, runtime.dependencies());
         defer alloc.free(replay);
         try std.testing.expectEqualStrings(first, replay);

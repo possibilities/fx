@@ -4,6 +4,7 @@ const model_context_encoding = @import("../shared/model_context_encoding.zig");
 const skill_contract = @import("skill_contract.zig");
 const skill_runtime = @import("skill_runtime.zig");
 const text_utils = @import("../shared/text_utils.zig");
+const types = @import("../shared/types.zig");
 const tool_result_limits = @import("../tooling/tool_result_limits.zig");
 const context_limits = @import("../config/context_limits.zig");
 const test_debug_trace = if (@import("builtin").is_test)
@@ -181,16 +182,20 @@ pub const ExplicitBinding = struct {
     path: []const u8,
 };
 
-/// Owns `text` and both optional notices.
+/// Owns `text` and all optional notices.
 pub const ExplicitPromptSection = struct {
     text: []u8,
     notice: ?[]u8 = null,
     diagnostic_notice: ?[]u8 = null,
+    load_notice: ?types.SemanticNotice = null,
+    load_details: ?[]u8 = null,
 
     pub fn deinit(self: *ExplicitPromptSection, alloc: Allocator) void {
         alloc.free(self.text);
         if (self.notice) |notice| alloc.free(notice);
         if (self.diagnostic_notice) |notice| alloc.free(notice);
+        if (self.load_notice) |notice| types.freeSemanticNotice(alloc, notice);
+        if (self.load_details) |details| alloc.free(details);
         self.* = .{ .text = &.{} };
     }
 };
@@ -217,6 +222,11 @@ pub fn buildExplicitPromptSection(
     defer notices.deinit();
     var diagnostic_notices: std.Io.Writer.Allocating = .init(alloc);
     defer diagnostic_notices.deinit();
+    var load_rows: std.Io.Writer.Allocating = .init(alloc);
+    defer load_rows.deinit();
+    var load_details: std.Io.Writer.Allocating = .init(alloc);
+    defer load_details.deinit();
+    var loaded: usize = 0;
 
     try out.writer.writeAll(
         "Explicitly invoked skill content for this query:\n" ++
@@ -224,33 +234,74 @@ pub fn buildExplicitPromptSection(
             "Follow each skill's complete instructions and required resources before substantive work.\n" ++
             "If a skill cannot be followed, state the blocker instead of silently substituting another workflow.\n",
     );
-    for (binding_plan) |entry| switch (entry) {
-        .bound => |binding| try appendExplicitSkill(
-            alloc,
-            &out.writer,
-            &notices.writer,
-            &diagnostic_notices,
-            catalog,
-            binding.name,
-            binding.path,
-            limits,
-            cancel_flag,
-            context_limits.emergency_ceiling_bytes -| out.written().len,
-        ),
-        .ambiguous => |name| {
-            const failure = try formatAmbiguousSkill(alloc, catalog.skills, name, 4096);
-            defer alloc.free(failure);
-            try out.writer.writeAll(failure);
-            try out.writer.writeByte('\n');
-        },
-    };
+    for (binding_plan, 0..) |entry, index| {
+        try load_rows.writer.writeAll(if (index + 1 == binding_plan.len) "\n└ " else "\n├ ");
+        switch (entry) {
+            .bound => |binding| if (try appendExplicitSkill(
+                alloc,
+                &out.writer,
+                &notices.writer,
+                &diagnostic_notices,
+                &load_rows.writer,
+                &load_details.writer,
+                catalog,
+                binding.name,
+                binding.path,
+                limits,
+                cancel_flag,
+                context_limits.emergency_ceiling_bytes -| out.written().len,
+            )) {
+                loaded += 1;
+            },
+            .ambiguous => |name| {
+                const failure = try formatAmbiguousSkill(alloc, catalog.skills, name, 4096);
+                defer alloc.free(failure);
+                try out.writer.writeAll(failure);
+                try out.writer.writeByte('\n');
+                try appendExplicitLoadRow(alloc, &load_rows.writer, name, "ambiguous name");
+                try appendExplicitLoadRow(alloc, &load_details.writer, name, failure);
+                try load_details.writer.writeByte('\n');
+            },
+        }
+    }
+
+    const failed = binding_plan.len - loaded;
+    const summary = if (failed == 0)
+        try std.fmt.allocPrint(alloc, "{d} requested skill{s} loaded{s}", .{ loaded, if (loaded == 1) "" else "s", load_rows.written() })
+    else
+        try std.fmt.allocPrint(alloc, "Requested skills · {d} loaded · {d} failed (ctrl o for details){s}", .{ loaded, failed, load_rows.written() });
+    errdefer alloc.free(summary);
+    const details = if (load_details.written().len > 0) try load_details.toOwnedSlice() else null;
+    errdefer if (details) |value| alloc.free(value);
 
     const text = try out.toOwnedSlice();
     errdefer alloc.free(text);
     const notice = if (notices.written().len > 0) try notices.toOwnedSlice() else null;
     errdefer if (notice) |value| alloc.free(value);
     const diagnostic_notice = if (diagnostic_notices.written().len > 0) try diagnostic_notices.toOwnedSlice() else null;
-    return .{ .text = text, .notice = notice, .diagnostic_notice = diagnostic_notice };
+    return .{
+        .text = text,
+        .notice = notice,
+        .diagnostic_notice = diagnostic_notice,
+        .load_notice = .{ .topic = "", .tone = if (failed == 0) .neutral else .warning, .body = summary },
+        .load_details = details,
+    };
+}
+
+fn appendExplicitLoadRow(alloc: Allocator, out: *std.Io.Writer, name: []const u8, failure: ?[]const u8) !void {
+    const row = if (failure) |detail|
+        if (detail.len > 0)
+            try std.fmt.allocPrint(alloc, "Could not load {s}: {s}", .{ name, detail })
+        else
+            try std.fmt.allocPrint(alloc, "Could not load {s}", .{name})
+    else
+        try std.fmt.allocPrint(alloc, "Loaded skill {s}", .{name});
+    defer alloc.free(row);
+    const redacted = try tool_result_limits.prepareRedactedOutput(alloc, row);
+    defer alloc.free(redacted);
+    const safe = try text_utils.encodeTerminalSafe(alloc, redacted, context_limits.emergency_ceiling_bytes);
+    defer alloc.free(safe.bytes);
+    try out.writeAll(safe.bytes);
 }
 
 test "explicit skill requests report ambiguous names without selecting a source" {
@@ -263,6 +314,16 @@ test "explicit skill requests report ambiguous names without selecting a source"
     defer section.deinit(alloc);
     try std.testing.expect(std.mem.find(u8, section.text, "ambiguous") != null);
     try std.testing.expect(std.mem.find(u8, section.text, "already loaded") == null);
+    try expectContains(section.load_notice.?.body, "Requested skills · 0 loaded · 1 failed");
+    try expectContains(section.load_notice.?.body, "Could not load review:");
+    try expectNotContains(section.load_notice.?.body, "Loaded skill review");
+    try expectContains(section.load_notice.?.body, "ambiguous name");
+    try expectNotContains(section.load_notice.?.body, "/workspace/review");
+    try expectNotContains(section.load_notice.?.body, "/global/review");
+    try expectContains(section.load_notice.?.body, "ctrl o");
+    try expectContains(section.load_details.?, "/workspace/review");
+    try expectContains(section.load_details.?, "/global/review");
+    try std.testing.expect(section.notice == null);
 }
 
 test "explicit skills include complete instructions beyond the default chunk" {
@@ -280,6 +341,38 @@ test "explicit skills include complete instructions beyond the default chunk" {
     defer section.deinit(alloc);
     try std.testing.expect(std.mem.find(u8, section.text, "BEGIN INSTRUCTIONS") != null);
     try std.testing.expect(std.mem.find(u8, section.text, "COMPLETE TAIL") != null);
+    try std.testing.expectEqualStrings("1 requested skill loaded\n└ Loaded skill workflow", section.load_notice.?.body);
+    try std.testing.expect(section.load_details == null);
+    const bindings = [_]ExplicitBinding{ .{ .name = "workflow", .path = path }, .{ .name = "workflow", .path = path } };
+    var repeated = try buildExplicitPromptSection(alloc, .{ .skills = &skills }, "$workflow $workflow", &bindings, .{}, null);
+    defer repeated.deinit(alloc);
+    try std.testing.expectEqualStrings(section.text, repeated.text);
+    try std.testing.expectEqualStrings(section.load_notice.?.body, repeated.load_notice.?.body);
+    var cancelled = std.atomic.Value(bool).init(true);
+    try std.testing.expectError(error.Cancelled, buildExplicitPromptSection(alloc, .{ .skills = &skills }, "$workflow", &.{}, .{}, &cancelled));
+}
+
+test "explicit load rows keep untrusted names and diagnostics terminal safe" {
+    const alloc = std.testing.allocator;
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    defer out.deinit();
+    try appendExplicitLoadRow(alloc, &out.writer, "workflow\n\x1b[2J", "Failed\r\nAPI_KEY=private-skill-secret");
+    try expectContains(out.written(), "Could not load workflow");
+    try std.testing.expect(text_utils.isTerminalSafe(out.written()));
+    try expectNotContains(out.written(), "\n");
+    try expectNotContains(out.written(), "\x1b");
+    try expectNotContains(out.written(), "private-skill-secret");
+}
+
+test "explicit load summary reports a missing bound skill without success" {
+    const alloc = std.testing.allocator;
+    var section = try buildExplicitPromptSection(alloc, .{ .skills = &.{} }, "Use the selected workflow", &.{.{ .name = "missing-workflow", .path = "/unavailable/workflow" }}, .{}, null);
+    defer section.deinit(alloc);
+    try expectContains(section.load_notice.?.body, "Requested skills · 0 loaded · 1 failed");
+    try expectContains(section.load_notice.?.body, "Could not load missing-workflow");
+    try expectNotContains(section.load_notice.?.body, "/unavailable/workflow");
+    try expectContains(section.load_details.?, "not found at advertised location");
+    try expectNotContains(section.text, "<skill_content");
 }
 
 test "skill resource defaults preserve whole and legacy reads" {
@@ -483,13 +576,15 @@ fn appendExplicitSkill(
     out: *std.Io.Writer,
     notices: *std.Io.Writer,
     diagnostic_notices: *std.Io.Writer.Allocating,
+    load_rows: *std.Io.Writer,
+    load_details: *std.Io.Writer,
     catalog: Catalog,
     name: []const u8,
     location: []const u8,
     limits: context_limits.Values,
     cancel_flag: ?*std.atomic.Value(bool),
     remaining_bytes: usize,
-) !void {
+) !bool {
     const result = try loadByIdentityWithOptions(alloc, catalog, name, location, null, 0, limits, null, .{ .mode = .whole, .cancel_flag = cancel_flag });
     defer freeExecuteResult(alloc, result);
     if (result.modelOutput().len +| 1 > remaining_bytes) return error.SkillContextTooLarge;
@@ -505,6 +600,16 @@ fn appendExplicitSkill(
             if (!std.mem.endsWith(u8, notice, "\n")) try diagnostic_notices.writer.writeByte('\n');
         }
     }
+    const failure: ?[]const u8 = switch (result) {
+        .loaded => |output| if (output.complete) null else "Complete instructions were not loaded.",
+        .failure => |output| output.model_output,
+    };
+    if (failure) |detail| {
+        try appendExplicitLoadRow(alloc, load_details, name, detail);
+        try load_details.writeByte('\n');
+    }
+    try appendExplicitLoadRow(alloc, load_rows, name, if (failure != null) "" else null);
+    return failure == null;
 }
 
 /// Resolves and reads one skill from an already discovered catalog.
@@ -1958,10 +2063,15 @@ test "explicit invocation reports user byte ceilings without partial success" {
     try expectContains(explicit.text, "name=\"skill_chunk_bytes\" action=\"blocked\"");
     try expectNotContains(explicit.text, "TAIL MUST WAIT");
     try std.testing.expect(explicit.notice != null);
+    try expectContains(explicit.load_notice.?.body, "0 loaded · 1 failed");
+    try expectContains(explicit.load_notice.?.body, "Could not load workflow");
+    try expectContains(explicit.load_details.?, "skill_chunk_bytes");
+    try expectNotContains(explicit.load_notice.?.body, "Loaded skill workflow");
 
     var fuzzy = try buildExplicitPromptSection(alloc, catalog, "please improve this workflow", &.{}, limits, null);
     defer fuzzy.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 0), fuzzy.text.len);
+    try std.testing.expect(fuzzy.load_notice == null);
 
     limits.skill_chunk_bytes = .{ .value = .{ .bytes = 0 }, .source = .command_line };
     var zero_chunk = try buildExplicitPromptSection(alloc, catalog, "$workflow", &.{}, limits, null);
