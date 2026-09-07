@@ -1272,6 +1272,7 @@ for (const provider of ["gateway", "codex", "grok"] as const) {
   }, TIMEOUT);
 }
 
+
 for (const provider of ["codex", "grok"] as const) {
   tmuxTest(`provider recovery switches from ${provider} after logout and preserves the fallback on restart`, async () => {
     home = mkdtempSync(join(tmpdir(), `fx-logout-fallback-${provider}-`));
@@ -1403,6 +1404,40 @@ for (const gatewayState of ["absent", "rejected"] as const) {
       grok.stop();
     }
   }, 60_000);
+}
+
+for (const otherProvider of ["codex", "grok"] as const) {
+  tmuxTest(`default logout preserves ${otherProvider} when active fx login becomes unreadable`, async () => {
+    home = mkdtempSync(join(tmpdir(), "fx-logout-active-unreadable-"));
+    stderrPath = join(home, "stderr.log");
+    writeFileSync(stderrPath, "");
+    gateway = startFakeGateway([]);
+    oauth = startFakeOAuth("unused-token");
+    writeSeededFxLogin(home, Date.now() + 3_600_000, oauth.issuerUrl, "team_fixture");
+    if (otherProvider === "codex") writeSeededChatGptLogin(home);
+    else writeSeededGrokLogin(home, "other-grok-token");
+    const otherPath = join(home, ".fx", otherProvider === "codex" ? "chatgpt-auth.json" : "grok-auth.json");
+    const otherCredential = readFileSync(otherPath, "utf8");
+    writeFileSync(join(home, ".fx", "settings.json"), JSON.stringify({ provider: "gateway", credential_source: "fx_login" }));
+    session = await startFx(home, stderrPath, gateway, oauth.issuerUrl, undefined, {
+      AI_GATEWAY_API_KEY: undefined,
+    });
+    await session.waitForComposer(TIMEOUT);
+    await session.sendText("/status");
+    await session.waitForText("auth=fx login", TIMEOUT);
+    const authPath = join(home, ".fx", "auth.json");
+    linkSync(authPath, join(home, "login.alias"));
+    await session.sendText("/logout");
+    const result = await session.waitForPane(
+      (pane) => pane.includes("Signed out of fx.") || pane.includes(`Signed out of ${otherProvider === "codex" ? "Codex" : "Grok"}.`),
+      TIMEOUT,
+    );
+    expect(result).toContain("Signed out of fx.");
+    expect(readFileSync(otherPath, "utf8")).toBe(otherCredential);
+    expect(existsSync(authPath)).toBe(false);
+    expect(gateway.requests).toHaveLength(0);
+    expect(readFileSync(stderrPath, "utf8")).toBe("");
+  }, TIMEOUT);
 }
 
 tmuxTest("provider recovery stays signed out when no replacement is connected", async () => {
@@ -1810,9 +1845,20 @@ tmuxTest(
         expect(response.error.message).toContain("Saved credential storage is unavailable");
         session = await startFx(home, stderrPath, gateway, oauth.issuerUrl, undefined, env);
         await session.waitForComposer(TIMEOUT);
+        await session.sendText("/status");
+        await session.waitForText("auth_help=", TIMEOUT);
+        expect(await session.captureFullScrollback()).toContain(
+          "auth_help=Saved credential storage is unavailable",
+        );
         await selectEnvKeyCredential(session);
         await session.sendText("Use the working Gateway account.");
         await session.waitForText(`GATEWAY_RECOVERED_${provider}`, TIMEOUT);
+        await session.sendText("/status");
+        await session.waitForText("auth=AI_GATEWAY_API_KEY", TIMEOUT);
+        const scrollback = await session.captureFullScrollback();
+        const recoveredStatus = scrollback.slice(scrollback.lastIndexOf("● Status:"));
+        expect(recoveredStatus).toContain("auth=AI_GATEWAY_API_KEY");
+        expect(recoveredStatus).not.toContain("auth_help=");
         expect(readFileSync(stderrPath, "utf8")).toBe("");
         await session.kill();
         session = null;
@@ -2833,6 +2879,155 @@ tmuxTest(
   },
   60_000,
 );
+
+for (const [provider, help] of [
+  ["gateway", "fx needs access to Vercel AI Gateway."],
+  ["codex", "Codex needs a subscription login."],
+  ["grok", "Grok needs a subscription login."],
+] as const) {
+  tmuxTest(`/status keeps ${provider} authentication requirements without credentials`, async () => {
+    home = mkdtempSync(join(tmpdir(), "fx-tui-status-provider-"));
+    stderrPath = join(home, "stderr.log");
+    writeFileSync(stderrPath, "");
+    mkdirSync(join(home, ".fx"));
+    const settingsPath = join(home, ".fx", "settings.json");
+    const settings = JSON.stringify({ provider, models: { [provider]: "test-model" } });
+    writeFileSync(settingsPath, settings);
+    gateway = startFakeGateway([]);
+    session = await startFx(home, stderrPath, gateway, undefined, undefined, {
+      AI_GATEWAY_API_KEY: undefined,
+      FX_MODEL: undefined,
+    });
+    await session.waitForComposer(TIMEOUT);
+    await session.sendText("/status");
+    await session.waitForText("auth_help=", TIMEOUT);
+    const scrollback = await session.captureFullScrollback();
+    expect(scrollback).toContain(`auth_help=${help}`);
+    if (provider !== "gateway") {
+      expect(scrollback).toContain(`model_source=${provider === "codex" ? "Codex" : "Grok"} subscription`);
+      expect(scrollback).not.toContain("auth_help=fx needs access to Vercel AI Gateway");
+    }
+    expect(scrollback).toContain("auth=missing");
+    expect(scrollback).toContain("auth_refreshable=false");
+    expect(await session.captureFullScrollbackEscapes()).toContain(help);
+    expect(gateway.requests).toHaveLength(0);
+    expect(readFileSync(settingsPath, "utf8")).toBe(settings);
+    expect(readFileSync(stderrPath, "utf8")).toBe("");
+  }, TIMEOUT);
+}
+
+for (const [source, help] of [
+  ["vercel_oidc_token", "VERCEL_OIDC_TOKEN is selected but unavailable."],
+  ["stored_key", "A stored API key is selected but unavailable."],
+] as const) {
+  tmuxTest(`/status retains ${source} until another credential is selected`, async () => {
+    home = mkdtempSync(join(tmpdir(), "fx-status-explicit-key-"));
+    stderrPath = join(home, "stderr.log");
+    writeFileSync(stderrPath, "");
+    mkdirSync(join(home, ".fx"));
+    const settingsPath = join(home, ".fx", "settings.json");
+    const settings = JSON.stringify({ provider: "gateway", credential_source: source });
+    writeFileSync(settingsPath, settings);
+    gateway = startFakeGateway([fakeGatewayFinalText("EXPLICIT_KEY_RECOVERED")]);
+    session = await startFx(home, stderrPath, gateway);
+    await session.waitForComposer(TIMEOUT);
+    await session.sendText("/status");
+    await session.waitForText("auth_help=", TIMEOUT);
+    const missing = await session.captureFullScrollback();
+    expect(missing).toContain(`auth_help=${help}`);
+    expect(missing).not.toContain("set AI_GATEWAY_API_KEY");
+    expect(gateway.requests).toHaveLength(0);
+    expect(readFileSync(settingsPath, "utf8")).toBe(settings);
+
+    await selectEnvKeyCredential(session);
+    await session.sendText("Verify the account with a greeting.");
+    await session.waitForText("EXPLICIT_KEY_RECOVERED", TIMEOUT);
+    await session.sendText("/status");
+    await session.waitForText("auth=AI_GATEWAY_API_KEY", TIMEOUT);
+    const scrollback = await session.captureFullScrollback();
+    expect(scrollback.slice(scrollback.lastIndexOf("● Status:"))).not.toContain("auth_help=");
+    expect(JSON.parse(readFileSync(settingsPath, "utf8")).credential_source).toBe("ai_gateway_api_key");
+    expect(gateway.requests).toHaveLength(1);
+    expect(gateway.requests[0].headers.get("authorization")).toBe(`Bearer ${ENV_TOKEN}`);
+    expect(readFileSync(stderrPath, "utf8")).toBe("");
+  }, TIMEOUT);
+}
+
+tmuxTest("/status preserves a missing selected login through explicit key recovery", async () => {
+  home = mkdtempSync(join(tmpdir(), "fx-status-selected-login-"));
+  stderrPath = join(home, "stderr.log");
+  writeFileSync(stderrPath, "");
+  mkdirSync(join(home, ".fx"));
+  const settingsPath = join(home, ".fx", "settings.json");
+  const settings = JSON.stringify({
+    provider: "gateway",
+    models: { gateway: FAKE_GATEWAY_MODEL },
+    credential_source: "fx_login",
+  });
+  writeFileSync(settingsPath, settings);
+  gateway = startFakeGateway([fakeGatewayFinalText("SELECTED_KEY_RECOVERED")]);
+  session = await startFx(home, stderrPath, gateway);
+  await session.waitForComposer(TIMEOUT);
+  await session.sendText("/status");
+  await session.waitForText("auth_help=", TIMEOUT);
+  const missing = await session.captureFullScrollback();
+  expect(missing).toContain("auth_help=fx login is selected but unavailable.");
+  expect(missing).toContain("Run /login to reconnect");
+  expect(missing).not.toContain("or set AI_GATEWAY_API_KEY");
+  expect(await session.captureFullScrollbackEscapes()).toContain("fx login is selected but unavailable.");
+  expect(gateway.requests).toHaveLength(0);
+  expect(readFileSync(settingsPath, "utf8")).toBe(settings);
+
+  writeFileSync(settingsPath, "{broken");
+  await session.sendText("/status");
+  await session.waitForText("Failed to load settings:", TIMEOUT);
+  expect(gateway.requests).toHaveLength(0);
+  writeFileSync(settingsPath, settings);
+
+  await selectEnvKeyCredential(session);
+  await session.sendText("Verify the selected account with a greeting.");
+  await session.waitForText("SELECTED_KEY_RECOVERED", TIMEOUT);
+  expect(JSON.parse(readFileSync(settingsPath, "utf8")).credential_source).toBe("ai_gateway_api_key");
+  writeFileSync(settingsPath, "{broken");
+  await session.sendText("/status");
+  await session.waitForText("auth=AI_GATEWAY_API_KEY", TIMEOUT);
+  const scrollback = await session.captureFullScrollback();
+  const recovered = scrollback.slice(scrollback.lastIndexOf("● Status:"));
+  expect(recovered).not.toContain("auth_help=");
+  expect(readFileSync(settingsPath, "utf8")).toBe("{broken");
+  expect(gateway.requests).toHaveLength(1);
+  expect(readFileSync(stderrPath, "utf8")).toBe("");
+}, TIMEOUT);
+
+for (const provider of ["codex", "grok"] as const) {
+  tmuxTest(`/status retains ${provider} storage failure after unrelated logout`, async () => {
+    home = mkdtempSync(join(tmpdir(), "fx-status-logout-storage-"));
+    stderrPath = join(home, "stderr.log");
+    writeFileSync(stderrPath, "");
+    if (provider === "codex") writeSeededChatGptLogin(home);
+    else writeSeededGrokLogin(home, "unreadable-grok-token");
+    const credentialPath = join(home, ".fx", provider === "codex" ? "chatgpt-auth.json" : "grok-auth.json");
+    linkSync(credentialPath, join(home, "credential.alias"));
+    const settingsPath = join(home, ".fx", "settings.json");
+    const settings = JSON.stringify({ provider, models: { [provider]: "test-model" } });
+    writeFileSync(settingsPath, settings);
+    gateway = startFakeGateway([]);
+    session = await startFx(home, stderrPath, gateway, undefined, undefined, {
+      AI_GATEWAY_API_KEY: undefined,
+      FX_MODEL: undefined,
+    });
+    await session.waitForComposer(TIMEOUT);
+    await session.sendText("/logout vercel");
+    await session.waitForText("No fx login session found.", TIMEOUT);
+    await session.sendText("/status");
+    await session.waitForText("auth_help=", TIMEOUT);
+    expect(await session.captureFullScrollback()).toContain("auth_help=Saved credential storage is unavailable");
+    expect(existsSync(credentialPath)).toBe(true);
+    expect(readFileSync(settingsPath, "utf8")).toBe(settings);
+    expect(gateway.requests).toHaveLength(0);
+    expect(readFileSync(stderrPath, "utf8")).toBe("");
+  }, TIMEOUT);
+}
 
 async function startFxWithoutAuth(
   testHome: string,
@@ -4460,6 +4655,399 @@ for (const scenario of ["replace", "conflict", "invalid-index"] as const) {
   }, 60_000);
 }
 
+test("native assistant messages keep their boundaries and phases through tools and resume", async () => {
+  for (const provider of ["codex", "grok"] as const) {
+    const profile = mkdtempSync(join(tmpdir(), "fx-message-replay-"));
+    const testGateway = startFakeGateway([]);
+    const model = "fixture-model";
+    const message = (id: string, phase: string, text: string) => ({ type: "message", id, role: "assistant", status: "completed", phase, content: [{ type: "output_text", text, annotations: [] }] });
+    const progress = message("msg_progress", "commentary", "Checking the file.");
+    const progressTwo = message("msg_progress_two", "commentary", "Reading its contents.");
+    const answer = message("msg_answer", "final_answer", "The value is 42.");
+    const reasoning = { type: "reasoning", id: "rs_messages", summary: [], encrypted_content: "MESSAGE_REPLAY_CONTEXT" };
+    const call = { type: "function_call", id: "fc_messages", call_id: "call_messages", name: "read_file", arguments: JSON.stringify({ path: "notes.txt" }) };
+    const responses = [fakeGatewaySse([
+      { type: "response.output_item.added", output_index: 0, item: { ...progress, content: [] } },
+      { type: "response.output_text.delta", output_index: 0, content_index: 0, item_id: progress.id, delta: "Checking " },
+      { type: "response.output_text.delta", output_index: 0, content_index: 0, item_id: progress.id, delta: "the file." },
+      { type: "response.output_item.done", output_index: 0, item: progress },
+      { type: "response.output_item.added", output_index: 3, item: { ...call, arguments: "" } },
+      { type: "response.completed", response: { status: "completed", output: [progress, reasoning, progressTwo, call] } },
+    ]), fakeGatewaySse([
+      { type: "response.completed", response: { status: "completed", output: [message("msg_result", "commentary", "Read complete."), answer] } },
+    ]), fakeGatewaySse([
+      { type: "response.completed", response: { status: "completed", output: [message("msg_resume", "final_answer", "Still 42.")] } },
+    ])];
+    const direct = provider === "codex" ? startFakeCodexToolLoop({ responses, model }) : startFakeGrokToolLoop({ responses, model });
+    try {
+      if (provider === "codex") writeSeededChatGptLogin(profile, direct.accessToken);
+      else writeSeededGrokLogin(profile, direct.accessToken);
+      writeFileSync(join(profile, ".fx", "settings.json"), JSON.stringify({ provider, [provider + "_model"]: model }), { mode: 0o600 });
+      writeFileSync(join(profile, "notes.txt"), "42\n");
+      const env = {
+        HOME: profile, AI_GATEWAY_API_KEY: "fixture", VERCEL_OIDC_TOKEN: undefined, FX_MODEL: undefined,
+        FX_DISABLE_KEYCHAIN: "1", FX_AUTO_UPGRADE: "0", FX_SOUND: "0",
+        FX_GATEWAY_BASE_URL: testGateway.baseUrl, FX_E2E_GATEWAY_MODELS_URL: testGateway.baseUrl + "/coding-agent/v1/models",
+        FX_E2E_OPENAI_CODEX_RESPONSES_URL: direct.responsesUrl, FX_E2E_OPENAI_CODEX_MODELS_URL: direct.modelsUrl,
+        FX_E2E_XAI_GROK_RESPONSES_URL: direct.responsesUrl, FX_E2E_XAI_GROK_MODELS_URL: direct.modelsUrl,
+        FX_E2E_XAI_GROK_MODALITIES_URL: "modalitiesUrl" in direct ? direct.modalitiesUrl : undefined,
+      };
+      const first = await runFx(["ask", "--json", "--auto", "Read notes.txt and report the value."], { cwd: profile, env, timeoutMs: TIMEOUT });
+      expect(first.code, first.stdout + first.stderr).toBe(0);
+      const result = JSON.parse(first.stdout);
+      expect(result.output).toBe("Checking the file.\n\nReading its contents.\n\nRead complete.\n\nThe value is 42.");
+      expect(direct.bodies).toHaveLength(2);
+      const resumed = await runFx(["ask", "--json", "--auto", "--resume-id", result.session_id, "What was the value?"], { cwd: profile, env, timeoutMs: TIMEOUT });
+      expect(resumed.code, resumed.stdout + resumed.stderr).toBe(0);
+      expect(JSON.parse(resumed.stdout).output).toBe("Still 42.");
+      expect(direct.bodies).toHaveLength(3);
+      for (const [index, body] of direct.bodies.slice(1).entries()) {
+        const input = JSON.parse(body).input;
+        const messages = input.filter((item: { role?: string }) => item.role === "assistant");
+        expect(messages.map((item: { phase?: string; content: Array<{ text: string }> }) => ({ phase: item.phase, text: item.content.map((part) => part.text).join("") }))).toEqual([
+          { phase: "commentary", text: "Checking the file." },
+          { phase: "commentary", text: "Reading its contents." },
+          ...(index === 1 ? [{ phase: "commentary", text: "Read complete." }, { phase: "final_answer", text: "The value is 42." }] : []),
+        ]);
+        expect(input.filter((item: { type?: string }) => item.type === "reasoning")).toEqual([reasoning]);
+        const calls = input.filter((item: { type?: string }) => item.type === "function_call");
+        const outputs = input.filter((item: { type?: string }) => item.type === "function_call_output");
+        expect(calls.map((item: { call_id: string }) => item.call_id)).toEqual(["call_messages"]);
+        expect(outputs.map((item: { call_id: string }) => item.call_id)).toEqual(["call_messages"]);
+        expect(outputs[0].output).toContain("42");
+      }
+      expect(testGateway.requests).toHaveLength(0);
+    } finally {
+      direct.stop(); testGateway.stop();
+      rmSync(profile, { recursive: true, force: true });
+    }
+  }
+}, 60_000);
+
+test("native reasoning snapshots survive tools and saved resume exactly once", async () => {
+  for (const provider of ["codex", "grok"] as const) for (const shape of ["both", "terminal-only", "enriched", "conflict", "identity-conflict"] as const) {
+    const conflict = shape === "conflict" || shape === "identity-conflict";
+    const profile = mkdtempSync(join(tmpdir(), "fx-reasoning-snapshot-"));
+    const testGateway = startFakeGateway([]);
+    const model = "fixture-model";
+    const signature = "REASONING_SNAPSHOT_CONTEXT";
+    const reasoning = { id: "rs_snapshot", type: "reasoning", summary: [], encrypted_content: signature };
+    const call = { id: "fc_snapshot", type: "function_call", call_id: "call_snapshot", name: "read_file", arguments: JSON.stringify({ path: "notes.txt" }) };
+    const events: object[] = [{ type: "response.output_item.added", output_index: 0, item: { id: reasoning.id, type: reasoning.type, summary: [] } }];
+    if (shape !== "terminal-only") events.push({ type: "response.output_item.done", output_index: 0, item: shape === "enriched" || shape === "identity-conflict" ? { id: reasoning.id, type: reasoning.type, summary: [] } : reasoning });
+    events.push(
+      { type: "response.output_item.added", output_index: 1, item: { ...call, arguments: "" } },
+      { type: "response.function_call_arguments.done", output_index: 1, item_id: call.id, arguments: call.arguments },
+      { type: "response.completed", response: { status: "completed", output: [{ ...reasoning, id: shape === "identity-conflict" ? "rs_replacement" : reasoning.id, encrypted_content: shape === "conflict" ? "CONFLICTING_CONTEXT" : signature }, call] } },
+    );
+    const answer = () => fakeGatewaySse([
+      { type: "response.output_text.delta", delta: "REASONING_SNAPSHOT_OK" },
+      { type: "response.completed", response: { status: "completed" } },
+    ]);
+    const responses = [fakeGatewaySse(events), answer(), answer()];
+    const direct = provider === "codex" ? startFakeCodexToolLoop({ responses, model }) : startFakeGrokToolLoop({ responses, model });
+    try {
+      if (provider === "codex") writeSeededChatGptLogin(profile, direct.accessToken);
+      else writeSeededGrokLogin(profile, direct.accessToken);
+      writeFileSync(join(profile, ".fx", "settings.json"), JSON.stringify({ provider, [provider + "_model"]: model }), { mode: 0o600 });
+      writeFileSync(join(profile, "notes.txt"), "SETTLED_READ_RESULT\n");
+      const env = {
+        HOME: profile, AI_GATEWAY_API_KEY: "fixture", VERCEL_OIDC_TOKEN: undefined, FX_MODEL: undefined,
+        FX_DISABLE_KEYCHAIN: "1", FX_AUTO_UPGRADE: "0", FX_SOUND: "0",
+        FX_GATEWAY_BASE_URL: testGateway.baseUrl,
+        FX_E2E_GATEWAY_MODELS_URL: testGateway.baseUrl + "/coding-agent/v1/models",
+        FX_E2E_OPENAI_CODEX_RESPONSES_URL: direct.responsesUrl, FX_E2E_OPENAI_CODEX_MODELS_URL: direct.modelsUrl,
+        FX_E2E_XAI_GROK_RESPONSES_URL: direct.responsesUrl, FX_E2E_XAI_GROK_MODELS_URL: direct.modelsUrl,
+        FX_E2E_XAI_GROK_MODALITIES_URL: "modalitiesUrl" in direct ? direct.modalitiesUrl : undefined,
+      };
+      const first = await runFx(["ask", "--json", "--auto", "Read notes.txt and summarize it."], { cwd: profile, env, timeoutMs: TIMEOUT });
+      expect(first.code, provider + "/" + shape + ": " + first.stdout + first.stderr).toBe(conflict ? 1 : 0);
+      expect(first.signal).toBeNull();
+      const result = JSON.parse(first.stdout);
+      if (conflict) {
+        expect(result.error).toBe("ResponsesReasoningConflict");
+        expect(result.tool_calls).toEqual([]);
+        expect(direct.bodies).toHaveLength(1);
+        continue;
+      }
+      expect(result.output).toBe("REASONING_SNAPSHOT_OK");
+      expect(first.stderr).toMatch(/^(?:● Reading\x1b\[0m\n)?Reading notes\.txt\n$/);
+      expect(direct.bodies).toHaveLength(2);
+      const saved = readFileSync(join(profile, ".fx", "sessions", result.session_id, "events.jsonl"), "utf8");
+      expect(saved).toContain(signature);
+      const resumed = await runFx(["ask", "--json", "--auto", "--resume-id", result.session_id, "Continue without tools."], { cwd: profile, env, timeoutMs: TIMEOUT });
+      expect(resumed.code, resumed.stdout + resumed.stderr).toBe(0);
+      expect(resumed.stderr).toBe("");
+      expect(direct.bodies).toHaveLength(3);
+      for (const body of direct.bodies.slice(1)) {
+        const input = JSON.parse(body).input as Array<{ type: string; encrypted_content?: string; call_id?: string; output?: string }>;
+        expect(input.filter((item) => item.type === "reasoning").map((item) => item.encrypted_content)).toEqual([signature]);
+        const results = input.filter((item) => item.type === "function_call_output");
+        expect(results).toHaveLength(1);
+        expect(results[0].call_id).toBe(call.call_id);
+        expect(results[0].output).toContain("SETTLED_READ_RESULT");
+      }
+      expect(testGateway.requests).toHaveLength(0);
+    } finally {
+      direct.stop(); testGateway.stop();
+      rmSync(profile, { recursive: true, force: true });
+    }
+  }
+}, 60_000);
+
+test("native final snapshots preserve completed items and reject conflicting kinds", async () => {
+  for (const provider of ["codex", "grok"] as const) for (const shape of ["null", "empty", "kind-at-item", "kind-at-terminal"] as const) {
+    const conflict = shape.startsWith("kind-");
+    const profile = mkdtempSync(join(tmpdir(), "fx-output-consistency-"));
+    const gateway = startFakeGateway([]);
+    const model = "fixture-model";
+    const reasoning = { type: "reasoning", id: "rs_snapshot", summary: [], encrypted_content: "SNAPSHOT_REASONING" };
+    const message = (id: string, text: string, phase: string) => ({ type: "message", id, role: "assistant", status: "completed", phase, content: [{ type: "output_text", text, annotations: [] }] });
+    const progress = message("msg_progress", "Inspecting.", "commentary");
+    const call = { type: "function_call", id: "fc_snapshot", call_id: "call_snapshot", name: "read_file", arguments: JSON.stringify({ path: "notes.txt" }) };
+    const replacement = message("msg_replacement", "CONFLICTING_TEXT", "final_answer");
+    const events: object[] = [
+      { type: "response.output_item.done", output_index: 0, item: reasoning },
+      { type: "response.output_item.done", output_index: 1, item: progress },
+      { type: "response.output_item.added", output_index: 2, item: { ...call, arguments: "" } },
+      { type: "response.function_call_arguments.done", output_index: 2, item_id: call.id, arguments: call.arguments },
+      { type: "response.output_item.done", output_index: 2, item: shape === "kind-at-item" ? replacement : call },
+      { type: "response.completed", response: { status: "completed", output: shape === "kind-at-terminal" ? [reasoning, progress, replacement] : shape === "empty" ? [] : null } },
+    ];
+    const answer = (text: string) => fakeGatewaySse([
+      { type: "response.output_item.done", output_index: 0, item: message("msg_answer", text, "final_answer") },
+      { type: "response.completed", response: { status: "completed", output: null } },
+    ]);
+    const responses = [fakeGatewaySse(events), answer("SNAPSHOT_OK"), answer("RESUMED_OK")];
+    const direct = provider === "codex" ? startFakeCodexToolLoop({ model, responses }) : startFakeGrokToolLoop({ model, responses });
+    try {
+      if (provider === "codex") writeSeededChatGptLogin(profile, direct.accessToken);
+      else writeSeededGrokLogin(profile, direct.accessToken);
+      writeFileSync(join(profile, ".fx", "settings.json"), JSON.stringify({ provider, [provider + "_model"]: model }), { mode: 0o600 });
+      writeFileSync(join(profile, "notes.txt"), "SNAPSHOT_READ_RESULT\n");
+      const tracePath = join(profile, "trace.log");
+      const env = {
+        HOME: profile, AI_GATEWAY_API_KEY: "fixture", VERCEL_OIDC_TOKEN: undefined, FX_MODEL: undefined,
+        FX_DISABLE_KEYCHAIN: "1", FX_AUTO_UPGRADE: "0", FX_SOUND: "0", FX_TRACE_LOG: tracePath, FX_TRACE_SCOPES: "agent,gateway,tool",
+        FX_GATEWAY_BASE_URL: gateway.baseUrl, FX_E2E_GATEWAY_MODELS_URL: gateway.baseUrl + "/coding-agent/v1/models",
+        FX_E2E_OPENAI_CODEX_RESPONSES_URL: direct.responsesUrl, FX_E2E_OPENAI_CODEX_MODELS_URL: direct.modelsUrl,
+        FX_E2E_XAI_GROK_RESPONSES_URL: direct.responsesUrl, FX_E2E_XAI_GROK_MODELS_URL: direct.modelsUrl,
+        FX_E2E_XAI_GROK_MODALITIES_URL: "modalitiesUrl" in direct ? direct.modalitiesUrl : undefined,
+      };
+      const first = await runFx(["ask", "--json", "--auto", "Read notes.txt and report the result."], { cwd: profile, env, timeoutMs: TIMEOUT });
+      expect(first.code, provider + "/" + shape + ": " + first.stdout + first.stderr).toBe(conflict ? 1 : 0);
+      expect(first.signal).toBeNull();
+      const result = JSON.parse(first.stdout);
+      expect(direct.bodies).toHaveLength(conflict ? 1 : 2);
+      const trace = readFileSync(tracePath, "utf8");
+      if (conflict) {
+        expect(result.error).toBe("ResponsesOutputItemConflict");
+        expect(result.tool_calls).toEqual([]);
+        expect(trace).not.toContain("after_tool_execution");
+        expect(result.output).not.toContain("CONFLICTING_TEXT");
+      } else {
+        expect(result.output).toBe("Inspecting.\n\nSNAPSHOT_OK");
+        expect(result.tool_calls).toEqual([{ name: "read_file", status: "success" }]);
+        expect(trace).toContain("after_tool_execution");
+      }
+      const detail = await runFx(["session", "--json", "--id", result.session_id], { cwd: profile, env });
+      expect(detail.code).toBe(0);
+      const history = JSON.parse(detail.stdout).history;
+      expect(history).toHaveLength(1);
+      expect(history[0].kind).toBe(conflict ? "interrupted" : "assistant");
+      expect(history[0].execution?.tool_steps ?? []).toHaveLength(conflict ? 0 : 1);
+      const resumed = await runFx(["ask", "--json", "--auto", "--resume-id", result.session_id, "Continue without tools."], { cwd: profile, env, timeoutMs: TIMEOUT });
+      expect(resumed.code, resumed.stdout + resumed.stderr).toBe(0);
+      expect(resumed.stderr).toBe("");
+      expect(JSON.parse(resumed.stdout).output).toBe(conflict ? "SNAPSHOT_OK" : "RESUMED_OK");
+      expect(direct.bodies).toHaveLength(conflict ? 2 : 3);
+      for (const body of direct.bodies.slice(1)) {
+        const input = JSON.parse(body).input;
+        const calls = input.filter((item: { type?: string }) => item.type === "function_call");
+        const outputs = input.filter((item: { type?: string }) => item.type === "function_call_output");
+        expect(calls.map((item: { call_id: string }) => item.call_id)).toEqual(conflict ? [] : ["call_snapshot"]);
+        expect(outputs).toHaveLength(conflict ? 0 : 1);
+        if (!conflict) {
+          expect(outputs[0].output).toContain("SNAPSHOT_READ_RESULT");
+          expect(input.filter((item: { type?: string }) => item.type === "reasoning")).toEqual([reasoning]);
+          expect(input.find((item: { phase?: string }) => item.phase === "commentary").content[0].text).toBe("Inspecting.");
+        }
+      }
+      expect(gateway.requests).toHaveLength(0);
+    } finally {
+      direct.stop(); gateway.stop();
+      rmSync(profile, { recursive: true, force: true });
+    }
+  }
+}, 60_000);
+
+test("native discarded prose keeps tool continuation and saved resume valid", async () => {
+  for (const provider of ["codex", "grok"] as const) for (const mismatch of [false, true]) for (const multiple of [false, true]) {
+    const profile = mkdtempSync(join(tmpdir(), "fx-discarded-prose-"));
+    const gateway = startFakeGateway([]);
+    const model = "fixture-model";
+    const prose = mismatch ? "我会先检查锁文件和依赖清单。" : "I will read the notes next.";
+    const reasoning = { type: "reasoning", id: "rs_filtered", summary: [], encrypted_content: "RETAINED_REASONING" };
+    const message = (id: string, text: string, phase?: string) => ({ type: "message", id, role: "assistant", status: "completed", ...(phase ? { phase } : {}), content: [{ type: "output_text", text, annotations: [] }] });
+    const messages = multiple ? [message("msg_first", prose), message("msg_second", prose)] : [message("msg_first", prose, "commentary")];
+    const call = { type: "function_call", id: "fc_filtered", call_id: "call_filtered", name: "read_file", arguments: JSON.stringify({ path: "notes.txt" }) };
+    const toolIndex = messages.length + 1;
+    const answer = (text: string) => fakeGatewaySse([
+      { type: "response.output_item.done", output_index: 0, item: message("msg_answer", text) },
+      { type: "response.completed", response: { status: "completed", output: null } },
+    ]);
+    const responses = [fakeGatewaySse([
+      { type: "response.output_item.done", output_index: 0, item: reasoning },
+      ...messages.map((item, index) => ({ type: "response.output_item.done", output_index: index + 1, item })),
+      { type: "response.output_item.added", output_index: toolIndex, item: { ...call, arguments: "" } },
+      { type: "response.function_call_arguments.done", output_index: toolIndex, item_id: call.id, arguments: call.arguments },
+      { type: "response.output_item.done", output_index: toolIndex, item: call },
+      { type: "response.completed", response: { status: "completed", output: [reasoning, ...messages, call] } },
+    ]), answer("The notes were checked."), answer("The saved session remains usable.")];
+    const direct = provider === "codex" ? startFakeCodexToolLoop({ model, responses }) : startFakeGrokToolLoop({ model, responses });
+    try {
+      if (provider === "codex") writeSeededChatGptLogin(profile, direct.accessToken);
+      else writeSeededGrokLogin(profile, direct.accessToken);
+      writeFileSync(join(profile, ".fx", "settings.json"), JSON.stringify({ provider, [provider + "_model"]: model }), { mode: 0o600 });
+      writeFileSync(join(profile, "notes.txt"), "FILTERED_READ_RESULT\n");
+      const tracePath = join(profile, "trace.log");
+      const env = {
+        HOME: profile, AI_GATEWAY_API_KEY: "fixture", VERCEL_OIDC_TOKEN: undefined, FX_MODEL: undefined,
+        FX_DISABLE_KEYCHAIN: "1", FX_AUTO_UPGRADE: "0", FX_SOUND: "0", FX_TRACE_LOG: tracePath, FX_TRACE_SCOPES: "agent,gateway,tool",
+        FX_GATEWAY_BASE_URL: gateway.baseUrl, FX_E2E_GATEWAY_MODELS_URL: gateway.baseUrl + "/coding-agent/v1/models",
+        FX_E2E_OPENAI_CODEX_RESPONSES_URL: direct.responsesUrl, FX_E2E_OPENAI_CODEX_MODELS_URL: direct.modelsUrl,
+        FX_E2E_XAI_GROK_RESPONSES_URL: direct.responsesUrl, FX_E2E_XAI_GROK_MODELS_URL: direct.modelsUrl,
+        FX_E2E_XAI_GROK_MODALITIES_URL: "modalitiesUrl" in direct ? direct.modalitiesUrl : undefined,
+      };
+      const first = await runFx(["ask", "--json", "--auto", "Please read the notes.txt file and explain the result."], { cwd: profile, env, timeoutMs: TIMEOUT });
+      expect(first.code, provider + "/" + mismatch + "/" + multiple + ": " + first.stdout + first.stderr).toBe(0);
+      expect(first.signal).toBeNull();
+      const result = JSON.parse(first.stdout);
+      expect(result.tool_calls).toEqual([{ name: "read_file", status: "success" }]);
+      expect(result.output).toBe(mismatch ? "The notes were checked." : messages.map(() => prose).join("\n\n") + "\n\nThe notes were checked.");
+      expect(direct.bodies).toHaveLength(2);
+      const trace = readFileSync(tracePath, "utf8");
+      expect(trace.includes("prose_discarded=true")).toBe(mismatch);
+      const detail = await runFx(["session", "--json", "--id", result.session_id], { cwd: profile, env });
+      expect(detail.code).toBe(0);
+      expect(JSON.parse(detail.stdout).history).toHaveLength(1);
+      const resumed = await runFx(["ask", "--json", "--auto", "--resume-id", result.session_id, "Please confirm the saved result without tools."], { cwd: profile, env, timeoutMs: TIMEOUT });
+      expect(resumed.code, resumed.stdout + resumed.stderr).toBe(0);
+      expect(resumed.stderr).toBe("");
+      expect(JSON.parse(resumed.stdout).tool_calls).toEqual([]);
+      expect(JSON.parse(resumed.stdout).output).toBe("The saved session remains usable.");
+      expect(direct.bodies).toHaveLength(3);
+      for (const body of direct.bodies.slice(1)) {
+        const input = JSON.parse(body).input;
+        expect(input.filter((item: { type?: string }) => item.type === "reasoning")).toEqual([reasoning]);
+        expect(input.filter((item: { type?: string }) => item.type === "function_call").map((item: { call_id: string }) => item.call_id)).toEqual([call.call_id]);
+        expect(input.filter((item: { type?: string }) => item.type === "function_call_output")).toHaveLength(1);
+        expect(body).toContain("FILTERED_READ_RESULT");
+        if (mismatch) expect(body).not.toContain(prose);
+      }
+      expect(gateway.requests).toHaveLength(0);
+    } finally {
+      direct.stop(); gateway.stop();
+      rmSync(profile, { recursive: true, force: true });
+    }
+  }
+}, 60_000);
+
+test("native terminal outcomes preserve recovery and incomplete warnings", async () => {
+  for (const provider of ["gateway", "codex", "grok"] as const) for (const mode of ["transient", "partial", "tool", "rejected", "rejected-partial", "length", "length-with-status"]) {
+    const native = provider !== "gateway";
+    if (!native && mode !== "transient") continue;
+    const profile = mkdtempSync(join(tmpdir(), "fx-native-outcomes-"));
+    const model = native ? "fixture-model" : FAKE_GATEWAY_MODEL;
+    const limited = mode.startsWith("length");
+    const rejected = mode.startsWith("rejected");
+    const event = (text: string) => native
+      ? { type: "response.output_text.delta", output_index: 0, content_index: 0, delta: text }
+      : { type: "text-delta", id: "answer", delta: text };
+    const terminal = native
+      ? { type: "response.completed", response: { id: "resp_ok", status: "completed", output: [], usage: { input_tokens: 1, output_tokens: 1 } } }
+      : { type: "finish", finishReason: { unified: "stop" } };
+    const events: object[] = [];
+    if (mode === "partial") events.push(event("DISCARDED_PREVIEW"));
+    if (mode === "rejected-partial") events.push(event("REJECTED_PARTIAL"));
+    if (limited) events.push(event("LIMITED_ANSWER"));
+    if (mode === "tool" || rejected) {
+      writeFileSync(join(profile, "read-me.txt"), "must not be read by the failed attempt");
+      events.push({ type: "response.output_item.added", output_index: 1, item: { type: "function_call", id: "fc_failed", call_id: "failed", name: "read_file", arguments: JSON.stringify({ path: "read-me.txt" }) } });
+    }
+    const failure = { code: rejected ? "invalid_prompt" : "server_error", message: rejected ? "OUTCOME_REJECTED" : "OUTCOME_RETRY" };
+    if (limited) events.push({ type: "response.incomplete", response: { id: "resp_limited", ...(mode === "length-with-status" ? { status: "incomplete" } : {}), output: [], incomplete_details: { reason: "max_output_tokens" } } });
+    else if (native) events.push({ type: "response.failed", response: { id: "resp_failed", status: "failed", error: failure, output: [], usage: null } });
+    else events.push({ type: "error", error: failure }, { type: "finish", finishReason: { unified: "error" } });
+    const replies = [fakeGatewaySse(events), fakeGatewaySse([event("RECOVERED_OK"), terminal])];
+    const gateway = startFakeGateway(native ? [] : replies);
+    const direct = provider === "codex" ? startFakeCodexToolLoop({ model, responses: replies })
+      : provider === "grok" ? startFakeGrokToolLoop({ model, responses: replies }) : null;
+    try {
+      if (provider === "codex") writeSeededChatGptLogin(profile, direct!.accessToken);
+      else if (provider === "grok") writeSeededGrokLogin(profile, direct!.accessToken);
+      mkdirSync(join(profile, ".fx"), { recursive: true });
+      writeFileSync(join(profile, ".fx", "settings.json"), JSON.stringify({ provider, [native ? provider + "_model" : "model"]: model }));
+      const env = {
+        HOME: profile, AI_GATEWAY_API_KEY: "fixture", VERCEL_OIDC_TOKEN: undefined, FX_MODEL: native ? undefined : model,
+        FX_DISABLE_KEYCHAIN: "1", FX_AUTO_UPGRADE: "0", FX_SOUND: "0",
+        FX_GATEWAY_BASE_URL: gateway.baseUrl, FX_E2E_GATEWAY_MODELS_URL: gateway.baseUrl + "/coding-agent/v1/models",
+        FX_GATEWAY_CHAT_URL: gateway.chatUrl, FX_E2E_GATEWAY_CHAT_URL: gateway.chatUrl,
+        FX_E2E_OPENAI_CODEX_RESPONSES_URL: direct?.responsesUrl, FX_E2E_OPENAI_CODEX_MODELS_URL: direct?.modelsUrl,
+        FX_E2E_XAI_GROK_RESPONSES_URL: direct?.responsesUrl, FX_E2E_XAI_GROK_MODELS_URL: direct?.modelsUrl,
+        FX_E2E_XAI_GROK_MODALITIES_URL: direct && "modalitiesUrl" in direct ? direct.modalitiesUrl : undefined,
+      };
+      const result = await runFx(["ask", "--json", "--auto", "Report the supplied answer without using tools."], { cwd: profile, env, timeoutMs: TIMEOUT });
+      expect(result.signal).toBeNull();
+      expect(result.code, result.stdout + result.stderr).toBe(rejected ? 1 : 0);
+      expect(direct ? direct.bodies.length : gateway.requests.length).toBe(rejected || limited ? 1 : 2);
+      const output = JSON.parse(result.stdout);
+      expect(output.tool_calls).toEqual([]);
+      if (native && !limited) {
+        const usage = JSON.parse(readFileSync(join(profile, ".fx", "sessions", output.session_id, "usage-v2.json"), "utf8"));
+        expect(usage.snapshot.billing).toBe("incomplete");
+      }
+      if (rejected) {
+        expect(result.stderr).toContain("invalid_prompt: OUTCOME_REJECTED");
+        expect(result.stderr).not.toContain("retrying");
+        if (mode === "rejected-partial") {
+          const detail = await runFx(["session", "--json", "--id", output.session_id], { cwd: profile, env });
+          expect(detail.code).toBe(0);
+          const history = JSON.parse(detail.stdout).history;
+          expect(history).toHaveLength(1);
+          expect(history[0].kind).toBe("interrupted");
+          expect(history[0].assistant).toBe("REJECTED_PARTIAL");
+          expect(history[0].execution?.tool_steps ?? []).toEqual([]);
+          expect(history[0].tool_call).toBeNull();
+          expect(history[0].completed_tool_names).toEqual([]);
+          const resumed = await runFx(["ask", "--json", "--auto", "--resume-id", output.session_id, "Continue from the saved partial answer without using tools."], { cwd: profile, env, timeoutMs: TIMEOUT });
+          expect(resumed.code, resumed.stdout + resumed.stderr).toBe(0);
+          expect(JSON.parse(resumed.stdout).output).toBe("RECOVERED_OK");
+          expect(direct!.bodies).toHaveLength(2);
+          const input = JSON.parse(direct!.bodies[1]).input;
+          expect(JSON.stringify(input)).toContain("REJECTED_PARTIAL");
+          expect(input.filter((item: { type?: string }) => item.type === "function_call")).toEqual([]);
+        }
+      } else {
+        expect(output.output).toBe(limited ? "LIMITED_ANSWER" : "RECOVERED_OK");
+        expect(result.stderr).toContain(limited ? "response hit provider length limit" : "OUTCOME_RETRY");
+        const detail = await runFx(["session", "--json", "--id", output.session_id], { cwd: profile, env });
+        expect(detail.code).toBe(0);
+        const history = JSON.parse(detail.stdout).history;
+        expect(history).toHaveLength(1);
+        expect(history[0].assistant).toBe(limited ? "LIMITED_ANSWER" : "RECOVERED_OK");
+        expect(history[0].execution.tool_steps).toEqual([]);
+        if (mode === "partial") expect(direct!.bodies[1]).not.toContain("DISCARDED_PREVIEW");
+      }
+      if (native) expect(gateway.requests).toHaveLength(0);
+    } finally {
+      direct?.stop();
+      gateway.stop();
+      rmSync(profile, { recursive: true, force: true });
+    }
+  }
+}, 60_000);
+
 test("provider SSE framing preserves saved and resumed answers", async () => {
   const prefix = "CONTROL_PREFIX\n", answer = "EXPECTED_FINAL";
   for (const provider of ["gateway", "codex", "grok"] as const) for (const mode of ["no-space", "multiline", "invalid"]) {
@@ -4539,6 +5127,7 @@ test("provider SSE framing preserves saved and resumed answers", async () => {
 
 test("direct providers reconcile final text before saving or releasing tools", async () => {
   const prefix = "COMMENTARY_ITEM\n", answer = "FINAL_ANSWER_ITEM";
+  const display = prefix + "\n\n" + answer;
   for (const provider of ["codex", "grok"] as const) for (const mode of ["streamed", "final-only", "mixed", "terminal-only", "conflict"]) {
     const profile = mkdtempSync(join(tmpdir(), "fx-response-text-"));
     const model = "fixture-model";
@@ -4594,17 +5183,17 @@ test("direct providers reconcile final text before saving or releasing tools", a
       } else {
         expect(first.code, first.stdout + first.stderr).toBe(0);
         expect(first.stderr).toBe("");
-        expect(output.output).toBe(prefix + answer);
-        expect(output.final_output).toBe(prefix + answer);
+        expect(output.output).toBe(display);
+        expect(output.final_output).toBe(display);
         const detail = await runFx(["session", "--json", "--id", output.session_id], { cwd: profile, env });
         expect(detail.code).toBe(0);
-        expect(JSON.parse(detail.stdout).history[0].assistant).toBe(prefix + answer);
+        expect(JSON.parse(detail.stdout).history[0].assistant).toBe(display);
         const resumed = await runFx(["ask", "--json", "--auto", "--resume-id", output.session_id, "Recall the prior answer."], { cwd: profile, env, timeoutMs: TIMEOUT });
         expect(resumed.code, resumed.stdout + resumed.stderr).toBe(0);
         expect(resumed.stderr).toBe("");
         expect(direct.bodies).toHaveLength(2);
         const replay = JSON.parse(direct.bodies[1]).input.filter((entry: { role?: string }) => entry.role === "assistant");
-        expect(replay.some((entry: { content: Array<{ text?: string }> }) => entry.content.some(part => part.text === prefix + answer))).toBe(true);
+        expect(replay.map((entry: { content: Array<{ text?: string }> }) => entry.content.map(part => part.text).join(""))).toEqual([prefix, answer]);
       }
       expect(gateway.requests).toHaveLength(0);
     } finally {
@@ -5858,6 +6447,132 @@ tmuxTest(
   },
   TIMEOUT,
 );
+
+tmuxTest(
+  "manual compaction refreshes the selected login without losing the draft",
+  async () => {
+    home = mkdtempSync(join(tmpdir(), "fx-compact-auth-refresh-"));
+    stderrPath = join(home, "stderr.log");
+    const tracePath = join(home, "trace.log");
+    writeFileSync(stderrPath, "");
+    gateway = startFakeGateway([
+      fakeGatewayFinalText("COMPACT_AUTH_FIRST_REPLY"),
+      fakeGatewayFinalText("COMPACT_AUTH_SECOND_REPLY"),
+      fakeGatewayFinalText("The conversation established COMPACT_AUTH_FIRST and COMPACT_AUTH_SECOND."),
+      fakeGatewayFinalText("COMPACT_AUTH_CONTINUED"),
+    ]);
+    oauth = startFakeOAuth(ACQUIRED_LOGIN_TOKEN, undefined, 3600, Number.POSITIVE_INFINITY, { tokenDelayMs: 2_000 });
+    const expiresAt = Date.now() + 80_000;
+    writeSeededFxLogin(home, expiresAt, oauth.issuerUrl, "team_123");
+    session = await startFx(home, stderrPath, gateway, oauth.issuerUrl, tracePath, {
+      AI_GATEWAY_API_KEY: undefined,
+      FX_TRACE_SCOPES: "auth,input,worker,context_compaction,session",
+    }, home);
+    await session.waitForComposer(TIMEOUT);
+    await session.sendText("Remember COMPACT_AUTH_FIRST.");
+    await session.waitForText("COMPACT_AUTH_FIRST_REPLY", TIMEOUT);
+    await session.sendText("Remember COMPACT_AUTH_SECOND.");
+    await session.waitForText("COMPACT_AUTH_SECOND_REPLY", TIMEOUT);
+    expect(gateway.requests).toHaveLength(2);
+    expect(oauth.requests.filter((request) => request.path === "/oauth/token")).toHaveLength(0);
+    await Bun.sleep(Math.max(0, expiresAt - 60_000 + 100 - Date.now()));
+    await session.sendText("/status");
+    await session.waitForText("auth_expired=true", TIMEOUT);
+    await session.sendText("/compact");
+    await waitForTrace(tracePath, "manual_compaction_auth_pending", TIMEOUT);
+    expect(gateway.requests).toHaveLength(2);
+    await session.sendText("/compact");
+    await session.sendLiteral("PRESERVE_COMPACTION_DRAFT");
+    await session.waitForText("PRESERVE_COMPACTION_DRAFT", 1_000);
+    await session.waitForText("Context compacted.", TIMEOUT);
+    expect(await session.captureFullScrollback()).toContain("PRESERVE_COMPACTION_DRAFT");
+    expect(oauth.requests.filter((request) => request.grantType === "refresh_token")).toHaveLength(1);
+    expect(gateway.requests).toHaveLength(3);
+    expect(gateway.requests[2].headers.get("authorization")).toBe(`Bearer ${ACQUIRED_LOGIN_TOKEN}`);
+    expect(JSON.parse(gateway.requests[2].body).tools ?? []).toHaveLength(0);
+    const sessionIds = readdirSync(join(home, ".fx", "sessions")).filter((id) => existsSync(join(home!, ".fx", "sessions", id, "session.json")));
+    expect(sessionIds).toHaveLength(1);
+    const historyPath = join(home, ".fx", "sessions", sessionIds[0], "events.jsonl");
+    const records = readFileSync(historyPath, "utf8").trim().split("\n").map((line) => JSON.parse(line));
+    expect(records.filter((record) => record.event.context_checkpoint)).toHaveLength(1);
+    await session.sendKeys("C-u");
+    await session.sendText("Continue after the manual compaction.");
+    await session.waitForText("COMPACT_AUTH_CONTINUED", TIMEOUT);
+    expect(gateway.requests).toHaveLength(4);
+    await session.sendText("/quit");
+    await session.waitForSessionEnd(TIMEOUT);
+    expect(readFileSync(stderrPath, "utf8")).toBe("");
+    const trace = readFileSync(tracePath, "utf8");
+    for (const secret of [LOGIN_TOKEN, ACQUIRED_LOGIN_TOKEN, "seeded-refresh-token", "acquired-refresh-token"]) expect(trace).not.toContain(secret);
+  },
+  90_000,
+);
+
+for (const outcome of ["failure", "cancel"] as const) {
+  tmuxTest(`manual compaction auth ${outcome} preserves the session and accepts a later prompt`, async () => {
+    home = mkdtempSync(join(tmpdir(), `fx-compact-auth-${outcome}-`));
+    stderrPath = join(home, "stderr.log");
+    const tracePath = join(home, "trace.log");
+    writeFileSync(stderrPath, "");
+    gateway = startFakeGateway([
+      fakeGatewayFinalText("AUTH_BOUNDARY_FIRST_REPLY"),
+      fakeGatewayFinalText("AUTH_BOUNDARY_SECOND_REPLY"),
+      fakeGatewayFinalText("AUTH_BOUNDARY_RECOVERED"),
+    ]);
+    oauth = startFakeOAuth(outcome === "failure" ? null : ACQUIRED_LOGIN_TOKEN, undefined, 3600, Number.POSITIVE_INFINITY, {
+      tokenDelayMs: outcome === "cancel" ? 10_000 : 1_000,
+    });
+    const expiresAt = Date.now() + 80_000;
+    writeSeededFxLogin(home, expiresAt, oauth.issuerUrl, "team_123");
+    writeFileSync(join(home, ".fx", "settings.json"), JSON.stringify({ credential_source: "fx_login" }));
+    session = await startFx(home, stderrPath, gateway, oauth.issuerUrl, tracePath, {
+      FX_TRACE_SCOPES: "auth,input,worker,context_compaction,session",
+    }, home);
+    await session.waitForComposer(TIMEOUT);
+    await session.sendText("Remember AUTH_BOUNDARY_FIRST.");
+    await session.waitForText("AUTH_BOUNDARY_FIRST_REPLY", TIMEOUT);
+    await session.sendText("Remember AUTH_BOUNDARY_SECOND.");
+    await session.waitForText("AUTH_BOUNDARY_SECOND_REPLY", TIMEOUT);
+    const sessionIds = readdirSync(join(home, ".fx", "sessions")).filter((id) => existsSync(join(home!, ".fx", "sessions", id, "session.json")));
+    expect(sessionIds).toHaveLength(1);
+    const historyPath = join(home, ".fx", "sessions", sessionIds[0], "events.jsonl");
+    const before = readFileSync(historyPath, "utf8");
+    expect(gateway.requests).toHaveLength(2);
+    expect(gateway.requests[0].headers.get("authorization")).toBe(`Bearer ${LOGIN_TOKEN}`);
+    expect(oauth.requests.filter((request) => request.path === "/oauth/token")).toHaveLength(0);
+    await Bun.sleep(Math.max(0, expiresAt - 60_000 + 100 - Date.now()));
+    await session.sendText("/compact");
+    await waitForTrace(tracePath, "manual_compaction_auth_pending", TIMEOUT);
+    await session.sendLiteral("DRAFT_DURING_AUTH_BOUNDARY");
+    await session.waitForText("DRAFT_DURING_AUTH_BOUNDARY", 1_000);
+    if (outcome === "cancel") {
+      await session.sendKeys("C-c");
+      await session.waitForText("Context compaction cancelled.", 3_000);
+    } else {
+      await session.waitForText("Your conversation is unchanged.", TIMEOUT);
+      const scrollback = await session.captureFullScrollback();
+      expect(scrollback).toContain("/compact again");
+      expect(scrollback).not.toContain("Your prompt is saved.");
+    }
+    expect(await session.captureFullScrollback()).toContain("DRAFT_DURING_AUTH_BOUNDARY");
+    expect(readFileSync(historyPath, "utf8")).toBe(before);
+    expect(gateway.requests).toHaveLength(2);
+    await session.sendKeys("C-u");
+    await selectEnvKeyCredential(session);
+    expect(gateway.requests).toHaveLength(2);
+    await session.sendText("Continue the original conversation without tools.");
+    await session.waitForText("AUTH_BOUNDARY_RECOVERED", TIMEOUT);
+    expect(gateway.requests).toHaveLength(3);
+    expect(gateway.requests[2].headers.get("authorization")).toBe(`Bearer ${ENV_TOKEN}`);
+    expect(readFileSync(historyPath, "utf8")).not.toContain('"context_checkpoint"');
+    await session.sendText("/quit");
+    await session.waitForSessionEnd(TIMEOUT);
+    expect(readFileSync(stderrPath, "utf8")).toBe("");
+    const trace = readFileSync(tracePath, "utf8");
+    expect(trace).not.toContain("context_compaction_enqueue");
+    for (const secret of [LOGIN_TOKEN, ACQUIRED_LOGIN_TOKEN, ENV_TOKEN, "seeded-refresh-token", "acquired-refresh-token"]) expect(trace).not.toContain(secret);
+  }, 90_000);
+}
 
 tmuxTest(
   "expired selected login preserves the prompt and avoids Gateway before explicit recovery",
