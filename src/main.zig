@@ -3,7 +3,7 @@ const builtin = @import("builtin");
 const build_options = @import("build_options");
 const io_mod = @import("core/shared/io.zig");
 
-pub const version = "0.0.7";
+pub const version = "0.0.8";
 
 const app_lifecycle = @import("core/app/app_lifecycle.zig");
 const provider_runtime = @import("core/app/provider_runtime.zig");
@@ -848,6 +848,9 @@ const App = struct {
 
         self.releaseTerminal();
         if (self.worker_thread) |thread| thread.join();
+        WorkerAppRuntime.settleFinishedPromptsForShutdown(self) catch |err| {
+            debug_trace.logf("session", "shutdown finished prompt persistence failed err={s}", .{@errorName(err)});
+        };
         self.terminal_client.deinit();
         self.managed_executions.deinit();
         self.model_cache.deinit();
@@ -1473,6 +1476,10 @@ const App = struct {
             .recovery_source_already_presented = recovery_checkpoint != null,
             .user_prompt_already_presented = user_prompt_already_presented,
         };
+    }
+
+    pub fn request_context_compaction(self: *App) !void {
+        try InputSubmitRuntime.request_context_compaction(self);
     }
 
     pub fn enqueueContextCompaction(self: *App) !bool {
@@ -4155,6 +4162,7 @@ test {
     _ = @import("core/app/app_commands.zig");
     _ = @import("core/app/app_entry_runtime.zig");
     _ = @import("core/app/app_input_runtime.zig");
+    _ = input_submit_runtime;
     _ = @import("core/app/app_lifecycle.zig");
     _ = @import("core/app/model_cache_runtime.zig");
     _ = @import("core/app/usage_dashboard_runtime.zig");
@@ -4256,6 +4264,7 @@ test {
     _ = @import("core/subagent/managed_owner.zig");
     _ = @import("core/subagent/resume_admission.zig");
     _ = @import("core/subagent/execution.zig");
+    _ = @import("core/subagent/agent_adapter.zig");
     _ = @import("core/subagent/tool_host.zig");
     _ = @import("core/subagent/authority.zig");
     _ = @import("core/subagent/approval_registry.zig");

@@ -890,7 +890,6 @@ pub fn Runtime(comptime App: type) type {
                     appAccessScope(app),
                 .interactive = true,
                 .permission_mode = permission_snapshot.mode,
-                .tracker = &app.change_tracker,
             }, arena, messages);
         }
 
@@ -1097,7 +1096,7 @@ pub fn Runtime(comptime App: type) type {
                 job.model,
                 capabilities,
             );
-            const window = try agent_runtime.prepareRetainedCompactionWindow(arena, job.history, null, capabilities, source_tokens);
+            const window = try agent_runtime.prepareRetainedCompactionWindow(arena, job.history, null, capabilities, source_tokens, deps.agent_stream_provider, .{ .provider = job.provider, .model = job.model });
             const continuation_messages = try arena.alloc(ChatMessage, continuation.request.messages.len + window.retained_messages.len);
             @memcpy(continuation_messages[0..continuation.request.messages.len], continuation.request.messages);
             @memcpy(continuation_messages[continuation.request.messages.len..], window.retained_messages);
@@ -1345,6 +1344,14 @@ fn formatToolAction(
             specLabel(spec, state, denied_label),
             display_target orelse spec.label_arg_default,
         );
+    }
+    if (try tool_presentation.subagentAction(arena, call, switch (state) {
+        .active => .active,
+        .completed => .completed,
+        .denied => .{ .stopped = denied_label.? },
+    })) |action| {
+        defer action.deinit(arena);
+        return formatToolActionValue(arena, action.label, action.detail);
     }
     const args = tool_args.parseToolArgsObject(arena, call.arguments_json) catch {
         return formatInvalidArgsToolAction(arena, state, denied_label);
@@ -2440,7 +2447,7 @@ test "tool labels preserve skill name value" {
     try std.testing.expect(std.mem.find(u8, install_completed, "vercel-labs/agent-skills") != null);
 }
 
-test "subagent labels name the action once with the subagent fallback" {
+test "subagent labels show named request and reply" {
     const alloc = std.testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(alloc);
     defer arena_state.deinit();
@@ -2452,14 +2459,14 @@ test "subagent labels name the action once with the subagent fallback" {
     const subagent_call: ToolCall = .{
         .id = "subagent",
         .name = "subagent",
-        .arguments_json = "{\"command\":{\"inspect\":{\"id\":\"child\",\"sections\":[\"status\"]}}}",
+        .arguments_json = "{\"request\":{\"action\":\"message\",\"agent\":\"reviewer\",\"message\":\"Check replay\"}}",
     };
 
     const active = try app.describeToolAction(arena, subagent_call);
-    try std.testing.expectEqualStrings("● Managing\x1b[0m \x1b[38;5;245msubagent\x1b[0m", active);
+    try std.testing.expectEqualStrings("● reviewer working\x1b[0m \x1b[38;5;245m· Check replay\x1b[0m", active);
 
     const completed = try app.describeToolActionCompleted(arena, subagent_call);
-    try std.testing.expectEqualStrings("● Managed\x1b[0m \x1b[38;5;245msubagent\x1b[0m", completed);
+    try std.testing.expectEqualStrings("● reviewer replied\x1b[0m \x1b[38;5;245m· Check replay\x1b[0m", completed);
 }
 
 test "app agent runtime refreshes enabled project context through registry" {
