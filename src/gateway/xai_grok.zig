@@ -1,4 +1,5 @@
 const std = @import("std");
+const debug_trace = @import("../core/shared/debug_trace.zig");
 const image_attachments = @import("../core/images/image_attachments.zig");
 const grok_session = @import("../core/auth/grok_session.zig");
 const secret = @import("../core/auth/secret.zig");
@@ -29,6 +30,7 @@ const connect_timeout_ms: i64 = 30_000;
 pub const agent_stream_provider = stream_provider.Provider{
     .stream_fn = streamCompletion,
     .build_request_fn = buildRequestForProvider,
+    .project_replay_fn = responses_protocol.selectReplayParts,
 };
 
 fn validateModel(model: []const u8) !void {
@@ -49,6 +51,9 @@ pub fn buildRequest(
     else
         .{};
     try budget.check();
+    const projected = try types.projectProviderReplay(alloc, request.messages, .{ .provider = .grok, .model = request.model });
+    defer if (projected) |messages| alloc.free(messages);
+    if (projected != null) debug_trace.logf("gateway", "provider_replay_omitted provider=grok reason=source_mismatch", .{});
 
     var instructions: std.Io.Writer.Allocating = .init(alloc);
     defer instructions.deinit();
@@ -68,7 +73,7 @@ pub fn buildRequest(
     try writer.writeAll(",\"store\":false,\"stream\":true,\"instructions\":");
     try std.json.Stringify.value(instructions.written(), .{}, writer);
     try writer.writeAll(",\"input\":[");
-    try writeResponsesInput(writer, std.heap.c_allocator, request.messages, request.verified_images, budget);
+    try writeResponsesInput(writer, std.heap.c_allocator, projected orelse request.messages, request.verified_images, budget);
     try writer.writeByte(']');
 
     const tool_count = try responses_protocol.writeTools(writer, alloc, request.tools);
@@ -486,7 +491,6 @@ fn mapReducerError(err: anyerror) anyerror {
         error.EventTooLarge => error.XaiGrokSseEventTooLarge,
         error.StreamTooLarge => error.XaiGrokResourceLimitExceeded,
         error.InvalidEvent => error.InvalidXaiGrokSseEvent,
-        error.ResponseFailed => error.XaiGrokResponseFailed,
         error.StreamIncomplete => error.XaiGrokStreamIncomplete,
         error.ToolCallLimitExceeded => error.XaiGrokToolCallLimitExceeded,
         error.ToolArgumentsTooLarge => error.XaiGrokToolArgumentsTooLarge,
@@ -507,7 +511,7 @@ test "xAI Grok request uses Responses input and converts AI SDK tool schemas" {
         .{
             .role = .assistant,
             .tool_calls = &.{.{ .id = "call_1", .name = "read_file", .arguments_json = "{\"path\":\"README.md\"}" }},
-            .provider_state_json = "[{\"id\":\"rs_1\",\"type\":\"reasoning\",\"encrypted_content\":\"opaque\"}]",
+            .provider_replay = .{ .source = .{ .provider = .grok, .model = "grok-4.20" }, .parts_json = "[{\"id\":\"rs_1\",\"type\":\"reasoning\",\"encrypted_content\":\"opaque\"}]" },
         },
         .{ .role = .tool, .tool_call_id = "call_1", .tool_name = "read_file", .content = "contents" },
     };
@@ -1066,23 +1070,22 @@ fn buildToolArgumentsSse(alloc: Allocator, argument_bytes: usize) ![]u8 {
 
 fn buildProviderStateSse(alloc: Allocator, provider_state_bytes: usize) ![]u8 {
     const item_count: usize = 8;
-    const event_prefix = "data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":";
-    const item_prefix = "{\"id\":\"rs\",\"type\":\"reasoning\",\"encrypted_content\":\"";
+    const item_prefix = "{\"id\":\"rs";
+    const item_middle = "\",\"type\":\"reasoning\",\"encrypted_content\":\"";
     const item_suffix = "\"}";
     const event_suffix = "}\n\n";
     const terminal = "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\n\n";
-    const framing_bytes = 2 + (item_count - 1) + item_count * (item_prefix.len + item_suffix.len);
+    const framing_bytes = 2 + (item_count - 1) + item_count * (item_prefix.len + 1 + item_middle.len + item_suffix.len);
     const content_bytes = provider_state_bytes - framing_bytes;
     const bytes_per_item = content_bytes / item_count;
     var remainder = content_bytes % item_count;
 
     var out: std.Io.Writer.Allocating = .init(alloc);
     errdefer out.deinit();
-    for (0..item_count) |_| {
+    for (0..item_count) |index| {
         const extra: usize = if (remainder > 0) 1 else 0;
         remainder -|= extra;
-        try out.writer.writeAll(event_prefix);
-        try out.writer.writeAll(item_prefix);
+        try out.writer.print("data: {{\"type\":\"response.output_item.done\",\"output_index\":{d},\"item\":{s}{d}{s}", .{ index, item_prefix, index, item_middle });
         try out.writer.splatByteAll('a', bytes_per_item + extra);
         try out.writer.writeAll(item_suffix);
         try out.writer.writeAll(event_suffix);

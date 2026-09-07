@@ -1465,7 +1465,6 @@ fn appendRuntimeContext(raw_ctx: *anyopaque, arena: Allocator, messages: *std.Ar
         .access_scope = ctx.state.workspace_access.scope(ctx.state.workspace_root),
         .interactive = false,
         .permission_mode = ctx.captured_permission_mode orelse session.permission_mode,
-        .tracker = null,
     }, arena, messages);
 }
 
@@ -1692,6 +1691,7 @@ fn resolveToolActionDisplayTarget(raw_ctx: *anyopaque, arena: Allocator, call: T
 
 fn describeToolActionCompleted(raw_ctx: *anyopaque, arena: Allocator, call: ToolCall, display_target: ?[]const u8, advertised_dynamic_tool_names: []const []const u8) ![]const u8 {
     const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
+    if (try tool_presentation.formatSubagentPlainAction(arena, call, .completed)) |line| return line;
     return tool_presentation.formatPlainAction(arena, .{
         .tool_registry = ctx.toolRegistry(),
         .call = call,
@@ -1702,6 +1702,7 @@ fn describeToolActionCompleted(raw_ctx: *anyopaque, arena: Allocator, call: Tool
 
 fn describeToolActionDenied(raw_ctx: *anyopaque, arena: Allocator, call: ToolCall, display_target: ?[]const u8, label: []const u8, advertised_dynamic_tool_names: []const []const u8) ![]const u8 {
     const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
+    if (try tool_presentation.formatSubagentPlainAction(arena, call, .{ .stopped = label })) |line| return line;
     const action = try tool_presentation.formatPlainAction(arena, .{
         .tool_registry = ctx.toolRegistry(),
         .call = call,
@@ -2691,6 +2692,9 @@ fn providerTerminalStatus(outcome: types.ToolOutcomeKind) ?acp_types.ToolCallSta
 }
 
 fn describeToolTitle(registry: tool_dispatch.Registry, arena: Allocator, call: ToolCall) ![]const u8 {
+    if (registry.lookup(call.name) != null) {
+        if (try tool_presentation.formatSubagentPlainAction(arena, call, .identity)) |title| return title;
+    }
     if (tool_presentation.isProviderSearchAlias(call.name)) {
         return tool_presentation.formatPlainAction(arena, .{
             .tool_registry = registry,
@@ -2701,6 +2705,20 @@ fn describeToolTitle(registry: tool_dispatch.Registry, arena: Allocator, call: T
         return std.fmt.allocPrint(arena, "{s}", .{presentation.action_label});
     }
     return std.fmt.allocPrint(arena, "{s}", .{call.name});
+}
+
+test "ACP subagent titles and terminal descriptions share request projection" {
+    const alloc = std.testing.allocator;
+    const call: ToolCall = .{ .id = "review", .name = "subagent", .arguments_json = "{\"request\":{\"action\":\"message\",\"agent\":\"reviewer\",\"message\":\"Check replay\"}}" };
+    const title = try describeToolTitle(builtin_tools.registry, alloc, call);
+    defer alloc.free(title);
+    try std.testing.expectEqualStrings("reviewer · Check replay", title);
+    const completed = (try tool_presentation.formatSubagentPlainAction(alloc, call, .completed)).?;
+    defer alloc.free(completed);
+    try std.testing.expectEqualStrings("reviewer replied · Check replay", completed);
+    const interrupted = (try tool_presentation.formatSubagentPlainAction(alloc, call, .{ .stopped = "Interrupted" })).?;
+    defer alloc.free(interrupted);
+    try std.testing.expectEqualStrings("reviewer interrupted · Check replay", interrupted);
 }
 
 test "ACP shell title uses the call-aware action label" {
