@@ -2905,6 +2905,64 @@ for (const [provider, help] of [
   }, TIMEOUT);
 }
 
+tmuxTest("/status keeps selected-profile preferences despite conflicting or malformed ambient settings", async () => {
+  home = mkdtempSync(join(tmpdir(), "fx-status-selected-profile-"));
+  const ambient = join(home, "ambient");
+  const selected = join(home, "selected");
+  const workspace = join(home, "workspace");
+  for (const path of [join(ambient, ".fx"), join(selected, ".fx"), workspace]) {
+    mkdirSync(path, { recursive: true, mode: 0o700 });
+  }
+  const selectedPath = join(selected, ".fx", "settings.json");
+  const selectedSettings = JSON.stringify({ provider: "gateway", credential_source: "ai_gateway_api_key" });
+  writeFileSync(selectedPath, selectedSettings);
+  gateway = startFakeGateway([]);
+  stderrPath = join(home, "stderr.log");
+  const quote = (value: string) => "'" + value.replaceAll("'", "'\\''") + "'";
+  for (const ambientSettings of [JSON.stringify({ credential_source: "vercel_oidc_token" }), "invalid json"]) {
+    const ambientPath = join(ambient, ".fx", "settings.json");
+    writeFileSync(ambientPath, ambientSettings);
+    writeFileSync(stderrPath, "");
+    session = await TmuxSession.create({
+      cmd: `${quote(FX_BIN)} --state-dir ${quote(selected)}`,
+      cwd: workspace,
+      env: {
+        HOME: ambient,
+        AI_GATEWAY_API_KEY: undefined,
+        VERCEL_OIDC_TOKEN: undefined,
+        FX_AUTH_MODE: undefined,
+        FX_AUTH_READ_ONLY_HOME: undefined,
+        FX_PROVIDER: undefined,
+        FX_DISABLE_KEYCHAIN: "1",
+        FX_SKIP_ONBOARDING: "1",
+        FX_GATEWAY_BASE_URL: gateway.baseUrl,
+        FX_GATEWAY_CHAT_URL: gateway.chatUrl,
+        FX_E2E_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+        FX_MODEL: FAKE_GATEWAY_MODEL,
+        FX_AUTO_UPGRADE: "0",
+        FX_SOUND: "0",
+      },
+      stderrPath,
+      width: 120,
+      height: 30,
+    });
+    await session.waitForComposer(TIMEOUT);
+    await session.sendText("/status");
+    await session.waitForText("AI_GATEWAY_API_KEY is selected but unavailable", TIMEOUT);
+    const scrollback = await session.captureFullScrollback();
+    expect(scrollback).toContain("auth=missing");
+    expect(scrollback).toContain("auth_help=AI_GATEWAY_API_KEY is selected but unavailable");
+    expect(scrollback).not.toContain("VERCEL_OIDC_TOKEN is selected");
+    expect(session.isPaneAlive()).toBe(true);
+    expect(readFileSync(stderrPath, "utf8")).toBe("");
+    expect(readFileSync(selectedPath, "utf8")).toBe(selectedSettings);
+    expect(readFileSync(ambientPath, "utf8")).toBe(ambientSettings);
+    expect(gateway.requests).toHaveLength(0);
+    await session.kill();
+    session = null;
+  }
+}, 2 * TIMEOUT);
+
 for (const [source, help] of [
   ["vercel_oidc_token", "VERCEL_OIDC_TOKEN is selected but unavailable."],
   ["stored_key", "A stored API key is selected but unavailable."],
