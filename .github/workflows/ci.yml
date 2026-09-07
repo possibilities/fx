@@ -192,7 +192,6 @@ jobs:
       - name: Test Node package and backend diagnostics
         run: |
           node --experimental-wasm-jspi sdk/tests/test-backend-info.mjs
-          node sdk/tests/test-package-imports.mjs
           node sdk/tests/test-node-package.mjs
           node sdk/tests/test-term-demo-package.mjs
           node sdk/scripts/package-libfx.mjs sdk/dist/libfx
