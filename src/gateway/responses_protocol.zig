@@ -2399,7 +2399,7 @@ test "Responses refusal beside a tool call keeps the tool-call disposition" {
     var stream = ToolRecordTest.init(std.testing.allocator);
     defer stream.deinit();
     try stream.apply(ToolRecordTest.start);
-    try stream.apply("{\"type\":\"response.refusal.delta\",\"delta\":\"refused\"}");
+    try stream.apply("{\"type\":\"response.refusal.delta\",\"output_index\":1,\"delta\":\"refused\"}");
     try stream.apply(ToolRecordTest.finalized);
     try stream.apply(ToolRecordTest.terminal);
     const completion = try stream.finish();
