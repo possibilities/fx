@@ -281,12 +281,18 @@ names them:
 
 ```
  - review the parser
-   id=fnGq6VphbKjL | 1 turn | reviewer @ codex | updated 2026-09-04 15:17:53 UTC
+   id=fnGq6VphbKjL | 1 turn | reviewer @ codex:6f4a132b990e | updated 2026-09-04 15:17:53 UTC
 ```
 
 The stored label is for reading; a content digest stored beside it decides
 whether two sessions are the same shape. `fx sessions --json` reports both as
-`shape` and `shape_identity`. A turn that may already have reached the provider
+`shape` and `shape_identity`, alongside `credential_source` and the full
+non-secret `credential_identity` digest. Text listings and the resume picker
+show a 12-character account digest beside the source, distinguishing accounts
+using the same provider. ACP `session/list` exposes this provenance in its
+additive `_meta.fx.provenance` object as `shape`, `shapeIdentity`,
+`credentialSource`, and `credentialIdentity`. Older sessions without recorded
+provenance remain readable. A turn that may already have reached the provider
 refuses to resume under a different shape or a different account.
 
 An explicit state directory can also carry one conventional system prompt for

@@ -73,6 +73,7 @@ pub fn cloneSessionSummary(
         .has_managed_children = source.has_managed_children,
         .shape = shape,
         .credential_source = source.credential_source,
+        .credential_identity = source.credential_identity,
     };
 }
 
@@ -176,6 +177,7 @@ test "summary clone owns every string" {
         .history_len = 3,
         .shape = .{ .id = @constCast("reviewer"), .identity = .{ .bytes = @splat(7) } },
         .credential_source = .fx_login,
+        .credential_identity = .{ .bytes = @splat(11) },
     });
     defer clone.deinit(alloc);
     try std.testing.expectEqualStrings("session", clone.id);
@@ -186,6 +188,7 @@ test "summary clone owns every string" {
     try std.testing.expectEqualStrings("reviewer", clone.shape.?.id);
     try std.testing.expect(clone.shape.?.identity.eql(.{ .bytes = @splat(7) }));
     try std.testing.expect(clone.credential_source.? == .fx_login);
+    try std.testing.expect(clone.credential_identity.?.eql(.{ .bytes = @splat(11) }));
 }
 
 test "summary pages filter and preserve append cursor order" {

@@ -46,6 +46,23 @@ pub fn displayTitle(summary: session_store.SessionSummary) []const u8 {
     return summary.title orelse session_display_metadata.fallback_title;
 }
 
+/// Formats only non-secret recorded provenance; the caller supplies 128 bytes.
+pub fn provenanceLabel(buffer: []u8, summary: session_store.SessionSummary) []const u8 {
+    const shape = if (summary.shape) |value| value.id else "";
+    const source = if (summary.credential_source) |value| switch (value) {
+        .chatgpt_subscription => "codex",
+        .grok_subscription => "grok",
+        .ai_gateway_api_key, .fx_login, .stored_key, .vercel_oidc_token => "gateway",
+        .host_managed => "host",
+    } else "";
+    const separator = if (shape.len > 0 and source.len > 0) " @ " else "";
+    if (summary.credential_identity) |identity| {
+        const hex = std.fmt.bytesToHex(identity.bytes, .lower);
+        return std.fmt.bufPrint(buffer, "{s}{s}{s}:{s}", .{ shape, separator, source, hex[0..12] }) catch "";
+    }
+    return std.fmt.bufPrint(buffer, "{s}{s}{s}", .{ shape, separator, source }) catch "";
+}
+
 pub fn workspacePath(summary: session_store.SessionSummary) []const u8 {
     return summary.workspace_root orelse summary.origin_workspace_root orelse "(unknown workspace)";
 }

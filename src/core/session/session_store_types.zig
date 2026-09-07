@@ -2,6 +2,7 @@ const std = @import("std");
 const session = @import("session.zig");
 const session_codec = @import("session_codec.zig");
 const session_log = @import("session_log.zig");
+const credential_authority = @import("../auth/credential_authority.zig");
 const shape_authority = @import("../auth/shape_authority.zig");
 const types = @import("../shared/types.zig");
 
@@ -74,9 +75,9 @@ pub const SessionSummary = struct {
     /// the digest beside it is what decides whether two sessions are the same
     /// shape. Null for a session written before provenance was recorded.
     shape: ?shape_authority.Reference = null,
-    /// The credential origin that created it, paired with the shape so a
-    /// listing can separate two accounts running the same agent.
+    /// Non-secret source and identity distinguish accounts running the same shape.
     credential_source: ?types.CredentialSource = null,
+    credential_identity: ?credential_authority.Identity = null,
 
     pub fn hasResumableContent(self: SessionSummary) bool {
         return self.history_len != 0 or self.has_checkpoint or self.has_managed_children;

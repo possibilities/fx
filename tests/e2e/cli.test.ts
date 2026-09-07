@@ -2572,6 +2572,62 @@ describe("cli: sessions", () => {
   );
 
   test(
+    "session listings and recovery preserve distinct account provenance",
+    async () => {
+      const root = mkdtempSync(join(tmpdir(), "fx-session-provenance-"));
+      try {
+        const home = join(root, "home");
+        const workspace = join(root, "workspace");
+        mkdirSync(workspace);
+        const cwd = realpathSync(workspace);
+        const env = { HOME: home, ...NO_GATEWAY_AUTH };
+        const shapeIdentity = "33".repeat(32);
+        for (const account of ["11", "22"]) {
+          const id = `account-${account}`;
+          writeConversationSession(home, cwd, id, { title: "Chosen title", turns: ["saved work"] });
+          const path = join(home, ".fx", "sessions", id, "session.json");
+          const metadata = JSON.parse(readFileSync(path, "utf8"));
+          metadata.provenance = {
+            shape_id: "reviewer", shape_identity: shapeIdentity,
+            credential_source: "chatgpt_subscription", credential_identity: account.repeat(32),
+          };
+          writeFileSync(path, JSON.stringify(metadata), { mode: 0o600 });
+        }
+        for (let pass = 0; pass < 2; pass++) {
+          const result = await runFx(["sessions", "--json"], { cwd, env, timeoutMs: TIMEOUT });
+          expect(result.code).toBe(0);
+          expect(result.stderr).toBe("");
+          for (const account of ["11", "22"]) {
+            expect(JSON.parse(result.stdout).sessions.find((row: any) => row.id === `account-${account}`)).toMatchObject({
+              shape: "reviewer", shape_identity: shapeIdentity,
+              credential_source: "chatgpt_subscription", credential_identity: account.repeat(32),
+            });
+          }
+        }
+        const text = await runFx(["sessions"], { cwd, env, timeoutMs: TIMEOUT });
+        expect(text.code).toBe(0);
+        expect(text.stderr).toBe("");
+        for (const account of ["11", "22"]) expect(text.stdout).toContain(`reviewer @ codex:${account.repeat(6)}`);
+        const source = join(home, ".fx", "sessions", "account-11");
+        const events = join(source, "events.jsonl");
+        const damaged = readFileSync(events, "utf8") + "invalid-tail\n";
+        writeFileSync(events, damaged, { mode: 0o600 });
+        const recovered = await runFx(["session", "recover", "account-11", "--json"], { cwd, env, timeoutMs: TIMEOUT });
+        expect(recovered.code).toBe(0);
+        expect(recovered.stderr).toBe("");
+        const target = join(home, ".fx", "sessions", JSON.parse(recovered.stdout).recovered_id, "session.json");
+        const saved = JSON.parse(readFileSync(target, "utf8"));
+        expect(saved.title).toBe("Chosen title");
+        expect(saved.provenance).toEqual(JSON.parse(readFileSync(join(source, "session.json"), "utf8")).provenance);
+        expect(readFileSync(events, "utf8")).toBe(damaged);
+      } finally {
+        rmSync(root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
     "fx sessions text shows named, unnamed, and renamed sessions",
     async () => {
       const root = mkdtempSync(join(tmpdir(), "fx-e2e-session-names-"));

@@ -1214,6 +1214,19 @@ pub fn handleListSessions(state: *server.ServerState, alloc: Allocator, msg: *js
         const iso = try formatIso8601(alloc, summary.updated_at_ms);
         defer alloc.free(iso);
         try writeJsonStr(iso, &out.writer);
+        if (summary.shape != null or summary.credential_source != null) {
+            var shape_hex: [64]u8 = undefined;
+            var account_hex: [64]u8 = undefined;
+            if (summary.shape) |shape| shape_hex = std.fmt.bytesToHex(shape.identity.bytes, .lower);
+            if (summary.credential_identity) |identity| account_hex = std.fmt.bytesToHex(identity.bytes, .lower);
+            try out.writer.writeAll(",\"_meta\":");
+            try std.json.Stringify.value(.{ .fx = .{ .provenance = .{
+                .shape = if (summary.shape) |shape| shape.id else null,
+                .shapeIdentity = if (summary.shape != null) @as(?[]const u8, &shape_hex) else null,
+                .credentialSource = if (summary.credential_source) |source| @as(?[]const u8, @tagName(source)) else null,
+                .credentialIdentity = if (summary.credential_identity != null) @as(?[]const u8, &account_hex) else null,
+            } } }, .{ .emit_null_optional_fields = false }, &out.writer);
+        }
         try out.writer.writeAll("}");
     }
     try out.writer.writeAll("]");

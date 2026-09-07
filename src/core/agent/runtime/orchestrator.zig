@@ -3219,6 +3219,9 @@ test "potentially sent recovery rejects missing or changed credential authority"
         "acct_1",
         null,
     ));
+    legacy.disposition = .history_only;
+    try std.testing.expect(shouldRejectRecoveryAuthority(legacy, .chatgpt_subscription, "acct_1", null));
+    try std.testing.expect(shouldRejectRecoveryAuthority(legacy, null, null, null));
 }
 
 test "potentially sent recovery rejects a turn begun under a different shape" {
@@ -3283,9 +3286,6 @@ test "potentially sent recovery rejects a turn begun under a different shape" {
         "acct_1",
         builder,
     ));
-    legacy.disposition = .history_only;
-    try std.testing.expect(shouldRejectRecoveryAuthority(legacy, .chatgpt_subscription, "acct_1"));
-    try std.testing.expect(shouldRejectRecoveryAuthority(legacy, null, null));
 }
 
 fn checkpointCause(

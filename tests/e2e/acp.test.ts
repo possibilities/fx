@@ -6814,6 +6814,51 @@ describe("acp: model-independent", () => {
   );
 
   test(
+    "session/list exposes shape and distinct account provenance in Fx metadata",
+    async () => {
+      const root = createIsolatedRoot("fx-acp-session-provenance-");
+      const gateway = startFakeGateway([]);
+      try {
+        for (const account of ["11", "22"]) {
+          const id = `account-${account}`;
+          writeAcpSession(root.home, root.workspace, id, 20);
+          const dir = join(root.home, ".fx", "sessions", id);
+          writeFileSync(join(dir, "session.json"), JSON.stringify({
+            schema_version: 4, id, created_at_ms: 1, updated_at_ms: 20,
+            origin_workspace_root: root.workspace, workspace_root: root.workspace,
+            conversation_language: "en", provider: "gateway", model: FAKE_GATEWAY_MODEL,
+            effort: "auto", fast_mode: false, title: "Saved work", subagent_child: false,
+            provenance: { shape_id: "reviewer", shape_identity: "33".repeat(32),
+              credential_source: "chatgpt_subscription", credential_identity: account.repeat(32) },
+          }), { mode: 0o600 });
+          writeFileSync(join(dir, "events.jsonl"), [
+            { user: { text: "saved work" } }, { assistant: { text: "done" } }, { turn_completed: {} },
+          ].map((event, index) => JSON.stringify({ schema_version: 1, seq: index + 1, timestamp_ms: 20, event })).join("\n") + "\n", { mode: 0o600 });
+        }
+        client = await AcpClient.create({ cwd: root.workspace, env: fakeGatewayEnv(root, gateway) });
+        await client.request("initialize", { protocolVersion: 1 }, 1);
+        for (const requestId of [2, 3]) {
+          const listed = await client.request("session/list", {}, requestId) as any;
+          expect(listed.error).toBeUndefined();
+          for (const account of ["11", "22"]) {
+            expect(listed.result.sessions.find((row: any) => row.sessionId === `account-${account}`)).toMatchObject({
+              cwd: root.workspace, title: "Saved work",
+              _meta: { fx: { provenance: { shape: "reviewer", shapeIdentity: "33".repeat(32),
+                credentialSource: "chatgpt_subscription", credentialIdentity: account.repeat(32) } } },
+            });
+          }
+        }
+        expect(client.stderr).toBe("");
+      } finally {
+        await client?.close();
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
     "session/list without cwd returns all sessions and filters by absolute cwd",
     async () => {
       const root = createIsolatedRoot("fx-acp-workspace-session-list-");

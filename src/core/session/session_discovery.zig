@@ -383,6 +383,7 @@ fn classifyConversationCandidate(
             .title = title,
             .shape = shape,
             .credential_source = if (provenance) |value| value.credential_source else null,
+            .credential_identity = if (provenance) |value| value.credential_identity else null,
             .created_at_ms = metadata.created_at_ms,
             .updated_at_ms = if (history_len == 0 and !has_checkpoint)
                 metadata.updated_at_ms
@@ -562,6 +563,10 @@ pub fn classifySchemaV3Candidate(
                 provenance.credential_source
             else
                 null,
+            .credential_identity = if (manifest.provenance) |provenance|
+                provenance.credential_identity
+            else
+                null,
         },
         .storage = .schema_v3,
         .projection_state = projection_state,
@@ -712,6 +717,10 @@ pub fn summaryFromState(
         .shape = shape,
         .credential_source = if (state.provenance) |provenance|
             provenance.credential_source
+        else
+            null,
+        .credential_identity = if (state.provenance) |provenance|
+            provenance.credential_identity
         else
             null,
     };

@@ -8,6 +8,7 @@ const mcp_health = @import("../mcp/health.zig");
 const model_catalog = @import("../gateway/model_catalog.zig");
 const provider_catalog = @import("../auth/provider_catalog.zig");
 const permissions = @import("../permissions/permissions.zig");
+const session_catalog = @import("../session/session_catalog.zig");
 const session_display_metadata = @import("../session/session_display_metadata.zig");
 const session_json = @import("../session/session_json.zig");
 const session_store = @import("../session/session_store.zig");
@@ -983,6 +984,11 @@ pub const SessionListSnapshot = struct {
                 try out.writer.writeAll(",\"credential_source\":");
                 try std.json.Stringify.value(@tagName(source), .{}, &out.writer);
             }
+            if (entry.credential_identity) |identity| {
+                try out.writer.writeAll(",\"credential_identity\":");
+                const hex = std.fmt.bytesToHex(identity.bytes, .lower);
+                try std.json.Stringify.value(&hex, .{}, &out.writer);
+            }
             try out.writer.writeByte('}');
         }
         try out.writer.writeAll("]}");
@@ -1003,31 +1009,15 @@ fn writeSessionListDetails(
         try writer.writeAll(" | ");
         try writeTerminalSafe(writer, alloc, label);
     }
-    if (entry.shape) |shape| {
-        // Shape and account are chosen independently, so a listing that named
-        // only one of them would not say what produced this history.
+    var provenance_buffer: [128]u8 = undefined;
+    const provenance = session_catalog.provenanceLabel(&provenance_buffer, entry);
+    if (provenance.len > 0) {
         try writer.writeAll(" | ");
-        try writeTerminalSafe(writer, alloc, shape.id);
-        if (credentialSourceLabel(entry.credential_source)) |source| {
-            try writer.writeAll(" @ ");
-            try writer.writeAll(source);
-        }
+        try writeTerminalSafe(writer, alloc, provenance);
     }
     try writer.writeAll(" | updated ");
     try writeUtcTimestamp(writer, entry.updated_at_ms);
     try writer.writeByte('\n');
-}
-
-/// Names the account origin a session ran under, in the operator's words
-/// rather than the credential enum's.
-fn credentialSourceLabel(source: ?types.CredentialSource) ?[]const u8 {
-    const value = source orelse return null;
-    return switch (value) {
-        .chatgpt_subscription => "codex",
-        .grok_subscription => "grok",
-        .ai_gateway_api_key, .fx_login, .stored_key, .vercel_oidc_token => "gateway",
-        .host_managed => "host",
-    };
 }
 
 fn sessionLanguageLabel(tag: []const u8) ?[]const u8 {
