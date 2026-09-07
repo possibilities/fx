@@ -7,16 +7,142 @@ const grok_session = @import("grok_session.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const host = @import("../hosts/host.zig");
 const io_mod = @import("../shared/io.zig");
+const profile_paths = @import("../shared/profile_paths.zig");
 const model_provider = @import("../config/model_provider.zig");
 const provider_catalog = @import("provider_catalog.zig");
 const oauth = @import("oauth.zig");
 const oauth_session = @import("oauth_session.zig");
 const oauth_transport = @import("oauth_transport.zig");
-const profile_paths = @import("../shared/profile_paths.zig");
 const secret = @import("secret.zig");
 const types = @import("../shared/types.zig");
 
 pub const Source = types.CredentialSource;
+pub const read_only_authorization_home_env = "FX_AUTH_READ_ONLY_HOME";
+
+/// Resolves the optional profile whose already-valid saved credential may be
+/// borrowed by an explicit selected-state launch. The returned path is owned
+/// by the caller. Requiring the input to equal its real path keeps the
+/// authorization authority stable and prevents a retained state root from
+/// concealing a redirect through a symlink.
+pub fn resolveReadOnlyAuthorizationHome(
+    alloc: std.mem.Allocator,
+    selected_state_home: ?[]const u8,
+    configured: ?[]const u8,
+) !?[]u8 {
+    const raw = configured orelse return null;
+    if (selected_state_home == null) return error.ReadOnlyAuthorizationHomeRequiresStateDirectory;
+    return try canonicalizeAuthorizationHome(alloc, raw);
+}
+
+/// Validates one borrowed authorization home. Requiring the input to equal its
+/// real path keeps the authorization authority stable and prevents a retained
+/// state root from concealing a redirect through a symlink.
+fn canonicalizeAuthorizationHome(alloc: std.mem.Allocator, raw: []const u8) ![]u8 {
+    if (raw.len == 0 or !std.unicode.utf8ValidateSlice(raw) or
+        !std.fs.path.isAbsolute(raw) or std.mem.eql(u8, raw, "/"))
+    {
+        return error.InvalidReadOnlyAuthorizationHome;
+    }
+
+    const canonical = io_mod.realpathAlloc(alloc, raw) catch
+        return error.InvalidReadOnlyAuthorizationHome;
+    errdefer alloc.free(canonical);
+    if (!std.mem.eql(u8, raw, canonical)) return error.InvalidReadOnlyAuthorizationHome;
+
+    var directory = io_mod.openDirAbsoluteNoFollow(canonical, .{}) catch
+        return error.InvalidReadOnlyAuthorizationHome;
+    directory.close(io_mod.getIo());
+    return canonical;
+}
+
+/// Resolves the profile whose already-valid credential this launch borrows.
+/// The explicit `--identity` selection stands on its own, because a flag on the
+/// command line is the operator naming an account for this run. The
+/// environment form still requires an explicit state root, so an ambient
+/// variable can never redirect a default launch's billing. Naming both is
+/// refused rather than silently preferring one account over the other.
+pub fn resolveBorrowedAuthorizationHome(
+    alloc: std.mem.Allocator,
+    selected_state_home: ?[]const u8,
+    selected_identity_home: ?[]const u8,
+    configured_environment: ?[]const u8,
+) !?[]u8 {
+    if (selected_identity_home) |selected| {
+        if (configured_environment != null) return error.ConflictingAuthorizationHome;
+        return try canonicalizeAuthorizationHome(alloc, selected);
+    }
+    return resolveReadOnlyAuthorizationHome(
+        alloc,
+        selected_state_home,
+        configured_environment,
+    );
+}
+
+pub fn borrowedAuthorizationHomeFromLaunch(
+    alloc: std.mem.Allocator,
+    selected_state_home: ?[]const u8,
+    selected_identity_home: ?[]const u8,
+) !?[]u8 {
+    return resolveBorrowedAuthorizationHome(
+        alloc,
+        selected_state_home,
+        selected_identity_home,
+        io_mod.getenv(read_only_authorization_home_env),
+    );
+}
+
+pub fn readOnlyAuthorizationHomeFromEnvironment(
+    alloc: std.mem.Allocator,
+    selected_state_home: ?[]const u8,
+) !?[]u8 {
+    return resolveReadOnlyAuthorizationHome(
+        alloc,
+        selected_state_home,
+        io_mod.getenv(read_only_authorization_home_env),
+    );
+}
+
+test "read-only authorization home requires one canonical directory beside selected state" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDir(std.testing.io, "state", .default_dir);
+    try tmp.dir.createDir(std.testing.io, "authorization", .default_dir);
+    try tmp.dir.symLink(std.testing.io, "authorization", "authorization-link", .{ .is_directory = true });
+    var file = try tmp.dir.createFile(std.testing.io, "not-a-directory", .{});
+    file.close(std.testing.io);
+
+    const state = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "state");
+    defer alloc.free(state);
+    const authorization = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "authorization");
+    defer alloc.free(authorization);
+    const linked = try std.fs.path.join(alloc, &.{ std.fs.path.dirname(authorization).?, "authorization-link" });
+    defer alloc.free(linked);
+    const wrong_kind = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "not-a-directory");
+    defer alloc.free(wrong_kind);
+
+    try std.testing.expect((try resolveReadOnlyAuthorizationHome(alloc, state, null)) == null);
+    try std.testing.expectError(
+        error.ReadOnlyAuthorizationHomeRequiresStateDirectory,
+        resolveReadOnlyAuthorizationHome(alloc, null, authorization),
+    );
+    try std.testing.expectError(
+        error.InvalidReadOnlyAuthorizationHome,
+        resolveReadOnlyAuthorizationHome(alloc, state, "relative"),
+    );
+    try std.testing.expectError(
+        error.InvalidReadOnlyAuthorizationHome,
+        resolveReadOnlyAuthorizationHome(alloc, state, linked),
+    );
+    try std.testing.expectError(
+        error.InvalidReadOnlyAuthorizationHome,
+        resolveReadOnlyAuthorizationHome(alloc, state, wrong_kind),
+    );
+
+    const selected = (try resolveReadOnlyAuthorizationHome(alloc, state, authorization)).?;
+    defer alloc.free(selected);
+    try std.testing.expectEqualStrings(authorization, selected);
+}
 
 pub const AuthMode = enum {
     local,
@@ -379,9 +505,47 @@ pub fn resolveForProvider(
     provider: model_provider.ProviderId,
     preferred: ?Source,
 ) !Resolution {
+    return resolveForProviderWithStore(
+        alloc,
+        transport,
+        secret_store,
+        mode,
+        provider,
+        preferred,
+        chatgpt_session.default_store,
+    );
+}
+
+pub fn resolveForProviderWithStore(
+    alloc: std.mem.Allocator,
+    transport: oauth_transport.Provider,
+    secret_store: host.SecretStore,
+    mode: LoadMode,
+    provider: model_provider.ProviderId,
+    preferred: ?Source,
+    chatgpt_store: chatgpt_session.Store,
+) !Resolution {
     if (provider != .gateway) {
         const source = provider_catalog.find(provider).login_source;
-        const credential = loadPreferredSource(alloc, transport, secret_store, mode, source) catch |err| {
+        // An unavailable subscription store is the provider source failing to
+        // load, reported like every other load failure so the diagnostic names
+        // the saved credential rather than the API-key store.
+        if (provider == .codex) switch (chatgpt_store) {
+            .profile => |configured_home| if (configured_home == null) requireSourceStorage(source) catch |err| {
+                debug_trace.logf("auth", "provider source storage unavailable source={t} err={s}", .{ source, @errorName(err) });
+                return .{ .failure = .{ .source = source, .err = err } };
+            },
+            .host => {},
+        };
+        const credential = (if (provider == .codex)
+            loadChatGptCredentialFromStore(
+                alloc,
+                if (mode == .stored) oauth_transport.unavailable_provider else transport,
+                if (mode == .stored) .stored else .if_needed,
+                chatgpt_store,
+            )
+        else
+            loadPreferredSource(alloc, transport, secret_store, mode, source)) catch |err| {
             if (err == error.OutOfMemory) return err;
             debug_trace.logf("auth", "provider source load failed source={t} err={s}", .{ source, @errorName(err) });
             return .{ .failure = .{ .source = source, .err = err } };
@@ -397,6 +561,105 @@ pub fn resolveForProvider(
     );
 }
 
+/// Resolves Fx-owned authorization exclusively beneath an explicit profile
+/// home. Environment credentials remain launch-time overrides, but ambient
+/// profile files and account-global keychains are never consulted.
+pub fn resolveForProviderFromHome(
+    alloc: std.mem.Allocator,
+    transport: oauth_transport.Provider,
+    mode: LoadMode,
+    provider: model_provider.ProviderId,
+    preferred: ?Source,
+    home: []const u8,
+) !Resolution {
+    if (provider != .gateway) {
+        const source = provider_catalog.find(provider).login_source;
+        const credential = loadPreferredSourceFromHome(alloc, transport, mode, source, home) catch |err| {
+            if (err == error.OutOfMemory) return err;
+            debug_trace.logf("auth", "isolated provider source load failed source={t} err={s}", .{ source, @errorName(err) });
+            return .{ .failure = .{ .source = source, .err = err } };
+        };
+        return .{ .credential = credential };
+    }
+    return resolvePreferringFromHome(
+        alloc,
+        transport,
+        mode,
+        if (preferred == .chatgpt_subscription or preferred == .grok_subscription) null else preferred,
+        home,
+    );
+}
+
+/// Resolves one already-valid saved credential without acquiring mutation
+/// authority over its profile. Expired or refresh-due sessions are treated as
+/// unavailable rather than refreshed through the borrowed home.
+pub fn resolveReadOnlyForProviderFromHome(
+    alloc: std.mem.Allocator,
+    provider: model_provider.ProviderId,
+    preferred: ?Source,
+    home: []const u8,
+) !Resolution {
+    var resolution = try resolveForProviderFromHome(
+        alloc,
+        oauth_transport.unavailable_provider,
+        .stored,
+        provider,
+        preferred,
+        home,
+    );
+    if (resolution.credential) |*credential| {
+        if (credential.needsRefreshAt(io_mod.milliTimestamp())) {
+            credential.deinit(alloc);
+            resolution.credential = null;
+        }
+    }
+    return resolution;
+}
+
+test "read-only resolution refuses refresh-due subscription without rewriting its profile" {
+    const fixture =
+        "{\"version\":1,\"access_token\":\"expired-token\",\"refresh_token\":\"do-not-send\",\"expires_at_ms\":1,\"account_id\":\"borrowed-account\"}\n";
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "authorization/.fx");
+    var auth_file = try tmp.dir.createFile(
+        std.testing.io,
+        "authorization/.fx/chatgpt-auth.json",
+        .{
+            .truncate = true,
+            .permissions = std.Io.File.Permissions.fromMode(0o600),
+        },
+    );
+    try auth_file.writeStreamingAll(std.testing.io, fixture);
+    auth_file.close(std.testing.io);
+
+    const authorization_home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "authorization");
+    defer alloc.free(authorization_home);
+    var resolution = try resolveReadOnlyForProviderFromHome(
+        alloc,
+        .codex,
+        null,
+        authorization_home,
+    );
+    defer if (resolution.credential) |*credential| credential.deinit(alloc);
+    try std.testing.expect(resolution.credential == null);
+
+    var retained_file = try tmp.dir.openFile(
+        std.testing.io,
+        "authorization/.fx/chatgpt-auth.json",
+        .{ .mode = .read_only },
+    );
+    defer retained_file.close(std.testing.io);
+    const retained = try io_mod.readFileToEnd(alloc, &retained_file, 4096);
+    defer alloc.free(retained);
+    try std.testing.expectEqualStrings(fixture, retained);
+}
+
+/// `preferred` is the source the user last chose in the hub. It wins over the
+/// precedence order below, including over the environment, because it is an
+/// explicit choice rather than a default. A preferred source that no longer
+/// resolves falls through to precedence instead of failing.
 /// `preferred` is the source the user last chose in the hub. It is an exact
 /// authority choice, not a precedence hint: absence or refresh failure must not
 /// silently select a different billing, account, or team boundary. Only null
@@ -456,6 +719,50 @@ pub fn resolvePreferring(
     return .{ .stored_key_status = status, .fx_login_status = fx_login_status, .failure = failure };
 }
 
+fn resolvePreferringFromHome(
+    alloc: std.mem.Allocator,
+    transport: oauth_transport.Provider,
+    mode: LoadMode,
+    preferred: ?Source,
+    home: []const u8,
+) !Resolution {
+    if (preferred) |source| {
+        const chosen = loadPreferredSourceFromHome(alloc, transport, mode, source, home) catch |err| {
+            if (err == error.OutOfMemory) return err;
+            debug_trace.logf("auth", "isolated explicit source load failed source={t} err={s}", .{ source, @errorName(err) });
+            return unavailableExplicitResolution(source, err);
+        };
+        if (chosen) |credential| return .{ .credential = credential };
+        debug_trace.logf("auth", "isolated explicit source unavailable source={t}", .{source});
+        return missingExplicitResolution(source);
+    }
+
+    if (try loadEnvCredential(alloc, "VERCEL_OIDC_TOKEN", .vercel_oidc_token)) |credential| return .{ .credential = credential };
+    if (try loadEnvCredential(alloc, "AI_GATEWAY_API_KEY", .ai_gateway_api_key)) |credential| return .{ .credential = credential };
+
+    var fx_login_status: FxLoginReadStatus = .absent;
+    var failure: ?LoadFailure = null;
+    const fx_login = loadFxLoginForPrecedenceFromHome(alloc, transport, mode, home) catch |err| blk: {
+        if (err == error.OutOfMemory) return err;
+        fx_login_status = .unavailable;
+        failure = .{ .source = .fx_login, .err = err };
+        debug_trace.logf("auth", "isolated fx login load failed mode={t} err={s}; using precedence", .{ mode, @errorName(err) });
+        break :blk null;
+    };
+    if (fx_login) |credential| return .{ .credential = credential };
+
+    var status: StoredKeyReadStatus = .not_found;
+    const stored = loadStoredKeyCredentialFromHome(alloc, home) catch |err| blk: {
+        if (err == error.OutOfMemory) return err;
+        status = .unavailable;
+        failure = .{ .source = .stored_key, .err = err };
+        debug_trace.logf("auth", "isolated stored key load failed err={s} status={t}", .{ @errorName(err), status });
+        break :blk null;
+    };
+    if (stored) |credential| return .{ .credential = credential, .fx_login_status = fx_login_status };
+    return .{ .stored_key_status = status, .fx_login_status = fx_login_status, .failure = failure };
+}
+
 fn missingExplicitResolution(source: Source) Resolution {
     return switch (source) {
         .fx_login => .{ .fx_login_status = .absent },
@@ -482,6 +789,18 @@ fn loadFxLoginForPrecedence(
     return switch (mode) {
         .stored => loadStoredFxLoginCredential(alloc),
         .refresh_if_needed => loadFxLoginCredential(alloc, transport),
+    };
+}
+
+fn loadFxLoginForPrecedenceFromHome(
+    alloc: std.mem.Allocator,
+    transport: oauth_transport.Provider,
+    mode: LoadMode,
+    home: []const u8,
+) !?Credential {
+    return switch (mode) {
+        .stored => loadStoredFxLoginCredentialFromHome(alloc, home),
+        .refresh_if_needed => loadFxLoginCredentialFromHome(alloc, transport, home),
     };
 }
 
@@ -512,6 +831,25 @@ fn loadPreferredSource(
     };
 }
 
+fn loadPreferredSourceFromHome(
+    alloc: std.mem.Allocator,
+    transport: oauth_transport.Provider,
+    mode: LoadMode,
+    source: Source,
+    home: []const u8,
+) !?Credential {
+    return switch (source) {
+        .fx_login => loadFxLoginForPrecedenceFromHome(alloc, transport, mode, home),
+        .chatgpt_subscription => loadChatGptCredentialFromHome(alloc, transport, mode, home),
+        .grok_subscription => loadGrokCredentialFromHome(alloc, transport, mode, home),
+        .stored_key => loadStoredKeyCredentialFromHome(alloc, home),
+        .vercel_oidc_token => loadEnvCredential(alloc, "VERCEL_OIDC_TOKEN", source),
+        .ai_gateway_api_key => loadEnvCredential(alloc, "AI_GATEWAY_API_KEY", source),
+        // Host-managed authority carries no bytes an isolated profile could hold.
+        .host_managed => null,
+    };
+}
+
 pub fn loadSource(
     alloc: std.mem.Allocator,
     transport: oauth_transport.Provider,
@@ -527,6 +865,21 @@ pub fn loadSource(
         .grok_subscription => loadGrokCredential(alloc, transport, .if_needed),
         .host_managed => null,
     };
+}
+
+pub fn loadSourceFromHome(
+    alloc: std.mem.Allocator,
+    transport: oauth_transport.Provider,
+    source: Source,
+    home: []const u8,
+) !?Credential {
+    return loadPreferredSourceFromHome(
+        alloc,
+        transport,
+        .refresh_if_needed,
+        source,
+        home,
+    );
 }
 
 pub fn sourceExists(
@@ -607,6 +960,44 @@ pub fn sourcePresence(
     };
 }
 
+pub fn sourceExistsFromHome(
+    alloc: std.mem.Allocator,
+    source: Source,
+    home: []const u8,
+) !bool {
+    var credential = (try loadPreferredSourceFromHome(
+        alloc,
+        oauth_transport.unavailable_provider,
+        .stored,
+        source,
+        home,
+    )) orelse return false;
+    defer credential.deinit(alloc);
+    return true;
+}
+
+pub fn storeKeyFromHome(
+    alloc: std.mem.Allocator,
+    home: []const u8,
+    value: []const u8,
+) host.SecretStoreWriteError!void {
+    if (value.len == 0) return error.StoredKeyWriteFailed;
+    var home_dir = io_mod.VerifiedDir{
+        .dir = std.Io.Dir.openDirAbsolute(io_mod.getIo(), home, .{ .iterate = true }) catch
+            return error.StoredKeyWriteFailed,
+    };
+    defer home_dir.close();
+    var fx_dir = io_mod.openOrCreateVerifiedPrivateDir(
+        &home_dir,
+        profile_paths.root_dir_name,
+    ) catch return error.StoredKeyWriteFailed;
+    defer fx_dir.close();
+    io_mod.durableReplaceVerified(alloc, &fx_dir, "api-key", value) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.StoredKeyWriteFailed,
+    };
+}
+
 /// Shared admission for reading a saved OAuth credential.
 pub fn requireSourceStorage(source: Source) error{CredentialStorageUnavailable}!void {
     if (!sourceRefreshable(source)) return;
@@ -646,13 +1037,66 @@ fn loadStoredKeyCredential(
     return .{ .token = value, .source = .stored_key };
 }
 
+fn loadStoredKeyCredentialFromHome(
+    alloc: std.mem.Allocator,
+    home: []const u8,
+) !?Credential {
+    const path = try profile_paths.apiKeyPath(alloc, home);
+    defer alloc.free(path);
+    var file = io_mod.openExistingRegularFile(std.Io.Dir.cwd(), path, .read_only) catch |err| switch (err) {
+        error.FileNotFound => return null,
+        else => return error.StoredKeyUnreadable,
+    };
+    defer file.close(io_mod.getIo());
+    const stat = file.stat(io_mod.getIo()) catch return error.StoredKeyUnreadable;
+    if (stat.kind != .file or stat.permissions.toMode() & 0o077 != 0) return error.StoredKeyInsecure;
+    const bytes = io_mod.readFileToEnd(alloc, &file, 8 * 1024) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.StoredKeyUnreadable,
+    };
+    var returned = false;
+    defer if (!returned) secret.zeroAndFree(alloc, bytes);
+    const trimmed = std.mem.trim(u8, bytes, "\r\n");
+    if (trimmed.len == 0) return null;
+    if (trimmed.len == bytes.len) {
+        returned = true;
+        return .{ .token = bytes, .source = .stored_key };
+    }
+    return .{ .token = try alloc.dupe(u8, trimmed), .source = .stored_key };
+}
+
 fn loadChatGptCredential(
     alloc: std.mem.Allocator,
     transport: oauth_transport.Provider,
     mode: chatgpt_oauth.RefreshMode,
 ) !?Credential {
     try requireSourceStorage(.chatgpt_subscription);
-    var access = (try chatgpt_oauth.loadAccess(alloc, transport, mode)) orelse return null;
+    return loadChatGptCredentialFromStore(alloc, transport, mode, chatgpt_session.default_store);
+}
+
+pub fn loadChatGptCredentialFromStore(
+    alloc: std.mem.Allocator,
+    transport: oauth_transport.Provider,
+    mode: chatgpt_oauth.RefreshMode,
+    store: chatgpt_session.Store,
+) !?Credential {
+    return loadChatGptCredentialForAccountFromStore(alloc, transport, mode, null, store);
+}
+
+pub fn loadChatGptCredentialForAccountFromStore(
+    alloc: std.mem.Allocator,
+    transport: oauth_transport.Provider,
+    mode: chatgpt_oauth.RefreshMode,
+    expected_account_id: ?[]const u8,
+    store: chatgpt_session.Store,
+) !?Credential {
+    var access = (try chatgpt_oauth.loadAccessForAccountFromStore(
+        alloc,
+        transport,
+        mode,
+        expected_account_id,
+        store,
+    )) orelse return null;
     defer access.deinit(alloc);
     const token = access.access_token;
     access.access_token = &.{};
@@ -668,6 +1112,39 @@ fn loadChatGptCredential(
 
 fn loadStoredChatGptCredential(alloc: std.mem.Allocator) !?Credential {
     return loadChatGptCredential(alloc, oauth_transport.unavailable_provider, .stored);
+}
+
+fn loadChatGptCredentialFromHome(
+    alloc: std.mem.Allocator,
+    transport: oauth_transport.Provider,
+    mode: LoadMode,
+    home: []const u8,
+) !?Credential {
+    const refresh_mode: chatgpt_oauth.RefreshMode = switch (mode) {
+        .stored => .stored,
+        .refresh_if_needed => .if_needed,
+    };
+    return loadChatGptCredentialFromHomeMode(alloc, transport, refresh_mode, home);
+}
+
+fn loadChatGptCredentialFromHomeMode(
+    alloc: std.mem.Allocator,
+    transport: oauth_transport.Provider,
+    mode: chatgpt_oauth.RefreshMode,
+    home: []const u8,
+) !?Credential {
+    var access = (try chatgpt_oauth.loadAccessFromHome(alloc, transport, mode, home)) orelse return null;
+    defer access.deinit(alloc);
+    const token = access.access_token;
+    access.access_token = &.{};
+    const account_id = access.account_id;
+    access.account_id = &.{};
+    return .{
+        .token = token,
+        .source = .chatgpt_subscription,
+        .account_id = account_id,
+        .refresh_after_ms = access.refresh_after_ms,
+    };
 }
 
 fn loadGrokCredential(
@@ -694,6 +1171,39 @@ fn loadStoredGrokCredential(alloc: std.mem.Allocator) !?Credential {
     return loadGrokCredential(alloc, oauth_transport.unavailable_provider, .stored);
 }
 
+fn loadGrokCredentialFromHome(
+    alloc: std.mem.Allocator,
+    transport: oauth_transport.Provider,
+    mode: LoadMode,
+    home: []const u8,
+) !?Credential {
+    const refresh_mode: grok_oauth.RefreshMode = switch (mode) {
+        .stored => .stored,
+        .refresh_if_needed => .if_needed,
+    };
+    return loadGrokCredentialFromHomeMode(alloc, transport, refresh_mode, home);
+}
+
+fn loadGrokCredentialFromHomeMode(
+    alloc: std.mem.Allocator,
+    transport: oauth_transport.Provider,
+    mode: grok_oauth.RefreshMode,
+    home: []const u8,
+) !?Credential {
+    var access = (try grok_oauth.loadAccessFromHome(alloc, transport, mode, home)) orelse return null;
+    defer access.deinit(alloc);
+    const token = access.access_token;
+    access.access_token = &.{};
+    const account_id = access.account_id;
+    access.account_id = &.{};
+    return .{
+        .token = token,
+        .source = .grok_subscription,
+        .account_id = account_id,
+        .refresh_after_ms = access.refresh_after_ms,
+    };
+}
+
 fn nonEmptyEnvValue(name: []const u8) ?[]const u8 {
     return nonEmptyValue(io_mod.getenv(name));
 }
@@ -702,6 +1212,41 @@ fn nonEmptyValue(value: ?[]const u8) ?[]const u8 {
     const raw = value orelse return null;
     if (std.mem.trim(u8, raw, " \t\r\n").len == 0) return null;
     return raw;
+}
+
+test "selected profile state keeps stored authorization in its root" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "state-a/.fx");
+    try tmp.dir.createDirPath(std.testing.io, "state-b/.fx");
+    {
+        var file = try tmp.dir.createFile(std.testing.io, "state-a/.fx/api-key", .{
+            .permissions = std.Io.File.Permissions.fromMode(0o600),
+        });
+        defer file.close(std.testing.io);
+        try file.writeStreamingAll(std.testing.io, "isolated-key\n");
+    }
+    const home_a = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "state-a");
+    defer alloc.free(home_a);
+    const home_b = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "state-b");
+    defer alloc.free(home_b);
+
+    var selected = (try loadStoredKeyCredentialFromHome(alloc, home_a)) orelse
+        return error.TestUnexpectedMissingStoredKey;
+    defer selected.deinit(alloc);
+    try std.testing.expectEqualStrings("isolated-key", selected.token);
+    try std.testing.expect((try loadStoredKeyCredentialFromHome(alloc, home_b)) == null);
+
+    try storeKeyFromHome(alloc, home_b, "state-b-key");
+    var stored_b = (try loadStoredKeyCredentialFromHome(alloc, home_b)) orelse
+        return error.TestUnexpectedMissingStoredKey;
+    defer stored_b.deinit(alloc);
+    try std.testing.expectEqualStrings("state-b-key", stored_b.token);
+    var unchanged_a = (try loadStoredKeyCredentialFromHome(alloc, home_a)) orelse
+        return error.TestUnexpectedMissingStoredKey;
+    defer unchanged_a.deinit(alloc);
+    try std.testing.expectEqualStrings("isolated-key", unchanged_a.token);
 }
 
 pub fn loadFxLoginCredential(
@@ -719,9 +1264,28 @@ pub fn loadFxLoginCredential(
     return takeCredentialFromSession(&session, null);
 }
 
+pub fn loadFxLoginCredentialFromHome(
+    alloc: std.mem.Allocator,
+    transport: oauth_transport.Provider,
+    home: []const u8,
+) !?Credential {
+    var session = (try oauth_session.loadFromHome(alloc, home)) orelse return null;
+    defer session.deinit(alloc);
+    if (session.expired(io_mod.milliTimestamp())) {
+        return refreshFxLoginCredentialLockedFromHome(alloc, transport, .if_needed, home);
+    }
+    return takeCredentialFromSession(&session, null);
+}
+
 fn loadStoredFxLoginCredential(alloc: std.mem.Allocator) !?Credential {
     try requireSourceStorage(.fx_login);
     var session = (try oauth_session.load(alloc)) orelse return null;
+    defer session.deinit(alloc);
+    return takeCredentialFromSession(&session, null);
+}
+
+fn loadStoredFxLoginCredentialFromHome(alloc: std.mem.Allocator, home: []const u8) !?Credential {
+    var session = (try oauth_session.loadFromHome(alloc, home)) orelse return null;
     defer session.deinit(alloc);
     return takeCredentialFromSession(&session, null);
 }
@@ -740,11 +1304,43 @@ pub fn refreshChatGptCredential(
     return loadChatGptCredential(alloc, transport, .force);
 }
 
+pub fn refreshChatGptCredentialFromStore(
+    alloc: std.mem.Allocator,
+    transport: oauth_transport.Provider,
+    store: chatgpt_session.Store,
+) !?Credential {
+    return loadChatGptCredentialFromStore(alloc, transport, .force, store);
+}
+
 pub fn refreshGrokCredential(
     alloc: std.mem.Allocator,
     transport: oauth_transport.Provider,
 ) !?Credential {
     return loadGrokCredential(alloc, transport, .force);
+}
+
+pub fn refreshFxLoginCredentialFromHome(
+    alloc: std.mem.Allocator,
+    transport: oauth_transport.Provider,
+    home: []const u8,
+) !?Credential {
+    return refreshFxLoginCredentialLockedFromHome(alloc, transport, .force, home);
+}
+
+pub fn refreshChatGptCredentialFromHome(
+    alloc: std.mem.Allocator,
+    transport: oauth_transport.Provider,
+    home: []const u8,
+) !?Credential {
+    return loadChatGptCredentialFromHomeMode(alloc, transport, .force, home);
+}
+
+pub fn refreshGrokCredentialFromHome(
+    alloc: std.mem.Allocator,
+    transport: oauth_transport.Provider,
+    home: []const u8,
+) !?Credential {
+    return loadGrokCredentialFromHomeMode(alloc, transport, .force, home);
 }
 
 fn refreshFxLoginCredentialLocked(
@@ -756,6 +1352,25 @@ fn refreshFxLoginCredentialLocked(
     var mutation = (try oauth_session.beginExistingMutation()) orelse return null;
     defer mutation.deinit();
 
+    var session = (try mutation.load(alloc)) orelse return null;
+    defer session.deinit(alloc);
+
+    var refreshed_at_ms: ?i64 = null;
+    if (mode == .force or session.expired(io_mod.milliTimestamp())) {
+        try refreshFxSession(alloc, transport, &mutation, &session);
+        refreshed_at_ms = io_mod.milliTimestamp();
+    }
+    return takeCredentialFromSession(&session, refreshed_at_ms);
+}
+
+fn refreshFxLoginCredentialLockedFromHome(
+    alloc: std.mem.Allocator,
+    transport: oauth_transport.Provider,
+    mode: FxLoginRefreshMode,
+    home: []const u8,
+) !?Credential {
+    var mutation = (try oauth_session.beginExistingMutationFromHome(home)) orelse return null;
+    defer mutation.deinit();
     var session = (try mutation.load(alloc)) orelse return null;
     defer session.deinit(alloc);
 

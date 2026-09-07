@@ -1,3 +1,4 @@
+import { consumeNativeHostAuthorization } from "./internal.js";
 import { CoreOutput, maxCoreMessageBytes } from "./core-output.js";
 import { loadModule } from "./wasm-module.js";
 
@@ -47,11 +48,17 @@ function normalizeAgentOptions(value) {
   if (!value || typeof value !== "object" || Array.isArray(value)) {
     throw new TypeError("createFxAgent() options must be an object");
   }
+  const nativeHostAuth = consumeNativeHostAuthorization(value);
   const options = { ...value };
   if (Object.hasOwn(options, "env")) {
     throw new TypeError("createFxAgent() does not accept env; pass apiKey and model directly");
   }
-  options.apiKey = boundedString(options.apiKey, "apiKey", maxApiKeyBytes, true);
+  options.apiKey = boundedString(
+    options.apiKey,
+    "apiKey",
+    maxApiKeyBytes,
+    !nativeHostAuth,
+  );
   options.model = boundedString(options.model, "model", maxModelBytes, false);
   validateGatewayChatUrl(options.gatewayChatUrl);
   return options;
@@ -59,7 +66,7 @@ function normalizeAgentOptions(value) {
 
 function agentEnvironment(options) {
   return {
-    AI_GATEWAY_API_KEY: options.apiKey,
+    ...(options.apiKey === undefined ? {} : { AI_GATEWAY_API_KEY: options.apiKey }),
     ...(options.model === undefined ? {} : { FX_MODEL: options.model }),
     ...(options.gatewayChatUrl === undefined ? {} : { FX_GATEWAY_CHAT_URL: options.gatewayChatUrl }),
   };
@@ -1199,6 +1206,25 @@ function base64ToBytes(value) {
 }
 
 export async function createFxAgent(options = {}) {
+  if (options?.auth !== undefined) {
+    const entries = Array.isArray(options.auth) ? options.auth : [options.auth];
+    if (entries.length !== 1 || !entries[0] || entries[0].provider !== "gateway") {
+      const error = new Error("WebAssembly libfx supports only Gateway auth; Codex requires the native Node backend");
+      error.code = "LIBFX_CODEX_NATIVE_REQUIRED";
+      throw error;
+    }
+    if (Object.keys(entries[0]).some((key) => key !== "provider" && key !== "apiKey")) {
+      throw new TypeError("Gateway auth accepts only provider and apiKey");
+    }
+    if (typeof entries[0].apiKey !== "string" || !entries[0].apiKey.length) {
+      throw new TypeError("Gateway auth requires a non-empty apiKey");
+    }
+    if (options.apiKey !== undefined && options.apiKey !== entries[0].apiKey) {
+      throw new TypeError("Gateway auth conflicts with apiKey");
+    }
+    const { auth: _auth, ...rest } = options;
+    options = { ...rest, apiKey: entries[0].apiKey };
+  }
   options = normalizeAgentOptions(options);
   const hostTools = normalizeHostTools(options.tools);
   const instructions = normalizeInstructions(options.instructions);
@@ -1206,6 +1232,7 @@ export async function createFxAgent(options = {}) {
   const pending = new Map();
   let nextId = 1;
   let sessionId = null;
+  let configOptions = [];
   let activeTurn = null;
   let closing = false;
   const isCurrentTurn = (turn) => turn && activeTurn === turn && !turn.cancelled && !closing;
@@ -1385,6 +1412,7 @@ export async function createFxAgent(options = {}) {
 
     const sessionResult = await request("libfx/new");
     sessionId = sessionResult.sessionId;
+    configOptions = Array.isArray(sessionResult.configOptions) ? sessionResult.configOptions : [];
     if (initialCheckpoint) {
       await request("libfx/restore", {
         sessionId,
@@ -1400,6 +1428,25 @@ export async function createFxAgent(options = {}) {
   }
 
   const agent = {
+    get configOptions() { return configOptions; },
+    async setConfig(values) {
+      if (closing) throw new Error("fx agent is closed");
+      if (activeTurn) throw new Error("cannot change config while a prompt is active");
+      if (!values || typeof values !== "object" || Array.isArray(values)) {
+        throw new TypeError("config must be an object");
+      }
+      for (const [configId, value] of Object.entries(values)) {
+        if (typeof value !== "string" || value.length === 0) {
+          throw new TypeError(`config value for ${configId} must be a non-empty string`);
+        }
+        const response = await request("session/set_config_option", {
+          sessionId,
+          configId,
+          value,
+        });
+        if (Array.isArray(response?.configOptions)) configOptions = response.configOptions;
+      }
+    },
     prompt(input, promptOptions = {}) {
       if (closing) throw new Error("fx agent is closed");
       if (activeTurn) throw new Error("a prompt is already in progress for this session");
@@ -1418,6 +1465,7 @@ export async function createFxAgent(options = {}) {
       turn?.cancel();
       if (turn) await turn.result.catch(() => {});
       closing = true;
+      runtime.abortHostEffects();
       runtime.closeStdin();
       await runtime.exited;
     },

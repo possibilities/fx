@@ -1,14 +1,26 @@
 const std = @import("std");
 const builtin = @import("builtin");
+const builtin_mcp = @import("../builtins/mcp.zig");
 const io_mod = @import("../core/shared/io.zig");
 const debug_trace = @import("../core/shared/debug_trace.zig");
 const jsonrpc = @import("jsonrpc.zig");
 const acp_types = @import("types.zig");
 const mcp_servers = @import("mcp_servers.zig");
 const server = @import("server.zig");
+const app_history_home = @import("../core/app/app_history_home.zig");
+const credential_authority = @import("../core/auth/credential_authority.zig");
 const session_codec = @import("../core/session/session_codec.zig");
 const session_display_metadata = @import("../core/session/session_display_metadata.zig");
 const session_store = @import("../core/session/session_store.zig");
+
+/// Sessions, prompt history, and usage follow the selected history root; every
+/// other ACP read keeps the profile home that shaped or authorized this launch.
+fn historyHome(state: *const server.ServerState) ?[]const u8 {
+    return app_history_home.forSelection(
+        state.cfg.history_home_override,
+        state.cfg.home_override,
+    );
+}
 const legacy_background_migration = @import("../core/session/legacy_background_migration.zig");
 const js_host_session_store = @import("../core/session/js_host_session_store.zig");
 const session_runtime = @import("../core/session/session.zig");
@@ -55,6 +67,13 @@ pub fn handleNewLibfxSession(
     );
     var session_rt_owned = true;
     defer if (session_rt_owned) session_rt.deinit(alloc);
+    if (comptime !host_target.is_wasm) {
+        _ = try session_rt.initializeProfileUsage(
+            alloc,
+            historyHome(state) orelse io_mod.getenv("HOME"),
+        );
+    }
+    session_rt.usage.setShape(state.cfg.shape, state.cfg.shape_label);
 
     state.active_session = .{
         .session_id = session_id,
@@ -76,6 +95,9 @@ pub fn handleNewLibfxSession(
         .cancel_flag = std.atomic.Value(bool).init(false),
         .pending_prompt_id = null,
     };
+    if (comptime !host_target.is_wasm) {
+        state.active_session.?.session_rt.attachProfileUsagePublisher(alloc);
+    }
     session_id_owned = false;
     model_owned = false;
     session_rt_owned = false;
@@ -123,7 +145,7 @@ pub fn handleNewWasmSession(state: *server.ServerState, alloc: Allocator, msg: *
         .agent_step_limit = state.agent_step_limit,
         .max_tool_result_bytes = state.max_tool_result_bytes,
         .fast_mode = state.fast_mode,
-        .effort = state.effort,
+        .effort = durable.preferences.effort,
         .first_call_tool_choice = state.first_call_tool_choice,
         .permission_mode = state.permission_mode,
         .permission_rules = state.permission_rules,
@@ -186,12 +208,13 @@ pub fn handleNewSession(state: *server.ServerState, alloc: Allocator, msg: *json
         }),
     };
     defer mcp_configs.deinit(alloc);
-    if (!state.cfg.allow_acp_mcp and mcp_configs.items.items.len > 0) {
-        return state.writer.writeError(alloc, msg.id, .{
-            .code = ErrorCode.invalid_params,
-            .message = "MCP servers are unavailable in this runtime",
-        });
-    }
+    if (try rejectUnavailableMcpServers(
+        state,
+        alloc,
+        msg,
+        mcp_configs.items.items.len,
+    )) return;
+    try appendLaunchMcpConfigs(state, alloc, &mcp_configs);
     if (state.cfg.allow_acp_mcp) try appendProjectMcpConfigs(state, alloc, &mcp_configs);
     retireReducedActiveMcp(state, alloc, mcp_configs.items.items);
     var mcp_preparation = try mcp_servers.prepare(
@@ -199,6 +222,7 @@ pub fn handleNewSession(state: *server.ServerState, alloc: Allocator, msg: *json
         &mcp_configs,
         state.client_elicitation,
         server.legacyUrlCompletionSink(state),
+        state.cfg.home_override,
     );
     defer mcp_preparation.deinit(alloc);
     switch (mcp_preparation) {
@@ -217,7 +241,7 @@ pub fn handleNewSession(state: *server.ServerState, alloc: Allocator, msg: *json
         }
     };
 
-    var store = (if (state.cfg.home_override) |home|
+    var store = (if (historyHome(state)) |home|
         session_store.Store.initFromHome(alloc, home, state.workspace_root)
     else
         session_store.Store.init(alloc, state.workspace_root)) catch
@@ -253,7 +277,11 @@ pub fn handleNewSession(state: *server.ServerState, alloc: Allocator, msg: *json
     );
     var session_rt_owned = true;
     defer if (session_rt_owned) session_rt.deinit(alloc);
-    _ = try session_rt.initializeProfileUsage(alloc, io_mod.getenv("HOME"));
+    _ = try session_rt.initializeProfileUsage(
+        alloc,
+        historyHome(state) orelse io_mod.getenv("HOME"),
+    );
+    session_rt.usage.setShape(state.cfg.shape, state.cfg.shape_label);
     if (writable.state.usage) |usage| {
         try session_rt.usage.restore(
             alloc,
@@ -309,7 +337,11 @@ fn writeNewSessionResponse(
     try writeJsonStr(session_id, &out.writer);
     try out.writer.writeAll(",\"configOptions\":[");
     if (comptime !host_target.is_wasm) {
-        try writeProviderConfigOption(&out.writer, state.active_session.?.provider);
+        try writeProviderConfigOption(
+            &out.writer,
+            state.active_session.?.provider,
+            state.cfg.allowed_providers,
+        );
         try out.writer.writeAll(",");
     }
     try writeModelConfigOption(
@@ -445,6 +477,20 @@ pub fn handleListWasmSessions(state: *server.ServerState, alloc: Allocator, msg:
     try state.writer.writeResponse(alloc, msg.id, out.writer.buffered());
 }
 
+fn rejectUnavailableMcpServers(
+    state: *server.ServerState,
+    alloc: Allocator,
+    msg: *jsonrpc.Message,
+    server_count: usize,
+) !bool {
+    if (state.cfg.allow_acp_mcp or server_count == 0) return false;
+    try state.writer.writeError(alloc, msg.id, .{
+        .code = ErrorCode.invalid_params,
+        .message = "MCP servers are unavailable in this runtime",
+    });
+    return true;
+}
+
 pub fn handleRemoveWasmSession(state: *server.ServerState, alloc: Allocator, msg: *jsonrpc.Message) !void {
     const params = msg.params_raw orelse return state.writer.writeError(alloc, msg.id, .{ .code = ErrorCode.invalid_params, .message = "Missing params" });
     const parsed = std.json.parseFromSlice(std.json.Value, alloc, params, .{}) catch
@@ -511,22 +557,21 @@ fn handleRestoreSession(
         }),
     };
     defer mcp_configs.deinit(alloc);
-    if (!state.cfg.allow_acp_mcp) {
-        if (mcp_configs.items.items.len > 0) {
-            return state.writer.writeError(alloc, msg.id, .{
-                .code = ErrorCode.invalid_params,
-                .message = "MCP servers are unavailable in this runtime",
-            });
-        }
-    } else {
-        try appendProjectMcpConfigs(state, alloc, &mcp_configs);
-    }
+    if (try rejectUnavailableMcpServers(
+        state,
+        alloc,
+        msg,
+        mcp_configs.items.items.len,
+    )) return;
+    try appendLaunchMcpConfigs(state, alloc, &mcp_configs);
+    if (state.cfg.allow_acp_mcp) try appendProjectMcpConfigs(state, alloc, &mcp_configs);
     retireReducedActiveMcp(state, alloc, mcp_configs.items.items);
     var mcp_preparation = try mcp_servers.prepare(
         alloc,
         &mcp_configs,
         state.client_elicitation,
         server.legacyUrlCompletionSink(state),
+        state.cfg.home_override,
     );
     defer mcp_preparation.deinit(alloc);
     switch (mcp_preparation) {
@@ -584,7 +629,7 @@ fn handleRestoreSession(
         }
     }
 
-    var store = (if (state.cfg.home_override) |home|
+    var store = (if (historyHome(state)) |home|
         session_store.Store.initFromHome(alloc, home, state.workspace_root)
     else
         session_store.Store.init(alloc, state.workspace_root)) catch
@@ -598,7 +643,7 @@ fn handleRestoreSession(
     const seed_preferences = session_codec.DurableSessionPreferences{
         .provider = state.provider,
         .model = state.configured_model,
-        .effort = state.effort,
+        .effort = state.configured_effort,
         .fast_mode = state.fast_mode,
     };
     var writable = subagent_resume_admission.resumeForExternalPrompt(
@@ -646,7 +691,11 @@ fn handleRestoreSession(
     );
     var session_rt_owned = true;
     defer if (session_rt_owned) session_rt.deinit(alloc);
-    _ = try session_rt.initializeProfileUsage(alloc, io_mod.getenv("HOME"));
+    _ = try session_rt.initializeProfileUsage(
+        alloc,
+        historyHome(state) orelse io_mod.getenv("HOME"),
+    );
+    session_rt.usage.setShape(state.cfg.shape, state.cfg.shape_label);
     try session_rt.restoreWithPermissionState(
         alloc,
         writable.state.conversation_language,
@@ -676,7 +725,7 @@ fn handleRestoreSession(
         .model = model_copy,
         .provider = effective_provider,
         .fast_mode = writable.state.preferences.fast_mode,
-        .effort = writable.state.preferences.effort,
+        .effort = if (state.process_effort_override) state.effort else writable.state.preferences.effort,
         .session_rt = session_rt,
         .mcp = session_mcp,
     }) catch
@@ -793,6 +842,35 @@ fn appendProjectMcpConfigs(
     );
 }
 
+/// Adds the profile server set selected by the launch shape after any
+/// client-supplied ACP servers. The state profile remains the credential
+/// authority; selecting configuration never moves writable MCP credentials.
+fn appendLaunchMcpConfigs(
+    state: *server.ServerState,
+    alloc: Allocator,
+    configs: *mcp_servers.OwnedServerConfigs,
+) !void {
+    const owned_path = if (state.cfg.mcp_config_path == null)
+        if (state.cfg.home_override) |home|
+            try builtin_mcp.configPathFromHome(alloc, home)
+        else
+            null
+    else
+        null;
+    defer if (owned_path) |path| alloc.free(path);
+    const path = state.cfg.mcp_config_path orelse owned_path orelse return;
+    var profile = try builtin_mcp.loadConfigFromPath(alloc, path);
+    defer {
+        for (profile.items) |*config| config.deinit(alloc);
+        profile.deinit(alloc);
+    }
+    try project_config.appendWorkspaceAfterAcpPrimary(
+        alloc,
+        &configs.items,
+        &profile,
+    );
+}
+
 fn sendPendingRecoveryUpdate(
     state: *server.ServerState,
     alloc: Allocator,
@@ -846,7 +924,11 @@ fn writeLoadSessionResponse(
     defer out.deinit();
     try out.writer.writeAll("{\"configOptions\":[");
     if (comptime !host_target.is_wasm) {
-        try writeProviderConfigOption(&out.writer, state.active_session.?.provider);
+        try writeProviderConfigOption(
+            &out.writer,
+            state.active_session.?.provider,
+            state.cfg.allowed_providers,
+        );
         try out.writer.writeAll(",");
     }
     try writeModelConfigOption(
@@ -884,6 +966,7 @@ fn freshAcpState(
     errdefer alloc.free(model);
     const history = try alloc.alloc(types.HistoryTurn, 0);
     errdefer alloc.free(history);
+    const provenance = try acpProvenance(state, alloc);
     return .{
         .id = id,
         .origin_workspace_root = origin,
@@ -894,12 +977,33 @@ fn freshAcpState(
         .preferences = .{
             .provider = state.provider,
             .model = model,
-            .effort = state.effort,
+            .effort = state.configured_effort,
             .fast_mode = state.fast_mode,
         },
         .history = history,
         .total_input_tokens = 0,
         .total_output_tokens = 0,
+        .provenance = provenance,
+    };
+}
+
+/// The shape and credential in effect for an ACP session, recorded the same way
+/// the interactive surface records it so one history reads back identically.
+fn acpProvenance(
+    state: *server.ServerState,
+    alloc: Allocator,
+) !?session_codec.SessionProvenance {
+    const identity = state.cfg.shape orelse return null;
+    return .{
+        .shape = .{
+            .id = try alloc.dupe(u8, state.cfg.shape_label),
+            .identity = identity,
+        },
+        .credential_source = state.credential_source,
+        .credential_identity = if (state.credential_source) |source|
+            credential_authority.derive(source, state.account_id)
+        else
+            null,
     };
 }
 
@@ -1045,7 +1149,7 @@ pub fn handleListSessions(state: *server.ServerState, alloc: Allocator, msg: *js
             .code = ErrorCode.invalid_params,
             .message = "Invalid params",
         });
-    var store = (if (state.cfg.home_override) |home|
+    var store = (if (historyHome(state)) |home|
         session_store.Store.initReadOnlyFromHome(alloc, home, params.cwd orelse state.workspace_root)
     else
         session_store.Store.initReadOnly(alloc, params.cwd orelse state.workspace_root)) catch {
@@ -1110,6 +1214,19 @@ pub fn handleListSessions(state: *server.ServerState, alloc: Allocator, msg: *js
         const iso = try formatIso8601(alloc, summary.updated_at_ms);
         defer alloc.free(iso);
         try writeJsonStr(iso, &out.writer);
+        if (summary.shape != null or summary.credential_source != null) {
+            var shape_hex: [64]u8 = undefined;
+            var account_hex: [64]u8 = undefined;
+            if (summary.shape) |shape| shape_hex = std.fmt.bytesToHex(shape.identity.bytes, .lower);
+            if (summary.credential_identity) |identity| account_hex = std.fmt.bytesToHex(identity.bytes, .lower);
+            try out.writer.writeAll(",\"_meta\":");
+            try std.json.Stringify.value(.{ .fx = .{ .provenance = .{
+                .shape = if (summary.shape) |shape| shape.id else null,
+                .shapeIdentity = if (summary.shape != null) @as(?[]const u8, &shape_hex) else null,
+                .credentialSource = if (summary.credential_source) |source| @as(?[]const u8, @tagName(source)) else null,
+                .credentialIdentity = if (summary.credential_identity != null) @as(?[]const u8, &account_hex) else null,
+            } } }, .{ .emit_null_optional_fields = false }, &out.writer);
+        }
         try out.writer.writeAll("}");
     }
     try out.writer.writeAll("]");
@@ -1432,12 +1549,26 @@ pub fn writeModelConfigOption(
 pub fn writeProviderConfigOption(
     w: *std.Io.Writer,
     current: model_provider.ProviderId,
+    allowed: std.EnumSet(model_provider.ProviderId),
 ) !void {
     try w.writeAll("{\"id\":\"provider\",\"name\":\"Provider\",\"category\":\"model\",\"type\":\"select\",\"currentValue\":");
     try writeJsonStr(@tagName(current), w);
-    try w.writeAll(",\"options\":[{\"value\":\"gateway\",\"name\":\"Vercel AI Gateway\"},{\"value\":\"codex\",\"name\":\"Codex subscription\"}");
-    if (comptime !host_target.is_wasm) {
-        try w.writeAll(",{\"value\":\"grok\",\"name\":\"Grok subscription\"}");
+    try w.writeAll(",\"options\":[");
+    var wrote = false;
+    for ([_]model_provider.ProviderId{ .gateway, .codex, .grok }) |provider| {
+        if (!allowed.contains(provider)) continue;
+        if (comptime host_target.is_wasm) if (provider != .gateway) continue;
+        if (wrote) try w.writeAll(",");
+        try w.writeAll("{\"value\":");
+        try writeJsonStr(@tagName(provider), w);
+        try w.writeAll(",\"name\":");
+        try writeJsonStr(switch (provider) {
+            .gateway => "Vercel AI Gateway",
+            .codex => "Codex subscription",
+            .grok => "Grok subscription",
+        }, w);
+        try w.writeAll("}");
+        wrote = true;
     }
     try w.writeAll("]}");
 }
@@ -1701,6 +1832,65 @@ test "ACP load maps one-off child denial to invalid params" {
     ) != null);
 }
 
+test "ACP restore rejects MCP servers when host capability is disabled" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
+    defer alloc.free(workspace);
+    var capture = try tmp.dir.createFile(
+        io_mod.getIo(),
+        "acp-disabled-mcp-restore.jsonl",
+        .{ .read = true },
+    );
+    defer capture.close(io_mod.getIo());
+
+    {
+        var state = try initAcpSessionTestState(arena, workspace, capture);
+        defer state.deinit();
+        state.cfg.allow_acp_mcp = false;
+        const params =
+            "{\"sessionId\":\"missing\",\"cwd\":\"/\",\"mcpServers\":[" ++
+            "{\"name\":\"blocked\",\"command\":\"/usr/bin/true\",\"args\":[],\"env\":[]}" ++
+            "]}";
+        var load_msg = jsonrpc.Message{
+            .id = .{ .integer = 1 },
+            .method = "session/load",
+            .params_raw = params,
+        };
+        try handleLoadSession(&state, arena, &load_msg);
+        var resume_msg = jsonrpc.Message{
+            .id = .{ .integer = 2 },
+            .method = "session/resume",
+            .params_raw = params,
+        };
+        try handleResumeSession(&state, arena, &resume_msg);
+        try std.testing.expect(state.active_session == null);
+        try capture.sync(io_mod.getIo());
+    }
+
+    var captured_file = try tmp.dir.openFile(
+        io_mod.getIo(),
+        "acp-disabled-mcp-restore.jsonl",
+        .{},
+    );
+    defer captured_file.close(io_mod.getIo());
+    const captured = try io_mod.readFileToEnd(alloc, &captured_file, 4096);
+    defer alloc.free(captured);
+    try std.testing.expectEqual(
+        @as(usize, 2),
+        std.mem.count(u8, captured, "MCP servers are unavailable in this runtime"),
+    );
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        std.mem.count(u8, captured, "failed to start"),
+    );
+}
+
 var acp_session_stable_test_environ: ?*std.process.Environ.Map = null;
 
 fn stableAcpSessionTestEnviron() !*const std.process.Environ.Map {
@@ -1859,6 +2049,47 @@ test "ACP project MCP loading expands workspace environment templates" {
     try std.testing.expectEqualStrings("node", config.command.?);
     try std.testing.expectEqualStrings("fallback", config.args[0]);
     try std.testing.expectEqualStrings("secret-value", config.env[0].value);
+}
+
+test "ACP launch MCP configuration follows the selected profile file" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io_mod.getIo(), "shape/.fx");
+    try tmp.dir.writeFile(io_mod.getIo(), .{
+        .sub_path = "shape/.fx/mcp.json",
+        .data =
+        \\{"mcp":{"client-wins":{"command":"/bin/false"},"shape-only":{"command":"/bin/true"}}}
+        ,
+    });
+    const config_path = try io_mod.dirRealpathAlloc(
+        alloc,
+        tmp.dir,
+        "shape/.fx/mcp.json",
+    );
+    defer alloc.free(config_path);
+    var capture = try tmp.dir.createFile(io_mod.getIo(), "capture.jsonl", .{});
+    defer capture.close(io_mod.getIo());
+
+    var state = server.ServerState{
+        .alloc = alloc,
+        .cfg = acpSessionTestConfig(),
+        .writer = .{ .stdout = capture },
+    };
+    state.cfg.mcp_config_path = config_path;
+    var configs = try mcp_servers.parse(
+        alloc,
+        "{\"mcpServers\":[{\"name\":\"client-wins\",\"command\":\"/bin/echo\",\"args\":[],\"env\":[]}]}",
+    );
+    defer configs.deinit(alloc);
+
+    try appendLaunchMcpConfigs(&state, alloc, &configs);
+
+    try std.testing.expectEqual(@as(usize, 2), configs.items.items.len);
+    try std.testing.expectEqualStrings("client-wins", configs.items.items[0].name);
+    try std.testing.expectEqualStrings("/bin/echo", configs.items.items[0].command.?);
+    try std.testing.expectEqualStrings("shape-only", configs.items.items[1].name);
+    try std.testing.expectEqualStrings("/bin/true", configs.items.items[1].command.?);
 }
 
 test "ACP host-disabled new load and resume skip project MCP effects" {

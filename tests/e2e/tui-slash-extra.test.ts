@@ -13,6 +13,7 @@ import { join } from "node:path";
 import {
   cleanupIsolatedTestHome,
   createIsolatedTestHome,
+  FX_BIN,
   HAS_API_KEY,
 } from "../evals/eval-helpers";
 import { readTrace } from "./tui-render-assertions";
@@ -37,6 +38,10 @@ const CLIPBOARD_PROGRAM = process.platform === "darwin"
     : null;
 
 let session: TmuxSession | null = null;
+
+function shellQuote(value: string): string {
+  return `'${value.replaceAll("'", `'"'"'`)}'`;
+}
 
 afterEach(async () => {
   if (session) { await session.kill(); session = null; }
@@ -816,13 +821,26 @@ describe.skipIf(!tmuxAvailable())("tui: MCP commands", () => {
     async () => {
       const root = mkdtempSync(join(tmpdir(), "fx-mcp-menu-mutate-"));
       const home = join(root, "home");
+      const stateHome = join(root, "state");
       const stderrPath = join(root, "stderr.log");
       mkdirSync(join(home, ".fx"), { recursive: true });
+      mkdirSync(join(stateHome, ".fx"), { recursive: true });
       writeFileSync(join(home, ".fx", "settings.json"), "{}");
+      writeFileSync(join(stateHome, ".fx", "settings.json"), "{}");
+      const ambientProfile = JSON.stringify({
+        mcp: {
+          ambient: {
+            command: ["/usr/bin/false"],
+            enabled: false,
+          },
+        },
+      });
+      writeFileSync(join(home, ".fx", "mcp.json"), ambientProfile);
       const fixture = join(import.meta.dir, "fixtures", "mcp-legacy-stdio.mjs");
 
       try {
         session = await TmuxSession.create({
+          cmd: `${shellQuote(FX_BIN)} --state-dir ${shellQuote(stateHome)}`,
           cwd: root,
           stderrPath,
           env: { HOME: home, FX_AUTO_UPGRADE: "0" },
@@ -842,8 +860,13 @@ describe.skipIf(!tmuxAvailable())("tui: MCP commands", () => {
 
         const added = await session.waitForText("MCP configuration reloaded.", 15_000);
         expect(added).toContain("fixture");
-        const profile = JSON.parse(readFileSync(join(home, ".fx", "mcp.json"), "utf8"));
+        const profile = JSON.parse(
+          readFileSync(join(stateHome, ".fx", "mcp.json"), "utf8"),
+        );
         expect(profile.mcp.fixture.command).toEqual([process.execPath, fixture]);
+        expect(readFileSync(join(home, ".fx", "mcp.json"), "utf8")).toBe(
+          ambientProfile,
+        );
 
         await session.sendKeys("Enter");
         await session.sendKeys("D");
@@ -852,6 +875,13 @@ describe.skipIf(!tmuxAvailable())("tui: MCP commands", () => {
         await session.sendKeys("Enter");
         const removed = await session.waitForText("MCP 0", 15_000);
         expect(removed).toContain("No MCP servers configured.");
+        const selectedAfterRemove = JSON.parse(
+          readFileSync(join(stateHome, ".fx", "mcp.json"), "utf8"),
+        );
+        expect(selectedAfterRemove.mcp.fixture).toBeUndefined();
+        expect(readFileSync(join(home, ".fx", "mcp.json"), "utf8")).toBe(
+          ambientProfile,
+        );
 
         await session.sendKeys("Escape");
         await session.waitForPane(
@@ -876,11 +906,15 @@ describe.skipIf(!tmuxAvailable())("tui: MCP commands", () => {
     async () => {
       const root = mkdtempSync(join(tmpdir(), "fx-mcp-menu-trust-"));
       const home = join(root, "home");
+      const stateHome = join(root, "state");
       const workspace = join(root, "workspace");
       const stderrPath = join(root, "stderr.log");
       mkdirSync(join(home, ".fx"), { recursive: true });
+      mkdirSync(join(stateHome, ".fx"), { recursive: true });
       mkdirSync(workspace);
-      writeFileSync(join(home, ".fx", "settings.json"), "{}");
+      const ambientSettings = '{"fast_mode":false}\n';
+      writeFileSync(join(home, ".fx", "settings.json"), ambientSettings);
+      writeFileSync(join(stateHome, ".fx", "settings.json"), "{}");
       writeFileSync(
         join(workspace, ".mcp.json"),
         JSON.stringify({
@@ -896,6 +930,7 @@ describe.skipIf(!tmuxAvailable())("tui: MCP commands", () => {
 
       try {
         session = await TmuxSession.create({
+          cmd: `${shellQuote(FX_BIN)} --state-dir ${shellQuote(stateHome)}`,
           cwd: workspace,
           stderrPath,
           env: { HOME: home, FX_AUTO_UPGRADE: "0" },
@@ -929,7 +964,7 @@ describe.skipIf(!tmuxAvailable())("tui: MCP commands", () => {
         await session.sendKeys("X");
         await session.waitForText("Reject this project MCP server?", 5_000);
         await session.sendKeys("Enter");
-        const settingsPath = join(home, ".fx", "settings.json");
+        const settingsPath = join(stateHome, ".fx", "settings.json");
         await session.waitForPane(() => {
           const settings = JSON.parse(readFileSync(settingsPath, "utf8"));
           return Object.values(settings.workspaces ?? {}).some(
@@ -939,6 +974,9 @@ describe.skipIf(!tmuxAvailable())("tui: MCP commands", () => {
         }, 15_000);
         const rejected = await session.waitForText("Disabled", 15_000);
         expect(rejected).not.toContain("Pending trust");
+        expect(readFileSync(join(home, ".fx", "settings.json"), "utf8")).toBe(
+          ambientSettings,
+        );
 
         await session.sendKeys("Escape");
         await session.waitForPane((pane) => !pane.includes("[Servers]"), 5_000);

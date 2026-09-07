@@ -34,24 +34,7 @@ pub fn loadStoredCredentials(
     {
         return;
     }
-    const auth = server.config.auth orelse mcp_contract.McpAuthConfig{};
-    var credentials = if (control.cancel_flag) |cancel_flag|
-        try mcp_auth_store.loadCancellable(
-            alloc,
-            server.config.name,
-            try server.config.remoteUrl(),
-            auth.resource,
-            auth.issuer,
-            cancel_flag,
-        )
-    else
-        try mcp_auth_store.load(
-            alloc,
-            server.config.name,
-            try server.config.remoteUrl(),
-            auth.resource,
-            auth.issuer,
-        );
+    var credentials = try loadCredentialsForServer(alloc, server, control.cancel_flag);
     errdefer if (credentials) |*owned| owned.deinit(alloc);
     try connection_control.check(io_mod.getIo(), control);
     server.auth_credentials = credentials;
@@ -60,6 +43,92 @@ pub fn loadStoredCredentials(
         server.auth_credentials != null,
         .release,
     );
+}
+
+/// The selected Fx profile owning this server's credentials, if any.
+fn profileHomeForServer(server: *const McpServer) ?[]const u8 {
+    return server.profile_home;
+}
+
+/// Loads stored credentials from the server's owning profile, falling back to
+/// the ambient profile only when no state root was selected at launch.
+pub fn loadCredentialsForServer(
+    alloc: Allocator,
+    server: *McpServer,
+    cancel_flag: ?*const std.atomic.Value(bool),
+) !?mcp_auth.Credentials {
+    const auth = server.config.auth orelse mcp_contract.McpAuthConfig{};
+    const endpoint = try server.config.remoteUrl();
+    if (profileHomeForServer(server)) |home| {
+        return if (cancel_flag) |flag|
+            mcp_auth_store.loadCancellableFromHome(
+                alloc,
+                server.config.name,
+                endpoint,
+                auth.resource,
+                auth.issuer,
+                flag,
+                home,
+            )
+        else
+            mcp_auth_store.loadFromHome(
+                alloc,
+                server.config.name,
+                endpoint,
+                auth.resource,
+                auth.issuer,
+                home,
+            );
+    }
+    return if (cancel_flag) |flag|
+        mcp_auth_store.loadCancellable(
+            alloc,
+            server.config.name,
+            endpoint,
+            auth.resource,
+            auth.issuer,
+            flag,
+        )
+    else
+        mcp_auth_store.load(
+            alloc,
+            server.config.name,
+            endpoint,
+            auth.resource,
+            auth.issuer,
+        );
+}
+
+pub fn saveCredentialsForServer(
+    alloc: Allocator,
+    server: *const McpServer,
+    credentials: mcp_auth.Credentials,
+) !mcp_auth_store.SaveResult {
+    return if (profileHomeForServer(server)) |home|
+        mcp_auth_store.saveFromHome(
+            alloc,
+            server.config.name,
+            credentials,
+            home,
+        )
+    else
+        mcp_auth_store.save(alloc, server.config.name, credentials);
+}
+
+pub fn deleteCredentialsForServer(
+    alloc: Allocator,
+    server: *const McpServer,
+) !mcp_auth_store.DeleteResult {
+    const endpoint = try server.config.remoteUrl();
+    return if (profileHomeForServer(server)) |home|
+        mcp_auth_store.deleteFromHome(
+            alloc,
+            server.config.name,
+            endpoint,
+            home,
+        )
+    else
+        mcp_auth_store.delete(alloc, server.config.name, endpoint);
 }
 
 pub fn buildResolvedHeaders(alloc: Allocator, server: *McpServer) !ResolvedHeaderSet {
@@ -322,11 +391,7 @@ pub fn refreshSharedCredentials(
     {
         return false;
     }
-    const save_result = try mcp_auth_store.save(
-        alloc,
-        server.config.name,
-        refreshed,
-    );
+    const save_result = try saveCredentialsForServer(alloc, server, refreshed);
     traceCredentialStoreRepair(
         "refresh",
         server.config.name,
@@ -432,11 +497,7 @@ pub fn authorizeForChallenge(
         credentials.deinit(alloc);
         return;
     }
-    const save_result = try mcp_auth_store.save(
-        alloc,
-        server.config.name,
-        credentials,
-    );
+    const save_result = try saveCredentialsForServer(alloc, server, credentials);
     traceCredentialStoreRepair(
         "automated_auth",
         server.config.name,
@@ -717,11 +778,7 @@ pub fn authenticate(
             source.generation,
             cancellation,
         );
-        const save_result = try mcp_auth_store.save(
-            alloc,
-            server.config.name,
-            credentials,
-        );
+        const save_result = try saveCredentialsForServer(alloc, server, credentials);
         repaired_entries = save_result.repaired_entries;
         installAuthCredentials(alloc, server, &credentials);
         transferred = true;
@@ -908,11 +965,7 @@ pub fn logout(alloc: Allocator, catalog_mutex: *std.Io.RwLock, completions: *leg
     if (server.config.source == .workspace and
         server.config.workspace_admission != .approved)
     {
-        const deleted = try mcp_auth_store.delete(
-            alloc,
-            server.config.name,
-            try server.config.remoteUrl(),
-        );
+        const deleted = try deleteCredentialsForServer(alloc, server);
         return .{
             .removed = deleted.removed > 0,
             .repaired_entries = deleted.repaired_entries,
@@ -937,11 +990,7 @@ pub fn logout(alloc: Allocator, catalog_mutex: *std.Io.RwLock, completions: *leg
     var auth = detachAuthForLogout(server);
     server.auth_lock.unlock(io_mod.getIo());
     defer auth.deinit(alloc);
-    const deleted = mcp_auth_store.delete(
-        alloc,
-        server.config.name,
-        try server.config.remoteUrl(),
-    ) catch |err| {
+    const deleted = deleteCredentialsForServer(alloc, server) catch |err| {
         restoreAuthAfterLogout(server, &auth);
         return err;
     };

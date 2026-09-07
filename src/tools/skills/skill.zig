@@ -141,7 +141,13 @@ fn prepareInput(ctx: tool_dispatch.DispatchContext, input: *const Input) !skill_
             return skill_invocation.prepareIdentity(ctx.allocator, .{ .skills = locations.skills, .diagnostics = locations.diagnostics }, input.name, path, ctx.max_tool_result_bytes);
         }
     }
-    var discovery = try builtin_skills.loadVisibleSkillsForTool(ctx.allocator, ctx.workspace_root, ctx.skills_dir);
+    var discovery = try builtin_skills.loadVisibleSkillsForTool(
+        ctx.allocator,
+        ctx.workspace_root,
+        ctx.skills_dir,
+        ctx.profile_home,
+        ctx.skill_root_policy orelse builtin_skills.root_policy,
+    );
     defer discovery.deinit(ctx.allocator);
     skill_runtime.traceDiagnostics("skill_tool", discovery.diagnostics);
     return skill_invocation.prepareIdentity(ctx.allocator, .{ .skills = discovery.skills, .diagnostics = discovery.diagnostics }, input.name, location, ctx.max_tool_result_bytes);
@@ -188,48 +194,12 @@ fn loadSelected(ctx: tool_dispatch.DispatchContext, input: *const Input, prepare
     return skill_invocation.loadWholeByLocation(ctx.allocator, catalog, skill.path, input.resource, ctx.context_limits, ctx.max_tool_result_bytes, ctx.cancel_flag);
 }
 
-pub fn execute(arena: Allocator, workspace_root: []const u8, skills_dir: []const u8, args_json: []const u8) ![]u8 {
-    const result = try executeForSession(arena, workspace_root, skills_dir, args_json);
-    return skill_invocation.takeModelOutput(arena, result);
-}
-
-pub fn executeForSession(
-    arena: Allocator,
-    workspace_root: []const u8,
-    skills_dir: []const u8,
-    args_json: []const u8,
-) !skill_invocation.ExecuteResult {
-    const args = try tool_args.parseToolArgsObject(arena, args_json);
-    const name = try tool_args.requiredStringArg(args, "name");
-    const location = if (args.get("location")) |value| blk: {
-        if (value != .string) return error.InvalidToolArguments;
-        break :blk value.string;
-    } else null;
-    const resource = if (args.get("resource")) |value| blk: {
-        if (value != .string) return error.InvalidToolArguments;
-        break :blk value.string;
-    } else null;
-    const offset = if (args.get("offset")) |value| blk: {
-        if (value != .integer or value.integer < 0) return error.InvalidToolArguments;
-        break :blk std.math.cast(usize, value.integer) orelse return error.InvalidToolArguments;
-    } else 0;
-    return loadByIdentity(
-        arena,
-        workspace_root,
-        skills_dir,
-        name,
-        location,
-        resource,
-        offset,
-        .{},
-        tool_result_limits.default_max_tool_result_bytes,
-    );
-}
-
 fn loadByIdentity(
     alloc: Allocator,
     workspace_root: []const u8,
     skills_dir: []const u8,
+    profile_home: ?[]const u8,
+    root_policy: @import("../../core/skills/skill_contract.zig").RootPolicy,
     name: []const u8,
     location: ?[]const u8,
     resource: ?[]const u8,
@@ -237,7 +207,13 @@ fn loadByIdentity(
     limits: context_limits.Values,
     max_tool_result_bytes: ?usize,
 ) !skill_invocation.ExecuteResult {
-    var discovery = try builtin_skills.loadVisibleSkillsForTool(alloc, workspace_root, skills_dir);
+    var discovery = try builtin_skills.loadVisibleSkillsForTool(
+        alloc,
+        workspace_root,
+        skills_dir,
+        profile_home,
+        root_policy,
+    );
     defer discovery.deinit(alloc);
     skill_runtime.traceDiagnostics("skill_tool", discovery.diagnostics);
     return skill_invocation.loadByIdentity(
@@ -251,7 +227,6 @@ fn loadByIdentity(
         max_tool_result_bytes,
     );
 }
-
 pub fn readsOnly(_: tool_dispatch.ToolInput) bool {
     return false;
 }

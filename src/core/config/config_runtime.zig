@@ -16,7 +16,26 @@ pub const context_limits = @import("context_limits.zig");
 
 const Allocator = std.mem.Allocator;
 const max_settings_bytes: usize = 64 * 1024;
+pub const max_launch_permission_policy_bytes: usize = max_settings_bytes;
 pub const default_permission_mode: types.PermissionMode = .auto;
+
+pub const LaunchPermissionPolicy = struct {
+    path: []u8,
+    rules: types.PermissionRuleSet,
+
+    pub fn deinit(self: *LaunchPermissionPolicy, alloc: Allocator) void {
+        alloc.free(self.path);
+        self.rules.deinit(alloc);
+        self.* = undefined;
+    }
+};
+
+pub const LoadLaunchPermissionPolicyError = error{
+    OutOfMemory,
+    PermissionPolicyUnavailable,
+    PermissionPolicyTooLarge,
+    InvalidPermissionPolicy,
+};
 
 pub const Paths = struct {
     home_dir: ?[]u8 = null,
@@ -149,6 +168,21 @@ pub fn resolveContextLimits(settings: *const Settings, command_line: []const con
     values.apply(settings.context_limits);
     values.applyCommandLine(command_line);
     return values;
+}
+
+/// Reasoning effort requested through `FX_EFFORT`, or null when the variable is
+/// unset, blank, or not a valid effort name. An invalid value never blocks startup.
+pub fn processEffortOverride() ?types.ReasoningEffort {
+    const raw = io_mod.getenv("FX_EFFORT") orelse return null;
+    const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+    if (trimmed.len == 0) return null;
+    if (types.ReasoningEffort.parse(trimmed)) |effort| return effort;
+    debug_trace.logf("config", "ignoring invalid FX_EFFORT value={s}", .{trimmed});
+    return null;
+}
+
+pub fn resolveEffort(configured: ?types.ReasoningEffort) types.ReasoningEffort {
+    return processEffortOverride() orelse configured orelse .auto;
 }
 
 pub const PermissionSourceViews = struct {
@@ -509,6 +543,7 @@ fn loadMergedSettingsDetailedWithOptionalHome(
             sources.models.set(settings.provider orelse .gateway, .process_override);
         }
     }
+    if (processEffortOverride() != null) sources.effort = .process_override;
 
     return .{
         .settings = settings,
@@ -850,6 +885,14 @@ pub fn attemptUserPreferences(
     patch: UserSettingsPatch,
 ) CommitAttempt {
     const home = io_mod.getenv("HOME") orelse return .{ .failure = .{ .err = error.HomeNotSet } };
+    return attemptUserPreferencesFromHome(alloc, home, patch);
+}
+
+pub fn attemptUserPreferencesFromHome(
+    alloc: Allocator,
+    home: []const u8,
+    patch: UserSettingsPatch,
+) CommitAttempt {
     var store = settings_store.Store.initFromHome(alloc, home, .writable) catch |err| {
         return .{ .failure = .{ .err = err } };
     };
@@ -869,6 +912,15 @@ pub fn attemptProjectMcpMutation(
     action: project_config.ProjectMcpAction,
 ) CommitAttempt {
     const home = io_mod.getenv("HOME") orelse return .{ .failure = .{ .err = error.HomeNotSet } };
+    return attemptProjectMcpMutationFromHome(alloc, home, workspace_root, action);
+}
+
+pub fn attemptProjectMcpMutationFromHome(
+    alloc: Allocator,
+    home: []const u8,
+    workspace_root: []const u8,
+    action: project_config.ProjectMcpAction,
+) CommitAttempt {
     var store = settings_store.Store.initFromHome(alloc, home, .writable) catch |err| {
         return .{ .failure = .{ .err = err } };
     };
@@ -898,6 +950,14 @@ pub fn mutateWorkspaceDirectory(
     mutation: WorkspaceDirectoryMutation,
 ) !CommitOutcome {
     const home = io_mod.getenv("HOME") orelse return error.HomeNotSet;
+    return mutateWorkspaceDirectoryFromHome(alloc, home, mutation);
+}
+
+pub fn mutateWorkspaceDirectoryFromHome(
+    alloc: Allocator,
+    home: []const u8,
+    mutation: WorkspaceDirectoryMutation,
+) !CommitOutcome {
     var store = try settings_store.Store.initFromHome(alloc, home, .writable);
     defer store.deinit(alloc);
     return store.applyWorkspaceDirectoryPatch(alloc, mutation);
@@ -908,6 +968,14 @@ pub fn mutatePermission(
     mutation: PermissionMutation,
 ) !CommitOutcome {
     const home = io_mod.getenv("HOME") orelse return error.HomeNotSet;
+    return mutatePermissionFromHome(alloc, home, mutation);
+}
+
+pub fn mutatePermissionFromHome(
+    alloc: Allocator,
+    home: []const u8,
+    mutation: PermissionMutation,
+) !CommitOutcome {
     var store = try settings_store.Store.initFromHome(alloc, home, .writable);
     defer store.deinit(alloc);
     return store.applyPermissionPatch(alloc, mutation);
@@ -922,6 +990,26 @@ pub fn addPermissionRule(
     action: types.PermissionAction,
 ) !CommitOutcome {
     return mutatePermission(alloc, .{
+        .scope = scope,
+        .workspace_root = workspace_root,
+        .patch = .{ .add = .{
+            .category = category,
+            .pattern = pattern,
+            .action = action,
+        } },
+    });
+}
+
+pub fn addPermissionRuleFromHome(
+    alloc: Allocator,
+    home: []const u8,
+    scope: PermissionScope,
+    workspace_root: ?[]const u8,
+    category: []const u8,
+    pattern: []const u8,
+    action: types.PermissionAction,
+) !CommitOutcome {
+    return mutatePermissionFromHome(alloc, home, .{
         .scope = scope,
         .workspace_root = workspace_root,
         .patch = .{ .add = .{
@@ -949,6 +1037,24 @@ pub fn removePermissionRule(
     });
 }
 
+pub fn removePermissionRuleFromHome(
+    alloc: Allocator,
+    home: []const u8,
+    scope: PermissionScope,
+    workspace_root: ?[]const u8,
+    category: []const u8,
+    pattern: []const u8,
+) !CommitOutcome {
+    return mutatePermissionFromHome(alloc, home, .{
+        .scope = scope,
+        .workspace_root = workspace_root,
+        .patch = .{ .remove = .{
+            .category = category,
+            .pattern = pattern,
+        } },
+    });
+}
+
 pub fn removeAllowlistRules(
     alloc: Allocator,
     permission_scope: PermissionScope,
@@ -956,6 +1062,20 @@ pub fn removeAllowlistRules(
     reset_scope: AllowlistResetScope,
 ) !CommitOutcome {
     return mutatePermission(alloc, .{
+        .scope = permission_scope,
+        .workspace_root = workspace_root,
+        .patch = .{ .reset = reset_scope },
+    });
+}
+
+pub fn removeAllowlistRulesFromHome(
+    alloc: Allocator,
+    home: []const u8,
+    permission_scope: PermissionScope,
+    workspace_root: ?[]const u8,
+    reset_scope: AllowlistResetScope,
+) !CommitOutcome {
+    return mutatePermissionFromHome(alloc, home, .{
         .scope = permission_scope,
         .workspace_root = workspace_root,
         .patch = .{ .reset = reset_scope },
@@ -1137,6 +1257,53 @@ fn readOptionalFile(alloc: Allocator, path: []const u8) !?[]u8 {
     const stat = try file.stat(io_mod.getIo());
     if (stat.kind != .file or stat.size > max_settings_bytes) return error.StreamTooLong;
     return try io_mod.readFileToEnd(alloc, &file, max_settings_bytes + 1);
+}
+
+/// Loads one invocation-owned permission policy. The returned path is
+/// canonical and both it and the parsed rules are owned by the caller.
+pub fn loadLaunchPermissionPolicy(
+    alloc: Allocator,
+    path: []const u8,
+) LoadLaunchPermissionPolicyError!LaunchPermissionPolicy {
+    const canonical = io_mod.realpathAlloc(alloc, path) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.PermissionPolicyUnavailable,
+    };
+    errdefer alloc.free(canonical);
+
+    var file = io_mod.openExistingReadOnlyRegularFile(
+        std.Io.Dir.cwd(),
+        canonical,
+        .no_follow,
+    ) catch return error.PermissionPolicyUnavailable;
+    defer file.close(io_mod.getIo());
+
+    const stat = file.stat(io_mod.getIo()) catch return error.PermissionPolicyUnavailable;
+    if (stat.kind != .file) return error.PermissionPolicyUnavailable;
+    if (stat.size > max_launch_permission_policy_bytes) {
+        return error.PermissionPolicyTooLarge;
+    }
+    const bytes = io_mod.readFileToEnd(
+        alloc,
+        &file,
+        max_launch_permission_policy_bytes + 1,
+    ) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.StreamTooLong => return error.PermissionPolicyTooLarge,
+        else => return error.PermissionPolicyUnavailable,
+    };
+    defer alloc.free(bytes);
+
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, bytes, .{}) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.InvalidPermissionPolicy,
+    };
+    defer parsed.deinit();
+    const rules = parsePermissionConfig(alloc, parsed.value) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.InvalidPermissionPolicy,
+    };
+    return .{ .path = canonical, .rules = rules };
 }
 
 fn parseSettingsJson(alloc: Allocator, json_text: []const u8) !Settings {
@@ -2527,6 +2694,83 @@ test "nested permission config preserves JSON object order" {
     try expectPermissionRule(settings.permission_rules.rules[3], "edit", "*", .deny);
 }
 
+test "launch permission policy owns a canonical path and parsed rule order" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(io_mod.getIo(), "nested");
+    try writeFixtureFile(
+        tmp.dir,
+        "policy.json",
+        "{\"bash\":{\"git *\":\"allow\",\"git push *\":\"deny\"},\"edit\":\"deny\"}",
+    );
+    const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(root);
+    const raw_path = try std.fs.path.join(alloc, &.{ root, "nested", "..", "policy.json" });
+    defer alloc.free(raw_path);
+    const expected = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "policy.json");
+    defer alloc.free(expected);
+
+    var policy = try loadLaunchPermissionPolicy(alloc, raw_path);
+    defer policy.deinit(alloc);
+
+    try std.testing.expect(policy.path.ptr != raw_path.ptr);
+    try std.testing.expectEqualStrings(expected, policy.path);
+    try std.testing.expectEqual(@as(usize, 3), policy.rules.rules.len);
+    try expectPermissionRule(policy.rules.rules[0], "bash", "git *", .allow);
+    try expectPermissionRule(policy.rules.rules[1], "bash", "git push *", .deny);
+    try expectPermissionRule(policy.rules.rules[2], "edit", "*", .deny);
+}
+
+test "launch permission policy rejects unavailable malformed and oversized files" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(io_mod.getIo(), "directory");
+    try writeFixtureFile(tmp.dir, "malformed.json", "{not json");
+    try writeFixtureFile(tmp.dir, "invalid-rule.json", "{\"bash\":\"sometimes\"}");
+    const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(root);
+    const missing = try std.fs.path.join(alloc, &.{ root, "missing.json" });
+    defer alloc.free(missing);
+    const directory = try std.fs.path.join(alloc, &.{ root, "directory" });
+    defer alloc.free(directory);
+    const malformed = try std.fs.path.join(alloc, &.{ root, "malformed.json" });
+    defer alloc.free(malformed);
+    const invalid_rule = try std.fs.path.join(alloc, &.{ root, "invalid-rule.json" });
+    defer alloc.free(invalid_rule);
+    const oversized = try std.fs.path.join(alloc, &.{ root, "oversized.json" });
+    defer alloc.free(oversized);
+    try writeRepeatedByteAbsolute(
+        oversized,
+        'x',
+        max_launch_permission_policy_bytes + 1,
+    );
+
+    try std.testing.expectError(
+        error.PermissionPolicyUnavailable,
+        loadLaunchPermissionPolicy(alloc, missing),
+    );
+    try std.testing.expectError(
+        error.PermissionPolicyUnavailable,
+        loadLaunchPermissionPolicy(alloc, directory),
+    );
+    try std.testing.expectError(
+        error.InvalidPermissionPolicy,
+        loadLaunchPermissionPolicy(alloc, malformed),
+    );
+    try std.testing.expectError(
+        error.InvalidPermissionPolicy,
+        loadLaunchPermissionPolicy(alloc, invalid_rule),
+    );
+    try std.testing.expectError(
+        error.PermissionPolicyTooLarge,
+        loadLaunchPermissionPolicy(alloc, oversized),
+    );
+}
+
 test "parsePermissionMode accepts only exact case-insensitive labels" {
     try std.testing.expectEqual(types.PermissionMode.ask, parsePermissionMode("ask").?);
     try std.testing.expectEqual(types.PermissionMode.ask, parsePermissionMode("ASK").?);
@@ -3565,6 +3809,60 @@ test "detailed settings report non-empty process model override as winning sourc
     try std.testing.expectEqual(ConfigSource.process_override, result.sources.models.get(.gateway));
     try std.testing.expectEqual(ModelSource.process_override, result.model_source.?);
     try std.testing.expectEqualStrings("user/model", result.settings.models.get(.gateway).?);
+}
+
+test "detailed settings report valid process effort override as winning source" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
+    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
+
+    const home_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "home");
+    defer std.testing.allocator.free(home_root);
+    const workspace_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "workspace");
+    defer std.testing.allocator.free(workspace_root);
+    try writeFixtureFile(tmp.dir, "home/.fx/settings.json", "{\"effort\":\"low\"}\n");
+
+    const home = try TestHome.install(std.testing.allocator, home_root);
+    defer home.deinit();
+    try home.map.put("FX_EFFORT", " high ");
+
+    var result = try loadMergedSettingsDetailedFromHome(std.testing.allocator, home_root, workspace_root);
+    defer result.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(ConfigSource.process_override, result.sources.effort);
+    try std.testing.expect(result.settings.effort.?.eql(types.ReasoningEffort.literal("low")));
+    try std.testing.expect(processEffortOverride().?.eql(types.ReasoningEffort.literal("high")));
+    try std.testing.expect(resolveEffort(result.settings.effort).eql(types.ReasoningEffort.literal("high")));
+}
+
+test "blank or invalid process effort override is ignored" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
+    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
+
+    const home_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "home");
+    defer std.testing.allocator.free(home_root);
+    const workspace_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "workspace");
+    defer std.testing.allocator.free(workspace_root);
+    try writeFixtureFile(tmp.dir, "home/.fx/settings.json", "{\"effort\":\"low\"}\n");
+
+    const home = try TestHome.install(std.testing.allocator, home_root);
+    defer home.deinit();
+
+    inline for (&.{ "", "   ", "not valid!", "x" ** (types.ReasoningEffort.max_name_bytes + 1) }) |raw| {
+        try home.map.put("FX_EFFORT", raw);
+        var result = try loadMergedSettingsDetailedFromHome(std.testing.allocator, home_root, workspace_root);
+        defer result.deinit(std.testing.allocator);
+        try std.testing.expectEqual(ConfigSource.user_global, result.sources.effort);
+        try std.testing.expect(processEffortOverride() == null);
+        try std.testing.expect(resolveEffort(result.settings.effort).eql(types.ReasoningEffort.literal("low")));
+    }
+
+    try home.map.put("FX_EFFORT", "default");
+    try std.testing.expectEqual(types.ReasoningEffort.auto, processEffortOverride().?);
+    try std.testing.expectEqual(types.ReasoningEffort.auto, resolveEffort(types.ReasoningEffort.literal("low")));
 }
 
 test "invalid user model emits typed diagnostic and project model is ignored" {

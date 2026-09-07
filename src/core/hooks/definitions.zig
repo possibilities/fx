@@ -91,6 +91,13 @@ pub const Scope = struct {
     workspace_root: []const u8,
     session_id: ?[]const u8 = null,
     subagent_id: ?u64 = null,
+    /// The main session that owned this subagent when the work was admitted,
+    /// captured rather than read live. A `/new` or resume replaces the active
+    /// main session while a child is still running, and reattributing that
+    /// child's later records to the new session makes two records about one
+    /// child disagree about its parent. Null on a main scope, and null on a
+    /// subagent scope whose caller has no captured identity to offer.
+    parent_session_id: ?[]const u8 = null,
 };
 
 pub const Invocation = struct {

@@ -9,6 +9,7 @@ const types = @import("../shared/types.zig");
 const stream_provider = @import("../agent/stream_provider.zig");
 const model_provider = @import("../config/model_provider.zig");
 const credential_authority = @import("../auth/credential_authority.zig");
+const shape_authority = @import("../auth/shape_authority.zig");
 pub const usage_report = @import("usage_report.zig");
 
 const Allocator = std.mem.Allocator;
@@ -272,6 +273,9 @@ pub const PendingGeneration = struct {
     credential_source: ?types.CredentialSource = null,
     credential_identity: ?credential_authority.Identity = null,
     account_id: ?[]u8 = null,
+    /// The shape that made this request. Null only for a record written before
+    /// shape authority, or by a host that declares no shape.
+    shape: ?shape_authority.Reference = null,
     observed_at_ms: ?i64 = null,
 
     fn deinit(self: *PendingGeneration, alloc: Allocator) void {
@@ -279,6 +283,7 @@ pub const PendingGeneration = struct {
         alloc.free(self.origin);
         if (self.team) |team| alloc.free(team);
         if (self.account_id) |account_id| alloc.free(account_id);
+        if (self.shape) |*shape| shape.deinit(alloc);
         self.* = undefined;
     }
 
@@ -290,6 +295,8 @@ pub const PendingGeneration = struct {
         const team = if (self.team) |value| try alloc.dupe(u8, value) else null;
         errdefer if (team) |value| alloc.free(value);
         const account_id = if (self.account_id) |value| try alloc.dupe(u8, value) else null;
+        errdefer if (account_id) |value| alloc.free(value);
+        const shape = if (self.shape) |value| try value.dupe(alloc) else null;
         return .{
             .id = id,
             .sequence = self.sequence,
@@ -298,6 +305,7 @@ pub const PendingGeneration = struct {
             .team = team,
             .credential_source = self.credential_source,
             .credential_identity = self.credential_identity,
+            .shape = shape,
             .account_id = account_id,
             .observed_at_ms = self.observed_at_ms,
         };
@@ -380,6 +388,11 @@ pub const Usage = struct {
     lines_removed: u64 = 0,
     models: std.ArrayList(ModelAggregate) = .empty,
     pending: std.ArrayList(PendingGeneration) = .empty,
+    /// The shape this process is running. It cannot change inside a process, so
+    /// every generation this runtime observes carries the same one.
+    shape: ?shape_authority.Identity = null,
+    /// Borrowed for the process; the label lives with the launch that set it.
+    shape_label: []const u8 = shape_authority.default_label,
     publication_backlog: std.ArrayList(usage_report.GenerationFact) = .empty,
     incidents: [max_usage_incidents]usage_report.Incident = undefined,
     incident_count: usize = 0,
@@ -454,6 +467,12 @@ pub const Usage = struct {
         if (session_started_at_ms <= 0 or session_started_at_ms > now_ms) return;
         self.wall_duration_complete = true;
         self.active_started_at_ms = session_started_at_ms;
+    }
+
+    /// Declares the shape every generation this runtime observes was made by.
+    pub fn setShape(self: *Usage, identity: ?shape_authority.Identity, label: []const u8) void {
+        self.shape = identity;
+        self.shape_label = label;
     }
 
     pub fn reserveInvocation(self: *Usage) !u64 {
@@ -938,6 +957,19 @@ pub const Usage = struct {
         );
     }
 
+    /// Shapes compare by digest. A record written before shape authority has
+    /// none and matches a runtime that declares none; anything else must agree.
+    fn optionalShapesEqual(
+        stored: ?shape_authority.Reference,
+        current: ?shape_authority.Identity,
+    ) bool {
+        if (stored) |value| {
+            const live = current orelse return false;
+            return value.identity.eql(live);
+        }
+        return current == null;
+    }
+
     fn observeGenerationFieldsUnlocked(
         self: *Usage,
         alloc: Allocator,
@@ -963,7 +995,8 @@ pub const Usage = struct {
                     !optionalStringsEqual(pending.team, team) or
                     pending.credential_source != credential_source or
                     !optionalCredentialIdentitiesEqual(pending.credential_identity, credential_identity) or
-                    !optionalStringsEqual(pending.account_id, account_id))
+                    !optionalStringsEqual(pending.account_id, account_id) or
+                    !optionalShapesEqual(pending.shape, self.shape))
                 {
                     self.billing = .incomplete;
                     self.dirty = true;
@@ -993,6 +1026,13 @@ pub const Usage = struct {
                 value.len,
             ) catch return self.failOverflow();
         }
+        if (self.shape != null) {
+            added_identifier_bytes = std.math.add(
+                usize,
+                added_identifier_bytes,
+                self.shape_label.len,
+            ) catch return self.failOverflow();
+        }
         const next_identifier_bytes = std.math.add(
             usize,
             self.identifierBytesUnlocked(),
@@ -1011,6 +1051,11 @@ pub const Usage = struct {
         errdefer if (owned_team) |value| alloc.free(value);
         const owned_account_id = if (account_id) |value| try alloc.dupe(u8, value) else null;
         errdefer if (owned_account_id) |value| alloc.free(value);
+        const owned_shape: ?shape_authority.Reference = if (self.shape) |identity| .{
+            .id = try alloc.dupe(u8, self.shape_label),
+            .identity = identity,
+        } else null;
+        errdefer if (owned_shape) |value| alloc.free(value.id);
         try self.pending.append(alloc, .{
             .id = owned_id,
             .sequence = sequence,
@@ -1020,6 +1065,7 @@ pub const Usage = struct {
             .credential_source = credential_source,
             .credential_identity = credential_identity,
             .account_id = owned_account_id,
+            .shape = owned_shape,
             .observed_at_ms = io_mod.milliTimestamp(),
         });
         if (self.billing == .complete) self.billing = .pending;
@@ -2691,6 +2737,7 @@ pub fn writeRichSnapshot(writer: *std.Io.Writer, snapshot: Snapshot) !void {
         } else {
             try writer.writeAll("null");
         }
+        try writePendingShape(writer, pending);
         try writer.writeByte('}');
     }
     try writer.writeAll("],\"publication_backlog\":[");
@@ -2731,6 +2778,20 @@ fn writePendingAuthority(writer: *std.Io.Writer, pending: PendingGeneration) !vo
     } else {
         try writer.writeAll("null");
     }
+}
+
+/// Shape travels with the rich sidecar entry only. The durable session payload
+/// is frozen in its pre-usage-dashboard shape because older binaries reject
+/// unknown snapshot fields outright, so a field added there makes every session
+/// this build writes unreadable on rollback. `observed_at_ms` is kept out of
+/// the shared helper for exactly this reason; shape follows it.
+fn writePendingShape(writer: *std.Io.Writer, pending: PendingGeneration) !void {
+    const shape = pending.shape orelse return;
+    try writer.writeAll(",\"shape_id\":");
+    try std.json.Stringify.value(shape.id, .{}, writer);
+    try writer.writeAll(",\"shape_identity\":");
+    const hex = std.fmt.bytesToHex(shape.identity.bytes, .lower);
+    try std.json.Stringify.value(&hex, .{}, writer);
 }
 
 /// Parses either the rollback-readable or current usage snapshot schema.
@@ -2851,12 +2912,13 @@ pub fn parseSnapshotValue(alloc: Allocator, value: std.json.Value) !Snapshot {
         if (pending_entry != .object) return error.InvalidUsageSnapshot;
         const provider_scoped = pending_entry.object.contains("provider");
         const has_observed_at = pending_entry.object.contains("observed_at_ms");
-        const expected_pending_fields: usize = if (provider_scoped)
-            if (has_observed_at) 9 else 8
-        else if (has_observed_at)
-            5
-        else
-            4;
+        const shape_scoped = pending_entry.object.contains("shape_identity");
+        // A shape is recorded only beside the authority it was used with, so a
+        // shape without provider scoping is a record we refuse to read.
+        if (shape_scoped and !provider_scoped) return error.InvalidUsageSnapshot;
+        var expected_pending_fields: usize = if (provider_scoped) 8 else 4;
+        if (has_observed_at) expected_pending_fields += 1;
+        if (shape_scoped) expected_pending_fields += 2;
         if (pending_entry != .object or
             pending_entry.object.count() != expected_pending_fields)
         {
@@ -2901,6 +2963,21 @@ pub fn parseSnapshotValue(alloc: Allocator, value: std.json.Value) !Snapshot {
         else
             null;
         errdefer if (account_id) |text| alloc.free(text);
+        const shape: ?shape_authority.Reference = if (shape_scoped) shape: {
+            const label = pending_entry.object.get("shape_id") orelse
+                return error.InvalidUsageSnapshot;
+            if (label != .string) return error.InvalidUsageSnapshot;
+            shape_authority.validateLabel(label.string) catch
+                return error.InvalidUsageSnapshot;
+            const identity = (try parseCredentialIdentityOptional(
+                pending_entry.object.get("shape_identity"),
+            )) orelse return error.InvalidUsageSnapshot;
+            break :shape .{
+                .id = try alloc.dupe(u8, label.string),
+                .identity = .{ .bytes = identity.bytes },
+            };
+        } else null;
+        errdefer if (shape) |stored| alloc.free(stored.id);
         pending[index] = .{
             .id = id,
             .sequence = sequence,
@@ -2910,6 +2987,7 @@ pub fn parseSnapshotValue(alloc: Allocator, value: std.json.Value) !Snapshot {
             .credential_source = credential_source,
             .credential_identity = credential_identity,
             .account_id = account_id,
+            .shape = shape,
             .observed_at_ms = observed_at_ms,
         };
         pending_count += 1;
@@ -3528,6 +3606,7 @@ fn parseCredentialIdentityOptional(value: ?std.json.Value) !?credential_authorit
     return switch (actual) {
         .null => null,
         .string => |hex| identity: {
+            if (hex.len != Sha256.digest_length * 2) return error.InvalidUsageSnapshot;
             var bytes: [Sha256.digest_length]u8 = undefined;
             _ = std.fmt.hexToBytes(&bytes, hex) catch return error.InvalidUsageSnapshot;
             const canonical = std.fmt.bytesToHex(bytes, .lower);
@@ -5129,6 +5208,10 @@ test "populated usage snapshot keeps the rollback-readable durable shape" {
     const alloc = std.testing.allocator;
     var usage = Usage.initFresh();
     defer usage.deinit(alloc);
+    // Every real launch sets a shape, so the guard must hold with one set.
+    // Without this the durable payload could grow keys and this test would
+    // still pass, which is exactly how a rollback break reached review.
+    usage.setShape(shape_authority.derive(.{ .system_prompt = "review" }), "reviewer");
 
     const first_sequence = try usage.reserveInvocation();
     try usage.finishObservedInvocation(
@@ -5881,4 +5964,72 @@ test "host-managed reconciliation records authority without credential bytes" {
         credential_authority.derive(.host_managed, null).?,
     ));
     try std.testing.expect(!usage.reconciliation_credential_blocked);
+}
+
+test "usage generations carry the shape that made them and fail closed on a mismatch" {
+    const alloc = std.testing.allocator;
+    const reviewer = shape_authority.derive(.{ .system_prompt = "review carefully" });
+    var usage = Usage.initFresh();
+    defer usage.deinit(alloc);
+    usage.setShape(reviewer, "reviewer");
+
+    const sequence = try usage.reserveInvocation();
+    try usage.finishDeferredInvocation(alloc, sequence, 1, .observed_generation, .{
+        .provider = .codex,
+        .generation_id = "gen_01ARZ3NDEKTSV4RRFFQ69GABCD",
+        .scope = "https://chatgpt.com",
+        .credential_source = .chatgpt_subscription,
+        .credential_identity = credential_authority.derive(.chatgpt_subscription, "acct_1"),
+        .account_id = "acct_1",
+    });
+
+    var snapshot = try usage.snapshot(alloc);
+    defer snapshot.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), snapshot.pending.len);
+    try std.testing.expectEqualStrings("reviewer", snapshot.pending[0].shape.?.id);
+    try std.testing.expect(snapshot.pending[0].shape.?.identity.eql(reviewer));
+
+    // Shape rides the rich sidecar and round trips there.
+    var encoded: std.Io.Writer.Allocating = .init(alloc);
+    defer encoded.deinit();
+    try writeRichSnapshot(&encoded.writer, snapshot);
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, encoded.written(), .{});
+    defer parsed.deinit();
+    var restored = try parseSnapshotValue(alloc, parsed.value);
+    defer restored.deinit(alloc);
+    try std.testing.expectEqualStrings("reviewer", restored.pending[0].shape.?.id);
+    try std.testing.expect(restored.pending[0].shape.?.identity.eql(reviewer));
+
+    // The durable payload must not have grown: an older binary rejects unknown
+    // snapshot fields, so a key added here makes this session unreadable on
+    // rollback. Eight keys is the frozen pre-usage-dashboard shape.
+    var durable: std.Io.Writer.Allocating = .init(alloc);
+    defer durable.deinit();
+    try writeSnapshot(&durable.writer, snapshot);
+    var durable_parsed = try std.json.parseFromSlice(std.json.Value, alloc, durable.written(), .{});
+    defer durable_parsed.deinit();
+    for (durable_parsed.value.object.get("pending").?.array.items) |pending| {
+        try std.testing.expectEqual(@as(usize, 8), pending.object.count());
+        try std.testing.expect(pending.object.get("shape_id") == null);
+        try std.testing.expect(pending.object.get("shape_identity") == null);
+    }
+
+    // Re-observing the same generation under a different shape is a conflict,
+    // not a silent overwrite: the digest, not the label, decides.
+    usage.setShape(shape_authority.derive(.{ .system_prompt = "build quickly" }), "builder");
+    const second = try usage.reserveInvocation();
+    try std.testing.expectError(error.ConflictingGenerationIdentity, usage.finishDeferredInvocation(
+        alloc,
+        second,
+        1,
+        .observed_generation,
+        .{
+            .provider = .codex,
+            .generation_id = "gen_01ARZ3NDEKTSV4RRFFQ69GABCD",
+            .scope = "https://chatgpt.com",
+            .credential_source = .chatgpt_subscription,
+            .credential_identity = credential_authority.derive(.chatgpt_subscription, "acct_1"),
+            .account_id = "acct_1",
+        },
+    ));
 }

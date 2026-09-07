@@ -26,9 +26,14 @@ pub const State = struct {
     pending_turn_end_error: usize = 0,
     pending_attention_required: usize = 0,
 
-    fn configure(self: *State, bell: notification_sound.BellSink) void {
+    fn configure(self: *State, bell: notification_sound.BellSink) std.mem.Allocator.Error!void {
         std.debug.assert(self.player == null);
-        self.player = notification_sound.Player.init(bell);
+        self.player = try notification_sound.Player.init(bell);
+    }
+
+    pub fn deinit(self: *State) void {
+        if (self.player) |*player| player.deinit();
+        self.player = null;
     }
 
     fn setPreferences(self: *State, next: Preferences) void {
@@ -119,7 +124,7 @@ pub const State = struct {
 fn Runtime(comptime App: type) type {
     return struct {
         pub fn configure(app: *App) !void {
-            app.notifications.configure(.{
+            try app.notifications.configure(.{
                 .ctx = app,
                 .emit = emitInteractiveBell,
             });

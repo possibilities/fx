@@ -12,6 +12,7 @@ const provider_set = @import("../gateway/provider_set.zig");
 const host = @import("../hosts/host.zig");
 const host_target = @import("../hosts/target.zig");
 const io_mod = @import("../shared/io.zig");
+const config_runtime = @import("../config/config_runtime.zig");
 const prompt_policy = @import("../config/prompt_policy.zig");
 const skill_contract = @import("../skills/skill_contract.zig");
 const command_specs = @import("../slash_commands/command_specs.zig");
@@ -21,6 +22,7 @@ const mcp_contract = @import("../mcp/mcp_contract.zig");
 const mcp_command_provider = @import("../mcp/command_provider.zig");
 const mcp_health = @import("../mcp/health.zig");
 const mcp_runtime = @import("../mcp/mcp_runtime.zig");
+const tool_selection = @import("../tooling/tool_selection.zig");
 const tool_set_contract = @import("../tooling/tool_set.zig");
 const update_target = @import("../upgrade/update_target.zig");
 const test_builtin_gateway = if (builtin.is_test)
@@ -92,6 +94,7 @@ pub const Config = struct {
     context_registry: context_contract.Registry,
     mode_registry: mode_registry.Registry,
     tool_set: tool_set_contract.ToolSet,
+    tool_selection_catalog: tool_selection.Catalog = .{},
     inspect_mcp_profile_config: mcp_contract.InspectProfileConfigFn,
     inspect_mcp_local_config: mcp_health.InspectLocalConfigFn =
         mcp_health.inspectLocalConfigUnavailable,
@@ -235,8 +238,38 @@ fn unavailableCliDispatch(_: ?*anyopaque, _: Allocator, _: []const [:0]const u8,
     return error.UnknownCliCommand;
 }
 
+/// A host that serves the inherited Codex credential channel owns the type
+/// that holds it between launch parsing and broker startup. Every other host
+/// gets an inert stand-in, so the entry sequence stays one shape.
+fn CodexCredentialBrokerActivationType(comptime App: type) type {
+    if (@hasDecl(App, "CodexCredentialBrokerActivation")) {
+        return App.CodexCredentialBrokerActivation;
+    }
+    return struct {
+        fn deinit(self: *@This()) void {
+            self.* = .{};
+        }
+    };
+}
+
 fn runInteractiveWithDeps(comptime App: type, comptime cooperative: bool, alloc: Allocator, launch: *cli_surface.InteractiveLaunch, auth_mode: credentials.AuthMode, deps: RunDeps) !RunOutcome {
+    if (comptime cooperative) {
+        if (launch.modifiers.hasCodexCredentialBrokerActivation()) {
+            return error.CodexCredentialBrokerUnsupported;
+        }
+    }
     const resume_requested = launch.requested_resume != null;
+    // The descriptor is validated and closed on exec before anything the app
+    // bootstrap might spawn exists.
+    var codex_credential_activation: CodexCredentialBrokerActivationType(App) =
+        if (comptime !cooperative and @hasDecl(App, "prepareCodexCredentialBrokerActivation"))
+            App.prepareCodexCredentialBrokerActivation(launch) catch |err| {
+                reportUnexpectedInteractiveError(deps, err);
+                return err;
+            }
+        else
+            .{};
+    defer codex_credential_activation.deinit();
     var app = App.init(alloc, launch, auth_mode) catch |err| {
         switch (err) {
             error.NotATerminal => {
@@ -291,6 +324,18 @@ fn runInteractiveWithDeps(comptime App: type, comptime cooperative: bool, alloc:
             },
         }
     };
+    if (comptime !cooperative) {
+        // All-or-none: the broker is serving before any other startup callback
+        // runs, or the launch fails here rather than reporting Fx as started.
+        if (comptime @hasDecl(App, "startCodexCredentialBroker")) {
+            app.startCodexCredentialBroker(&codex_credential_activation) catch |err| {
+                app.releaseTerminal();
+                reportUnexpectedInteractiveError(deps, err);
+                app.deinit();
+                return err;
+            };
+        }
+    }
     var app_needs_deinit = true;
     defer if (app_needs_deinit) app.deinit();
     if (comptime !cooperative and @hasField(App, "session") and
@@ -327,6 +372,15 @@ fn runInteractiveWithDeps(comptime App: type, comptime cooperative: bool, alloc:
         app.takeUpgradeRelaunchRequest()
     else
         null;
+    const broker_relaunch_blocked = !cooperative and
+        launch.modifiers.hasCodexCredentialBrokerActivation();
+    const relaunch_skill_roots = try cloneInvocationSkillRootsForRelaunch(
+        App,
+        alloc,
+        &app,
+        relaunch_request != null,
+    );
+    defer freeInvocationSkillRoots(alloc, relaunch_skill_roots);
     const resume_handoff_columns: u16 = if (comptime cooperative)
         0
     else if (comptime @hasDecl(App, "resumeHandoffColumns"))
@@ -342,24 +396,50 @@ fn runInteractiveWithDeps(comptime App: type, comptime cooperative: bool, alloc:
         app.deinit();
         break :blk null;
     } else app.deinitWithResumeHandoff();
+    if (relaunch_request != null and broker_relaunch_blocked) {
+        if (handoff_value) |value| {
+            var handoff = value;
+            handoff.deinit(alloc);
+        }
+        // exec preserves the PID, but the replacement would mint a new broker
+        // nonce and cannot authenticate the existing host channel. Carrying
+        // that secret in argv would expose the authority it protects, so a
+        // fresh host launch is the only valid replacement. Never print a
+        // partial recovery argv that silently omits the credential channel.
+        writeStderr(
+            deps,
+            "fx: upgrade installed; restart from your host to apply it. This session's credential channel cannot survive a restart.\n",
+        );
+        return .{ .exit = 1 };
+    }
     if (relaunch_request) |request| {
         if (handoff_value) |value| {
             var handoff = value;
             defer handoff.deinit(alloc);
-            var argv = [_][]const u8{
-                request.executablePath(),
-                "resume",
+            var relaunch_args = try UpgradeRelaunchArguments.init(
+                alloc,
+                launch,
                 handoff.session_id,
-                cli_surface.upgrade_relaunch_arg,
-                request.previousRevision() orelse "",
-            };
-            const argv_slice = if (request.previousRevision() == null) argv[0..4] else argv[0..5];
+                relaunch_skill_roots,
+            );
+            defer relaunch_args.deinit(alloc);
+            var process_argv = try relaunch_args.processArgv(
+                alloc,
+                request.executablePath(),
+                request.previousRevision(),
+            );
+            defer process_argv.deinit(alloc);
             const replace_err = deps.replace_process(
                 deps.replace_ctx,
                 io_mod.getIo(),
-                .{ .argv = argv_slice },
+                .{ .argv = process_argv.items },
             );
-            writeUpgradeRelaunchFailure(deps, replace_err, handoff.session_id);
+            writeUpgradeRelaunchFailure(
+                alloc,
+                deps,
+                replace_err,
+                relaunch_args.args.items,
+            );
         } else {
             writeStderr(
                 deps,
@@ -393,18 +473,238 @@ fn replaceProcessDefault(
     return std.process.replace(zio, options);
 }
 
+const UpgradeRelaunchArguments = struct {
+    args: std.ArrayList([]const u8) = .empty,
+    owned_args: std.ArrayList([]u8) = .empty,
+
+    fn init(
+        alloc: Allocator,
+        launch: *const cli_surface.InteractiveLaunch,
+        session_id: []const u8,
+        invocation_skill_roots: []const []const u8,
+    ) !UpgradeRelaunchArguments {
+        var result = UpgradeRelaunchArguments{};
+        errdefer result.deinit(alloc);
+
+        for (launch.modifiers.context_limit_overrides) |override| {
+            try result.append(alloc, "--context-limit");
+            const rendered = switch (override.value) {
+                .bytes => |bytes| try std.fmt.allocPrint(
+                    alloc,
+                    "{s}={d}",
+                    .{ @tagName(override.name), bytes },
+                ),
+                .off => try std.fmt.allocPrint(
+                    alloc,
+                    "{s}=off",
+                    .{@tagName(override.name)},
+                ),
+            };
+            try result.appendOwned(alloc, rendered);
+        }
+        for (launch.modifiers.additional_directories) |path| {
+            try result.appendPair(alloc, "--add-dir", path);
+        }
+        if (launch.modifiers.saved_directories_suppressed) {
+            try result.append(alloc, "--no-additional-dirs");
+        }
+        if (launch.modifiers.prompt_files.replacement_path) |path| {
+            try result.appendPair(alloc, "--system-prompt-file", path);
+        }
+        for (launch.modifiers.prompt_files.append_paths) |path| {
+            try result.appendPair(alloc, "--append-system-prompt-file", path);
+        }
+        if (launch.modifiers.state_home) |home| {
+            try result.appendPair(alloc, "--state-dir", home);
+        }
+        // Shape, identity, and history are separate authorities: dropping any
+        // of them across an upgrade silently reverts the agent's definition,
+        // the account it bills, or where its history lands, mid-session.
+        if (launch.modifiers.shape_home) |home| {
+            try result.appendPair(alloc, "--shape", home);
+        }
+        if (launch.modifiers.identity_home) |home| {
+            try result.appendPair(alloc, "--identity", home);
+        }
+        if (launch.modifiers.history_home) |home| {
+            try result.appendPair(alloc, "--history-dir", home);
+        }
+        if (launch.modifiers.mcp_config_path) |path| {
+            try result.appendPair(alloc, "--mcp-config", path);
+        }
+        if (launch.modifiers.permission_policy) |policy| {
+            try result.appendPair(alloc, "--permissions-file", policy.path);
+        }
+        if (!launch.modifiers.allow_native_tools) {
+            try result.append(alloc, "--no-native-tools");
+        } else {
+            for (launch.modifiers.selected_native_tools) |name| {
+                try result.appendPair(alloc, "--tool", name);
+            }
+        }
+        if (launch.modifiers.no_default_skills) {
+            try result.append(alloc, "--no-default-skills");
+        }
+        const requested_roots = @min(
+            launch.modifiers.requested_skill_root_count,
+            invocation_skill_roots.len,
+        );
+        for (invocation_skill_roots[0..requested_roots]) |root| {
+            try result.appendPair(alloc, "--skills-dir", root);
+        }
+        if (!launch.modifiers.project_instructions_enabled) {
+            try result.append(alloc, "--no-project-instructions");
+        }
+        try result.appendPair(alloc, "resume", session_id);
+        return result;
+    }
+
+    fn deinit(self: *UpgradeRelaunchArguments, alloc: Allocator) void {
+        for (self.owned_args.items) |arg| alloc.free(arg);
+        self.owned_args.deinit(alloc);
+        self.args.deinit(alloc);
+        self.* = .{};
+    }
+
+    fn append(self: *UpgradeRelaunchArguments, alloc: Allocator, arg: []const u8) !void {
+        try self.args.append(alloc, arg);
+    }
+
+    fn appendPair(
+        self: *UpgradeRelaunchArguments,
+        alloc: Allocator,
+        name: []const u8,
+        value: []const u8,
+    ) !void {
+        try self.append(alloc, name);
+        errdefer _ = self.args.pop();
+        try self.append(alloc, value);
+    }
+
+    fn appendOwned(
+        self: *UpgradeRelaunchArguments,
+        alloc: Allocator,
+        arg: []u8,
+    ) !void {
+        self.owned_args.append(alloc, arg) catch |err| {
+            alloc.free(arg);
+            return err;
+        };
+        self.args.append(alloc, arg) catch |err| {
+            _ = self.owned_args.pop();
+            alloc.free(arg);
+            return err;
+        };
+    }
+
+    fn processArgv(
+        self: UpgradeRelaunchArguments,
+        alloc: Allocator,
+        executable_path: []const u8,
+        previous_revision: ?[]const u8,
+    ) !std.ArrayList([]const u8) {
+        var argv: std.ArrayList([]const u8) = .empty;
+        errdefer argv.deinit(alloc);
+        try argv.append(alloc, executable_path);
+
+        try argv.appendSlice(alloc, self.args.items);
+        try argv.append(alloc, cli_surface.upgrade_relaunch_arg);
+        // Upstream carries the outgoing revision through the relaunch so the
+        // replacement can report what it replaced; it stays last.
+        if (previous_revision) |revision| try argv.append(alloc, revision);
+        return argv;
+    }
+};
+
 fn writeUpgradeRelaunchFailure(
+    alloc: Allocator,
     deps: RunDeps,
     err: std.process.ReplaceError,
-    session_id: []const u8,
+    relaunch_args: []const []const u8,
 ) void {
-    var buffer: [768]u8 = undefined;
-    const message = std.fmt.bufPrint(
-        &buffer,
-        "fx: upgrade installed, but relaunch failed: {s}\nContinue session with: fx --resume {s}\n",
-        .{ @errorName(err), session_id },
-    ) catch "fx: upgrade installed, but relaunch failed; run `fx doctor`.\n";
-    writeStderr(deps, message);
+    const rendered = formatUpgradeRelaunchFailure(
+        alloc,
+        err,
+        relaunch_args,
+    ) catch {
+        writeStderr(
+            deps,
+            "fx: upgrade installed, but relaunch failed; run `fx doctor`.\n",
+        );
+        return;
+    };
+    defer alloc.free(rendered);
+    writeStderr(deps, rendered);
+}
+
+fn formatUpgradeRelaunchFailure(
+    alloc: Allocator,
+    err: std.process.ReplaceError,
+    relaunch_args: []const []const u8,
+) ![]u8 {
+    var writer: std.Io.Writer.Allocating = .init(alloc);
+    errdefer writer.deinit();
+    try writer.writer.print(
+        "fx: upgrade installed, but relaunch failed: {s}\nContinue session with: fx",
+        .{@errorName(err)},
+    );
+    for (relaunch_args) |arg| {
+        try writer.writer.writeByte(' ');
+        try writeShellArgument(&writer.writer, arg);
+    }
+    try writer.writer.writeByte('\n');
+    return writer.toOwnedSlice();
+}
+
+fn cloneInvocationSkillRootsForRelaunch(
+    comptime App: type,
+    alloc: Allocator,
+    app: *const App,
+    enabled: bool,
+) ![][]u8 {
+    if (!enabled) return &.{};
+    if (comptime !@hasField(App, "invocation_skill_roots")) return &.{};
+    if (app.invocation_skill_roots.len == 0) return &.{};
+
+    const roots = try alloc.alloc([]u8, app.invocation_skill_roots.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (roots[0..initialized]) |root| alloc.free(root);
+        alloc.free(roots);
+    }
+    for (app.invocation_skill_roots, 0..) |root, index| {
+        roots[index] = try alloc.dupe(u8, root);
+        initialized += 1;
+    }
+    return roots;
+}
+
+fn freeInvocationSkillRoots(alloc: Allocator, roots: [][]u8) void {
+    for (roots) |root| alloc.free(root);
+    if (roots.len > 0) alloc.free(roots);
+}
+
+fn writeShellArgument(writer: *std.Io.Writer, arg: []const u8) !void {
+    var safe = arg.len > 0;
+    for (arg) |byte| {
+        if (std.ascii.isAlphanumeric(byte) or switch (byte) {
+            '_', '-', '.', '/', ':', '=', '+', ',', '@', '%' => true,
+            else => false,
+        }) continue;
+        safe = false;
+        break;
+    }
+    if (safe) return writer.writeAll(arg);
+
+    try writer.writeByte('\'');
+    for (arg) |byte| {
+        if (byte == '\'') {
+            try writer.writeAll("'\"'\"'");
+        } else {
+            try writer.writeByte(byte);
+        }
+    }
+    try writer.writeByte('\'');
 }
 
 fn cliSurfaceConfig(cfg: Config) cli_surface.Config {
@@ -437,6 +737,7 @@ fn cliSurfaceConfig(cfg: Config) cli_surface.Config {
         .context_registry = cfg.context_registry,
         .mode_registry = cfg.mode_registry,
         .tool_set = cfg.tool_set,
+        .tool_selection_catalog = cfg.tool_selection_catalog,
         .inspect_mcp_profile_config = cfg.inspect_mcp_profile_config,
         .inspect_mcp_local_config = cfg.inspect_mcp_local_config,
         .load_mcp_runtime = cfg.load_mcp_runtime,
@@ -482,7 +783,28 @@ fn formatResumeHandoff(buffer: []u8, session_id: []const u8) ![]const u8 {
 }
 
 fn formatUnexpectedError(buffer: []u8, err: anyerror) ![]const u8 {
+    if (launchControlErrorMessage(err)) |message| {
+        return std.fmt.bufPrint(buffer, "fx: {s}\n", .{message});
+    }
     return std.fmt.bufPrint(buffer, "fx: {s}\n", .{@errorName(err)});
+}
+
+/// Launch-control failures the operator can act on. Error values are global,
+/// so this stays readable without importing the surface that raises them.
+fn launchControlErrorMessage(err: anyerror) ?[]const u8 {
+    return switch (err) {
+        error.CodexCredentialFdUnavailable => "--codex-credential-fd does not name a usable inherited descriptor",
+        error.CodexCredentialFdNotLocalStream => "--codex-credential-fd must name a local stream socket",
+        error.CodexCredentialFdNotConnected => "--codex-credential-fd must name an already connected socket",
+        error.CodexCredentialPeerUnavailable => "--codex-credential-fd peer credentials are unavailable",
+        error.CodexCredentialPeerRejected => "--codex-credential-fd peer belongs to another user",
+        error.CodexCredentialBrokerHostManagedAuth => "--codex-credential-fd has nothing to lease under host-managed authentication",
+        error.CodexCredentialBrokerBorrowedAuth => "--codex-credential-fd cannot lease a borrowed read-only credential",
+        error.CodexCredentialBrokerCredentialUnavailable => "--codex-credential-fd requires a usable Codex subscription credential",
+        error.CodexCredentialBrokerAlreadyStarted => "--codex-credential-fd may only start one credential broker",
+        error.CodexCredentialBrokerUnsupported => "--codex-credential-fd is unsupported on this host",
+        else => null,
+    };
 }
 
 fn reportUnexpectedInteractiveError(deps: RunDeps, err: anyerror) void {
@@ -497,7 +819,7 @@ fn writeStderr(deps: RunDeps, text: []const u8) void {
 
 fn tryWriteErrorMessage(deps: RunDeps, err: anyerror) void {
     writeStderr(deps, "fx: ");
-    writeStderr(deps, @errorName(err));
+    writeStderr(deps, launchControlErrorMessage(err) orelse @errorName(err));
     writeStderr(deps, "\n");
 }
 
@@ -517,7 +839,13 @@ const test_entry_context_registry = context_contract.Registry{ .default_provider
     .append_transient_fn = appendNoopTransientContextForTest,
 } };
 
-fn noMcpRuntimeForTest(_: Allocator, _: []const u8, _: @import("../mcp/elicitation.zig").Capabilities) !?*mcp_runtime.McpRuntime {
+fn noMcpRuntimeForTest(
+    _: Allocator,
+    _: []const u8,
+    _: @import("../mcp/elicitation.zig").Capabilities,
+    _: ?[]const u8,
+    _: ?[]const u8,
+) !?*mcp_runtime.McpRuntime {
     return null;
 }
 
@@ -614,6 +942,7 @@ const TestCapture = struct {
     bench_value: ?[]const u8 = null,
     init_error: ?anyerror = null,
     configure_error: ?anyerror = null,
+    broker_error: ?anyerror = null,
     worker_error: ?anyerror = null,
     run_error: ?anyerror = null,
     stderr_error: ?anyerror = null,
@@ -629,8 +958,10 @@ const TestCapture = struct {
     replace_error: std.process.ReplaceError = error.InvalidExe,
     replace_calls: usize = 0,
     replace_arg_count: usize = 0,
-    replace_arg_bufs: [5][128]u8 = undefined,
-    replace_arg_lens: [5]usize = .{ 0, 0, 0, 0, 0 },
+    // Headroom over the longest relaunch this suite builds: every launch
+    // control, all three authority axes, and the selected MCP configuration.
+    replace_arg_bufs: [48][256]u8 = undefined,
+    replace_arg_lens: [48]usize = [_]usize{0} ** 48,
     fail_unexpected_format: bool = false,
 
     fn init(run_result: cli_surface.RunResult) TestCapture {
@@ -735,13 +1066,16 @@ fn startWorkerThreadForTest(ctx: ?*anyopaque, _: *anyopaque) !void {
 
 const TestApp = struct {
     requested_resume: ?cli_surface.ResumeTarget = null,
+    invocation_skill_roots: [][]u8 = &.{},
     terminal_released: bool = false,
 
     fn init(_: Allocator, launch: *cli_surface.InteractiveLaunch, _: credentials.AuthMode) !TestApp {
         appendInitEvent(launch);
         if (active_capture.?.init_error) |err| return err;
 
-        var app = TestApp{};
+        var app = TestApp{
+            .invocation_skill_roots = launch.modifiers.takeInvocationSkillRoots(),
+        };
         if (launch.requested_resume) |target| {
             app.requested_resume = target;
             launch.requested_resume = null;
@@ -752,6 +1086,7 @@ const TestApp = struct {
     fn deinit(self: *TestApp) void {
         self.releaseTerminal();
         if (self.requested_resume) |*target| target.deinit(std.testing.allocator);
+        freeInvocationSkillRoots(std.testing.allocator, self.invocation_skill_roots);
         appendTestEvent("deinit");
         self.* = undefined;
     }
@@ -1009,7 +1344,7 @@ test "app entry relaunches only after teardown with the validated handoff" {
     try std.testing.expect(std.mem.find(
         u8,
         capture.stderr.written(),
-        "fx --resume session-123",
+        "fx resume session-123",
     ) != null);
     try expectEvents(&.{
         "init:none",
@@ -1025,6 +1360,145 @@ test "app entry relaunches only after teardown with the validated handoff" {
         "deinit",
         "stderr-attempt",
     });
+}
+
+test "app entry preserves every launch control across an upgrade relaunch" {
+    const alloc = std.testing.allocator;
+    const overrides = try alloc.dupe(
+        config_runtime.context_limits.Override,
+        &.{.{
+            .name = .skill_chunk_bytes,
+            .value = .{ .bytes = 4096 },
+        }},
+    );
+    const directories = try alloc.alloc([]u8, 1);
+    directories[0] = try alloc.dupe(u8, "/tmp/fx extra");
+    const prompt_replacement = try alloc.dupe(u8, "/tmp/base prompt.md");
+    const prompt_appends = try alloc.alloc([]u8, 2);
+    prompt_appends[0] = try alloc.dupe(u8, "/tmp/first-extra.md");
+    prompt_appends[1] = try alloc.dupe(u8, "/tmp/second extra.md");
+    const effective_system_prompt = try alloc.dupe(u8, "COMPOSED_LAUNCH_SYSTEM_PROMPT");
+    const selected_tools = try alloc.alloc([]u8, 2);
+    selected_tools[0] = try alloc.dupe(u8, "terminal:exec");
+    selected_tools[1] = try alloc.dupe(u8, "read_file");
+    // Two roots the operator asked for, then the root a --shape contributed.
+    // Only the first two may be re-emitted; the third is re-derived by --shape.
+    const skill_roots = try alloc.alloc([]u8, 3);
+    skill_roots[0] = try alloc.dupe(u8, "/tmp/team skills");
+    skill_roots[1] = try alloc.dupe(u8, "/opt/shared-skills");
+    skill_roots[2] = try alloc.dupe(u8, "/tmp/fx-shape/.fx/skills");
+    const state_home = try alloc.dupe(u8, "/tmp/fx-state");
+    const shape_home = try alloc.dupe(u8, "/tmp/fx-shape");
+    const identity_home = try alloc.dupe(u8, "/tmp/fx-identity");
+    const history_home = try alloc.dupe(u8, "/tmp/fx-history");
+    const mcp_config_path = try alloc.dupe(u8, "/tmp/fx-shape/.fx/mcp.json");
+    const permission_path = try alloc.dupe(u8, "/tmp/fx-policy.json");
+    var capture = TestCapture.init(.{ .interactive = .{
+        .modifiers = .{
+            .context_limit_overrides = overrides,
+            .additional_directories = directories,
+            .saved_directories_suppressed = true,
+            .prompt_files = .{
+                .replacement_path = prompt_replacement,
+                .append_paths = prompt_appends,
+            },
+            .effective_system_prompt = effective_system_prompt,
+            .selected_native_tools = selected_tools,
+            .invocation_skill_roots = skill_roots,
+            .requested_skill_root_count = 2,
+            .no_default_skills = true,
+            .project_instructions_enabled = false,
+            .state_home = state_home,
+            .shape_home = shape_home,
+            .identity_home = identity_home,
+            .history_home = history_home,
+            .mcp_config_path = mcp_config_path,
+            .permission_policy = .{
+                .path = permission_path,
+                .rules = .{},
+            },
+        },
+    } });
+    defer capture.deinit();
+    capture.resume_handoff_id = "session-123";
+    capture.upgrade_relaunch_path = "/tmp/fx-upgraded";
+
+    const outcome = try runWithDeps(
+        TestApp,
+        alloc,
+        &.{},
+        testConfig(),
+        capture.deps(),
+    );
+
+    try std.testing.expectEqual(@as(u8, 1), outcome.exit);
+    const expected = [_][]const u8{
+        "/tmp/fx-upgraded",
+        "--context-limit",
+        "skill_chunk_bytes=4096",
+        "--add-dir",
+        "/tmp/fx extra",
+        "--no-additional-dirs",
+        "--system-prompt-file",
+        "/tmp/base prompt.md",
+        "--append-system-prompt-file",
+        "/tmp/first-extra.md",
+        "--append-system-prompt-file",
+        "/tmp/second extra.md",
+        "--state-dir",
+        "/tmp/fx-state",
+        "--shape",
+        "/tmp/fx-shape",
+        "--identity",
+        "/tmp/fx-identity",
+        "--history-dir",
+        "/tmp/fx-history",
+        "--mcp-config",
+        "/tmp/fx-shape/.fx/mcp.json",
+        "--permissions-file",
+        "/tmp/fx-policy.json",
+        "--tool",
+        "terminal:exec",
+        "--tool",
+        "read_file",
+        "--no-default-skills",
+        "--skills-dir",
+        "/tmp/team skills",
+        "--skills-dir",
+        "/opt/shared-skills",
+        "--no-project-instructions",
+        "resume",
+        "session-123",
+        "--upgrade-relaunch",
+    };
+    try std.testing.expectEqual(expected.len, capture.replace_arg_count);
+    for (expected, 0..) |arg, index| {
+        try std.testing.expectEqualStrings(arg, capture.replaceArg(index));
+    }
+    try std.testing.expectEqualStrings(
+        "fx: upgrade installed, but relaunch failed: InvalidExe\n" ++
+            "Continue session with: fx --context-limit skill_chunk_bytes=4096" ++
+            " --add-dir '/tmp/fx extra' --no-additional-dirs" ++
+            " --system-prompt-file '/tmp/base prompt.md'" ++
+            " --append-system-prompt-file /tmp/first-extra.md" ++
+            " --append-system-prompt-file '/tmp/second extra.md'" ++
+            " --state-dir /tmp/fx-state --shape /tmp/fx-shape" ++
+            " --identity /tmp/fx-identity --history-dir /tmp/fx-history" ++
+            " --mcp-config /tmp/fx-shape/.fx/mcp.json" ++
+            " --permissions-file /tmp/fx-policy.json" ++
+            " --tool terminal:exec --tool read_file --no-default-skills" ++
+            " --skills-dir '/tmp/team skills' --skills-dir /opt/shared-skills" ++
+            " --no-project-instructions resume session-123\n",
+        capture.stderr.written(),
+    );
+}
+
+test "upgrade relaunch recovery shell-quotes unsafe arguments" {
+    var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+
+    try writeShellArgument(&out.writer, "team's skills");
+    try std.testing.expectEqualStrings("'team'\"'\"'s skills'", out.written());
 }
 
 test "app entry carries the previous revision through upgrade relaunch" {
@@ -1049,6 +1523,44 @@ test "app entry carries the previous revision through upgrade relaunch" {
         "1111111111111111111111111111111111111111",
         capture.replaceArg(4),
     );
+}
+
+test "app entry preserves ordered native tool selection across upgrade relaunch" {
+    const alloc = std.testing.allocator;
+    const selected = try alloc.alloc([]u8, 2);
+    selected[0] = try alloc.dupe(u8, "terminal:exec");
+    selected[1] = try alloc.dupe(u8, "read_file");
+    var capture = TestCapture.init(.{ .interactive = .{
+        .modifiers = .{ .selected_native_tools = selected },
+    } });
+    defer capture.deinit();
+    capture.resume_handoff_id = "session-123";
+    capture.upgrade_relaunch_path = "/tmp/fx-upgraded";
+
+    const outcome = try runWithDeps(
+        TestApp,
+        alloc,
+        &.{},
+        testConfig(),
+        capture.deps(),
+    );
+
+    try std.testing.expectEqual(@as(u8, 1), outcome.exit);
+    try std.testing.expectEqual(@as(usize, 1), capture.replace_calls);
+    try std.testing.expectEqual(@as(usize, 8), capture.replace_arg_count);
+    try std.testing.expectEqualStrings("/tmp/fx-upgraded", capture.replaceArg(0));
+    try std.testing.expectEqualStrings("--tool", capture.replaceArg(1));
+    try std.testing.expectEqualStrings("terminal:exec", capture.replaceArg(2));
+    try std.testing.expectEqualStrings("--tool", capture.replaceArg(3));
+    try std.testing.expectEqualStrings("read_file", capture.replaceArg(4));
+    try std.testing.expectEqualStrings("resume", capture.replaceArg(5));
+    try std.testing.expectEqualStrings("session-123", capture.replaceArg(6));
+    try std.testing.expectEqualStrings("--upgrade-relaunch", capture.replaceArg(7));
+    try std.testing.expect(std.mem.find(
+        u8,
+        capture.stderr.written(),
+        "fx --tool terminal:exec --tool read_file resume session-123",
+    ) != null);
 }
 
 test "app entry never relaunches without a validated handoff" {
@@ -1333,4 +1845,226 @@ test "app entry maps unavailable session state to one expected startup failure" 
         try std.testing.expectEqual(@as(usize, 1), capture.stderr_calls);
         try expectEvents(&.{"init:none"});
     }
+}
+
+const BrokerLifecycleTestApp = struct {
+    terminal_released: bool = false,
+    broker_started: bool = false,
+
+    const CodexCredentialBrokerActivation = struct {
+        configured_fd: ?u8 = null,
+        transferred: bool = false,
+
+        fn deinit(self: *@This()) void {
+            if (self.configured_fd != null and !self.transferred) {
+                appendTestEvent("credential-broker-activation-close");
+            }
+            self.* = .{};
+        }
+    };
+
+    fn prepareCodexCredentialBrokerActivation(
+        launch: *const cli_surface.InteractiveLaunch,
+    ) !CodexCredentialBrokerActivation {
+        if (launch.modifiers.codex_credential_fd != null) {
+            appendTestEvent("credential-broker-prepare");
+        }
+        return .{ .configured_fd = launch.modifiers.codex_credential_fd };
+    }
+
+    fn init(
+        _: Allocator,
+        launch: *cli_surface.InteractiveLaunch,
+        _: credentials.AuthMode,
+    ) !BrokerLifecycleTestApp {
+        appendInitEvent(launch);
+        if (active_capture.?.init_error) |err| return err;
+        return .{};
+    }
+
+    fn startCodexCredentialBroker(
+        self: *BrokerLifecycleTestApp,
+        activation: *CodexCredentialBrokerActivation,
+    ) !void {
+        appendTestEvent("credential-broker-start");
+        if (active_capture.?.broker_error) |err| return err;
+        self.broker_started = true;
+        if (activation.configured_fd) |fd| {
+            if (fd != 3) return error.TestUnexpectedCredentialFd;
+            appendTestEvent("credential-broker-fd-three");
+        }
+        activation.transferred = true;
+    }
+
+    fn startMcpDiscovery(_: *BrokerLifecycleTestApp) void {
+        appendTestEvent("mcp-discovery");
+    }
+
+    fn startAutoUpgrade(_: *BrokerLifecycleTestApp) void {
+        appendTestEvent("auto-upgrade");
+    }
+
+    fn startFileIndex(_: *BrokerLifecycleTestApp) void {
+        appendTestEvent("file-index");
+    }
+
+    fn startResumedSessionReconciliation(_: *BrokerLifecycleTestApp) void {
+        appendTestEvent("resume-reconciliation");
+    }
+
+    fn startModelCacheWarmup(_: *BrokerLifecycleTestApp) void {
+        appendTestEvent("model-cache");
+    }
+
+    fn run(_: *BrokerLifecycleTestApp) !void {
+        appendTestEvent("run");
+    }
+
+    fn releaseTerminal(self: *BrokerLifecycleTestApp) void {
+        if (self.terminal_released) return;
+        self.terminal_released = true;
+        appendTestEvent("terminal-release");
+    }
+
+    fn deinit(self: *BrokerLifecycleTestApp) void {
+        if (self.broker_started) appendTestEvent("credential-broker-stop");
+        self.releaseTerminal();
+        appendTestEvent("deinit");
+        self.* = undefined;
+    }
+
+    fn deinitWithResumeHandoff(self: *BrokerLifecycleTestApp) ?app_session_runtime.ResumeHandoff {
+        const handoff: ?app_session_runtime.ResumeHandoff = if (active_capture.?.resume_handoff_id) |id| blk: {
+            const session_id = std.testing.allocator.dupe(u8, id) catch {
+                self.deinit();
+                return null;
+            };
+            break :blk .{ .session_id = session_id };
+        } else null;
+        self.deinit();
+        return handoff;
+    }
+
+    fn takeUpgradeRelaunchRequest(_: *BrokerLifecycleTestApp) ?auto_upgrade.RelaunchRequest {
+        const path = active_capture.?.upgrade_relaunch_path orelse return null;
+        var request = auto_upgrade.RelaunchRequest{
+            .executable_path_len = path.len,
+        };
+        @memcpy(request.executable_path_buf[0..path.len], path);
+        return request;
+    }
+};
+
+test "app entry starts the Codex credential broker before every other startup callback" {
+    const alloc = std.testing.allocator;
+    var capture = TestCapture.init(.{ .interactive = .{
+        .modifiers = .{ .codex_credential_fd = 3 },
+    } });
+    defer capture.deinit();
+
+    const outcome = try runWithDeps(
+        BrokerLifecycleTestApp,
+        alloc,
+        &.{},
+        testConfig(),
+        capture.deps(),
+    );
+
+    try std.testing.expectEqual(RunOutcome.returned, outcome);
+    try expectEvents(&.{
+        "credential-broker-prepare",
+        "init:none",
+        "credential-broker-start",
+        "credential-broker-fd-three",
+        "mcp-discovery",
+        "auto-upgrade",
+        "file-index",
+        "worker-thread",
+        "model-cache",
+        "run",
+        "credential-broker-stop",
+        "terminal-release",
+        "deinit",
+    });
+
+    // A cooperative host declares no broker, so the activation is refused
+    // before bootstrap rather than silently ignored.
+    var launch = cli_surface.InteractiveLaunch{ .modifiers = .{ .codex_credential_fd = 3 } };
+    defer launch.deinit(alloc);
+    resetTestEvents();
+    try std.testing.expectError(
+        error.CodexCredentialBrokerUnsupported,
+        runInteractiveWithDeps(
+            BrokerLifecycleTestApp,
+            true,
+            alloc,
+            &launch,
+            .local,
+            capture.deps(),
+        ),
+    );
+    try expectEvents(&.{});
+
+    // A broker that cannot start ends the launch with the terminal released
+    // and the inherited descriptor closed, never a started Fx without a broker.
+    resetTestEvents();
+    capture.broker_error = error.TestCredentialBrokerStartFailed;
+    capture.record_stderr_event = true;
+    try std.testing.expectError(
+        error.TestCredentialBrokerStartFailed,
+        runWithDeps(
+            BrokerLifecycleTestApp,
+            alloc,
+            &.{},
+            testConfig(),
+            capture.deps(),
+        ),
+    );
+    try expectEvents(&.{
+        "credential-broker-prepare",
+        "init:none",
+        "credential-broker-start",
+        "terminal-release",
+        "stderr-attempt",
+        "deinit",
+        "credential-broker-activation-close",
+    });
+
+    // The upgrade remains installed, but process replacement cannot preserve
+    // the broker's per-instance nonce. Ask the host for a fresh launch and do
+    // not print a recovery command that silently drops credential authority.
+    var relaunch_capture = TestCapture.init(.{ .interactive = .{
+        .modifiers = .{ .codex_credential_fd = 3 },
+    } });
+    defer relaunch_capture.deinit();
+    relaunch_capture.resume_handoff_id = "session-123";
+    relaunch_capture.upgrade_relaunch_path = "/tmp/fx-upgraded";
+    const relaunch_outcome = try runWithDeps(
+        BrokerLifecycleTestApp,
+        alloc,
+        &.{},
+        testConfig(),
+        relaunch_capture.deps(),
+    );
+    try std.testing.expectEqual(@as(u8, 1), relaunch_outcome.exit);
+    try std.testing.expectEqual(@as(usize, 0), relaunch_capture.replace_calls);
+    try std.testing.expectEqualStrings(
+        "fx: upgrade installed; restart from your host to apply it. This session's credential channel cannot survive a restart.\n",
+        relaunch_capture.stderr.written(),
+    );
+    try expectEvents(&.{
+        "credential-broker-prepare",
+        "init:none",
+        "credential-broker-start",
+        "credential-broker-fd-three",
+        "mcp-discovery",
+        "auto-upgrade",
+        "file-index",
+        "worker-thread",
+        "model-cache",
+        "run",
+        "credential-broker-stop",
+        "terminal-release",
+        "deinit",
+    });
 }

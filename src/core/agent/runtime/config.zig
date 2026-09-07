@@ -10,6 +10,7 @@ const model_response_recovery = @import("model_response_recovery.zig");
 const provider_set = @import("../../gateway/provider_set.zig");
 const model_tool_schema = @import("../../tooling/model_tool_schema.zig");
 const stream_provider = @import("../stream_provider.zig");
+const shape_authority = @import("../../auth/shape_authority.zig");
 
 const ReasoningEffort = types.ReasoningEffort;
 
@@ -22,6 +23,10 @@ pub const Config = struct {
     pub const default_step_limit_notice = "Agent step limit reached; continue with a follow-up prompt if needed.";
 
     system_prompt: []const u8,
+    /// The shape driving this run. It cannot change inside a process, so a
+    /// difference from a checkpoint's shape means the checkpoint was written by
+    /// an earlier launch of a differently-defined agent.
+    shape: ?shape_authority.Identity = null,
     model_prompt_overlay: ?[]const u8 = null,
     host_instructions: []const u8 = "",
     skill_catalog: skill_invocation.Catalog = .{ .skills = &.{} },

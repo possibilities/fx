@@ -2,15 +2,18 @@ const std = @import("std");
 const io_mod = @import("../shared/io.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const session = @import("session.zig");
+const credential_authority = @import("../auth/credential_authority.zig");
+const shape_authority = @import("../auth/shape_authority.zig");
 const session_codec = @import("session_codec.zig");
 const session_layout = @import("session_layout.zig");
 const session_store = @import("session_store.zig");
 const summary_codec = @import("session_summary_codec.zig");
+const types = @import("../shared/types.zig");
 
 const Allocator = std.mem.Allocator;
 const Sha256 = std.crypto.hash.sha2.Sha256;
-// Disposable v4 proofs bind replay and the legacy route gates to one stat window.
-const magic = "fx-resume-catalog-v4\n";
+// Disposable v5 preserves carried provenance and upstream ranking proofs.
+const magic = "fx-resume-catalog-v5\n";
 const file_name = ".resume-catalog";
 pub const max_bytes = 64 * 1024 * 1024;
 pub const max_records = 100_000;
@@ -70,6 +73,12 @@ const Summary = struct {
     language: []const u8,
     has_checkpoint: bool,
     has_managed_children: bool,
+    /// Shape and credential provenance ride along so a listing served from
+    /// the cache reports the same authority as one read from the manifest.
+    shape_id: ?[]const u8 = null,
+    shape_identity: ?shape_authority.Identity = null,
+    credential_source: ?types.CredentialSource = null,
+    credential_identity: ?credential_authority.Identity = null,
 
     fn from(source: *const session_store.SessionSummary) Summary {
         return .{
@@ -84,10 +93,16 @@ const Summary = struct {
             .language = source.conversation_language.view(),
             .has_checkpoint = source.has_checkpoint,
             .has_managed_children = source.has_managed_children,
+            .shape_id = if (source.shape) |shape| shape.id else null,
+            .shape_identity = if (source.shape) |shape| shape.identity else null,
+            .credential_source = source.credential_source,
+            .credential_identity = source.credential_identity,
         };
     }
 
     fn clone(self: Summary, alloc: Allocator, id: []const u8) !session_store.SessionSummary {
+        if (self.credential_identity != null and self.credential_source == null) return error.InvalidCatalogCache;
+        if ((self.shape_id == null) != (self.shape_identity == null)) return error.InvalidCatalogCache;
         return summary_codec.cloneSessionSummary(alloc, .{
             .id = @constCast(id),
             .workspace_root = if (self.workspace_root) |value| @constCast(value) else null,
@@ -101,6 +116,12 @@ const Summary = struct {
             .conversation_language = try session.ConversationLanguage.fromSlice(self.language),
             .has_checkpoint = self.has_checkpoint,
             .has_managed_children = self.has_managed_children,
+            .shape = if (self.shape_id) |label| .{
+                .id = @constCast(label),
+                .identity = self.shape_identity.?,
+            } else null,
+            .credential_source = self.credential_source,
+            .credential_identity = self.credential_identity,
         });
     }
 };
@@ -196,6 +217,9 @@ pub const Loaded = struct {
             }
             if (row.value == .visible) {
                 const summary = row.value.visible;
+                if ((summary.shape_id == null) != (summary.shape_identity == null) or
+                    (summary.credential_identity != null and summary.credential_source == null)) return error.InvalidCatalogCache;
+                if (summary.shape_id) |label| shape_authority.validateLabel(label) catch return error.InvalidCatalogCache;
                 if (summary.created_at_ms < 0 or summary.updated_at_ms < summary.created_at_ms) return error.InvalidCatalogCache;
                 if (summary.history_len == 0 and !summary.has_checkpoint) return error.InvalidCatalogCache;
                 _ = try session.ConversationLanguage.fromSlice(summary.language);
@@ -494,6 +518,9 @@ test "catalog cache round trips owned rows and ignores incomplete observations" 
             .updated_at_ms = 2,
             .history_len = 3,
             .conversation_language = .literal("en"),
+            .shape = .{ .id = @constCast("reviewer"), .identity = .{ .bytes = @splat(9) } },
+            .credential_source = .fx_login,
+            .credential_identity = .{ .bytes = @splat(11) },
         }) } },
         .{ .fingerprint = @splat(2), .value = .{ .excluded = try alloc.dupe(u8, "private") } },
         .{ .fingerprint = null, .value = .{ .excluded = try alloc.dupe(u8, "temporary-failure") } },
@@ -510,6 +537,10 @@ test "catalog cache round trips owned rows and ignores incomplete observations" 
     defer visible.deinit(alloc);
     try std.testing.expectEqualStrings("Saved title", visible.value.visible.title.?);
     try std.testing.expectEqual(@as(usize, 3), visible.value.visible.history_len);
+    try std.testing.expectEqualStrings("reviewer", visible.value.visible.shape.?.id);
+    try std.testing.expect(visible.value.visible.shape.?.identity.eql(.{ .bytes = @splat(9) }));
+    try std.testing.expect(visible.value.visible.credential_source.? == .fx_login);
+    try std.testing.expect(visible.value.visible.credential_identity.?.eql(.{ .bytes = @splat(11) }));
     try std.testing.expect((try loaded.reuse(alloc, "visible", @splat(3))) == null);
     var excluded = (try loaded.reuse(alloc, "private", @splat(2))).?;
     defer excluded.deinit(alloc);
@@ -519,6 +550,21 @@ test "catalog cache round trips owned rows and ignores incomplete observations" 
     var retained = try Loaded.load(alloc, writer.dir, null);
     defer retained.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 2), retained.count());
+
+    var old_bytes = try alloc.dupe(u8, retained.bytes.?);
+    defer alloc.free(old_bytes);
+    @memcpy(old_bytes[0..magic.len], "fx-resume-catalog-v4\n");
+    try io_mod.durableReplaceVerified(alloc, &writer.dir, file_name, old_bytes);
+    var outdated = try Loaded.load(alloc, writer.dir, null);
+    defer outdated.deinit(alloc);
+    try std.testing.expect(!outdated.present());
+
+    stopped.store(false, .release);
+    entries[0].value.visible.credential_source = null;
+    try writer.save(alloc, &entries, &stopped);
+    var orphaned = try Loaded.load(alloc, writer.dir, null);
+    defer orphaned.deinit(alloc);
+    try std.testing.expect(!orphaned.present());
 }
 
 test "catalog cache corruption and duplicate identifiers require rebuilding" {

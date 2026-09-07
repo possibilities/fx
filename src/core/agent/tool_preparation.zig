@@ -5,6 +5,7 @@ const permissions = @import("../permissions/permissions.zig");
 const types = @import("../shared/types.zig");
 const file_mutation_contract = @import("../tooling/file_mutation_contract.zig");
 const tool_admission = @import("../tooling/tool_admission.zig");
+const tool_args = @import("../tooling/tool_args.zig");
 const tool_dispatch = @import("../tooling/tool_dispatch.zig");
 const workspace_access = @import("../workspace/workspace_access.zig");
 
@@ -362,7 +363,8 @@ fn isCapturedCommandCall(
     };
     defer parsed.deinit();
     if (parsed.value != .object) return false;
-    const action = parsed.value.object.get("action") orelse return false;
+    const arguments = tool_args.commandArguments(parsed.value.object);
+    const action = arguments.get("action") orelse return false;
     return action == .string and std.mem.eql(u8, action.string, expected_action);
 }
 

@@ -461,10 +461,8 @@ fn inferTitle(task: *Task) !?[]u8 {
 /// unsluggable answer is null so the caller may ask again; cancellation and
 /// transport faults stay errors and end the task.
 fn requestTitle(task: *Task, excerpt: []const u8, timeout_ms: u64) !?[]u8 {
-    const messages = [_]types.ChatMessage{
-        .{ .role = .system, .content = naming_instruction },
-        .{ .role = .user, .content = excerpt },
-    };
+    const instructions = [_]types.ChatMessage{.{ .role = .system, .content = naming_instruction }};
+    const messages = [_]types.ChatMessage{.{ .role = .user, .content = excerpt }};
     const deadline = std.Io.Clock.Timestamp.fromNow(io_mod.getIo(), .{
         .clock = .awake,
         .raw = .fromMilliseconds(@intCast(timeout_ms)),
@@ -488,6 +486,7 @@ fn requestTitle(task: *Task, excerpt: []const u8, timeout_ms: u64) !?[]u8 {
         .session_id = null,
         .model = task.model,
         .retry_count = 1,
+        .instructions = &instructions,
         .messages = &messages,
         .tools = .{},
         .tool_choice = .none,

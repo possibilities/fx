@@ -5247,9 +5247,9 @@ test("manual upgrade output links stable notes and dev changes", async () => {
 }, UPGRADE_TIMEOUT);
 
 test.skipIf(!tmuxAvailable())(
-  "upgrade ctrl-g reloads the background-installed binary and resumes",
+  "upgrade ctrl-t reloads the background-installed binary and resumes",
   async () => {
-    const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-tui-upgrade-ctrl-g-")));
+    const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-tui-upgrade-ctrl-t-")));
     const home = join(root, "home");
     const freshHome = join(root, "fresh-home");
     const workspace = join(root, "workspace");
@@ -5270,8 +5270,8 @@ test.skipIf(!tmuxAvailable())(
     let active: TmuxSession | null = null;
     let fresh: TmuxSession | null = null;
     const gateway = startFakeGateway([
-      fakeGatewayFinalText("UPGRADE_CTRL_G_INITIAL_DONE"),
-      fakeGatewayFinalText("UPGRADE_CTRL_G_FOLLOWUP_DONE"),
+      fakeGatewayFinalText("UPGRADE_CTRL_T_INITIAL_DONE"),
+      fakeGatewayFinalText("UPGRADE_CTRL_T_FOLLOWUP_DONE"),
     ]);
     const release = startUpgradeServer(root, argvLogPath);
 
@@ -5295,12 +5295,12 @@ test.skipIf(!tmuxAvailable())(
       });
       await active.waitForComposer(TIMEOUT);
       await active.sendText("Save a turn before upgrade handoff.");
-      await active.waitForText("UPGRADE_CTRL_G_INITIAL_DONE", TIMEOUT);
+      await active.waitForText("UPGRADE_CTRL_T_INITIAL_DONE", TIMEOUT);
       await active.waitForComposer(TIMEOUT);
       const sessionId = sessionIdFromHome(home);
 
       await active.waitForText(
-        "update ready: ctrl+g to reload",
+        "update ready: ctrl+t to reload",
         UPGRADE_TIMEOUT,
       );
       expect(readFileSync(installedFx, "utf8")).toContain(argvLogPath);
@@ -5318,14 +5318,14 @@ test.skipIf(!tmuxAvailable())(
       expect(readFileSync(argvLogPath, "utf8").trim().split("\n")).toEqual([
         installedFx,
       ]);
-      expect(await fresh.capturePane()).not.toContain("update ready: ctrl+g to reload");
+      expect(await fresh.capturePane()).not.toContain("update ready: ctrl+t to reload");
       await fresh.sendText("/quit");
       expect(await fresh.waitForSessionEnd()).toBe(true);
       await fresh.kill();
       fresh = null;
 
       const version = (await runFx(["--version"])).stdout.trim();
-      await active.sendHexBytes(["07"]);
+      await active.sendHexBytes(["14"]);
 
       const updatedNotice = `● fx has been updated to v${version} (notes)`;
       await active.waitForText(updatedNotice, TIMEOUT);
@@ -5334,8 +5334,8 @@ test.skipIf(!tmuxAvailable())(
       expect(postUpgradeTrace.slice(traceBeforeUpgrade.length)).not.toContain(
         "session picker completion",
       );
-      const resumed = await waitForScrollback(active, "UPGRADE_CTRL_G_INITIAL_DONE");
-      expect(resumed).toContain("UPGRADE_CTRL_G_INITIAL_DONE");
+      const resumed = await waitForScrollback(active, "UPGRADE_CTRL_T_INITIAL_DONE");
+      expect(resumed).toContain("UPGRADE_CTRL_T_INITIAL_DONE");
       expect(resumed).toContain(updatedNotice);
       const noticeEscapes = await active.capturePaneEscapes();
       expect(noticeEscapes).toContain(
@@ -5352,7 +5352,7 @@ test.skipIf(!tmuxAvailable())(
       ]);
 
       await active.sendText("Continue after upgrade handoff.");
-      await active.waitForText("UPGRADE_CTRL_G_FOLLOWUP_DONE", TIMEOUT);
+      await active.waitForText("UPGRADE_CTRL_T_FOLLOWUP_DONE", TIMEOUT);
       const stderr = readFileSync(stderrPath, "utf8");
       expect(stderr).not.toContain("relaunch failed");
       expect(stderr).not.toContain("AnsiBandOverflow");

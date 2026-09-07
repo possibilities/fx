@@ -890,7 +890,7 @@ pub const WorkerRuntime = struct {
     };
 
     pub fn enqueuePrompt(self: *WorkerRuntime, alloc: std.mem.Allocator, prompt: QueuedPrompt) !void {
-        try self.admitPromptObserved(alloc, prompt, false, null);
+        _ = try self.admitPromptObserved(alloc, prompt, false, null);
     }
 
     pub fn enqueuePromptObserved(
@@ -4424,11 +4424,13 @@ test "work control snapshot and text update preserve native admission order" {
         alloc,
         try makePrompt(alloc, "steer now", "model"),
         true,
+        null,
     );
     const queued = try runtime.admitPromptObserved(
         alloc,
         try makePrompt(alloc, "then queue", "model"),
         false,
+        null,
     );
     try std.testing.expectEqual(PromptAdmissionDisposition.steering, steering.disposition);
     try std.testing.expectEqual(PromptAdmissionDisposition.queued, queued.disposition);
@@ -4470,7 +4472,7 @@ test "work control snapshot and update enforce semantic bounds" {
         .name = @constCast("review"),
         .path = @constCast("/tmp/.codex/skills/review"),
     }});
-    const admitted = try runtime.admitPromptObserved(alloc, controlled, false);
+    const admitted = try runtime.admitPromptObserved(alloc, controlled, false, null);
     try std.testing.expectError(
         error.WorkSnapshotEntryLimitExceeded,
         runtime.snapshotWork(alloc, .{ .max_entries = 0, .max_text_bytes = 64 }),
@@ -4504,7 +4506,7 @@ test "work control semantic pause blocks and resumes steering consumption" {
     runtime.worker_processing = true;
     runtime.active_turn_id = 41;
 
-    _ = try runtime.admitPromptObserved(alloc, try makePrompt(alloc, "before", "model"), true);
+    _ = try runtime.admitPromptObserved(alloc, try makePrompt(alloc, "before", "model"), true, null);
     try std.testing.expect(runtime.pauseQueue());
     try std.testing.expectEqual(
         SteeringBoundaryResult.interrupt,

@@ -1,6 +1,5 @@
 const std = @import("std");
-const builtin_mcp = @import("../../builtins/mcp.zig");
-const config_runtime = @import("../config/config_runtime.zig");
+const app_profile_runtime = @import("app_profile_runtime.zig");
 const mcp_command_provider = @import("../mcp/command_provider.zig");
 const mcp_menu_state = @import("../mcp/menu_state.zig");
 const project_config = @import("../mcp/project_config.zig");
@@ -27,7 +26,7 @@ pub fn Runtime(comptime App: type) type {
                 ),
             }
             const intent = try mcp_command_provider.parseAddIntent(tokens.items);
-            var result = try builtin_mcp.addProfileServer(app.alloc, intent);
+            var result = try app_profile_runtime.addMcpProfileServer(app, intent);
             defer result.deinit(app.alloc);
             try app.mcp.setMenuFeedback(app.alloc, "Saved MCP server; reconnecting…");
             app.mcp.returnMenuToServers();
@@ -39,7 +38,7 @@ pub fn Runtime(comptime App: type) type {
         pub fn removeServer(app: *App, generation: u64) !void {
             const server_name = app.mcp.selectedMenuServerName() orelse
                 return error.McpServerNotFound;
-            var result = try builtin_mcp.removeProfileServer(app.alloc, server_name);
+            var result = try app_profile_runtime.removeMcpProfileServer(app, server_name);
             defer result.deinit(app.alloc);
             if (!result.removed) return error.McpProfileServerNotFound;
             try app.mcp.setMenuFeedback(app.alloc, "Removed MCP server; reconnecting…");
@@ -65,9 +64,8 @@ pub fn Runtime(comptime App: type) type {
                 .trust_reset => .reset,
                 else => return error.McpMenuInvalidOperation,
             };
-            var attempt = config_runtime.attemptProjectMcpMutation(
-                app.alloc,
-                app.workspace_root,
+            var attempt = app_profile_runtime.attemptProjectMcpMutation(
+                app,
                 project_action,
             );
             defer attempt.deinit(app.alloc);

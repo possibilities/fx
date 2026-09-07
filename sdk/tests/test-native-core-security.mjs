@@ -1,8 +1,9 @@
 #!/usr/bin/env node
 import { strict as assert } from "node:assert";
 import { createRequire } from "node:module";
-import { readdirSync } from "node:fs";
-import { resolve } from "node:path";
+import { mkdtempSync, readdirSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const require = createRequire(import.meta.url);
@@ -38,7 +39,8 @@ assert.throws(
 for (const handle of runtimeLimitProbe) addon.closeCore(handle);
 for (const handle of runtimeLimitProbe) addon.destroyCore(handle);
 
-const core = addon.createCore({ apiKey: "security-test-key", home: process.cwd(), workspaceRoot: process.cwd() });
+const testRoot = mkdtempSync(join(tmpdir(), "libfx-native-security-"));
+const core = addon.createCore({ apiKey: "security-test-key", home: testRoot, workspaceRoot: testRoot });
 let nextId = 1;
 function send(method, params) {
   const id = nextId++;
@@ -58,14 +60,29 @@ function send(method, params) {
   throw new Error(`timed out waiting for ${method}`);
 }
 
-assert.ok(send("initialize", { protocolVersion: 1, clientCapabilities: {} }).result);
-const response = send("session/new", {
-  cwd: process.cwd(),
-  mcpServers: [{ name: "blocked", command: "/bin/sh", args: ["-c", "exit 0"], env: [] }],
-});
-assert.equal(response.error?.code, -32602);
-assert.match(response.error?.message ?? "", /MCP servers are unavailable/);
+try {
+  assert.ok(send("initialize", { protocolVersion: 1, clientCapabilities: {} }).result);
+  const created = send("session/new", { cwd: testRoot, mcpServers: [] });
+  assert.ok(created.result?.sessionId);
+  const response = send("session/new", {
+    cwd: testRoot,
+    mcpServers: [{ name: "blocked", command: "/bin/sh", args: ["-c", "exit 0"], env: [] }],
+  });
+  assert.equal(response.error?.code, -32602);
+  assert.match(response.error?.message ?? "", /MCP servers are unavailable/);
 
-addon.closeCore(core);
-addon.destroyCore(core);
-console.log("native core security passed: malformed creation is stable and ACP stdio MCP is blocked");
+  for (const method of ["session/load", "session/resume"]) {
+    const restored = send(method, {
+      sessionId: created.result.sessionId,
+      cwd: testRoot,
+      mcpServers: [{ name: `blocked-${method}`, command: "/usr/bin/true", args: [], env: [] }],
+    });
+    assert.equal(restored.error?.code, -32602);
+    assert.match(restored.error?.message ?? "", /MCP servers are unavailable/);
+  }
+} finally {
+  addon.closeCore(core);
+  addon.destroyCore(core);
+  rmSync(testRoot, { recursive: true, force: true });
+}
+console.log("native core security passed: malformed creation is stable and ACP MCP is blocked on new and restore");

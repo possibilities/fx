@@ -416,7 +416,7 @@ test "app_upgrade_runtime skips upgrade render facts when disabled" {
     try std.testing.expectEqual(@as(usize, 0), app.shell.render_requests.footer_count);
 }
 
-test "app_upgrade_runtime rejects ctrl+g while upgrade is not ready" {
+test "app_upgrade_runtime rejects ctrl+t while upgrade is not ready" {
     var app = TestApp{ .alloc = std.testing.allocator };
     defer app.deinit();
     var deps_state = TestDepsState{};

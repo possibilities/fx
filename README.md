@@ -86,6 +86,8 @@ While fx is working, Ctrl+C clears a nonempty composer without interrupting the 
 
 Ctrl+L clears the inline display while keeping the conversation available in Ctrl+O. It preserves your draft and conversation context; `/clear` starts a fresh conversation instead.
 
+Press `Ctrl+G` to edit the current prompt with `VISUAL`, falling back to `EDITOR`, even while a response is streaming; drafts containing pasted blocks, images, or skills are left unchanged. When an automatic upgrade is ready, press `Ctrl+T` to reload it.
+
 The status line hides the workspace path and Git branch by default. Enable the `Status line workspace` option in `/settings`, run `/statusline workspace`, or set it in `~/.fx/settings.json`:
 
 ```json
@@ -162,9 +164,26 @@ fx ask "explain the changes in this repository"
 
 With `--json`, `output` contains accumulated assistant Markdown across the request. Recovery replaces failed preview text rather than joining separate responses. If recovery pauses before a replacement is accepted, `output` keeps the latest preview. `final_output` contains only a completed final assistant response and is `""` for interrupted, failed, background, or otherwise absent final responses.
 
+Customize the system prompt for one model-launching invocation with global
+file options placed before the command:
+
+```bash
+fx --system-prompt-file ./base-prompt.md ask "review this change"
+fx --append-system-prompt-file ./team-rules.md --append-system-prompt-file ./task-rules.md
+```
+
+`--system-prompt-file` replaces the effective base prompt and may be supplied
+once. `--append-system-prompt-file` preserves that base and adds files in CLI
+order, separated by blank lines. The options also apply to interactive and
+resumed sessions, ACP, `pr`, and `issue`. Custom prompt files must be regular
+UTF-8 files without NUL bytes and may contain at most 256 KiB combined. File
+errors stop the launch. For `fx ask`, these options cannot be combined with
+the inline `--system` option.
+
 JSON results also include `usage.input_tokens` and `usage.output_tokens`, even with `--no-save`. These are the sums of token counts reported by main-agent completions in the turn, not the latest prompt size or session totals. A field is `null` when no completion reported that count; when only some completions report it, the sum includes only those known counts. JSON errors retain usage already observed. These fields do not include nested tool/provider usage, request counts, or dollar spend.
 
 Foreground terminal commands run with an explicit finite deadline. fx uses durable terminal sessions for services, watchers, GUI applications, and other long-lived work, and keeps captured foreground output available through an opaque bounded-read handle for the active session or `--no-save` process.
+
 
 Invalid Shell requests return the specific argument problems before any command runs. When the intended repair is unambiguous, the error includes a `retry_with` request for the agent to submit through normal validation and permissions. Repeated equivalent corrections stop the tool loop.
 
@@ -176,6 +195,18 @@ JSON and quiet requests stay noninteractive by default. Add `--prompt-permission
 
 Inside a saved session, `/permissions remember <allow|deny> <tool-name> <arguments-json>` stores an exact confirmed rule without running the action. `/permissions` lists stable rule IDs, and `/permissions revoke <rule-id>` removes a stored rule even when its original workspace or file state has changed.
 
+Use `--permissions-file <path>` before an interactive launch, resume command, or `acp` command to replace profile, workspace, and project permission rules for that process. The file uses the same permission-rule JSON shape as `settings.json`; saved-session exact grants still apply, but cannot override a deny from the launch policy:
+
+```json
+{
+  "bash": {
+    "git *": "allow",
+    "git push *": "deny"
+  },
+  "edit": "deny"
+}
+```
+
 ## Embed fx
 
 fx builds as a native binary or WebAssembly. Applications embedding fx can provide network transport, session storage, configuration, permission handling, and terminal I/O.
@@ -186,7 +217,93 @@ fx builds as a native binary or WebAssembly. Applications embedding fx can provi
 | `createFxAgent()` | Embed the agent core in a JavaScript host with `fx-core.wasm`. |
 | `createFxTerminal()` | Embed the interactive terminal with `fx-term.wasm`. |
 
+Interactive TUI and ACP launches can disable Fx-native tools with the global
+`--no-native-tools` option, or select an ordered allowlist with repeatable
+`--tool <name>`. The `terminal:exec` selection exposes only one-shot terminal
+commands, without interactive terminal-session actions. ACP can independently
+reject client-supplied MCP servers with `fx acp --no-acp-mcp`.
+
 The WebAssembly SDK is experimental. See the [WebAssembly SDK](sdk/README.md) and [ACP documentation](https://fx.sh/docs/using-fx/acp).
+
+For a repository-neutral interactive TUI or ACP process, launch Fx with the
+global `--no-project-instructions` option. Fx omits `AGENTS.md`, `CLAUDE.md`,
+and compatible scoped instruction prose for that process while retaining
+runtime context such as the working directory, date, Git state, tool guidance,
+and permission guidance.
+
+Run `fx --state-dir <path>` for an interactive session, or
+`fx --state-dir <path> acp` for ACP, when the agent needs an isolated Fx
+profile. The directory must already exist; Fx keeps its settings,
+authorization, profile instructions, profile-global skills, MCP state,
+memories, usage, prompt history, and sessions beneath `<path>/.fx` while
+terminal tools and MCP processes retain the normal `HOME` environment.
+
+An isolated launch can borrow one already-valid saved credential without
+copying it into that state root. Set `FX_AUTH_READ_ONLY_HOME` to the canonical
+home of another Fx profile and select the process provider with
+`FX_PROVIDER=gateway|codex|grok`. `FX_MODEL` supplies the process model when
+the isolated profile has no model for that provider. The borrowed profile is
+read only: Fx does not refresh, replace, or delete its credential, and every
+setting, session, history, skill, MCP entry, and authentication action remains
+owned by `--state-dir`. Fx rejects this authorization override when no
+`--state-dir` is selected.
+
+`--state-dir` sets three things at once: where the agent's shape comes from,
+which account it uses, and where its history is written. Each is also selectable
+on its own, so one common history can hold work from several agents and
+accounts:
+
+```bash
+fx --shape ~/shapes/reviewer                  # prompt, skills, MCP from that root
+fx --identity ~/fx-work                       # borrow that profile's credential
+fx --history-dir ~/fx-history                 # own sessions, history, and usage
+fx --mcp-config ~/shapes/reviewer/servers.json
+```
+
+`--shape <dir>` reads `<dir>/.fx/SYSTEM.md` or `<dir>/.fx/SYSTEM_APPEND.md`,
+adds `<dir>/.fx/skills` as a skill root, and uses `<dir>/.fx/mcp.json` when it
+exists. It moves no credentials and no sessions, and its conventional prompt
+wins over `--state-dir`'s. `--mcp-config <file>` selects that configuration
+directly; MCP credentials stay with the profile home either way.
+
+`--identity <dir>` borrows one already-valid credential from that profile under
+the same read-only contract as `FX_AUTH_READ_ONLY_HOME`: Fx does not refresh,
+replace, or delete it, and a credential due for refresh is declined rather than
+rewritten. Unlike the environment form, which still requires `--state-dir`, the
+flag stands on its own; naming both is refused.
+
+`--history-dir <dir>` owns sessions, prompt history, and usage. Without it,
+history stays with the profile home, so `--state-dir` isolates all three exactly
+as before.
+
+Every session records the shape and account that created it, and `fx sessions`
+names them:
+
+```
+ - review the parser
+   id=fnGq6VphbKjL | 1 turn | reviewer @ codex:6f4a132b990e | updated 2026-09-04 15:17:53 UTC
+```
+
+The stored label is for reading; a content digest stored beside it decides
+whether two sessions are the same shape. `fx sessions --json` reports both as
+`shape` and `shape_identity`, alongside `credential_source` and the full
+non-secret `credential_identity` digest. Text listings and the resume picker
+show a 12-character account digest beside the source, distinguishing accounts
+using the same provider. ACP `session/list` exposes this provenance in its
+additive `_meta.fx.provenance` object as `shape`, `shapeIdentity`,
+`credentialSource`, and `credentialIdentity`. Older sessions without recorded
+provenance remain readable. A turn that may already have reached the provider
+refuses to resume under a different shape or a different account.
+
+An explicit state directory can also carry one conventional system prompt for
+interactive, resumed, and ACP sessions and their in-process children.
+`<path>/.fx/SYSTEM.md` replaces Fx's built-in prompt, while
+`<path>/.fx/SYSTEM_APPEND.md` appends to it. The names are case-sensitive, and
+a launch fails if both files exist. `--system-prompt-file` bypasses this state
+discovery; repeatable `--append-system-prompt-file` values are added afterward.
+The same regular-file, UTF-8, NUL-free, and combined 256 KiB limits apply.
+`--no-project-instructions` does not suppress the selected state prompt, and Fx
+does not discover these files from the default home without `--state-dir`.
 
 ## Extend fx
 
@@ -218,6 +335,16 @@ an explicit notice.
 Skills are advertised in a stable catalog sized to the selected model's context window. The default budget is approximately 2% of context, or 8,000 characters when the context size is unknown, with up to 1,024 characters per description. Explicit byte overrides take precedence. When space is limited, fx shortens descriptions before omitting skill identities; `capability_search` can find skills outside that catalog.
 
 Explicit `$skill-name` mentions load the selected instructions before the model starts work. The `skill` tool accepts an advertised `location` and an optional relative `resource`, returning the complete document or a visible failure. Omitting `resource` or passing an empty string reads `SKILL.md`. File and tool-result limits still apply, and an explicit `skill_chunk_bytes` limit blocks a complete read that would exceed it. Existing named, offset-based calls remain supported.
+Load additional skill roots for one invocation with repeatable `--skills-dir`
+flags. Each root contains one directory per skill and is scanned before
+automatically discovered roots:
+
+```bash
+fx --skills-dir ./team-skills --skills-dir /opt/shared-skills ask "Review this change"
+```
+
+Invocation skill roots are not saved, and skill installation continues to use
+`~/.fx/skills`.
 
 In the interactive shell, explicitly requested skills show a named load summary before the assistant replies. Full failure details are available in Ctrl+O. These automatic loads are not counted as tool calls; a loaded status confirms prepared instructions, not that the model followed them.
 

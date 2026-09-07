@@ -255,6 +255,8 @@ pub const DispatchContext = struct {
     permission_decider: ?PermissionDecider = null,
     execution_authority: ?command_admission.ToolExecutionAuthority = null,
     workspace_root: []const u8 = "",
+    /// Optional Fx profile home; execution environments still inherit HOME.
+    profile_home: ?[]const u8 = null,
     access_scope: ?workspace_access.AccessScope = null,
     ignored_list_entries: []const []const u8 = &default_ignored_list_entries,
     max_list_entries: usize = default_max_list_entries,
@@ -264,6 +266,7 @@ pub const DispatchContext = struct {
     max_tool_result_bytes: usize = tool_result_limits.default_max_tool_result_bytes,
     max_command_output_bytes: usize = tool_result_limits.default_max_tool_result_bytes,
     skills_dir: []const u8 = "",
+    skill_root_policy: ?skill_contract.RootPolicy = null,
     skill_locations: ?*const skill_contract.Locations = null,
     resolved_skill: ?*const skill_contract.PreparedSkill = null,
     context_limits: context_limits.Values = .{},
