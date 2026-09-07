@@ -276,7 +276,7 @@ pub fn Commands(comptime App: type) type {
             const provider = provider_runtime.provider(app);
             var preferred: ?types.CredentialSource = null;
             if (provider == .gateway and app.auth.credentialSource() == null) {
-                var settings = config_runtime.loadMergedSettings(app.alloc, app.workspace_root) catch |err| {
+                var settings = app_profile_runtime.loadMergedSettings(app) catch |err| {
                     try writeSettingsLoadError(app, err);
                     return;
                 };
@@ -1650,6 +1650,7 @@ const FakeHistoryCommandApp = struct {
 };
 
 const FakeApp = struct {
+    profile_home: ?[]const u8 = null,
     alloc: std.mem.Allocator,
     workspace_root: []u8,
     tool_registry: tool_dispatch.Registry = .{},
@@ -1955,6 +1956,34 @@ test "session_commands showStatus writes session status snapshot" {
     app.permission_engine.mode = .yolo;
     try Commands(FakeApp).showStatus(&app);
     try expectTranscriptContains(&app, "permission_mode=full access\n");
+}
+
+test "session_commands selected profile status never reads ambient credential preferences" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "ambient/.fx");
+    try tmp.dir.createDirPath(std.testing.io, "selected/.fx");
+    try tmp.dir.createDirPath(std.testing.io, "workspace");
+    const ambient = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "ambient");
+    defer alloc.free(ambient);
+    const selected = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "selected");
+    defer alloc.free(selected);
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
+    defer alloc.free(workspace);
+    const env = try SessionCommandTestHome.install(alloc, ambient);
+    defer env.deinit();
+    try writeFixtureFile(tmp.dir, "selected/.fx/settings.json", "{\"credential_source\":\"ai_gateway_api_key\"}");
+    var app = try FakeApp.init(alloc, workspace, "test/model");
+    defer app.deinit();
+    app.profile_home = selected;
+    for ([_][]const u8{ "{\"credential_source\":\"vercel_oidc_token\"}", "invalid json" }) |ambient_settings| {
+        try writeFixtureFile(tmp.dir, "ambient/.fx/settings.json", ambient_settings);
+        app.clearTranscript();
+        try Commands(FakeApp).showStatus(&app);
+        try expectTranscriptContains(&app, "AI_GATEWAY_API_KEY is selected but unavailable");
+        try std.testing.expect(std.mem.find(u8, app.text(), "VERCEL_OIDC_TOKEN") == null);
+    }
 }
 
 test "session_commands history setting toggles durable input history" {
