@@ -263,7 +263,7 @@ pub fn Runtime(comptime App: type) type {
             else
                 .gateway;
             const provider_inventory = if (comptime @hasDecl(@TypeOf(app.auth), "pickerView")) inventory: {
-                try app.auth.refreshSourceInventoryForLogout(app.alloc);
+                try app.auth.refreshSourceInventory(app.alloc);
                 break :inventory app.auth.pickerView().available_sources;
             } else @as(auth_runtime.SourceSet, .empty);
             const logout_provider = auth_transition.decideLogoutProvider(.{
@@ -1876,9 +1876,9 @@ pub fn Runtime(comptime App: type) type {
                 app.auth.recordCredentialFailure(failure)
             else
                 true;
-            if (!first_observation) return false;
-
-            const recovery = try credentialRecoveryText(app.alloc, failure);
+            const for_compaction = if (comptime @hasField(App, "submission")) app.submission.compaction_pending else false;
+            if (!first_observation and !for_compaction) return false;
+            const recovery = try credentialRecoveryText(app.alloc, failure, for_compaction);
             defer app.alloc.free(recovery);
             try app.writeDomainNotice(.{
                 .topic = "auth",
@@ -1892,8 +1892,20 @@ pub fn Runtime(comptime App: type) type {
         fn credentialRecoveryText(
             alloc: std.mem.Allocator,
             failure: auth_runtime.CredentialFailure,
+            for_compaction: bool,
         ) ![]u8 {
             const source_label = credentials.sourceLabel(failure.source);
+            if (for_compaction) {
+                const reason = if (auth_runtime.preparationError(failure)) |err|
+                    auth_runtime.preparationFailureNotice(err).?
+                else
+                    "Sign-in expired.";
+                return std.fmt.allocPrint(
+                    alloc,
+                    "{s}: {s} Your conversation is unchanged. Check /status and repair authentication with /provider, then run /compact again.",
+                    .{ source_label, reason },
+                );
+            }
             return switch (failure.reason) {
                 .invalid_credential => std.fmt.allocPrint(
                     alloc,
@@ -2497,10 +2509,6 @@ const TestAuth = struct {
 
     fn openOnboardingPicker(self: *TestAuth, _: std.mem.Allocator) void {
         self.picker_opened = true;
-    }
-
-    fn refreshSourceInventoryForLogout(self: *TestAuth, _: std.mem.Allocator) !void {
-        self.source_inventory_refresh_count += 1;
     }
 
     fn beginSourceInventoryRefresh(
@@ -3384,6 +3392,20 @@ test "prompt credential refresh allows only OutOfMemory to escape" {
     try std.testing.expect(!app.shell.render_requests.footer_requested);
     try std.testing.expectEqual(@as(usize, 0), app.auth.source_inventory_refresh_count);
     try std.testing.expect(!app.auth.picker_opened);
+}
+
+test "manual compaction credential failure guidance does not promise a saved prompt" {
+    const alloc = std.testing.allocator;
+    const failure = auth_runtime.classifyCredentialFailure(.fx_login, error.CredentialRefreshUnavailable);
+    const manual = try Runtime(TestApp).credentialRecoveryText(alloc, failure, true);
+    defer alloc.free(manual);
+    try std.testing.expect(std.mem.find(u8, manual, "Your conversation is unchanged.") != null);
+    try std.testing.expect(std.mem.find(u8, manual, "/compact again") != null);
+    try std.testing.expect(std.mem.find(u8, manual, "Your prompt is saved.") == null);
+    const prompt = try Runtime(TestApp).credentialRecoveryText(alloc, failure, false);
+    defer alloc.free(prompt);
+    try std.testing.expect(std.mem.find(u8, prompt, "Your prompt is saved.") != null);
+    try std.testing.expect(std.mem.find(u8, prompt, "/compact") == null);
 }
 
 test "prompt credential refresh falls back when its task cannot start" {

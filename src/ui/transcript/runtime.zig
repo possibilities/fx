@@ -2585,7 +2585,7 @@ test "historical context-withheld tool detail keeps the call without result evid
         alloc,
         &metrics,
         .deferred,
-        "Not run — project instructions changed: Running cat nested/input.txt",
+        "Reading project instructions before continuing: Running cat nested/input.txt",
         true,
     );
     try runtime.attachHistoricalToolDetail(
@@ -7671,7 +7671,8 @@ pub const TranscriptRuntime = struct {
                         scroll_facts.source_visual_offset + accepted_semantic_progress_rows,
                     );
                 }
-                if (target.normal_buffer_recovery_pending and
+                if (target.body_disposition == .paint and
+                    target.normal_buffer_recovery_pending and
                     scroll_facts.source_compatible and
                     target.visual_offset > target.history_visual_offset)
                 {
@@ -12036,6 +12037,141 @@ test "pending tail projection seals against the complete frame layout" {
         candidate.transcript_area.bottom,
         transition.target_layout.transcript_area.bottom,
     );
+}
+
+test "history recovery preserves retained geometry and stages painted frames" {
+    const alloc = std.testing.allocator;
+    for ([_]bool{ false, true }) |repaint| {
+        const layout = invalidationTestLayout();
+        var runtime = TranscriptRuntime{ .layout = layout, .owned_top_row = 1 };
+        defer runtime.deinit(alloc);
+        var flow: std.ArrayList(u8) = .empty;
+        defer flow.deinit(alloc);
+        for (0..79) |_| try flow.appendSlice(alloc, "row\n");
+        try flow.appendSlice(alloc, "row");
+        var source = try source_preparation.prepareFullTranscriptViewportSource(
+            &runtime,
+            alloc,
+            try alloc.dupe(u8, flow.items),
+        );
+        defer source.deinit(alloc);
+        const activity = render_engine.frame_layout.ActivityState{ .thinking = .{
+            .gap_above_activity = 0,
+            .footer_gap_after_activity = 1,
+        } };
+        const frame_input = render_engine.frame_layout.SolveInput{
+            .terminal = layout,
+            .owned_top = 1,
+            .footer = .{ .natural_rows = 3, .min_rows = 3, .max_rows = 3 },
+            .transcript = source.preview,
+            .activity = activity,
+        };
+        const candidate = render_engine.frame_layout.solve(frame_input);
+        var prior_input = frame_input;
+        if (repaint) prior_input.footer = .{ .natural_rows = 5, .min_rows = 5, .max_rows = 5 };
+        const committed = render_engine.frame_layout.CommittedLayoutSnapshot.fromLayout(
+            render_engine.frame_layout.solve(prior_input),
+        );
+        runtime.committed_frame_layout = committed;
+        const committed_selection = ViewportSelection{
+            .top_row = 1,
+            .bottom_row = 16,
+            .start_line = 62,
+            .partial_skip_rows = 0,
+            .line_count = 80,
+            .last_visible_row = 16,
+            .replaceable_start_row = 1,
+        };
+        // A pending card left fewer canonical rows in the committed frame.
+        runtime.transcript_commit_state = .{ .stable = .{
+            .selection = committed_selection,
+            .visual_offset = 64,
+            .history_visual_offset = 62,
+            .total_visual_rows = 80,
+            .flow = try alloc.dupe(u8, flow.items),
+            .cursor_row = 17,
+            .cursor_col = 1,
+            .occupied_last_row = 16,
+            .occupied_last_row_blank = false,
+            .layout_id = committed.layout_id,
+            .normal_buffer_recovery_pending = true,
+        } };
+        const area = render_engine.frame_layout.FrameRect{ .top = 1, .bottom = if (repaint) 16 else 18 };
+        var metrics: Metrics = .{};
+        var prepared = try runtime.prepareTranscriptSurfacePaintFromSourceForFrame(
+            alloc,
+            &metrics,
+            &source,
+            area,
+            repaint,
+        );
+        defer prepared.deinit(alloc);
+        const facts = try runtime.prepareTranscriptScrollFactsForFrame(
+            alloc,
+            &source,
+            &prepared,
+            repaint,
+            false,
+        );
+        const scroll = render_engine.frame_scroll_plan.merge(layout.rows, 1, 0, facts.planned_rows);
+        if (repaint) {
+            try std.testing.expectEqual(@as(u32, 64), facts.target_visual_offset);
+            try std.testing.expectEqual(@as(u32, 0), facts.semantic_rows);
+        }
+        const resolved = try runtime.resolveTranscriptTransitionTargetForFrameInArea(
+            alloc,
+            &source,
+            &prepared,
+            render_engine.frame_layout.CommittedLayoutSnapshot.fromLayout(candidate),
+            area,
+            scroll,
+            facts,
+            repaint,
+            false,
+        );
+        if (repaint) {
+            try std.testing.expect(resolved.bodyDisposition() == .paint);
+            try std.testing.expectEqual(@as(usize, 62), resolved.selection().start_line);
+            try std.testing.expectEqual(@as(u16, 17), resolved.cursorRow());
+            try std.testing.expectEqual(@as(u16, 1), resolved.cursorCol());
+            try std.testing.expectEqual(@as(u16, 16), resolved.selection().last_visible_row);
+        } else {
+            try std.testing.expect(resolved.bodyDisposition() == .retain_committed);
+            try std.testing.expectEqualDeep(committed_selection, resolved.selection());
+            try std.testing.expectEqual(@as(u16, 17), resolved.cursorRow());
+            try std.testing.expectEqual(@as(u16, 1), resolved.cursorCol());
+        }
+        const footer_rows = render_engine.footer_layout.resolve(.{
+            .footer_top_for_extra = candidate.footer_area.top,
+            .terminal_rows = layout.rows,
+            .activity_offset = 0,
+            .extra_input_rows = 0,
+            .input_extra = 0,
+            .composer_top_chrome_rows = 0,
+            .picker_rows = 0,
+            .banner_active = false,
+        });
+        var plan = candidate.toPaintPlan(.{
+            .footer_rows = footer_rows,
+            .viewport = resolved.selection(),
+            .activity = render_engine.activity_placement.resolve(
+                .{ .turn_thinking = .{ .label = "Thinking" } },
+                activity,
+                candidate,
+            ),
+            .cursor_target = .{
+                .row = resolved.cursorRow(),
+                .col = resolved.cursorCol(),
+                .visible = true,
+            },
+        });
+        if (repaint) try plan.invalidation.append(.{ .reason = .external_clear, .top = 1, .bottom = 18 });
+        var transition = try runtime.sealTranscriptTransition(alloc, &source, &prepared, &plan, resolved);
+        defer transition.deinit(alloc);
+        try std.testing.expectEqualDeep(resolved.selection(), transition.selection);
+        try std.testing.expectEqual(resolved.cursorRow(), transition.cursor_row);
+        try std.testing.expectEqual(resolved.cursorCol(), transition.cursor_col);
+    }
 }
 
 test "transition commit keeps unplanned physical scroll as recovery debt" {
