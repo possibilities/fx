@@ -80,6 +80,7 @@ pub const PendingSkillRefresh = enum {
 pub const State = struct {
     pending: ?PendingSubmission = null,
     retry_after_auth: bool = false,
+    compaction_pending: bool = false,
 };
 
 fn buildPendingPromptDraft(
@@ -132,6 +133,72 @@ fn buildPendingPromptDraft(
 
 pub fn SubmitRuntime(comptime App: type) type {
     return struct {
+        pub fn request_context_compaction(app: *App) !void {
+            if (app.submission.compaction_pending) return;
+            if (!app.hasContextToCompact()) {
+                try app.writeDomainNotice(.{ .topic = "context", .tone = .neutral, .body = "No context to compact." }, true);
+                return;
+            }
+            if (app.submission.pending != null or app.worker.isProcessing() or
+                app.worker.queuedPromptCount() > 0 or app.worker.contextCompactionStatus() != .idle)
+            {
+                try app.writeDomainNotice(.{ .topic = "context", .tone = .warning, .body = "Wait for the active work to finish before compacting context." }, true);
+                return;
+            }
+            app.submission.compaction_pending = true;
+            errdefer clear_context_compaction(app, "notice_failed");
+            collect_context_compaction(app);
+            if (app.submission.compaction_pending) {
+                debug_trace.logf("input", "manual_compaction_auth_pending", .{});
+                try app.writeDomainNotice(.{ .topic = "context", .tone = .neutral, .body = "Preparing authentication for compaction. Press Ctrl+C to cancel." }, true);
+            }
+        }
+
+        fn collect_context_compaction(app: *App) void {
+            if (comptime !@hasDecl(App, "enqueueContextCompaction")) return;
+            if (!app.submission.compaction_pending) return;
+            admit_context_compaction(app) catch |err| {
+                clear_context_compaction(app, "admission_failed");
+                app.submission.retry_after_auth = false;
+                debug_trace.logf("input", "manual compaction admission failed err={s}", .{@errorName(err)});
+                var buffer: [256]u8 = undefined;
+                const body = std.fmt.bufPrint(&buffer, "Compaction was not started ({s}). Your conversation is unchanged. Check authentication and try /compact again.", .{@errorName(err)}) catch "Compaction was not started. Your conversation is unchanged. Try /compact again.";
+                app.writeDomainNotice(.{ .topic = "context", .tone = .@"error", .body = body }, true) catch |notice_err| {
+                    debug_trace.logf("input", "manual compaction failure notice failed err={s}", .{@errorName(notice_err)});
+                };
+            };
+        }
+
+        fn admit_context_compaction(app: *App) !void {
+            switch (try App.collectPendingPromptCredential(app)) {
+                .pending => return,
+                .rejected => {
+                    clear_context_compaction(app, "auth_rejected");
+                    app.submission.retry_after_auth = false;
+                    return;
+                },
+                .current => {},
+            }
+            app.submission.compaction_pending = false;
+            const queued = try app.enqueueContextCompaction();
+            app.writeDomainNotice(.{
+                .topic = "context",
+                .tone = if (queued) .neutral else .warning,
+                .body = if (queued) "Compaction queued." else "Wait for the active work to finish before compacting context.",
+            }, true) catch |err| {
+                debug_trace.logf("input", "manual compaction admission notice failed queued={} err={s}", .{ queued, @errorName(err) });
+            };
+        }
+
+        fn clear_context_compaction(app: *App, reason: []const u8) void {
+            if (!app.submission.compaction_pending) return;
+            app.submission.compaction_pending = false;
+            debug_trace.logf("input", "manual compaction intent cleared reason={s}", .{reason});
+            if (comptime @hasField(App, "auth")) {
+                if (comptime @hasDecl(@TypeOf(app.auth), "cancelPromptCredentialRefresh")) app.auth.cancelPromptCredentialRefresh();
+            }
+        }
+
         pub fn requestPromptRetryAfterAuth(app: *App) void {
             app.submission.retry_after_auth = true;
         }
@@ -235,6 +302,7 @@ pub fn SubmitRuntime(comptime App: type) type {
 
         pub fn collectPendingSubmissionFacts(app: *App) void {
             if (comptime !@hasField(App, "submission")) return;
+            collect_context_compaction(app);
             var pending = if (app.submission.pending) |*value| value else return;
             if (pending.phase == .awaiting_adoption) {
                 adoptPendingSubmission(app) catch |err| {
@@ -352,6 +420,14 @@ pub fn SubmitRuntime(comptime App: type) type {
 
         pub fn cancelPendingSubmission(app: *App) bool {
             if (comptime !@hasField(App, "submission")) return false;
+            if (app.submission.compaction_pending) {
+                clear_context_compaction(app, "cancelled");
+                app.writeDomainNotice(.{ .topic = "context", .tone = .neutral, .body = "Context compaction cancelled." }, true) catch |err| {
+                    debug_trace.logf("input", "manual compaction cancellation notice failed err={s}", .{@errorName(err)});
+                };
+                app.shell.render_requests.request(.footer);
+                return true;
+            }
             const pending = app.submission.pending orelse return false;
             if (pending.phase == .queued) {
                 if (comptime !@hasDecl(@TypeOf(app.worker), "removeQueuedPrompt")) {
@@ -395,6 +471,7 @@ pub fn SubmitRuntime(comptime App: type) type {
         }
 
         pub fn clearPendingSubmission(app: *App, reason: []const u8) void {
+            if (comptime @hasField(App, "submission")) clear_context_compaction(app, reason);
             const snapshot_cleanup: PendingSnapshotCleanup = if (transferPendingImageSnapshotsToComposerHistory(app))
                 .preserve
             else
@@ -403,6 +480,7 @@ pub fn SubmitRuntime(comptime App: type) type {
         }
 
         pub fn clearPendingSubmissionForSessionTransition(app: *App) void {
+            if (comptime @hasField(App, "submission")) clear_context_compaction(app, "session_transition");
             if (comptime @hasField(App, "auth")) {
                 if (comptime @hasDecl(@TypeOf(app.auth), "cancelProviderPreparation")) _ = app.auth.cancelProviderPreparation();
             }
@@ -545,6 +623,7 @@ pub fn SubmitRuntime(comptime App: type) type {
 
         pub fn submit(app: *App, max_prompt_history: usize) !void {
             if (comptime @hasField(App, "submission")) {
+                if (app.submission.compaction_pending and !pendingAuthRoutesLocalCommand(app)) return;
                 if (app.submission.pending) |pending| {
                     const route_local_command = pending.phase == .awaiting_auth and
                         pendingAuthRoutesLocalCommand(app);
@@ -2132,6 +2211,160 @@ test "pending draft construction frees every partial allocation" {
         checkPendingDraftConstructionAllocationFailure,
         .{},
     );
+}
+
+const CompactionAdmissionFake = struct {
+    alloc: std.mem.Allocator = std.testing.allocator,
+    submission: State = .{},
+    has_context: bool = true,
+    readiness: enum { pending, current, rejected } = .pending,
+    readiness_error: ?anyerror = null,
+    enqueue_error: ?anyerror = null,
+    credential_checks: usize = 0,
+    enqueue_count: usize = 0,
+    notice_error: bool = false,
+    notice_count: usize = 0,
+    notices: std.ArrayList(u8) = .empty,
+    auth: struct {
+        cancelled: usize = 0,
+        pub fn cancelPromptCredentialRefresh(self: *@This()) void {
+            self.cancelled += 1;
+        }
+    } = .{},
+    shell: struct { render_requests: @import("../../ui/render_request.zig").RenderRequestState = .{} } = .{},
+    worker: struct {
+        busy: bool = false,
+        queued: usize = 0,
+        status: worker_runtime.ContextCompactionStatus = .idle,
+        released_holds: usize = 0,
+        pub fn isProcessing(self: *@This()) bool {
+            return self.busy;
+        }
+        pub fn queuedPromptCount(self: *@This()) usize {
+            return self.queued;
+        }
+        pub fn contextCompactionStatus(self: *@This()) worker_runtime.ContextCompactionStatus {
+            return self.status;
+        }
+        pub fn releaseTurnStartHold(self: *@This()) void {
+            self.released_holds += 1;
+        }
+        pub fn clearQueuedPrompts(self: *@This(), _: std.mem.Allocator, _: []const types.ImageAttachment) void {
+            self.queued = 0;
+        }
+    } = .{},
+
+    fn deinit(self: *CompactionAdmissionFake) void {
+        SubmitRuntime(CompactionAdmissionFake).clear_context_compaction(self, "test_cleanup");
+        self.notices.deinit(self.alloc);
+    }
+    pub fn hasContextToCompact(self: *CompactionAdmissionFake) bool {
+        return self.has_context;
+    }
+    pub fn collectPendingPromptCredential(self: *CompactionAdmissionFake) !@TypeOf(self.readiness) {
+        self.credential_checks += 1;
+        if (self.readiness_error) |err| return err;
+        return self.readiness;
+    }
+    pub fn enqueueContextCompaction(self: *CompactionAdmissionFake) !bool {
+        if (self.enqueue_error) |err| return err;
+        self.enqueue_count += 1;
+        return true;
+    }
+    pub fn writeDomainNotice(self: *CompactionAdmissionFake, notice: types.SemanticNotice, _: bool) !void {
+        self.notice_count += 1;
+        if (self.notice_error) return error.OutOfMemory;
+        try self.notices.appendSlice(self.alloc, notice.body);
+    }
+};
+
+test "manual compaction admission waits for authentication and enqueues once" {
+    var app: CompactionAdmissionFake = .{};
+    defer app.deinit();
+    const Runtime = SubmitRuntime(CompactionAdmissionFake);
+    try Runtime.request_context_compaction(&app);
+    try Runtime.request_context_compaction(&app);
+    try std.testing.expect(app.submission.compaction_pending);
+    try std.testing.expectEqual(@as(usize, 1), app.credential_checks);
+    try std.testing.expectEqual(@as(usize, 0), app.enqueue_count);
+    app.readiness = .current;
+    Runtime.collect_context_compaction(&app);
+    Runtime.collect_context_compaction(&app);
+    try std.testing.expect(!app.submission.compaction_pending);
+    try std.testing.expectEqual(@as(usize, 1), app.enqueue_count);
+    try std.testing.expectEqual(@as(usize, 0), app.auth.cancelled);
+}
+
+test "manual compaction empty and busy admission does not prepare authentication" {
+    for (0..4) |case| {
+        var app: CompactionAdmissionFake = .{};
+        defer app.deinit();
+        switch (case) {
+            0 => app.has_context = false,
+            1 => app.worker.busy = true,
+            2 => app.worker.queued = 1,
+            3 => app.worker.status = .queued,
+            else => unreachable,
+        }
+        try SubmitRuntime(CompactionAdmissionFake).request_context_compaction(&app);
+        try std.testing.expect(!app.submission.compaction_pending);
+        try std.testing.expectEqual(@as(usize, 0), app.credential_checks);
+        try std.testing.expectEqual(@as(usize, 0), app.enqueue_count);
+    }
+}
+
+test "manual compaction rejected authentication cannot submit a draft later" {
+    var app: CompactionAdmissionFake = .{ .readiness = .rejected };
+    defer app.deinit();
+    app.submission.retry_after_auth = true;
+    try SubmitRuntime(CompactionAdmissionFake).request_context_compaction(&app);
+    try std.testing.expect(!app.submission.compaction_pending);
+    try std.testing.expect(!app.submission.retry_after_auth);
+    app.readiness = .current;
+    SubmitRuntime(CompactionAdmissionFake).collect_context_compaction(&app);
+    try std.testing.expectEqual(@as(usize, 0), app.enqueue_count);
+}
+
+test "manual compaction admission errors stay local and release pending ownership" {
+    for ([_]bool{ false, true }) |after_readiness| {
+        var app: CompactionAdmissionFake = .{ .readiness = .current };
+        defer app.deinit();
+        if (after_readiness) app.enqueue_error = error.MissingApiKey else app.readiness_error = error.OutOfMemory;
+        try SubmitRuntime(CompactionAdmissionFake).request_context_compaction(&app);
+        try std.testing.expect(!app.submission.compaction_pending);
+        try std.testing.expectEqual(@as(usize, 0), app.enqueue_count);
+        try std.testing.expect(std.mem.find(u8, app.notices.items, "Your conversation is unchanged.") != null);
+    }
+}
+
+test "manual compaction queued work is not reported unstarted after a notice failure" {
+    var app: CompactionAdmissionFake = .{ .readiness = .current, .notice_error = true };
+    defer app.deinit();
+    try SubmitRuntime(CompactionAdmissionFake).request_context_compaction(&app);
+    try std.testing.expectEqual(@as(usize, 1), app.enqueue_count);
+    try std.testing.expectEqual(@as(usize, 1), app.notice_count);
+    try std.testing.expect(!app.submission.compaction_pending);
+}
+
+test "manual compaction cancellation and transition clearing prevent late enqueue" {
+    for (0..3) |boundary| {
+        var app: CompactionAdmissionFake = .{};
+        defer app.deinit();
+        const Runtime = SubmitRuntime(CompactionAdmissionFake);
+        try Runtime.request_context_compaction(&app);
+        switch (boundary) {
+            0 => try std.testing.expect(Runtime.cancelPendingSubmission(&app)),
+            1 => Runtime.clearPendingSubmissionForSessionTransition(&app),
+            2 => Runtime.clearPendingSubmission(&app, "shutdown"),
+            else => unreachable,
+        }
+        Runtime.clearPendingSubmission(&app, "repeated_cleanup");
+        app.readiness = .current;
+        Runtime.collect_context_compaction(&app);
+        try std.testing.expectEqual(@as(usize, 1), app.auth.cancelled);
+        try std.testing.expectEqual(@as(usize, 0), app.enqueue_count);
+        try std.testing.expectEqual(@as(usize, 0), app.worker.released_holds);
+    }
 }
 
 const PendingLifecycleFake = struct {
