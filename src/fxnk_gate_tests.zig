@@ -29,6 +29,7 @@ test {
     _ = @import("core/mcp/mcp_runtime.zig");
     _ = @import("core/notifications/sound.zig");
     _ = @import("core/output/output_contracts.zig");
+    _ = @import("core/session/session_commands.zig");
     _ = @import("core/session/session_naming.zig");
     _ = @import("core/skills/skill_runtime.zig");
     _ = @import("core/subagent/approval_registry.zig");
