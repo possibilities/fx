@@ -39,12 +39,35 @@ const ConversationProgress = struct {
     pending: usize = 0,
     coverage: u64 = 0,
     reached: bool = false,
+    pending_assistant: ?struct { seq: u64, has_replay: bool } = null,
 
     fn observe(self: *ConversationProgress, seq: u64, event: session_event.ConversationEvent, cut: ?types.ContextHistoryCut) !void {
+        if (self.pending_assistant) |assistant| {
+            const standalone = switch (event) {
+                .assistant, .context_checkpoint, .interrupted => true,
+                .steering => assistant.has_replay,
+                else => false,
+            };
+            if (standalone) {
+                self.point.tool_steps += 1;
+                if (cut) |target| if (!self.reached and std.meta.eql(self.point, target)) {
+                    self.coverage = assistant.seq;
+                    self.reached = true;
+                };
+            }
+            self.pending_assistant = null;
+        }
         if (cut) |target| if (std.meta.eql(self.point, target) and self.pending == 0) {
             self.reached = true;
         };
         switch (event) {
+            .assistant => |value| {
+                if (value.standalone_response) {
+                    self.point.tool_steps += 1;
+                } else if (value.text.len > 0 or value.provider_replay != null) {
+                    self.pending_assistant = .{ .seq = seq, .has_replay = value.provider_replay != null };
+                }
+            },
             .tool_call => self.pending += 1,
             .tool_result => {
                 if (self.pending == 0) return error.InvalidConversationFrame;
@@ -68,6 +91,24 @@ const ConversationProgress = struct {
         }
     }
 };
+
+test "conversation cut counts standalone text without changing steering prefixes" {
+    var progress: ConversationProgress = .{};
+    const cut: types.ContextHistoryCut = .{ .tool_steps = 1 };
+    try progress.observe(1, .{ .user = .{ .text = "request" } }, cut);
+    try progress.observe(2, .{ .assistant = .{ .text = "CANDIDATE_741" } }, cut);
+    try progress.observe(3, .{ .assistant = .{ .text = "FINAL_852" } }, cut);
+    try std.testing.expectEqual(@as(usize, 1), progress.point.tool_steps);
+    try std.testing.expectEqual(@as(u64, 2), progress.coverage);
+    try std.testing.expect(progress.reached);
+
+    var steering: ConversationProgress = .{};
+    try steering.observe(1, .{ .user = .{ .text = "request" } }, null);
+    try steering.observe(2, .{ .assistant = .{ .text = "prefix" } }, null);
+    try steering.observe(3, .{ .steering = .{ .text = "human update" } }, null);
+    try std.testing.expectEqual(@as(usize, 0), steering.point.tool_steps);
+    try std.testing.expectEqual(@as(usize, 1), steering.point.steering);
+}
 
 pub const ConversationWriter = struct {
     alloc: Allocator,
@@ -702,6 +743,15 @@ fn loadConversationStateIfPresent(
     dir: *io_mod.VerifiedDir,
     expected_session_id: []const u8,
 ) !?session_codec.DurableSessionState {
+    return load_conversation_state_at_boundary(alloc, dir, expected_session_id, null);
+}
+
+fn load_conversation_state_at_boundary(
+    alloc: Allocator,
+    dir: *io_mod.VerifiedDir,
+    expected_session_id: []const u8,
+    recovery: ?ConversationRecoveryBoundary,
+) !?session_codec.DurableSessionState {
     const metadata_bytes = readManagedFileAlloc(
         alloc,
         dir,
@@ -714,7 +764,10 @@ fn loadConversationStateIfPresent(
     defer alloc.free(metadata_bytes);
     var probe = std.json.parseFromSlice(std.json.Value, alloc, metadata_bytes, .{
         .parse_numbers = false,
-    }) catch return null;
+    }) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => return null,
+    };
     defer probe.deinit();
     const object = if (probe.value == .object) probe.value.object else return null;
     const version_value = object.get("schema_version") orelse return null;
@@ -734,10 +787,15 @@ fn loadConversationStateIfPresent(
     var conversation_seq: u64 = 0;
     var open_work_id: ?[]u8 = null;
     defer if (open_work_id) |work_id| alloc.free(work_id);
-    const history = try replayConversationHistory(alloc, event_file, &conversation_seq, &open_work_id);
+    const length = if (recovery) |boundary| boundary.bytes else try event_file.length(io_mod.getIo());
+    const history = try replayConversationHistory(alloc, event_file, length, &conversation_seq, &open_work_id);
     errdefer session.freeHistoryTurnSlice(alloc, history);
-    try restoreContextResultBodies(alloc, dir, history);
-    const last_work_id = if (latestConversationWorkId(history)) |work_id|
+    if (recovery == null) try restoreContextResultBodies(alloc, dir, history);
+    const latest_work_id = if (recovery != null and recovery.?.turn_open and open_work_id != null)
+        open_work_id
+    else
+        latestConversationWorkId(history);
+    const last_work_id = if (latest_work_id) |work_id|
         try alloc.dupe(u8, work_id)
     else
         null;
@@ -750,7 +808,10 @@ fn loadConversationStateIfPresent(
     errdefer if (usage) |*snapshot| snapshot.deinit(alloc);
     var permission_state = try loadConversationPermissionState(alloc, dir);
     errdefer permission_state.deinit(alloc);
-    var recovery_checkpoint = try loadConversationRecoveryCheckpoint(alloc, dir, conversation_seq);
+    var recovery_checkpoint = if (recovery == null)
+        try loadConversationRecoveryCheckpoint(alloc, dir, conversation_seq)
+    else
+        null;
     errdefer if (recovery_checkpoint) |*checkpoint| checkpoint.deinit(alloc);
     if (recovery_checkpoint) |*checkpoint| {
         if (checkpoint.user.work_id == null) {
@@ -816,6 +877,259 @@ pub fn hasConversationMetadata(
     const bytes = (try readConversationMetadataBytes(alloc, dir)) orelse return false;
     defer alloc.free(bytes);
     return isConversationMetadata(alloc, bytes);
+}
+
+pub const ConversationRecoveryBoundary = struct {
+    bytes: u64 = 0,
+    seq: u64 = 0,
+    timestamp_ms: i64 = 0,
+    turn_open: bool = false,
+};
+
+/// Reads only. The existing transition validator remains the record authority.
+pub fn find_conversation_recovery_boundary(
+    alloc: Allocator,
+    dir: *io_mod.VerifiedDir,
+) !ConversationRecoveryBoundary {
+    var reader = try ConversationHistoryReader.init(alloc, dir);
+    defer reader.deinit();
+    const file = reader.file;
+    const length = reader.length;
+    reader.length = 0;
+    var state = ConversationWriter{ .alloc = alloc, .file = file };
+    defer {
+        state.clearPendingToolCalls();
+        state.pending_tool_calls.deinit(alloc);
+    }
+    var boundary: ConversationRecoveryBoundary = .{};
+    var offset: u64 = 0;
+    var coverage_offset: u64 = 0;
+    var coverage_seq: u64 = 0;
+    var coverage_progress: ConversationProgress = .{};
+    scan: while (offset < length) {
+        const line = session_replay.readLineAt(alloc, file, offset, length) catch |err| switch (err) {
+            error.TruncatedEventFrame, error.EventFrameTooLarge => break,
+            else => return err,
+        } orelse break;
+        defer alloc.free(line.bytes);
+        var decoded = session_event.decodeConversationFrame(alloc, line.bytes) catch |err| switch (err) {
+            error.InvalidConversationFrame => break,
+            else => return err,
+        };
+        defer decoded.deinit();
+        session_event.validateConversationTransition(.{
+            .last_seq = state.last_seq,
+            .latest_checkpoint_coverage = state.latest_checkpoint_coverage,
+            .pending_tool_calls = state.pending_tool_calls.items,
+        }, decoded.value) catch break;
+        if (decoded.value.event == .context_checkpoint) {
+            const coverage = decoded.value.event.context_checkpoint.covers_through_seq;
+            // Coverage is monotone, so historical cuts need only one extra scan.
+            while (coverage_seq < coverage) {
+                const covered = (try session_replay.readLineAt(alloc, file, coverage_offset, offset)) orelse
+                    return error.SessionRecoveryBoundaryInvalid;
+                defer alloc.free(covered.bytes);
+                var frame = try session_event.decodeConversationFrame(alloc, covered.bytes);
+                defer frame.deinit();
+                try coverage_progress.observe(frame.value.seq, frame.value.event, null);
+                coverage_seq = frame.value.seq;
+                coverage_offset = covered.next_offset;
+            }
+            if (coverage_progress.pending != 0) break :scan;
+        }
+        state.applyReplayedEvent(decoded.value.seq, decoded.value.event) catch |err| switch (err) {
+            error.InvalidConversationFrame => break :scan,
+            else => return err,
+        };
+        // A valid frame must also be replayable before it can extend the copy.
+        reader.length = line.next_offset;
+        if (reader.next() catch |err| switch (err) {
+            error.InvalidConversationFrame, error.ConversationSizeOverflow => break :scan,
+            else => return err,
+        }) |turn| session.freeHistoryTurn(alloc, turn);
+        offset = line.next_offset;
+        if (!state.turn_open or
+            (decoded.value.event == .context_checkpoint and state.pending_tool_calls.items.len == 0))
+        {
+            boundary = .{
+                .bytes = offset,
+                .seq = state.last_seq,
+                .timestamp_ms = decoded.value.timestamp_ms,
+                .turn_open = state.turn_open,
+            };
+        }
+    }
+    if (offset == length and boundary.bytes == length) return error.SessionRecoveryNotNeeded;
+    if (boundary.bytes == 0) return error.SessionRecoveryBoundaryInvalid;
+    debug_trace.logf("session", "event=conversation_recovery_boundary source_bytes={d} retained_bytes={d} through_seq={d}", .{ length, boundary.bytes, boundary.seq });
+    return boundary;
+}
+
+/// Caller owns the returned complete archive, with a checkpointed open turn
+/// explicitly interrupted rather than scheduling its abandoned continuation.
+pub fn load_conversation_recovery_state(
+    alloc: Allocator,
+    dir: *io_mod.VerifiedDir,
+    session_id: []const u8,
+    boundary: ConversationRecoveryBoundary,
+) !session_codec.DurableSessionState {
+    const loaded = load_conversation_state_at_boundary(alloc, dir, session_id, boundary) catch |err| switch (err) {
+        error.InvalidSessionMetadata, error.InvalidSessionFormat => return error.SessionRecoveryBoundaryInvalid,
+        else => return err,
+    };
+    var state = loaded orelse return error.SessionRecoveryBoundaryInvalid;
+    errdefer state.deinit(alloc);
+    const file = try openManagedFile(dir, events_file, .read_only);
+    defer file.close(io_mod.getIo());
+    const archive = try load_conversation_archive_from_file(alloc, file, boundary.bytes, boundary.turn_open);
+    session.freeHistoryTurnSlice(alloc, state.history);
+    state.history = archive;
+    state.context_history_start = latestConversationCheckpointIndex(archive);
+    return state;
+}
+
+/// Installs exact validated records in an unpublished target; never edits source.
+pub fn copy_conversation_recovery_prefix(
+    alloc: Allocator,
+    source: *io_mod.VerifiedDir,
+    target: *io_mod.VerifiedDir,
+    boundary: ConversationRecoveryBoundary,
+) !void {
+    const input = try openManagedFile(source, events_file, .read_only);
+    defer input.close(io_mod.getIo());
+    const output = try openManagedFile(target, events_file, .read_write);
+    defer output.close(io_mod.getIo());
+    var buffer: [8192]u8 = undefined;
+    var offset: u64 = 0;
+    while (offset < boundary.bytes) {
+        const count: usize = @intCast(@min(buffer.len, boundary.bytes - offset));
+        if (try input.readPositionalAll(io_mod.getIo(), buffer[0..count], offset) != count)
+            return error.SessionRecoveryBoundaryInvalid;
+        try output.writePositionalAll(io_mod.getIo(), buffer[0..count], offset);
+        offset += count;
+    }
+    if (boundary.turn_open) {
+        const interrupted = try session_event.encodeConversationFrame(alloc, .{
+            .seq = try std.math.add(u64, boundary.seq, 1),
+            .timestamp_ms = boundary.timestamp_ms,
+            .event = .{ .interrupted = .{ .reason = .failed } },
+        });
+        defer alloc.free(interrupted);
+        try output.writePositionalAll(io_mod.getIo(), interrupted, offset);
+        offset = try std.math.add(u64, offset, interrupted.len);
+    }
+    try output.setLength(io_mod.getIo(), offset);
+    try output.sync(io_mod.getIo());
+    debug_trace.logf("session", "event=conversation_recovery_prefix bytes={d} through_seq={d} interrupted={}", .{ boundary.bytes, boundary.seq, boundary.turn_open });
+}
+
+test "conversation recovery boundary validates prefix and never edits source" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var dir = io_mod.VerifiedDir{ .dir = tmp.dir };
+    const prefix =
+        "{\"schema_version\":1,\"seq\":1,\"timestamp_ms\":1,\"event\":{\"user\":{\"text\":\"fact\"}}}\n" ++
+        "{\"schema_version\":1,\"seq\":2,\"timestamp_ms\":1,\"event\":{\"assistant\":{\"text\":\"saved\"}}}\n" ++
+        "{\"schema_version\":1,\"seq\":3,\"timestamp_ms\":1,\"event\":{\"turn_completed\":{}}}\n";
+    const suffixes = [_][]const u8{
+        "{",
+        "invalid\n",
+        "{\"schema_version\":1,\"seq\":99,\"timestamp_ms\":1,\"event\":{\"user\":{\"text\":\"wrong sequence\"}}}\n",
+        "{\"schema_version\":1,\"seq\":4,\"timestamp_ms\":1,\"event\":{\"context_checkpoint\":{\"covers_through_seq\":9,\"summary\":\"invalid coverage\"}}}\n",
+        "{\"schema_version\":1,\"seq\":4,\"timestamp_ms\":1,\"event\":{\"user\":{\"text\":\"unfinished batch\"}}}\n" ++
+            "{\"schema_version\":1,\"seq\":5,\"timestamp_ms\":1,\"event\":{\"tool_call\":{\"call_id\":\"one\",\"tool_name\":\"shell\",\"arguments_json\":\"{}\"}}}\n" ++
+            "{\"schema_version\":1,\"seq\":6,\"timestamp_ms\":1,\"event\":{\"tool_call\":{\"call_id\":\"two\",\"tool_name\":\"shell\",\"arguments_json\":\"{}\"}}}\n" ++
+            "{\"schema_version\":1,\"seq\":7,\"timestamp_ms\":1,\"event\":{\"interrupted\":{\"reason\":\"failed\"}}}\ninvalid\n",
+    };
+    for (suffixes) |suffix| {
+        const bytes = try std.mem.concat(alloc, u8, &.{ prefix, suffix });
+        defer alloc.free(bytes);
+        try tmp.dir.writeFile(std.testing.io, .{ .sub_path = events_file, .data = bytes, .flags = .{ .permissions = private_file_permissions } });
+        const boundary = try find_conversation_recovery_boundary(alloc, &dir);
+        try std.testing.expectEqual(prefix.len, boundary.bytes);
+        try std.testing.expectEqual(@as(u64, 3), boundary.seq);
+        try std.testing.expect(!boundary.turn_open);
+        const actual = try readManagedFileAlloc(alloc, &dir, events_file, bytes.len);
+        defer alloc.free(actual);
+        try std.testing.expectEqualStrings(bytes, actual);
+    }
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = events_file, .data = prefix, .flags = .{ .permissions = private_file_permissions } });
+    try std.testing.expectError(error.SessionRecoveryNotNeeded, find_conversation_recovery_boundary(alloc, &dir));
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = events_file, .data = "invalid\n", .flags = .{ .permissions = private_file_permissions } });
+    try std.testing.expectError(error.SessionRecoveryBoundaryInvalid, find_conversation_recovery_boundary(alloc, &dir));
+}
+
+test "conversation recovery rejects checkpoint cuts inside tool batches" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var dir = io_mod.VerifiedDir{ .dir = tmp.dir };
+    const prefix =
+        "{\"schema_version\":1,\"seq\":1,\"timestamp_ms\":1,\"event\":{\"user\":{\"text\":\"request\"}}}\n" ++
+        "{\"schema_version\":1,\"seq\":2,\"timestamp_ms\":1,\"event\":{\"tool_call\":{\"call_id\":\"one\",\"tool_name\":\"shell\",\"arguments_json\":\"{}\"}}}\n" ++
+        "{\"schema_version\":1,\"seq\":3,\"timestamp_ms\":1,\"event\":{\"tool_call\":{\"call_id\":\"two\",\"tool_name\":\"shell\",\"arguments_json\":\"{}\"}}}\n" ++
+        "{\"schema_version\":1,\"seq\":4,\"timestamp_ms\":1,\"event\":{\"tool_result\":{\"call_id\":\"one\",\"tool_name\":\"shell\",\"status\":\"success\",\"artifact_ref\":\"one.txt\",\"stored_bytes\":0,\"completeness\":\"complete\"}}}\n" ++
+        "{\"schema_version\":1,\"seq\":5,\"timestamp_ms\":1,\"event\":{\"tool_result\":{\"call_id\":\"two\",\"tool_name\":\"shell\",\"status\":\"success\",\"artifact_ref\":\"two.txt\",\"stored_bytes\":0,\"completeness\":\"complete\"}}}\n" ++
+        "{\"schema_version\":1,\"seq\":6,\"timestamp_ms\":1,\"event\":{\"turn_completed\":{}}}\n";
+    for ([_]u64{ 1, 2, 3, 4, 5, 6 }) |coverage| {
+        for ([_][]const u8{ "", "invalid\n" }) |tail| {
+            const bytes = try std.fmt.allocPrint(alloc, "{s}{{\"schema_version\":1,\"seq\":7,\"timestamp_ms\":1,\"event\":{{\"context_checkpoint\":{{\"covers_through_seq\":{d},\"summary\":\"checkpoint\"}}}}}}\n{s}", .{ prefix, coverage, tail });
+            defer alloc.free(bytes);
+            try tmp.dir.writeFile(std.testing.io, .{ .sub_path = events_file, .data = bytes, .flags = .{ .permissions = private_file_permissions } });
+            if (coverage >= 2 and coverage <= 4) {
+                const boundary = try find_conversation_recovery_boundary(alloc, &dir);
+                try std.testing.expectEqual(prefix.len, boundary.bytes);
+                try std.testing.expectEqual(@as(u64, 6), boundary.seq);
+            } else if (tail.len == 0) {
+                try std.testing.expectError(error.SessionRecoveryNotNeeded, find_conversation_recovery_boundary(alloc, &dir));
+            } else {
+                const boundary = try find_conversation_recovery_boundary(alloc, &dir);
+                try std.testing.expectEqual(bytes.len - tail.len, boundary.bytes);
+            }
+        }
+    }
+}
+
+test "conversation recovery allocation failures do not become corruption" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var dir = io_mod.VerifiedDir{ .dir = tmp.dir };
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = events_file, .flags = .{ .permissions = private_file_permissions }, .data = "{\"schema_version\":1,\"seq\":1,\"timestamp_ms\":1,\"event\":{\"user\":{\"text\":\"fact\"}}}\n" ++
+        "{\"schema_version\":1,\"seq\":2,\"timestamp_ms\":1,\"event\":{\"assistant\":{\"text\":\"saved\"}}}\n" ++
+        "{\"schema_version\":1,\"seq\":3,\"timestamp_ms\":1,\"event\":{\"turn_completed\":{}}}\n" ++
+        "{\"schema_version\":1,\"seq\":4,\"timestamp_ms\":1,\"event\":{\"context_checkpoint\":{\"covers_through_seq\":1,\"summary\":\"retained fact\"}}}\n" ++
+        "{\"schema_version\":1,\"seq\":5,\"timestamp_ms\":1,\"event\":{\"user\":{\"text\":\"pending\"}}}\n" ++
+        "{\"schema_version\":1,\"seq\":6,\"timestamp_ms\":1,\"event\":{\"tool_call\":{\"call_id\":\"call1\",\"tool_name\":\"shell\",\"arguments_json\":\"{}\"}}}\ninvalid\n" });
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, struct {
+        fn check(alloc: Allocator, source: *io_mod.VerifiedDir) !void {
+            const boundary = try find_conversation_recovery_boundary(alloc, source);
+            try std.testing.expectEqual(@as(u64, 4), boundary.seq);
+        }
+    }.check, .{&dir});
+}
+
+test "conversation recovery state preserves allocation errors and contains invalid metadata" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var dir = io_mod.VerifiedDir{ .dir = tmp.dir };
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = manifest_file, .flags = .{ .permissions = private_file_permissions }, .data = "{\"schema_version\":4,\"id\":\"recovery-source\",\"created_at_ms\":1,\"updated_at_ms\":1,\"origin_workspace_root\":\"/tmp\",\"workspace_root\":\"/tmp\",\"conversation_language\":\"en\",\"provider\":\"gateway\",\"model\":\"test/model\",\"effort\":\"auto\",\"fast_mode\":false,\"title\":null,\"subagent_child\":false}" });
+    const prefix =
+        "{\"schema_version\":1,\"seq\":1,\"timestamp_ms\":1,\"event\":{\"user\":{\"text\":\"fact\"}}}\n" ++
+        "{\"schema_version\":1,\"seq\":2,\"timestamp_ms\":1,\"event\":{\"assistant\":{\"text\":\"saved\"}}}\n" ++
+        "{\"schema_version\":1,\"seq\":3,\"timestamp_ms\":1,\"event\":{\"turn_completed\":{}}}\n";
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = events_file, .flags = .{ .permissions = private_file_permissions }, .data = prefix ++ "invalid\n" });
+    const boundary = try find_conversation_recovery_boundary(alloc, &dir);
+    try std.testing.expectError(error.SessionRecoveryBoundaryInvalid, load_conversation_recovery_state(alloc, &dir, "wrong-id", boundary));
+    try std.testing.checkAllAllocationFailures(alloc, struct {
+        fn check(a: Allocator, source: *io_mod.VerifiedDir, cut: ConversationRecoveryBoundary) !void {
+            var state = try load_conversation_recovery_state(a, source, "recovery-source", cut);
+            defer state.deinit(a);
+            try std.testing.expectEqual(@as(usize, 1), state.history.len);
+            try std.testing.expect(state.recovery_checkpoint == null);
+        }
+    }.check, .{ &dir, boundary });
 }
 
 /// Reads and validates current metadata once. The caller owns the decoded value.
@@ -910,10 +1224,10 @@ fn openConversationWritableSession(
 fn replayConversationHistory(
     alloc: Allocator,
     file: std.Io.File,
+    length: u64,
     conversation_seq: *u64,
     open_work_id: *?[]u8,
 ) ![]session.HistoryTurn {
-    const length = try file.length(io_mod.getIo());
     const window = try findConversationReplayWindow(alloc, file, length);
     conversation_seq.* = window.last_complete_seq;
     var offset = window.offset;
@@ -960,7 +1274,7 @@ fn replayConversationHistory(
         defer decoded.deinit();
         switch (decoded.value.event) {
             .user => |value| try turn.begin(value),
-            .assistant => |value| try turn.appendAssistant(value.text),
+            .assistant => |value| try turn.appendAssistant(value),
             .tool_call => |value| try turn.appendToolCall(value),
             .tool_result => |value| try turn.appendToolResult(value),
             .steering => |value| try turn.appendSteering(value.text),
@@ -976,7 +1290,10 @@ fn replayConversationHistory(
                 errdefer session.freeHistoryTurn(alloc, completed);
                 try history.append(alloc, completed);
             },
-            .context_checkpoint => checkpoint_turn_open = turn.user != null,
+            .context_checkpoint => {
+                try turn.finishStandalone();
+                checkpoint_turn_open = turn.user != null;
+            },
         }
         offset = line.next_offset;
     }
@@ -1034,7 +1351,7 @@ pub const ConversationHistoryReader = struct {
                     break :blk null;
                 },
                 .assistant => |value| blk: {
-                    try self.builder.appendAssistant(value.text);
+                    try self.builder.appendAssistant(value);
                     break :blk null;
                 },
                 .tool_call => |value| blk: {
@@ -1055,6 +1372,7 @@ pub const ConversationHistoryReader = struct {
                     if (self.builder.calls.items.len != 0 or self.builder.results.items.len != 0) {
                         return error.InvalidConversationFrame;
                     }
+                    try self.builder.finishStandalone();
                     break :blk null;
                 },
             };
@@ -1099,6 +1417,15 @@ pub fn loadConversationArchive(
     var file = try openManagedFile(dir, events_file, .read_only);
     defer file.close(io_mod.getIo());
     const length = try file.length(io_mod.getIo());
+    return load_conversation_archive_from_file(alloc, file, length, false);
+}
+
+fn load_conversation_archive_from_file(
+    alloc: Allocator,
+    file: std.Io.File,
+    length: u64,
+    close_open_turn: bool,
+) ![]session.HistoryTurn {
     var offset: u64 = 0;
     var turns: std.ArrayList(session.HistoryTurn) = .empty;
     errdefer {
@@ -1123,7 +1450,7 @@ pub fn loadConversationArchive(
                 break :blk null;
             },
             .assistant => |value| blk: {
-                try builder.appendAssistant(value.text);
+                try builder.appendAssistant(value);
                 break :blk null;
             },
             .tool_call => |value| blk: {
@@ -1144,6 +1471,7 @@ pub fn loadConversationArchive(
                 if (builder.calls.items.len != 0 or builder.results.items.len != 0) {
                     return error.InvalidConversationFrame;
                 }
+                try builder.finishStandalone();
                 compaction_count += 1;
                 break :blk .{ .compacted_summary = .{
                     .summary = try alloc.dupe(u8, value.summary),
@@ -1160,6 +1488,11 @@ pub fn loadConversationArchive(
             if (turn != .compacted_summary) raw_turn_count += 1;
         }
         offset = line.next_offset;
+    }
+    if (close_open_turn and builder.user != null) {
+        const completed = try builder.finishInterrupted(.{ .reason = .failed });
+        errdefer session.freeHistoryTurn(alloc, completed);
+        try turns.append(alloc, completed);
     }
     return turns.toOwnedSlice(alloc);
 }
@@ -1263,6 +1596,7 @@ const ConversationTurnBuilder = struct {
     alloc: Allocator,
     user: ?types.UserTurn = null,
     pending_assistant: ?[]u8 = null,
+    pending_replay: ?types.ProviderReplay = null,
     calls: std.ArrayList(types.ToolCall) = .empty,
     results: std.ArrayList(types.PersistedToolResult) = .empty,
     steps: std.ArrayList(types.ToolExecutionStep) = .empty,
@@ -1275,12 +1609,14 @@ const ConversationTurnBuilder = struct {
     fn deinit(self: *ConversationTurnBuilder) void {
         if (self.user) |user| types.freeUserTurn(self.alloc, user);
         if (self.pending_assistant) |text| self.alloc.free(text);
+        if (self.pending_replay) |replay| types.freeProviderReplay(self.alloc, replay);
         for (self.calls.items) |call| types.freeToolCall(self.alloc, call);
         self.calls.deinit(self.alloc);
         for (self.results.items) |result| freeConversationToolResult(self.alloc, result);
         self.results.deinit(self.alloc);
         for (self.steps.items) |step| {
             if (step.assistant) |text| self.alloc.free(text);
+            if (step.provider_replay) |replay| types.freeProviderReplay(self.alloc, replay);
             types.freeToolCallSlice(self.alloc, step.tool_calls);
             types.freePersistedToolResults(self.alloc, step.tool_results);
         }
@@ -1314,11 +1650,18 @@ const ConversationTurnBuilder = struct {
         });
     }
 
-    fn appendAssistant(self: *ConversationTurnBuilder, text: []const u8) !void {
+    fn appendAssistant(self: *ConversationTurnBuilder, value: session_event.ConversationAssistant) !void {
+        if (self.calls.items.len == 0 and self.results.items.len == 0) try self.finishStandalone();
         if (self.user == null or self.pending_assistant != null or self.calls.items.len != 0) {
             return error.InvalidConversationFrame;
         }
-        self.pending_assistant = try self.alloc.dupe(u8, text);
+        {
+            const text = try self.alloc.dupe(u8, value.text);
+            errdefer self.alloc.free(text);
+            self.pending_replay = if (value.provider_replay) |replay| try types.dupeProviderReplay(self.alloc, replay) else null;
+            self.pending_assistant = text;
+        }
+        if (value.standalone_response) try self.finishStep();
     }
 
     fn appendToolCall(
@@ -1374,6 +1717,17 @@ const ConversationTurnBuilder = struct {
         if (self.results.items.len == self.calls.items.len) try self.finishStep();
     }
 
+    fn finishStandalone(self: *ConversationTurnBuilder) !void {
+        if (self.calls.items.len != 0 or self.results.items.len != 0) return error.InvalidConversationFrame;
+        const text = self.pending_assistant orelse return;
+        if (text.len == 0 and self.pending_replay == null) {
+            self.alloc.free(text);
+            self.pending_assistant = null;
+            return;
+        }
+        try self.finishStep();
+    }
+
     fn finishStep(self: *ConversationTurnBuilder) !void {
         try self.steps.ensureUnusedCapacity(self.alloc, 1);
         const calls = try self.calls.toOwnedSlice(self.alloc);
@@ -1382,16 +1736,19 @@ const ConversationTurnBuilder = struct {
         errdefer types.freePersistedToolResults(self.alloc, results);
         self.steps.appendAssumeCapacity(.{
             .assistant = self.pending_assistant,
+            .provider_replay = self.pending_replay,
             .tool_calls = calls,
             .tool_results = results,
         });
         self.pending_assistant = null;
+        self.pending_replay = null;
     }
 
     fn appendSteering(self: *ConversationTurnBuilder, text: []const u8) !void {
         if (self.user == null or self.calls.items.len != 0 or self.results.items.len != 0) {
             return error.InvalidConversationFrame;
         }
+        if (self.pending_replay != null) try self.finishStep();
         const owned = try self.alloc.dupe(u8, text);
         errdefer self.alloc.free(owned);
         try self.steering.append(self.alloc, .{
@@ -1420,10 +1777,13 @@ const ConversationTurnBuilder = struct {
         const user = self.user.?;
         self.user = null;
         self.pending_assistant = null;
+        const replay = self.pending_replay;
+        self.pending_replay = null;
         return .{ .assistant = .{
             .user = user,
             .assistant = assistant,
             .execution = execution,
+            .provider_replay = replay,
         } };
     }
 
@@ -1434,6 +1794,7 @@ const ConversationTurnBuilder = struct {
         if (self.user == null or self.results.items.len != 0 or self.calls.items.len > 1) {
             return error.InvalidConversationFrame;
         }
+        if (self.calls.items.len == 0) try self.finishStandalone();
         const tool_call = if (self.calls.items.len == 1)
             self.calls.orderedRemove(0)
         else
@@ -1442,6 +1803,11 @@ const ConversationTurnBuilder = struct {
         if (self.pending_assistant) |text| {
             self.alloc.free(text);
             self.pending_assistant = null;
+        }
+        if (self.pending_replay) |replay| {
+            debug_trace.logf("session", "provider replay omitted reason=interrupted_association", .{});
+            types.freeProviderReplay(self.alloc, replay);
+            self.pending_replay = null;
         }
         const assistant = if (value.partial_text) |text|
             try self.alloc.dupe(u8, text)
@@ -1496,14 +1862,7 @@ const ConversationTurnBuilder = struct {
         turn_summary: ?types.TurnSummary,
     ) !types.ExecutionMemory {
         const steps = try self.steps.toOwnedSlice(self.alloc);
-        errdefer {
-            for (steps) |step| {
-                if (step.assistant) |text| self.alloc.free(text);
-                types.freeToolCallSlice(self.alloc, step.tool_calls);
-                types.freePersistedToolResults(self.alloc, step.tool_results);
-            }
-            if (steps.len > 0) self.alloc.free(steps);
-        }
+        errdefer types.freeToolExecutionSteps(self.alloc, steps);
         const steering = try self.steering.toOwnedSlice(self.alloc);
         errdefer types.freePersistedSteering(self.alloc, steering);
         const files = try types.dupeFileEvidenceSlice(self.alloc, files_source);
@@ -1515,6 +1874,86 @@ const ConversationTurnBuilder = struct {
         };
     }
 };
+
+test "conversation replay keeps reasoning-only assistant units before the final reply" {
+    const alloc = std.testing.allocator;
+    var builder = ConversationTurnBuilder.init(alloc);
+    defer builder.deinit();
+    const replay = types.ProviderReplay{ .source = .{ .provider = .gateway, .model = "test" }, .parts_json = "[{\"type\":\"reasoning\",\"text\":\"\"}]" };
+    try builder.begin(.{ .text = "question" });
+    try builder.appendAssistant(.{ .text = "", .provider_replay = replay });
+    try builder.appendAssistant(.{ .text = "answer" });
+    const turn = try builder.finishAssistant(.{});
+    defer types.freeHistoryTurn(alloc, turn);
+    try std.testing.expectEqualStrings("answer", turn.assistant.assistant);
+    try std.testing.expectEqual(@as(usize, 1), turn.assistant.execution.tool_steps.len);
+    try std.testing.expectEqualStrings(replay.parts_json, turn.assistant.execution.tool_steps[0].provider_replay.?.parts_json);
+}
+
+test "reasoning-only checkpoint coverage and replay count the same completed unit" {
+    const alloc = std.testing.allocator;
+    const replay = types.ProviderReplay{ .source = .{ .provider = .gateway, .model = "test" }, .parts_json = "[{\"type\":\"reasoning\",\"text\":\"\"}]" };
+    const events = [_]session_event.ConversationEvent{
+        .{ .user = .{ .text = "question" } },
+        .{ .assistant = .{ .text = "", .provider_replay = replay } },
+        .{ .context_checkpoint = .{ .covers_through_seq = 2, .summary = "prior facts" } },
+    };
+    var progress: ConversationProgress = .{};
+    var builder = ConversationTurnBuilder.init(alloc);
+    defer builder.deinit();
+    for (events, 1..) |event, seq| {
+        try progress.observe(@intCast(seq), event, .{ .tool_steps = 1 });
+        switch (event) {
+            .user => |value| try builder.begin(value),
+            .assistant => |value| try builder.appendAssistant(value),
+            .context_checkpoint => try builder.finishStep(),
+            else => unreachable,
+        }
+    }
+    try std.testing.expectEqual(@as(u64, 2), progress.coverage);
+    try std.testing.expectEqual(@as(usize, 1), progress.point.tool_steps);
+    try std.testing.expectEqual(progress.point.tool_steps, builder.steps.items.len);
+    try builder.appendAssistant(.{ .text = "final", .provider_replay = replay });
+    try progress.observe(4, .{ .assistant = .{ .text = "final", .provider_replay = replay } }, null);
+    try progress.observe(5, .{ .turn_completed = .{} }, null);
+    const turn = try builder.finishAssistant(.{});
+    defer types.freeHistoryTurn(alloc, turn);
+    try std.testing.expectEqual(@as(usize, 1), progress.point.turns);
+    try std.testing.expectEqual(@as(usize, 1), turn.assistant.execution.tool_steps.len);
+    try std.testing.expectEqualStrings(replay.parts_json, turn.assistant.provider_replay.?.parts_json);
+}
+
+test "reasoning-only history keeps an empty final response as a distinct boundary" {
+    const alloc = std.testing.allocator;
+    const replay = types.ProviderReplay{ .source = .{ .provider = .gateway, .model = "test" }, .parts_json = "[{\"type\":\"reasoning\",\"text\":\"\"}]" };
+    var steps = [_]types.ToolExecutionStep{.{ .provider_replay = replay }};
+    var events: std.ArrayList(session_event.ConversationEvent) = .empty;
+    defer events.deinit(alloc);
+    try session_event.appendHistoryTurnConversationEvents(alloc, &events, .{ .assistant = .{
+        .user = .{ .text = @constCast("question") },
+        .assistant = @constCast(""),
+        .execution = .{ .tool_steps = &steps },
+    } });
+    var builder = ConversationTurnBuilder.init(alloc);
+    defer builder.deinit();
+    var progress: ConversationProgress = .{};
+    for (events.items, 1..) |event, seq| {
+        try progress.observe(@intCast(seq), event, .{ .tool_steps = 1 });
+        switch (event) {
+            .user => |value| try builder.begin(value),
+            .assistant => |value| try builder.appendAssistant(value),
+            .turn_completed => |value| {
+                const turn = try builder.finishAssistant(value);
+                defer types.freeHistoryTurn(alloc, turn);
+                try std.testing.expectEqual(@as(usize, 1), turn.assistant.execution.tool_steps.len);
+                try std.testing.expectEqualStrings("", turn.assistant.assistant);
+                try std.testing.expect(turn.assistant.provider_replay == null);
+            },
+            else => unreachable,
+        }
+    }
+    try std.testing.expectEqual(@as(u64, 2), progress.coverage);
+}
 
 fn dupeConversationToolResult(
     alloc: Allocator,
@@ -2451,6 +2890,9 @@ fn importLegacySnapshotStateWithOps(
     if (migrated_permissions) |permissions| import_state.permission_state = permissions;
     var converted = try import_state.dupe(alloc);
     errdefer converted.deinit(alloc);
+    if (try converted.archive_legacy_recovery(alloc)) {
+        debug_trace.logf("session", "legacy recovery archived session_id={s} reason=unverifiable_route_authority", .{converted.id});
+    }
     const discarded = try discardEmptyLegacyFileEvidence(alloc, converted.history);
     if (discarded > 0) debug_trace.logf("session", "legacy import discarded file evidence count={d} reason=empty_path", .{discarded});
     try projectConversationSnapshotLocators(alloc, converted.history);
@@ -2761,18 +3203,24 @@ pub const Root = struct {
             return failLoadedWritableSession(error.SessionAlreadyExists);
         }
 
+        const random = randomIdentifier();
+        const suffix = std.fmt.bytesToHex(random, .lower);
+        const staging_name = try std.fmt.allocPrint(alloc, "creating+{s}", .{suffix});
+        defer alloc.free(staging_name);
         sessions.dir.createDir(
             io_mod.getIo(),
-            initial_state.id,
+            staging_name,
             private_dir_permissions,
-        ) catch |err| switch (err) {
-            error.PathAlreadyExists => return failLoadedWritableSession(error.SessionAlreadyExists),
-            else => return failLoadedWritableSession(error.SessionStartFailed),
+        ) catch return failLoadedWritableSession(error.SessionStartFailed);
+        var unpublished = true;
+        errdefer if (unpublished) {
+            debug_trace.logf("session", "session creation discarded unpublished state id={s}", .{initial_state.id});
+            sessions.dir.deleteTree(io_mod.getIo(), staging_name) catch |err| {
+                debug_trace.logf("session", "session creation cleanup retained id={s} err={s}", .{ initial_state.id, @errorName(err) });
+            };
         };
-        io_mod.syncVerifiedDir(sessions.dir) catch
-            return failLoadedWritableSession(error.SessionStartFailed);
 
-        var session_dir = try openSessionDir(sessions, initial_state.id, .writable);
+        var session_dir = try io_mod.openOrCreateVerifiedPrivateDir(sessions, staging_name);
         options.test_controls.lock(.session);
         var writer_lock = acquireLockWithDeadline(
             &session_dir,
@@ -2793,13 +3241,29 @@ pub const Root = struct {
             .writer_lock = writer_lock,
             .session_id = session_id,
         };
-        errdefer writable.deinit(alloc);
-        return createNativeSession(
+        var writable_owned = true;
+        errdefer if (writable_owned) writable.deinit(alloc);
+        var loaded = try createNativeSession(
             alloc,
             &writable,
             initial_state,
             options,
         );
+        writable_owned = false;
+        errdefer loaded.deinit(alloc);
+        try loaded.conversation_writer.file.sync(io_mod.getIo());
+        try io_mod.syncVerifiedDir(loaded.log.dir.dir);
+        publishSessionDirectory(sessions.dir, staging_name, initial_state.id) catch |err| {
+            if (err == error.PathAlreadyExists) return error.SessionAlreadyExists;
+            debug_trace.logf("session", "session creation publication failed id={s} err={s}", .{ initial_state.id, @errorName(err) });
+            return err;
+        };
+        unpublished = false;
+        io_mod.syncVerifiedDir(sessions.dir) catch |err| {
+            debug_trace.logf("session", "session creation retained published state id={s} durability=uncertain err={s}", .{ initial_state.id, @errorName(err) });
+            return error.SessionStartFailed;
+        };
+        return loaded;
     }
 
     pub fn resumeForWrite(
@@ -2937,6 +3401,34 @@ pub const Root = struct {
         return entryExists(&dir, name);
     }
 };
+
+fn publishSessionDirectory(parent: std.Io.Dir, staging: []const u8, target: []const u8) !void {
+    if (comptime @import("builtin").os.tag != .macos) {
+        return parent.renamePreserve(staging, parent, target, io_mod.getIo());
+    }
+    // Zig 0.16's Darwin preserve-rename uses hard links, which cannot publish directories.
+    const Darwin = struct {
+        extern "c" fn renameatx_np(c_int, [*:0]const u8, c_int, [*:0]const u8, c_uint) c_int;
+    };
+    var staging_buffer: [256]u8 = undefined;
+    var target_buffer: [256]u8 = undefined;
+    const staging_z = try std.fmt.bufPrintZ(&staging_buffer, "{s}", .{staging});
+    const target_z = try std.fmt.bufPrintZ(&target_buffer, "{s}", .{target});
+    while (true) {
+        try io_mod.getIo().checkCancel();
+        const err = std.posix.errno(Darwin.renameatx_np(parent.handle, staging_z, parent.handle, target_z, 0x4));
+        switch (err) {
+            .SUCCESS => return,
+            .INTR => continue,
+            .EXIST, .NOTEMPTY => return error.PathAlreadyExists,
+            .OPNOTSUPP, .NOSYS => return error.OperationUnsupported,
+            else => {
+                debug_trace.logf("session", "session directory publication failed errno={s}", .{@tagName(err)});
+                return error.SessionStartFailed;
+            },
+        }
+    }
+}
 
 fn validateLeaf(name: []const u8) !void {
     if (name.len == 0 or std.mem.eql(u8, name, ".") or
@@ -3958,6 +4450,105 @@ test "root starts a cache-free conversation session" {
     try std.testing.expect(saw_usage);
 }
 
+test "root session creation stays outside discovery while preparing" {
+    const alloc = std.testing.allocator;
+    var temp = try TempRoot.init(alloc);
+    defer temp.deinit(alloc);
+    var initial = try testState(alloc, "unpublished-session", 10);
+    defer initial.deinit(alloc);
+    const Probe = struct {
+        root: *Root,
+        observed: bool = false,
+        visible: bool = false,
+        failure: ?anyerror = null,
+
+        fn lock(context: ?*anyopaque, _: LockKind) void {
+            const self: *@This() = @ptrCast(@alignCast(context.?));
+            self.observed = true;
+            self.visible = entryExists(&self.root.sessions.?, "unpublished-session") catch |err| {
+                self.failure = err;
+                return;
+            };
+        }
+    };
+    var probe = Probe{ .root = &temp.root };
+    var loaded = try temp.root.startConversationSession(alloc, initial, .{
+        .test_controls = .{ .context = &probe, .lock_fn = Probe.lock },
+    });
+    defer loaded.deinit(alloc);
+    if (probe.failure) |err| return err;
+    try std.testing.expect(probe.observed);
+    try std.testing.expect(!probe.visible);
+    try std.testing.expect(try entryExists(&temp.root.sessions.?, initial.id));
+    try std.testing.expectEqualStrings(initial.id, loaded.active_id);
+    var saved = try temp.root.loadReadOnly(alloc, initial.id, .{});
+    defer saved.deinit(alloc);
+    try std.testing.expectEqualStrings(initial.id, saved.id);
+}
+
+test "root session creation never replaces a racing target" {
+    const alloc = std.testing.allocator;
+    var temp = try TempRoot.init(alloc);
+    defer temp.deinit(alloc);
+    var initial = try testState(alloc, "racing-session", 10);
+    defer initial.deinit(alloc);
+    const Probe = struct {
+        root: *Root,
+        created: bool = false,
+        failure: ?anyerror = null,
+
+        fn lock(context: ?*anyopaque, _: LockKind) void {
+            const self: *@This() = @ptrCast(@alignCast(context.?));
+            self.root.sessions.?.dir.createDir(std.testing.io, "racing-session", private_dir_permissions) catch |err| {
+                if (err != error.PathAlreadyExists) self.failure = err;
+                return;
+            };
+            self.created = true;
+        }
+    };
+    var probe = Probe{ .root = &temp.root };
+    if (temp.root.startConversationSession(alloc, initial, .{
+        .test_controls = .{ .context = &probe, .lock_fn = Probe.lock },
+    })) |value| {
+        var loaded = value;
+        loaded.deinit(alloc);
+        return error.ExpectedSessionCollision;
+    } else |err| try std.testing.expectEqual(error.SessionAlreadyExists, err);
+    if (probe.failure) |err| return err;
+    try std.testing.expect(probe.created);
+    var preserved = try openSessionDir(&temp.root.sessions.?, initial.id, .read_only);
+    defer preserved.close();
+    var entries = preserved.dir.iterate();
+    try std.testing.expect((try entries.next(std.testing.io)) == null);
+}
+
+test "root session creation allocation failures leave no published state" {
+    const alloc = std.testing.allocator;
+    var temp = try TempRoot.init(alloc);
+    defer temp.deinit(alloc);
+    var initial = try testState(alloc, "allocation-session", 10);
+    defer initial.deinit(alloc);
+    var measured = std.testing.FailingAllocator.init(alloc, .{});
+    var successful = try temp.root.startConversationSession(measured.allocator(), initial, .{});
+    successful.deinit(measured.allocator());
+    try temp.root.sessions.?.dir.deleteTree(std.testing.io, initial.id);
+    for (0..measured.alloc_index) |fail_index| {
+        var failing = std.testing.FailingAllocator.init(alloc, .{ .fail_index = fail_index });
+        if (temp.root.startConversationSession(failing.allocator(), initial, .{})) |value| {
+            var loaded = value;
+            loaded.deinit(failing.allocator());
+            return error.ExpectedAllocationFailure;
+        } else |err| {
+            try std.testing.expect(failing.has_induced_failure);
+            // Existing allocating JSON writers surface allocation loss as WriteFailed.
+            try std.testing.expect(err == error.OutOfMemory or err == error.WriteFailed);
+        }
+        try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+        var entries = temp.root.sessions.?.dir.iterate();
+        try std.testing.expect((try entries.next(std.testing.io)) == null);
+    }
+}
+
 test "conversation writer appends without duplicating live history" {
     const alloc = std.testing.allocator;
     var temp = try TempRoot.init(alloc);
@@ -4019,6 +4610,251 @@ test "cache-free conversation session resumes from metadata and JSONL" {
     try std.testing.expectEqual(@as(usize, 1), resumed.history.len);
     try std.testing.expectEqualStrings("question", resumed.history[0].assistant.user.text);
     try std.testing.expectEqualStrings("answer", resumed.history[0].assistant.assistant);
+}
+
+test "conversation preserves standalone replies across completion and interruption" {
+    const alloc = std.testing.allocator;
+    const Outcome = enum { completed, cancelled, failed, active_call };
+    for ([_]bool{ false, true }) |with_replay| {
+        for (std.enums.values(Outcome)) |outcome| {
+            var temp = try TempRoot.init(alloc);
+            defer temp.deinit(alloc);
+            var initial = try testState(alloc, "standalone-replies", 10);
+            defer initial.deinit(alloc);
+            const replay: types.ProviderReplay = .{
+                .source = .{ .provider = .gateway, .model = "test-model" },
+                .parts_json = "[{\"type\":\"reasoning\",\"text\":\"private state\"}]",
+            };
+            var steps = [_]types.ToolExecutionStep{.{
+                .assistant = @constCast("earlier reply"),
+                .provider_replay = if (with_replay) replay else null,
+            }};
+            const user: types.UserTurn = .{ .text = @constCast("request") };
+            const turn: types.HistoryTurn = if (outcome == .completed) .{ .assistant = .{
+                .user = user,
+                .assistant = @constCast("current reply"),
+                .execution = .{ .tool_steps = &steps },
+            } } else .{ .interrupted = .{
+                .user = user,
+                .assistant = @constCast("partial reply"),
+                .execution = .{ .tool_steps = &steps },
+                .terminal_reason = if (outcome == .failed) .failed else .cancelled,
+                .tool_call = if (outcome == .active_call) .{ .id = "pending", .name = "read_file", .arguments_json = "{\"path\":\"file\"}" } else null,
+            } };
+            {
+                var loaded = try temp.root.startConversationSession(alloc, initial, .{});
+                defer loaded.deinit(alloc);
+                _ = try loaded.appendEvent(alloc, .{ .history_turn_committed = .{
+                    .conversation_language = .literal("en"),
+                    .total_input_tokens = 1,
+                    .total_output_tokens = 1,
+                    .turn = turn,
+                } }, 20);
+            }
+            var resumed = try temp.root.loadReadOnly(alloc, initial.id, .{});
+            defer resumed.deinit(alloc);
+            try std.testing.expectEqual(@as(usize, 1), resumed.history.len);
+            const execution = switch (resumed.history[0]) {
+                .assistant => |entry| blk: {
+                    try std.testing.expectEqual(Outcome.completed, outcome);
+                    try std.testing.expectEqualStrings("current reply", entry.assistant);
+                    break :blk entry.execution;
+                },
+                .interrupted => |entry| blk: {
+                    try std.testing.expectEqualStrings("partial reply", entry.assistant.?);
+                    try std.testing.expectEqual(outcome == .active_call, entry.tool_call != null);
+                    try std.testing.expectEqual(if (outcome == .failed) types.InterruptedTerminalReason.failed else .cancelled, entry.terminal_reason);
+                    break :blk entry.execution;
+                },
+                else => return error.TestUnexpectedResult,
+            };
+            try std.testing.expectEqual(@as(usize, 1), execution.tool_steps.len);
+            try std.testing.expectEqualStrings("earlier reply", execution.tool_steps[0].assistant.?);
+            try std.testing.expectEqual(with_replay, execution.tool_steps[0].provider_replay != null);
+            if (execution.tool_steps[0].provider_replay) |saved| try std.testing.expectEqualStrings(replay.parts_json, saved.parts_json);
+            try std.testing.expectEqual(@as(usize, 0), execution.tool_steps[0].tool_calls.len);
+        }
+    }
+}
+
+test "standalone steering round trip preserves step boundaries" {
+    try checkStandaloneSteering(false);
+}
+
+test "standalone steering checkpoint preserves step boundaries" {
+    try checkStandaloneSteering(true);
+}
+
+fn checkStandaloneSteering(checkpoint: bool) !void {
+    const alloc = std.testing.allocator;
+    for ([_]bool{ false, true }) |with_replay| {
+        var temp = try TempRoot.init(alloc);
+        defer temp.deinit(alloc);
+        var initial = try testState(alloc, "standalone-steering", 10);
+        defer initial.deinit(alloc);
+        const replay: types.ProviderReplay = .{
+            .source = .{ .provider = .gateway, .model = "test-model" },
+            .parts_json = "[{\"type\":\"reasoning\",\"text\":\"private state\"}]",
+        };
+        var steps = [_]types.ToolExecutionStep{.{
+            .assistant = @constCast("earlier reply"),
+            .provider_replay = if (with_replay) replay else null,
+        }};
+        var steering = [_]types.PersistedSteering{.{
+            .text = @constCast("human update"),
+            .after_tool_step_count = 1,
+        }};
+        const user: types.UserTurn = .{ .text = @constCast("request") };
+        {
+            var loaded = try temp.root.startConversationSession(alloc, initial, .{});
+            defer loaded.deinit(alloc);
+            if (checkpoint) {
+                _ = try loaded.commitContextCompaction(alloc, .{
+                    .summary = @constCast("<context_handoff>Earlier reply.</context_handoff>"),
+                    .removed_turn_count = 0,
+                    .compaction_count = 1,
+                }, .{
+                    .user = user,
+                    .assistant = @constCast(""),
+                    .execution = .{ .tool_steps = &steps, .steering = &steering },
+                }, .{ .tool_steps = 1 }, 20);
+                steering[0].after_tool_step_count = 0;
+            }
+            _ = try loaded.appendEvent(alloc, .{ .history_turn_committed = .{
+                .conversation_language = .literal("en"),
+                .total_input_tokens = 1,
+                .total_output_tokens = 1,
+                .turn = .{ .assistant = .{
+                    .user = user,
+                    .assistant = @constCast("final reply"),
+                    .execution = .{
+                        .tool_steps = if (checkpoint) &.{} else &steps,
+                        .steering = &steering,
+                    },
+                } },
+            } }, 30);
+        }
+        var resumed = try temp.root.resumeForWrite(alloc, initial.id, .{});
+        defer resumed.deinit(alloc);
+        try std.testing.expectEqual(@as(usize, if (checkpoint) 2 else 1), resumed.state.history.len);
+        const active = resumed.state.history[if (checkpoint) 1 else 0].assistant;
+        try std.testing.expectEqualStrings("final reply", active.assistant);
+        try std.testing.expectEqual(@as(usize, if (checkpoint) 0 else 1), active.execution.tool_steps.len);
+        try std.testing.expectEqual(@as(usize, 1), active.execution.steering.len);
+        try std.testing.expectEqual(@as(usize, if (checkpoint) 0 else 1), active.execution.steering[0].after_tool_step_count);
+        try std.testing.expect(active.execution.steering[0].assistant_prefix == null);
+        try std.testing.expectEqualStrings("human update", active.execution.steering[0].text);
+        const archive = try loadConversationHistoryRange(alloc, &resumed.log.dir, 0, 1);
+        defer session.freeHistoryTurnSlice(alloc, archive);
+        const execution = archive[0].assistant.execution;
+        try std.testing.expectEqual(@as(usize, 1), execution.tool_steps.len);
+        try std.testing.expectEqualStrings("earlier reply", execution.tool_steps[0].assistant.?);
+        try std.testing.expectEqual(with_replay, execution.tool_steps[0].provider_replay != null);
+        if (execution.tool_steps[0].provider_replay) |saved| try std.testing.expectEqualStrings(replay.parts_json, saved.parts_json);
+        try std.testing.expectEqual(@as(usize, 1), execution.steering.len);
+        try std.testing.expectEqual(@as(usize, 1), execution.steering[0].after_tool_step_count);
+        try std.testing.expect(execution.steering[0].assistant_prefix == null);
+    }
+}
+
+test "legacy steering prefix records retain their original boundary" {
+    const alloc = std.testing.allocator;
+    for ([_]u8{ 1, 2 }) |schema_version| {
+        const bytes = try std.fmt.allocPrint(
+            alloc,
+            "{{\"schema_version\":{d},\"seq\":2,\"timestamp_ms\":10,\"event\":{{\"assistant\":{{\"text\":\"legacy prefix\"}}}}}}\n",
+            .{schema_version},
+        );
+        defer alloc.free(bytes);
+        var decoded = try session_event.decodeConversationFrame(alloc, bytes);
+        defer decoded.deinit();
+        var progress: ConversationProgress = .{};
+        try progress.observe(1, .{ .user = .{ .text = "request" } }, null);
+        try progress.observe(2, decoded.value.event, null);
+        try progress.observe(3, .{ .steering = .{ .text = "human update" } }, null);
+        try std.testing.expectEqual(@as(usize, 0), progress.point.tool_steps);
+        try std.testing.expectEqual(@as(usize, 1), progress.point.steering);
+        var builder = ConversationTurnBuilder.init(alloc);
+        defer builder.deinit();
+        try builder.begin(.{ .text = "request" });
+        try builder.appendAssistant(decoded.value.event.assistant);
+        try builder.appendSteering("human update");
+        const execution = try builder.takeExecution(&.{}, null);
+        defer types.freeExecutionMemory(alloc, execution);
+        try std.testing.expectEqual(@as(usize, 0), execution.tool_steps.len);
+        try std.testing.expectEqual(@as(usize, 1), execution.steering.len);
+        try std.testing.expectEqual(@as(usize, 0), execution.steering[0].after_tool_step_count);
+        try std.testing.expectEqualStrings("legacy prefix", execution.steering[0].assistant_prefix.?);
+    }
+}
+
+test "takeExecution frees provider replay on allocation failure" {
+    for ([_]bool{ false, true }) |standalone_response| try std.testing.checkAllAllocationFailures(std.testing.allocator, struct {
+        fn run(alloc: Allocator, standalone: bool) !void {
+            var builder = ConversationTurnBuilder.init(alloc);
+            defer builder.deinit();
+            try builder.begin(.{ .text = "request" });
+            try builder.appendAssistant(.{
+                .text = "earlier reply",
+                .standalone_response = standalone,
+                .provider_replay = .{
+                    .source = .{ .provider = .gateway, .model = "test-model" },
+                    .parts_json = "[{\"type\":\"reasoning\",\"text\":\"private state\"}]",
+                },
+            });
+            try builder.appendSteering("human update");
+            const execution = try builder.takeExecution(&.{.{
+                .path = @constCast("result.txt"),
+                .tool_call_id = @constCast("call-1"),
+                .tool_name = @constCast("read_file"),
+            }}, null);
+            defer types.freeExecutionMemory(alloc, execution);
+            try std.testing.expectEqual(@as(usize, 1), execution.tool_steps.len);
+            try std.testing.expect(execution.tool_steps[0].provider_replay != null);
+            try std.testing.expectEqual(@as(usize, 1), execution.steering.len);
+            try std.testing.expectEqual(@as(usize, 1), execution.files.len);
+        }
+    }.run, .{standalone_response});
+}
+
+test "standalone checkpoint boundaries do not create empty replies" {
+    const alloc = std.testing.allocator;
+    var temp = try TempRoot.init(alloc);
+    defer temp.deinit(alloc);
+    var initial = try testState(alloc, "standalone-checkpoint", 10);
+    defer initial.deinit(alloc);
+    var steps = [_]types.ToolExecutionStep{
+        .{ .assistant = @constCast("older reply") },
+        .{ .assistant = @constCast("recent reply") },
+    };
+    const user: types.UserTurn = .{ .text = @constCast("request") };
+    {
+        var loaded = try temp.root.startConversationSession(alloc, initial, .{});
+        defer loaded.deinit(alloc);
+        _ = try loaded.commitContextCompaction(alloc, .{
+            .summary = @constCast("<context_handoff>Earlier context.</context_handoff>"),
+            .removed_turn_count = 0,
+            .compaction_count = 1,
+        }, .{ .user = user, .assistant = @constCast(""), .execution = .{ .tool_steps = &steps } }, .{ .tool_steps = 1 }, 20);
+        _ = try loaded.appendEvent(alloc, .{ .history_turn_committed = .{
+            .conversation_language = .literal("en"),
+            .total_input_tokens = 1,
+            .total_output_tokens = 1,
+            .turn = .{ .assistant = .{ .user = user, .assistant = @constCast("final reply"), .execution = .{ .tool_steps = steps[1..] } } },
+        } }, 30);
+    }
+    var resumed = try temp.root.resumeForWrite(alloc, initial.id, .{});
+    defer resumed.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 2), resumed.state.history.len);
+    const active = resumed.state.history[1].assistant;
+    try std.testing.expectEqual(@as(usize, 1), active.execution.tool_steps.len);
+    try std.testing.expectEqualStrings("recent reply", active.execution.tool_steps[0].assistant.?);
+    try std.testing.expectEqualStrings("final reply", active.assistant);
+    const archive = try loadConversationHistoryRange(alloc, &resumed.log.dir, 0, 1);
+    defer session.freeHistoryTurnSlice(alloc, archive);
+    try std.testing.expectEqual(@as(usize, 2), archive[0].assistant.execution.tool_steps.len);
+    try std.testing.expectEqualStrings("older reply", archive[0].assistant.execution.tool_steps[0].assistant.?);
+    try std.testing.expectEqualStrings("recent reply", archive[0].assistant.execution.tool_steps[1].assistant.?);
 }
 
 test "cache-free writable resume continues the conversation sequence" {
@@ -4520,6 +5356,7 @@ test "cache-free permission state resumes from its domain file" {
 
 test "cache-free resume rebuilds tool calls and external result references" {
     const alloc = std.testing.allocator;
+    const provider_state = types.ProviderReplay{ .source = .{ .provider = .gateway, .model = "test" }, .parts_json = "[{\"type\":\"reasoning\",\"text\":\"kept\"}]" };
     var temp = try TempRoot.init(alloc);
     defer temp.deinit(alloc);
     var initial = try testState(alloc, "conversation-tool-resume", 10);
@@ -4568,6 +5405,7 @@ test "cache-free resume rebuilds tool calls and external result references" {
     }};
     var steps = [_]types.ToolExecutionStep{.{
         .assistant = @constCast("Running it."),
+        .provider_replay = provider_state,
         .tool_calls = &calls,
         .tool_results = &results,
     }};
@@ -4587,6 +5425,7 @@ test "cache-free resume rebuilds tool calls and external result references" {
             .total_output_tokens = 1,
             .turn = .{ .assistant = .{
                 .user = .{ .text = @constCast("Run it.") },
+                .provider_replay = provider_state,
                 .assistant = @constCast("Done."),
                 .execution = .{
                     .tool_steps = &steps,
@@ -4605,6 +5444,8 @@ test "cache-free resume rebuilds tool calls and external result references" {
     defer resumed.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 1), resumed.history.len);
     const execution = resumed.history[0].assistant.execution;
+    try std.testing.expectEqualStrings(provider_state.parts_json, resumed.history[0].assistant.provider_replay.?.parts_json);
+    try std.testing.expectEqualStrings(provider_state.parts_json, execution.tool_steps[0].provider_replay.?.parts_json);
     try std.testing.expectEqual(@as(usize, 1), execution.tool_steps.len);
     try std.testing.expectEqualStrings("call-shell", execution.tool_steps[0].tool_calls[0].id);
     try std.testing.expectEqual(

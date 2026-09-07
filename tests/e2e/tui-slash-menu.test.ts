@@ -3615,6 +3615,14 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       expect(firstPrompt).toContain(fixture.bodyB);
       expect(firstPrompt).not.toContain(fixture.bodyA);
 
+      const loadScrollback = await session.captureFullScrollback();
+      expect(countOccurrences(loadScrollback, "1 requested skill loaded")).toBe(1);
+      expect(loadScrollback).toContain("Loaded skill exact-picker");
+      expect(loadScrollback.indexOf("1 requested skill loaded")).toBeLessThan(
+        loadScrollback.indexOf("exact picker selection complete"),
+      );
+      expect(loadScrollback).not.toContain("1 tool call");
+
       expect(
         countOccurrences(
           await session.captureFullScrollback(),
