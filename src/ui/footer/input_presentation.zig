@@ -1733,8 +1733,8 @@ test "compose hint row prioritizes red yolo warning with compact fallback" {
     var input = InputRuntime{};
     defer input.deinit(std.testing.allocator);
     var ctx = testRenderContext(&input);
-    ctx.danger_status = "YOLO enabled: fx permission checks disabled";
-    ctx.danger_status_compact = "YOLO: unrestricted";
+    ctx.danger_status = "Full access enabled: fx permission checks disabled";
+    ctx.danger_status_compact = "Full access";
 
     var full = try composeHintRow(std.testing.allocator, false, ctx, 80);
     defer full.deinit(std.testing.allocator);
@@ -1750,15 +1750,15 @@ test "compose hint row prioritizes red yolo warning with compact fallback" {
     var suppressed = try composeHintRow(std.testing.allocator, false, ctx, 80);
     defer suppressed.deinit(std.testing.allocator);
     try std.testing.expect(std.mem.find(u8, suppressed.items, "esc again to clear") != null);
-    try std.testing.expect(std.mem.find(u8, suppressed.items, "YOLO") == null);
+    try std.testing.expect(std.mem.find(u8, suppressed.items, "Full access") == null);
 }
 
 test "compose hint row yields the yolo warning to a pending ctrl+c quit hint" {
     var input = InputRuntime{};
     defer input.deinit(std.testing.allocator);
     var ctx = testRenderContext(&input);
-    ctx.danger_status = "YOLO enabled: fx permission checks disabled";
-    ctx.danger_status_compact = "YOLO: unrestricted";
+    ctx.danger_status = "Full access enabled: fx permission checks disabled";
+    ctx.danger_status_compact = "Full access";
     ctx.ctrl_c_pending = true;
 
     // Reported as unpainted so the warning's visible budget pauses.
@@ -1767,7 +1767,7 @@ test "compose hint row yields the yolo warning to a pending ctrl+c quit hint" {
     var pending = try composeHintRow(std.testing.allocator, false, ctx, 60);
     defer pending.deinit(std.testing.allocator);
     try std.testing.expect(std.mem.find(u8, pending.items, "press ctrl+c again to exit") != null);
-    try std.testing.expect(std.mem.find(u8, pending.items, "YOLO") == null);
+    try std.testing.expect(std.mem.find(u8, pending.items, "Full access") == null);
 
     ctx.ctrl_c_pending = false;
     try std.testing.expectEqualStrings(ctx.danger_status, dangerStatusText(false, ctx, 60));

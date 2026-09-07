@@ -2036,7 +2036,10 @@ pub fn contextHistoryRange(
             execution.files = &.{};
             execution.turn_summary = null;
             switch (turn) {
-                .assistant => |*entry| entry.assistant = @constCast(""),
+                .assistant => |*entry| {
+                    entry.assistant = @constCast("");
+                    entry.provider_replay = null;
+                },
                 .interrupted => |*entry| {
                     entry.assistant = null;
                     entry.tool_call = null;
@@ -2074,9 +2077,10 @@ pub fn prepareCompactedHistory(
 test "retained context history replacement is allocation-failure atomic" {
     const Fixture = struct {
         fn run(alloc: Allocator) !void {
+            const replay = core_types.ProviderReplay{ .source = .{ .provider = .gateway, .model = "test" }, .parts_json = "[{\"type\":\"reasoning\",\"text\":\"retained\"}]" };
             const source = [_]HistoryTurn{
                 .{ .assistant = .{ .user = .{ .text = @constCast("older request") }, .assistant = @constCast("older reply") } },
-                .{ .assistant = .{ .user = .{ .text = @constCast("recent request") }, .assistant = @constCast("recent reply") } },
+                .{ .assistant = .{ .user = .{ .text = @constCast("recent request") }, .assistant = @constCast("recent reply"), .provider_replay = replay } },
             };
             const prepared = try prepareCompactedHistory(alloc, &source, .{
                 .summary = @constCast("<context_handoff>older facts</context_handoff>"),
@@ -2086,6 +2090,7 @@ test "retained context history replacement is allocation-failure atomic" {
             defer freeHistoryTurnSlice(alloc, prepared);
             try std.testing.expectEqual(@as(usize, 2), prepared.len);
             try std.testing.expectEqualStrings("recent reply", prepared[1].assistant.assistant);
+            try std.testing.expectEqualStrings(replay.parts_json, prepared[1].assistant.provider_replay.?.parts_json);
             try std.testing.expectEqualStrings("older reply", source[0].assistant.assistant);
         }
     };
@@ -2145,71 +2150,7 @@ fn dupeImageAttachment(alloc: Allocator, src: ImageAttachment) !ImageAttachment 
     };
 }
 /// Deep-copies one history turn; caller owns the returned turn and frees with freeHistoryTurn.
-pub fn dupeHistoryTurn(alloc: Allocator, turn: HistoryTurn) !HistoryTurn {
-    switch (turn) {
-        .compacted_summary => |entry| {
-            const summary = try alloc.dupe(u8, entry.summary);
-            errdefer alloc.free(summary);
-            const root_user_messages = try core_types.dupeCompletedToolNames(
-                alloc,
-                entry.root_user_messages,
-            );
-            errdefer core_types.freeCompletedToolNames(alloc, root_user_messages);
-            const permission_feedback = try core_types.dupePermissionFeedback(
-                alloc,
-                entry.permission_feedback,
-            );
-            return .{ .compacted_summary = .{
-                .summary = summary,
-                .removed_turn_count = entry.removed_turn_count,
-                .compaction_count = entry.compaction_count,
-                .root_user_messages = root_user_messages,
-                .root_user_messages_complete = entry.root_user_messages_complete,
-                .permission_feedback = permission_feedback,
-                .permission_feedback_complete = entry.permission_feedback_complete,
-            } };
-        },
-        .assistant => |entry| {
-            const user = try dupeUserTurn(alloc, entry.user);
-            errdefer freeUserTurn(alloc, user);
-            const assistant_copy = try alloc.dupe(u8, entry.assistant);
-            errdefer alloc.free(assistant_copy);
-            const execution = try core_types.dupeExecutionMemory(alloc, entry.execution);
-            return .{ .assistant = .{
-                .user = user,
-                .assistant = assistant_copy,
-                .execution = execution,
-            } };
-        },
-        .interrupted => |entry| {
-            const user = try dupeUserTurn(alloc, entry.user);
-            errdefer freeUserTurn(alloc, user);
-            const assistant = if (entry.assistant) |text| try alloc.dupe(u8, text) else null;
-            errdefer if (assistant) |text| alloc.free(text);
-            const tool_call = if (entry.tool_call) |call| try core_types.dupeToolCall(alloc, call) else null;
-            errdefer if (tool_call) |call| core_types.freeToolCall(alloc, call);
-            const completed_tool_names = try core_types.dupeCompletedToolNames(alloc, entry.completed_tool_names);
-            errdefer core_types.freeCompletedToolNames(alloc, completed_tool_names);
-            const cancelled_command = if (entry.cancelled_command) |presentation|
-                try core_types.dupeCancelledCommandPresentation(alloc, presentation)
-            else
-                null;
-            errdefer if (cancelled_command) |presentation| {
-                core_types.freeCancelledCommandPresentation(alloc, presentation);
-            };
-            const execution = try core_types.dupeExecutionMemory(alloc, entry.execution);
-            return .{ .interrupted = .{
-                .user = user,
-                .assistant = assistant,
-                .tool_call = tool_call,
-                .completed_tool_names = completed_tool_names,
-                .execution = execution,
-                .cancelled_command = cancelled_command,
-                .terminal_reason = entry.terminal_reason,
-            } };
-        },
-    }
-}
+pub const dupeHistoryTurn = core_types.dupeHistoryTurn;
 pub fn appendAssistantTurnWithExecution(
     alloc: Allocator,
     current: []HistoryTurn,
@@ -3162,11 +3103,13 @@ pub fn appendExecutionMemoryChatMessages(
             }
             steering_index += 1;
         }
-        if (step.tool_calls.len == 0) continue;
+        if (step.tool_calls.len == 0 and step.provider_replay == null and step.assistant == null) continue;
         try messages.append(alloc, .{
             .role = .assistant,
             .content = step.assistant,
             .tool_calls = step.tool_calls,
+            .provider_replay = step.provider_replay,
+            .standalone_response = step.tool_calls.len == 0,
         });
         for (step.tool_results) |result| {
             try messages.append(alloc, .{
@@ -3240,8 +3183,8 @@ fn appendHistoryChatMessagesImpl(
             .assistant => |entry| {
                 try messages.append(alloc, .{ .role = .user, .content = entry.user.text, .images = entry.user.images });
                 try appendExecutionMemoryChatMessages(alloc, messages, entry.execution);
-                if (entry.assistant.len > 0) {
-                    try messages.append(alloc, .{ .role = .assistant, .content = entry.assistant });
+                if (entry.assistant.len > 0 or entry.provider_replay != null) {
+                    try messages.append(alloc, .{ .role = .assistant, .content = entry.assistant, .provider_replay = entry.provider_replay });
                 }
             },
             .interrupted => |entry| {
@@ -3259,6 +3202,11 @@ fn appendHistoryChatMessagesImpl(
                         .tool_call_id = tool_call.id,
                         .tool_name = tool_call.name,
                         .tool_result_status = .failure,
+                        .tool_result_memory = .{
+                            .output_bytes = tool_output.len,
+                            .stored_output_bytes = tool_output.len,
+                            .truncated = false,
+                        },
                     });
                 } else if (interrupted_projection == .steering_continuation) {
                     if (entry.assistant) |assistant| {
@@ -4598,6 +4546,50 @@ test "interrupted history projects marker and aborted tool result" {
     for (chat_messages.items) |entry| {
         if (entry.content) |content| {
             try std.testing.expect(std.mem.find(u8, content, artifact_sentinel) == null);
+        }
+    }
+}
+
+test "interrupted tool diagnostics remain complete for compaction" {
+    const compaction = @import("../agent/runtime/context_compaction.zig");
+    const replay_handle = "cancelled-output.bin";
+    const oversized_handle = "h" ** 129;
+    const presentations = [_]?CancelledCommandPresentation{
+        null,
+        .{},
+        .{ .output_replay = .unavailable },
+        .{ .output_replay = .{ .available = .{ .handle = replay_handle, .framed_bytes = 42 } } },
+        .{ .output_replay = .{ .available = .{ .handle = oversized_handle, .framed_bytes = 42 } } },
+    };
+    for (presentations, 0..) |presentation, index| {
+        for ([_]InterruptedTerminalReason{ .cancelled, .failed }) |reason| {
+            for ([_]InterruptedChatProjection{ .closed, .steering_continuation }) |projection| {
+                var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+                defer arena_state.deinit();
+                const alloc = arena_state.allocator();
+                const history = [_]HistoryTurn{.{ .interrupted = .{
+                    .user = .{ .text = @constCast("Stop the current tool.") },
+                    .tool_call = .{ .id = "cancelled-call", .name = "subagent", .arguments_json = "{}" },
+                    .cancelled_command = presentation,
+                    .terminal_reason = reason,
+                } }};
+                var messages: std.ArrayList(core_types.ChatMessage) = .empty;
+                try appendHistoryChatMessagesImpl(alloc, &messages, &history, projection);
+                // Compaction must accept the complete diagnostic, not claim the tool completed.
+                try compaction.promoteMessageResults(alloc, messages.items, .unavailable, 0);
+                const result = messages.items[2];
+                try std.testing.expectEqual(.failure, result.tool_result_status.?);
+                try std.testing.expectEqualStrings("cancelled-call", result.tool_call_id.?);
+                const memory = result.tool_result_memory.?;
+                try std.testing.expectEqual(result.content.?.len, memory.output_bytes);
+                try std.testing.expectEqual(result.content.?.len, memory.stored_output_bytes);
+                try std.testing.expect(!memory.truncated);
+                try std.testing.expect(memory.output_handle == null);
+                try std.testing.expect(std.mem.startsWith(u8, result.content.?, aborted_tool_output));
+                try std.testing.expectEqual(@as(usize, if (index == 3) 1 else 0), std.mem.count(u8, result.content.?, replay_handle));
+                try std.testing.expect(std.mem.find(u8, result.content.?, oversized_handle) == null);
+                try std.testing.expectEqual(reason, history[0].interrupted.terminal_reason);
+            }
         }
     }
 }

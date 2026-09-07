@@ -687,7 +687,7 @@ fn permissionModeLabel(mode: types.PermissionMode) []const u8 {
     return switch (mode) {
         .ask => "ask",
         .auto => "auto",
-        .yolo => "yolo",
+        .yolo => "full access",
     };
 }
 
