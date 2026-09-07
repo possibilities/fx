@@ -380,6 +380,7 @@ describe("session recovery", () => {
           timeoutMs: TIMEOUT,
         });
         expect(continued.code).toBe(0);
+        expect(JSON.parse(readFileSync(join(target, "session.json"), "utf8")).title).toBe(metadata.title);
         expect(JSON.parse(continued.stdout)).toMatchObject({ output: "RECOVERED_CONTINUATION_SAVED", tool_calls: [{ name: "read_tool_result", status: "success" }] });
         expect(gateway.requests).toHaveLength(4);
         const executionStarts = readFileSync(tracePath, "utf8").split("\n")
@@ -398,6 +399,54 @@ describe("session recovery", () => {
         expect(inspected.code).toBe(0);
         expect(inspected.stderr).toBe("");
         expect(inspected.stdout).toContain("RECOVERED_CONTINUATION_SAVED");
+      } finally {
+        gateway.stop();
+        rmSync(fixture.root, { recursive: true, force: true });
+      }
+    }, TIMEOUT);
+  }
+
+  for (const explicitTitle of [null, "Explicit recovered title"]) {
+    test(`checkpoint-only recovery derives the first real title after reopening with explicit title=${explicitTitle !== null}`, async () => {
+      const fixture = createFixture("fx-session-checkpoint-title-");
+      const gateway = startFakeGateway([
+        fakeGatewayFinalText("SEED_SESSION"),
+        fakeGatewayFinalText("FIRST_REAL_RECOVERY_ANSWER"),
+      ]);
+      try {
+        const id = await createSavedSession(fixture, gateway);
+        const source = join(fixture.home, ".fx", "sessions", id);
+        const metadataPath = join(source, "session.json");
+        const metadata = JSON.parse(readFileSync(metadataPath, "utf8"));
+        metadata.title = explicitTitle;
+        writeFileSync(metadataPath, JSON.stringify(metadata), { mode: 0o600 });
+        const checkpoint = JSON.stringify({
+          schema_version: 1, seq: 1, timestamp_ms: Date.now(),
+          event: { context_checkpoint: {
+            covers_through_seq: 0,
+            summary: "<context_handoff>Recovered summary without an original prompt.</context_handoff>",
+          } },
+        }) + "\n";
+        writeFileSync(join(source, "events.jsonl"), checkpoint + "invalid recovery tail\n", { mode: 0o600 });
+        const before = savedFileHashes(source);
+        const recovered = await runFx(["session", "recover", id, "--json"], {
+          cwd: fixture.workspace, env: gatewayEnv(fixture, gateway), timeoutMs: TIMEOUT,
+        });
+        expect(recovered.code).toBe(0);
+        expect(recovered.stderr).toBe("");
+        const recoveredId = JSON.parse(recovered.stdout).recovered_id;
+        expect(recoveredId).not.toBe(id);
+        const targetMetadata = join(fixture.home, ".fx", "sessions", recoveredId, "session.json");
+        expect(JSON.parse(readFileSync(targetMetadata, "utf8")).title).toBe(explicitTitle);
+        const continued = await runFx([
+          "ask", "--json", "--auto", "--resume-id", recoveredId, "First real recovery prompt",
+        ], { cwd: fixture.workspace, env: gatewayEnv(fixture, gateway), timeoutMs: TIMEOUT });
+        expect(continued.code).toBe(0);
+        expect(continued.stderr).toBe("");
+        expect(JSON.parse(continued.stdout).output).toBe("FIRST_REAL_RECOVERY_ANSWER");
+        expect(JSON.parse(readFileSync(targetMetadata, "utf8")).title).toBe(explicitTitle ?? "First real recovery prompt");
+        expect(gateway.requests).toHaveLength(2);
+        expect(savedFileHashes(source)).toEqual(before);
       } finally {
         gateway.stop();
         rmSync(fixture.root, { recursive: true, force: true });
