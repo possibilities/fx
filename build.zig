@@ -136,6 +136,7 @@ pub fn build(b: *std.Build) void {
             "pinned ChatGPT account rejects a swapped selected-profile session before refresh side effects",
             "resume handoff owns the exact non-pristine session id",
             "provider selection beneath a selected profile never reads the ambient store",
+            "session_commands selected profile status never reads ambient credential preferences",
             "global system prompt file modifiers preserve replacement and append order",
             "state system prompts compose replacement append conflict and explicit precedence",
             "ACP command routes parsed options and launch config through the injected runner",
