@@ -399,6 +399,76 @@ fn classifyConversationCandidate(
     };
 }
 
+/// Reads only the facts needed for writable latest selection. Caller owns the candidate.
+pub fn writable_conversation_candidate(
+    alloc: Allocator,
+    session_dir: *io_mod.VerifiedDir,
+    session_id: []const u8,
+    metadata: session_codec.SessionMetadata,
+    workspace_root: []const u8,
+) !WritableCandidate {
+    if (!std.mem.eql(u8, metadata.id, session_id)) return error.InvalidSessionFormat;
+    var updated_at_ms = metadata.updated_at_ms;
+    if (std.mem.eql(u8, metadata.workspace_root, workspace_root)) {
+        const path_stat = try session_dir.dir.statFile(io_mod.getIo(), "events.jsonl", .{ .follow_symlinks = false });
+        if (path_stat.kind != .file or path_stat.nlink != 1) return error.SessionPathUnsafe;
+        var file = try openSessionFile(session_dir, "events.jsonl", .read_only);
+        defer file.close(io_mod.getIo());
+        const stat = try file.stat(io_mod.getIo());
+        var offset: u64 = 0;
+        while (offset < stat.size) {
+            const line = session_replay.readLineAt(alloc, file, offset, stat.size) catch |err| switch (err) {
+                error.TruncatedEventFrame => break,
+                else => return err,
+            } orelse break;
+            defer alloc.free(line.bytes);
+            var decoded = try session_event.decodeConversationFrame(alloc, line.bytes);
+            defer decoded.deinit();
+            switch (decoded.value.event) {
+                .turn_completed, .interrupted, .context_checkpoint => {
+                    updated_at_ms = @max(updated_at_ms, std.math.cast(
+                        i64,
+                        @divFloor(stat.mtime.nanoseconds, std.time.ns_per_ms),
+                    ) orelse std.math.maxInt(i64));
+                    break;
+                },
+                else => {},
+            }
+            offset = line.next_offset;
+        }
+    }
+    return dupeWritableCandidate(alloc, metadata.id, metadata.workspace_root, updated_at_ms, .conversation, .current);
+}
+
+/// Identifies a fenced candidate without recovering it. Caller owns the candidate.
+pub fn fenced_legacy_writable_candidate(
+    alloc: Allocator,
+    session_dir: *io_mod.VerifiedDir,
+    session_id: []const u8,
+    fallback_workspace: []const u8,
+) !WritableCandidate {
+    const name: []const u8 = if (try entryExistsRelative(session_dir, "session.legacy.json")) "session.legacy.json" else "session.json";
+    const path_stat = try session_dir.dir.statFile(io_mod.getIo(), name, .{ .follow_symlinks = false });
+    if (path_stat.kind != .file or path_stat.nlink != 1) return error.SessionPathUnsafe;
+    var file = try openSessionFile(session_dir, name, .read_only);
+    defer file.close(io_mod.getIo());
+    const stat = try file.stat(io_mod.getIo());
+    if (stat.size > automatic_legacy_max_bytes) return error.LegacySessionTooLarge;
+    var buffer: [16 * 1024]u8 = undefined;
+    var reader = file.readerStreaming(io_mod.getIo(), &buffer);
+    var summary = try readLegacySummary(alloc, &reader.interface, null);
+    defer summary.deinit(alloc);
+    if (!std.mem.eql(u8, summary.id, session_id)) return error.InvalidSessionFormat;
+    return dupeWritableCandidate(
+        alloc,
+        summary.id,
+        summary.workspace_root orelse fallback_workspace,
+        summary.updated_at_ms,
+        candidateStorageForLegacy(summary.schema_version),
+        .stale,
+    );
+}
+
 /// Builds a read-only candidate from a schema-v3 manifest, validating the
 /// authority marker, manifest identity, and projection freshness.
 /// Fails with `error.InvalidSessionFormat` / `error.UnsupportedSessionSchema` on mismatch.
