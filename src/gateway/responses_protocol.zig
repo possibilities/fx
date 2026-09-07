@@ -1841,7 +1841,10 @@ test "Responses reasoning replay frees duplicate comparison and final encoding a
     defer stream.deinit();
     try stream.apply("{\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"output\":[{\"type\":\"reasoning\",\"encrypted_content\":\"opaque\"}]}}");
     stream.cancelled.store(true, .seq_cst);
-    try std.testing.expectError(error.Cancelled, stream.finish());
+    const completion = try stream.finish();
+    defer stream.freeCompletion(completion);
+    try std.testing.expectEqual(types.ProviderFinishReason.stop, completion.finish_reason.?);
+    try std.testing.expect(completion.provider_state_json != null);
 }
 
 test "Responses text finalization preserves mixed streamed and final-only items" {
@@ -1894,9 +1897,11 @@ test "Responses terminal failure classification is conservative and diagnostics 
             .response = .{ .id = "resp_failure", .@"error" = .{ .code = case[0], .message = "é" ** 512 }, .usage = .{ .input_tokens = 7, .output_tokens = 3 } },
         }, .{});
         defer std.testing.allocator.free(event);
+        try stream.apply("{\"type\":\"response.refusal.delta\",\"output_index\":0,\"content_index\":0,\"delta\":\"refused\"}");
         try stream.apply(event);
         const completion = try stream.finish();
         defer stream.freeCompletion(completion);
+        try std.testing.expectEqual(types.ProviderFinishReason.provider_error, completion.finish_reason.?);
         try std.testing.expectEqual(case[1], completion.provider_failure_cause == .non_retryable);
         if (std.mem.eql(u8, case[0], "rate_limit_exceeded")) {
             try std.testing.expectEqual(@as(?types.ProviderFailureCause, .rate_limited), completion.provider_failure_cause);
@@ -1947,7 +1952,7 @@ test "Responses terminal failure retains progress without final-only output" {
     try std.testing.expectEqual(types.ProviderCompletionDisposition.provider_failure, types.classifyProviderCompletion(completion));
 }
 
-test "Responses terminal failure releases allocations and obeys cancellation" {
+test "Responses terminal failure releases allocations and preserves an already-read terminal" {
     const Scenario = struct {
         fn run(alloc: std.mem.Allocator) !void {
             var stream = ToolRecordTest.init(alloc);
@@ -1962,8 +1967,10 @@ test "Responses terminal failure releases allocations and obeys cancellation" {
     var stream = ToolRecordTest.init(std.testing.allocator);
     defer stream.deinit();
     stream.cancelled.store(true, .seq_cst);
-    try std.testing.expectError(error.Cancelled, stream.apply("{\"type\":\"error\",\"code\":\"server_error\"}"));
-    try std.testing.expectError(error.Cancelled, stream.finish());
+    try stream.apply("{\"type\":\"error\",\"code\":\"server_error\"}");
+    const completion = try stream.finish();
+    defer stream.freeCompletion(completion);
+    try std.testing.expectEqual(types.ProviderFinishReason.provider_error, completion.finish_reason.?);
 }
 
 const TextRecordTest = struct {
@@ -2392,7 +2399,7 @@ test "Responses refusal beside a tool call keeps the tool-call disposition" {
     var stream = ToolRecordTest.init(std.testing.allocator);
     defer stream.deinit();
     try stream.apply(ToolRecordTest.start);
-    try stream.apply("{\"type\":\"response.refusal.delta\",\"delta\":\"refused\"}");
+    try stream.apply("{\"type\":\"response.refusal.delta\",\"output_index\":1,\"delta\":\"refused\"}");
     try stream.apply(ToolRecordTest.finalized);
     try stream.apply(ToolRecordTest.terminal);
     const completion = try stream.finish();
