@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import { strict as assert } from "node:assert";
+import { spawnSync } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
@@ -147,7 +148,7 @@ const server = createServer(async (request, response) => {
     response.end(String(error?.stack ?? error));
   }
 });
-await new Promise((resolveListen) => server.listen(0, "127.0.0.1", resolveListen));
+await new Promise((resolveListen) => server.listen(Number(process.env.LIBFX_CODEX_TEST_PORT ?? 0), "127.0.0.1", resolveListen));
 const { port } = server.address();
 const baseUrl = `http://127.0.0.1:${port}`;
 
@@ -160,6 +161,19 @@ const envOverrides = {
   FX_E2E_GATEWAY_MODELS_URL: `${baseUrl}/gateway/models`,
   FX_E2E_GATEWAY_CATALOG_TIMEOUT_MS: "40",
 };
+// Bun keeps later process.env assignments separate from libc getenv, which
+// the native OAuth transport reads. Start this fixture's worker with its
+// loopback overrides already in the process environment.
+if (process.versions.bun && !process.env.LIBFX_CODEX_TEST_PORT) {
+  await new Promise((resolveClose) => server.close(resolveClose));
+  const child = spawnSync(process.execPath, [fileURLToPath(import.meta.url), ...process.argv.slice(2)], {
+    env: { ...process.env, ...envOverrides, LIBFX_CODEX_TEST_PORT: String(port) },
+    stdio: "inherit",
+    timeout: 30_000,
+  });
+  if (child.error) throw child.error;
+  process.exit(child.status ?? 1);
+}
 const originalEnv = Object.fromEntries(
   Object.keys(envOverrides).map((key) => [key, process.env[key]]),
 );
