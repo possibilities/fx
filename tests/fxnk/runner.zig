@@ -18,6 +18,8 @@ const expected_names = [_][]const u8{
     "core.app.app_session_runtime.test.resume handoff owns the exact non-pristine session id",
     "core.auth.auth_runtime.test.provider selection beneath a selected profile never reads the ambient store",
     "core.session.session_commands.test.session_commands selected profile status never reads ambient credential preferences",
+    "core.session.session_log.test.native session checkpoint-only history leaves first real title uncommitted",
+    "ui.footer.resume_menu_presentation.test.resume menu retains account provenance in clipped titles",
     "builtins.hooks.ade_events.test.ADE feed serializes a main turn as one versioned JSON line",
     "builtins.hooks.ade_events.test.ADE feed serializes native session metadata as a generic raw event",
     "builtins.hooks.ade_events.test.ADE feed serializes an additive Git root discovery record",
