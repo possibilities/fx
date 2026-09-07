@@ -1841,7 +1841,10 @@ test "Responses reasoning replay frees duplicate comparison and final encoding a
     defer stream.deinit();
     try stream.apply("{\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"output\":[{\"type\":\"reasoning\",\"encrypted_content\":\"opaque\"}]}}");
     stream.cancelled.store(true, .seq_cst);
-    try std.testing.expectError(error.Cancelled, stream.finish());
+    const completion = try stream.finish();
+    defer stream.freeCompletion(completion);
+    try std.testing.expectEqual(types.ProviderFinishReason.stop, completion.finish_reason.?);
+    try std.testing.expect(completion.provider_state_json != null);
 }
 
 test "Responses text finalization preserves mixed streamed and final-only items" {

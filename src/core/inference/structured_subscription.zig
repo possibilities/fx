@@ -378,6 +378,7 @@ pub fn infer(
     if (completion.finish_reason == .provider_error) {
         const kind: stream_provider.FailureKind = if (completion.provider_failure_cause) |cause| switch (cause) {
             .rate_limited => .rate_limited,
+            .gateway_stream_timeout => .gateway_timeout,
             .non_retryable => .provider_error,
         } else .server_error;
         return terminalize(alloc, &entry, request_digest, .provider_failed, null, .{
