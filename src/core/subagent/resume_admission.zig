@@ -194,7 +194,7 @@ pub fn listActionableCatalog(
                 errdefer copy.deinit(alloc);
                 try catalog.summaries.append(alloc, copy);
             },
-            .excluded => {},
+            .excluded, .legacy_ranking => {},
         }
     }
     if (cache_writer) |writer| {

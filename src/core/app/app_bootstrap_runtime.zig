@@ -209,6 +209,7 @@ pub fn Runtime(comptime App: type) type {
             app.auth.recordStartupStatus(
                 startup.stored_key_status,
                 startup.fx_login_status,
+                startup.credential_load_failure,
                 startup.credential_onboarding_skipped,
             );
             if (comptime @hasDecl(@TypeOf(app.auth), "refreshSourceInventory")) {
