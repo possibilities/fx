@@ -34,8 +34,10 @@ const app_agent_runtime = @import("core/app/app_agent_runtime.zig");
 const app_runtime_setup = @import("core/app/app_runtime_setup.zig");
 const app_render_runtime = @import("core/app/app_render_runtime.zig");
 const app_session_runtime = @import("core/app/app_session_runtime.zig");
+const app_session_naming_runtime = @import("core/app/app_session_naming_runtime.zig");
 const app_upgrade_runtime = @import("core/app/app_upgrade_runtime.zig");
 const app_worker_runtime = @import("core/app/app_worker_runtime.zig");
+const app_work_control_runtime = @import("core/app/app_work_control_runtime.zig");
 const app_workspace_runtime = @import("core/app/app_workspace_runtime.zig");
 const app_callbacks = @import("core/app/app_callbacks.zig");
 const app_commands = @import("core/app/app_commands.zig");
@@ -59,6 +61,7 @@ const provider_set = @import("core/gateway/provider_set.zig");
 const provider_catalog = @import("core/auth/provider_catalog.zig");
 const vercel_model_policy = @import("gateway/vercel_model_policy.zig");
 const model_catalog = @import("core/gateway/model_catalog.zig");
+const session_naming_runtime = @import("core/session/session_naming.zig");
 const agent_stream_provider = @import("core/agent/stream_provider.zig");
 const builtin_hooks = @import("builtins/hooks.zig");
 const builtin_mcp = @import("builtins/mcp.zig");
@@ -88,6 +91,7 @@ const github_publish = @import("core/github/github_publish.zig");
 const subagent_domain = @import("core/subagent/domain.zig");
 const subagent_execution = @import("core/subagent/execution.zig");
 const types = @import("core/shared/types.zig");
+const work_control = @import("core/control/work_control.zig");
 const image_attachments = @import("core/images/image_attachments.zig");
 const permissions = @import("core/permissions/permissions.zig");
 const command_runner = @import("core/execution/command_runner.zig");
@@ -407,11 +411,13 @@ const App = struct {
         Self,
         builtin_hooks.notifications.provider(Self),
     );
-    const HerdrAppRuntime = builtin_hooks.Runtime(Self);
+    const LifecycleAppRuntime = builtin_hooks.Runtime(Self);
     const RenderAppRuntime = app_render_runtime.Runtime(Self);
     const SessionAppRuntime = app_session_runtime.Runtime(Self);
+    const SessionNamingAppRuntime = app_session_naming_runtime.Runtime(Self);
     const UpgradeAppRuntime = app_upgrade_runtime.Runtime(Self);
     const WorkerAppRuntime = app_worker_runtime.Runtime(Self);
+    const WorkControlAppRuntime = app_work_control_runtime.Runtime(Self);
     const WorkspaceAppRuntime = app_workspace_runtime.Runtime(Self);
 
     pub fn contextRegistry(_: *const Self) context_contract.Registry {
@@ -524,6 +530,8 @@ const App = struct {
     lifecycle_runtime: hooks.Runtime = hooks.Runtime.init(std.heap.c_allocator),
     lifecycle_view: hooks.RuntimeView = hooks.RuntimeView.empty(),
     notifications: builtin_hooks.notifications.State = .{},
+    lifecycle_state: builtin_hooks.lifecycle_state.Reducer = .{},
+    ade_events: builtin_hooks.ade_events.Client = .{},
     herdr: builtin_hooks.Client = .{},
 
     session: SessionRuntime = SessionRuntime.initWithProviders(
@@ -534,6 +542,7 @@ const App = struct {
             .{},
     ),
     session_persistence: app_session_runtime.Persistence = .{},
+    session_naming: session_naming_runtime.Runtime = .{},
     prompt_history: PromptHistoryRuntime = .{},
     requested_resume: ?cli_surface.ResumeTarget = null,
     approval_prompt: ApprovalPrompt = .{},
@@ -551,6 +560,7 @@ const App = struct {
 
     worker_thread: ?std.Thread = null,
     worker: WorkerRuntime = .{},
+    work_control: work_control.Endpoint = .{},
     terminal_client: terminal_client_runtime.Runtime = .{},
     managed_executions: managed_execution.Runtime = managed_execution.Runtime.init(std.heap.c_allocator),
     legacy_process_provider: process_provider.Provider = process_provider.unavailable_provider,
@@ -652,6 +662,9 @@ const App = struct {
             },
         );
         errdefer app.deinit();
+        if (comptime !host_target.is_wasm) {
+            try app.work_control.configureFromEnvironment();
+        }
         try WorkspaceAppRuntime.applyLaunch(
             &app,
             launch.modifiers.additional_directories,
@@ -701,10 +714,37 @@ const App = struct {
     }
 
     pub fn configureNotifications(self: *App) !void {
-        // Register herdr hooks before NotificationAppRuntime.configure freezes
-        // the lifecycle runtime (its call to freeze() is the sole freeze site).
-        try HerdrAppRuntime.configure(self, SessionAppRuntime.activeSessionId(self));
+        // Register built-in observers before NotificationAppRuntime.configure
+        // freezes the lifecycle runtime (its call to freeze() is the sole
+        // freeze site).
+        try LifecycleAppRuntime.configure(self, SessionAppRuntime.activeSessionId(self));
+        if (SessionAppRuntime.durableCachedSessionTitle(self)) |title| {
+            LifecycleAppRuntime.reportSessionMetadataChanged(self, title);
+        }
         try NotificationAppRuntime.configure(self);
+    }
+
+    pub fn configureSessionNaming(
+        self: *App,
+        config: session_naming_runtime.Config,
+    ) void {
+        SessionNamingAppRuntime.configure(self, config);
+    }
+
+    pub fn reportSessionIdentityChanged(self: *App, session_id: ?[]const u8) void {
+        SessionNamingAppRuntime.invalidate(self);
+        LifecycleAppRuntime.reportSessionChanged(self, session_id);
+        if (SessionAppRuntime.durableCachedSessionTitle(self)) |title| {
+            LifecycleAppRuntime.reportSessionMetadataChanged(self, title);
+        }
+    }
+
+    pub fn reportSessionMetadataChanged(self: *App, title: []const u8) void {
+        LifecycleAppRuntime.reportSessionMetadataChanged(self, title);
+    }
+
+    pub fn cancelPendingSessionName(self: *App) void {
+        SessionNamingAppRuntime.invalidate(self);
     }
 
     pub fn rebindAfterInit(self: *App) void {
@@ -771,8 +811,83 @@ const App = struct {
         self: *App,
         turn_id: u64,
         kind: hooks.AttentionKind,
+        child_session_id: ?[]const u8,
     ) void {
-        NotificationAppRuntime.dispatchAttentionRequired(self, turn_id, kind);
+        self.dispatchAttentionRequiredTokenized(turn_id, kind, child_session_id, null);
+    }
+
+    pub fn dispatchAttentionRequiredTokenized(
+        self: *App,
+        turn_id: u64,
+        kind: hooks.AttentionKind,
+        child_session_id: ?[]const u8,
+        attention_token: ?hooks.AttentionToken,
+    ) void {
+        agent_runtime.dispatchAttentionRequiredCheckpoint(.{
+            .view = self.lifecycle_view,
+            .scope = self.attentionScope(child_session_id),
+            .outcome_allocator = self.alloc,
+        }, .{
+            .turn_id = if (child_session_id == null) turn_id else null,
+            .kind = kind,
+            .presented_interactively = true,
+            .attention_token = attention_token,
+        });
+    }
+
+    pub fn dispatchAttentionResolved(
+        self: *App,
+        turn_id: u64,
+        kind: hooks.AttentionKind,
+        child_session_id: ?[]const u8,
+    ) void {
+        self.dispatchAttentionResolvedTokenized(turn_id, kind, child_session_id, null);
+    }
+
+    pub fn dispatchAttentionResolvedTokenized(
+        self: *App,
+        turn_id: u64,
+        kind: hooks.AttentionKind,
+        child_session_id: ?[]const u8,
+        attention_token: ?hooks.AttentionToken,
+    ) void {
+        agent_runtime.dispatchAttentionResolvedCheckpoint(.{
+            .view = self.lifecycle_view,
+            .scope = self.attentionScope(child_session_id),
+            .outcome_allocator = self.alloc,
+        }, .{
+            .turn_id = if (child_session_id == null) turn_id else null,
+            .kind = kind,
+            .presented_interactively = true,
+            .attention_token = attention_token,
+        });
+    }
+
+    pub fn invalidateSubagentAttentionToken(
+        self: *App,
+        child_session_id: []const u8,
+        attention_token: hooks.AttentionToken,
+    ) void {
+        _ = self.lifecycle_state.closeAttentionToken(
+            .{ .subagent_session = child_session_id },
+            .permission,
+            attention_token,
+        );
+    }
+
+    fn attentionScope(
+        self: *App,
+        child_session_id: ?[]const u8,
+    ) hooks.Scope {
+        return if (child_session_id) |session_id| .{
+            .kind = .subagent,
+            .workspace_root = self.workspace_root,
+            .session_id = session_id,
+        } else .{
+            .kind = .interactive,
+            .workspace_root = self.workspace_root,
+            .session_id = SessionAppRuntime.activeSessionId(self),
+        };
     }
 
     /// Must be called after init() returns so the AutoUpgrade thread
@@ -781,6 +896,13 @@ const App = struct {
         if (self.auto_upgrade_enabled) {
             self.upgrader.start(self.alloc, currentBuild());
         }
+    }
+
+    /// Starts only after init() returns so the listener retains the final App
+    /// address through its pending main-loop handoff.
+    pub fn startWorkControl(self: *App) !void {
+        if (comptime host_target.is_wasm) return;
+        try self.work_control.start();
     }
 
     pub fn applyReadyUpgradeShortcut(self: *App) !void {
@@ -833,16 +955,19 @@ const App = struct {
         self.auth.stopProviderPreparation();
         // Client.deinit releases the herdr pane (clear agent + label) when enabled.
         self.herdr.deinit();
+        if (comptime !host_target.is_wasm) self.work_control.deinit();
         self.stopStream();
 
         self.worker.requestShutdown();
         SessionAppRuntime.requestPersistenceShutdown(self);
         self.managed_executions.shutdown();
+        SessionNamingAppRuntime.requestStop(self);
         self.upgrader.stop();
         self.file_index.requestStop();
 
         self.releaseTerminal();
         if (self.worker_thread) |thread| thread.join();
+        SessionNamingAppRuntime.deinit(self);
         WorkerAppRuntime.settleFinishedPromptsForShutdown(self) catch |err| {
             debug_trace.logf("session", "shutdown finished prompt persistence failed err={s}", .{@errorName(err)});
         };
@@ -860,6 +985,8 @@ const App = struct {
         self.worker.deinit(std.heap.c_allocator);
         self.web_fetch_runtime.deinit(self.alloc);
         self.web_search_runtime.deinit();
+        LifecycleAppRuntime.prepareStopped(self);
+        self.ade_events.deinit();
         self.prompt_history.deinit(self.alloc);
         self.clearPendingImages();
         self.pending_images.deinit(self.alloc);
@@ -887,6 +1014,7 @@ const App = struct {
         self.context_snapshot.deinit(self.alloc);
         self.file_index.deinit(std.heap.c_allocator);
         self.lifecycle_runtime.deinit();
+        LifecycleAppRuntime.deinit(self);
 
         self.auth.deinit(self.alloc);
         WorkspaceAppRuntime.deinit(self);
@@ -1312,9 +1440,69 @@ const App = struct {
             false,
         );
         errdefer worker_runtime.freeQueuedPrompt(std.heap.c_allocator, queued);
-        try self.worker.admitInteractivePrompt(std.heap.c_allocator, queued);
-        HerdrAppRuntime.reportWorking(self);
+        var naming_admission = SessionNamingAppRuntime.prepareAdmission(self, prompt);
+        defer if (naming_admission) |*prepared| prepared.deinit();
+        var admission_context = PromptAdmissionContext{
+            .app = self,
+            .naming_admission = &naming_admission,
+        };
+        try self.worker.admitInteractivePromptObserved(std.heap.c_allocator, queued, .{
+            .ctx = &admission_context,
+            .report = reportPromptAdmission,
+        });
+        LifecycleAppRuntime.reportPromptWorking(self);
         return true;
+    }
+
+    pub const PromptSubmitIntent = enum { queue, steer };
+
+    /// Applies host-supplied semantic work through the same snapshot and
+    /// worker admission path as interactive submission, with deliberately
+    /// empty image and skill state rather than borrowing the composer.
+    pub fn admitWorkControlPrompt(
+        self: *App,
+        prompt: []const u8,
+        intent: PromptSubmitIntent,
+    ) !worker_runtime.PromptAdmissionResult {
+        const no_images: []const types.ImageAttachment = &.{};
+        const context_targets = if (self.context_enabled)
+            try context_contract.applicableTargetsForImages(self.alloc, no_images)
+        else
+            &.{};
+        defer if (context_targets.len > 0) self.alloc.free(context_targets);
+
+        try AgentAppRuntime.refreshProjectContext(self, context_targets);
+        self.session.setConversationLanguageFromUserMessage(prompt);
+        const queued = try self.snapshotPrompt(
+            prompt,
+            &.{},
+            null,
+            no_images,
+            0,
+            false,
+        );
+        errdefer worker_runtime.freeQueuedPrompt(std.heap.c_allocator, queued);
+        var naming_admission = SessionNamingAppRuntime.prepareAdmission(self, prompt);
+        defer if (naming_admission) |*prepared| prepared.deinit();
+        var admission_context = PromptAdmissionContext{
+            .app = self,
+            .naming_admission = &naming_admission,
+        };
+        const admission = try self.worker.admitPromptObserved(
+            std.heap.c_allocator,
+            queued,
+            intent == .steer,
+            .{
+                .ctx = &admission_context,
+                .report = reportPromptAdmission,
+            },
+        );
+        LifecycleAppRuntime.reportPromptWorking(self);
+        WorkerAppRuntime.syncState(
+            self,
+            app_callbacks.Bindings(App).worker_tool_lifecycle_presenter(self),
+        );
+        return admission;
     }
 
     pub fn continuePausedRecovery(self: *App) !bool {
@@ -1350,6 +1538,7 @@ const App = struct {
         turn_id: u64,
         user_prompt_already_presented: bool,
     ) !bool {
+        _ = try self.requestSkillsRefresh();
         const queued = try self.snapshotPrompt(
             prompt,
             skill_tokens,
@@ -1359,8 +1548,17 @@ const App = struct {
             user_prompt_already_presented,
         );
         errdefer worker_runtime.freeQueuedPrompt(std.heap.c_allocator, queued);
-        try self.worker.enqueuePrompt(std.heap.c_allocator, queued);
-        HerdrAppRuntime.reportWorking(self);
+        var naming_admission = SessionNamingAppRuntime.prepareAdmission(self, prompt);
+        defer if (naming_admission) |*prepared| prepared.deinit();
+        var admission_context = PromptAdmissionContext{
+            .app = self,
+            .naming_admission = &naming_admission,
+        };
+        try self.worker.enqueuePromptObserved(std.heap.c_allocator, queued, .{
+            .ctx = &admission_context,
+            .report = reportPromptAdmission,
+        });
+        LifecycleAppRuntime.reportPromptWorking(self);
         return true;
     }
 
@@ -1473,6 +1671,20 @@ const App = struct {
         };
     }
 
+    const PromptAdmissionContext = struct {
+        app: *App,
+        naming_admission: *?session_naming_runtime.PreparedAdmission,
+    };
+
+    fn reportPromptAdmission(raw: *anyopaque) void {
+        const context: *PromptAdmissionContext = @ptrCast(@alignCast(raw));
+        LifecycleAppRuntime.reportPromptQueued(context.app);
+        if (context.naming_admission.*) |*prepared| {
+            SessionNamingAppRuntime.admit(context.app, prepared);
+            context.naming_admission.* = null;
+        }
+    }
+
     pub fn request_context_compaction(self: *App) !void {
         try InputSubmitRuntime.request_context_compaction(self);
     }
@@ -1511,7 +1723,7 @@ const App = struct {
             .history = history,
             .unversioned_history_count = self.session.unversionedHistoryEnd(),
         });
-        HerdrAppRuntime.reportWorking(self);
+        LifecycleAppRuntime.reportPromptWorking(self);
         return true;
     }
 
@@ -2851,6 +3063,7 @@ const App = struct {
 
     pub fn loopCollectFacts(ctx: *anyopaque) !void {
         const self: *App = @ptrCast(@alignCast(ctx));
+        if (comptime !host_target.is_wasm) try WorkControlAppRuntime.collect(self);
         if (!try WorkerAppRuntime.authorizeInteractiveAdmission(self)) return;
 
         if (comptime !host_target.is_wasm) {
@@ -2885,6 +3098,7 @@ const App = struct {
             .none => {},
             .repaint => RenderAppRuntime.requestActiveSurfaceFrame(self, .footer),
         }
+        SessionNamingAppRuntime.collectFacts(self);
         try app_commands.Handlers(App).collectMcpAuthenticationFacts(self);
         try app_commands.Handlers(App).collectMcpReloadFacts(self);
         if (try self.mcp.refreshMenuHealth(self.alloc, @intCast(@max(io_mod.milliTimestamp(), 0)))) {
