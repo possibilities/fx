@@ -1429,6 +1429,8 @@ fn noticeLabelStyle(styles: Styles, tone: types.NoticeTone) []const u8 {
 
 fn noticeContinuationIndent(text: []const u8, cursor: usize, cols: u16) usize {
     if (cols <= 2 or cursor >= text.len) return 0;
+    const line_start = cursor > 0 and (text[cursor - 1] == '\n' or text[cursor - 1] == '\r');
+    if (line_start and (std.mem.startsWith(u8, text[cursor..], "├ ") or std.mem.startsWith(u8, text[cursor..], "└ "))) return 0;
     if (text[cursor] == '\n' or text[cursor] == '\r') return 2;
     const unit = display_width.displayUnitAt(text, cursor);
     return if (unit.cell_width <= cols - 2) 2 else 0;
@@ -2851,6 +2853,33 @@ test "background semantic notices render one topic for launch and failure" {
     }
 }
 
+test "semantic notice tree branches align with the header while wrapped prose stays indented" {
+    const alloc = std.testing.allocator;
+    const cases = [_]struct { body: []const u8, cols: u16, expected: []const u8 }{
+        .{ .body = "2 skills loaded\n├ Loaded alpha\n└ Loaded beta", .cols = 40, .expected = "● 2 skills loaded\n├ Loaded alpha\n└ Loaded beta" },
+        .{ .body = "Ready\n└ alpha beta gamma", .cols = 12, .expected = "● Ready\n└ alpha beta\n  gamma" },
+        .{ .body = "alpha └ beta", .cols = 8, .expected = "● alpha\n  └ beta" },
+        .{ .body = "Ready\nordinary prose", .cols = 40, .expected = "● Ready\n  ordinary prose" },
+    };
+    for (cases) |case| {
+        const rendered = try renderSemanticNotice(alloc, .{ .topic = "", .tone = .neutral, .body = case.body }, .{}, case.cols);
+        defer alloc.free(rendered);
+        try std.testing.expectEqualStrings(case.expected, rendered);
+    }
+    const styled = try renderSemanticNotice(alloc, .{
+        .topic = "",
+        .tone = .neutral,
+        .body = cases[0].body,
+    }, .{ .system_notice_text_style = "\x1b[37m", .reset_style = "\x1b[0m" }, 40);
+    defer alloc.free(styled);
+    var grid = try vt_emulator.Grid.init(alloc, 40, 4);
+    defer grid.deinit();
+    try grid.feed(styled);
+    try std.testing.expectEqual(@as(u21, '●'), grid.cellAt(1, 1).?.codepoint);
+    try std.testing.expectEqual(@as(u21, '├'), grid.cellAt(2, 1).?.codepoint);
+    try std.testing.expectEqual(@as(u21, '└'), grid.cellAt(3, 1).?.codepoint);
+}
+
 test "semantic notice wraps words paths UTF-8 and explicit newlines without truncation" {
     const alloc = std.testing.allocator;
     const body = "alpha beta/gamma/delta\n東京🙂 final-token";
@@ -4029,6 +4058,23 @@ test "renderEntriesToBytes reflows parser-rendered lists at paint-time cols" {
     while (lines.next()) |line| {
         try std.testing.expect(display_width.visibleWidthIgnoringAnsi(line) <= 20);
     }
+}
+
+test "renderEntriesToBytes preserves parser-rendered list paragraph indentation" {
+    const alloc = std.testing.allocator;
+    var processor = assistant_presentation.MarkdownProcessor{};
+    defer processor.deinit(alloc);
+    var source: std.ArrayList(u8) = .empty;
+    defer source.deinit(alloc);
+    try processor.push(alloc, "1. Heading\n   alpha beta gamma delta\n\n- Heading\n  alpha beta gamma delta\n", &source);
+    try processor.flush(alloc, &source);
+    var entries: std.ArrayList(TranscriptEntry) = .empty;
+    defer deinitTestEntries(&entries, alloc);
+    try appendAssistantTestEntry(&entries, alloc, 1, source.items);
+    const narrow = try renderEntriesToBytes(alloc, entries.items, 18, .{});
+    defer alloc.free(narrow);
+    try std.testing.expect(std.mem.find(u8, narrow, "     alpha beta\n     gamma delta") != null);
+    try std.testing.expect(std.mem.find(u8, narrow, "    alpha beta\n    gamma delta") != null);
 }
 
 test "renderEntriesToBytes reflows parser-rendered task lists at paint-time cols" {

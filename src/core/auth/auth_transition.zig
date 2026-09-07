@@ -45,6 +45,7 @@ pub fn decideLogoutProvider(facts: LogoutFacts) model_provider.ProviderId {
     if (facts.requested) |provider| return provider;
     if (facts.selected == .grok or facts.active_source == .grok_subscription) return .grok;
     if (facts.selected == .codex or facts.active_source == .chatgpt_subscription) return .codex;
+    if (facts.active_source == .fx_login) return .gateway;
 
     const only_grok_login = facts.available_sources.contains(.grok_subscription) and
         !facts.available_sources.contains(.fx_login) and
@@ -96,6 +97,26 @@ test "logout fallback prefers Gateway then the remaining subscription" {
             if (provider == .codex) model_provider.ProviderId.grok else model_provider.ProviderId.codex,
             candidates[1].?,
         );
+    }
+}
+
+test "default logout honors an active fx login before other subscriptions" {
+    for ([_]model_provider.ProviderId{ .codex, .grok }) |other| {
+        var facts: LogoutFacts = .{
+            .requested = null,
+            .selected = .gateway,
+            .active_source = .fx_login,
+            .available_sources = .initOne(if (other == .codex) .chatgpt_subscription else .grok_subscription),
+        };
+        try std.testing.expectEqual(model_provider.ProviderId.gateway, decideLogoutProvider(facts));
+        facts.requested = other;
+        try std.testing.expectEqual(other, decideLogoutProvider(facts));
+        facts.requested = null;
+        facts.selected = other;
+        try std.testing.expectEqual(other, decideLogoutProvider(facts));
+        facts.selected = .gateway;
+        facts.active_source = .ai_gateway_api_key;
+        try std.testing.expectEqual(other, decideLogoutProvider(facts));
     }
 }
 

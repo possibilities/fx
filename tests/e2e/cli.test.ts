@@ -29,6 +29,7 @@ import {
 import {
   FAKE_GATEWAY_MODEL,
   fakeGatewayFinalText,
+  fakeGatewaySse,
   startFakeGateway,
 } from "./tmux-helpers";
 
@@ -393,11 +394,12 @@ describe("cli: help", () => {
 Run one noninteractive request
 
 Usage:
-  fx ask [--auto|--yolo] [--image PATH] [--system TEXT] [--json] [--quiet] [--prompt-permissions] [--no-save] [--no-color] [--resume <last|id>|--resume-id <id>] [--continue-recovery] [--] <prompt>
+  fx ask [--auto|--full-access] [--image PATH] [--system TEXT] [--json] [--quiet] [--prompt-permissions] [--no-save] [--no-color] [--resume <last|id>|--resume-id <id>] [--continue-recovery] [--] <prompt>
 
 Options:
   --auto                Automatically review unresolved permission requests
-  --yolo                Disable fx permission checks
+  --full-access         Disable fx permission checks
+  --yolo                Alias for --full-access
   --image PATH          Attach an image file; repeat for multiple images
   --system TEXT         Replace the built-in system prompt for this request
   --json                Emit machine-readable JSON instead of text
@@ -413,6 +415,7 @@ Options:
 The prompt may be passed as arguments or piped on stdin when no prompt args are given.
 TTY stdout uses the Minimal transcript presentation; redirected stdout emits raw assistant Markdown.
 Operational progress and diagnostics are written to stderr. JSON \`output\` keeps accumulated assistant Markdown; \`final_output\` contains only the completed final response, or an empty string when absent.
+JSON usage sums reported main-agent input_tokens and output_tokens, including with --no-save; unreported counts are null. Nested usage and dollar spend are excluded.
 --system replaces only the built-in base prompt for this request; tool, skill, project, and runtime context still apply.
 With --prompt-permissions, JSON and quiet requests may prompt on stderr only when stdin is a TTY.
 `;
@@ -723,6 +726,9 @@ describe("cli: status", () => {
     { name: "Gateway with a stale Codex preference", provider: "gateway", source: "chatgpt_subscription", help: MISSING_AUTH_MESSAGE },
     { name: "Gateway with a stale Grok preference", provider: "gateway", source: "grok_subscription", help: MISSING_AUTH_MESSAGE },
     { name: "an exact Gateway login", provider: "gateway", source: "fx_login", help: "fx login is selected but unavailable. Run fx login to reconnect; no other credential was selected." },
+    { name: "an exact OIDC token", provider: "gateway", source: "vercel_oidc_token", help: "VERCEL_OIDC_TOKEN is selected but unavailable. Set VERCEL_OIDC_TOKEN before starting fx; no other credential was selected." },
+    { name: "an exact environment key", provider: "gateway", source: "ai_gateway_api_key", help: "AI_GATEWAY_API_KEY is selected but unavailable. Set AI_GATEWAY_API_KEY before starting fx; no other credential was selected." },
+    { name: "an exact stored key", provider: "gateway", source: "stored_key", help: "A stored API key is selected but unavailable. Start fx and open /provider to choose an available credential; no other credential was selected." },
     { name: "Codex", provider: "codex", source: undefined, help: "fx needs a Codex subscription login for this model. Run fx login codex." },
     { name: "Grok", provider: "grok", source: undefined, help: "fx needs a Grok subscription login for this model. Run fx login grok." },
   ]) {
@@ -770,9 +776,7 @@ describe("cli: status", () => {
           const ask = await runFx(["ask", "--json", "--no-save", "Say hello."], options);
           expect(ask.code).toBe(1);
           expect(JSON.parse(ask.stdout).error).toBe("MissingCredentials");
-          expect(ask.stderr).toContain(
-            scenario.provider === "gateway" ? MISSING_AUTH_MESSAGE : scenario.help,
-          );
+          expect(ask.stderr).toContain(scenario.help);
           expect(readFileSync(settingsPath, "utf8")).toBe(settings);
         } finally {
           rmSync(root, { recursive: true, force: true });
@@ -781,6 +785,71 @@ describe("cli: status", () => {
       TIMEOUT,
     );
   }
+
+  test("fresh and resumed asks retain an unavailable exact login with an environment key", async () => {
+    const root = mkdtempSync(join(tmpdir(), "fx-ask-exact-source-"));
+    const gateway = startFakeGateway([
+      fakeGatewayFinalText("SESSION_SEEDED"),
+      fakeGatewayFinalText("AUTOMATIC_KEY_WORKS"),
+    ]);
+    try {
+      const home = join(root, "home");
+      const workspace = join(root, "workspace");
+      mkdirSync(join(home, ".fx"), { recursive: true });
+      mkdirSync(workspace);
+      const settingsPath = join(home, ".fx", "settings.json");
+      const settings = { provider: "gateway", models: { gateway: FAKE_GATEWAY_MODEL } };
+      writeFileSync(settingsPath, JSON.stringify(settings));
+      const options = {
+        cwd: realpathSync(workspace),
+        env: {
+          HOME: realpathSync(home),
+          AI_GATEWAY_API_KEY: "exact-source-control-key",
+          VERCEL_OIDC_TOKEN: undefined,
+          FX_MODEL: undefined,
+          FX_DISABLE_KEYCHAIN: "1",
+          FX_GATEWAY_BASE_URL: gateway.baseUrl,
+          FX_GATEWAY_CHAT_URL: gateway.chatUrl,
+          FX_E2E_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+        },
+      };
+      const seeded = await runFx(["ask", "--json", "Create a short greeting."], options);
+      expect(seeded.code).toBe(0);
+      const sessionId = JSON.parse(seeded.stdout).session_id;
+      expect(sessionId.length).toBeGreaterThan(0);
+      expect(gateway.requests).toHaveLength(1);
+
+      const pinned = JSON.stringify({ ...settings, credential_source: "fx_login" });
+      writeFileSync(settingsPath, pinned);
+      const status = await runFx(["status", "--json"], options);
+      const help = JSON.parse(status.stdout).auth_help;
+      expect(help).toContain("fx login is selected but unavailable");
+      for (const resumed of [false, true]) {
+        for (const json of [false, true]) {
+          const result = await runFx([
+            "ask", ...(json ? ["--json"] : []),
+            ...(resumed ? ["--resume-id", sessionId] : ["--no-save"]),
+            "Continue with a greeting.",
+          ], options);
+          expect(result.code).toBe(1);
+          expect(result.stderr).toContain(help);
+          expect(result.stderr).not.toContain("set AI_GATEWAY_API_KEY");
+          if (json) expect(JSON.parse(result.stdout).error).toBe("MissingCredentials");
+          expect(readFileSync(settingsPath, "utf8")).toBe(pinned);
+          expect(gateway.requests).toHaveLength(1);
+        }
+      }
+
+      writeFileSync(settingsPath, JSON.stringify(settings));
+      const automatic = await runFx(["ask", "--json", "--no-save", "Give a greeting."], options);
+      expect(automatic.code).toBe(0);
+      expect(JSON.parse(automatic.stdout).output).toContain("AUTOMATIC_KEY_WORKS");
+      expect(gateway.requests).toHaveLength(2);
+    } finally {
+      gateway.stop();
+      rmSync(root, { recursive: true, force: true });
+    }
+  }, TIMEOUT);
 
   test(
     "status and doctor share fx login source, team, and refreshability",
@@ -4050,7 +4119,7 @@ describe("cli: ask success", () => {
       expect(jsonResult.code).toBe(1);
       expect(jsonResult.stderr).toBe("");
       expect(jsonResult.stdout).toBe(
-        '{"output":"","final_output":"","exit_code":1,"model":"","session_id":"","steps":0,"tool_calls":[],"error":"PromptResourceLimitExceeded"}\n',
+        '{"output":"","final_output":"","exit_code":1,"model":"","session_id":"","steps":0,"tool_calls":[],"usage":{"input_tokens":null,"output_tokens":null},"error":"PromptResourceLimitExceeded"}\n',
       );
     },
     120_000,
@@ -4190,6 +4259,124 @@ describe("cli: ask success", () => {
     120_000,
   );
 
+  test.each([
+    {
+      name: "reports exact provider totals",
+      reportedUsage: { inputTokens: { total: 17 }, outputTokens: { total: 23 } },
+      expectedUsage: { input_tokens: 17, output_tokens: 23 },
+      toolLoop: false,
+      json: true,
+    },
+    {
+      name: "reports null when provider totals are missing",
+      reportedUsage: undefined,
+      expectedUsage: { input_tokens: null, output_tokens: null },
+      toolLoop: false,
+      json: true,
+    },
+    {
+      name: "sums main-agent completions across a read_file tool loop",
+      reportedUsage: { inputTokens: { total: 17 }, outputTokens: { total: 23 } },
+      expectedUsage: { input_tokens: 20, output_tokens: 28 },
+      toolLoop: true,
+      json: true,
+    },
+    {
+      name: "leaves plain output unchanged",
+      reportedUsage: { inputTokens: { total: 17 }, outputTokens: { total: 23 } },
+      expectedUsage: undefined,
+      toolLoop: false,
+      json: false,
+    },
+  ])(
+    "fx ask usage $name",
+    async ({ reportedUsage, expectedUsage, toolLoop, json }) => {
+      const root = mkdtempSync(join(tmpdir(), "fx-e2e-ask-usage-"));
+      const answer = "Usage fixture complete.\n";
+      const gateway = startFakeGateway([
+        fakeGatewaySse([
+          toolLoop
+            ? {
+                type: "tool-call",
+                toolCallId: "read_usage_fixture",
+                toolName: "read_file",
+                input: JSON.stringify({ path: "fixture.txt" }),
+              }
+            : { type: "text-delta", id: "answer_1", delta: answer },
+          {
+            type: "finish",
+            finishReason: toolLoop
+              ? { unified: "tool-calls", raw: "tool-calls" }
+              : { unified: "stop", raw: "stop" },
+            usage: reportedUsage,
+          },
+        ]),
+        ...(toolLoop ? [fakeGatewayFinalText(answer)] : []),
+      ]);
+      try {
+        const home = join(root, "home");
+        const workspace = join(root, "workspace");
+        mkdirSync(home);
+        mkdirSync(workspace);
+        writeFileSync(join(workspace, "fixture.txt"), "usage fixture contents\n");
+
+        const result = await runFx(
+          [
+            "ask",
+            ...(json ? ["--json"] : []),
+            "--auto",
+            "--no-save",
+            toolLoop ? "Read fixture.txt and reply." : "Reply with the fixture answer.",
+          ],
+          {
+            cwd: realpathSync(workspace),
+            env: {
+              HOME: realpathSync(home),
+              AI_GATEWAY_API_KEY: "fake-ask-usage-key",
+              VERCEL_OIDC_TOKEN: undefined,
+              FX_DISABLE_KEYCHAIN: "1",
+              FX_GATEWAY_BASE_URL: gateway.baseUrl,
+              FX_GATEWAY_CHAT_URL: gateway.chatUrl,
+              FX_E2E_GATEWAY_CHAT_URL: gateway.chatUrl,
+              FX_E2E_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+              FX_MODEL: FAKE_GATEWAY_MODEL,
+              FX_AUTO_UPGRADE: "0",
+            },
+            timeoutMs: 60_000,
+          },
+        );
+
+        expect(result.code).toBe(0);
+        if (json) {
+          const output = JSON.parse(result.stdout);
+          expect(output.output).toBe(answer);
+          expect(output.final_output).toBe(answer.trimEnd());
+          expect(output.exit_code).toBe(0);
+          expect(output.session_id).toBe("");
+          expect(output.usage).toEqual(expectedUsage);
+          expect(output.tool_calls).toEqual(
+            toolLoop ? [{ name: "read_file", status: "success" }] : [],
+          );
+        } else {
+          expect(result.stdout).toBe(answer);
+        }
+        if (toolLoop) {
+          expect(result.stderr).toContain("Reading fixture.txt");
+          expect(gateway.requests[1]!.body).toContain("usage fixture contents");
+        } else {
+          expect(result.stderr).toBe("");
+        }
+        expect(gateway.requests).toHaveLength(toolLoop ? 2 : 1);
+        expect(gateway.classifierRequests).toHaveLength(0);
+        expect(existsSync(join(home, ".fx"))).toBe(false);
+      } finally {
+        gateway.stop();
+        rmSync(root, { recursive: true, force: true });
+      }
+    },
+    60_000,
+  );
+
   test(
     "saved ask resumes the exact session while no-save creates no durable state",
     async () => {
@@ -4228,6 +4415,7 @@ describe("cli: ask success", () => {
         expect(first.code).toBe(0);
         expect(first.stderr).toBe("");
         const firstJson = JSON.parse(first.stdout.trim());
+        expect(firstJson.usage).toEqual({ input_tokens: 3, output_tokens: 5 });
         expect(typeof firstJson.session_id).toBe("string");
         expect(firstJson.session_id.length).toBeGreaterThan(0);
         expect(gateway.requests[0]?.headers.get("x-session-id")).toBe(
@@ -4271,9 +4459,9 @@ describe("cli: ask success", () => {
         );
         expect(resumed.code).toBe(0);
         expect(resumed.stderr).toBe("");
-        expect(JSON.parse(resumed.stdout.trim()).session_id).toBe(
-          firstJson.session_id,
-        );
+        const resumedJson = JSON.parse(resumed.stdout.trim());
+        expect(resumedJson.session_id).toBe(firstJson.session_id);
+        expect(resumedJson.usage).toEqual({ input_tokens: 3, output_tokens: 5 });
         expect(gateway.requests[1]?.headers.get("x-session-id")).toBe(
           firstJson.session_id,
         );
@@ -4310,7 +4498,9 @@ describe("cli: ask success", () => {
         );
         expect(noSave.code).toBe(0);
         expect(noSave.stderr).toBe("");
-        expect(JSON.parse(noSave.stdout.trim()).session_id).toBe("");
+        const noSaveJson = JSON.parse(noSave.stdout.trim());
+        expect(noSaveJson.session_id).toBe("");
+        expect(noSaveJson.usage).toEqual({ input_tokens: 3, output_tokens: 5 });
         expect(gateway.requests[2]?.headers.get("x-session-id")).toBeNull();
         expect(gateway.requests[2]?.headers.get("x-session-affinity")).toBeNull();
         expect(existsSync(join(noSaveHome, ".fx"))).toBe(false);
@@ -4764,7 +4954,7 @@ describe("cli: error handling", () => {
             "fx ask: --no-save cannot be used with --resume or --resume-id",
           );
           expect(rejected.stderr).toContain(
-            "usage: fx ask [--auto|--yolo] [--image PATH] [--system TEXT] [--json] [--quiet] [--prompt-permissions] [--no-save]",
+            "usage: fx ask [--auto|--full-access] [--image PATH] [--system TEXT] [--json] [--quiet] [--prompt-permissions] [--no-save]",
           );
         }
         expect(gateway.requests).toHaveLength(0);
