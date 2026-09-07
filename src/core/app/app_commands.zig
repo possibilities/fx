@@ -1932,29 +1932,8 @@ pub fn Handlers(comptime App: type) type {
 
         fn commandCompactHistory(ctx: *anyopaque) !void {
             const app: *App = @ptrCast(@alignCast(ctx));
-            if (comptime @hasDecl(App, "enqueueContextCompaction")) {
-                if (!app.hasContextToCompact()) {
-                    try app.writeDomainNotice(.{
-                        .topic = "context",
-                        .tone = .neutral,
-                        .body = "No context to compact.",
-                    }, true);
-                    return;
-                }
-                if (try app.enqueueContextCompaction()) {
-                    try app.writeDomainNotice(.{
-                        .topic = "context",
-                        .tone = .neutral,
-                        .body = "Compaction queued.",
-                    }, true);
-                } else {
-                    try app.writeDomainNotice(.{
-                        .topic = "context",
-                        .tone = .warning,
-                        .body = "Wait for the active work to finish before compacting context.",
-                    }, true);
-                }
-                return;
+            if (comptime @hasDecl(App, "request_context_compaction")) {
+                return app.request_context_compaction();
             }
             try app.writeDomainNotice(.{
                 .topic = "context",
