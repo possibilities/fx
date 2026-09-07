@@ -139,7 +139,7 @@ pub fn build(b: *std.Build) void {
             "session_commands selected profile status never reads ambient credential preferences",
             "catalog cache round trips owned rows and ignores incomplete observations",
             "summary clone owns every string",
-            "native session checkpoint-only history leaves first real title uncommitted",
+            "native session checkpoint-only history derives a title after reopening unless explicitly named",
             "resume menu retains account provenance in clipped titles",
             "global system prompt file modifiers preserve replacement and append order",
             "ACP command routes parsed options and launch config through the injected runner",

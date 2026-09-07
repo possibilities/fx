@@ -20,7 +20,7 @@ const expected_names = [_][]const u8{
     "core.session.session_commands.test.session_commands selected profile status never reads ambient credential preferences",
     "core.session.session_catalog_cache.test.catalog cache round trips owned rows and ignores incomplete observations",
     "core.session.session_summary_codec.test.summary clone owns every string",
-    "core.session.session_log.test.native session checkpoint-only history leaves first real title uncommitted",
+    "core.session.session_log.test.native session checkpoint-only history derives a title after reopening unless explicitly named",
     "ui.footer.resume_menu_presentation.test.resume menu retains account provenance in clipped titles",
     "builtins.hooks.ade_events.test.ADE feed serializes a main turn as one versioned JSON line",
     "builtins.hooks.ade_events.test.ADE feed serializes native session metadata as a generic raw event",
