@@ -222,6 +222,9 @@ pub fn loadSchemaV3ReadOnly(
     {
         return error.InvalidSessionFormat;
     }
+    if (try replayed.state.archive_legacy_recovery(alloc)) {
+        @import("../shared/debug_trace.zig").logf("session", "legacy recovery archived session_id={s} reason=unverifiable_route_authority", .{session_id});
+    }
     const state = replayed.takeState();
     return .{
         .state = state,
@@ -351,6 +354,46 @@ fn loadMigrationPreferences(
         .effort = detailed.settings.effort orelse .auto,
         .fast_mode = detailed.settings.fast_mode orelse false,
     };
+}
+
+test "schema v3 import archives legacy recovery with allocation failure cleanup" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var dir = io_mod.VerifiedDir{ .dir = try tmp.dir.openDir(std.testing.io, ".", .{}) };
+    defer dir.close();
+    const generation = [_]u8{1} ** 16;
+    const started = try session_event.encodeLegacyFixtureFrame(alloc, .{
+        .log_generation = generation,
+        .seq = 1,
+        .event_id = [_]u8{1} ** 16,
+        .timestamp_ms = 10,
+        .event = .{ .session_started = .{
+            .id = @constCast("legacy-recovery"),
+            .created_at_ms = 10,
+            .origin_workspace_root = @constCast("/workspace"),
+            .workspace_root = @constCast("/workspace"),
+            .conversation_language = .literal("en"),
+            .preferences = .{ .model = @constCast("test/model"), .effort = .auto, .fast_mode = false },
+        } },
+    });
+    defer alloc.free(started);
+    const recovery = "{\"schema_version\":1,\"log_generation\":\"01010101010101010101010101010101\",\"seq\":2,\"event_id\":\"02020202020202020202020202020202\",\"timestamp_ms\":20,\"kind\":\"recovery_checkpoint_set\",\"payload\":{\"checkpoint\":{\"version\":2,\"route_identity\":{\"connection_id\":\"vercel\",\"adapter_kind\":\"vercel_ai_gateway\",\"permission_review_model_id\":\"review\"},\"delivery\":\"possibly_sent\",\"turn_id\":1,\"user\":{\"text\":\"saved request\",\"images\":[]},\"assistant_source\":\"saved partial\",\"execution\":{\"schema_version\":3,\"tool_steps\":[],\"files\":[]},\"cause\":\"response_interrupted\",\"action\":\"continuing_response\",\"tool_state\":\"uncertain\",\"route_model\":\"test/model\",\"requested_fast_mode\":false,\"fast_mode\":false,\"max_provider_attempts\":3,\"consumed_provider_attempts\":0,\"outstanding_reservation\":false}}}\n";
+    const events = try std.mem.concat(alloc, u8, &.{ started, recovery });
+    defer alloc.free(events);
+    try dir.dir.writeFile(std.testing.io, .{ .sub_path = "events.jsonl", .data = events });
+    const watermark = try std.fmt.allocPrint(alloc, "{{\"schema_version\":1,\"session_id\":\"legacy-recovery\",\"log_generation\":\"01010101010101010101010101010101\",\"through_seq\":2,\"through_event_id\":\"02020202020202020202020202020202\",\"through_event_log_bytes\":{d}}}", .{events.len});
+    defer alloc.free(watermark);
+    try dir.dir.writeFile(std.testing.io, .{ .sub_path = "commit.01010101010101010101010101010101.json", .data = watermark });
+    try std.testing.checkAllAllocationFailures(alloc, struct {
+        fn check(a: Allocator, source: *io_mod.VerifiedDir) !void {
+            var imported = try loadSchemaV3ReadOnly(a, source, "legacy-recovery");
+            defer imported.deinit(a);
+            try std.testing.expect(imported.state.recovery_checkpoint == null);
+            try std.testing.expectEqual(@as(usize, 1), imported.state.history.len);
+            try std.testing.expectEqualStrings("saved partial", imported.state.history[0].interrupted.assistant.?);
+        }
+    }.check, .{&dir});
 }
 
 test "schema v3 import follows the committed watermark beyond a stale manifest" {

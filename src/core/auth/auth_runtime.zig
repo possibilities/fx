@@ -43,11 +43,6 @@ const SourceProbeFn = *const fn (?*anyopaque, Allocator, credentials.Source) any
 const CredentialLoaderFn = *const fn (?*anyopaque, Allocator, credentials.Source) anyerror!?credentials.Credential;
 const StoredKeyStoreFn = *const fn (?*anyopaque, Allocator, []const u8) anyerror!void;
 
-const UnavailableSourcePolicy = enum {
-    fail,
-    omit,
-};
-
 const max_api_key_entry_bytes: usize = 8 * 1024;
 const max_api_key_mask_glyphs = provider_picker_catalog.max_key_mask_glyphs;
 const max_manual_code_mask_glyphs: usize = 32;
@@ -475,11 +470,33 @@ fn prepareResolvedCredential(
     return credential;
 }
 
-fn requestedSource(
+pub fn requestedSource(
     provider: model_provider.ProviderId,
     preferred: ?credentials.Source,
 ) ?credentials.Source {
-    return if (provider == .gateway) preferred else provider_catalog.find(provider).login_source;
+    if (provider != .gateway) return provider_catalog.find(provider).login_source;
+    return if (model_provider.authorizesCredential(provider, preferred)) preferred else null;
+}
+
+test "requested credential source follows provider authority" {
+    const cases = [_]struct {
+        provider: model_provider.ProviderId,
+        preferred: ?credentials.Source,
+        required: ?credentials.Source,
+    }{
+        .{ .provider = .gateway, .preferred = null, .required = null },
+        .{ .provider = .gateway, .preferred = .fx_login, .required = .fx_login },
+        .{ .provider = .gateway, .preferred = .stored_key, .required = .stored_key },
+        .{ .provider = .gateway, .preferred = .ai_gateway_api_key, .required = .ai_gateway_api_key },
+        .{ .provider = .gateway, .preferred = .vercel_oidc_token, .required = .vercel_oidc_token },
+        .{ .provider = .gateway, .preferred = .chatgpt_subscription, .required = null },
+        .{ .provider = .gateway, .preferred = .grok_subscription, .required = null },
+        .{ .provider = .codex, .preferred = .fx_login, .required = .chatgpt_subscription },
+        .{ .provider = .grok, .preferred = .fx_login, .required = .grok_subscription },
+    };
+    for (cases) |case| {
+        try std.testing.expectEqual(case.required, requestedSource(case.provider, case.preferred));
+    }
 }
 
 pub fn preparationError(failure: CredentialFailure) ?CredentialPreparationError {
@@ -1541,31 +1558,47 @@ pub const StatusSnapshot = struct {
 
     pub fn missingHelp(self: StatusSnapshot, surface: MissingHelpSurface) ?[]const u8 {
         if (self.active_source != null) return null;
-        if (self.stored_key_status == .unavailable) return credentials.unreadable_store_message;
+        if (self.stored_key_status == .unavailable) {
+            if (self.required_source == .stored_key) return switch (surface) {
+                .cli => "The selected stored API key could not be read from " ++ credentials.stored_key_backend_label ++ ". Start fx and open /provider to choose an available credential; no other credential was selected.",
+                .interactive => "The selected stored API key could not be read from " ++ credentials.stored_key_backend_label ++ ". Run /provider to choose an available credential; no other credential was selected.",
+            };
+            return credentials.unreadable_store_message;
+        }
         if (self.failure) |failure| {
             if (preparationError(failure)) |err| return preparationFailureNotice(err);
         }
-        if (self.required_source == .fx_login) {
-            return if (self.fx_login_status == .unavailable)
-                "The saved fx login could not be loaded. Run fx login to repair this source; no other credential was selected."
-            else
-                "fx login is selected but unavailable. Run fx login to reconnect; no other credential was selected.";
-        }
-        if (self.required_source == .chatgpt_subscription) {
-            return switch (surface) {
-                .cli => credentials.missing_chatgpt_credential_message,
-                .interactive => credentials.missing_chatgpt_interactive_credential_message,
-            };
-        }
-        if (self.required_source == .grok_subscription) {
-            return switch (surface) {
-                .cli => credentials.missing_grok_credential_message,
-                .interactive => credentials.missing_grok_interactive_credential_message,
-            };
-        }
-        return switch (surface) {
+        const automatic_help: []const u8 = switch (surface) {
             .cli => credentials.missing_credential_message,
             .interactive => credentials.missing_interactive_credential_message,
+        };
+        const required_source = self.required_source orelse return automatic_help;
+        return switch (required_source) {
+            .vercel_oidc_token => "VERCEL_OIDC_TOKEN is selected but unavailable. Set VERCEL_OIDC_TOKEN before starting fx; no other credential was selected.",
+            .ai_gateway_api_key => "AI_GATEWAY_API_KEY is selected but unavailable. Set AI_GATEWAY_API_KEY before starting fx; no other credential was selected.",
+            .stored_key => switch (surface) {
+                .cli => "A stored API key is selected but unavailable. Start fx and open /provider to choose an available credential; no other credential was selected.",
+                .interactive => "A stored API key is selected but unavailable. Run /provider to choose an available credential; no other credential was selected.",
+            },
+            .fx_login => switch (surface) {
+                .cli => if (self.fx_login_status == .unavailable)
+                    "The saved fx login could not be loaded. Run fx login to repair this source; no other credential was selected."
+                else
+                    "fx login is selected but unavailable. Run fx login to reconnect; no other credential was selected.",
+                .interactive => if (self.fx_login_status == .unavailable)
+                    "The saved fx login could not be loaded. Run /login to repair this source; no other credential was selected."
+                else
+                    "fx login is selected but unavailable. Run /login to reconnect; no other credential was selected.",
+            },
+            .chatgpt_subscription => switch (surface) {
+                .cli => credentials.missing_chatgpt_credential_message,
+                .interactive => credentials.missing_chatgpt_interactive_credential_message,
+            },
+            .grok_subscription => switch (surface) {
+                .cli => credentials.missing_grok_credential_message,
+                .interactive => credentials.missing_grok_interactive_credential_message,
+            },
+            .host_managed => automatic_help,
         };
     }
 
@@ -1674,14 +1707,7 @@ pub fn loadStatusSnapshotForProvider(
         };
     }
     return .{
-        .required_source = if (provider == .codex)
-            .chatgpt_subscription
-        else if (provider == .grok)
-            .grok_subscription
-        else if (provider == .gateway and !model_provider.authorizesCredential(.gateway, preferred))
-            null
-        else
-            preferred,
+        .required_source = if (provider) |selected_provider| requestedSource(selected_provider, preferred) else preferred,
         .stored_key_status = resolution.stored_key_status,
         .fx_login_status = resolution.fx_login_status,
         .failure = if (resolution.failure) |failure| classifyCredentialFailure(failure.source, failure.err) else null,
@@ -1902,7 +1928,7 @@ pub const Runtime = struct {
 
     pub fn modelCatalogAccess(self: *const Self) credentials.CatalogAccess {
         if (self.auth_mode == .host_managed) return .host_managed;
-        if (self.credential_failure) |failure| {
+        if (self.credentialFailure()) |failure| {
             return credentials.catalogAccessAfterRefreshFailure(failure.source);
         }
         return credentials.catalogAccessAt(self.selected_credential, io_mod.milliTimestamp());
@@ -1922,8 +1948,10 @@ pub const Runtime = struct {
         return true;
     }
 
+    /// Recovery and catalog access concern only the selected credential.
     pub fn credentialFailure(self: *const Self) ?CredentialFailure {
-        return self.credential_failure;
+        const failure = self.credential_failure orelse return null;
+        return if (self.credentialSource() == failure.source) failure else null;
     }
 
     pub fn credentialSource(self: *const Self) ?credentials.Source {
@@ -1952,11 +1980,11 @@ pub const Runtime = struct {
         return credential.needsRefreshAt(now_ms);
     }
 
-    pub fn statusSnapshot(self: *const Self) StatusSnapshot {
-        return self.statusSnapshotAt(io_mod.milliTimestamp());
+    pub fn statusSnapshot(self: *const Self, provider: model_provider.ProviderId, preferred: ?credentials.Source) StatusSnapshot {
+        return self.statusSnapshotAt(io_mod.milliTimestamp(), provider, preferred);
     }
 
-    fn statusSnapshotAt(self: *const Self, now_ms: i64) StatusSnapshot {
+    fn statusSnapshotAt(self: *const Self, now_ms: i64, provider: model_provider.ProviderId, preferred: ?credentials.Source) StatusSnapshot {
         if (self.auth_mode == .host_managed) return .{
             .active_source = .host_managed,
             .gateway_connected = true,
@@ -1970,6 +1998,13 @@ pub const Runtime = struct {
         const chatgpt_connected = self.source_inventory.contains(.chatgpt_subscription);
         const grok_connected = self.source_inventory.contains(.grok_subscription);
         const credential = self.selected_credential orelse return .{
+            .required_source = requestedSource(provider, preferred),
+            .failure = if (self.credential_failure) |failure|
+                if (model_provider.authorizesCredential(provider, failure.source)) failure else null
+            else
+                null,
+            .stored_key_status = if (provider == .gateway) self.stored_key_status else .not_attempted,
+            .fx_login_status = if (provider == .gateway) self.fx_login_status else .not_attempted,
             .gateway_connected = gateway_connected,
             .chatgpt_connected = chatgpt_connected,
             .grok_connected = grok_connected,
@@ -2004,11 +2039,18 @@ pub const Runtime = struct {
         self: *Self,
         stored_key_status: credentials.StoredKeyReadStatus,
         fx_login_status: credentials.FxLoginReadStatus,
+        load_failure: ?credentials.LoadFailure,
         onboarding_skipped: bool,
     ) void {
         self.stored_key_status = stored_key_status;
         self.fx_login_status = fx_login_status;
         self.onboarding_skipped = onboarding_skipped;
+        if (self.auth_mode == .local and self.selected_credential == null) {
+            self.credential_failure = if (load_failure) |failure|
+                classifyCredentialFailure(failure.source, failure.err)
+            else
+                null;
+        }
     }
 
     pub fn beginProviderPreparation(self: *Self, alloc: Allocator, input: ProviderPreparationInput) !void {
@@ -2053,10 +2095,6 @@ pub const Runtime = struct {
             return;
         }
         try self.refreshSourceInventoryWithProbe(alloc, self, probeCredentialSource);
-    }
-
-    pub fn refreshSourceInventoryForLogout(self: *Self, alloc: Allocator) !void {
-        try self.refreshSourceInventoryWithProbe(alloc, self, probeCredentialSourceForLogout);
     }
 
     pub fn beginSourceInventoryRefresh(
@@ -2138,8 +2176,19 @@ pub const Runtime = struct {
         self.source_inventory = inventory.available;
         self.unavailable_sources = inventory.unavailable;
         self.fx_login_session_available = inventory.available.contains(.fx_login);
+        if (!inventory.available.contains(.stored_key) and !inventory.unavailable.contains(.stored_key)) {
+            self.stored_key_status = .not_found;
+        }
+        if (!inventory.available.contains(.fx_login) and !inventory.unavailable.contains(.fx_login)) {
+            self.fx_login_status = .absent;
+        }
         if (self.credentialSource()) |source| {
             if (source != .host_managed and !inventory.unavailable.contains(source)) self.source_inventory.insert(source);
+        } else if (self.credential_failure) |failure| {
+            if (!inventory.available.contains(failure.source) and !inventory.unavailable.contains(failure.source)) {
+                debug_trace.logf("auth", "credential load failure cleared source={t} reason=source_absent", .{failure.source});
+                self.credential_failure = null;
+            }
         }
     }
 
@@ -2932,7 +2981,7 @@ pub const Runtime = struct {
         return self.reconcileAfterFxLoginLogoutWithDeps(
             alloc,
             self,
-            probeCredentialSourceForLogout,
+            probeCredentialSource,
             loadRuntimeCredentialSource,
         );
     }
@@ -3049,7 +3098,7 @@ test "host-managed runtime exposes authority without local credential state" {
     try std.testing.expectEqual(credentials.Source.host_managed, runtime.gatewayCredential().?.source);
     try std.testing.expect(runtime.gatewayCredential().?.api_key == null);
     try std.testing.expectEqual(credentials.CatalogAccess.host_managed, runtime.modelCatalogAccess());
-    const status = runtime.statusSnapshot();
+    const status = runtime.statusSnapshot(.gateway, null);
     try std.testing.expectEqual(credentials.Source.host_managed, status.active_source.?);
     try std.testing.expect(status.gateway_connected);
     try std.testing.expect(status.chatgpt_connected);
@@ -3062,30 +3111,10 @@ test "host-managed runtime exposes authority without local credential state" {
 fn probeCredentialSource(raw_context: ?*anyopaque, _: Allocator, source: credentials.Source) !bool {
     const self: *Runtime = @ptrCast(@alignCast(raw_context.?));
     if (self.auth_mode == .host_managed) return false;
-    return sourcePresenceAvailable(credentials.sourcePresence(self.secret_store, source), .fail);
-}
-
-fn probeCredentialSourceForLogout(raw_context: ?*anyopaque, _: Allocator, source: credentials.Source) !bool {
-    const self: *Runtime = @ptrCast(@alignCast(raw_context.?));
-    if (self.auth_mode == .host_managed) return false;
-    const presence = credentials.sourcePresence(self.secret_store, source);
-    if (presence == .unavailable) {
-        debug_trace.logf("auth", "logout inventory omitted unavailable source={s}", .{@tagName(source)});
-    }
-    return sourcePresenceAvailable(presence, .omit);
-}
-
-fn sourcePresenceAvailable(
-    presence: host.SecretStorePresence,
-    unavailable_policy: UnavailableSourcePolicy,
-) error{CredentialStorageUnavailable}!bool {
-    return switch (presence) {
+    return switch (credentials.sourcePresence(self.secret_store, source)) {
         .present => true,
         .missing => false,
-        .unavailable => switch (unavailable_policy) {
-            .fail => error.CredentialStorageUnavailable,
-            .omit => false,
-        },
+        .unavailable => error.CredentialStorageUnavailable,
     };
 }
 
@@ -3560,12 +3589,12 @@ test "auth runtime withholds an fx credential across its expiry boundary" {
     try std.testing.expect(runtime.gatewayCredentialAt(40_000) == null);
     try std.testing.expectEqual(credentials.Source.fx_login, runtime.credentialSource().?);
     try std.testing.expectEqualStrings("team_123", runtime.view().selected_team.?);
-    try std.testing.expectEqual(credentials.Source.fx_login, runtime.statusSnapshotAt(40_000).active_source.?);
+    try std.testing.expectEqual(credentials.Source.fx_login, runtime.statusSnapshotAt(40_000, .gateway, null).active_source.?);
 
     // The source is still reported; only its freshness changes across the boundary.
-    try std.testing.expect(!runtime.statusSnapshotAt(39_999).expired);
-    try std.testing.expect(runtime.statusSnapshotAt(40_000).expired);
-    try std.testing.expect(runtime.statusSnapshotAt(40_000).refreshable());
+    try std.testing.expect(!runtime.statusSnapshotAt(39_999, .gateway, null).expired);
+    try std.testing.expect(runtime.statusSnapshotAt(40_000, .gateway, null).expired);
+    try std.testing.expect(runtime.statusSnapshotAt(40_000, .gateway, null).refreshable());
 
     var refreshed = try makeTestCredential(alloc, "stale-token", .fx_login, "team_123", "vercel-labs");
     defer refreshed.deinit(alloc);
@@ -3580,7 +3609,7 @@ test "auth runtime view preserves missing and loaded states" {
     var runtime: Runtime = .{};
     defer runtime.deinit(alloc);
 
-    runtime.recordStartupStatus(.unavailable, .unavailable, true);
+    runtime.recordStartupStatus(.unavailable, .unavailable, null, true);
     const missing = runtime.view();
     try std.testing.expect(missing.active_source == null);
     try std.testing.expect(missing.selected_team == null);
@@ -3603,6 +3632,188 @@ test "auth runtime view preserves missing and loaded states" {
     try std.testing.expect(!loaded.available_inactive_sources.contains(.fx_login));
 }
 
+test "provider status snapshot retains required sources without selecting a credential" {
+    var runtime: Runtime = .{};
+    defer runtime.deinit(std.testing.allocator);
+    runtime.provider_picker_active = .grok;
+    runtime.source_inventory.insert(.grok_subscription);
+    const cases = [_]struct {
+        provider: model_provider.ProviderId,
+        preferred: ?credentials.Source = null,
+        required: ?credentials.Source,
+    }{
+        .{ .provider = .codex, .required = .chatgpt_subscription },
+        .{ .provider = .grok, .required = .grok_subscription },
+        .{ .provider = .gateway, .required = null },
+        .{ .provider = .gateway, .preferred = .fx_login, .required = .fx_login },
+        .{ .provider = .gateway, .preferred = .ai_gateway_api_key, .required = .ai_gateway_api_key },
+        .{ .provider = .gateway, .preferred = .vercel_oidc_token, .required = .vercel_oidc_token },
+        .{ .provider = .gateway, .preferred = .stored_key, .required = .stored_key },
+        .{ .provider = .gateway, .preferred = .chatgpt_subscription, .required = null },
+        .{ .provider = .gateway, .preferred = .grok_subscription, .required = null },
+        .{ .provider = .codex, .preferred = .fx_login, .required = .chatgpt_subscription },
+        .{ .provider = .grok, .preferred = .fx_login, .required = .grok_subscription },
+    };
+    for (cases) |case| {
+        const snapshot = runtime.statusSnapshotAt(100, case.provider, case.preferred);
+        try std.testing.expectEqual(case.required, snapshot.required_source);
+        try std.testing.expect(snapshot.active_source == null);
+        try std.testing.expect(snapshot.grok_connected);
+        try std.testing.expect(!snapshot.refreshable());
+    }
+    try std.testing.expect(runtime.selected_credential == null);
+}
+
+test "provider status snapshot preserves loaded and host-managed authority" {
+    const alloc = std.testing.allocator;
+    var runtime: Runtime = .{};
+    defer runtime.deinit(alloc);
+    var credential = try makeTestCredential(alloc, "token", .fx_login, "team_123", "team");
+    defer credential.deinit(alloc);
+    credential.refresh_after_ms = 100;
+    _ = runtime.adoptCredential(alloc, &credential);
+    const loaded = runtime.statusSnapshotAt(100, .gateway, .ai_gateway_api_key);
+    try std.testing.expectEqual(credentials.Source.fx_login, loaded.active_source.?);
+    try std.testing.expectEqualStrings("team", loaded.team.?);
+    try std.testing.expect(loaded.expired);
+    try std.testing.expect(loaded.required_source == null);
+    try std.testing.expect(loaded.missingHelp(.interactive) == null);
+
+    runtime.auth_mode = .host_managed;
+    const hosted = runtime.statusSnapshotAt(100, .codex, .fx_login);
+    try std.testing.expectEqual(credentials.Source.host_managed, hosted.active_source.?);
+    try std.testing.expect(hosted.required_source == null);
+    try std.testing.expect(hosted.missingHelp(.interactive) == null);
+}
+
+test "startup credential failures reach only the matching provider status" {
+    for ([_]credentials.Source{ .stored_key, .fx_login, .chatgpt_subscription, .grok_subscription }) |source| {
+        const help = if (source == .stored_key)
+            credentials.unreadable_store_message
+        else
+            preparationFailureNotice(error.CredentialStorageUnavailable).?;
+        var runtime: Runtime = .{};
+        defer runtime.deinit(std.testing.allocator);
+        runtime.recordStartupStatus(
+            if (source == .stored_key) .unavailable else .not_attempted,
+            if (source == .fx_login) .unavailable else .not_attempted,
+            .{ .source = source, .err = error.CredentialStorageUnavailable },
+            true,
+        );
+
+        try std.testing.expect(runtime.credentialSource() == null);
+        try std.testing.expect(runtime.credentialFailure() == null);
+        try std.testing.expectEqual(credentials.CatalogPublicOnlyReason.no_credential, runtime.modelCatalogAccess().publicOnlyReason().?);
+        for ([_]model_provider.ProviderId{ .gateway, .codex, .grok }) |provider| {
+            const snapshot = runtime.statusSnapshotAt(100, provider, null);
+            if (model_provider.authorizesCredential(provider, source)) {
+                try std.testing.expectEqual(classifyCredentialFailure(source, error.CredentialStorageUnavailable), snapshot.failure.?);
+                try std.testing.expectEqualStrings(help, snapshot.missingHelp(.interactive).?);
+            } else {
+                try std.testing.expect(snapshot.failure == null);
+                try std.testing.expect(!std.mem.eql(u8, help, snapshot.missingHelp(.interactive).?));
+            }
+        }
+    }
+}
+
+test "startup credential failures clear after source removal or credential adoption" {
+    const alloc = std.testing.allocator;
+    for ([_]credentials.Source{ .stored_key, .fx_login, .chatgpt_subscription, .grok_subscription }) |source| {
+        var runtime: Runtime = .{};
+        defer runtime.deinit(alloc);
+        runtime.recordStartupStatus(
+            if (source == .stored_key) .unavailable else .not_attempted,
+            if (source == .fx_login) .unavailable else .not_attempted,
+            .{ .source = source, .err = error.CredentialStorageUnavailable },
+            true,
+        );
+        runtime.applySourceInventory(.{ .available = SourceSet.initOne(source) });
+        try std.testing.expect(runtime.credential_failure != null);
+        runtime.applySourceInventory(.{ .unavailable = SourceSet.initOne(source) });
+        try std.testing.expect(runtime.credential_failure != null);
+        runtime.applySourceInventory(.{});
+        try std.testing.expect(runtime.credential_failure == null);
+        try std.testing.expect(runtime.stored_key_status != .unavailable);
+        try std.testing.expect(runtime.fx_login_status != .unavailable);
+
+        runtime.recordStartupStatus(.not_attempted, .not_attempted, .{
+            .source = source,
+            .err = error.CredentialStorageUnavailable,
+        }, true);
+        var credential = try makeTestCredential(alloc, "replacement-token", .ai_gateway_api_key, null, null);
+        defer credential.deinit(alloc);
+        _ = runtime.adoptCredential(alloc, &credential);
+        try std.testing.expect(runtime.credential_failure == null);
+        try std.testing.expect(runtime.statusSnapshotAt(100, .gateway, null).missingHelp(.interactive) == null);
+    }
+}
+
+test "startup status and inventory preserve selected and host-managed failure semantics" {
+    const alloc = std.testing.allocator;
+    var runtime: Runtime = .{};
+    defer runtime.deinit(alloc);
+    var credential = try makeTestCredential(alloc, "selected-token", .fx_login, "team_1", null);
+    defer credential.deinit(alloc);
+    _ = runtime.adoptCredential(alloc, &credential);
+    const failure = classifyCredentialFailure(.fx_login, error.OAuthRequestFailed);
+    _ = runtime.recordCredentialFailure(failure);
+    runtime.recordStartupStatus(.not_attempted, .not_attempted, .{
+        .source = .grok_subscription,
+        .err = error.InvalidGrokAuthSession,
+    }, true);
+    runtime.applySourceInventory(.{});
+    try std.testing.expectEqual(failure, runtime.credentialFailure().?);
+    try std.testing.expectEqual(credentials.CatalogPublicOnlyReason.credential_refresh_failed, runtime.modelCatalogAccess().publicOnlyReason().?);
+
+    var hosted: Runtime = .{ .auth_mode = .host_managed };
+    defer hosted.deinit(alloc);
+    hosted.recordStartupStatus(.unavailable, .unavailable, .{
+        .source = .chatgpt_subscription,
+        .err = error.InvalidChatGptAuthSession,
+    }, true);
+    try std.testing.expect(hosted.credential_failure == null);
+    try std.testing.expectEqual(credentials.CatalogAccess.host_managed, hosted.modelCatalogAccess());
+    try std.testing.expect(hosted.statusSnapshotAt(100, .codex, null).missingHelp(.interactive) == null);
+}
+
+test "credential inventory retains startup failure while storage is unavailable" {
+    const alloc = std.testing.allocator;
+    var fixture: ApiKeySaveFixture = .{};
+    var runtime: Runtime = .{ .secret_store = fixture.secretStore() };
+    defer runtime.deinit(alloc);
+    runtime.recordStartupStatus(.unavailable, .not_attempted, .{
+        .source = .stored_key,
+        .err = error.StoredKeyUnreadable,
+    }, true);
+
+    try runtime.refreshSourceInventory(alloc);
+
+    try std.testing.expect(runtime.credential_failure != null);
+    try std.testing.expect(runtime.unavailable_sources.contains(.stored_key));
+    try std.testing.expect(!runtime.source_inventory.contains(.stored_key));
+    try std.testing.expectEqual(credentials.StoredKeyReadStatus.unavailable, runtime.stored_key_status);
+    try std.testing.expectEqual(@as(usize, 0), fixture.load_calls);
+}
+
+test "confirmed source removal clears stale store status after adoption and logout" {
+    const alloc = std.testing.allocator;
+    var runtime: Runtime = .{};
+    defer runtime.deinit(alloc);
+    runtime.recordStartupStatus(.unavailable, .not_attempted, .{
+        .source = .stored_key,
+        .err = error.StoredKeyUnreadable,
+    }, true);
+    var login = try makeTestCredential(alloc, "login-token", .fx_login, "team_1", null);
+    defer login.deinit(alloc);
+    _ = runtime.adoptCredential(alloc, &login);
+    runtime.applySourceInventory(.{ .available = SourceSet.initOne(.fx_login) });
+    var fixture: LogoutFixture = .{ .existing = .empty };
+    _ = try runtime.reconcileAfterFxLoginLogoutWithDeps(alloc, &fixture, LogoutFixture.probe, LogoutFixture.load);
+
+    try std.testing.expectEqualStrings(credentials.missing_interactive_credential_message, runtime.statusSnapshotAt(100, .gateway, null).missingHelp(.interactive).?);
+}
+
 test "auth status snapshot labels every credential source without exposing tokens" {
     const alloc = std.testing.allocator;
     const sources = [_]credentials.Source{
@@ -3619,7 +3830,7 @@ test "auth status snapshot labels every credential source without exposing token
         defer credential.deinit(alloc);
         _ = runtime.adoptCredential(alloc, &credential);
 
-        const snapshot = runtime.statusSnapshot();
+        const snapshot = runtime.statusSnapshot(.gateway, null);
         try std.testing.expectEqualStrings(credentials.sourceLabel(source), snapshot.activeSourceLabel());
         try std.testing.expectEqual(credentials.sourceRefreshable(source), snapshot.refreshable());
         const detail = try snapshot.formatDoctorDetail(alloc);
@@ -3634,7 +3845,7 @@ test "auth status snapshot preserves display team and surface-specific missing h
     var runtime: Runtime = .{};
     defer runtime.deinit(alloc);
 
-    const missing = runtime.statusSnapshot();
+    const missing = runtime.statusSnapshot(.gateway, null);
     try std.testing.expectEqualStrings(credentials.missing_credential_message, missing.missingHelp(.cli).?);
     try std.testing.expectEqualStrings(credentials.missing_interactive_credential_message, missing.missingHelp(.interactive).?);
 
@@ -3642,7 +3853,7 @@ test "auth status snapshot preserves display team and surface-specific missing h
     defer credential.deinit(alloc);
     _ = runtime.adoptCredential(alloc, &credential);
 
-    const selected = runtime.statusSnapshot();
+    const selected = runtime.statusSnapshot(.gateway, null);
     try std.testing.expectEqualStrings("vercel-labs", selected.team.?);
     try std.testing.expect(selected.missingHelp(.cli) == null);
 }
@@ -3668,14 +3879,61 @@ test "auth status snapshot distinguishes an absent store from an unreadable one"
     try std.testing.expect(resolved.missingHelp(.cli) == null);
 }
 
-test "auth status keeps an unavailable explicit fx login distinct from automatic absence" {
-    const status = StatusSnapshot{
-        .required_source = .fx_login,
-        .fx_login_status = .unavailable,
+test "auth status names each explicit key source and its recovery" {
+    const cases = [_]struct {
+        source: credentials.Source,
+        label: []const u8,
+        cli_recovery: []const u8,
+        interactive_recovery: []const u8,
+    }{
+        .{ .source = .vercel_oidc_token, .label = "VERCEL_OIDC_TOKEN", .cli_recovery = "Set VERCEL_OIDC_TOKEN before starting fx", .interactive_recovery = "Set VERCEL_OIDC_TOKEN before starting fx" },
+        .{ .source = .ai_gateway_api_key, .label = "AI_GATEWAY_API_KEY", .cli_recovery = "Set AI_GATEWAY_API_KEY before starting fx", .interactive_recovery = "Set AI_GATEWAY_API_KEY before starting fx" },
+        .{ .source = .stored_key, .label = "stored API key", .cli_recovery = "Start fx and open /provider", .interactive_recovery = "Run /provider" },
     };
-    const help = status.missingHelp(.cli).?;
-    try std.testing.expect(std.mem.find(u8, help, "Run fx login") != null);
-    try std.testing.expect(std.mem.find(u8, help, "no other credential was selected") != null);
+    for (cases) |case| {
+        const status = StatusSnapshot{ .required_source = case.source };
+        for ([_]MissingHelpSurface{ .cli, .interactive }) |surface| {
+            const help = status.missingHelp(surface).?;
+            try std.testing.expect(std.mem.find(u8, help, case.label) != null);
+            try std.testing.expect(std.mem.find(u8, help, if (surface == .cli) case.cli_recovery else case.interactive_recovery) != null);
+            try std.testing.expect(std.mem.find(u8, help, "no other credential was selected") != null);
+            if (case.source != .ai_gateway_api_key) try std.testing.expect(std.mem.find(u8, help, "AI_GATEWAY_API_KEY") == null);
+        }
+    }
+}
+
+test "auth status preserves selected stored-key read failure without suggesting an excluded key" {
+    var status = StatusSnapshot{
+        .required_source = .stored_key,
+        .stored_key_status = .unavailable,
+        .failure = classifyCredentialFailure(.stored_key, error.CredentialStorageUnavailable),
+    };
+    for ([_]MissingHelpSurface{ .cli, .interactive }) |surface| {
+        const help = status.missingHelp(surface).?;
+        try std.testing.expect(std.mem.find(u8, help, "could not be read") != null);
+        try std.testing.expect(std.mem.find(u8, help, credentials.stored_key_backend_label) != null);
+        try std.testing.expect(std.mem.find(u8, help, "/provider") != null);
+        try std.testing.expect(std.mem.find(u8, help, "AI_GATEWAY_API_KEY") == null);
+    }
+    status.required_source = null;
+    try std.testing.expectEqualStrings(credentials.unreadable_store_message, status.missingHelp(.cli).?);
+    status.active_source = .ai_gateway_api_key;
+    try std.testing.expect(status.missingHelp(.cli) == null);
+}
+
+test "auth status keeps an unavailable explicit fx login distinct from automatic absence" {
+    for ([_]credentials.FxLoginReadStatus{ .absent, .unavailable }) |read_status| {
+        const status = StatusSnapshot{
+            .required_source = .fx_login,
+            .fx_login_status = read_status,
+        };
+        const help = status.missingHelp(.cli).?;
+        try std.testing.expect(std.mem.find(u8, help, "Run fx login") != null);
+        try std.testing.expect(std.mem.find(u8, help, "no other credential was selected") != null);
+        const interactive = status.missingHelp(.interactive).?;
+        try std.testing.expect(std.mem.find(u8, interactive, "Run /login") != null);
+        try std.testing.expect(std.mem.find(u8, interactive, "no other credential was selected") != null);
+    }
 }
 
 test "auth status snapshot reports an expired session without claiming it is unrefreshable" {
@@ -3729,16 +3987,6 @@ test "auth runtime detects only credential sources that exist" {
     try std.testing.expect(inventory.contains(.fx_login));
     try std.testing.expect(!inventory.contains(.vercel_oidc_token));
     try std.testing.expect(!inventory.contains(.stored_key));
-}
-
-test "credential inventory treats unavailable sources according to command policy" {
-    try std.testing.expect(try sourcePresenceAvailable(.present, .fail));
-    try std.testing.expect(!try sourcePresenceAvailable(.missing, .fail));
-    try std.testing.expectError(
-        error.CredentialStorageUnavailable,
-        sourcePresenceAvailable(.unavailable, .fail),
-    );
-    try std.testing.expect(!try sourcePresenceAvailable(.unavailable, .omit));
 }
 
 test "auth inventory skips unavailable sources and keeps later sources" {

@@ -246,7 +246,7 @@ fn permissionModeStatusLabel(mode: types.PermissionMode, out: []u8) []const u8 {
     return switch (mode) {
         .ask => "ask",
         .auto => std.fmt.bufPrint(out, "{s}auto{s}", .{ permission_auto_style, statusline_style }) catch "auto",
-        .yolo => std.fmt.bufPrint(out, "{s}YOLO{s}", .{ permission_auto_style, statusline_style }) catch "YOLO",
+        .yolo => std.fmt.bufPrint(out, "{s}full access{s}", .{ permission_auto_style, statusline_style }) catch "full access",
     };
 }
 
@@ -1107,13 +1107,13 @@ test "buildHintLine colors auto mode with theme accent" {
     try std.testing.expectEqualStrings(light_expected, light_line);
 }
 
-test "buildHintLine renders yolo uppercase with subdued permission styling" {
+test "buildHintLine renders full access with subdued permission styling" {
     initTheme(false, null);
     var buf: [128]u8 = undefined;
     const line = buildHintLine(false, true, "openai/gpt-4o", .yolo, false, .auto, false, .{}, 80, &buf);
     const expected = try std.fmt.allocPrint(
         std.testing.allocator,
-        "{s}YOLO{s} · gpt-4o",
+        "{s}full access{s} · gpt-4o",
         .{ permission_auto_style, statusline_style },
     );
     defer std.testing.allocator.free(expected);

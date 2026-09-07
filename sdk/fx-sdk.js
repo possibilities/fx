@@ -1,5 +1,6 @@
 import { consumeNativeHostAuthorization } from "./internal.js";
 import { CoreOutput, maxCoreMessageBytes } from "./core-output.js";
+import { loadModule } from "./wasm-module.js";
 
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
@@ -294,43 +295,6 @@ class ByteQueue {
   wake() {
     this.waiters.splice(0).forEach((resolve) => resolve());
   }
-}
-
-const modulePromisesBySource = new Map();
-const modulePromisesByObject = new WeakMap();
-
-async function compileModule(input) {
-  if (input instanceof WebAssembly.Module) return input;
-  if (typeof input === "string") input = fetch(input);
-  if (input instanceof Promise) input = await input;
-  if (input instanceof WebAssembly.Module) return input;
-  if (input instanceof Response) {
-    const contentType = input.headers.get("content-type")?.split(";", 1)[0].trim().toLowerCase();
-    if (contentType === "application/wasm" && typeof WebAssembly.compileStreaming === "function") {
-      return WebAssembly.compileStreaming(input);
-    }
-    const bytes = await input.arrayBuffer();
-    return WebAssembly.compile(bytes);
-  }
-  if (input instanceof ArrayBuffer || ArrayBuffer.isView(input)) {
-    return WebAssembly.compile(input);
-  }
-  throw new TypeError("wasm must be a URL, Response, ArrayBuffer, typed array, or WebAssembly.Module");
-}
-
-function loadModule(input) {
-  if (input instanceof WebAssembly.Module) return Promise.resolve(input);
-  const isString = typeof input === "string";
-  if (!isString && (typeof input !== "object" || input === null)) return compileModule(input);
-  const cache = isString ? modulePromisesBySource : modulePromisesByObject;
-  const cached = cache.get(input);
-  if (cached) return cached;
-  const pending = compileModule(input);
-  cache.set(input, pending);
-  pending.catch(() => {
-    if (cache.get(input) === pending) cache.delete(input);
-  });
-  return pending;
 }
 
 function raceWithTimeout(promise, timeoutMs, timeoutValue) {
@@ -1039,7 +1003,10 @@ async function instantiate(options) {
       runtime.setInstance(null);
       if (options.args?.[0] === "acp" && !String(error).includes("proc_exit")) runtime.abort(error);
       else {
-        if (!String(error).includes("proc_exit")) console.error(error);
+        if (!String(error).includes("proc_exit")) {
+          runtime.abortHostEffects();
+          console.error(error);
+        }
         runtime.markExited(runtime.aborted ? 130 : 1);
       }
     },
@@ -1083,13 +1050,13 @@ export async function createFxTerminal(options) {
     if (interruptKey && data.includes(interruptKey)) runtime.abortHostEffects();
     runtime.write(data);
   };
-  const unsubscribeData = options.terminal.onData(forwardData);
-  const unsubscribeKeyData = options.terminal.onKeyData?.(forwardData) ?? (() => {});
   const signalResize = () => {
     emit("terminal.resize", { cols: options.terminal.cols, rows: options.terminal.rows });
     runtime.wake();
   };
-  const unsubscribeResize = options.terminal.onResize(signalResize);
+  let unsubscribeData;
+  let unsubscribeKeyData;
+  let unsubscribeResize;
   let subscriptionsReleased = false;
   const releaseSubscriptions = () => {
     if (subscriptionsReleased) return;
@@ -1102,6 +1069,17 @@ export async function createFxTerminal(options) {
     releaseSubscriptions();
     emit("runtime.exit", { surface: "terminal", code });
   });
+  try {
+    unsubscribeData = options.terminal.onData(forwardData);
+    unsubscribeKeyData = options.terminal.onKeyData?.(forwardData);
+    unsubscribeResize = options.terminal.onResize(signalResize);
+  } catch (error) {
+    // The rejected factory never transfers this promise to a caller.
+    interactive.catch(() => {});
+    releaseSubscriptions();
+    runtime.abort();
+    throw error;
+  }
   return {
     interactive,
     exited: runtime.exited,
