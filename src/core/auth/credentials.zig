@@ -419,6 +419,16 @@ pub fn resolveForProviderFromHome(
     preferred: ?Source,
     home: []const u8,
 ) !Resolution {
+    if (provider == .configured) {
+        var registry = try @import("../config/config_runtime.zig").loadConfiguredProvidersFromHome(alloc, home);
+        defer registry.deinit(alloc);
+        const bound = try provider.bind(registry);
+        const definition = registry.get(bound.label()).?;
+        return switch (definition.auth) {
+            .none => .{ .credential = .{ .token = try alloc.dupe(u8, ""), .source = .configured } },
+            .bearer => |env| .{ .credential = try loadEnvCredential(alloc, env, .configured) },
+        };
+    }
     if (provider != .gateway) {
         const source = provider_catalog.find(provider).login_source;
         const credential = loadPreferredSourceFromHome(alloc, transport, mode, source, home) catch |err| {

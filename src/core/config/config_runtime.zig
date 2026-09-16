@@ -274,6 +274,16 @@ fn resolve_provider_selection(settings: *Settings) !void {
 pub fn loadConfiguredProviders(alloc: Allocator) !configured_provider.Registry {
     var paths = try discoverPaths(alloc, ".");
     defer paths.deinit(alloc);
+    return loadConfiguredProvidersFromPaths(alloc, paths);
+}
+
+pub fn loadConfiguredProvidersFromHome(alloc: Allocator, home: []const u8) !configured_provider.Registry {
+    var paths = try discoverPathsFromHome(alloc, home, ".");
+    defer paths.deinit(alloc);
+    return loadConfiguredProvidersFromPaths(alloc, paths);
+}
+
+fn loadConfiguredProvidersFromPaths(alloc: Allocator, paths: Paths) !configured_provider.Registry {
     const bytes = (try readOptionalUserSettingsFile(alloc, paths)) orelse return .{};
     defer alloc.free(bytes);
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, bytes, .{ .duplicate_field_behavior = .@"error" });

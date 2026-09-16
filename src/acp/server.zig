@@ -525,7 +525,7 @@ pub fn refreshModelCredential(
     expected_account_id: ?[]const u8,
 ) !?[]u8 {
     const state: *ServerState = @ptrCast(@alignCast(raw));
-    if (mode == .if_needed and auth_runtime.requestPathCredentialVerifiedRecently(source)) {
+    if (state.cfg.home_override == null and mode == .if_needed and auth_runtime.requestPathCredentialVerifiedRecently(source)) {
         debug_trace.logf("auth", "credential refresh skipped source={t} reason=verified_recently", .{source});
         return null;
     }
