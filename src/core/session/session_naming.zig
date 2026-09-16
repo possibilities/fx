@@ -788,6 +788,9 @@ test "session naming resolves the Codex default and skips other providers" {
     try std.testing.expectEqualStrings(default_codex_model, config.codex.model.?);
     try std.testing.expect(config.gateway.model == null);
     try std.testing.expect(config.grok.model == null);
+    const custom = model_provider.parse("custom").?;
+    try std.testing.expect(config.provider(custom) == null);
+    try std.testing.expect(settings.setting(custom) == null);
     try std.testing.expect(config.codex.effort.eql(default_effort));
     try std.testing.expectEqual(default_timeout_ms, config.timeout_ms);
 }
