@@ -936,7 +936,7 @@ fn runPrompt(
         writable.childCapability() catch null
     else
         null;
-    maybeStartAcpTitleTask(state, session, owned_prompt, recovery_checkpoint != null);
+    // Automatic naming is interactive-only in this fork.
     defer if (session.title_task != null) completeAcpTitleTask(state, session, alloc);
     agent_runtime.processAgentPrompt(&session.session_rt.agent, &deps, null, .{
         .view = state.lifecycle_view,

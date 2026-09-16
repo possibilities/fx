@@ -1834,7 +1834,7 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
     try ctx.checkCancellation();
     const title_task = maybeStartAskTitleTask(
         &ctx,
-        startup.session_title_generation,
+        false, // Automatic naming is interactive-only in this fork.
         owned_prompt,
         recovery_checkpoint == null and options.save_session and ctx.requested_resume == null,
     );
