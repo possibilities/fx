@@ -179,6 +179,43 @@ pub const FailureSnapshot = struct {
     }
 };
 
+/// Process-local proof that a request-path credential load succeeded recently.
+/// The request path's defensive `.if_needed` reload reads the OS secret store
+/// (tens of milliseconds on macOS); when admission or an earlier step just
+/// proved the credential, repeating that read only adds latency. A stale skip
+/// costs one unauthorized response, which the existing force-refresh replay
+/// already recovers from.
+const request_path_verified_window_ms: u32 = 30_000;
+const source_none: u8 = std.math.maxInt(u8);
+// u32 keeps the stamp atomic-loadable on 32-bit wasm; wrapping subtraction
+// keeps window comparisons correct across the ~49 day wrap.
+var request_path_verified_ms = std.atomic.Value(u32).init(0);
+var request_path_verified_source = std.atomic.Value(u8).init(source_none);
+
+fn stampNowMs() u32 {
+    return @truncate(@as(u64, @bitCast(io_mod.milliTimestamp())));
+}
+
+fn noteRequestPathCredentialVerified(source: credentials.Source) void {
+    request_path_verified_source.store(@intFromEnum(source), .seq_cst);
+    request_path_verified_ms.store(stampNowMs(), .seq_cst);
+}
+
+/// True when one refreshable source's credential was loaded successfully within
+/// the skip window. Request-path callers use this to bypass a redundant
+/// defensive reload; admission and forced refreshes must not consult it.
+pub fn requestPathCredentialVerifiedRecently(source: credentials.Source) bool {
+    const verified_ms = request_path_verified_ms.load(.seq_cst);
+    if (verified_ms == 0) return false;
+    if (request_path_verified_source.load(.seq_cst) != @intFromEnum(source)) return false;
+    return stampNowMs() -% verified_ms < request_path_verified_window_ms;
+}
+
+fn resetRequestPathCredentialVerification() void {
+    request_path_verified_ms.store(0, .seq_cst);
+    request_path_verified_source.store(source_none, .seq_cst);
+}
+
 /// Returns one complete owned credential after a provider-specific refresh.
 /// The caller owns every field and must call `Credential.deinit`.
 pub fn refreshCredentialForAccount(
@@ -209,6 +246,7 @@ pub fn refreshCredentialForAccount(
             return error.ChatGptAccountChanged;
         }
     }
+    noteRequestPathCredentialVerified(source);
     return credential;
 }
 
@@ -400,7 +438,7 @@ fn prepareResolvedCredential(
     };
     resolution.credential = null;
 
-    const blocked = credential.token.len == 0 or
+    const blocked = (credential.token.len == 0 and !(provider == .configured and credential.source == .configured)) or
         !model_provider.authorizesCredential(provider, credential.source) or
         credential.needsRefreshAt(now_ms) or
         (credential.source == .fx_login and
@@ -413,6 +451,9 @@ fn prepareResolvedCredential(
     if (blocked) {
         credential.deinit(alloc);
         return null;
+    }
+    if (credentials.sourceRefreshable(credential.source)) {
+        noteRequestPathCredentialVerified(credential.source);
     }
     return credential;
 }
@@ -1299,7 +1340,6 @@ const InventoryRefreshTask = struct {
 const ApiKeyExitReason = enum {
     cancel,
     saved,
-    save_failed,
     screen_replacement,
     runtime_deinit,
 };
@@ -1320,7 +1360,7 @@ pub const Choice = union(enum) {
     pub fn eql(self: Choice, other: Choice) bool {
         return switch (self) {
             .provider => |provider| switch (other) {
-                .provider => |other_provider| provider == other_provider,
+                .provider => |other_provider| provider.eql(other_provider),
                 .source, .action, .team => false,
             },
             .source => |source| switch (other) {
@@ -1462,7 +1502,7 @@ pub const PickerView = struct {
 
     pub fn choiceDescription(self: PickerView, choice: Choice) []const u8 {
         return switch (choice) {
-            .provider => |provider| if (provider == self.active_provider) "current" else "available",
+            .provider => |provider| if (provider.eql(self.active_provider)) "current" else "available",
             .source => |source| if (self.active_source == source) "current" else "available",
             .action => |action| switch (action) {
                 .connections => "",
@@ -1611,6 +1651,7 @@ pub const StatusSnapshot = struct {
                 .interactive => credentials.missing_grok_interactive_credential_message,
             },
             .host_managed => automatic_help,
+            .configured => "The configured provider credential is unavailable. Check its auth environment variable in settings.json; no other provider was selected.",
         };
     }
 
@@ -1687,8 +1728,8 @@ pub fn loadStatusSnapshotForProvider(
         },
     };
     const resolved_source = if (resolution.credential) |credential| credential.source else null;
-    var gateway_connected = resolved_source != null and resolved_source != .chatgpt_subscription and resolved_source != .grok_subscription;
-    const gateway_probe_required = provider == .codex or provider == .grok or
+    var gateway_connected = resolved_source != null and resolved_source != .chatgpt_subscription and resolved_source != .grok_subscription and resolved_source != .configured;
+    const gateway_probe_required = (provider != null and (provider.? == .codex or provider.? == .grok)) or
         resolved_source == .chatgpt_subscription or resolved_source == .grok_subscription;
     if (gateway_probe_required) {
         for ([_]credentials.Source{ .vercel_oidc_token, .ai_gateway_api_key, .fx_login, .stored_key }) |source| {
@@ -1771,7 +1812,10 @@ pub const Runtime = struct {
     profile_home: ?[]const u8 = null,
     auth_mode: credentials.AuthMode = .local,
     selected_credential: ?credentials.Credential = null,
-    credential_failure: ?CredentialFailure = null,
+    credential_failure: ?struct {
+        failure: CredentialFailure,
+        notice_claimed: bool,
+    } = null,
     source_inventory: SourceSet = .empty,
     unavailable_sources: SourceSet = .empty,
     stored_key_status: credentials.StoredKeyReadStatus = .not_attempted,
@@ -1953,24 +1997,28 @@ pub const Runtime = struct {
         return credentials.catalogAccessAt(self.selected_credential, io_mod.milliTimestamp());
     }
 
-    /// Returns true only for the first observation of this failure episode.
-    pub fn recordCredentialFailure(self: *Self, failure: CredentialFailure) bool {
+    /// Records recovery state even when silent. Returns true only when claiming
+    /// the first requested notice of this failure episode.
+    pub fn recordCredentialFailure(
+        self: *Self,
+        failure: CredentialFailure,
+        options: struct { notify: bool = true },
+    ) bool {
         std.debug.assert(self.credentialSource() == failure.source);
-        if (self.credential_failure) |current| {
-            if (current.source == failure.source and
-                current.reason == failure.reason)
-            {
-                return false;
-            }
-        }
-        self.credential_failure = failure;
+        const same_failure = if (self.credential_failure) |current|
+            current.failure.source == failure.source and current.failure.reason == failure.reason
+        else
+            false;
+        if (!same_failure) self.credential_failure = .{ .failure = failure, .notice_claimed = false };
+        if (!options.notify or self.credential_failure.?.notice_claimed) return false;
+        self.credential_failure.?.notice_claimed = true;
         return true;
     }
 
     /// Recovery and catalog access concern only the selected credential.
     pub fn credentialFailure(self: *const Self) ?CredentialFailure {
-        const failure = self.credential_failure orelse return null;
-        return if (self.credentialSource() == failure.source) failure else null;
+        const episode = self.credential_failure orelse return null;
+        return if (self.credentialSource() == episode.failure.source) episode.failure else null;
     }
 
     pub fn credentialSource(self: *const Self) ?credentials.Source {
@@ -2018,8 +2066,8 @@ pub const Runtime = struct {
         const grok_connected = self.source_inventory.contains(.grok_subscription);
         const credential = self.selected_credential orelse return .{
             .required_source = requestedSource(provider, preferred),
-            .failure = if (self.credential_failure) |failure|
-                if (model_provider.authorizesCredential(provider, failure.source)) failure else null
+            .failure = if (self.credential_failure) |episode|
+                if (model_provider.authorizesCredential(provider, episode.failure.source)) episode.failure else null
             else
                 null,
             .stored_key_status = if (provider == .gateway) self.stored_key_status else .not_attempted,
@@ -2065,10 +2113,10 @@ pub const Runtime = struct {
         self.fx_login_status = fx_login_status;
         self.onboarding_skipped = onboarding_skipped;
         if (self.auth_mode == .local and self.selected_credential == null) {
-            self.credential_failure = if (load_failure) |failure|
-                classifyCredentialFailure(failure.source, failure.err)
-            else
-                null;
+            self.credential_failure = if (load_failure) |failure| .{
+                .failure = classifyCredentialFailure(failure.source, failure.err),
+                .notice_claimed = true,
+            } else null;
         }
     }
 
@@ -2203,7 +2251,8 @@ pub const Runtime = struct {
         }
         if (self.credentialSource()) |source| {
             if (source != .host_managed and !inventory.unavailable.contains(source)) self.source_inventory.insert(source);
-        } else if (self.credential_failure) |failure| {
+        } else if (self.credential_failure) |episode| {
+            const failure = episode.failure;
             if (!inventory.available.contains(failure.source) and !inventory.unavailable.contains(failure.source)) {
                 debug_trace.logf("auth", "credential load failure cleared source={t} reason=source_absent", .{failure.source});
                 self.credential_failure = null;
@@ -2896,7 +2945,7 @@ pub const Runtime = struct {
         preferred: ?credentials.Source,
     ) Allocator.Error!ProviderCredentialSelection {
         if (self.auth_mode == .host_managed or
-            model_provider.authorizesCredential(provider, self.credentialSource())) return .unchanged;
+            (provider != .configured and model_provider.authorizesCredential(provider, self.credentialSource()))) return .unchanged;
 
         // A selected profile is the only credential store this runtime may
         // consult; the ambient profile and keychain are never a fallback.
@@ -3271,12 +3320,6 @@ fn gatewaySourceAtIndex(sources: SourceSet, wanted_index: usize) ?credentials.So
     return null;
 }
 
-fn optionalBytesEqual(a: ?[]const u8, b: ?[]const u8) bool {
-    if (a == null and b == null) return true;
-    if (a == null or b == null) return false;
-    return std.mem.eql(u8, a.?, b.?);
-}
-
 fn credentialAuthorityFacts(credential: credentials.Credential) auth_transition.CredentialAuthorityFacts {
     return .{
         .provider = switch (credential.source) {
@@ -3541,7 +3584,7 @@ test "catalog access records a refresh failure until another credential is adopt
     _ = runtime.recordCredentialFailure(classifyCredentialFailure(
         .fx_login,
         error.OAuthRequestFailed,
-    ));
+    ), .{});
 
     const failed = runtime.modelCatalogAccess();
     try std.testing.expectEqual(credentials.CatalogPublicOnlyReason.credential_refresh_failed, failed.publicOnlyReason().?);
@@ -3563,17 +3606,29 @@ test "credential failure episodes deduplicate and clear on adoption" {
     _ = runtime.adoptCredential(alloc, &login);
 
     const failure = classifyCredentialFailure(.fx_login, error.InvalidGrant);
-    try std.testing.expect(runtime.recordCredentialFailure(failure));
-    try std.testing.expect(!runtime.recordCredentialFailure(failure));
+    try std.testing.expect(!runtime.recordCredentialFailure(failure, .{ .notify = false }));
+    try std.testing.expectEqual(failure, runtime.credentialFailure().?);
+    runtime.cancelPromptCredentialRefresh();
+    try std.testing.expect(runtime.recordCredentialFailure(failure, .{}));
+    try std.testing.expect(!runtime.recordCredentialFailure(failure, .{ .notify = false }));
+    try std.testing.expect(!runtime.recordCredentialFailure(failure, .{}));
     try std.testing.expectEqual(failure, runtime.credentialFailure().?);
     try std.testing.expectEqual(
         credentials.CatalogPublicOnlyReason.credential_refresh_failed,
         runtime.modelCatalogAccess().publicOnlyReason().?,
     );
 
+    const temporary = classifyCredentialFailure(.fx_login, error.OAuthRequestFailed);
+    try std.testing.expect(!runtime.recordCredentialFailure(temporary, .{ .notify = false }));
+    try std.testing.expectEqual(temporary, runtime.credentialFailure().?);
+    try std.testing.expect(runtime.recordCredentialFailure(temporary, .{}));
+    try std.testing.expect(!runtime.recordCredentialFailure(temporary, .{}));
+
     var refreshed = try makeTestCredential(alloc, "fresh-login-token", .fx_login, null, null);
     _ = runtime.adoptCredential(alloc, &refreshed);
     try std.testing.expect(runtime.credentialFailure() == null);
+    try std.testing.expect(runtime.recordCredentialFailure(temporary, .{}));
+    try std.testing.expect(!runtime.recordCredentialFailure(temporary, .{}));
 }
 
 test "auth runtime adopts credential ownership and prefers team id" {
@@ -3842,7 +3897,7 @@ test "startup status and inventory preserve selected and host-managed failure se
     defer credential.deinit(alloc);
     _ = runtime.adoptCredential(alloc, &credential);
     const failure = classifyCredentialFailure(.fx_login, error.OAuthRequestFailed);
-    _ = runtime.recordCredentialFailure(failure);
+    _ = runtime.recordCredentialFailure(failure, .{});
     runtime.recordStartupStatus(.not_attempted, .not_attempted, .{
         .source = .grok_subscription,
         .err = error.InvalidGrokAuthSession,
@@ -5264,4 +5319,18 @@ test "manual code visibility cannot toggle without provider capability" {
     try std.testing.expect(!runtime.toggleSignInCodeEntry());
     try std.testing.expect(!runtime.pickerView().sign_in_code_visible);
     try std.testing.expect(!runtime.signInCodeEntryActive());
+}
+
+test "request-path credential verification stamp gates only within the window" {
+    resetRequestPathCredentialVerification();
+    defer resetRequestPathCredentialVerification();
+
+    try std.testing.expect(!requestPathCredentialVerifiedRecently(.fx_login));
+
+    noteRequestPathCredentialVerified(.fx_login);
+    try std.testing.expect(requestPathCredentialVerifiedRecently(.fx_login));
+    try std.testing.expect(!requestPathCredentialVerifiedRecently(.chatgpt_subscription));
+
+    request_path_verified_ms.store(stampNowMs() -% request_path_verified_window_ms -% 1, .seq_cst);
+    try std.testing.expect(!requestPathCredentialVerifiedRecently(.fx_login));
 }
