@@ -589,7 +589,7 @@ fn refreshGatewayCredential(
     expected_account_id: ?[]const u8,
 ) !?[]u8 {
     const context: *Context = @ptrCast(@alignCast(raw));
-    if (mode == .if_needed and auth_runtime.requestPathCredentialVerifiedRecently(source)) {
+    if (context.config.tool_context.profile_home == null and mode == .if_needed and auth_runtime.requestPathCredentialVerifiedRecently(source)) {
         debug_trace.logf("auth", "credential refresh skipped source={t} reason=verified_recently", .{source});
         return null;
     }
