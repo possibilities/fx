@@ -54,8 +54,12 @@ pub fn describeToolTitle(registry: tool_dispatch.Registry, arena: Allocator, cal
 
 pub fn activeToolSet(state: *const server.ServerState) tool_set_contract.ToolSet {
     if (state.host_tools.tools.len > 0) return state.host_tools.toolSet();
+    return nativeToolSet(state.cfg.allow_native_tools);
+}
+
+pub fn nativeToolSet(allow_native_tools: bool) tool_set_contract.ToolSet {
     if (comptime host_target.is_wasm) return tool_set_contract.empty;
-    return if (state.cfg.allow_native_tools) builtin_tools.advertisement_set else tool_set_contract.empty;
+    return if (allow_native_tools) builtin_tools.advertisement_set else tool_set_contract.empty;
 }
 
 pub fn activeToolRegistry(state: *const server.ServerState) tool_dispatch.Registry {
