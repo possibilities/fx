@@ -39,7 +39,7 @@ function startTitleAwareGateway(title = GENERATED_TITLE) {
     }
     return fakeGatewayFinalText("MAIN_ANSWER_OK");
   }, {
-    models: [{ id: MAIN_MODEL, type: "language", tags: ["tool-use"] }],
+    models: [MAIN_MODEL, TITLE_MODEL].map(id => ({ id, type: "language", tags: ["tool-use"] })),
     titleResponses: [fakeGatewayFinalText(title)],
   });
   return { ...gateway, namingRequests };
