@@ -268,3 +268,47 @@ test.skipIf(SKIP_TMUX)("tui shows the generated session title", async () => {
     gateway.stop();
   }
 }, 60_000);
+
+test.skipIf(SKIP_TMUX)("manual rename wins over an in-flight naming request and later prompts", async () => {
+  const root = createFixtureRoot("manual-rename", JSON.stringify({
+    session_naming: { gateway: { model: TITLE_MODEL }, timeout_ms: 10_000 },
+  }));
+  const started = Promise.withResolvers<void>();
+  const release = Promise.withResolvers<void>();
+  let namingCalls = 0;
+  let mainCalls = 0;
+  const gateway = startDynamicFakeGateway(async raw => {
+    if (raw.includes("Generate a short session title")) {
+      namingCalls += 1;
+      started.resolve();
+      await release.promise;
+      return fakeGatewayFinalText("Obsolete Generated Title");
+    }
+    mainCalls += 1;
+    return fakeGatewayFinalText(mainCalls === 1 ? "FIRST_MAIN_ANSWER" : "SECOND_MAIN_ANSWER");
+  }, { models: [MAIN_MODEL, TITLE_MODEL].map(id => ({ id, type: "language", tags: ["tool-use"] })) });
+  let tui: TmuxSession | undefined;
+  try {
+    tui = await TmuxSession.create({
+      cmd: JSON.stringify(FX_BIN), cwd: root.workspace, isolated: true,
+      remainOnExit: true, env: baseEnv(root, gateway),
+    });
+    await tui.waitForStableComposer(15_000);
+    await tui.sendText("prepare a bounded naming request");
+    await tui.waitForText("FIRST_MAIN_ANSWER", 15_000);
+    await Promise.race([started.promise, Bun.sleep(10_000).then(() => { throw new Error("naming was not admitted"); })]);
+    await tui.sendText("/rename Manual Title");
+    for (let n = 0; n < 100 && !sessionTitles(root).includes("Manual Title"); n += 1) await Bun.sleep(25);
+    expect(sessionTitles(root)).toContain("Manual Title");
+    release.resolve();
+    await tui.sendText("continue the same session");
+    await tui.waitForText("SECOND_MAIN_ANSWER", 15_000);
+    expect(sessionTitles(root)).toContain("Manual Title");
+    expect(sessionTitles(root)).not.toContain("obsolete-generated-title");
+    expect(namingCalls).toBe(1);
+  } finally {
+    release.resolve();
+    await tui?.kill();
+    gateway.stop();
+  }
+}, 45_000);
