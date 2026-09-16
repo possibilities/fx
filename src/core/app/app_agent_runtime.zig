@@ -1,4 +1,3 @@
-const subagent_model_contract = @import("../subagent/model_contract.zig");
 const std = @import("std");
 const ade_events = @import("../../builtins/hooks/ade_events.zig");
 const ade_git_roots = @import("../../builtins/hooks/ade_git_roots.zig");
