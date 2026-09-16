@@ -131,6 +131,8 @@ pub const InitialContextInput = struct {
     targets: []const ApplicableTarget = &.{},
     omissions: []const ContextOmissionInput = &.{},
     omission_summary: ?ContextOmissionSummary = null,
+    /// Internal request reconstruction only; ordinary gathers retain their work limits.
+    bounded_reconstruction: bool = false,
     context_limits: context_limits.Values = .{},
 };
 
@@ -251,6 +253,9 @@ pub const TransientContextInput = struct {
     access_scope: ?workspace_access.AccessScope = null,
     interactive: bool,
     permission_mode: types.PermissionMode,
+    /// True when the resumed session history references shell execution handles
+    /// the current process does not own; the model must not reuse them.
+    stale_shell_handles: bool = false,
 };
 
 pub const Provider = struct {
@@ -439,13 +444,11 @@ pub const EntryPoint = enum {
 pub const DriftStatus = enum {
     intentional,
     temporary,
-    phase12_follow_up,
 
     fn label(self: DriftStatus) []const u8 {
         return switch (self) {
             .intentional => "intentional",
             .temporary => "temporary",
-            .phase12_follow_up => "phase12_follow_up",
         };
     }
 };
