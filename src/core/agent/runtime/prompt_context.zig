@@ -4,6 +4,7 @@ const token_estimate = @import("../../shared/token_estimate.zig");
 const types = @import("../../shared/types.zig");
 const session_runtime = @import("../../session/session.zig");
 const stream_provider = @import("../stream_provider.zig");
+const model_provider = @import("../../config/model_provider.zig");
 
 const Allocator = std.mem.Allocator;
 const ChatMessage = types.ChatMessage;
@@ -15,7 +16,6 @@ const compaction_target_denominator: usize = 10;
 const compaction_recent_denominator: usize = 20;
 const compaction_soft_ceiling_denominator: usize = 4;
 const compaction_source_reduction_denominator: usize = 8;
-const compaction_generation_multiplier: usize = 4;
 
 pub const CompactionTrigger = enum {
     automatic,
@@ -42,7 +42,6 @@ pub const CompactionPlan = struct {
     high_water_tokens: ?usize,
     session_target_tokens: ?usize,
     accepted_handoff_tokens: ?usize,
-    generation_tokens: ?usize,
 };
 
 pub fn planCompaction(input: CompactionPlanInput) CompactionPlan {
@@ -65,7 +64,6 @@ pub fn planCompaction(input: CompactionPlanInput) CompactionPlan {
         .high_water_tokens = high_water,
         .session_target_tokens = session_target,
         .accepted_handoff_tokens = null,
-        .generation_tokens = null,
     };
 
     const source_target = @max(
@@ -89,21 +87,14 @@ pub fn planCompaction(input: CompactionPlanInput) CompactionPlan {
         .high_water_tokens = high_water,
         .session_target_tokens = session_target,
         .accepted_handoff_tokens = null,
-        .generation_tokens = null,
     };
     const accepted = @min(total_target, request_ceiling - input.protected_tokens);
-    const requested_generation = accepted *| compaction_generation_multiplier;
-    const generation = if (input.capabilities.max_output_tokens) |limit|
-        @min(requested_generation, @as(usize, @intCast(limit)))
-    else
-        requested_generation;
     return .{
         .decision = .compact,
         .usable_input_tokens = usable,
         .high_water_tokens = high_water,
         .session_target_tokens = session_target,
         .accepted_handoff_tokens = accepted,
-        .generation_tokens = generation,
     };
 }
 
@@ -118,7 +109,10 @@ pub const RetainedContext = struct {
 };
 
 /// Selects complete execution steps. Payloads are measured, never shortened.
-pub fn selectRecentContext(history: []const HistoryTurn, target: usize, input_capacity: ?usize) RetainedContext {
+pub fn selectRecentContext(history: []const HistoryTurn, target: usize, input_capacity: ?usize, options: struct {
+    provider: ?model_provider.ProviderSelection = null,
+    reject_oversized_tool_step: bool = false,
+}) RetainedContext {
     var raw_count = session_runtime.rawHistoryTurnCount(history);
     var selected = types.ContextHistoryCut{ .turns = raw_count };
     var total: usize = 0;
@@ -145,7 +139,12 @@ pub fn selectRecentContext(history: []const HistoryTurn, target: usize, input_ca
             .interrupted => |entry| entry.execution,
             .compacted_summary => unreachable,
         };
-        var base = textTokens(user) +| textTokens(reply) +| 8;
+        const replay = switch (turn) {
+            .assistant => |entry| entry.provider_replay,
+            .interrupted => null,
+            .compacted_summary => unreachable,
+        };
+        var base = textTokens(user) +| textTokens(reply) +| replay_tokens(replay, options.provider) +| 8;
         var steering_index = execution.steering.len;
         var step_index = execution.tool_steps.len;
         if (step_index == 0) {
@@ -165,13 +164,14 @@ pub fn selectRecentContext(history: []const HistoryTurn, target: usize, input_ca
         }
         while (step_index > 0) {
             step_index -= 1;
-            var cost = base +| executionStepTokens(execution.tool_steps[step_index]);
+            var cost = base +| executionStepTokens(execution.tool_steps[step_index], options.provider);
             var next_steering = steering_index;
             while (next_steering > 0 and execution.steering[next_steering - 1].after_tool_step_count >= step_index) {
                 next_steering -= 1;
                 cost +|= textTokens(execution.steering[next_steering].text);
                 if (execution.steering[next_steering].assistant_prefix) |prefix| cost +|= textTokens(prefix);
             }
+            if (!selected_any and options.reject_oversized_tool_step and cost > target) break :history_scan;
             if (input_capacity) |capacity| {
                 if (!selected_any and cost >= capacity) break :history_scan;
             }
@@ -197,8 +197,14 @@ fn textTokens(text: []const u8) usize {
     return @intCast(@min(estimator.estimate(), std.math.maxInt(usize)));
 }
 
-fn executionStepTokens(step: types.ToolExecutionStep) usize {
-    var total: usize = 8;
+fn replay_tokens(replay: ?types.ProviderReplay, provider: ?model_provider.ProviderSelection) usize {
+    const value = replay orelse return 0;
+    if (provider) |selection| if (!value.matches(selection)) return 0;
+    return textTokens(value.parts_json);
+}
+
+fn executionStepTokens(step: types.ToolExecutionStep, provider: ?model_provider.ProviderSelection) usize {
+    var total: usize = 8 +| replay_tokens(step.provider_replay, provider);
     if (step.assistant) |text| total +|= textTokens(text);
     for (step.tool_calls) |call| {
         total +|= textTokens(call.id) +| textTokens(call.name) +| textTokens(call.arguments_json) +| 8;
@@ -232,6 +238,7 @@ pub fn validateCompactionHandoff(
 
 pub const RequestCost = struct {
     serialized_bytes: usize,
+    /// Uncalibrated serialization estimate; non-image usage may replace it.
     text_tokens: usize,
     /// Null means no image parts. Otherwise visual cost needs applicable usage.
     image_identity: ?[32]u8 = null,
@@ -248,11 +255,16 @@ pub const RequestTokenCalibration = struct {
     }
 };
 
+const ImagePartData = struct {
+    type: []const u8 = "",
+    data: ?[]const u8 = null,
+};
+
 const ImagePart = struct {
     type: []const u8 = "",
     mediaType: ?[]const u8 = null,
     detail: ?[]const u8 = null,
-    data: ?[]const u8 = null,
+    data: ?ImagePartData = null,
     image_url: ?[]const u8 = null,
 };
 
@@ -315,9 +327,11 @@ pub fn measureProviderRequest(alloc: Allocator, body: []const u8, request: strea
                 part.image_url orelse return error.InvalidRequestMeasurement
             else if (parsed.value.prompt != null and std.mem.eql(u8, part.type, "file") and
                 std.mem.startsWith(u8, part.mediaType orelse "", "image/"))
-                part.data orelse return error.InvalidRequestMeasurement
-            else
-                continue;
+            payload: {
+                const data = part.data orelse return error.InvalidRequestMeasurement;
+                if (!std.mem.eql(u8, data.type, "data")) return error.InvalidRequestMeasurement;
+                break :payload data.data orelse return error.InvalidRequestMeasurement;
+            } else continue;
             const address = @intFromPtr(payload.ptr);
             if (address < @intFromPtr(body.ptr)) return error.InvalidRequestMeasurement;
             const offset = address - @intFromPtr(body.ptr);
@@ -354,7 +368,10 @@ pub fn calibrateProviderRequest(
     else
         multiplyDivideCeilSaturating(cost.serialized_bytes, calibration.exact_input_tokens, calibration.request.serialized_bytes);
     var result = cost;
-    result.estimated_input_tokens = @max(cost.text_tokens, calibrated_tokens);
+    result.estimated_input_tokens = if (cost.image_identity != null)
+        @max(cost.text_tokens, calibrated_tokens)
+    else
+        @max(1, calibrated_tokens);
     return result;
 }
 
@@ -405,14 +422,6 @@ pub fn usableInputTokens(
         if (output_tokens < context_tokens) return context_tokens - output_tokens;
     }
     return context_tokens;
-}
-
-pub fn usableInputTokensForGeneration(
-    capabilities: model_capabilities.Capabilities,
-    generation_tokens: usize,
-) ?usize {
-    const context_window = capabilities.context_window orelse return null;
-    return @as(usize, @intCast(context_window)) -| generation_tokens;
 }
 
 pub const ProviderPrompt = struct {
@@ -608,13 +617,14 @@ test "provider request measurement includes serialized structure" {
 }
 
 test "provider request image accounting excludes encoded payload length" {
-    const suffix = "\"}]}]}";
-    inline for (.{
-        "{\"input\":[{\"role\":\"user\",\"content\":[{\"type\":\"input_image\",\"image_url\":\"data:image/png;base64,",
-        "{\"prompt\":[{\"role\":\"user\",\"content\":[{\"type\":\"file\",\"mediaType\":\"image/png\",\"data\":\"",
-    }) |prefix| {
-        const small = try measureProviderRequest(std.testing.allocator, prefix ++ "AAAA" ++ suffix, measurement_test_request(true));
-        const large = try measureProviderRequest(std.testing.allocator, prefix ++ ("AAAA" ** 1000) ++ suffix, measurement_test_request(true));
+    const Case = struct { prefix: []const u8, suffix: []const u8 };
+    const cases = [_]Case{
+        .{ .prefix = "{\"input\":[{\"role\":\"user\",\"content\":[{\"type\":\"input_image\",\"image_url\":\"data:image/png;base64,", .suffix = "\"}]}]}" },
+        .{ .prefix = "{\"prompt\":[{\"role\":\"user\",\"content\":[{\"type\":\"file\",\"mediaType\":\"image/png\",\"data\":{\"type\":\"data\",\"data\":\"", .suffix = "\"}}]}]}" },
+    };
+    inline for (cases) |case| {
+        const small = try measureProviderRequest(std.testing.allocator, case.prefix ++ "AAAA" ++ case.suffix, measurement_test_request(true));
+        const large = try measureProviderRequest(std.testing.allocator, case.prefix ++ ("AAAA" ** 1000) ++ case.suffix, measurement_test_request(true));
         try std.testing.expect(large.serialized_bytes > small.serialized_bytes);
         try std.testing.expectEqual(small.text_tokens, large.text_tokens);
         try std.testing.expectEqual(small.estimated_input_tokens, large.estimated_input_tokens);
@@ -636,6 +646,45 @@ test "provider request measurement learns the prior exact token density" {
 
     try std.testing.expect(calibrated.estimated_input_tokens > 695_142);
     try std.testing.expect(calibrated.estimated_input_tokens >= current.estimated_input_tokens);
+}
+
+test "provider usage corrects a serialized estimate downward" {
+    const cost = RequestCost{ .serialized_bytes = 34_210, .text_tokens = 8_892, .estimated_input_tokens = 8_892 };
+    const calibrated = calibrateProviderRequest(cost, .{ .request = cost, .exact_input_tokens = 6_030 });
+    try std.testing.expectEqual(@as(usize, 6_030), calibrated.estimated_input_tokens);
+    try std.testing.expectEqual(cost.text_tokens, calibrated.text_tokens);
+}
+
+test "retained context budgets provider replay on completed exchanges" {
+    const replay = types.ProviderReplay{ .source = .{ .provider = .gateway, .model = "fixture/model" }, .parts_json = "[{\"type\":\"reasoning\",\"text\":\"\",\"providerOptions\":{\"openai\":{\"reasoningEncryptedContent\":\"" ++ ("r" ** 80_000) ++ "\"}}}]" };
+    var steps = [_]types.ToolExecutionStep{
+        .{ .assistant = @constCast("one"), .provider_replay = replay },
+        .{ .assistant = @constCast("two"), .provider_replay = replay },
+        .{ .assistant = @constCast("three"), .provider_replay = replay },
+    };
+    const history = [_]HistoryTurn{.{ .assistant = .{
+        .user = .{ .text = @constCast("continue") },
+        .assistant = @constCast(""),
+        .execution = .{ .tool_steps = &steps },
+    } }};
+    const selected = selectRecentContext(&history, 5_990, 119_808, .{});
+    try std.testing.expectEqual(@as(usize, 2), selected.cut.tool_steps);
+    try std.testing.expect(selected.newest_exchange_tokens >= 20_000);
+    const changed_model = selectRecentContext(&history, 5_990, 119_808, .{ .provider = .{ .provider = .gateway, .model = "fixture/other" } });
+    try std.testing.expectEqual(@as(usize, 1), changed_model.cut.tool_steps);
+    try std.testing.expect(changed_model.newest_exchange_tokens < 100);
+}
+
+test "retained context budgets replay on standalone assistant replies" {
+    const turn = types.AssistantHistoryTurn{
+        .user = .{ .text = @constCast("continue") },
+        .assistant = @constCast("small reply"),
+        .provider_replay = .{ .source = .{ .provider = .gateway, .model = "fixture/model" }, .parts_json = "[{\"type\":\"reasoning\",\"text\":\"\",\"providerOptions\":{\"openai\":{\"reasoningEncryptedContent\":\"" ++ ("r" ** 80_000) ++ "\"}}}]" },
+    };
+    const history = [_]HistoryTurn{ .{ .assistant = turn }, .{ .assistant = turn }, .{ .assistant = turn } };
+    const selected = selectRecentContext(&history, 5_990, 119_808, .{});
+    try std.testing.expectEqual(@as(usize, 2), selected.cut.turns);
+    try std.testing.expect(selected.newest_exchange_tokens >= 20_000);
 }
 
 fn measurement_test_request(with_images: bool) stream_provider.RequestData {
@@ -660,7 +709,7 @@ test "provider request image accounting preserves text and tool payloads" {
     ;
     try std.testing.expectEqual(textTokens(without_image_payload), measured.text_tokens);
 
-    const file_text = "{\"prompt\":[{\"role\":\"user\",\"content\":[{\"type\":\"file\",\"mediaType\":\"text/plain\",\"data\":\"AAAA\"}]}]}";
+    const file_text = "{\"prompt\":[{\"role\":\"user\",\"content\":[{\"type\":\"file\",\"mediaType\":\"text/plain\",\"data\":{\"type\":\"data\",\"data\":\"AAAA\"}}]}]}";
     const non_image = try measureProviderRequest(std.testing.allocator, file_text, measurement_test_request(true));
     try std.testing.expectEqual(textTokens(file_text), non_image.text_tokens);
     try std.testing.expectEqual(@as(?[32]u8, null), non_image.image_identity);
@@ -739,23 +788,30 @@ test "provider request image accounting handles allocation and malformed input f
         "{\"input\":[],\"prompt\":[]}",
         "{\"input\":[{\"role\":\"user\",\"content\":[{\"type\":\"input_image\"}]}]}",
         "{\"input\":[{\"role\":\"user\",\"content\":[{\"type\":\"input_image\",\"image_url\":\"escaped\\nimage\"}]}]}",
+        // Prompt-shape file parts must carry the nested v4 data object; every
+        // other shape is rejected rather than mis-measured.
+        "{\"prompt\":[{\"role\":\"user\",\"content\":[{\"type\":\"file\",\"mediaType\":\"image/png\",\"data\":\"AAAA\"}]}]}",
+        "{\"prompt\":[{\"role\":\"user\",\"content\":[{\"type\":\"file\",\"mediaType\":\"image/png\"}]}]}",
+        "{\"prompt\":[{\"role\":\"user\",\"content\":[{\"type\":\"file\",\"mediaType\":\"image/png\",\"data\":{\"type\":\"url\",\"url\":\"https://x/y.png\"}}]}]}",
+        "{\"prompt\":[{\"role\":\"user\",\"content\":[{\"type\":\"file\",\"mediaType\":\"image/png\",\"data\":{\"type\":\"data\"}}]}]}",
+        "{\"prompt\":[{\"role\":\"user\",\"content\":[{\"type\":\"file\",\"mediaType\":\"image/png\",\"data\":{\"type\":\"data\",\"data\":\"escaped\\nimage\"}}]}]}",
     }) |body| {
         try std.testing.expectError(error.InvalidRequestMeasurement, measureProviderRequest(std.testing.allocator, body, measurement_test_request(true)));
     }
 }
 
-test "compactor input budget reserves the requested generation" {
+test "compactor input budget follows normal model capacity" {
     try std.testing.expectEqual(
         @as(?usize, 296_816),
-        usableInputTokensForGeneration(.{ .context_window = 500_000 }, 203_184),
+        usableInputTokens(.{ .context_window = 500_000, .max_output_tokens = 203_184 }),
     );
     try std.testing.expectEqual(
-        @as(?usize, 0),
-        usableInputTokensForGeneration(.{ .context_window = 500_000 }, 500_000),
+        @as(?usize, 500_000),
+        usableInputTokens(.{ .context_window = 500_000, .max_output_tokens = 500_000 }),
     );
     try std.testing.expectEqual(
         @as(?usize, null),
-        usableInputTokensForGeneration(.{}, 1),
+        usableInputTokens(.{}),
     );
 }
 
@@ -788,7 +844,6 @@ test "compaction v2 triggers automatic work at eighty percent and targets ten pe
     try std.testing.expectEqual(@as(?usize, 640), at_boundary.high_water_tokens);
     try std.testing.expectEqual(@as(?usize, 80), at_boundary.session_target_tokens);
     try std.testing.expectEqual(@as(?usize, 80), at_boundary.accepted_handoff_tokens);
-    try std.testing.expectEqual(@as(?usize, 200), at_boundary.generation_tokens);
 
     const protected_prompt = planCompaction(.{
         .trigger = .automatic,
@@ -868,13 +923,13 @@ test "retained context selects whole parallel tool exchanges without shortening 
         .{ .assistant = .{ .user = .{ .text = @constCast("old request") }, .assistant = @constCast("old answer") } },
         .{ .assistant = .{ .user = .{ .text = @constCast("current request") }, .assistant = @constCast(""), .execution = .{ .tool_steps = @constCast(&steps) } } },
     };
-    const selected = selectRecentContext(&history, 5000, null);
+    const selected = selectRecentContext(&history, 5000, null, .{});
     try std.testing.expectEqual(@as(usize, 1), selected.cut.turns);
     try std.testing.expectEqual(@as(usize, 1), selected.cut.tool_steps);
     try std.testing.expect(selected.newest_exchange_tokens > 5000);
     try std.testing.expectEqualStrings(body, results[0].output);
     try std.testing.expectEqualStrings(body, results[1].output);
-    const over_capacity = selectRecentContext(&history, 5000, 10_000);
+    const over_capacity = selectRecentContext(&history, 5000, 10_000, .{});
     try std.testing.expectEqual(@as(usize, 2), over_capacity.cut.turns);
     try std.testing.expectEqual(@as(usize, 0), over_capacity.cut.tool_steps);
     try std.testing.expectEqual(@as(usize, 0), over_capacity.estimated_tokens);
@@ -894,7 +949,6 @@ test "manual compaction shares the budget and stops after a smaller source" {
     });
     try std.testing.expectEqual(CompactionDecision.compact, plan.decision);
     try std.testing.expectEqual(@as(?usize, 80), plan.accepted_handoff_tokens);
-    try std.testing.expectEqual(@as(?usize, 200), plan.generation_tokens);
 
     const empty = planCompaction(.{
         .trigger = .manual,
