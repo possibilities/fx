@@ -43,6 +43,8 @@ fx ask "explain the changes in this repository"
 
 Inside the shell, run `/help` to browse interactive commands.
 
+Press `Ctrl+G` to edit the current prompt with `VISUAL`, falling back to `EDITOR`, even while a response is streaming; drafts containing pasted blocks, images, or skills are left unchanged. When an automatic upgrade is ready, press `Ctrl+T` to reload it.
+
 ### Automatic tool review
 
 In auto mode, a valid structured safety decision remains usable when the reviewer adds commentary. If the response has no valid decision, fx retries the review once within its original 30-second deadline. A safety caution is never retried for approval. If review still fails, the action stays unexecuted and the agent can continue with other tools.
