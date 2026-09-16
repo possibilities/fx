@@ -786,7 +786,7 @@ fn loadPreferredSourceFromHome(
         .vercel_oidc_token => loadEnvCredential(alloc, "VERCEL_OIDC_TOKEN", source),
         .ai_gateway_api_key => loadEnvCredential(alloc, "AI_GATEWAY_API_KEY", source),
         // Host-managed authority carries no bytes an isolated profile could hold.
-        .host_managed => null,
+        .host_managed, .configured => null,
     };
 }
 
