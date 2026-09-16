@@ -367,7 +367,8 @@ function handle(message) {
         id: message.id,
         error: {
           code: -32602,
-          message: "Resource request rejected by fixture",
+          message: process.env.FX_MCP_PROTOCOL_ERROR_MESSAGE ??
+            "Resource request rejected by fixture",
           data: { method: message.method, retryable: false },
         },
       });
@@ -475,7 +476,8 @@ function handle(message) {
         id: message.id,
         error: {
           code: -32603,
-          message: "Prompt request rejected by fixture",
+          message: process.env.FX_MCP_PROTOCOL_ERROR_MESSAGE ??
+            "Prompt request rejected by fixture",
           data: { method: message.method, retryable: false },
         },
       });
