@@ -121,6 +121,7 @@ pub fn build(b: *std.Build) void {
             .mode = .simple,
         },
         .filters = &.{
+            "prepared compaction checkpoint preserves shape and credential authority",
             "selected profile configured authorization uses only its connection registry",
             "suppressed project instructions stay disabled during retained context reconstruction",
             "Codex request-path verification never crosses store or account authority",
