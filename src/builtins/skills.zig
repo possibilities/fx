@@ -135,7 +135,7 @@ fn executeCommand(alloc: Allocator, command: Command, request: CommandRequest) !
         .create => |name| createCommandResult(alloc, request.skills_dir, name),
         .remove => |name| removeCommandResult(alloc, request, name),
         .path => pathCommandResult(alloc, request),
-        .usage => noticeLiteral(alloc, "Usage: /skills [list|add|install|show|create|remove|path] [name|url|path]", false),
+        .usage => noticeLiteral(alloc, "usage: /skills [list|add|install|show|create|remove|path] [name|url|path]", false),
     };
 }
 
