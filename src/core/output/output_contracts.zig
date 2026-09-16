@@ -21,6 +21,10 @@ const workspace_commands = @import("../workspace/workspace_commands.zig");
 
 const Allocator = std.mem.Allocator;
 
+fn providerDisplayName(provider: *const model_provider.ProviderId) []const u8 {
+    return if (provider.* == .configured) provider.label() else provider_catalog.label(provider.*);
+}
+
 fn permissionModeLabel(mode: types.PermissionMode) []const u8 {
     return permissions.permissionModeLabel(mode);
 }
@@ -367,7 +371,7 @@ fn writeTerminalSafe(writer: *std.Io.Writer, alloc: Allocator, raw: []const u8) 
 
 fn gatewayProviderConnected(auth: auth_runtime.StatusSnapshot) bool {
     const source = auth.active_source orelse return auth.gateway_connected;
-    return auth.gateway_connected or (source != .chatgpt_subscription and source != .grok_subscription);
+    return auth.gateway_connected or (source != .chatgpt_subscription and source != .grok_subscription and source != .configured);
 }
 
 fn chatGptProviderConnected(auth: auth_runtime.StatusSnapshot) bool {
@@ -463,6 +467,7 @@ pub const McpLocalSnapshot = struct {
 
 pub const StatusSnapshot = struct {
     model: []const u8,
+    provider_endpoint: ?[]const u8 = null,
     provider: model_provider.ProviderId = .gateway,
     update_channel: []const u8 = "stable",
     build_channel: []const u8 = "stable",
@@ -491,8 +496,9 @@ pub const StatusSnapshot = struct {
 
         try out.writer.print("[status] model={s}\n", .{self.model});
         if (self.provider != .gateway) {
-            try out.writer.print("[status] model_source={s}\n", .{provider_catalog.label(self.provider)});
+            try out.writer.print("[status] model_source={s}\n", .{providerDisplayName(&self.provider)});
         }
+        if (self.provider_endpoint) |endpoint| try out.writer.print("[status] provider_endpoint={s}\n", .{endpoint});
         try out.writer.print("[status] update_channel={s}\n", .{self.update_channel});
         try out.writer.print("[status] build_channel={s}\n", .{self.build_channel});
         if (self.build_revision.len > 0) {
@@ -518,7 +524,7 @@ pub const StatusSnapshot = struct {
         try out.writer.print("[status] auth={s}\n", .{self.auth.activeSourceLabel()});
         if (self.provider != .gateway) {
             try out.writer.writeAll("[status] connected_providers=");
-            try writeConnectedProvidersText(&out.writer, self.auth);
+            try self.writeConnections(&out.writer);
             try out.writer.writeByte('\n');
         }
         try out.writer.print("[status] auth_refreshable={}\n", .{self.auth.refreshable()});
@@ -544,8 +550,9 @@ pub const StatusSnapshot = struct {
 
         try out.writer.print("model={s}\n", .{self.model});
         if (self.provider != .gateway) {
-            try out.writer.print("model_source={s}\n", .{provider_catalog.label(self.provider)});
+            try out.writer.print("model_source={s}\n", .{providerDisplayName(&self.provider)});
         }
+        if (self.provider_endpoint) |endpoint| try out.writer.print("provider_endpoint={s}\n", .{endpoint});
         try out.writer.print("update_channel={s}\n", .{self.update_channel});
         try out.writer.print("build_channel={s}\n", .{self.build_channel});
         if (self.build_revision.len > 0) {
@@ -554,7 +561,7 @@ pub const StatusSnapshot = struct {
         try out.writer.print("auth={s}\n", .{self.auth.activeSourceLabel()});
         if (self.provider != .gateway) {
             try out.writer.writeAll("connected_providers=");
-            try writeConnectedProvidersText(&out.writer, self.auth);
+            try self.writeConnections(&out.writer);
             try out.writer.writeByte('\n');
         }
         try out.writer.print("auth_refreshable={}\n", .{self.auth.refreshable()});
@@ -577,12 +584,25 @@ pub const StatusSnapshot = struct {
         return try out.toOwnedSlice();
     }
 
+    fn writeConnections(self: StatusSnapshot, writer: *std.Io.Writer) !void {
+        if (self.provider == .configured and self.auth.active_source == .configured) {
+            try writer.writeAll(self.provider.label());
+            if (!gatewayProviderConnected(self.auth) and !chatGptProviderConnected(self.auth) and !grokProviderConnected(self.auth)) return;
+            try writer.writeAll(", ");
+        }
+        try writeConnectedProvidersText(writer, self.auth);
+    }
+
     pub fn writeJson(self: StatusSnapshot, writer: *std.Io.Writer) !void {
         try writer.writeAll("{\"kind\":\"status\",\"model\":");
         try std.json.Stringify.value(self.model, .{}, writer);
         if (self.provider != .gateway) {
             try writer.writeAll(",\"model_source\":");
-            try std.json.Stringify.value(provider_catalog.label(self.provider), .{}, writer);
+            try std.json.Stringify.value(providerDisplayName(&self.provider), .{}, writer);
+        }
+        if (self.provider_endpoint) |endpoint| {
+            try writer.writeAll(",\"provider_endpoint\":");
+            try std.json.Stringify.value(endpoint, .{}, writer);
         }
         try writer.writeAll(",\"update_channel\":");
         try std.json.Stringify.value(self.update_channel, .{}, writer);
@@ -613,7 +633,12 @@ pub const StatusSnapshot = struct {
         if (self.provider != .gateway) {
             try writer.writeAll(",\"connected_providers\":[");
             var wrote_provider = false;
+            if (self.provider == .configured and self.auth.active_source == .configured) {
+                try std.json.Stringify.value(self.provider.label(), .{}, writer);
+                wrote_provider = true;
+            }
             if (gatewayProviderConnected(self.auth)) {
+                if (wrote_provider) try writer.writeByte(',');
                 try std.json.Stringify.value("vercel-ai-gateway", .{}, writer);
                 wrote_provider = true;
             }
@@ -781,7 +806,7 @@ pub const ModelListSnapshot = struct {
         for (0..shown) |index| {
             const id = self.modelId(index);
             if (self.provider != .gateway) {
-                try out.writer.print(" - {s} · {s}\n", .{ id, provider_catalog.label(self.provider) });
+                try out.writer.print(" - {s} · {s}\n", .{ id, providerDisplayName(&self.provider) });
             } else {
                 try out.writer.print(" - {s}\n", .{id});
             }
@@ -810,7 +835,7 @@ pub const ModelListSnapshot = struct {
         for (0..shown) |index| {
             const id = self.modelId(index);
             if (self.provider != .gateway) {
-                try out.writer.print("\n - {s} · {s}", .{ id, provider_catalog.label(self.provider) });
+                try out.writer.print("\n - {s} · {s}", .{ id, providerDisplayName(&self.provider) });
             } else {
                 try out.writer.print("\n - {s}", .{id});
             }
@@ -840,7 +865,7 @@ pub const ModelListSnapshot = struct {
                 try out.writer.writeAll("{\"id\":");
                 try std.json.Stringify.value(self.modelId(index), .{}, &out.writer);
                 try out.writer.writeAll(",\"source\":");
-                try std.json.Stringify.value(provider_catalog.label(self.provider), .{}, &out.writer);
+                try std.json.Stringify.value(providerDisplayName(&self.provider), .{}, &out.writer);
                 try out.writer.writeAll(",\"reasoning_efforts\":[");
                 for (self.modelReasoningEfforts(index), 0..) |effort, effort_index| {
                     if (effort_index > 0) try out.writer.writeByte(',');
@@ -875,10 +900,12 @@ pub const ModelListSnapshot = struct {
             .gateway => "gateway",
             .codex => provider_catalog.label(.codex),
             .grok => provider_catalog.label(.grok),
+            .configured => "configured provider",
         };
     }
 
     fn catalogExplanation(self: ModelListSnapshot) ?[]const u8 {
+        if (self.provider == .configured) return "Models from profile settings; explicit model IDs do not require catalog discovery.";
         if (!self.private_models_hidden) return null;
         const reason = self.public_only_reason orelse return "Using the public model catalog.";
         return switch (reason) {
@@ -1257,13 +1284,15 @@ pub const SessionRecoverySnapshot = struct {
         self: SessionRecoverySnapshot,
         alloc: Allocator,
     ) ![]u8 {
+        const usage_warning = if (self.result.usage_incomplete) "warning: historical usage is incomplete because the source accounting data is corrupt\n" else "";
         if (self.result.status == .indeterminate) {
             return std.fmt.allocPrint(
                 alloc,
-                "[session recovery] could not confirm target {s}\nsource: {s} (unchanged)\nresolve: fx --resume {s}\ninspect: fx doctor\n",
+                "[session recovery] could not confirm target {s}\nsource: {s} (unchanged)\n{s}resolve: fx --resume {s}\ninspect: fx doctor\n",
                 .{
                     self.result.recovered_session_id,
                     self.result.source_session_id,
+                    usage_warning,
                     self.result.recovered_session_id,
                 },
             );
@@ -1271,22 +1300,24 @@ pub const SessionRecoverySnapshot = struct {
         if (self.result.status == .recovered_with_unverified_artifacts) {
             return std.fmt.allocPrint(
                 alloc,
-                "[session recovery] copied {s} to {s}\nhistory_turns: {d}\nwarning: legacy command artifacts could not be authenticated\nresume: fx --resume {s}\n",
+                "[session recovery] copied {s} to {s}\nhistory_turns: {d}\nwarning: legacy command artifacts could not be authenticated\n{s}resume: fx --resume {s}\n",
                 .{
                     self.result.source_session_id,
                     self.result.recovered_session_id,
                     self.result.history_len,
+                    usage_warning,
                     self.result.recovered_session_id,
                 },
             );
         }
         return std.fmt.allocPrint(
             alloc,
-            "[session recovery] copied {s} to {s}\nhistory_turns: {d}\nresume: fx --resume {s}\n",
+            "[session recovery] copied {s} to {s}\nhistory_turns: {d}\n{s}resume: fx --resume {s}\n",
             .{
                 self.result.source_session_id,
                 self.result.recovered_session_id,
                 self.result.history_len,
+                usage_warning,
                 self.result.recovered_session_id,
             },
         );
@@ -1319,9 +1350,11 @@ pub const SessionRecoverySnapshot = struct {
             &out.writer,
         );
         try out.writer.print(
-            ",\"history_turns\":{d}}}",
+            ",\"history_turns\":{d}",
             .{self.result.history_len},
         );
+        if (self.result.usage_incomplete) try out.writer.writeAll(",\"usage_incomplete\":true");
+        try out.writer.writeByte('}');
         return try out.toOwnedSlice();
     }
 };
@@ -1355,7 +1388,7 @@ pub const DoctorSnapshot = struct {
         try out.writer.print("[doctor] workspace={s}\n", .{self.workspace_root});
         try out.writer.print("[doctor] model={s}\n", .{self.model});
         if (self.provider != .gateway) {
-            try out.writer.print("[doctor] model_source={s}\n", .{provider_catalog.label(self.provider)});
+            try out.writer.print("[doctor] model_source={s}\n", .{providerDisplayName(&self.provider)});
         }
         try out.writer.print("[doctor] auth={s}\n", .{self.auth.activeSourceLabel()});
         try out.writer.print("[doctor] auth_refreshable={}\n", .{self.auth.refreshable()});
@@ -1398,7 +1431,7 @@ pub const DoctorSnapshot = struct {
         try std.json.Stringify.value(self.model, .{}, writer);
         if (self.provider != .gateway) {
             try writer.writeAll(",\"model_source\":");
-            try std.json.Stringify.value(provider_catalog.label(self.provider), .{}, writer);
+            try std.json.Stringify.value(providerDisplayName(&self.provider), .{}, writer);
         }
         try writer.writeAll(",\"auth\":");
         try std.json.Stringify.value(self.auth.activeSourceLabel(), .{}, writer);
@@ -1877,14 +1910,6 @@ fn writeSessionHistoryTurnJson(writer: *std.Io.Writer, turn: types.HistoryTurn) 
             }
             try writer.writeByte('}');
         },
-    }
-}
-
-fn writeHexBytes(writer: *std.Io.Writer, bytes: []const u8) !void {
-    const alphabet = "0123456789abcdef";
-    for (bytes) |byte| {
-        try writer.writeByte(alphabet[byte >> 4]);
-        try writer.writeByte(alphabet[byte & 0x0f]);
     }
 }
 
@@ -2695,6 +2720,24 @@ test "core session migration snapshot text and json stay stable" {
         "{\"kind\":\"session_migration\",\"id\":\"session.v3\",\"status\":\"migrated\",\"source_schema_version\":2,\"source_bytes\":4096}",
         json,
     );
+}
+
+test "core session recovery keeps incomplete accounting visible for every result" {
+    inline for (.{ .recovered, .recovered_with_unverified_artifacts, .indeterminate }) |status| {
+        const snapshot: SessionRecoverySnapshot = .{ .result = .{
+            .source_session_id = @constCast("source"),
+            .recovered_session_id = @constCast("copy"),
+            .history_len = 1,
+            .usage_incomplete = true,
+            .status = status,
+        } };
+        const text = try snapshot.renderText(std.testing.allocator);
+        defer std.testing.allocator.free(text);
+        try std.testing.expect(std.mem.find(u8, text, "historical usage is incomplete") != null);
+        const json = try snapshot.renderJson(std.testing.allocator);
+        defer std.testing.allocator.free(json);
+        try std.testing.expect(std.mem.find(u8, json, "\"usage_incomplete\":true") != null);
+    }
 }
 
 test "core session recovery snapshot text and json stay stable" {
