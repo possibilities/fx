@@ -223,6 +223,30 @@ pub const Loaded = struct {
         return try cloneRow(alloc, row, fingerprint_value);
     }
 
+    /// Clones every visible row into picker summaries, excluding `active_id`.
+    /// Rows are NOT revalidated against current on-disk state; the result is
+    /// stale evidence for instant paint only, and canonical admission still
+    /// re-checks any selection. Caller owns the list and each summary.
+    pub fn cloneVisibleSummaries(self: *const Loaded, alloc: Allocator, active_id: ?[]const u8) !std.ArrayList(session_store.SessionSummary) {
+        var summaries: std.ArrayList(session_store.SessionSummary) = .empty;
+        errdefer {
+            for (summaries.items) |*summary| summary.deinit(alloc);
+            summaries.deinit(alloc);
+        }
+        const parsed = self.parsed orelse return summaries;
+        for (parsed.value) |row| {
+            const summary = switch (row.value) {
+                .visible => |*value| value,
+                .excluded, .legacy_ranking => continue,
+            };
+            if (active_id) |active| if (std.mem.eql(u8, active, row.id)) continue;
+            var cloned = try summary.clone(alloc, row.id);
+            errdefer cloned.deinit(alloc);
+            try summaries.append(alloc, cloned);
+        }
+        return summaries;
+    }
+
     /// Generation from a successful replay observation, not a caller-selected source.
     pub fn rankingGeneration(self: *const Loaded, id: []const u8) ?Generation {
         const position = self.index.get(id) orelse return null;
@@ -341,11 +365,28 @@ pub fn fingerprint(dir: std.Io.Dir, id: []const u8) !?Fingerprint {
     var digest = Sha256.init(.{});
     addStat(&digest, before);
     var path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
-    for ([_][]const u8{ "session.json", "events.jsonl" }) |name| {
-        const path = try std.fmt.bufPrint(&path_buffer, "{s}/{s}", .{ id, name });
-        const stat = (try statOptional(dir, path)) orelse return null;
+    const session_path = try std.fmt.bufPrint(&path_buffer, "{s}/{s}", .{ id, "session.json" });
+    const session_stat = (try statOptional(dir, session_path)) orelse return null;
+    if (session_stat.kind != .file or session_stat.nlink != 1) return null;
+    addStat(&digest, session_stat);
+    // Legacy sessions carry no event log, so absence is part of the proof:
+    // a later appearance of events.jsonl must invalidate a cached row.
+    const events_path = try std.fmt.bufPrint(&path_buffer, "{s}/{s}", .{ id, "events.jsonl" });
+    if (try statOptional(dir, events_path)) |stat| {
         if (stat.kind != .file or stat.nlink != 1) return null;
+        digest.update(&.{1});
         addStat(&digest, stat);
+    } else digest.update(&.{0});
+    // schema_v3 and legacy classification also observe the authority marker,
+    // the authority fence, and the display sidecar. Their presence, absence, or
+    // replacement must invalidate a cached row, so bind them into the digest.
+    for ([_][]const u8{ "authority.json", "authority.pending.json", "display.json" }) |name| {
+        const path = try std.fmt.bufPrint(&path_buffer, "{s}/{s}", .{ id, name });
+        if (try statOptional(dir, path)) |stat| {
+            if (stat.kind != .file or stat.nlink != 1) return null;
+            digest.update(&.{1});
+            addStat(&digest, stat);
+        } else digest.update(&.{0});
     }
     const child_path = try std.fmt.bufPrint(&path_buffer, "{s}/subagent", .{id});
     const child = try statOptional(dir, child_path);
@@ -762,6 +803,42 @@ test "catalog ranking allocation failures clean owned rows and merged publicatio
             try output.save(a, &.{}, &cancelled);
         }
     }.check, .{ &writer, stamp });
+}
+
+test "catalog fingerprint binds authority fence display sidecar and missing event log" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "session");
+    {
+        var file = try tmp.dir.createFile(std.testing.io, "session/session.json", .{});
+        defer file.close(std.testing.io);
+        try file.writeStreamingAll(std.testing.io, "{}\n");
+    }
+    // Legacy sessions carry no event log; the fingerprint must still exist.
+    const legacy = (try fingerprint(tmp.dir, "session")).?;
+    try std.testing.expectEqual(legacy, (try fingerprint(tmp.dir, "session")).?);
+    // A later appearance of events.jsonl invalidates the legacy observation.
+    {
+        var file = try tmp.dir.createFile(std.testing.io, "session/events.jsonl", .{});
+        defer file.close(std.testing.io);
+        try file.writeStreamingAll(std.testing.io, "{}\n");
+    }
+    const with_events = (try fingerprint(tmp.dir, "session")).?;
+    try std.testing.expect(!std.mem.eql(u8, &legacy, &with_events));
+    // Adding or removing the authority marker, fence, or display sidecar must
+    // invalidate the observation even when session.json and events.jsonl are
+    // untouched.
+    for ([_][]const u8{ "authority.json", "authority.pending.json", "display.json" }) |name| {
+        const path = try std.fmt.allocPrint(std.testing.allocator, "session/{s}", .{name});
+        defer std.testing.allocator.free(path);
+        const absent = (try fingerprint(tmp.dir, "session")).?;
+        var file = try tmp.dir.createFile(std.testing.io, path, .{});
+        try file.writeStreamingAll(std.testing.io, "{}\n");
+        file.close(std.testing.io);
+        const present = (try fingerprint(tmp.dir, "session")).?;
+        try std.testing.expect(!std.mem.eql(u8, &absent, &present));
+        try tmp.dir.deleteFile(std.testing.io, path);
+    }
 }
 
 test "catalog fingerprint detects event appends and child directory permissions" {

@@ -121,6 +121,12 @@ pub fn build(b: *std.Build) void {
             .mode = .simple,
         },
         .filters = &.{
+            "selected profile configured authorization uses only its connection registry",
+            "suppressed project instructions stay disabled during retained context reconstruction",
+            "Codex request-path verification never crosses store or account authority",
+            "ACP provider options preserve host allowlist with configured providers",
+            "ACP credential preparation preserves the existing borrowed credential",
+
             "ACP restore rejects MCP servers when host capability is disabled",
             "wrapped shell commands preserve exact normalized admission authority",
             "automatic review trace preserves the typed unavailable cause without action text",

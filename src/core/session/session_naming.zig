@@ -65,19 +65,21 @@ pub const Settings = struct {
         self.* = .{};
     }
 
-    pub fn setting(self: *Settings, provider: model_provider.ProviderId) *ProviderSetting {
+    pub fn setting(self: *Settings, provider: model_provider.ProviderId) ?*ProviderSetting {
         return switch (provider) {
             .gateway => &self.gateway,
             .codex => &self.codex,
             .grok => &self.grok,
+            .configured => null,
         };
     }
 
-    pub fn settingConst(self: *const Settings, provider: model_provider.ProviderId) *const ProviderSetting {
+    pub fn settingConst(self: *const Settings, provider: model_provider.ProviderId) ?*const ProviderSetting {
         return switch (provider) {
             .gateway => &self.gateway,
             .codex => &self.codex,
             .grok => &self.grok,
+            .configured => null,
         };
     }
 };
@@ -106,11 +108,12 @@ pub const Config = struct {
         self.* = .{};
     }
 
-    pub fn provider(self: *const Config, provider_id: model_provider.ProviderId) *const ProviderConfig {
+    pub fn provider(self: *const Config, provider_id: model_provider.ProviderId) ?*const ProviderConfig {
         return switch (provider_id) {
             .gateway => &self.gateway,
             .codex => &self.codex,
             .grok => &self.grok,
+            .configured => null,
         };
     }
 };
@@ -296,7 +299,7 @@ pub const Runtime = struct {
         input: AdmissionInput,
     ) !?PreparedAdmission {
         const alloc = self.alloc orelse return null;
-        const provider_config = self.config.provider(input.provider_id);
+        const provider_config = self.config.provider(input.provider_id) orelse return null;
         const model = provider_config.model orelse return null;
         if (input.session_id.len == 0 or input.prompt.len == 0) return null;
         const credential_secret = input.credential.secret() orelse "";
@@ -534,10 +537,9 @@ const NamingAdmission = struct {
     }
 };
 
-/// Keeps the opening bytes of one naming stream and stops the provider as
-/// soon as a slug can be built from them. The Codex endpoint refuses the
-/// Responses API output bound, so stopping the stream is the only thing that
-/// keeps a naming answer short.
+/// Freezes a bounded opening title while allowing the provider stream to
+/// finish. The Codex endpoint refuses the Responses API output bound; this
+/// limits captured memory rather than generation or billing.
 const TitleCapture = struct {
     task: *Task,
     buffer: [capture_max_bytes]u8 = undefined,
@@ -784,6 +786,9 @@ test "session naming resolves the Codex default and skips other providers" {
     try std.testing.expectEqualStrings(default_codex_model, config.codex.model.?);
     try std.testing.expect(config.gateway.model == null);
     try std.testing.expect(config.grok.model == null);
+    const custom = model_provider.parse("custom").?;
+    try std.testing.expect(config.provider(custom) == null);
+    try std.testing.expect(settings.setting(custom) == null);
     try std.testing.expect(config.codex.effort.eql(default_effort));
     try std.testing.expectEqual(default_timeout_ms, config.timeout_ms);
 }

@@ -15,3 +15,11 @@ host promise retains only its operation-owned copy until settlement. The timed
 out runtime closes so a never-settling promise cannot strand a later request.
 The ordinary libfx `home` also owns profile usage state; ambient `HOME` is not
 consulted when an explicit library home is present.
+
+The configured-provider launch surface introduced upstream does not widen a
+libfx host's authorization list. Native ACP keeps named configured providers,
+while libfx advertises and admits only its explicitly supplied Gateway/Codex
+provider tags. Credential preparation stages new storage until existing session
+borrowers stop. A process-wide source-only recent-verification stamp is never
+sufficient for Codex: independent libfx stores and account pins must still be
+validated on the request path.
