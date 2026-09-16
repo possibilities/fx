@@ -992,7 +992,6 @@ test "ADE terminal root tracking follows only filesystem-write classification" {
             .fingerprint = .{
                 .command = fingerprint.command,
                 .resolved_cwd = fingerprint.resolved_cwd,
-                .background = fingerprint.background,
                 .target_os = fingerprint.target_os,
                 .environment = .{ .clean = "/bin/sh" },
             },
@@ -1009,7 +1008,6 @@ test "ADE terminal root tracking follows only filesystem-write classification" {
             .fingerprint = .{
                 .command = "git status --short",
                 .resolved_cwd = fingerprint.resolved_cwd,
-                .background = false,
                 .target_os = fingerprint.target_os,
             },
             .source = .yolo,
@@ -1021,7 +1019,6 @@ test "ADE terminal root tracking follows only filesystem-write classification" {
             .fingerprint = .{
                 .command = "cd ../other && touch edited.txt",
                 .resolved_cwd = fingerprint.resolved_cwd,
-                .background = false,
                 .target_os = fingerprint.target_os,
             },
             .source = .yolo,
