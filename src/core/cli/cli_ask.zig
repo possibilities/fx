@@ -28,6 +28,7 @@ const image_attachments = @import("../images/image_attachments.zig");
 const hooks = @import("../hooks/hooks.zig");
 const notification_sound = @import("../notifications/sound.zig");
 const io_mod = @import("../shared/io.zig");
+const session_title_generation = @import("../session/session_title_generation.zig");
 const config_runtime = @import("../config/config_runtime.zig");
 const model_capabilities = @import("../config/model_capabilities.zig");
 const model_provider = @import("../config/model_provider.zig");
@@ -329,6 +330,9 @@ const AskOptions = struct {
     prompt: []u8,
     resume_target: ?ResumeTarget = null,
     permission_override: ?PermissionMode = null,
+    model_override: ?[]u8 = null,
+    effort_override: ?types.ReasoningEffort = null,
+    fast_override: ?bool = null,
     image_paths: std.ArrayList([]u8) = .empty,
     images: std.ArrayList(ImageAttachment) = .empty,
     system_prompt_override: ?[]u8 = null,
@@ -348,6 +352,7 @@ const AskOptions = struct {
         for (self.images.items) |image| types.freeImageAttachment(alloc, image);
         self.images.deinit(alloc);
         if (self.system_prompt_override) |s| alloc.free(s);
+        if (self.model_override) |m| alloc.free(m);
     }
 };
 
@@ -433,7 +438,6 @@ const RunDeps = struct {
     discard_pristine_session_ctx: ?*anyopaque = null,
     discard_pristine_session: DiscardPristineSessionFn = discardPristineSessionDefault,
     install_headless_interrupt: bool = false,
-    start_subagent_background_recovery: bool = true,
     stdin_source: StdinSource = .real,
 };
 
@@ -462,6 +466,9 @@ const RunOptions = struct {
     resume_target: ?ResumeTarget = null,
     color_enabled: bool = true,
     continue_recovery: bool = false,
+    model_override: ?[]const u8 = null,
+    effort_override: ?types.ReasoningEffort = null,
+    fast_override: ?bool = null,
     deps: RunDeps,
 };
 
@@ -599,7 +606,6 @@ const AskContext = struct {
     image_snapshot_temp_dir: ?[]u8 = null,
     prompt_snapshot_committed: bool = false,
     last_recovery_status: ?types.RouteRecoveryStatus = null,
-    retain_external_root_user_turn: bool = false,
 
     fn init(alloc: Allocator, cfg: Config, deps: RunDeps, workspace_root: []const u8) AskContext {
         const lifecycle_runtime = hooks.Runtime.init(alloc);
@@ -829,6 +835,24 @@ const AskContext = struct {
         );
     }
 
+    /// Record whether restored history references shell execution handles this
+    /// process does not own. Registry membership, not the resume itself,
+    /// decides staleness (see session_runtime.detectStaleShellHandles).
+    fn updateStaleShellHandles(self: *AskContext, history: []const session_runtime.HistoryTurn) void {
+        self.session.has_stale_shell_handles = session_runtime.detectStaleShellHandles(
+            self.alloc,
+            history,
+            &self.managed_executions,
+        ) catch |err| blk: {
+            debug_trace.logf(
+                "session",
+                "event=stale_shell_handle_scan outcome=skipped err={s}",
+                .{@errorName(err)},
+            );
+            break :blk false;
+        };
+    }
+
     fn initializeSessionStores(self: *AskContext) !void {
         var store = session_store.Store.init(self.alloc, self.workspace_root) catch |err| {
             if (err == error.OutOfMemory or self.requested_resume != null) return err;
@@ -874,6 +898,7 @@ const AskContext = struct {
                 writable.state.history,
                 writable.state.permission_state,
             );
+            updateStaleShellHandles(self, writable.state.history);
             writable.releaseHydrationHistory(self.alloc);
             if (writable.state.usage) |usage| {
                 try self.session.usage.restore(
@@ -908,24 +933,21 @@ const AskContext = struct {
             self.effort = preferences.effort;
             self.fast_mode = preferences.fast_mode;
         }
-        self.subagent_host = try subagent_tool_host.Runtime.create(
+        self.subagent_host = subagent_tool_host.Runtime.create(
             self.alloc,
             &self.store.?,
             self.writable.?.active_id,
             .{ .context = self, .resolve_fn = resolveAskSubagentAuthority },
             .{ .context = self, .run_fn = runAskChild },
-        );
-        if (self.deps.start_subagent_background_recovery) {
-            self.subagent_host.?.requestBackgroundRecovery(
-                io_mod.milliTimestamp(),
-            ) catch |err| {
-                debug_trace.logf(
-                    "subagent",
-                    "ask background recovery unavailable root_id={s} outcome={s}",
-                    .{ self.subagent_host.?.root_id, @errorName(err) },
-                );
-            };
-        }
+        ) catch |err| blk: {
+            if (err == error.OutOfMemory) return err;
+            debug_trace.logf(
+                "subagent",
+                "ask subagent host unavailable root_id={s} err={s}",
+                .{ self.writable.?.active_id, @errorName(err) },
+            );
+            break :blk null;
+        };
         const capability = try self.writable.?.childCapability();
         if (legacy_background_migration.migrate(
             self.alloc,
@@ -1293,6 +1315,9 @@ fn runWithDeps(alloc: Allocator, args: []const [:0]const u8, cfg: Config, deps: 
         .resume_target = options.resume_target,
         .color_enabled = !options.no_color,
         .continue_recovery = options.continue_recovery,
+        .model_override = options.model_override,
+        .effort_override = options.effort_override,
+        .fast_override = options.fast_override,
         .deps = deps,
     }) catch |err| {
         if (interrupt_scope.requested()) return headless_interrupt.exitCode();
@@ -1422,7 +1447,8 @@ fn missingCredentialResult(
     };
 }
 
-fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: ?PermissionMode, cfg: Config, options: RunOptions) !PromptRunResult {
+fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: ?PermissionMode, initial_cfg: Config, options: RunOptions) !PromptRunResult {
+    var cfg = initial_cfg;
     var owned_prompt = try alloc.dupe(u8, prompt);
     defer alloc.free(owned_prompt);
 
@@ -1445,6 +1471,7 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
             cfg.default_agent_step_limit,
         );
     defer startup.deinit(alloc);
+    cfg.provider_set.definitions = startup.configured_providers.definitions;
     try checkHeadlessCancellation(options.deps);
 
     var permission_mode = toCorePermissionMode(startup.permission_mode);
@@ -1539,6 +1566,10 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
         try ctx.checkCancellation();
         try options.deps.initialize_session_stores(&ctx);
         try ctx.checkCancellation();
+        if (config_runtime.providerEnvOverride() != null) {
+            ctx.provider = startup.provider;
+            ctx.model = startup.selected_model;
+        }
         if (startup.model_source == .process_override) {
             ctx.model = startup.selected_model;
         } else if (ctx.requested_resume != null) {
@@ -1546,6 +1577,24 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
             ctx.model = owned_resumed_model.?;
         }
         ctx.session.setConversationLanguageFromUserMessage(owned_prompt);
+    }
+
+    // Ask flags are per-run overrides: they win over startup and resumed
+    // session preferences but are never persisted into session preferences.
+    if (options.model_override) |model| {
+        ctx.model = model;
+    }
+    if (options.effort_override) |effort| {
+        ctx.effort = effort;
+    }
+    if (options.fast_override) |fast| {
+        ctx.fast_mode = fast;
+    } else if (options.model_override != null and ctx.requested_resume == null and
+        startup.fast_mode_source == .compiled_default)
+    {
+        // Default fast mode applies to the compiled default model only; an
+        // explicit model override drops it unless --fast restores it.
+        ctx.fast_mode = false;
     }
 
     var recovery_checkpoint: ?session_codec.RecoveryCheckpoint = null;
@@ -1586,7 +1635,7 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
         }
     } else {
         const startup_matches_final_model = if (startup.credential) |credential|
-            model_provider.authorizesCredential(ctx.provider, credential.source)
+            startup.provider.same_authority(ctx.provider) and model_provider.authorizesCredential(ctx.provider, credential.source)
         else
             false;
         const startup_credential_is_final = startup_matches_final_model and
@@ -1642,10 +1691,10 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
             options.images,
     );
     defer types.freeImageAttachmentSlice(alloc, current_images);
-    defer if (options.save_session and !ctx.prompt_snapshot_committed) {
+    defer if (recovery_checkpoint == null and options.save_session and !ctx.prompt_snapshot_committed) {
         image_attachments.deleteUnreferencedImageSnapshots(current_images, restored_image_catalog);
     };
-    if (current_images.len > 0) {
+    if (recovery_checkpoint == null and current_images.len > 0) {
         try ctx.checkCancellation();
         _ = std.math.add(
             usize,
@@ -1657,7 +1706,10 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
         try ctx.checkCancellation();
     }
 
-    const authorized_image_catalog = try ctx.session.snapshotImageCatalog(alloc, current_images);
+    const authorized_image_catalog = if (recovery_checkpoint) |checkpoint|
+        try session_runtime.merge_image_catalog_history_turn(alloc, restored_image_catalog, checkpoint.interruptedTurn())
+    else
+        try ctx.session.snapshotImageCatalog(alloc, current_images);
     defer types.freeImageAttachmentSlice(alloc, authorized_image_catalog);
 
     try ctx.checkCancellation();
@@ -1780,12 +1832,18 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
     const deps = agentRuntimeDeps(&ctx);
     const semantic_presentation = if (ctx.presenter) |value| value.semanticSink() else null;
     try ctx.checkCancellation();
+    const title_task = maybeStartAskTitleTask(
+        &ctx,
+        false, // Automatic naming is interactive-only in this fork.
+        owned_prompt,
+        recovery_checkpoint == null and options.save_session and ctx.requested_resume == null,
+    );
+    defer if (title_task) |task| completeAskTitleTask(&ctx, task);
     const current_prompt_is_root_authority = if (ctx.writable) |writable|
         writable.external_prompt_origin == .persistent_child and
             recovery_checkpoint == null
     else
         false;
-    ctx.retain_external_root_user_turn = current_prompt_is_root_authority;
     options.deps.process_queued_prompt(&ctx.session.agent, &deps, semantic_presentation, ctx.lifecycleContext(), .{
         .system_prompt = cfg.prompt_policy.system_prompt,
         .model_prompt_overlay = cfg.prompt_policy.modelPromptOverlay(ctx.model),
@@ -1851,6 +1909,69 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
     var result = try takePromptRunResult(&ctx, alloc);
     finalizeFreshAuthSession(&ctx, &result);
     return result;
+}
+
+/// Starts background title generation for a fresh saved session. The task runs
+/// concurrently with the first turn and is applied by `completeAskTitleTask`
+/// on every exit path. The locally derived title remains when generation is
+/// skipped or unavailable.
+fn maybeStartAskTitleTask(
+    ctx: *AskContext,
+    setting_enabled: bool,
+    prompt: []const u8,
+    fresh_session: bool,
+) ?*session_title_generation.Task {
+    // Unit tests share the real provider bundles; never spawn network side
+    // calls from a test process. Wiring is covered by e2e mock servers.
+    if (comptime @import("builtin").is_test) return null;
+    if (comptime @import("builtin").os.tag == .wasi) return null;
+    if (!setting_enabled or !fresh_session) return null;
+    if (ctx.session.agent.history.items.len != 0) return null;
+    const writable = if (ctx.writable) |*value| value else return null;
+    const bundle = ctx.cfg.provider_set.select(ctx.provider);
+    const title_model = bundle.title_model orelse return null;
+    const agent_stream = bundle.agent_stream orelse return null;
+    const excerpt = session_title_generation.promptExcerpt(prompt) orelse return null;
+    if (ctx.credential_source != .host_managed and ctx.api_key.len == 0) return null;
+    const task = session_title_generation.Task.create(.{
+        .session_id = writable.active_id,
+        .model = title_model,
+        .prompt_excerpt = excerpt,
+        .api_key = if (ctx.api_key.len > 0) ctx.api_key else null,
+        .gateway_team = ctx.gateway_team,
+        .account_id = ctx.account_id,
+        .credential_source = ctx.credential_source,
+        .stream_provider = agent_stream,
+    }) catch return null;
+    task.spawn() catch |err| {
+        debug_trace.logf("session", "event=title_generation result=unavailable reason=spawn err={s}", .{@errorName(err)});
+        task.destroy();
+        return null;
+    };
+    return task;
+}
+
+/// Joins the bounded title task and installs the generated title unless the
+/// session already carries a user-set title.
+fn completeAskTitleTask(ctx: *AskContext, task: *session_title_generation.Task) void {
+    defer task.destroy();
+    task.join();
+    const title = task.takeTitle() orelse return;
+    defer std.heap.c_allocator.free(title);
+    ctx.session_write_mutex.lockUncancelable(io_mod.getIo());
+    defer ctx.session_write_mutex.unlock(io_mod.getIo());
+    const writable = if (ctx.writable) |*value| value else return;
+    if (!std.mem.eql(u8, writable.active_id, task.session_id)) {
+        debug_trace.logf("session", "event=title_generation_apply result=dropped reason=session_changed session={s}", .{task.session_id});
+        return;
+    }
+    const installed = session_title_generation.installGeneratedTitle(ctx.alloc, writable, ctx.session.agent.history.items, title) catch |err| {
+        debug_trace.logf("session", "event=title_generation_apply result=failed session={s} err={s}", .{ task.session_id, @errorName(err) });
+        return;
+    };
+    if (installed) {
+        debug_trace.logf("session", "event=title_generation_apply result=installed session={s}", .{task.session_id});
+    }
 }
 
 fn takePromptRunResult(ctx: *AskContext, alloc: Allocator) !PromptRunResult {
@@ -1999,12 +2120,18 @@ fn agentRuntimeDeps(ctx: *AskContext) agent_runtime.AgentRuntimeDeps {
         .refresh_gateway_credential = refreshGatewayCredential,
         .available_model_capabilities = availableModelCapabilities,
         .resolve_model_capabilities = resolveModelCapabilities,
+        .model_catalog_unavailable = modelCatalogUnavailable,
         .format_tool_execution_error = formatToolExecutionError,
         .record_tool_call_rejected = recordToolCallRejected,
         .report_usage = reportUsage,
         .usage = &ctx.session.usage,
         .usage_allocator = ctx.alloc,
     };
+}
+
+fn modelCatalogUnavailable(raw_ctx: *anyopaque) bool {
+    const ctx: *AskContext = @ptrCast(@alignCast(raw_ctx));
+    return ctx.capability_resolver.state == .failed;
 }
 
 fn releaseAgentTerminalLease(raw_ctx: *anyopaque, session_id: []const u8) !void {
@@ -2020,6 +2147,10 @@ fn refreshGatewayCredential(
     expected_account_id: ?[]const u8,
 ) !?[]u8 {
     const ctx: *AskContext = @ptrCast(@alignCast(raw_ctx));
+    if (mode == .if_needed and auth_runtime.requestPathCredentialVerifiedRecently(source)) {
+        debug_trace.logf("auth", "credential refresh skipped source={t} reason=verified_recently", .{source});
+        return null;
+    }
     var refreshed = (try auth_runtime.refreshCredentialForAccount(
         ctx.cfg.gateway_provider.oauth_transport,
         ctx.alloc,
@@ -2153,13 +2284,14 @@ fn appendRuntimeContext(raw_ctx: *anyopaque, arena: Allocator, messages: *std.Ar
         .access_scope = ctx.workspace_access.scope(ctx.workspace_root),
         .interactive = false,
         .permission_mode = ctx.permission_mode,
+        .stale_shell_handles = ctx.session.has_stale_shell_handles,
     }, arena, messages);
 }
 
-fn appendStaticContext(raw_ctx: *anyopaque, arena: Allocator, messages: *std.ArrayList(ChatMessage)) !void {
+fn appendStaticContext(raw_ctx: *anyopaque, arena: Allocator, project_context: ?[]const u8, messages: *std.ArrayList(ChatMessage)) !void {
     const ctx: *AskContext = @ptrCast(@alignCast(raw_ctx));
     try ctx.deps.context_registry.appendDefaultStatic(.{
-        .project_context = ctx.modelVisibleProjectContext(),
+        .project_context = project_context orelse ctx.modelVisibleProjectContext(),
     }, arena, messages);
     var snapshot = if (ctx.mcp) |mcp|
         try mcp.snapshotModelCatalog(arena, ctx.permission_rules, true)
@@ -2854,15 +2986,7 @@ fn propagateHistoryTurn(raw_ctx: *anyopaque, turn: HistoryTurn) !void {
         return;
     };
     try writable.prepareHistoryTurnForCommit(ctx.alloc, &prepared);
-    try subagent_resume_admission.retainExternalRootUserTurn(
-        ctx.store,
-        ctx.alloc,
-        writable,
-        prepared,
-        ctx.retain_external_root_user_turn,
-    );
-
-    _ = try writable.appendEvent(
+    _ = writable.appendEvent(
         ctx.alloc,
         .{ .history_turn_committed = .{
             .conversation_language = ctx.session.languageSnapshot(),
@@ -2871,7 +2995,10 @@ fn propagateHistoryTurn(raw_ctx: *anyopaque, turn: HistoryTurn) !void {
             .turn = prepared,
         } },
         io_mod.milliTimestamp(),
-    );
+    ) catch |err| {
+        if (err == error.SessionPersistenceUncertain) ctx.prompt_snapshot_committed = true;
+        return err;
+    };
     ctx.session.commitPreparedHistoryEntry(ctx.alloc, prepared);
     prepared_owned = false;
     ctx.prompt_snapshot_committed = true;
@@ -2889,7 +3016,10 @@ fn commitContextCompaction(
     const prepared = try session_runtime.prepareCompactedHistory(ctx.alloc, ctx.session.agent.history.items, summary, retained_from orelse .{ .turns = session_runtime.rawHistoryTurnCount(ctx.session.agent.history.items) });
     errdefer types.freeHistoryTurnSlice(ctx.alloc, prepared);
     if (ctx.writable) |*writable| {
-        _ = try writable.commitContextCompaction(ctx.alloc, summary, active_prefix, retained_from, io_mod.milliTimestamp());
+        _ = writable.commitContextCompaction(ctx.alloc, summary, active_prefix, retained_from, io_mod.milliTimestamp()) catch |err| {
+            if (err == error.SessionPersistenceUncertain and active_prefix != null) ctx.prompt_snapshot_committed = true;
+            return err;
+        };
         if (active_prefix != null) ctx.prompt_snapshot_committed = true;
     }
     ctx.session.commitCompactedHistory(ctx.alloc, prepared);
@@ -2900,6 +3030,9 @@ fn setRecoveryCheckpoint(
     checkpoint: session_codec.RecoveryCheckpoint,
 ) !void {
     const ctx: *AskContext = @ptrCast(@alignCast(raw_ctx));
+    errdefer |err| if (err == error.SessionPersistenceUncertain) {
+        ctx.prompt_snapshot_committed = true;
+    };
     ctx.session_write_mutex.lockUncancelable(io_mod.getIo());
     defer ctx.session_write_mutex.unlock(io_mod.getIo());
     const writable = if (ctx.writable) |*value| value else return error.SessionPersistenceUnavailable;
@@ -2909,6 +3042,7 @@ fn setRecoveryCheckpoint(
         .{ .recovery_checkpoint_set = .{ .checkpoint = checkpoint } },
         now_ms,
     );
+    ctx.prompt_snapshot_committed = true;
 }
 
 fn flushAskSessionUsage(
@@ -3605,6 +3739,24 @@ fn parseOptionsWithStdin(alloc: Allocator, args: []const [:0]const u8, stdin: St
         } else if (std.mem.eql(u8, arg, "--full-access") or std.mem.eql(u8, arg, "--yolo")) {
             if (opts.permission_override != null) return error.InvalidAskArgs;
             opts.permission_override = .yolo;
+        } else if (std.mem.eql(u8, arg, "--model")) {
+            i += 1;
+            if (i >= args.len) return error.InvalidAskArgs;
+            const model = std.mem.trim(u8, args[i], " \t\r\n");
+            if (model.len == 0) return error.InvalidAskArgs;
+            const owned_model = try alloc.dupe(u8, model);
+            if (opts.model_override) |old| alloc.free(old);
+            opts.model_override = owned_model;
+        } else if (std.mem.eql(u8, arg, "--effort")) {
+            i += 1;
+            if (i >= args.len) return error.InvalidAskArgs;
+            opts.effort_override = types.ReasoningEffort.parse(args[i]) orelse
+                return error.InvalidAskArgs;
+        } else if (std.mem.eql(u8, arg, "--fast") or std.mem.eql(u8, arg, "--no-fast")) {
+            const enabled = std.mem.eql(u8, arg, "--fast");
+            if (opts.fast_override != null and opts.fast_override.? != enabled)
+                return error.InvalidAskArgs;
+            opts.fast_override = enabled;
         } else if (std.mem.eql(u8, arg, "--resume") or std.mem.eql(u8, arg, "--resume-id")) {
             if (opts.resume_target != null) return error.InvalidAskArgs;
             const exact_id = std.mem.eql(u8, arg, "--resume-id");
@@ -4644,7 +4796,7 @@ const TestContextRegistryFixture = struct {
         defer messages.deinit(arena);
 
         const append_static = deps.append_static_context orelse return error.TestExpectedEqual;
-        try append_static(deps.ctx, arena, &messages);
+        try append_static(deps.ctx, arena, null, &messages);
         try deps.append_runtime_context(deps.ctx, arena, &messages);
         try std.testing.expectEqual(
             ctx.permission_mode,
@@ -4721,49 +4873,6 @@ fn testPermissionRuleSet(alloc: Allocator, permission: []const u8, pattern: []co
         .pattern = owned_pattern,
         .action = action,
     };
-    return rules;
-}
-
-fn testPermissionRuleSetPair(
-    alloc: Allocator,
-    permission: []const u8,
-    first_pattern: []const u8,
-    first_action: types.PermissionAction,
-    second_pattern: []const u8,
-    second_action: types.PermissionAction,
-) !types.PermissionRuleSet {
-    const entries = [_]struct {
-        pattern: []const u8,
-        action: types.PermissionAction,
-    }{
-        .{ .pattern = first_pattern, .action = first_action },
-        .{ .pattern = second_pattern, .action = second_action },
-    };
-    var rules: types.PermissionRuleSet = .{
-        .rules = try alloc.alloc(types.PermissionRule, entries.len),
-    };
-    errdefer alloc.free(rules.rules);
-    var initialized: usize = 0;
-    errdefer {
-        for (rules.rules[0..initialized]) |rule| {
-            alloc.free(rule.permission);
-            alloc.free(rule.pattern);
-        }
-    }
-
-    for (entries, 0..) |entry, index| {
-        const owned_permission = try alloc.dupe(u8, permission);
-        const owned_pattern = alloc.dupe(u8, entry.pattern) catch |err| {
-            alloc.free(owned_permission);
-            return err;
-        };
-        rules.rules[index] = .{
-            .permission = owned_permission,
-            .pattern = owned_pattern,
-            .action = entry.action,
-        };
-        initialized += 1;
-    }
     return rules;
 }
 
@@ -4975,7 +5084,7 @@ test "CLI prompt projection configures web search then blocks native execution" 
     defer messages.deinit(arena);
     const deps = agentRuntimeDeps(&ctx);
     const append_static = deps.append_static_context orelse return error.TestExpectedEqual;
-    try append_static(deps.ctx, arena, &messages);
+    try append_static(deps.ctx, arena, null, &messages);
     try deps.append_runtime_context(deps.ctx, arena, &messages);
 
     try std.testing.expectEqualStrings("stale-key", ctx.web_search_runtime.api_key);
@@ -5202,6 +5311,54 @@ test "parse options preserves full access aliases after the delimiter as prompt 
         try std.testing.expectEqual(@as(?PermissionMode, case.mode), options.permission_override);
         try std.testing.expectEqualStrings("--full-access --yolo --auto", options.prompt);
     }
+}
+
+test "parse options preserves model effort and fast overrides" {
+    const alloc = std.testing.allocator;
+    var options = try parseOptionsWithStdin(alloc, &.{
+        "--model",
+        "provider/override-model",
+        "--effort",
+        "high",
+        "--fast",
+        "hello",
+    }, .tty);
+    defer options.deinit(alloc);
+
+    try std.testing.expectEqualStrings("provider/override-model", options.model_override.?);
+    try std.testing.expect(options.effort_override.?.eql(types.ReasoningEffort.literal("high")));
+    try std.testing.expectEqual(@as(?bool, true), options.fast_override);
+    try std.testing.expectEqualStrings("hello", options.prompt);
+
+    var off = try parseOptionsWithStdin(alloc, &.{ "--no-fast", "hello" }, .tty);
+    defer off.deinit(alloc);
+    try std.testing.expectEqual(@as(?bool, false), off.fast_override);
+
+    var defaulted = try parseOptionsWithStdin(alloc, &.{"hello"}, .tty);
+    defer defaulted.deinit(alloc);
+    try std.testing.expectEqual(@as(?[]u8, null), defaulted.model_override);
+    try std.testing.expectEqual(@as(?types.ReasoningEffort, null), defaulted.effort_override);
+    try std.testing.expectEqual(@as(?bool, null), defaulted.fast_override);
+
+    var last_model = try parseOptionsWithStdin(alloc, &.{ "--model", "first/model", "--model", "second/model", "hello" }, .tty);
+    defer last_model.deinit(alloc);
+    try std.testing.expectEqualStrings("second/model", last_model.model_override.?);
+}
+
+test "parse options rejects invalid model effort and fast flag forms" {
+    const alloc = std.testing.allocator;
+    try std.testing.expectError(error.InvalidAskArgs, parseOptionsWithStdin(alloc, &.{"--model"}, .tty));
+    try std.testing.expectError(error.InvalidAskArgs, parseOptionsWithStdin(alloc, &.{ "--model", "  ", "hello" }, .tty));
+    try std.testing.expectError(error.InvalidAskArgs, parseOptionsWithStdin(alloc, &.{"--effort"}, .tty));
+    try std.testing.expectError(error.InvalidAskArgs, parseOptionsWithStdin(alloc, &.{ "--effort", "not an effort", "hello" }, .tty));
+    try std.testing.expectError(error.InvalidAskArgs, parseOptionsWithStdin(alloc, &.{ "--fast", "--no-fast", "hello" }, .tty));
+    try std.testing.expectError(error.InvalidAskArgs, parseOptionsWithStdin(alloc, &.{ "--no-fast", "--fast", "hello" }, .tty));
+
+    var literal = try parseOptionsWithStdin(alloc, &.{ "--", "--model", "--fast" }, .tty);
+    defer literal.deinit(alloc);
+    try std.testing.expectEqual(@as(?[]u8, null), literal.model_override);
+    try std.testing.expectEqual(@as(?bool, null), literal.fast_override);
+    try std.testing.expectEqualStrings("--model --fast", literal.prompt);
 }
 
 test "headless yolo warning reaches stderr before acknowledgment persistence" {
@@ -7160,12 +7317,11 @@ fn exerciseSavedAskSessionStoreAllocation(
     defer stdout_capture.deinit(setup_alloc);
     var stderr_capture: TestCapture = .{};
     defer stderr_capture.deinit(setup_alloc);
-    var deps = testPromptRunDeps(
+    const deps = testPromptRunDeps(
         &stdout_capture,
         &stderr_capture,
         testPresentKeyStartup,
     );
-    deps.start_subagent_background_recovery = false;
     var ctx = AskContext.init(
         alloc,
         testConfig(),
@@ -8630,15 +8786,18 @@ test "json run with missing API key prints diagnostic then final object" {
     );
 }
 
-test "ordinary resumed ask preserves its user after a retained mid-turn checkpoint" {
+test "resumed ask preserves user and image identity after a retained mid-turn checkpoint" {
     const Process = struct {
         fn run(_: *agent_runtime.Agent, deps: *const agent_runtime.AgentRuntimeDeps, _: ?agent_runtime.SemanticPresentationSink, _: agent_runtime.LifecycleContext, _: agent_runtime.Config, job: worker_runtime.QueuedPrompt) !void {
             if (job.recovery_checkpoint) |checkpoint| {
                 try std.testing.expectEqual(@as(u64, 7), checkpoint.turn_id);
                 try std.testing.expectEqualStrings("original request", job.prompt);
+                try std.testing.expectEqual(@as(usize, 7), job.images[0].id);
+                try std.testing.expectEqual(@as(usize, 1), job.authorized_image_catalog.len);
+                try std.testing.expectEqualStrings(job.images[0].snapshot_sha256.?, job.authorized_image_catalog[0].snapshot_sha256.?);
             }
             try deps.propagate_history_turn(deps.ctx, .{ .assistant = .{
-                .user = .{ .text = job.prompt },
+                .user = .{ .text = job.prompt, .images = job.images },
                 .assistant = @constCast("new answer"),
             } });
             try testPushAssistantText(deps, "new answer");
@@ -8662,7 +8821,17 @@ test "ordinary resumed ask preserves its user after a retained mid-turn checkpoi
         defer store.deinit(alloc);
         var state = try testAskDurableState(alloc, "/tmp/fx-test", session_id);
         defer state.deinit(alloc);
-        const old_user = types.UserTurn{ .text = @constCast("original request") };
+        var images = [_]ImageAttachment{.{
+            .id = 7,
+            .path = @constCast("/missing/original.png"),
+            .media_type = @constCast("image/png"),
+            .snapshot_path = @constCast("images/image-7-aaaaaaaaaaaaaaaa.bin"),
+            .snapshot_sha256 = @constCast("a" ** 64),
+        }};
+        const old_user = types.UserTurn{
+            .text = @constCast("original request"),
+            .images = if (case.continue_recovery) &images else &.{},
+        };
         {
             var writable = try store.startWritableSession(alloc, state);
             defer writable.deinit(alloc);

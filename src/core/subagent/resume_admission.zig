@@ -9,7 +9,6 @@ const catalog_cache = @import("../session/session_catalog_cache.zig");
 const session_summary_codec = @import("../session/session_summary_codec.zig");
 
 const Allocator = std.mem.Allocator;
-const max_page_limit: usize = 100;
 
 pub const ActionableContinuation = struct {
     updated_at_ms: i64,
@@ -22,19 +21,6 @@ pub const ActionableContinuation = struct {
 
     pub fn view(self: ActionableContinuation) session_store.ResumableSessionContinuation {
         return .{ .updated_at_ms = self.updated_at_ms, .id = self.id };
-    }
-};
-
-pub const ActionableSessionPage = struct {
-    summaries: std.ArrayList(session_store.SessionSummary) = .empty,
-    has_more: bool = false,
-    continuation: ?ActionableContinuation = null,
-
-    pub fn deinit(self: *ActionableSessionPage, alloc: Allocator) void {
-        for (self.summaries.items) |*summary| summary.deinit(alloc);
-        self.summaries.deinit(alloc);
-        if (self.continuation) |*continuation| continuation.deinit(alloc);
-        self.* = undefined;
     }
 };
 
@@ -104,9 +90,18 @@ const CatalogWorker = struct {
             const is_active = if (self.read.active_id) |active| std.mem.eql(u8, id, active) else false;
             if (is_active and !candidate.summary.hasResumableContent()) continue;
             if (self.read.cancelled.load(.acquire)) return error.Cancelled;
-            var cacheable = candidate.storage == .conversation;
-            const managed = if (!candidate.summary.hasResumableContent()) true else child_state.isListedManagedChildSession(self.read.store, self.alloc, &candidate) catch |err| switch (err) {
+            // Every storage class can reuse a cached row once the fingerprint
+            // binds its classification inputs, with one exception: stale
+            // schema_v3 sessions belong to the legacy ranking cache, which
+            // stores one row per id in the same file. Publishing a picker row
+            // for one would supersede its ranking row and thrash both caches.
+            var cacheable = candidate.storage != .schema_v3 or candidate.projection_state != .stale;
+            const managed = if (!candidate.summary.hasResumableContent()) true else child_state.isDiscoveredManagedChildSession(self.read.store, self.alloc, candidate.summary.id, candidate.subagent_child) catch |err| switch (err) {
                 error.OutOfMemory => return err,
+                // A missing file (typically a legacy session without an event
+                // log) is itself fingerprinted state, so the exclusion is as
+                // stable as the directory stats and can be cached.
+                error.FileNotFound => true,
                 else => blk: {
                     cacheable = false;
                     break :blk true;
@@ -301,84 +296,13 @@ pub fn loadVisibleReadOnlyDetail(
     };
     if (managed) return error.SessionNotFound;
 
-    var detail = try store.loadReadOnlyDetail(alloc, session_id, options);
+    var detail = store.loadReadOnlyAdmissionDetail(alloc, session_id, options) catch |err| switch (err) {
+        error.ConversationHistoryUnavailable => return error.SessionNotFound,
+        else => return err,
+    };
     errdefer detail.deinit(alloc);
     if (detail.state.subagent_child) return error.SessionNotFound;
     return detail;
-}
-
-pub fn listActionablePage(
-    store: session_store.Store,
-    alloc: Allocator,
-    scope: session_store.SessionListScope,
-    active_id: ?[]const u8,
-    continuation: ?session_store.ResumableSessionContinuation,
-    limit: usize,
-) !ActionableSessionPage {
-    if (limit == 0 or limit > max_page_limit) return error.InvalidSessionListLimit;
-
-    var result: ActionableSessionPage = .{};
-    errdefer result.deinit(alloc);
-    var position: ?ActionableContinuation = if (continuation) |value| .{
-        .updated_at_ms = value.updated_at_ms,
-        .id = try alloc.dupe(u8, value.id),
-    } else null;
-    defer if (position) |*value| value.deinit(alloc);
-
-    var scanned: usize = 0;
-    while (result.summaries.items.len < limit and scanned < max_page_limit) {
-        var scoped = store;
-        scoped.resume_page_limit = @min(
-            limit - result.summaries.items.len,
-            max_page_limit - scanned,
-        );
-        const next = if (position) |value| value.view() else null;
-        var page = switch (scope) {
-            .current_workspace => try scoped.listResumableWorkspacePage(
-                alloc,
-                active_id,
-                next,
-            ),
-            .all_workspaces => try scoped.listResumablePage(
-                alloc,
-                active_id,
-                next,
-            ),
-        };
-        defer page.deinit(alloc);
-        result.has_more = page.has_more;
-        if (page.summaries.items.len == 0) break;
-
-        for (page.summaries.items) |summary| {
-            scanned += 1;
-            if (position) |*value| value.deinit(alloc);
-            position = .{
-                .updated_at_ms = summary.updated_at_ms,
-                .id = try alloc.dupe(u8, summary.id),
-            };
-            const managed = child_state.isManagedChildSession(
-                store,
-                alloc,
-                summary.id,
-            ) catch |err| switch (err) {
-                error.OutOfMemory => return error.OutOfMemory,
-                else => true,
-            };
-            if (managed) continue;
-            var cloned = try session_summary_codec.cloneSessionSummary(alloc, summary);
-            result.summaries.append(alloc, cloned) catch |err| {
-                cloned.deinit(alloc);
-                return err;
-            };
-        }
-        if (!page.has_more) break;
-    }
-
-    if (position) |value| {
-        result.continuation = value;
-        position = null;
-    }
-    return result;
 }
 
 pub fn resumeForExternalPrompt(
@@ -402,36 +326,6 @@ pub fn resumeForExternalPrompt(
     try ensureExternalMarkerAllowed(store, alloc, loaded.active_id);
     try ensureLoadedExternalPromptAllowed(&loaded);
     return loaded;
-}
-
-/// Direct child prompts no longer exist. Parent-owned child execution resumes
-/// child history internally, so an externally resumed ordinary session has no
-/// subagent root-user evidence to retain.
-pub fn retainExternalRootUserTurn(
-    _: ?session_store.Store,
-    _: Allocator,
-    _: *session_store.LoadedWritableSession,
-    _: session.HistoryTurn,
-    _: bool,
-) !void {}
-
-fn ensureExternalPromptAllowed(
-    store: session_store.Store,
-    alloc: Allocator,
-    session_id: []const u8,
-) !void {
-    const managed = child_state.isManagedChildSession(
-        store,
-        alloc,
-        session_id,
-    ) catch |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
-        error.SessionNotFound,
-        error.SessionStoreUnavailable,
-        => return,
-        else => return err,
-    };
-    if (managed) return error.OneOffSessionNotResumable;
 }
 
 fn isVisibleSession(
@@ -591,6 +485,42 @@ test "actionable catalog preserves discovery and child visibility" {
     var read_only = try session_store.Store.initReadOnlyFromHome(alloc, home, workspace);
     defer read_only.deinit(alloc);
     try std.testing.expect((try catalog_cache.Writer.init(read_only)) == null);
+}
+
+test "actionable catalog caches legacy sessions without event logs" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "home/.fx/sessions/legacy-old");
+    try tmp.dir.createDirPath(std.testing.io, "workspace");
+    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
+    defer alloc.free(home);
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
+    defer alloc.free(workspace);
+    // Oldest persisted format: a schema v2 snapshot with no event log.
+    const manifest = try std.fmt.allocPrint(alloc, "{{\"schema_version\":2,\"id\":\"legacy-old\",\"created_at_ms\":1,\"updated_at_ms\":2,\"workspace_root\":\"{s}\",\"conversation_language\":\"en\",\"history_len\":1,\"history\":[{{\"role\":\"user\",\"content\":\"saved\"}}],\"total_input_tokens\":0,\"total_output_tokens\":0}}\n", .{workspace});
+    defer alloc.free(manifest);
+    var file = try tmp.dir.createFile(std.testing.io, "home/.fx/sessions/legacy-old/session.json", .{});
+    try file.writeStreamingAll(std.testing.io, manifest);
+    file.close(std.testing.io);
+
+    var store = try session_store.Store.initFromHome(alloc, home, workspace);
+    defer store.deinit(alloc);
+    var writer = (try catalog_cache.Writer.init(store)).?;
+    defer writer.deinit();
+    var stopped = std.atomic.Value(bool).init(false);
+    var catalog = try listActionableCatalog(store, alloc, null, &stopped, &writer);
+    defer catalog.deinit(alloc);
+    // Legacy sessions stay excluded from the picker, but the exclusion must
+    // land in the cache so later scans reuse it instead of reparsing.
+    try std.testing.expectEqual(@as(usize, 0), catalog.summaries.items.len);
+    var saved = try catalog_cache.Loaded.load(alloc, writer.dir, null);
+    defer saved.deinit(alloc);
+    try std.testing.expect(saved.present());
+    try std.testing.expect(saved.contains("legacy-old"));
+    var again = try listActionableCatalog(store, alloc, null, &stopped, &writer);
+    defer again.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 0), again.summaries.items.len);
 }
 
 test "managed child marker is hidden from external access" {
