@@ -5,7 +5,6 @@ const Allocator = std.mem.Allocator;
 
 pub const TopLevelKind = command_specs.TopLevelKind;
 pub const TopLevelSpec = command_specs.TopLevelSpec;
-pub const TopLevelHelpEntry = command_specs.TopLevelHelpEntry;
 pub const TopLevelHelpGroup = command_specs.TopLevelHelpGroup;
 pub const TopLevelFlag = command_specs.TopLevelFlag;
 pub const TopLevelExample = command_specs.TopLevelExample;
@@ -30,12 +29,16 @@ pub const top_level_specs = [_]TopLevelSpec{
     .{
         .kind = .ask,
         .token = "ask",
-        .usage = "ask [--auto|--full-access] [--image PATH] [--system TEXT] [--json] [--quiet] [--prompt-permissions] [--no-save] [--no-color] [--resume <last|id>|--resume-id <id>] [--continue-recovery] [--] <prompt>",
+        .usage = "ask [--auto|--full-access] [--model <id>] [--effort <level>] [--fast|--no-fast] [--image PATH] [--system TEXT] [--json] [--quiet] [--prompt-permissions] [--no-save] [--no-color] [--resume <last|id>|--resume-id <id>] [--continue-recovery] [--] <prompt>",
         .summary = "Run one noninteractive request",
         .options = &.{
             .{ .flag = "--auto", .description = "Automatically review unresolved permission requests" },
             .{ .flag = "--full-access", .description = "Disable fx permission checks" },
             .{ .flag = "--yolo", .description = "Alias for --full-access" },
+            .{ .flag = "--model <id>", .description = "Override the model for this request" },
+            .{ .flag = "--effort <level>", .description = "Override the reasoning effort for this request" },
+            .{ .flag = "--fast", .description = "Enable Fast mode for this request when the model supports it" },
+            .{ .flag = "--no-fast", .description = "Disable Fast mode for this request" },
             .{ .flag = "--image PATH", .description = "Attach an image file; repeat for multiple images" },
             .{ .flag = "--system TEXT", .description = "Replace the built-in system prompt for this request" },
             json_option,
@@ -163,7 +166,7 @@ pub const top_level_specs = [_]TopLevelSpec{
     .{
         .kind = .provider,
         .token = "provider",
-        .usage = "provider <gateway|codex|grok>",
+        .usage = "provider <name>",
         .summary = "Choose the model provider used by fx",
     },
     .{
@@ -304,7 +307,7 @@ pub const top_level_help_groups = [_]TopLevelHelpGroup{
     .{ .entries = &.{
         .{ .kind = .login, .usage = "login [vercel|codex|grok]", .summary = "Sign in to a model provider" },
         .{ .kind = .logout, .usage = "logout [vercel|codex|grok]", .summary = "Sign out of a model provider" },
-        .{ .kind = .provider, .usage = "provider <gateway|codex|grok>", .summary = "Choose the active model provider" },
+        .{ .kind = .provider, .usage = "provider <name>", .summary = "Choose the active model provider" },
         .{ .kind = .models, .usage = "models" },
     } },
     .{ .entries = &.{
@@ -349,8 +352,24 @@ pub const top_level_flags = [_]TopLevelFlag{
         .description = "Allow only this native tool; repeatable",
     },
     .{
+        .usage = "--provider <name>",
+        .description = "Override the model provider for an interactive session (gateway, codex, grok, or a configured name)",
+    },
+    .{
+        .usage = "--model <id>",
+        .description = "Override the model for an interactive session",
+    },
+    .{
+        .usage = "--effort <level>",
+        .description = "Override the reasoning effort for an interactive session",
+    },
+    .{
+        .usage = "--fast, --no-fast",
+        .description = "Turn Fast mode on or off for an interactive session",
+    },
+    .{
         .usage = "-c, --continue",
-        .description = "Resume the latest workspace session",
+        .description = "Resume the remembered workspace session",
     },
     .{
         .usage = "-r",
@@ -486,10 +505,6 @@ pub fn renderSlashHelp(alloc: Allocator) ![]u8 {
     return command_specs.renderSlashHelp(alloc, slash_registry);
 }
 
-pub fn renderSlashWelcome(alloc: Allocator) ![]u8 {
-    return command_specs.renderSlashWelcome(alloc, slash_registry);
-}
-
 pub fn firstSlashCompletion(prefix: []const u8) ?[]const u8 {
     return command_specs.firstSlashCompletion(slash_registry, prefix);
 }
@@ -519,11 +534,6 @@ pub fn slashCompletionHasArgs(command: []const u8) bool {
 }
 
 pub const argCompletionAnchor = command_specs.argCompletionAnchor;
-pub const argCompletionIndexForLabel = command_specs.argCompletionIndexForLabel;
-pub const allowlistArgCompletionPrefix = command_specs.allowlistArgCompletionPrefix;
-pub const statuslineArgCompletionPrefix = command_specs.statuslineArgCompletionPrefix;
-pub const notificationsArgCompletionPrefix = command_specs.notificationsArgCompletionPrefix;
-pub const permissionsArgCompletionPrefix = command_specs.permissionsArgCompletionPrefix;
 
 test "built-in slash commands register exact active order" {
     const expected_commands = [_][]const u8{
