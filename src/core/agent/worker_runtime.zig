@@ -987,7 +987,7 @@ pub const WorkerRuntime = struct {
     };
 
     pub fn enqueuePrompt(self: *WorkerRuntime, alloc: std.mem.Allocator, prompt: QueuedPrompt) !void {
-        try self.admitPromptObserved(alloc, prompt, false, null);
+        _ = try self.admitPromptObserved(alloc, prompt, false, null);
     }
 
     pub fn enqueuePromptObserved(
