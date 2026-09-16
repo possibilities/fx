@@ -2,6 +2,7 @@
 // own carried behavior. Keeping this root separate from main.zig avoids
 // compiling and discovering the complete native test graph for every edit.
 test {
+    _ = @import("core/agent/runtime/tests/tool_flow.zig");
     _ = @import("acp/sessions.zig");
     _ = @import("acp/types.zig");
     _ = @import("acp/prompt.zig");

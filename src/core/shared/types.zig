@@ -42,6 +42,21 @@ pub const SemanticNotice = struct {
     visibility: NoticeVisibility = .compact_and_full,
 };
 
+/// Status glyph leading every semantic notice, keyed by tone. Tool activity
+/// owns "●"; notices deliberately use distinct git-style status glyphs so the
+/// two channels never read as the same raw marker. The neutral marker "*"
+/// avoids the middot, which the footer already uses as a separator.
+pub fn noticeGlyph(tone: NoticeTone) []const u8 {
+    return switch (tone) {
+        .information => "i",
+        .success => "✓",
+        .warning => "!",
+        .@"error" => "✗",
+        .cancelled => "⊘",
+        .neutral => "*",
+    };
+}
+
 /// Returns a duplicate with owned topic and body bytes. The caller frees it
 /// with `freeSemanticNotice` using the same allocator.
 pub fn dupeSemanticNotice(alloc: std.mem.Allocator, notice: SemanticNotice) std.mem.Allocator.Error!SemanticNotice {
@@ -96,6 +111,7 @@ pub const CredentialSource = enum {
     chatgpt_subscription,
     grok_subscription,
     host_managed,
+    configured,
 };
 
 pub const DirectCredentialLease = struct {
@@ -156,7 +172,7 @@ test "empty direct credential lease preserves absent authority" {
 
 pub fn parseCredentialSource(text: []const u8) ?CredentialSource {
     const source = parseRuntimeCredentialSource(text) orelse return null;
-    return if (source == .host_managed) null else source;
+    return if (source == .host_managed or source == .configured) null else source;
 }
 
 pub fn parseRuntimeCredentialSource(text: []const u8) ?CredentialSource {
@@ -165,7 +181,7 @@ pub fn parseRuntimeCredentialSource(text: []const u8) ?CredentialSource {
 
 test "credential source round trips through its persisted name" {
     for (std.meta.tags(CredentialSource)) |source| {
-        if (source == .host_managed) continue;
+        if (source == .host_managed or source == .configured) continue;
         try std.testing.expectEqual(source, parseCredentialSource(@tagName(source)).?);
     }
     try std.testing.expect(parseCredentialSource("keychain") == null);
@@ -248,6 +264,7 @@ pub const TurnPhase = enum {
     thinking,
     generating,
     running,
+    waiting_for_subagent,
 };
 
 pub const TurnPhaseUpdate = struct {
@@ -299,6 +316,7 @@ pub const ModelRecoveryCause = enum {
     system_resumed,
     authentication,
     request_limit_reached,
+    compaction_prepared,
 };
 
 pub const ModelRecoveryAction = enum {
@@ -334,6 +352,7 @@ pub const ModelFailureDiagnostic = struct {
             .system_resumed => "SystemResumed",
             .authentication => "AuthenticationExpired",
             .request_limit_reached => "ProviderRequestLimitReached",
+            .compaction_prepared => "CompactionPrepared",
         };
     }
 
@@ -481,6 +500,7 @@ pub const RouteRecoveryStatus = struct {
             .system_resumed => "Mac woke from sleep",
             .authentication => "Authentication refreshed",
             .request_limit_reached => "Provider request limit reached",
+            .compaction_prepared => "Resuming saved compaction",
         };
         const action = switch (self.action orelse .retrying_request) {
             .retrying_request => "retrying request",
@@ -586,6 +606,7 @@ pub const RouteRecoveryStatus = struct {
             .system_resumed => "Mac woke from sleep",
             .authentication => "Authentication expired",
             .request_limit_reached => unreachable,
+            .compaction_prepared => "Saved compaction",
         };
         return self.pausedCauseLabel(buf, name);
     }
@@ -794,6 +815,23 @@ pub const WebFetchCompletion = struct {
     }
 };
 
+pub const SubagentStatus = struct {
+    session_title: ?[]const u8 = null,
+    model: []const u8,
+    effort: ReasoningEffort,
+    input_tokens: u64,
+    context_window: ?u32,
+};
+
+pub const SubagentStatusRenderer = struct {
+    ctx: *anyopaque,
+    render_fn: *const fn (*anyopaque, buf: []u8, SubagentStatus) []const u8,
+
+    pub fn render(self: SubagentStatusRenderer, buf: []u8, status: SubagentStatus) []const u8 {
+        return self.render_fn(self.ctx, buf, status);
+    }
+};
+
 pub const PersistedToolStatus = enum {
     success,
     failure,
@@ -856,6 +894,7 @@ pub const PersistedToolResult = struct {
     stored_output_bytes: usize,
     truncated: bool = false,
     provider_native: bool = false,
+    review_feedback: bool = false,
     created_at_ms: i64 = 0,
     permission_feedback: [][]u8 = &.{},
     committed_file_presentation: ?CommittedFilePresentation = null,
@@ -1007,6 +1046,8 @@ test "persisted deferred tool result classifier is exact" {
 }
 
 pub const ToolResultMemory = struct {
+    /// Host review feedback is retained for the agent, not security evidence.
+    review_feedback: bool = false,
     tool_images: []const ToolImage = &.{},
     tool_image_handle: ?[]const u8 = null,
     output_handle: ?[]const u8 = null,
@@ -1033,6 +1074,8 @@ pub const PersistedSteering = struct {
     assistant_prefix: ?[]u8 = null,
     after_tool_step_count: usize,
 };
+
+pub const SteeringDelivery = enum(u8) { queued, applied, not_applied };
 
 pub const FileEvidence = struct {
     path: []u8,
@@ -1120,7 +1163,7 @@ pub const ProviderReplay = struct {
     parts_json: []const u8,
 
     pub fn matches(self: ProviderReplay, source: @import("../config/model_provider.zig").ProviderSelection) bool {
-        return self.source.provider == source.provider and std.mem.eql(u8, self.source.model, source.model);
+        return self.source.provider.same_authority(source.provider) and std.mem.eql(u8, self.source.model, source.model);
     }
 };
 
@@ -1147,6 +1190,8 @@ pub const ChatMessage = struct {
     tool_result_status: ?PersistedToolStatus = null,
     tool_result_memory: ?ToolResultMemory = null,
     permission_feedback: bool = false,
+    // Source provenance for compaction, never permission authority.
+    context_origin: enum { ordinary, user_turn, handoff } = .ordinary,
     standalone_response: bool = false,
 };
 
@@ -1867,6 +1912,11 @@ pub const InterruptedTerminalReason = enum {
     failed,
 };
 
+pub const CancellationOrigin = enum {
+    turn,
+    compaction,
+};
+
 pub const InterruptedHistoryTurn = struct {
     user: UserTurn,
     assistant: ?[]u8 = null,
@@ -1875,6 +1925,7 @@ pub const InterruptedHistoryTurn = struct {
     execution: ExecutionMemory = .{},
     cancelled_command: ?CancelledCommandPresentation = null,
     terminal_reason: InterruptedTerminalReason = .cancelled,
+    cancellation_origin: CancellationOrigin = .turn,
 };
 
 pub const context_handoff_open = "<context_handoff>";
@@ -2285,6 +2336,7 @@ pub fn dupeHistoryTurn(alloc: std.mem.Allocator, turn: HistoryTurn) !HistoryTurn
                 .execution = execution,
                 .cancelled_command = cancelled_command,
                 .terminal_reason = entry.terminal_reason,
+                .cancellation_origin = entry.cancellation_origin,
             } };
         },
     };
@@ -2611,6 +2663,7 @@ fn dupePersistedToolResult(alloc: std.mem.Allocator, result: PersistedToolResult
         .stored_output_bytes = result.stored_output_bytes,
         .truncated = result.truncated,
         .provider_native = result.provider_native,
+        .review_feedback = result.review_feedback,
         .created_at_ms = result.created_at_ms,
         .permission_feedback = permission_feedback,
         .committed_file_presentation = committed_file_presentation,

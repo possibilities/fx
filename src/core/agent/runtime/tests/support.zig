@@ -480,6 +480,7 @@ pub const FakeAgentRuntimeDeps = struct {
     tool_registry: tool_dispatch.Registry = test_tool_registry,
     context_registry: ?context_contract.Registry = null,
     context_enabled: bool = false,
+    project_instructions_enabled: bool = true,
     root_permission_mode: ?PermissionMode = null,
     validation_mcp_runtime_generation: ?u64 = null,
     validation_mcp_tool_name: ?[]const u8 = null,
@@ -538,6 +539,7 @@ pub const FakeAgentRuntimeDeps = struct {
     permission_waiting: ?*std.atomic.Value(bool) = null,
     permission_release: ?*std.atomic.Value(bool) = null,
     tool_execution_override: ?ToolExecutionOverride = null,
+    catalog_unavailable: bool = false,
     permission_failure_names: []const []const u8 = &.{},
     permission_index: usize = 0,
     exec_plans: []const FakeExecPlan = &.{},
@@ -753,6 +755,7 @@ pub const FakeAgentRuntimeDeps = struct {
             .tool_activity_recorder = self.tool_activity_recorder,
             .context_registry = self.context_registry,
             .context_enabled = self.context_enabled,
+            .project_instructions_enabled = self.project_instructions_enabled,
             .snapshot_root_permission_mode = if (self.root_permission_mode != null)
                 snapshotRootPermissionMode
             else
@@ -793,6 +796,7 @@ pub const FakeAgentRuntimeDeps = struct {
             .request_route_recovery = if (self.enable_route_recovery) requestRouteRecovery else null,
             .available_model_capabilities = availableModelCapabilities,
             .resolve_model_capabilities = resolveModelCapabilities,
+            .model_catalog_unavailable = catalogUnavailable,
             .take_steering_boundary = if (self.steering_messages.len > 0 or
                 self.immediate_steering_messages.len > 0)
                 takeSteeringBoundary
@@ -833,6 +837,11 @@ pub const FakeAgentRuntimeDeps = struct {
     fn snapshotRootPermissionMode(raw: *anyopaque) PermissionMode {
         const self: *FakeAgentRuntimeDeps = @ptrCast(@alignCast(raw));
         return self.root_permission_mode.?;
+    }
+
+    fn catalogUnavailable(raw: *anyopaque) bool {
+        const self: *FakeAgentRuntimeDeps = @ptrCast(@alignCast(raw));
+        return self.catalog_unavailable;
     }
 
     fn resolveModelCapabilities(raw: *anyopaque, _: Allocator, model: []const u8) !model_capabilities.Capabilities {
@@ -886,7 +895,7 @@ pub const FakeAgentRuntimeDeps = struct {
     ) !worker_runtime.SteeringBoundaryResult {
         const self: *FakeAgentRuntimeDeps = @ptrCast(@alignCast(raw));
         const source = switch (kind) {
-            .model => blk: {
+            .model, .finalizing => blk: {
                 self.steering_take_count += 1;
                 if (self.steering_take_count != self.steering_take_at) return .none;
                 break :blk self.steering_messages;
@@ -942,9 +951,9 @@ pub const FakeAgentRuntimeDeps = struct {
         }
     }
 
-    fn appendStaticContext(raw: *anyopaque, arena: Allocator, messages: *std.ArrayList(ChatMessage)) !void {
+    fn appendStaticContext(raw: *anyopaque, arena: Allocator, project_context: ?[]const u8, messages: *std.ArrayList(ChatMessage)) !void {
         const self: *FakeAgentRuntimeDeps = @ptrCast(@alignCast(raw));
-        if (self.static_context_text) |text| {
+        if (project_context orelse self.static_context_text) |text| {
             try messages.append(arena, .{ .role = .system, .content = try arena.dupe(u8, text) });
         }
     }
@@ -969,7 +978,6 @@ pub const FakeAgentRuntimeDeps = struct {
                 @as(u64, @intCast(self.parent_turn_prepare_count)),
             .delivery_id = try arena.dupe(u8, "delivery"),
             .start_offset = 0,
-            .end_offset = 0,
             .total_bytes = 0,
         };
         return .{
