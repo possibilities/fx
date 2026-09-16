@@ -12,7 +12,7 @@ import {
 
 const MAIN_MODEL = "openai/gpt-5.5";
 const TITLE_MODEL = "openai/gpt-5.6-luna";
-const GENERATED_TITLE = "Renderer Loop Refactor";
+const GENERATED_TITLE = "renderer-loop-refactor";
 
 type FixtureRoot = {
   root: string;
@@ -30,11 +30,19 @@ function createFixtureRoot(label: string, settings: string = "{}"): FixtureRoot 
   return { root, home, workspace: realpathSync(workspace) };
 }
 
-function startTitleAwareGateway() {
-  return startDynamicFakeGateway(_raw => fakeGatewayFinalText("MAIN_ANSWER_OK"), {
-    models: [{ id: MAIN_MODEL, type: "language", tags: ["tool-use"] }],
-    titleResponses: [fakeGatewayFinalText(GENERATED_TITLE)],
+function startTitleAwareGateway(title = GENERATED_TITLE) {
+  const namingRequests: string[] = [];
+  const gateway = startDynamicFakeGateway(raw => {
+    if (raw.includes("Generate a short session title")) {
+      namingRequests.push(raw);
+      return fakeGatewayFinalText(title);
+    }
+    return fakeGatewayFinalText("MAIN_ANSWER_OK");
+  }, {
+    models: [MAIN_MODEL, TITLE_MODEL].map(id => ({ id, type: "language", tags: ["tool-use"] })),
+    titleResponses: [fakeGatewayFinalText(title)],
   });
+  return { ...gateway, namingRequests };
 }
 
 function baseEnv(root: FixtureRoot, gateway: { baseUrl: string; chatUrl: string }) {
@@ -71,10 +79,10 @@ function sessionTitles(root: FixtureRoot): string[] {
 }
 
 function titleRequests(gateway: ReturnType<typeof startTitleAwareGateway>) {
-  return gateway.titleRequests;
+  return [...gateway.titleRequests, ...gateway.namingRequests];
 }
 
-test("fx ask generates a model title for a fresh session", async () => {
+test("fx ask retains its derived title without a naming request", async () => {
   const root = createFixtureRoot("ask");
   const gateway = startTitleAwareGateway();
   try {
@@ -87,11 +95,8 @@ test("fx ask generates a model title for a fresh session", async () => {
     expect(result.stdout).toContain("MAIN_ANSWER_OK");
 
     const titleCalls = titleRequests(gateway);
-    expect(titleCalls.length).toBe(1);
-    expect(titleCalls[0].headers.get("ai-language-model-id")).toBe(TITLE_MODEL);
-    expect(titleCalls[0].body).toContain("refactor the renderer loop");
-
-    expect(sessionTitles(root)).toContain(GENERATED_TITLE);
+    expect(titleCalls.length).toBe(0);
+    expect(sessionTitles(root)).not.toContain(GENERATED_TITLE);
 
     const list = await runFx(["sessions", "--json"], {
       cwd: root.workspace,
@@ -99,7 +104,7 @@ test("fx ask generates a model title for a fresh session", async () => {
       timeoutMs: 15_000,
     });
     expect(list.code).toBe(0);
-    expect(list.stdout).toContain(GENERATED_TITLE);
+    expect(list.stdout).not.toContain(GENERATED_TITLE);
   } finally {
     gateway.stop();
   }
@@ -123,12 +128,9 @@ test("fx ask keeps the derived title when session_titles is off", async () => {
   }
 });
 
-test("fx ask keeps the derived title when the title model output is unusable", async () => {
+test("fx ask never admits a title request even when a title provider is available", async () => {
   const root = createFixtureRoot("unusable");
-  const gateway = startDynamicFakeGateway(_raw => fakeGatewayFinalText("MAIN_ANSWER_OK"), {
-    models: [{ id: MAIN_MODEL, type: "language", tags: ["tool-use"] }],
-    titleResponses: [fakeGatewayFinalText("\n  \n")],
-  });
+  const gateway = startTitleAwareGateway("\n  \n");
   try {
     const result = await runFx(["ask", "refactor the renderer loop to fix the crash"], {
       cwd: root.workspace,
@@ -137,6 +139,7 @@ test("fx ask keeps the derived title when the title model output is unusable", a
     });
     expect(result.code).toBe(0);
     expect(result.stdout).toContain("MAIN_ANSWER_OK");
+    expect(titleRequests(gateway).length).toBe(0);
     const titles = sessionTitles(root);
     expect(titles.length).toBe(1);
     expect(titles[0]).not.toBe(GENERATED_TITLE);
@@ -179,7 +182,7 @@ async function captureTraceReport(tui: TmuxSession, root: FixtureRoot): Promise<
 }
 
 test.skipIf(SKIP_TMUX)("tui trace report shows an installed session title", async () => {
-  const root = createFixtureRoot("tui-trace", JSON.stringify({ statusLine: { session: true } }));
+  const root = createFixtureRoot("tui-trace", JSON.stringify({ statusLine: { session: true }, session_naming: { gateway: { model: TITLE_MODEL } } }));
   const gateway = startTitleAwareGateway();
   let tui: TmuxSession | undefined;
   try {
@@ -199,8 +202,8 @@ test.skipIf(SKIP_TMUX)("tui trace report shows an installed session title", asyn
     expect(report).toContain("## Session Title");
     expect(report).toContain("setting: true");
     expect(report).toContain(`title: ${GENERATED_TITLE}`);
-    expect(report).toContain("generation: status=installed");
-    expect(report).toContain(`model=${TITLE_MODEL}`);
+    expect(report).toContain("generation: engine=session_naming pending=0 attempted=1");
+    expect(titleRequests(gateway).length).toBe(1);
   } finally {
     await tui?.kill();
     gateway.stop();
@@ -208,11 +211,8 @@ test.skipIf(SKIP_TMUX)("tui trace report shows an installed session title", asyn
 }, 60_000);
 
 test.skipIf(SKIP_TMUX)("tui trace report explains why no session title was generated", async () => {
-  const root = createFixtureRoot("tui-trace-failed");
-  const gateway = startDynamicFakeGateway(_raw => fakeGatewayFinalText("MAIN_ANSWER_OK"), {
-    models: [{ id: MAIN_MODEL, type: "language", tags: ["tool-use"] }],
-    titleResponses: [fakeGatewayFinalText("\n  \n")],
-  });
+  const root = createFixtureRoot("tui-trace-failed", JSON.stringify({ session_naming: { gateway: { model: TITLE_MODEL } } }));
+  const gateway = startTitleAwareGateway("\n  \n");
   let tui: TmuxSession | undefined;
   try {
     tui = await TmuxSession.create({
@@ -232,13 +232,13 @@ test.skipIf(SKIP_TMUX)("tui trace report explains why no session title was gener
     let report = "";
     while (Date.now() < deadline) {
       report = await captureTraceReport(tui, root);
-      if (!report.includes("generation: status=running")) break;
+      if (report.includes("generation: engine=session_naming pending=0")) break;
       await new Promise(resolve => setTimeout(resolve, 250));
     }
     expect(report).toContain("## Session Title");
-    expect(report).toContain("generation: status=failed");
-    expect(report).toContain("model=openai/gpt-5.6-luna");
-    expect(report).toContain("reason=unsanitizable");
+    expect(report).toContain("generation: engine=session_naming pending=0 attempted=1");
+    expect(titleRequests(gateway).length).toBe(2);
+    expect(sessionTitles(root)).not.toContain(GENERATED_TITLE);
   } finally {
     await tui?.kill();
     gateway.stop();
@@ -246,7 +246,7 @@ test.skipIf(SKIP_TMUX)("tui trace report explains why no session title was gener
 }, 60_000);
 
 test.skipIf(SKIP_TMUX)("tui shows the generated session title", async () => {
-  const root = createFixtureRoot("tui", JSON.stringify({ statusLine: { session: true } }));
+  const root = createFixtureRoot("tui", JSON.stringify({ statusLine: { session: true }, session_naming: { gateway: { model: TITLE_MODEL } } }));
   const gateway = startTitleAwareGateway();
   let tui: TmuxSession | undefined;
   try {
@@ -262,8 +262,53 @@ test.skipIf(SKIP_TMUX)("tui shows the generated session title", async () => {
     await tui.waitForText("MAIN_ANSWER_OK", 20000);
     await tui.waitForText(GENERATED_TITLE, 15000);
     expect(sessionTitles(root)).toContain(GENERATED_TITLE);
+    expect(titleRequests(gateway).length).toBe(1);
   } finally {
     await tui?.kill();
     gateway.stop();
   }
 }, 60_000);
+
+test.skipIf(SKIP_TMUX)("manual rename wins over an in-flight naming request and later prompts", async () => {
+  const root = createFixtureRoot("manual-rename", JSON.stringify({
+    session_naming: { gateway: { model: TITLE_MODEL }, timeout_ms: 10_000 },
+  }));
+  const started = Promise.withResolvers<void>();
+  const release = Promise.withResolvers<void>();
+  let namingCalls = 0;
+  let mainCalls = 0;
+  const gateway = startDynamicFakeGateway(async raw => {
+    if (raw.includes("Generate a short session title")) {
+      namingCalls += 1;
+      started.resolve();
+      await release.promise;
+      return fakeGatewayFinalText("Obsolete Generated Title");
+    }
+    mainCalls += 1;
+    return fakeGatewayFinalText(mainCalls === 1 ? "FIRST_MAIN_ANSWER" : "SECOND_MAIN_ANSWER");
+  }, { models: [MAIN_MODEL, TITLE_MODEL].map(id => ({ id, type: "language", tags: ["tool-use"] })) });
+  let tui: TmuxSession | undefined;
+  try {
+    tui = await TmuxSession.create({
+      cmd: JSON.stringify(FX_BIN), cwd: root.workspace, isolated: true,
+      remainOnExit: true, env: baseEnv(root, gateway),
+    });
+    await tui.waitForStableComposer(15_000);
+    await tui.sendText("prepare a bounded naming request");
+    await tui.waitForText("FIRST_MAIN_ANSWER", 15_000);
+    await Promise.race([started.promise, Bun.sleep(10_000).then(() => { throw new Error("naming was not admitted"); })]);
+    await tui.sendText("/rename Manual Title");
+    for (let n = 0; n < 100 && !sessionTitles(root).includes("Manual Title"); n += 1) await Bun.sleep(25);
+    expect(sessionTitles(root)).toContain("Manual Title");
+    release.resolve();
+    await tui.sendText("continue the same session");
+    await tui.waitForText("SECOND_MAIN_ANSWER", 15_000);
+    expect(sessionTitles(root)).toContain("Manual Title");
+    expect(sessionTitles(root)).not.toContain("obsolete-generated-title");
+    expect(namingCalls).toBe(1);
+  } finally {
+    release.resolve();
+    await tui?.kill();
+    gateway.stop();
+  }
+}, 45_000);

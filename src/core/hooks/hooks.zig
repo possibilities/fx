@@ -5,10 +5,12 @@ pub const runtime = @import("runtime.zig");
 pub const tool = @import("tool.zig");
 
 pub const HookKind = definitions.HookKind;
+pub const turn_started = definitions.turn_started;
 pub const pre_tool_use = definitions.pre_tool_use;
 pub const stop = definitions.stop;
 pub const post_turn_end = definitions.post_turn_end;
 pub const attention_required = definitions.attention_required;
+pub const attention_resolved = definitions.attention_resolved;
 
 pub const HandlerError = definitions.HandlerError;
 pub const Invocation = definitions.Invocation;
@@ -24,12 +26,18 @@ pub const StopHandler = definitions.StopHandler;
 pub const StopInput = definitions.StopInput;
 pub const StopOutcome = definitions.StopOutcome;
 
+pub const TurnStartedHandler = definitions.TurnStartedHandler;
+pub const TurnStartedInput = definitions.TurnStartedInput;
+
 pub const PostTurnEndHandler = definitions.PostTurnEndHandler;
 pub const PostTurnEndInput = definitions.PostTurnEndInput;
 
 pub const AttentionKind = definitions.AttentionKind;
+pub const AttentionToken = definitions.AttentionToken;
 pub const AttentionRequiredHandler = definitions.AttentionRequiredHandler;
 pub const AttentionRequiredInput = definitions.AttentionRequiredInput;
+pub const AttentionResolvedHandler = definitions.AttentionResolvedHandler;
+pub const AttentionResolvedInput = definitions.AttentionResolvedInput;
 
 pub const Runtime = runtime.Runtime;
 pub const RuntimeView = runtime.RuntimeView;

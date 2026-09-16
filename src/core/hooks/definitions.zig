@@ -2,17 +2,21 @@ const std = @import("std");
 const types = @import("../shared/types.zig");
 
 pub const HookKind = enum {
+    turn_started,
     pre_tool_use,
     stop,
     post_turn_end,
     attention_required,
+    attention_resolved,
 
     pub fn definition(self: HookKind) HookDefinition {
         return switch (self) {
+            .turn_started => turn_started,
             .pre_tool_use => pre_tool_use,
             .stop => stop,
             .post_turn_end => post_turn_end,
             .attention_required => attention_required,
+            .attention_resolved => attention_resolved,
         };
     }
 };
@@ -22,6 +26,13 @@ pub const HookDefinition = struct {
     lifecycle_event: []const u8,
     agent_loop_point: []const u8,
     purpose: []const u8,
+};
+
+pub const turn_started = HookDefinition{
+    .kind = .turn_started,
+    .lifecycle_event = "TurnStarted",
+    .agent_loop_point = "after a turn receives its stable identity and before agent execution",
+    .purpose = "lets handlers observe every accepted top-level and subagent turn",
 };
 
 pub const pre_tool_use = HookDefinition{
@@ -52,11 +63,20 @@ pub const attention_required = HookDefinition{
     .purpose = "lets handlers observe when a foreground turn is waiting for user attention",
 };
 
+pub const attention_resolved = HookDefinition{
+    .kind = .attention_resolved,
+    .lifecycle_event = "AttentionResolved",
+    .agent_loop_point = "after an active user decision is accepted and agent work can continue",
+    .purpose = "lets handlers observe when a foreground turn no longer needs user attention",
+};
+
 pub const all_hooks = [_]HookDefinition{
+    turn_started,
     pre_tool_use,
     stop,
     post_turn_end,
     attention_required,
+    attention_resolved,
 };
 
 pub const ScopeKind = enum {
@@ -76,6 +96,19 @@ pub const Scope = struct {
 pub const Invocation = struct {
     scope: Scope,
     turn_id: ?u64 = null,
+};
+
+pub const TurnStartedInput = struct {
+    invocation: Invocation,
+};
+
+pub const TurnStartedHandler = struct {
+    name: []const u8,
+    ctx: *anyopaque,
+    run: *const fn (
+        ctx: *anyopaque,
+        input: TurnStartedInput,
+    ) HandlerError!void,
 };
 
 pub const Limits = struct {
@@ -204,9 +237,16 @@ pub const AttentionKind = enum {
     route_recovery,
 };
 
+/// Internal identity for one attention request. First-party lifecycle
+/// projections use it to reject a delayed edge after that exact request was
+/// already resolved; it is not part of any external event schema.
+pub const AttentionToken = [32]u8;
+
 pub const AttentionRequiredInput = struct {
     invocation: Invocation,
     kind: AttentionKind,
+    presented_interactively: bool = false,
+    attention_token: ?AttentionToken = null,
 };
 
 pub const AttentionRequiredHandler = struct {
@@ -218,24 +258,50 @@ pub const AttentionRequiredHandler = struct {
     ) HandlerError!void,
 };
 
+pub const AttentionResolvedInput = struct {
+    invocation: Invocation,
+    kind: AttentionKind,
+    presented_interactively: bool = false,
+    attention_token: ?AttentionToken = null,
+};
+
+pub const AttentionResolvedHandler = struct {
+    name: []const u8,
+    ctx: *anyopaque,
+    run: *const fn (
+        ctx: *anyopaque,
+        input: AttentionResolvedInput,
+    ) HandlerError!void,
+};
+
 test "hook definitions enumerate current hook surfaces" {
-    try std.testing.expectEqual(@as(usize, 4), all_hooks.len);
-    try std.testing.expectEqual(HookKind.pre_tool_use, all_hooks[0].kind);
-    try std.testing.expectEqual(HookKind.stop, all_hooks[1].kind);
-    try std.testing.expectEqual(HookKind.post_turn_end, all_hooks[2].kind);
-    try std.testing.expectEqual(HookKind.attention_required, all_hooks[3].kind);
+    try std.testing.expectEqual(@as(usize, 6), all_hooks.len);
+    try std.testing.expectEqual(HookKind.turn_started, all_hooks[0].kind);
+    try std.testing.expectEqual(HookKind.pre_tool_use, all_hooks[1].kind);
+    try std.testing.expectEqual(HookKind.stop, all_hooks[2].kind);
+    try std.testing.expectEqual(HookKind.post_turn_end, all_hooks[3].kind);
+    try std.testing.expectEqual(HookKind.attention_required, all_hooks[4].kind);
+    try std.testing.expectEqual(HookKind.attention_resolved, all_hooks[5].kind);
+    try std.testing.expectEqualStrings("TurnStarted", turn_started.lifecycle_event);
     try std.testing.expectEqualStrings("PreToolUse", pre_tool_use.lifecycle_event);
     try std.testing.expectEqualStrings("Stop", stop.lifecycle_event);
     try std.testing.expectEqualStrings("PostTurnEnd", post_turn_end.lifecycle_event);
     try std.testing.expectEqualStrings("AttentionRequired", attention_required.lifecycle_event);
+    try std.testing.expectEqualStrings("AttentionResolved", attention_resolved.lifecycle_event);
+    try std.testing.expectEqual(HookKind.turn_started, HookKind.turn_started.definition().kind);
     try std.testing.expectEqual(HookKind.pre_tool_use, HookKind.pre_tool_use.definition().kind);
     try std.testing.expectEqual(HookKind.stop, HookKind.stop.definition().kind);
     try std.testing.expectEqual(HookKind.post_turn_end, HookKind.post_turn_end.definition().kind);
     try std.testing.expectEqual(HookKind.attention_required, HookKind.attention_required.definition().kind);
+    try std.testing.expectEqual(HookKind.attention_resolved, HookKind.attention_resolved.definition().kind);
+    try std.testing.expectEqualStrings("TurnStarted", HookKind.turn_started.definition().lifecycle_event);
     try std.testing.expectEqualStrings("PreToolUse", HookKind.pre_tool_use.definition().lifecycle_event);
     try std.testing.expectEqualStrings("Stop", HookKind.stop.definition().lifecycle_event);
     try std.testing.expectEqualStrings("PostTurnEnd", HookKind.post_turn_end.definition().lifecycle_event);
     try std.testing.expectEqualStrings("AttentionRequired", HookKind.attention_required.definition().lifecycle_event);
+    try std.testing.expectEqualStrings("AttentionResolved", HookKind.attention_resolved.definition().lifecycle_event);
+    try std.testing.expect(turn_started.agent_loop_point.len > 0);
+    try std.testing.expect(turn_started.purpose.len > 0);
     try std.testing.expect(pre_tool_use.agent_loop_point.len > 0);
     try std.testing.expect(pre_tool_use.purpose.len > 0);
     try std.testing.expect(stop.agent_loop_point.len > 0);
@@ -244,6 +310,8 @@ test "hook definitions enumerate current hook surfaces" {
     try std.testing.expect(post_turn_end.purpose.len > 0);
     try std.testing.expect(attention_required.agent_loop_point.len > 0);
     try std.testing.expect(attention_required.purpose.len > 0);
+    try std.testing.expect(attention_resolved.agent_loop_point.len > 0);
+    try std.testing.expect(attention_resolved.purpose.len > 0);
 }
 
 test "Hooks v1.0 scope kinds remain limited to the current surfaces" {

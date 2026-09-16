@@ -35,6 +35,31 @@ cd your_project
 fx
 ```
 
+On the first submitted prompt, fx starts a small naming request alongside the
+main agent and installs the result as the session's native name without
+delaying the turn. The Codex route defaults to `gpt-5.4-mini` at low effort;
+other providers are skipped unless configured. Naming settings are profile
+settings in `~/.fx/settings.json` and are ignored in project `.fx.json` files:
+
+```json
+{
+  "session_naming": {
+    "codex": {
+      "model": "gpt-5.4-mini",
+      "effort": "low"
+    },
+    "timeout_ms": 60000
+  }
+}
+```
+
+Set `codex` to `null` to disable its compiled default. Configure `gateway` or
+`grok` with the same `model` and optional `effort` fields to opt those providers
+in. Before naming, fx removes a leading slash command and its `--flag` tokens,
+expands readable `@path` mentions up to 32 KiB each, and then limits the model
+input to 1600 bytes. Generated names are limited to 64 bytes. `/rename` always
+wins over an in-flight generated result.
+
 Or make a one-shot request:
 
 ```bash
@@ -119,6 +144,7 @@ The SDK is published to npm as [libfx](https://www.npmjs.com/package/libfx). For
 - [Skills](https://fx.sh/docs/capabilities/skills): reusable instructions the agent loads when invoked
 - [MCP](https://fx.sh/docs/capabilities/mcp): connect external tools and servers
 - [Subagents](https://fx.sh/docs/capabilities/subagents): delegate independent work
+- [ADE event feed](docs/ade-event-feed.md): observe hosted TUI agent lifecycle
 
 ## Documentation
 

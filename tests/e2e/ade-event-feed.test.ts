@@ -1,0 +1,659 @@
+import { afterEach, describe, expect, test } from "bun:test";
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  realpathSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+  readdirSync,
+} from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { FX_BIN } from "../evals/eval-helpers";
+import {
+  FAKE_GATEWAY_MODEL,
+  fakeGatewayFinalText,
+  fakeGatewayToolCall,
+  fakeShellRun,
+  startDynamicFakeGateway,
+  TmuxSession,
+  tmuxAvailable,
+} from "./tmux-helpers";
+
+const TIMEOUT = 30_000;
+const INSTANCE_ID = "ade-e2e-instance";
+
+type AgentRole = "main" | "subagent";
+type AgentState = "idle" | "working" | "blocked";
+type AttentionKind = "permission" | "question" | "route_recovery";
+
+type AdeRecord = {
+  schema_version: number;
+  sequence: number;
+  event: string;
+  instance_id: string;
+  context: {
+    agent_role: AgentRole;
+    workspace_root: string;
+    session_id: string | null;
+    parent_session_id: string | null;
+    subagent_id: number | null;
+    turn_id: number | null;
+    agent_state: AgentState;
+    attention_kind: AttentionKind | null;
+  };
+  payload: Record<string, unknown>;
+};
+
+class AdeReceiver {
+  readonly records: AdeRecord[] = [];
+  readonly errors: string[] = [];
+  private listener: ReturnType<typeof Bun.listen> | null = null;
+  private readonly pending = new WeakMap<object, Buffer>();
+
+  constructor(readonly path: string) {}
+
+  start(): void {
+    this.listener = Bun.listen({
+      unix: this.path,
+      socket: {
+        data: (socket, data) => this.acceptData(socket as object, data),
+        close: (socket) => this.acceptClose(socket as object),
+        error: (socket, error) => {
+          this.errors.push(String(error));
+          this.acceptClose(socket as object);
+        },
+      },
+    });
+  }
+
+  close(): void {
+    this.listener?.stop(true);
+    this.listener = null;
+    rmSync(this.path, { force: true });
+  }
+
+  async waitFor(
+    predicate: (record: AdeRecord) => boolean,
+    timeoutMs = TIMEOUT,
+  ): Promise<AdeRecord> {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      const record = this.records.find(predicate);
+      if (record) return record;
+      await Bun.sleep(25);
+    }
+    throw new Error(
+      `timed out waiting for ADE event; records=${JSON.stringify(this.records)}`,
+    );
+  }
+
+  private acceptData(socket: object, data: Uint8Array): void {
+    const previous = this.pending.get(socket) ?? Buffer.alloc(0);
+    const bytes = Buffer.concat([previous, Buffer.from(data)]);
+    let offset = 0;
+    for (;;) {
+      const newline = bytes.indexOf(0x0a, offset);
+      if (newline < 0) break;
+      this.acceptLine(bytes.subarray(offset, newline).toString("utf8"));
+      offset = newline + 1;
+    }
+    this.pending.set(socket, bytes.subarray(offset));
+  }
+
+  private acceptClose(socket: object): void {
+    const trailing = this.pending.get(socket);
+    this.pending.delete(socket);
+    if (trailing && trailing.length > 0) {
+      this.errors.push(`connection closed before newline: ${trailing.toString("utf8")}`);
+    }
+  }
+
+  private acceptLine(line: string): void {
+    try {
+      this.records.push(JSON.parse(line) as AdeRecord);
+    } catch (error) {
+      this.errors.push(`invalid JSON ${JSON.stringify(line)}: ${String(error)}`);
+    }
+  }
+}
+
+let root: string | null = null;
+let session: TmuxSession | null = null;
+let receiver: AdeReceiver | null = null;
+let gateway: ReturnType<typeof startDynamicFakeGateway> | null = null;
+
+afterEach(async () => {
+  await session?.kill();
+  session = null;
+  gateway?.stop();
+  gateway = null;
+  receiver?.close();
+  receiver = null;
+  if (root) rmSync(root, { recursive: true, force: true });
+  root = null;
+});
+
+function eventIndex(
+  records: AdeRecord[],
+  event: string,
+  role: AgentRole,
+  after = -1,
+): number {
+  return records.findIndex(
+    (record, index) =>
+      index > after &&
+      record.event === event &&
+      record.context.agent_role === role,
+  );
+}
+
+function latestPrompt(body: string): string {
+  const request = JSON.parse(body) as { prompt?: unknown[] };
+  const prompt = request.prompt ?? [];
+  for (let index = prompt.length - 1; index >= 0; index -= 1) {
+    // Upstream reverted post-tool reassessment, so no injected decision
+    // prompt sits between the model's turns any more.
+    return JSON.stringify(prompt[index] ?? "");
+  }
+  return "";
+}
+
+async function waitForJsonFile(
+  path: string,
+  timeoutMs = TIMEOUT,
+): Promise<unknown> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (existsSync(path)) return JSON.parse(readFileSync(path, "utf8"));
+    await Bun.sleep(25);
+  }
+  throw new Error(`timed out waiting for JSON file ${path}`);
+}
+
+describe.skipIf(!tmuxAvailable())("ADE event feed", () => {
+  test(
+    "publishes ordered main, attention, subagent, and shutdown lifecycle records",
+    async () => {
+      const tempRoot = existsSync("/private/tmp") ? "/private/tmp" : tmpdir();
+      root = realpathSync(mkdtempSync(join(tempRoot, "fx-ade-feed-e2e-")));
+      const home = join(root, "home");
+      const workspace = join(root, "workspace");
+      const secondWorkspace = join(root, "second-workspace");
+      const socketPath = join(root, "ade.sock");
+      const checkpointPath = join(root, "git-roots.json");
+      const stderrPath = join(root, "stderr.log");
+      mkdirSync(join(home, ".fx"), { recursive: true });
+      mkdirSync(workspace);
+      mkdirSync(secondWorkspace);
+      expect(Bun.spawnSync(["git", "init", "-q", workspace]).exitCode).toBe(
+        0,
+      );
+      expect(
+        Bun.spawnSync(["git", "init", "-q", secondWorkspace]).exitCode,
+      ).toBe(0);
+      writeFileSync(
+        join(home, ".fx", "settings.json"),
+        JSON.stringify({
+          sandbox: "none",
+          permission_mode: "ask",
+          permission: {},
+          session_naming: {
+            gateway: { model: FAKE_GATEWAY_MODEL, effort: "low" },
+            timeout_ms: 10_000,
+          },
+        }),
+      );
+      writeFileSync(stderrPath, "");
+
+      receiver = new AdeReceiver(socketPath);
+      receiver.start();
+
+      const childPrompt = "ADE_CHILD_PROMPT: run a terminal command";
+      const childFinished = Promise.withResolvers<void>();
+      gateway = startDynamicFakeGateway(async (body) => {
+        if (body.includes("Generate a short session title")) {
+          return fakeGatewayFinalText("ADE native session title");
+        }
+        const latest = latestPrompt(body);
+        if (latest.includes('"toolCallId":"ade_question_1"')) {
+          return fakeGatewayFinalText("ADE_QUESTION_DONE");
+        }
+        if (latest.includes('"toolCallId":"ade_child_terminal_1"')) {
+          childFinished.resolve();
+          return fakeGatewayFinalText("ADE_CHILD_DONE");
+        }
+        if (latest.includes('"toolCallId":"ade_parent_create_1"')) {
+          await childFinished.promise;
+          return fakeGatewayFinalText("ADE_PARENT_DONE");
+        }
+        if (latest.includes(childPrompt)) {
+          return fakeShellRun("ade_child_terminal_1", "touch ADE_CHILD_EDITED", {
+            cwd: secondWorkspace,
+            profile: "clean",
+            timeout_ms: 10_000,
+          });
+        }
+        if (latest.includes("ADE_QUESTION_REQUEST")) {
+          return fakeGatewayToolCall("ade_question_1", "ask_user_question", {
+            questions: [{
+              header: "ADE feed",
+              question: "Which ADE event path should continue?",
+              options: [
+                { label: "Main", description: "Continue the main-agent fixture." },
+                { label: "Child", description: "Continue the child-agent fixture." },
+              ],
+            }],
+          });
+        }
+        if (latest.includes("ADE_SUBAGENT_REQUEST")) {
+          return fakeGatewayToolCall("ade_parent_create_1", "subagent", {
+            request: {
+              action: "run",
+              task: childPrompt,
+            },
+          });
+        }
+        return new Response("unexpected ADE fixture request", { status: 500 });
+      }, {
+        classifierDecision: "caution",
+        models: [{ id: FAKE_GATEWAY_MODEL, type: "language", tags: ["tool-use"] }],
+      });
+
+      session = await TmuxSession.create({
+        cwd: realpathSync(workspace),
+        env: {
+          HOME: realpathSync(home),
+          AI_GATEWAY_API_KEY: "ade-event-feed-key",
+          VERCEL_OIDC_TOKEN: undefined,
+          FX_GATEWAY_BASE_URL: gateway.baseUrl,
+          FX_GATEWAY_CHAT_URL: gateway.chatUrl,
+          FX_MODEL: FAKE_GATEWAY_MODEL,
+          FX_AUTO_UPGRADE: "0",
+          FX_ADE_SOCKET_PATH: socketPath,
+          FX_ADE_INSTANCE_ID: INSTANCE_ID,
+          FX_ADE_CHECKPOINT_PATH: checkpointPath,
+          NO_COLOR: "1",
+        },
+        width: 100,
+        height: 28,
+        stderrPath,
+      });
+      await session.waitForComposer(TIMEOUT);
+      await receiver.waitFor((record) => record.event === "FxStarted");
+      const launchRoot = await receiver.waitFor(
+        (record) =>
+          record.event === "GitRootDiscovered" &&
+          record.payload.reason === "launch_directory",
+      );
+      expect(launchRoot.payload).toEqual({
+        git_root: realpathSync(workspace),
+        revision: 1,
+        reason: "launch_directory",
+      });
+      expect(receiver.records[0]?.event).toBe("FxStarted");
+      expect(JSON.parse(readFileSync(checkpointPath, "utf8"))).toEqual({
+        schema: 1,
+        instance_id: INSTANCE_ID,
+        revision: 1,
+        git_roots: [realpathSync(workspace)],
+      });
+      expect(statSync(checkpointPath).mode & 0o777).toBe(0o600);
+
+      await session.sendText("ADE_QUESTION_REQUEST");
+      const nativeMetadata = await receiver.waitFor(
+        (record) =>
+          record.event === "SessionMetadataChanged" &&
+          record.context.agent_role === "main" &&
+          // The provider answers in words; fx publishes the slug it made of them.
+          record.payload.title === "ade-native-session-title",
+      );
+      const metadataSessionId = nativeMetadata.context.session_id;
+      expect(metadataSessionId).not.toBeNull();
+      // The title is durable only in the conversation manifest; no display
+      // sidecar exists any more.
+      const manifest = JSON.parse(readFileSync(
+        join(home, ".fx", "sessions", metadataSessionId!, "session.json"),
+        "utf8",
+      )) as { title?: unknown };
+      expect(manifest.title).toBe("ade-native-session-title");
+      expect(existsSync(
+        join(home, ".fx", "sessions", metadataSessionId!, "display.json"),
+      )).toBe(false);
+      await session.waitForText("Which ADE event path should continue?", TIMEOUT);
+      await receiver.waitFor(
+        (record) =>
+          record.event === "AttentionRequired" &&
+          record.context.agent_role === "main" &&
+          record.payload.kind === "question",
+      );
+      await session.sendKeys("1");
+      const questionResolution = await receiver.waitFor(
+        (record) =>
+          record.event === "AttentionResolved" &&
+          record.context.agent_role === "main" &&
+          record.payload.kind === "question",
+      );
+      expect(questionResolution.context.agent_state).toBe("working");
+      expect(questionResolution.context.attention_kind).toBeNull();
+      expect(questionResolution.context.turn_id).toBeGreaterThan(0);
+      await session.waitForText("ADE_QUESTION_DONE", TIMEOUT);
+      await session.waitForComposer(TIMEOUT);
+
+      await session.sendText("ADE_SUBAGENT_REQUEST");
+      // Upstream addresses a child by its model-safe handle, not its prompt.
+      await session.waitForText("needs permission", TIMEOUT);
+      const childAttention = await receiver.waitFor(
+        (record) =>
+          record.event === "AttentionRequired" &&
+          record.context.agent_role === "subagent" &&
+          record.payload.kind === "permission",
+      );
+      expect(childAttention.context.session_id).not.toBeNull();
+      expect(childAttention.context.parent_session_id).not.toBeNull();
+      expect(childAttention.context.turn_id).toBeNull();
+      // Upstream's subagent delegation simplification removed the panel, so
+      // the mirrored main prompt is the only surface that answers for a child.
+      await session.waitForPane(
+        (pane) =>
+          pane.includes("needs permission") &&
+          pane.includes("shell.run") &&
+          pane.includes("1. Yes"),
+        TIMEOUT,
+      );
+      await session.sendKeys("1");
+      const childResolution = await receiver.waitFor(
+        (record) =>
+          record.event === "AttentionResolved" &&
+          record.context.agent_role === "subagent" &&
+          record.payload.kind === "permission",
+      );
+      expect(childResolution.context.session_id).toBe(childAttention.context.session_id);
+      expect(childResolution.context.agent_state).toBe("working");
+      expect(childResolution.context.attention_kind).toBeNull();
+      // Upstream's managed subagents render the child as a tool-call summary
+      // in the parent rather than printing the child's own final text there,
+      // so the child's completion is proved by its PostTurnEnd record below.
+      await session.waitForText("ADE_PARENT_DONE", TIMEOUT);
+      await receiver.waitFor(
+        (record) =>
+          record.event === "PostTurnEnd" &&
+          record.context.agent_role === "subagent",
+      );
+      const childRoot = await receiver.waitFor(
+        (record) =>
+          record.event === "GitRootDiscovered" &&
+          record.payload.reason === "subagent_terminal_write",
+      );
+      expect(childRoot.context.agent_role).toBe("subagent");
+      expect(childRoot.context.session_id).toBe(childAttention.context.session_id);
+      expect(childRoot.context.parent_session_id).toBe(
+        childAttention.context.parent_session_id,
+      );
+      expect(childRoot.payload).toEqual({
+        git_root: realpathSync(secondWorkspace),
+        revision: 2,
+        reason: "subagent_terminal_write",
+      });
+      expect(JSON.parse(readFileSync(checkpointPath, "utf8"))).toEqual({
+        schema: 1,
+        instance_id: INSTANCE_ID,
+        revision: 2,
+        git_roots: [realpathSync(workspace), realpathSync(secondWorkspace)],
+      });
+      await session.waitForComposer(TIMEOUT);
+
+      const originalMainSession = receiver.records.find(
+        (record) =>
+          record.event === "TurnStarted" &&
+          record.context.agent_role === "main",
+      )?.context.session_id;
+      expect(originalMainSession).not.toBeNull();
+      expect(metadataSessionId).toBe(originalMainSession);
+      await session.sendText("/new");
+      const newSession = await receiver.waitFor(
+        (record) =>
+          record.event === "SessionChanged" &&
+          record.payload.previous_session_id === originalMainSession &&
+          typeof record.payload.session_id === "string",
+      );
+      const freshMainSession = newSession.payload.session_id as string;
+      expect(freshMainSession).not.toBe(originalMainSession);
+      await session.waitForComposer(TIMEOUT);
+
+      // The feed's scope ends here. Resume-picker semantics belong to
+      // upstream, so instead of driving the picker this asserts what upstream
+      // asserts about discovery after a child completes: the parent and child
+      // both persist, and the parent is the session holding the child
+      // registry, which is what keeps a child private to it.
+      const sessionsRoot = join(home, ".fx", "sessions");
+      const persisted = readdirSync(sessionsRoot, { withFileTypes: true })
+        .filter((entry) =>
+          entry.isDirectory() &&
+          existsSync(join(sessionsRoot, entry.name, "session.json"))
+        )
+        .map((entry) => entry.name);
+      expect(persisted).toContain(originalMainSession);
+      expect(persisted).toContain(childAttention.context.session_id);
+      const registryOwners = persisted.filter((id) =>
+        existsSync(join(sessionsRoot, id, "subagent", "children.json"))
+      );
+      expect(registryOwners).toEqual([originalMainSession]);
+
+      await session.waitForComposer(TIMEOUT);
+      await session.sendText("/quit");
+      expect(await session.waitForSessionEnd(TIMEOUT)).toBe(true);
+      await receiver.waitFor((record) => record.event === "FxStopped");
+
+      const records = receiver.records;
+      expect(receiver.errors).toEqual([]);
+      expect(records.length).toBeGreaterThan(12);
+      expect(records.map((record) => record.sequence)).toEqual(
+        records.map((_, index) => index + 1),
+      );
+      expect(records.every((record) => record.schema_version === 1)).toBe(true);
+      expect(records.every((record) => record.instance_id === INSTANCE_ID)).toBe(true);
+      expect(records.every(
+        (record) => ["idle", "working", "blocked"].includes(record.context.agent_state),
+      )).toBe(true);
+      expect(records.every(
+        (record) => record.context.agent_state === "blocked"
+          ? record.context.attention_kind !== null
+          : record.context.attention_kind === null,
+      )).toBe(true);
+      expect(records[0]?.event).toBe("FxStarted");
+      expect(records.at(-1)?.event).toBe("FxStopped");
+
+      const mainStarts = records.filter(
+        (record) =>
+          record.event === "TurnStarted" &&
+          record.context.agent_role === "main",
+      );
+      const childStarts = records.filter(
+        (record) =>
+          record.event === "TurnStarted" &&
+          record.context.agent_role === "subagent",
+      );
+      expect(mainStarts).toHaveLength(2);
+      expect(childStarts).toHaveLength(1);
+      expect(mainStarts.every((record) => record.context.turn_id !== null)).toBe(true);
+      expect(childStarts[0]?.context.turn_id).not.toBeNull();
+
+      const firstMainStart = eventIndex(records, "TurnStarted", "main");
+      const firstPromptQueued = eventIndex(records, "PromptQueued", "main");
+      const questionTool = eventIndex(records, "PreToolUse", "main", firstMainStart);
+      const attention = eventIndex(records, "AttentionRequired", "main", questionTool);
+      const resolution = eventIndex(records, "AttentionResolved", "main", attention);
+      const firstMainEnd = eventIndex(records, "PostTurnEnd", "main", resolution);
+      const secondPromptQueued = eventIndex(records, "PromptQueued", "main", firstMainEnd);
+      const secondMainStart = eventIndex(records, "TurnStarted", "main", firstMainEnd);
+      const subagentTool = eventIndex(records, "PreToolUse", "main", secondMainStart);
+      const childStart = eventIndex(records, "TurnStarted", "subagent", subagentTool);
+      const childTool = eventIndex(records, "PreToolUse", "subagent", childStart);
+      const childAttentionIndex = eventIndex(records, "AttentionRequired", "subagent", childTool);
+      const childResolutionIndex = eventIndex(records, "AttentionResolved", "subagent", childAttentionIndex);
+      const childStop = eventIndex(records, "Stop", "subagent", childResolutionIndex);
+      const childEnd = eventIndex(records, "PostTurnEnd", "subagent", childStop);
+      const secondMainStop = eventIndex(records, "Stop", "main", subagentTool);
+      const secondMainEnd = eventIndex(records, "PostTurnEnd", "main", secondMainStop);
+      for (const [label, index] of Object.entries({
+        firstMainStart,
+        firstPromptQueued,
+        questionTool,
+        attention,
+        resolution,
+        firstMainEnd,
+        secondPromptQueued,
+        secondMainStart,
+        subagentTool,
+        childStart,
+        childTool,
+        childAttentionIndex,
+        childResolutionIndex,
+        childStop,
+        childEnd,
+        secondMainStop,
+        secondMainEnd,
+      })) {
+        if (index < 0) {
+          throw new Error(
+            `missing ordered ${label}; records=${JSON.stringify(records)}`,
+          );
+        }
+      }
+      expect(firstPromptQueued).toBeLessThan(firstMainStart);
+      expect(secondPromptQueued).toBeLessThan(secondMainStart);
+      expect(records[firstMainEnd]?.context.agent_state).toBe("idle");
+      expect(records[childEnd]?.context.agent_state).toBe("idle");
+      expect(records[secondMainEnd]?.context.agent_state).toBe("idle");
+
+      const mainSession = mainStarts[0]?.context.session_id;
+      const childContext = childStarts[0]!.context;
+      expect(mainSession).not.toBeNull();
+      expect(childContext.session_id).not.toBeNull();
+      expect(childContext.session_id).not.toBe(mainSession);
+      expect(childContext.parent_session_id).toBe(mainSession);
+      expect(childAttention.context.session_id).toBe(childContext.session_id);
+      expect(childAttention.context.parent_session_id).toBe(mainSession);
+      expect(records.filter(
+        (record) =>
+          record.event === "AttentionRequired" &&
+          record.context.agent_role === "subagent" &&
+          record.context.session_id === childContext.session_id &&
+          record.payload.kind === "permission",
+      )).toHaveLength(1);
+      expect(records.some(
+        (record) =>
+          record.event === "AttentionRequired" &&
+          record.context.agent_role === "main" &&
+          record.payload.kind === "permission",
+      )).toBe(false);
+      expect(records.every((record) => record.context.workspace_root === realpathSync(workspace)))
+        .toBe(true);
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+    },
+    60_000,
+  );
+
+  test("keeps the checkpoint current when the ADE socket is unavailable", async () => {
+    const tempRoot = existsSync("/private/tmp") ? "/private/tmp" : tmpdir();
+    root = realpathSync(mkdtempSync(join(tempRoot, "fx-ade-checkpoint-e2e-")));
+    const home = join(root, "home");
+    const workspace = join(root, "workspace");
+    const checkpointPath = join(root, "git-roots.json");
+    const stderrPath = join(root, "stderr.log");
+    mkdirSync(join(home, ".fx"), { recursive: true });
+    mkdirSync(workspace);
+    expect(Bun.spawnSync(["git", "init", "-q", workspace]).exitCode).toBe(0);
+    writeFileSync(
+      join(home, ".fx", "settings.json"),
+      JSON.stringify({ sandbox: "none", permission_mode: "auto", permission: {} }),
+    );
+    writeFileSync(stderrPath, "");
+    gateway = startDynamicFakeGateway(() => fakeGatewayFinalText("unused"));
+
+    session = await TmuxSession.create({
+      cwd: realpathSync(workspace),
+      env: {
+        HOME: realpathSync(home),
+        AI_GATEWAY_API_KEY: "ade-checkpoint-key",
+        VERCEL_OIDC_TOKEN: undefined,
+        FX_GATEWAY_BASE_URL: gateway.baseUrl,
+        FX_GATEWAY_CHAT_URL: gateway.chatUrl,
+        FX_MODEL: FAKE_GATEWAY_MODEL,
+        FX_AUTO_UPGRADE: "0",
+        FX_ADE_SOCKET_PATH: join(root, "missing.sock"),
+        FX_ADE_INSTANCE_ID: "checkpoint-without-socket",
+        FX_ADE_CHECKPOINT_PATH: checkpointPath,
+        NO_COLOR: "1",
+      },
+      width: 100,
+      height: 28,
+      stderrPath,
+    });
+    await session.waitForComposer(TIMEOUT);
+    expect(await waitForJsonFile(checkpointPath)).toEqual({
+      schema: 1,
+      instance_id: "checkpoint-without-socket",
+      revision: 1,
+      git_roots: [realpathSync(workspace)],
+    });
+    await session.sendText("/quit");
+    expect(await session.waitForSessionEnd(TIMEOUT)).toBe(true);
+    expect(readFileSync(stderrPath, "utf8")).toBe("");
+  }, TIMEOUT);
+});
+
+describe("ADE event feed process exclusions", () => {
+  test("fx ask ignores ADE feed environment variables", async () => {
+    const tempRoot = existsSync("/private/tmp") ? "/private/tmp" : tmpdir();
+    root = realpathSync(mkdtempSync(join(tempRoot, "fx-ade-ask-e2e-")));
+    const home = join(root, "home");
+    const workspace = join(root, "workspace");
+    const socketPath = join(root, "ade.sock");
+    mkdirSync(join(home, ".fx"), { recursive: true });
+    mkdirSync(workspace);
+    writeFileSync(
+      join(home, ".fx", "settings.json"),
+      JSON.stringify({ sandbox: "none", permission_mode: "auto", permission: {} }),
+    );
+    receiver = new AdeReceiver(socketPath);
+    receiver.start();
+    gateway = startDynamicFakeGateway(() => fakeGatewayFinalText("ADE_ASK_DONE"));
+
+    const proc = Bun.spawn([FX_BIN, "ask", "ADE_ASK_EXCLUSION"], {
+      cwd: workspace,
+      env: {
+        ...process.env,
+        HOME: home,
+        AI_GATEWAY_API_KEY: "ade-ask-key",
+        VERCEL_OIDC_TOKEN: undefined,
+        FX_GATEWAY_BASE_URL: gateway.baseUrl,
+        FX_GATEWAY_CHAT_URL: gateway.chatUrl,
+        FX_MODEL: FAKE_GATEWAY_MODEL,
+        FX_AUTO_UPGRADE: "0",
+        FX_DISABLE_KEYCHAIN: "1",
+        FX_SKIP_ONBOARDING: "1",
+        FX_ADE_SOCKET_PATH: socketPath,
+        FX_ADE_INSTANCE_ID: "ask-must-not-publish",
+        NO_COLOR: "1",
+      },
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const [exitCode, stdout, stderr] = await Promise.all([
+      proc.exited,
+      new Response(proc.stdout).text(),
+      new Response(proc.stderr).text(),
+    ]);
+    await Bun.sleep(100);
+    expect(exitCode).toBe(0);
+    expect(stdout).toContain("ADE_ASK_DONE");
+    expect(stderr).toBe("");
+    expect(receiver.records).toEqual([]);
+    expect(receiver.errors).toEqual([]);
+  }, TIMEOUT);
+});

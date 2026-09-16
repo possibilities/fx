@@ -54,6 +54,7 @@ TRAINING_E2E_TESTS = (
 )
 
 VERIFICATION_E2E_TESTS = (
+    "ade-event-feed.test.ts",
     "auto-mode-reliability.test.ts",
     "configured-providers.test.ts",
     "oauth-keychain-migration.test.ts",
@@ -369,7 +370,7 @@ class PgsoCorpusTests(unittest.TestCase):
             tuple(test_file for test_file, _ in corpus.intentional_exclusions),
         )
         self.assertEqual(36, len(corpus.scenarios))
-        self.assertEqual(56, len(corpus.candidate_scenarios))
+        self.assertEqual(57, len(corpus.candidate_scenarios))
         self.assertEqual(
             {
                 "direct-help": 100,
