@@ -54,6 +54,7 @@ pub fn provenanceLabel(buffer: []u8, summary: session_store.SessionSummary) []co
         .grok_subscription => "grok",
         .ai_gateway_api_key, .fx_login, .stored_key, .vercel_oidc_token => "gateway",
         .host_managed => "host",
+        .configured => "configured",
     } else "";
     const separator = if (shape.len > 0 and source.len > 0) " @ " else "";
     if (summary.credential_identity) |identity| {

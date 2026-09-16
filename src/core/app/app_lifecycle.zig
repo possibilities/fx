@@ -512,6 +512,7 @@ pub fn loadCatalogStartupStateBorrowingIdentity(
     default_model: []const u8,
     default_agent_step_limit: usize,
     auth_mode: credentials.AuthMode,
+    provider_override: ?model_provider.ProviderId,
 ) !StartupState {
     const workspace_root = try io_mod.realpathAlloc(alloc, ".");
     var state = try loadStartupStateFromOwnedWorkspace(
@@ -525,6 +526,7 @@ pub fn loadCatalogStartupStateBorrowingIdentity(
         null,
         authorization_home,
         .stored,
+        provider_override,
     );
     if (state.credential) |*credential| {
         if (credential.needsRefreshAt(io_mod.milliTimestamp())) {
@@ -836,6 +838,7 @@ pub fn bootstrapInteractiveApp(cfg: BootstrapConfig) !StartupState {
             cfg.default_model,
             cfg.default_agent_step_limit,
             cfg.auth_mode,
+            cfg.provider_override,
         )
     else
         try loadCatalogStartupStateWithAuthMode(
