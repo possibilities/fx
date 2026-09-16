@@ -410,7 +410,7 @@ pub fn Bindings(comptime App: type) type {
             expected_account_id: ?[]const u8,
         ) !?[]u8 {
             const app: *App = @ptrCast(@alignCast(raw_ctx));
-            if (mode == .if_needed and auth_runtime.requestPathCredentialVerifiedRecently(source)) {
+            if ((if (comptime @hasField(App, "profile_home")) app.profile_home == null else true) and mode == .if_needed and auth_runtime.requestPathCredentialVerifiedRecently(source)) {
                 debug_trace.logf("auth", "credential refresh skipped source={t} reason=verified_recently", .{source});
                 return null;
             }

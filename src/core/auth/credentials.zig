@@ -540,6 +540,16 @@ pub fn resolveForProviderFromHome(
     preferred: ?Source,
     home: []const u8,
 ) !Resolution {
+    if (provider == .configured) {
+        var registry = try @import("../config/config_runtime.zig").loadConfiguredProvidersFromHome(alloc, home);
+        defer registry.deinit(alloc);
+        const bound = try provider.bind(registry);
+        const definition = registry.get(bound.label()).?;
+        return switch (definition.auth) {
+            .none => .{ .credential = .{ .token = try alloc.dupe(u8, ""), .source = .configured } },
+            .bearer => |env| .{ .credential = try loadEnvCredential(alloc, env, .configured) },
+        };
+    }
     if (provider != .gateway) {
         const source = provider_catalog.find(provider).login_source;
         const credential = loadPreferredSourceFromHome(alloc, transport, mode, source, home) catch |err| {
@@ -814,7 +824,7 @@ fn loadPreferredSourceFromHome(
         .vercel_oidc_token => loadEnvCredential(alloc, "VERCEL_OIDC_TOKEN", source),
         .ai_gateway_api_key => loadEnvCredential(alloc, "AI_GATEWAY_API_KEY", source),
         // Host-managed authority carries no bytes an isolated profile could hold.
-        .host_managed => null,
+        .host_managed, .configured => null,
     };
 }
 
@@ -2229,4 +2239,29 @@ test "a disabled store still reports why the fx login was silent" {
     try std.testing.expect(resolution.credential == null);
     try std.testing.expectEqual(FxLoginReadStatus.unavailable, resolution.fx_login_status);
     try std.testing.expectEqual(StoredKeyReadStatus.not_attempted, resolution.stored_key_status);
+}
+
+test "selected profile configured authorization uses only its connection registry" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "selected/.fx");
+    try tmp.dir.createDirPath(std.testing.io, "other/.fx");
+    {
+        var file = try tmp.dir.createFile(std.testing.io, "selected/.fx/settings.json", .{});
+        defer file.close(std.testing.io);
+        try file.writeStreamingAll(std.testing.io,
+            \\{"providers":{"isolated-test":{"protocol":"openai-chat-completions","base_url":"http://localhost:11434/v1","auth":{"type":"none"}}}}
+        );
+    }
+    const selected = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "selected");
+    defer alloc.free(selected);
+    const other = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "other");
+    defer alloc.free(other);
+    const provider = model_provider.parse("isolated-test").?;
+    var resolution = try resolveForProviderFromHome(alloc, oauth_transport.unavailable_provider, .stored, provider, null, selected);
+    defer if (resolution.credential) |*credential| credential.deinit(alloc);
+    try std.testing.expectEqual(Source.configured, resolution.credential.?.source);
+    try std.testing.expectEqualStrings("", resolution.credential.?.token);
+    try std.testing.expectError(error.UnknownConfiguredProvider, resolveForProviderFromHome(alloc, oauth_transport.unavailable_provider, .stored, provider, null, other));
 }
