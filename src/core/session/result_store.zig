@@ -13,7 +13,7 @@ pub const preview_bytes: usize = 4 * 1024;
 pub const read_default_bytes: usize = 8 * 1024;
 pub const read_max_bytes: usize = 64 * 1024;
 pub const full_read_chunk_bytes: usize = 64 * 1024;
-const stored_text_max_bytes: usize = 8 * 1024 * 1024;
+pub const stored_text_max_bytes: usize = 8 * 1024 * 1024;
 
 pub const PreparedResult = struct {
     model_output: []const u8,
@@ -333,7 +333,7 @@ pub fn formatStoredResultOutput(alloc: Allocator, handle: []const u8, preview: [
         alloc,
         "<tool_result_preview handle=\"{s}\" stored_bytes=\"{d}\">\n{s}\n</tool_result_preview>\n" ++
             "<tool_result_handle>{s}</tool_result_handle>\n" ++
-            "Full redacted result is stored outside session JSON. Use read_tool_result with this handle to inspect a byte range or literal query.",
+            "Full result is stored outside session JSON. Use read_tool_result with this handle to inspect a byte range or literal query.",
         .{ handle, stored_bytes, preview, handle },
     );
 }
@@ -449,7 +449,7 @@ pub fn statManaged(
     };
 }
 
-/// Opens a persisted redacted result for bounded read-only pages. This never
+/// Opens a persisted tool result for bounded read-only pages. This never
 /// materializes the full sidecar in memory.
 pub fn openReaderManaged(
     alloc: Allocator,
