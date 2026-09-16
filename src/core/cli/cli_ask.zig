@@ -1542,6 +1542,7 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
                 authorization_home,
                 cfg.default_model,
                 cfg.default_agent_step_limit,
+                null,
             )
         else
             try app_lifecycle.loadCatalogStartupStateFromHome(
@@ -1549,6 +1550,7 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
                 profile_home,
                 cfg.default_model,
                 cfg.default_agent_step_limit,
+                null,
             )
     else if (cfg.auth_mode == .host_managed)
         try options.deps.load_startup_state_with_auth_mode(
