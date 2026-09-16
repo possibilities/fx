@@ -1,6 +1,5 @@
 const std = @import("std");
 const approval_registry = @import("approval_registry.zig");
-const worker_runtime = @import("../agent/worker_runtime.zig");
 const authority = @import("authority.zig");
 const child_state = @import("child_state.zig");
 const domain = @import("domain.zig");
