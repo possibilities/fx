@@ -8,10 +8,6 @@ const types = @import("../shared/types.zig");
 
 const Allocator = std.mem.Allocator;
 
-/// Upper bound on a single legacy `session.json` read in the non-`allow_large`
-/// path. Larger snapshots are rejected with `error.LegacySessionTooLarge`.
-pub const max_session_bytes: usize = 512 * 1024;
-
 /// Default ceiling for an automatic (non-opt-in) legacy snapshot. Snapshots
 /// above this are surfaced by `doctor` and refused by automatic migration.
 pub const automatic_legacy_max_bytes: u64 = 256 * 1024 * 1024;
@@ -216,6 +212,7 @@ pub const SessionRecoveryResult = struct {
     recovered_session_id: []u8,
     history_len: usize,
     status: SessionRecoveryStatus = .recovered,
+    usage_incomplete: bool = false,
 
     pub fn deinit(self: *SessionRecoveryResult, alloc: Allocator) void {
         alloc.free(self.source_session_id);

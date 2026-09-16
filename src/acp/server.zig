@@ -31,6 +31,7 @@ const session_log = @import("../core/session/session_log.zig");
 const app_history_home = @import("../core/app/app_history_home.zig");
 const session_store = @import("../core/session/session_store.zig");
 const session_runtime = @import("../core/session/session.zig");
+const session_title_generation = @import("../core/session/session_title_generation.zig");
 const worker_runtime = @import("../core/agent/worker_runtime.zig");
 const terminal_client_runtime = @import("../core/terminal/client.zig");
 const subagent_tool_host = @import("../core/subagent/tool_host.zig");
@@ -208,6 +209,7 @@ pub const ActiveSessionState = struct {
     /// profile or project configuration.
     session_grants: []types.PermissionGrant = &.{},
     session_rt: session_runtime.SessionRuntime,
+    title_task: ?*session_title_generation.Task = null,
     mcp: ?*mcp_runtime.McpRuntime = null,
     cancel_flag: std.atomic.Value(bool),
     pending_prompt_id: ?jsonrpc.RequestId,
@@ -246,6 +248,7 @@ const ActivePrompt = struct {
 };
 
 pub const ServerState = struct {
+    configured_providers: @import("../core/config/configured_provider.zig").Registry = .{},
     alloc: Allocator,
     cfg: Config,
     writer: jsonrpc.Writer,
@@ -268,6 +271,7 @@ pub const ServerState = struct {
     configured_model: []u8 = &.{},
     process_model_override: bool = false,
     process_effort_override: bool = false,
+    process_provider_override: bool = false,
     permission_mode: types.PermissionMode = .ask,
     permission_rules: types.PermissionRuleSet = .{},
     agent_step_limit: usize = 0,
@@ -278,6 +282,7 @@ pub const ServerState = struct {
     configured_effort: types.ReasoningEffort = .auto,
     first_call_tool_choice: types.ToolChoice = .auto,
     context_enabled: bool = true,
+    session_titles: bool = true,
     active_session: ?ActiveSessionState = null,
     active_prompt: ?*ActivePrompt = null,
     subagent_authority_mutex: std.Io.Mutex = .init,
@@ -339,6 +344,7 @@ pub const ServerState = struct {
         self.pending_outbound.deinit(self.alloc);
         clearPendingLegacyUrls(self);
         self.pending_legacy_urls.deinit(self.alloc);
+        self.configured_providers.deinit(self.alloc);
     }
 };
 
@@ -379,7 +385,7 @@ fn prepareConfiguredCredential(
             state.cfg.identity_home,
         );
     defer if (borrowed_authorization_home) |home| alloc.free(home);
-    if (borrowed_authorization_home) |authorization_home| {
+    if (provider != .configured) if (borrowed_authorization_home) |authorization_home| {
         const resolution = try credentials.resolveReadOnlyForProviderFromHome(
             alloc,
             provider,
@@ -387,7 +393,7 @@ fn prepareConfiguredCredential(
             authorization_home,
         );
         return resolution.credential;
-    }
+    };
     if (state.cfg.home_override) |home| {
         return auth_runtime.prepareCredentialFromHome(
             alloc,
@@ -459,7 +465,7 @@ fn credentialReadyAt(
     refresh_after_ms: ?i64,
     now_ms: i64,
 ) bool {
-    if (source == null or token.len == 0) return false;
+    if (source == null or (token.len == 0 and source != .configured)) return false;
     if (credentials.sourceRefreshable(source.?) and
         refresh_after_ms != null and refresh_after_ms.? <= now_ms)
     {
@@ -478,7 +484,8 @@ fn ensureCodexAccountPin(state: *ServerState, credential: *const credentials.Cre
     state.codex_account_id = try state.alloc.dupe(u8, account_id);
 }
 
-fn adoptServerCredential(state: *ServerState, credential: *credentials.Credential) void {
+/// Transfers credential storage after the caller has stopped its prior borrowers.
+pub fn adoptServerCredential(state: *ServerState, credential: *credentials.Credential) void {
     if (state.active_session) |*active| active.api_key = &.{};
     if (state.api_key.len > 0) secret.zeroAndFree(state.alloc, state.api_key);
     if (state.gateway_team) |team| state.alloc.free(team);
@@ -517,7 +524,7 @@ pub fn selectCredentialForProvider(
     state: *ServerState,
     provider: model_provider.ProviderId,
 ) !bool {
-    if (!state.cfg.allowed_providers.contains(provider)) return false;
+    if (!state.cfg.allowed_providers.contains(std.meta.activeTag(provider))) return false;
     if (state.cfg.auth_mode == .host_managed) {
         state.credential_source = .host_managed;
         state.credential_refresh_after_ms = null;
@@ -531,28 +538,39 @@ pub fn selectCredentialForProvider(
         }
         return true;
     }
-    if (state.active_session) |active| {
-        if (credentialMatchesProvider(active.credential_source, provider)) return true;
-    }
+    var prepared = prepareCredentialForProvider(state, provider) catch |err| {
+        if (err == error.ProviderCredentialUnavailable) return false;
+        return err;
+    };
+    defer if (prepared) |*credential| credential.deinit(state.alloc);
+    if (prepared) |*credential| adoptServerCredential(state, credential);
+    return true;
+}
+
+/// Stages authorization without changing any in-flight credential storage.
+/// The caller owns a non-null credential; null retains the current authorization.
+pub fn prepareCredentialForProvider(state: *ServerState, provider: model_provider.ProviderId) !?credentials.Credential {
+    if (!state.cfg.allowed_providers.contains(std.meta.activeTag(provider))) return error.ProviderCredentialUnavailable;
+    if (state.cfg.auth_mode == .host_managed) return null;
     const now_ms = io_mod.milliTimestamp();
     if (state.active_session) |active| {
-        if (credentialMatchesProvider(active.credential_source, provider) and
+        if (provider != .configured and credentialMatchesProvider(active.credential_source, provider) and
             credentialReadyAt(
                 active.credential_source,
                 active.api_key,
                 active.credential_refresh_after_ms,
                 now_ms,
-            )) return true;
+            )) return null;
     }
-    if (credentialMatchesProvider(state.credential_source, provider) and
+    if (provider != .configured and credentialMatchesProvider(state.credential_source, provider) and
         credentialReadyAt(
             state.credential_source,
             state.api_key,
             state.credential_refresh_after_ms,
             now_ms,
-        )) return true;
+        )) return null;
 
-    var credential = if (provider == .gateway and state.cfg.credential_override != null)
+    return if (provider == .gateway and state.cfg.credential_override != null)
         credentials.Credential{
             .token = try state.alloc.dupe(u8, state.cfg.credential_override.?),
             .source = .ai_gateway_api_key,
@@ -573,12 +591,31 @@ pub fn selectCredentialForProvider(
                 provider,
                 if (provider == .gateway) state.gateway_source_preference else state.credential_source,
             );
-        break :blk prepared orelse return false;
+        var credential = prepared orelse return error.ProviderCredentialUnavailable;
+        errdefer credential.deinit(state.alloc);
+        try ensureCodexAccountPin(state, &credential);
+        break :blk credential;
     };
-    defer credential.deinit(state.alloc);
-    try ensureCodexAccountPin(state, &credential);
-    adoptServerCredential(state, &credential);
-    return true;
+}
+
+test "ACP credential preparation preserves the existing borrowed credential" {
+    const alloc = std.testing.allocator;
+    var state: ServerState = undefined;
+    state.alloc = alloc;
+    state.cfg.auth_mode = .local;
+    state.cfg.allowed_providers = .initFull();
+    state.cfg.credential_override = "next-token";
+    state.active_session = null;
+    state.credential_source = .configured;
+    state.api_key = try alloc.dupe(u8, "active-token");
+    defer secret.zeroAndFree(alloc, state.api_key);
+    const borrowed = state.api_key;
+    var prepared = (try prepareCredentialForProvider(&state, .gateway)).?;
+    defer prepared.deinit(alloc);
+    try std.testing.expectEqualStrings("next-token", prepared.token);
+    try std.testing.expectEqualStrings("active-token", borrowed);
+    try std.testing.expect(state.api_key.ptr == borrowed.ptr);
+    try std.testing.expectEqual(types.CredentialSource.configured, state.credential_source.?);
 }
 
 pub fn streamProviderFor(
@@ -727,6 +764,10 @@ fn closeActiveSession(state: *ServerState) !void {
 
 fn destroyActiveSession(state: *ServerState) void {
     const active = if (state.active_session) |*session| session else return;
+    if (active.title_task) |task| {
+        debug_trace.logf("session", "event=title_generation_dropped reason=session_release", .{});
+        task.destroy();
+    }
     state.alloc.free(active.session_id);
     state.alloc.free(active.model);
     types.freePermissionGrantSlice(state.alloc, active.session_grants);
@@ -770,15 +811,6 @@ pub fn enableSubagentHost(state: *ServerState) void {
         state.subagent_store.?.deinit(state.alloc);
         state.subagent_store = null;
         return;
-    };
-    state.subagent_host.?.requestBackgroundRecovery(
-        io_mod.milliTimestamp(),
-    ) catch |err| {
-        debug_trace.logf(
-            "subagent",
-            "acp background recovery unavailable root_id={s} outcome={s}",
-            .{ state.subagent_host.?.root_id, @errorName(err) },
-        );
     };
 }
 
@@ -2065,12 +2097,17 @@ fn handleInitialize(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message
         state.process_model_override = startup.model_source == .process_override;
     }
     state.provider = state.cfg.provider_override orelse startup.provider;
-    if (!state.cfg.allowed_providers.contains(state.provider)) {
+    if (!state.cfg.allowed_providers.contains(std.meta.activeTag(state.provider))) {
         return state.writer.writeError(alloc, msg.id, .{
             .code = ErrorCode.invalid_request,
             .message = "Selected provider was not authorized by this host",
         });
     }
+    state.process_provider_override = config_runtime.providerEnvOverride() != null;
+    state.configured_providers.deinit(alloc);
+    state.configured_providers = startup.configured_providers;
+    startup.configured_providers = .{};
+    state.cfg.provider_set.definitions = state.configured_providers.definitions;
     state.gateway_source_preference = startup.credential_source_preference;
     state.configured_model = try alloc.dupe(u8, startup.configured_model);
 
@@ -2129,7 +2166,7 @@ fn handleInitialize(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message
             }
             break :routed &routed_credential.?;
         };
-        if (credential.token.len == 0) {
+        if (credential.token.len == 0 and credential.source != .configured) {
             return state.writer.writeError(alloc, msg.id, .{
                 .code = ErrorCode.invalid_request,
                 .message = if (state.provider == .codex)
@@ -2153,7 +2190,7 @@ fn handleInitialize(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message
     state.max_tool_result_bytes = startup.max_tool_result_bytes;
     state.context_limits = startup.context_limits;
     state.context_limits.applyCommandLine(state.cfg.context_limit_overrides);
-    state.fast_mode = startup.fast_mode and state.provider == startup.provider and
+    state.fast_mode = startup.fast_mode and state.provider.eql(startup.provider) and
         (state.cfg.model_override == null or startup.fast_mode_source != .compiled_default);
     state.effort = state.cfg.effort_override orelse startup.effort;
     state.configured_effort = startup.configured_effort;
@@ -2161,6 +2198,7 @@ fn handleInitialize(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message
         startup.effort_source == .process_override;
     state.first_call_tool_choice = startup.first_call_tool_choice;
     state.context_enabled = startup.context_enabled;
+    state.session_titles = startup.session_title_generation;
 
     if (comptime !host_target.is_wasm) {
         if (!state.cfg.minimal_kernel) {
@@ -2201,7 +2239,7 @@ fn handleInitialize(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message
             state.selected_model,
             state.cfg.provider_set.select(state.provider).fallbackModelCapabilities(state.selected_model),
         );
-        if (state.cfg.provider_override == .codex) {
+        if (state.cfg.provider_override != null and state.cfg.provider_override.? == .codex) {
             const entries = state.capability_resolver.catalogEntries() orelse
                 return state.writer.writeError(alloc, msg.id, .{
                     .code = ErrorCode.invalid_request,
@@ -2363,29 +2401,33 @@ fn handleSetConfigOption(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Me
             });
         if (comptime !host_target.is_wasm) {
             if (session.provider != .gateway) {
-                try refreshModelCatalogForOptions(state);
-                var model_available = false;
-                if (state.capability_resolver.catalogEntries()) |entries| {
-                    for (entries) |entry| {
-                        if (std.mem.eql(u8, entry.id, value)) {
-                            model_available = true;
-                            break;
+                if (session.provider != .configured) {
+                    try refreshModelCatalogForOptions(state);
+                    var model_available = false;
+                    if (state.capability_resolver.catalogEntries()) |entries| {
+                        for (entries) |entry| {
+                            if (std.mem.eql(u8, entry.id, value)) {
+                                model_available = true;
+                                break;
+                            }
                         }
                     }
-                }
-                if (!model_available) {
-                    return state.writer.writeError(alloc, msg.id, .{
-                        .code = ErrorCode.invalid_params,
-                        .message = "Model is not available for the active provider",
-                    });
+                    if (!model_available) {
+                        return state.writer.writeError(alloc, msg.id, .{
+                            .code = ErrorCode.invalid_params,
+                            .message = "Model is not available for the active provider",
+                        });
+                    }
                 }
                 if (!try selectCredentialForProvider(state, session.provider)) {
                     return state.writer.writeError(alloc, msg.id, .{
                         .code = ErrorCode.invalid_request,
                         .message = if (session.provider == .codex)
                             credentials.missing_chatgpt_credential_message
+                        else if (session.provider == .grok)
+                            credentials.missing_grok_credential_message
                         else
-                            credentials.missing_grok_credential_message,
+                            "Configured provider authentication is unavailable",
                     });
                 }
             }
@@ -2432,12 +2474,14 @@ fn handleSetConfigOption(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Me
             });
         };
     } else if (std.mem.eql(u8, config_id, "provider")) {
-        const target = model_provider.parse(value) orelse
+        const parsed_provider = model_provider.parse(value) orelse
             return state.writer.writeError(alloc, msg.id, .{
                 .code = ErrorCode.invalid_params,
                 .message = "Invalid provider",
             });
-        if (!state.cfg.allowed_providers.contains(target)) {
+        const target = parsed_provider.bind(state.configured_providers) catch
+            return state.writer.writeError(alloc, msg.id, .{ .code = ErrorCode.invalid_params, .message = "Unknown or changed configured provider" });
+        if (!state.cfg.allowed_providers.contains(std.meta.activeTag(target))) {
             return state.writer.writeError(alloc, msg.id, .{
                 .code = ErrorCode.invalid_request,
                 .message = "Provider was not supplied by this host",
@@ -2447,7 +2491,7 @@ fn handleSetConfigOption(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Me
             .code = ErrorCode.invalid_request,
             .message = "No active session",
         });
-        if (target != session.provider) {
+        if (!target.eql(session.provider)) {
             if (host_target.is_wasm) {
                 return state.writer.writeError(alloc, msg.id, .{
                     .code = ErrorCode.invalid_request,
@@ -2542,7 +2586,7 @@ fn handleSetConfigOption(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Me
                 }),
             };
             defer model_catalog.freeModelCatalog(alloc, &catalog);
-            if (catalog.items.len == 0) {
+            if (target != .configured and catalog.items.len == 0) {
                 return state.writer.writeError(alloc, msg.id, .{
                     .code = ErrorCode.invalid_request,
                     .message = "Provider returned no supported models",
@@ -2554,15 +2598,18 @@ fn handleSetConfigOption(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Me
                 try config_runtime.loadMergedSettings(alloc, state.workspace_root);
             defer settings.deinit(alloc);
             const saved_model = settings.models.get(target);
-            var selected_model = catalog.items[0].id;
-            if (saved_model) |saved| {
+            var selected_model = if (target == .configured)
+                saved_model orelse return state.writer.writeError(alloc, msg.id, .{ .code = ErrorCode.invalid_request, .message = "Configure a model for the selected provider" })
+            else
+                catalog.items[0].id;
+            if (target != .configured) if (saved_model) |saved| {
                 for (catalog.items) |entry| {
                     if (std.mem.eql(u8, entry.id, saved)) {
                         selected_model = entry.id;
                         break;
                     }
                 }
-            }
+            };
             if (state.cfg.minimal_kernel and session.writable == null) {
                 const next_model = alloc.dupe(u8, selected_model) catch
                     return state.writer.writeError(alloc, msg.id, .{
@@ -2599,6 +2646,33 @@ fn handleSetConfigOption(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Me
             defer state.subagent_authority_mutex.unlock(io_mod.getIo());
             applySessionMode(state.cfg.mode_registry, session, value);
         }
+    } else if (std.mem.eql(u8, config_id, "effort")) {
+        const session = if (state.active_session) |*active| active else return state.writer.writeError(alloc, msg.id, .{
+            .code = ErrorCode.invalid_request,
+            .message = "No active session",
+        });
+        const effort = types.ReasoningEffort.parse(value) orelse
+            return state.writer.writeError(alloc, msg.id, .{
+                .code = ErrorCode.invalid_params,
+                .message = "Invalid reasoning effort",
+            });
+        const config = sessions.effortConfigState(state) orelse
+            return state.writer.writeError(alloc, msg.id, .{
+                .code = ErrorCode.invalid_params,
+                .message = "Reasoning effort is unavailable for the active model",
+            });
+        if (!sessions.effortSupportedBy(config.efforts, effort)) {
+            return state.writer.writeError(alloc, msg.id, .{
+                .code = ErrorCode.invalid_params,
+                .message = "Reasoning effort is not available for the active model",
+            });
+        }
+        commitActiveSessionEffort(alloc, session, effort) catch {
+            return state.writer.writeError(alloc, msg.id, .{
+                .code = ErrorCode.internal_error,
+                .message = "Failed to persist session effort",
+            });
+        };
     }
 
     try refreshModelCatalogForOptions(state);
@@ -2613,6 +2687,7 @@ fn handleSetConfigOption(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Me
             &out.writer,
             if (state.active_session) |session| session.provider else state.provider,
             state.cfg.allowed_providers,
+            state.configured_providers.definitions,
         );
         try out.writer.writeAll(",");
     }
@@ -2623,6 +2698,10 @@ fn handleSetConfigOption(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Me
     );
     try out.writer.writeAll(",");
     try sessions.writeModeConfigOption(&out.writer, state.cfg.mode_registry, current_mode);
+    if (sessions.effortConfigState(state)) |config| {
+        try out.writer.writeAll(",");
+        try sessions.writeEffortConfigOption(&out.writer, config.efforts, config.current);
+    }
     try out.writer.writeAll("]}");
     try state.writer.writeResponse(alloc, msg.id, out.writer.buffered());
 }
@@ -2711,6 +2790,34 @@ fn commitSessionModel(
     );
     alloc.free(active_model.*);
     active_model.* = staged_model;
+}
+
+fn commitActiveSessionEffort(
+    alloc: Allocator,
+    session: *ActiveSessionState,
+    effort: types.ReasoningEffort,
+) !void {
+    if (host_target.is_wasm and session.writable == null) {
+        const previous = session.effort;
+        session.effort = effort;
+        sessions.commitWasmSession(alloc, session) catch |err| {
+            session.effort = previous;
+            return err;
+        };
+        return;
+    }
+    session.session_write_mutex.lockUncancelable(io_mod.getIo());
+    defer session.session_write_mutex.unlock(io_mod.getIo());
+    const writable = if (session.writable) |*active|
+        active
+    else
+        return error.SessionPersistenceUnavailable;
+    _ = try writable.appendEvent(
+        alloc,
+        .{ .preferences_changed = .{ .effort = effort } },
+        io_mod.milliTimestamp(),
+    );
+    session.effort = effort;
 }
 
 fn handleSetMode(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message) !void {

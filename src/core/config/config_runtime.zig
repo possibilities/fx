@@ -11,6 +11,7 @@ const project_config = @import("../mcp/project_config.zig");
 const model_provider = @import("model_provider.zig");
 const model_preferences = @import("model_preferences.zig");
 const session_naming = @import("../session/session_naming.zig");
+const configured_provider = @import("configured_provider.zig");
 const update_target = @import("../upgrade/update_target.zig");
 pub const context_limits = @import("context_limits.zig");
 
@@ -57,6 +58,7 @@ pub const Paths = struct {
 };
 
 pub const Settings = struct {
+    providers: ?configured_provider.Registry = null,
     models: model_preferences.Preferences = .{},
     provider: ?model_provider.ProviderId = null,
     permission_mode: ?types.PermissionMode = null,
@@ -79,6 +81,7 @@ pub const Settings = struct {
     statusline_context: ?bool = null,
     statusline_session: ?bool = null,
     statusline_workspace: ?bool = null,
+    session_titles: ?bool = null,
     notification_turn_end: ?bool = null,
     notification_attention_required: ?bool = null,
     notification_max: ?bool = null,
@@ -89,6 +92,7 @@ pub const Settings = struct {
     pub fn deinit(self: *Settings, alloc: Allocator) void {
         self.models.deinit(alloc);
         self.session_naming.deinit(alloc);
+        if (self.providers) |*providers| providers.deinit(alloc);
         self.permission_rules.deinit(alloc);
         self.* = .{};
     }
@@ -145,21 +149,35 @@ pub const ConfigSources = struct {
     prompt_history_enabled: ConfigSource = .compiled_default,
     statusline_context: ConfigSource = .compiled_default,
     statusline_session: ConfigSource = .compiled_default,
+    session_titles: ConfigSource = .compiled_default,
     notification_turn_end: ConfigSource = .compiled_default,
     notification_attention_required: ConfigSource = .compiled_default,
     notification_max: ConfigSource = .compiled_default,
 };
 
 pub const ProviderModelSources = struct {
-    values: [std.meta.fields(model_provider.ProviderId).len]ConfigSource =
-        [_]ConfigSource{.compiled_default} ** std.meta.fields(model_provider.ProviderId).len,
+    const Entry = struct { provider: model_provider.NameKey, source: ConfigSource };
+    entries: [model_preferences.max_preferences]?Entry = @splat(null),
 
-    pub fn get(self: ProviderModelSources, provider: model_provider.ProviderId) ConfigSource {
-        return self.values[@intFromEnum(provider)];
+    pub fn get(self: *const ProviderModelSources, provider: model_provider.NameKey) ConfigSource {
+        for (self.entries) |entry| if (entry) |*value| {
+            if (value.provider.eqlName(provider.label())) return value.source;
+        };
+        return .compiled_default;
     }
 
-    pub fn set(self: *ProviderModelSources, provider: model_provider.ProviderId, source: ConfigSource) void {
-        self.values[@intFromEnum(provider)] = source;
+    pub fn set(self: *ProviderModelSources, provider: model_provider.NameKey, source: ConfigSource) !void {
+        for (&self.entries) |*entry| {
+            if (entry.*) |*value| {
+                if (!value.provider.eqlName(provider.label())) continue;
+                value.source = source;
+                return;
+            } else {
+                entry.* = .{ .provider = provider, .source = source };
+                return;
+            }
+        }
+        return error.TooManyModelPreferences;
     }
 };
 
@@ -274,6 +292,41 @@ pub fn discoverPaths(alloc: Allocator, workspace_root: []const u8) !Paths {
 
 pub fn discoverPathsFromHome(alloc: Allocator, home_dir: []const u8, workspace_root: []const u8) !Paths {
     return discoverPathsWithOptionalHome(alloc, home_dir, workspace_root);
+}
+
+pub fn providerEnvOverride() ?[]const u8 {
+    const raw = io_mod.getenv("FX_PROVIDER") orelse return null;
+    return std.mem.trim(u8, raw, " \t\r\n");
+}
+
+fn resolve_provider_selection(settings: *Settings) !void {
+    if (providerEnvOverride()) |raw| {
+        settings.provider = model_provider.parse(raw) orelse return error.InvalidProviderValue;
+    }
+    if (settings.provider) |provider| settings.provider = try provider.bind(settings.providers orelse .{});
+}
+
+/// Reads only profile-global connection definitions. Caller owns the registry.
+pub fn loadConfiguredProviders(alloc: Allocator) !configured_provider.Registry {
+    var paths = try discoverPaths(alloc, ".");
+    defer paths.deinit(alloc);
+    return loadConfiguredProvidersFromPaths(alloc, paths);
+}
+
+pub fn loadConfiguredProvidersFromHome(alloc: Allocator, home: []const u8) !configured_provider.Registry {
+    var paths = try discoverPathsFromHome(alloc, home, ".");
+    defer paths.deinit(alloc);
+    return loadConfiguredProvidersFromPaths(alloc, paths);
+}
+
+fn loadConfiguredProvidersFromPaths(alloc: Allocator, paths: Paths) !configured_provider.Registry {
+    const bytes = (try readOptionalUserSettingsFile(alloc, paths)) orelse return .{};
+    defer alloc.free(bytes);
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, bytes, .{ .duplicate_field_behavior = .@"error" });
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.InvalidSettingsShape;
+    const definitions = parsed.value.object.get("providers") orelse return .{};
+    return configured_provider.Registry.parse(alloc, definitions);
 }
 
 pub fn loadMergedSettings(alloc: Allocator, workspace_root: []const u8) !Settings {
@@ -538,9 +591,18 @@ fn loadMergedSettingsDetailedWithOptionalHome(
         }
     }
 
+    try resolve_provider_selection(&settings);
+    if (providerEnvOverride() != null) sources.provider = .process_override;
     if (io_mod.getenv("FX_MODEL")) |model_override| {
         if (std.mem.trim(u8, model_override, " \t\r\n").len > 0) {
-            sources.models.set(settings.provider orelse .gateway, .process_override);
+            const override_provider = model_provider.NameKey.fromProvider(settings.provider orelse .gateway);
+            sources.models.set(override_provider, .process_override) catch |err| switch (err) {
+                error.TooManyModelPreferences => debug_trace.logf(
+                    "config",
+                    "dropping process model override provenance provider={s}: provenance table holds at most {d} provider names",
+                    .{ override_provider.label(), model_preferences.max_preferences },
+                ),
+            };
         }
     }
     if (processEffortOverride() != null) sources.effort = .process_override;
@@ -548,7 +610,7 @@ fn loadMergedSettingsDetailedWithOptionalHome(
     return .{
         .settings = settings,
         .diagnostics = try diagnostics.toOwnedSlice(alloc),
-        .model_source = sources.models.get(settings.provider orelse .gateway),
+        .model_source = sources.models.get(model_provider.NameKey.fromProvider(settings.provider orelse .gateway)),
         .sources = sources,
         .permission_sources = permission_sources,
         .prompt_history_store_allowed = prompt_history_store_allowed,
@@ -641,6 +703,7 @@ fn isProfileOnlySettingKey(key: []const u8) bool {
         "model",
         "models",
         "provider",
+        "providers",
         "codex_model",
         "grok_model",
         "session_naming",
@@ -649,6 +712,7 @@ fn isProfileOnlySettingKey(key: []const u8) bool {
         "fast_mode_model_bound",
         "slash_menu_categories",
         "collapse_tool_calls",
+        "session_titles",
         "startup_scrollback",
         "prompt_history",
         "statusLine",
@@ -686,10 +750,51 @@ fn appendIgnoredProjectProfileSettingDiagnostics(
     }
 }
 
-fn updateConfigSources(sources: *ConfigSources, settings: Settings, source: ConfigSource) void {
-    inline for (std.meta.tags(model_provider.ProviderId)) |provider| {
-        if (settings.models.get(provider) != null) sources.models.set(provider, source);
+/// The profile layer parse is atomic: one malformed field discards every
+/// field, including provider routing. When that happens, re-parse only the
+/// provider routing triple (connections, selection, per-provider models)
+/// through the same layer-scoped parser so a broken sibling (for example a
+/// mistyped effort) cannot silently drop the configured connection and fall
+/// back to Gateway. The layer scope is identical to normal parsing, so
+/// workspace override provider definitions stay ignored here too. Returns
+/// true when the layer declared routing that is now installed; errors when
+/// the routing fields themselves are broken.
+fn salvageProviderRouting(alloc: Allocator, settings: *Settings, sources: *ConfigSources, value: std.json.Value, layer: SettingsLayer, source: ConfigSource) error{ OutOfMemory, InvalidProviderRouting }!bool {
+    var routing_only: std.json.ObjectMap = .empty;
+    defer routing_only.deinit(alloc);
+    for ([_][]const u8{ "provider", "providers", "models" }) |key| {
+        const field = value.object.get(key) orelse continue;
+        routing_only.put(alloc, key, field) catch return error.OutOfMemory;
     }
+    if (routing_only.count() == 0) return false;
+    var salvaged = parseSettingsValueForLayer(alloc, .{ .object = routing_only }, layer, false, false) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.InvalidProviderRouting,
+    };
+    defer salvaged.deinit(alloc);
+    if (salvaged.provider == null and salvaged.providers == null and salvaged.models.isEmpty()) return false;
+    updateConfigSources(sources, salvaged, source);
+    if (salvaged.providers) |registry| {
+        if (settings.providers) |*old| old.deinit(alloc);
+        settings.providers = registry;
+        salvaged.providers = null;
+    }
+    if (salvaged.provider) |provider| settings.provider = provider;
+    settings.models.mergeOwnedFrom(alloc, &salvaged.models) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.TooManyModelPreferences => return error.InvalidProviderRouting,
+    };
+    return true;
+}
+
+fn updateConfigSources(sources: *ConfigSources, settings: Settings, source: ConfigSource) void {
+    for (settings.models.entries.items) |entry| sources.models.set(entry.provider, source) catch |err| switch (err) {
+        error.TooManyModelPreferences => debug_trace.logf(
+            "config",
+            "dropping model provenance provider={s} source={s}: provenance table holds at most {d} provider names",
+            .{ entry.provider.label(), @tagName(source), model_preferences.max_preferences },
+        ),
+    };
     if (settings.provider != null) sources.provider = source;
     if (settings.permission_mode != null) sources.permission_mode = source;
     if (settings.effort != null) sources.effort = source;
@@ -697,6 +802,7 @@ fn updateConfigSources(sources: *ConfigSources, settings: Settings, source: Conf
     if (settings.fast_mode_model_bound != null) sources.fast_mode_model_bound = source;
     if (settings.slash_menu_categories != null) sources.slash_menu_categories = source;
     if (settings.collapse_tool_calls != null) sources.collapse_tool_calls = source;
+    if (settings.session_titles != null) sources.session_titles = source;
     if (settings.startup_scrollback != null) sources.startup_scrollback = source;
     if (settings.prompt_history_enabled != null) sources.prompt_history_enabled = source;
     if (settings.statusline_context != null) sources.statusline_context = source;
@@ -733,7 +839,7 @@ fn mergeDetailedSettingsLayer(
     if (parseSettingsValueForLayer(
         alloc,
         value,
-        settings_layer,
+        if (source == .user_workspace) .profile_workspace else settings_layer,
         tolerate_non_object_user_containers,
         source != .user_workspace,
     )) |layer_settings| {
@@ -762,9 +868,15 @@ fn mergeDetailedSettingsLayer(
                 },
             }
         }
-        mergeSettings(state.settings, &incoming, alloc);
+        try mergeSettings(state.settings, &incoming, alloc);
     } else |err| {
         if (err == error.OutOfMemory) return err;
+        if (diagnostic_layer == .user and value == .object) {
+            _ = salvageProviderRouting(alloc, state.settings, state.sources, value, if (source == .user_workspace) .profile_workspace else settings_layer, source) catch |salvage_err| switch (salvage_err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                error.InvalidProviderRouting => return err,
+            };
+        }
         if (diagnostic_layer == .user and err == error.InvalidModelValue) state.prompt_history_store_allowed.* = false;
         try state.diagnostics.append(alloc, .{
             .layer = diagnostic_layer,
@@ -791,12 +903,6 @@ fn diagnosticCauseForUserStoreError(err: anyerror) ConfigDiagnosticCause {
         error.PrivateStatePermissionsUnsupported => .private_state_permissions_unsupported,
         else => .malformed_settings,
     };
-}
-
-pub fn loadStartupStatusSettings(alloc: Allocator, workspace_root: []const u8) !StartupStatusSettings {
-    var paths = try discoverPaths(alloc, workspace_root);
-    defer paths.deinit(alloc);
-    return loadStartupStatusSettingsFromPaths(alloc, paths);
 }
 
 pub fn loadStartupStatusSettingsFromHome(alloc: Allocator, home_dir: []const u8, workspace_root: []const u8) !StartupStatusSettings {
@@ -1129,14 +1235,15 @@ pub fn loadMergedSettingsFromPaths(alloc: Allocator, paths: Paths) !Settings {
         var user_settings = try parseSettingsValueForLayer(alloc, parsed.value, .profile, false, true);
         defer user_settings.deinit(alloc);
         user_settings.context_limits.retag(.user_global);
-        mergeSettings(&settings, &user_settings, alloc);
+        try mergeSettings(&settings, &user_settings, alloc);
 
         try mergeWorkspaceOverridesFromValue(&settings, alloc, parsed.value, paths.workspace_root);
+        try resolve_provider_selection(&settings);
         return settings;
     }
 
     try mergeSettingsFile(&settings, alloc, paths.workspace_settings);
-
+    try resolve_provider_selection(&settings);
     return settings;
 }
 
@@ -1227,11 +1334,11 @@ fn mergeWorkspaceOverridesFromValue(target: *Settings, alloc: Allocator, root_va
     const override_val = workspaces_val.object.get(workspace_root) orelse return;
     if (override_val != .object) return;
 
-    var override_settings = try parseSettingsValueForLayer(alloc, override_val, .profile, true, false);
+    var override_settings = try parseSettingsValueForLayer(alloc, override_val, .profile_workspace, true, false);
     defer override_settings.deinit(alloc);
     override_settings.update_channel = null;
     override_settings.context_limits.retag(.user_workspace);
-    mergeSettings(target, &override_settings, alloc);
+    try mergeSettings(target, &override_settings, alloc);
 }
 
 fn mergeSettingsFile(target: *Settings, alloc: Allocator, path: []const u8) !void {
@@ -1240,7 +1347,7 @@ fn mergeSettingsFile(target: *Settings, alloc: Allocator, path: []const u8) !voi
 
     var parsed = try parseSettingsJsonForLayer(alloc, bytes, .project);
     defer parsed.deinit(alloc);
-    mergeSettings(target, &parsed, alloc);
+    try mergeSettings(target, &parsed, alloc);
 }
 
 fn readOptionalFile(alloc: Allocator, path: []const u8) !?[]u8 {
@@ -1327,6 +1434,7 @@ const JsonStringToken = struct {
 
 const SettingsLayer = enum {
     profile,
+    profile_workspace,
     project,
 };
 
@@ -1497,7 +1605,10 @@ fn parseSettingsValueForLayer(
     var settings = Settings{};
     errdefer settings.deinit(alloc);
 
-    if (layer == .profile) try parseProfileOnlyFields(
+    if (layer == .profile) {
+        if (root.object.get("providers")) |value| settings.providers = try configured_provider.Registry.parse(alloc, value);
+    }
+    if (layer != .project) try parseProfileOnlyFields(
         &settings,
         alloc,
         root,
@@ -1544,12 +1655,13 @@ fn parseProfileOnlyFields(
 
     if (root.object.get("models")) |models_value| {
         if (models_value != .object) return error.InvalidModelType;
-        inline for (std.meta.tags(model_provider.ProviderId)) |provider| {
-            if (models_value.object.get(@tagName(provider))) |model_value| {
-                if (model_value != .string) return error.InvalidModelType;
-                settings_store.validateModel(model_value.string) catch return error.InvalidModelValue;
-                try settings.models.putCopy(alloc, provider, model_value.string);
-            }
+        var iterator = models_value.object.iterator();
+        while (iterator.next()) |entry| {
+            const provider = model_provider.parse(entry.key_ptr.*) orelse return error.InvalidProviderValue;
+            const model_value = entry.value_ptr.*;
+            if (model_value != .string) return error.InvalidModelType;
+            settings_store.validateModel(model_value.string) catch return error.InvalidModelValue;
+            try settings.models.putCopy(alloc, provider, model_value.string);
         }
     }
 
@@ -1610,6 +1722,12 @@ fn parseProfileOnlyFields(
         const value = collapse_tool_calls_value;
         if (value != .bool) return error.InvalidCollapseToolCallsType;
         settings.collapse_tool_calls = value.bool;
+    }
+
+    if (root.object.get("session_titles")) |session_titles_value| {
+        const value = session_titles_value;
+        if (value != .bool) return error.InvalidSessionTitlesType;
+        settings.session_titles = value.bool;
     }
 
     if (root.object.get("auto_upgrade")) |auto_upgrade_value| {
@@ -1716,8 +1834,13 @@ fn parseProjectSafeFields(settings: *Settings, root: std.json.Value) !void {
     }
 }
 
-fn mergeSettings(target: *Settings, incoming: *Settings, alloc: Allocator) void {
-    target.models.mergeOwnedFrom(alloc, &incoming.models);
+fn mergeSettings(target: *Settings, incoming: *Settings, alloc: Allocator) !void {
+    try target.models.mergeOwnedFrom(alloc, &incoming.models);
+    if (incoming.providers) |providers| {
+        if (target.providers) |*old| old.deinit(alloc);
+        target.providers = providers;
+        incoming.providers = null;
+    }
     if (incoming.provider) |value| target.provider = value;
     mergeSessionNamingSettings(
         &target.session_naming,
@@ -1736,6 +1859,7 @@ fn mergeSettings(target: *Settings, incoming: *Settings, alloc: Allocator) void 
     if (incoming.fast_mode_model_bound) |value| target.fast_mode_model_bound = value;
     if (incoming.slash_menu_categories) |value| target.slash_menu_categories = value;
     if (incoming.collapse_tool_calls) |value| target.collapse_tool_calls = value;
+    if (incoming.session_titles) |value| target.session_titles = value;
     if (incoming.auto_upgrade) |value| target.auto_upgrade = value;
     if (incoming.update_channel) |value| target.update_channel = value;
     if (incoming.startup_scrollback) |value| target.startup_scrollback = value;
@@ -1776,7 +1900,7 @@ fn parseSessionNamingSettings(
     };
     for (provider_entries) |entry| {
         const provider_value = value.object.get(entry.key) orelse continue;
-        const setting = result.setting(entry.provider);
+        const setting = result.setting(entry.provider) orelse unreachable;
         setting.specified = true;
         if (provider_value == .null) continue;
         if (provider_value != .object) return error.InvalidSessionNamingProviderType;
@@ -1818,9 +1942,9 @@ fn mergeSessionNamingSettings(
         model_provider.ProviderId.grok,
     };
     for (providers) |provider| {
-        const source = incoming.setting(provider);
+        const source = incoming.setting(provider) orelse unreachable;
         if (!source.specified) continue;
-        const destination = target.setting(provider);
+        const destination = target.setting(provider) orelse unreachable;
         destination.deinit(alloc);
         destination.* = source.*;
         source.* = .{};
@@ -2369,7 +2493,7 @@ test "max_tool_result_bytes parses resolves merges and serializes" {
 
     var second = try parseSettingsJson(std.testing.allocator, "{\"max_tool_result_bytes\":131072}");
     defer second.deinit(std.testing.allocator);
-    mergeSettings(&first, &second, std.testing.allocator);
+    try mergeSettings(&first, &second, std.testing.allocator);
     try std.testing.expectEqual(@as(usize, 131072), first.max_tool_result_bytes.?);
 
     var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, "{\"max_tool_result_bytes\":131072}", .{});
@@ -2410,7 +2534,7 @@ test "startup_scrollback parses merges rejects invalid type and round trips" {
 
     var second = try parseSettingsJson(std.testing.allocator, "{\"startup_scrollback\":false}");
     defer second.deinit(std.testing.allocator);
-    mergeSettings(&first, &second, std.testing.allocator);
+    try mergeSettings(&first, &second, std.testing.allocator);
     try std.testing.expectEqual(false, first.startup_scrollback.?);
 
     try std.testing.expectError(error.InvalidStartupScrollbackType, parseSettingsJson(std.testing.allocator, "{\"startup_scrollback\":\"off\"}"));
@@ -2433,7 +2557,7 @@ test "collapse tool calls parses merges and rejects invalid types" {
 
     var second = try parseSettingsJson(std.testing.allocator, "{\"collapse_tool_calls\":false}");
     defer second.deinit(std.testing.allocator);
-    mergeSettings(&first, &second, std.testing.allocator);
+    try mergeSettings(&first, &second, std.testing.allocator);
     try std.testing.expect(!first.collapse_tool_calls.?);
 
     try std.testing.expectError(
@@ -2453,7 +2577,7 @@ test "slash menu categories parses merges and rejects invalid types" {
 
     var second = try parseSettingsJson(std.testing.allocator, "{\"slash_menu_categories\":false}");
     defer second.deinit(std.testing.allocator);
-    mergeSettings(&first, &second, std.testing.allocator);
+    try mergeSettings(&first, &second, std.testing.allocator);
     try std.testing.expectEqual(false, first.slash_menu_categories.?);
 
     try std.testing.expectError(
@@ -2473,7 +2597,7 @@ test "first_call_tool_choice parses merges and round trips" {
 
     var second = try parseSettingsJson(std.testing.allocator, "{\"first_call_tool_choice\":\"auto\"}");
     defer second.deinit(std.testing.allocator);
-    mergeSettings(&first, &second, std.testing.allocator);
+    try mergeSettings(&first, &second, std.testing.allocator);
     try std.testing.expectEqual(types.ToolChoice.auto, first.first_call_tool_choice.?);
 
     var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, "{\"first_call_tool_choice\":\"none\"}", .{});
@@ -3475,7 +3599,7 @@ test "global statusline fields parse and merge independently" {
     );
     defer incoming.deinit(std.testing.allocator);
 
-    mergeSettings(&target, &incoming, std.testing.allocator);
+    try mergeSettings(&target, &incoming, std.testing.allocator);
 
     try std.testing.expectEqual(true, target.statusline_context.?);
     try std.testing.expectEqual(true, target.statusline_session.?);
@@ -3608,7 +3732,7 @@ test "notification settings default off parse and merge by field" {
         "{\"notifications\":{\"attention_required\":true,\"max\":true}}",
     );
     defer workspace.deinit(std.testing.allocator);
-    mergeSettings(&global, &workspace, std.testing.allocator);
+    try mergeSettings(&global, &workspace, std.testing.allocator);
 
     try std.testing.expectEqual(true, global.notification_turn_end.?);
     try std.testing.expectEqual(true, global.notification_attention_required.?);
@@ -3764,7 +3888,7 @@ test "detailed settings expose target sources and permission views" {
     var result = try loadMergedSettingsDetailedFromHome(std.testing.allocator, home_root, workspace_root);
     defer result.deinit(std.testing.allocator);
 
-    try std.testing.expectEqual(ConfigSource.user_workspace, result.sources.models.get(.gateway));
+    try std.testing.expectEqual(ConfigSource.user_workspace, result.sources.models.get(model_provider.NameKey.fromProvider(.gateway)));
     try std.testing.expectEqual(ConfigSource.user_workspace, result.sources.permission_mode);
     try std.testing.expectEqual(ConfigSource.compiled_default, result.sources.effort);
     try std.testing.expectEqual(ConfigSource.user_global, result.sources.fast_mode);
@@ -3806,12 +3930,12 @@ test "detailed settings report non-empty process model override as winning sourc
     var result = try loadMergedSettingsDetailedFromHome(std.testing.allocator, home_root, workspace_root);
     defer result.deinit(std.testing.allocator);
 
-    try std.testing.expectEqual(ConfigSource.process_override, result.sources.models.get(.gateway));
+    try std.testing.expectEqual(ConfigSource.process_override, result.sources.models.get(model_provider.NameKey.fromProvider(.gateway)));
     try std.testing.expectEqual(ModelSource.process_override, result.model_source.?);
     try std.testing.expectEqualStrings("user/model", result.settings.models.get(.gateway).?);
 }
 
-test "detailed settings report valid process effort override as winning source" {
+test "full model provenance table drops process override bookkeeping without failing the load" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
@@ -3821,22 +3945,33 @@ test "detailed settings report valid process effort override as winning source" 
     defer std.testing.allocator.free(home_root);
     const workspace_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "workspace");
     defer std.testing.allocator.free(workspace_root);
-    try writeFixtureFile(tmp.dir, "home/.fx/settings.json", "{\"effort\":\"low\"}\n");
+
+    var json: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer json.deinit();
+    try json.writer.writeAll("{\"models\":{");
+    for (0..model_preferences.max_preferences) |i| {
+        if (i > 0) try json.writer.writeByte(',');
+        try json.writer.print("\"p{d}\":\"m{d}\"", .{ i, i });
+    }
+    try json.writer.writeAll("}}\n");
+    const user_settings = try json.toOwnedSlice();
+    defer std.testing.allocator.free(user_settings);
+    try writeFixtureFile(tmp.dir, "home/.fx/settings.json", user_settings);
 
     const home = try TestHome.install(std.testing.allocator, home_root);
     defer home.deinit();
-    try home.map.put("FX_EFFORT", " high ");
+    try home.map.put("FX_MODEL", "process/model");
 
     var result = try loadMergedSettingsDetailedFromHome(std.testing.allocator, home_root, workspace_root);
     defer result.deinit(std.testing.allocator);
 
-    try std.testing.expectEqual(ConfigSource.process_override, result.sources.effort);
-    try std.testing.expect(result.settings.effort.?.eql(types.ReasoningEffort.literal("low")));
-    try std.testing.expect(processEffortOverride().?.eql(types.ReasoningEffort.literal("high")));
-    try std.testing.expect(resolveEffort(result.settings.effort).eql(types.ReasoningEffort.literal("high")));
+    try std.testing.expectEqualStrings("m0", result.settings.models.get(model_provider.parse("p0").?).?);
+    // The 36th provenance entry was dropped, so the diagnostic reads as the
+    // default rather than failing the whole settings load.
+    try std.testing.expectEqual(ConfigSource.compiled_default, result.model_source.?);
 }
 
-test "blank or invalid process effort override is ignored" {
+test "provider routing stays fail-closed only when provider fields are broken" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
@@ -3846,23 +3981,132 @@ test "blank or invalid process effort override is ignored" {
     defer std.testing.allocator.free(home_root);
     const workspace_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "workspace");
     defer std.testing.allocator.free(workspace_root);
-    try writeFixtureFile(tmp.dir, "home/.fx/settings.json", "{\"effort\":\"low\"}\n");
+    try writeFixtureFile(
+        tmp.dir,
+        "home/.fx/settings.json",
+        "{\"providers\":{\"local\":{\"protocol\":\"openai-chat-completions\",\"base_url\":\"http://localhost:11434/v1/\",\"auth\":{\"type\":\"none\"}}},\"provider\":\"local\",\"models\":{\"local\":\"local-model\"},\"effort\":42}\n",
+    );
+
+    var result = try loadMergedSettingsDetailedFromHome(std.testing.allocator, home_root, workspace_root);
+    defer result.deinit(std.testing.allocator);
+
+    // Unrelated malformed fields downgrade to diagnostics; the valid provider
+    // routing triple (connection, selection, model) survives.
+    try std.testing.expect(result.settings.provider.? == .configured);
+    try std.testing.expectEqualStrings("local", result.settings.provider.?.label());
+    try std.testing.expectEqualStrings("local-model", result.settings.models.get(model_provider.parse("local").?).?);
+    var saw_user_diagnostic = false;
+    for (result.diagnostics) |diagnostic| {
+        if (diagnostic.layer == .user and diagnostic.cause == .malformed_settings) saw_user_diagnostic = true;
+    }
+    try std.testing.expect(saw_user_diagnostic);
+}
+
+test "broken provider definitions in the profile still fail the load" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
+    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
+
+    const home_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "home");
+    defer std.testing.allocator.free(home_root);
+    const workspace_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "workspace");
+    defer std.testing.allocator.free(workspace_root);
+    try writeFixtureFile(
+        tmp.dir,
+        "home/.fx/settings.json",
+        "{\"providers\":{\"local\":{\"protocol\":\"bogus\",\"base_url\":\"http://localhost:11434/v1/\",\"auth\":{\"type\":\"none\"}}},\"provider\":\"local\"}\n",
+    );
+
+    try std.testing.expectError(error.InvalidProtocol, loadMergedSettingsDetailedFromHome(std.testing.allocator, home_root, workspace_root));
+}
+
+test "workspace provider definitions stay ignored when a sibling workspace field fails to parse" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
+    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
+
+    const home_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "home");
+    defer std.testing.allocator.free(home_root);
+    const workspace_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "workspace");
+    defer std.testing.allocator.free(workspace_root);
+
+    var json: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer json.deinit();
+    try json.writer.print(
+        "{{\"providers\":{{\"local\":{{\"protocol\":\"openai-chat-completions\",\"base_url\":\"http://localhost:11434/v1/\",\"auth\":{{\"type\":\"none\"}}}}}},\"provider\":\"local\",\"models\":{{\"local\":\"local-model\"}},\"workspaces\":{{\"{s}\":{{\"providers\":{{\"shadow\":{{\"protocol\":\"openai-chat-completions\",\"base_url\":\"http://localhost:11435/v1/\",\"auth\":{{\"type\":\"none\"}}}}}},\"effort\":42}}}}}}\n",
+        .{workspace_root},
+    );
+    const user_settings = try json.toOwnedSlice();
+    defer std.testing.allocator.free(user_settings);
+    try writeFixtureFile(tmp.dir, "home/.fx/settings.json", user_settings);
+
+    var result = try loadMergedSettingsDetailedFromHome(std.testing.allocator, home_root, workspace_root);
+    defer result.deinit(std.testing.allocator);
+
+    // Recovery follows the same layer scope as normal parsing: workspace
+    // override provider definitions are ignored, so the global connection
+    // survives the malformed sibling field.
+    try std.testing.expect(result.settings.provider.? == .configured);
+    try std.testing.expectEqualStrings("local", result.settings.provider.?.label());
+    try std.testing.expectEqualStrings("http://localhost:11434/v1", result.settings.providers.?.get("local").?.base_url);
+    try std.testing.expect(result.settings.providers.?.get("shadow") == null);
+    var saw_user_diagnostic = false;
+    for (result.diagnostics) |diagnostic| {
+        if (diagnostic.layer == .user and diagnostic.cause == .malformed_settings) saw_user_diagnostic = true;
+    }
+    try std.testing.expect(saw_user_diagnostic);
+}
+
+test "ignored workspace provider definitions with broken protocols stay inert during recovery" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
+    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
+
+    const home_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "home");
+    defer std.testing.allocator.free(home_root);
+    const workspace_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "workspace");
+    defer std.testing.allocator.free(workspace_root);
+
+    var json: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer json.deinit();
+    try json.writer.print(
+        "{{\"providers\":{{\"local\":{{\"protocol\":\"openai-chat-completions\",\"base_url\":\"http://localhost:11434/v1/\",\"auth\":{{\"type\":\"none\"}}}}}},\"provider\":\"local\",\"models\":{{\"local\":\"local-model\"}},\"workspaces\":{{\"{s}\":{{\"providers\":{{\"shadow\":{{\"protocol\":\"bogus\",\"base_url\":\"http://localhost:11435/v1/\",\"auth\":{{\"type\":\"none\"}}}}}},\"effort\":42}}}}}}\n",
+        .{workspace_root},
+    );
+    const user_settings = try json.toOwnedSlice();
+    defer std.testing.allocator.free(user_settings);
+    try writeFixtureFile(tmp.dir, "home/.fx/settings.json", user_settings);
+
+    var result = try loadMergedSettingsDetailedFromHome(std.testing.allocator, home_root, workspace_root);
+    defer result.deinit(std.testing.allocator);
+
+    try std.testing.expectEqualStrings("http://localhost:11434/v1", result.settings.providers.?.get("local").?.base_url);
+    try std.testing.expect(result.settings.providers.?.get("shadow") == null);
+}
+
+test "empty FX_PROVIDER fails before selected profile startup" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
+    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
+
+    const home_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "home");
+    defer std.testing.allocator.free(home_root);
+    const workspace_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "workspace");
+    defer std.testing.allocator.free(workspace_root);
+    try writeFixtureFile(tmp.dir, "home/.fx/settings.json", "{}\n");
 
     const home = try TestHome.install(std.testing.allocator, home_root);
     defer home.deinit();
+    try home.map.put("FX_PROVIDER", "");
 
-    inline for (&.{ "", "   ", "not valid!", "x" ** (types.ReasoningEffort.max_name_bytes + 1) }) |raw| {
-        try home.map.put("FX_EFFORT", raw);
-        var result = try loadMergedSettingsDetailedFromHome(std.testing.allocator, home_root, workspace_root);
-        defer result.deinit(std.testing.allocator);
-        try std.testing.expectEqual(ConfigSource.user_global, result.sources.effort);
-        try std.testing.expect(processEffortOverride() == null);
-        try std.testing.expect(resolveEffort(result.settings.effort).eql(types.ReasoningEffort.literal("low")));
-    }
-
-    try home.map.put("FX_EFFORT", "default");
-    try std.testing.expectEqual(types.ReasoningEffort.auto, processEffortOverride().?);
-    try std.testing.expectEqual(types.ReasoningEffort.auto, resolveEffort(types.ReasoningEffort.literal("low")));
+    try std.testing.expectError(
+        error.InvalidProviderValue,
+        loadMergedSettingsDetailedFromHome(std.testing.allocator, home_root, workspace_root),
+    );
 }
 
 test "invalid user model emits typed diagnostic and project model is ignored" {
@@ -4126,4 +4370,58 @@ test "malformed or duplicate additional directories do not discard sibling setti
         }
         try std.testing.expect(found_diagnostic);
     }
+}
+
+test "detailed settings report valid process effort override as winning source" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
+    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
+
+    const home_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "home");
+    defer std.testing.allocator.free(home_root);
+    const workspace_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "workspace");
+    defer std.testing.allocator.free(workspace_root);
+    try writeFixtureFile(tmp.dir, "home/.fx/settings.json", "{\"effort\":\"low\"}\n");
+
+    const home = try TestHome.install(std.testing.allocator, home_root);
+    defer home.deinit();
+    try home.map.put("FX_EFFORT", " high ");
+
+    var result = try loadMergedSettingsDetailedFromHome(std.testing.allocator, home_root, workspace_root);
+    defer result.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(ConfigSource.process_override, result.sources.effort);
+    try std.testing.expect(result.settings.effort.?.eql(types.ReasoningEffort.literal("low")));
+    try std.testing.expect(processEffortOverride().?.eql(types.ReasoningEffort.literal("high")));
+    try std.testing.expect(resolveEffort(result.settings.effort).eql(types.ReasoningEffort.literal("high")));
+}
+
+test "blank or invalid process effort override is ignored" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
+    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
+
+    const home_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "home");
+    defer std.testing.allocator.free(home_root);
+    const workspace_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "workspace");
+    defer std.testing.allocator.free(workspace_root);
+    try writeFixtureFile(tmp.dir, "home/.fx/settings.json", "{\"effort\":\"low\"}\n");
+
+    const home = try TestHome.install(std.testing.allocator, home_root);
+    defer home.deinit();
+
+    inline for (&.{ "", "   ", "not valid!", "x" ** (types.ReasoningEffort.max_name_bytes + 1) }) |raw| {
+        try home.map.put("FX_EFFORT", raw);
+        var result = try loadMergedSettingsDetailedFromHome(std.testing.allocator, home_root, workspace_root);
+        defer result.deinit(std.testing.allocator);
+        try std.testing.expectEqual(ConfigSource.user_global, result.sources.effort);
+        try std.testing.expect(processEffortOverride() == null);
+        try std.testing.expect(resolveEffort(result.settings.effort).eql(types.ReasoningEffort.literal("low")));
+    }
+
+    try home.map.put("FX_EFFORT", "default");
+    try std.testing.expectEqual(types.ReasoningEffort.auto, processEffortOverride().?);
+    try std.testing.expectEqual(types.ReasoningEffort.auto, resolveEffort(types.ReasoningEffort.literal("low")));
 }
