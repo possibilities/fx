@@ -101,6 +101,9 @@ pub fn buildRequest(
         try std.json.Stringify.value(effort.label(), .{}, writer);
         try writer.writeAll(",\"summary\":\"auto\"}");
     }
+    // xAI exposes Fast mode as its priority service tier; the subscription
+    // proxy accepts the parameter endpoint-wide, independent of the model.
+    if (request.provider_options.fast) try writer.writeAll(",\"service_tier\":\"priority\"");
     if (request.max_output_tokens) |limit| try writer.print(",\"max_output_tokens\":{d}", .{limit});
     try writer.writeByte('}');
     return out.toOwnedSlice();
@@ -176,45 +179,6 @@ fn requestDeadlineExpired(request: stream_provider.ModelRequest) bool {
     return !std.Io.Clock.Timestamp.compare(now, .lt, deadline);
 }
 
-const OpenedRequest = struct {
-    request: ?std.http.Client.Request,
-
-    pub fn deinit(self: *OpenedRequest, _: Allocator) void {
-        if (self.request) |*request| request.deinit();
-        self.request = null;
-    }
-
-    pub fn take(self: *OpenedRequest) std.http.Client.Request {
-        const request = self.request.?;
-        self.request = null;
-        return request;
-    }
-};
-
-const OpenRequestOperation = struct {
-    client: *std.http.Client,
-    uri: std.Uri,
-    auth_header: ?[]const u8,
-    extra_headers: []const std.http.Header,
-
-    pub fn run(self: *@This()) !OpenedRequest {
-        var headers: std.http.Client.Request.Headers = .{
-            .content_type = .{ .override = "application/json" },
-            .accept_encoding = .omit,
-            .user_agent = .{ .override = gateway_client.user_agent },
-        };
-        if (self.auth_header) |authorization| {
-            headers.authorization = .{ .override = authorization };
-        }
-        return .{ .request = try self.client.request(.POST, self.uri, .{
-            .headers = headers,
-            .extra_headers = self.extra_headers,
-            .keep_alive = false,
-            .redirect_behavior = .unhandled,
-        }) };
-    }
-};
-
 const RequestAuthHeaders = struct {
     authorization: ?[]u8 = null,
     account_id: ?[]const u8 = null,
@@ -286,10 +250,10 @@ pub fn streamPrepared(
 
     var client: std.http.Client = .{ .allocator = alloc, .io = io_mod.getIo() };
     defer client.deinit();
-    var open_operation = OpenRequestOperation{
+    var open_operation = gateway_client.PostOperation{
         .client = &client,
         .uri = uri,
-        .auth_header = auth_headers.authorization,
+        .authorization = auth_headers.authorization,
         .extra_headers = extra_headers_buf[0..extra_count],
     };
     var connect_deadline = std.Io.Clock.Timestamp.fromNow(io_mod.getIo(), .{
@@ -302,8 +266,7 @@ pub fn streamPrepared(
         }
     }
     try request.admission.admit();
-    var opened = try gateway_client.runBoundedHttpOperation(
-        OpenedRequest,
+    var opened = try gateway_client.openBoundedPost(
         alloc,
         request.cancel_flag,
         connect_deadline,
@@ -311,27 +274,10 @@ pub fn streamPrepared(
     );
     var http_request = opened.take();
     defer http_request.deinit();
-    var cancel_watch_done = std.atomic.Value(bool).init(false);
-    const cancel_watcher = if (http_request.connection) |connection|
-        if (request.deadline) |deadline|
-            try gateway_client.spawnHttpCancelWatcherBounded(
-                &cancel_watch_done,
-                request.cancel_flag,
-                deadline,
-                connection.stream_writer.stream,
-            )
-        else
-            try gateway_client.spawnHttpCancelWatcher(
-                &cancel_watch_done,
-                request.cancel_flag,
-                connection.stream_writer.stream,
-            )
-    else
-        null;
-    defer {
-        cancel_watch_done.store(true, .seq_cst);
-        if (cancel_watcher) |thread| thread.join();
-    }
+    var cancel_watch: gateway_client.CancelWatch = .{};
+    defer cancel_watch.stop();
+    if (http_request.connection) |connection|
+        try cancel_watch.start(request.cancel_flag, request.deadline, connection.stream_writer.stream);
     if (request.cancel_flag.load(.seq_cst)) return error.Cancelled;
 
     http_request.transfer_encoding = .{ .content_length = payload.len };
@@ -420,8 +366,8 @@ const EventBridge = struct {
         sink(raw).emit(.{ .tool_input_delta = chunk });
     }
 
-    fn toolStart(raw: *anyopaque, id: []const u8, name: []const u8, label: ?[]const u8) void {
-        sink(raw).emit(.{ .tool_started = .{ .id = id, .name = name, .label = label } });
+    fn toolStart(raw: *anyopaque, id: []const u8, name: []const u8, label: ?[]const u8, arguments_json: ?[]const u8) void {
+        sink(raw).emit(.{ .tool_started = .{ .id = id, .name = name, .label = label, .arguments_json = arguments_json } });
     }
 };
 
@@ -532,8 +478,21 @@ test "xAI Grok request uses Responses input and converts AI SDK tool schemas" {
     try std.testing.expect(std.mem.find(u8, body, "\"encrypted_content\":\"opaque\"") != null);
     try std.testing.expect(std.mem.find(u8, body, "\"parameters\":{\"type\":\"object\",\"properties\":{}}") != null);
     try std.testing.expect(std.mem.find(u8, body, "\"reasoning\":{\"effort\":\"high\"") != null);
-    try std.testing.expect(std.mem.find(u8, body, "\"service_tier\"") == null);
+    try std.testing.expect(std.mem.find(u8, body, "\"service_tier\":\"priority\"") != null);
     try std.testing.expect(std.mem.find(u8, body, "\"max_output_tokens\":4096") != null);
+}
+
+test "xAI Grok fast requests use the priority service tier" {
+    const messages = [_]types.ChatMessage{.{ .role = .user, .content = "Hello." }};
+    const body = try buildRequest(std.testing.allocator, .{
+        .model = "grok-4.20",
+        .messages = &messages,
+        .tool_choice = .none,
+        .provider_options = .{ .fast = true },
+    });
+    defer std.testing.allocator.free(body);
+
+    try std.testing.expect(std.mem.find(u8, body, "\"service_tier\":\"priority\"") != null);
 }
 
 test "xAI Grok standard requests omit the priority service tier" {
@@ -672,7 +631,7 @@ test "xAI Grok SSE maps text reasoning tools and usage" {
             const self: *@This() = @ptrCast(@alignCast(raw));
             self.reasoning.appendSlice(std.testing.allocator, chunk) catch unreachable;
         }
-        fn toolStart(raw: *anyopaque, _: []const u8, name: []const u8, _: ?[]const u8) void {
+        fn toolStart(raw: *anyopaque, _: []const u8, name: []const u8, _: ?[]const u8, _: ?[]const u8) void {
             const self: *@This() = @ptrCast(@alignCast(raw));
             self.saw_read_file = std.mem.eql(u8, name, "read_file");
         }
