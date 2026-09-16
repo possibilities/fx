@@ -1318,7 +1318,7 @@ describe("acp: model-independent", () => {
   );
 
   test(
-    "ACP session adopts a generated title from the first prompt",
+    "ACP session retains its derived title without automatic naming",
     async () => {
       const root = createIsolatedRoot("fx-acp-session-title-");
       const gateway = startDynamicFakeGateway(_raw => finalText("ACP_MAIN_ANSWER_OK"), {
@@ -1336,14 +1336,17 @@ describe("acp: model-independent", () => {
 
         expect(result.promptResult.result.stopReason).toBe("end_turn");
         expect(JSON.stringify(result.messages)).toContain("ACP_MAIN_ANSWER_OK");
-        expect(JSON.stringify(result.messages)).toContain("ACP Generated Title");
+        expect(JSON.stringify(result.messages)).not.toContain("ACP Generated Title");
+        expect(gateway.titleRequests.length).toBe(0);
+        expect(gateway.requests.length).toBe(1);
 
         const sessionsDir = join(root.home, ".fx", "sessions");
         const titles = readdirSync(sessionsDir)
           .map(id => join(sessionsDir, id, "session.json"))
           .filter(path => existsSync(path))
           .map(path => JSON.parse(readFileSync(path, "utf8")).title);
-        expect(titles).toContain("ACP Generated Title");
+        expect(titles).not.toContain("ACP Generated Title");
+        expect(titles).toContain("Name this conversation for me.");
         expect(client.stderr).toBe("");
       } finally {
         await client?.close();
