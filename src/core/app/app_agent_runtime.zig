@@ -1,3 +1,4 @@
+const subagent_model_contract = @import("../subagent/model_contract.zig");
 const std = @import("std");
 const ade_events = @import("../../builtins/hooks/ade_events.zig");
 const ade_git_roots = @import("../../builtins/hooks/ade_git_roots.zig");
@@ -3947,8 +3948,7 @@ test "managed child ADE observation keeps root parent through delayed discovery"
     if (!delayed_sink.delivered.load(.acquire)) return error.TestUnexpectedResult;
     try std.testing.expect(runner.authority_matches.load(.acquire));
     try std.testing.expect(runner.observation_reported.load(.acquire));
-    // Runtime accepts a HostResolver: the production authority resolver walks
-    // attached child IDs and calls the host only with their canonical root.
+    // The managed runtime resolves authority through its declared root.
     try std.testing.expect(authority.saw_root_host_resolution.load(.acquire));
     try std.testing.expect(!authority.saw_attached_host_resolution.load(.acquire));
     try std.testing.expectEqual(@as(usize, 3), client.queue_len);
