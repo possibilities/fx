@@ -3216,6 +3216,39 @@ test "retained project context cancellation preserves an interrupted turn" {
     try std.testing.expect(hooks.history_turns.items[0] == .interrupted);
 }
 
+test "suppressed project instructions stay disabled during retained context reconstruction" {
+    const alloc = std.testing.allocator;
+    defer ApplicableContextDelta.reset("", null);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(workspace);
+    const calls = [_]ToolCall{toolCall("prior_read", "read_file", "{\"path\":\"prior.txt\"}")};
+    const steps = [_]types.ToolExecutionStep{.{ .tool_calls = @constCast(&calls) }};
+    const history = [_]types.HistoryTurn{.{ .assistant = .{
+        .user = .{ .text = @constCast("prior") },
+        .assistant = @constCast("prior result"),
+        .execution = .{ .tool_steps = @constCast(&steps) },
+    } }};
+    const completions = [_]FakeCompletion{.{ .content = "Final" }};
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    hooks.context_enabled = true;
+    hooks.project_instructions_enabled = false;
+    hooks.context_registry = ApplicableContextDelta.registry;
+    var fixture = PromptFixture{ .workspace_root = workspace };
+    var job = fixture.job();
+    job.history = @constCast(&history);
+    ApplicableContextDelta.reset("", &fixture.cancel_flag);
+    try runFakePrompt(&gateway, &hooks, fixture.config(), job);
+    try std.testing.expect(!fixture.cancel_flag.load(.seq_cst));
+    try std.testing.expectEqual(@as(usize, 1), gateway.request_bodies.items.len);
+    try std.testing.expectEqual(@as(usize, 0), hooks.executed_names.items.len);
+    try std.testing.expectEqual(types.TurnPresentationOutcome.completed, hooks.finalized_outcome.?);
+}
+
 test "retained project context leaves empty history host context unchanged" {
     const alloc = std.testing.allocator;
     const completions = [_]FakeCompletion{.{ .content = "Final" }};

@@ -1721,9 +1721,7 @@ const App = struct {
         turn_id: u64,
         user_prompt_already_presented: bool,
     ) !worker_runtime.QueuedPrompt {
-        if (recovery_checkpoint == null) {
-            SessionAppRuntime.maybeStartSessionTitleGeneration(self, prompt);
-        }
+        // SessionNamingAppRuntime starts the one title request after admission.
         const source_images = if (recovery_checkpoint) |checkpoint|
             checkpoint.user.images
         else if (prompt_images) |images|

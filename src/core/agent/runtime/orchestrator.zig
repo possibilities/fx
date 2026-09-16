@@ -4007,6 +4007,7 @@ fn persist_compaction_source(
             .model = @constCast(route_model),
             .credential_source = job.credential_source,
             .credential_identity = if (job.credential_source) |source| credential_authority.derive(source, job.account_id) else null,
+            .shape = if (deps.shape) |shape| .{ .id = @constCast(deps.shape_label), .identity = shape } else null,
         },
         .requested_fast_mode = requested_fast_mode,
         .fast_mode = fast_mode,
@@ -4940,7 +4941,7 @@ pub fn processAgentPrompt(
         effective_lifecycle,
     );
     defer finalization.deinit();
-    runtime_lifecycle.dispatchTurnStartedCheckpoint(lifecycle, .{
+    runtime_lifecycle.dispatchTurnStartedCheckpoint(effective_lifecycle, .{
         .turn_id = effective_job.turn_id,
     });
 
@@ -5740,7 +5741,7 @@ fn reconstructProjectContext(
     config: Config,
     job: QueuedPrompt,
 ) !?context_contract.GatheredContextSnapshot {
-    if (!deps.context_enabled) return null;
+    if (!deps.context_enabled or !deps.project_instructions_enabled) return null;
     var retained = try tool_preparation.retainedContextTargets(
         alloc,
         job.history,
@@ -5768,6 +5769,7 @@ fn reconstructProjectContext(
         .access_scope = config.access_scope,
         .targets = targets.items,
         .bounded_reconstruction = true,
+        .project_instructions_enabled = deps.project_instructions_enabled,
         .context_limits = config.context_limits,
     });
     errdefer snapshot.deinit(alloc);
@@ -12241,4 +12243,43 @@ test "malformed duplicate unauthorized and path Vision calls settle no image ids
         &catalog,
     ));
     try std.testing.expectEqual(@as(usize, 0), settled_ids.items.len);
+}
+
+test "prepared compaction checkpoint preserves shape and credential authority" {
+    const support = @import("tests/support.zig");
+    const Sink = struct {
+        checkpoint: ?session_codec.RecoveryCheckpoint = null,
+        fn set(raw: *anyopaque, checkpoint: session_codec.RecoveryCheckpoint) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.checkpoint = try checkpoint.dupe(std.testing.allocator);
+        }
+    };
+    var sink: Sink = .{};
+    defer if (sink.checkpoint) |*checkpoint| checkpoint.deinit(std.testing.allocator);
+    var fake = support.FakeAgentRuntimeDeps.init(std.testing.allocator);
+    defer fake.deinit();
+    var deps = fake.deps();
+    deps.ctx = &sink;
+    deps.recovery_checkpoint = .{ .set = Sink.set };
+    const identity = shape_authority.derive(.{ .system_prompt = "review carefully" });
+    deps.shape = identity;
+    deps.shape_label = "reviewer";
+    var fixture: support.PromptFixture = .{};
+    var job = fixture.job();
+    job.credential_source = .chatgpt_subscription;
+    job.account_id = @constCast("compaction-account");
+    var finalization = TurnFinalizationGuard.init(&deps, 1, support.testLifecycleContext(
+        hooks.RuntimeView.empty(),
+        std.testing.allocator,
+        fixture.workspace_root,
+    ));
+    defer finalization.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    try persist_compaction_source(&deps, &finalization, arena.allocator(), job, &.{}, "model", false, false, 3, 1, .none, .{});
+    const checkpoint = sink.checkpoint.?;
+    try std.testing.expectEqual(@as(@TypeOf(checkpoint.cause), .compaction_prepared), checkpoint.cause);
+    try std.testing.expectEqualStrings("reviewer", checkpoint.authority.shape.?.id);
+    try std.testing.expect(checkpoint.authority.shape.?.identity.eql(identity));
+    try std.testing.expect(checkpoint.authority.credential_identity.?.eql(credential_authority.derive(.chatgpt_subscription, "compaction-account").?));
 }

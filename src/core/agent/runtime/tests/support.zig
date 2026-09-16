@@ -480,6 +480,7 @@ pub const FakeAgentRuntimeDeps = struct {
     tool_registry: tool_dispatch.Registry = test_tool_registry,
     context_registry: ?context_contract.Registry = null,
     context_enabled: bool = false,
+    project_instructions_enabled: bool = true,
     root_permission_mode: ?PermissionMode = null,
     validation_mcp_runtime_generation: ?u64 = null,
     validation_mcp_tool_name: ?[]const u8 = null,
@@ -754,6 +755,7 @@ pub const FakeAgentRuntimeDeps = struct {
             .tool_activity_recorder = self.tool_activity_recorder,
             .context_registry = self.context_registry,
             .context_enabled = self.context_enabled,
+            .project_instructions_enabled = self.project_instructions_enabled,
             .snapshot_root_permission_mode = if (self.root_permission_mode != null)
                 snapshotRootPermissionMode
             else

@@ -2669,6 +2669,13 @@ fn writeSessionTitleSummary(writer: *std.Io.Writer, app: anytype, alloc: std.mem
             try writer.writeAll("title: (none)\n");
         }
     }
+    if (comptime @hasField(App, "session_naming")) {
+        try writer.print("generation: engine=session_naming pending={d} attempted={d}\n", .{
+            app.session_naming.tasks.items.len,
+            app.session_naming.attempted_session_ids.items.len,
+        });
+        return;
+    }
     const generation = &app.session_persistence.title_generation;
     if (generation.task) |task| {
         try writer.print("generation: status=running session={s} model={s}", .{ task.session_id, task.model });

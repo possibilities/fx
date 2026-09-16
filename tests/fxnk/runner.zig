@@ -2,6 +2,12 @@ const builtin = @import("builtin");
 const std = @import("std");
 
 const expected_names = [_][]const u8{
+    "core.auth.credentials.test.selected profile configured authorization uses only its connection registry",
+    "core.agent.runtime.tests.tool_flow.test.suppressed project instructions stay disabled during retained context reconstruction",
+    "core.auth.auth_runtime.test.Codex request-path verification never crosses store or account authority",
+    "acp.sessions.test.ACP provider options preserve host allowlist with configured providers",
+    "acp.server.test.ACP credential preparation preserves the existing borrowed credential",
+
     "acp.sessions.test.ACP restore rejects MCP servers when host capability is disabled",
     "core.tooling.tool_admission.test.wrapped shell commands preserve exact normalized admission authority",
     "core.tooling.tool_admission.test.automatic review trace preserves the typed unavailable cause without action text",
