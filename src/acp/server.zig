@@ -1986,7 +1986,7 @@ fn handleInitialize(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message
             state.selected_model,
             state.cfg.provider_set.select(state.provider).fallbackModelCapabilities(state.selected_model),
         );
-        if (state.cfg.provider_override == .codex) {
+        if (state.cfg.provider_override != null and state.cfg.provider_override.? == .codex) {
             const entries = state.capability_resolver.catalogEntries() orelse
                 return state.writer.writeError(alloc, msg.id, .{
                     .code = ErrorCode.invalid_request,
