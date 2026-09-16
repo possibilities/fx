@@ -3740,7 +3740,7 @@ const NestedGitRootObservationRunner = struct {
             "completed",
         ) catch return error.OutOfMemory;
         defer session_runtime.freeHistoryTurn(turn.alloc, history_turn);
-        turn.commit(message.id, history_turn, 1, 1, io_mod.milliTimestamp()) catch
+        turn.commit(turn.active_work_id.?, history_turn, 1, 1, io_mod.milliTimestamp()) catch
             return error.ProviderFailed;
         return .completed;
     }
@@ -3808,15 +3808,6 @@ fn nestedHostOptions(
     };
 }
 
-fn nestedResultChildIdAlloc(alloc: Allocator, encoded: []const u8) ![]u8 {
-    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, encoded, .{});
-    defer parsed.deinit();
-    const child_id = parsed.value.object.get("child_id") orelse
-        return error.TestUnexpectedResult;
-    if (child_id != .string) return error.TestUnexpectedResult;
-    return alloc.dupe(u8, child_id.string);
-}
-
 test "nested host ADE observation keeps root parent through delayed discovery" {
     const alloc = std.testing.allocator;
     const root_id = "01J00000000000000000000000";
@@ -3863,65 +3854,57 @@ test "nested host ADE observation keeps root parent through delayed discovery" {
     var store = try session_store.Store.initFromHome(alloc, home, workspace);
     defer store.deinit(alloc);
     try createNestedTestSession(alloc, &store, root_id, workspace);
-    var authority = NestedTestHostAuthority{ .root_id = root_id };
+    // Persist an attached parent using the current managed registry. The nested
+    // host must resolve authority through that parent to the original root.
+    const child_state = @import("../subagent/child_state.zig");
+    const model_contract = @import("../subagent/model_contract.zig");
+    const parent_id = "01J00000000000000000000002";
+    try createNestedTestSession(alloc, &store, parent_id, workspace);
+    const root_children = child_state.Store{ .sessions = &store, .parent_id = root_id };
+    var root_registry = try root_children.load(alloc);
+    defer root_registry.deinit(alloc);
+    try root_registry.appendPersistent(alloc, parent_id, "parent-child", "", .{
+        .id = @constCast("parent-work"),
+        .message = @constCast("create parent"),
+        .created_at_ms = 1,
+    });
+    try root_registry.finish(alloc, parent_id, "parent-work", .completed, null);
+    try root_children.save(alloc, root_registry);
+    try root_children.markChildSession(alloc, parent_id);
+    var authority = NestedTestHostAuthority{ .root_id = root_id, .parent_id = parent_id };
     var runner = NestedGitRootObservationRunner{
         .app = &app,
         .client = &client,
         .edited_path = edited_path,
         .expected_root_id = root_id,
+        .expected_parent_id = parent_id,
     };
     const subagent_host = try subagent_tool_host.Runtime.create(
         alloc,
         &store,
-        root_id,
+        parent_id,
         authority.resolver(),
         .{ .context = &runner, .run_fn = NestedGitRootObservationRunner.run },
     );
     defer subagent_host.deinit();
     defer delayed_sink.release.store(true, .release);
-
-    var parent_command = try subagent_domain.validateCommand(alloc, .{ .create = .{
-        .name = "parent-child",
-        .mode = .persistent,
+    var request = try model_contract.validateRequest(alloc, .{ .message = .{
+        .agent = "nested-child",
+        .message = "observe one edited path",
     } });
-    defer parent_command.deinit(alloc);
-    const parent_result = try subagent_host.execute(
+    defer request.deinit(alloc);
+    const result = try subagent_host.executeManaged(
         alloc,
-        &parent_command,
-        nestedHostOptions(root_id, "create-parent-child"),
-    );
-    defer alloc.free(parent_result);
-    const parent_id = try nestedResultChildIdAlloc(alloc, parent_result);
-    defer alloc.free(parent_id);
-    authority.parent_id = parent_id;
-    runner.expected_parent_id = parent_id;
-
-    var nested_command = try subagent_domain.validateCommand(alloc, .{ .create = .{
-        .name = "nested-child",
-        .mode = .persistent,
-    } });
-    defer nested_command.deinit(alloc);
-    const nested_result = try subagent_host.execute(
-        alloc,
-        &nested_command,
-        nestedHostOptions(parent_id, "create-nested-child"),
-    );
-    defer alloc.free(nested_result);
-    const nested_id = try nestedResultChildIdAlloc(alloc, nested_result);
-    defer alloc.free(nested_id);
-    authority.nested_id = nested_id;
-
-    var send_command = try subagent_domain.validateCommand(alloc, .{ .message = .{ .send = .{
-        .id = nested_id,
-        .content = "observe one edited path",
-    } } });
-    defer send_command.deinit(alloc);
-    const send_result = try subagent_host.execute(
-        alloc,
-        &send_command,
+        &request,
         nestedHostOptions(parent_id, "message-nested-child"),
     );
-    defer alloc.free(send_result);
+    defer alloc.free(result.body);
+    try std.testing.expect(result.success);
+    var nested_registry = try subagent_host.managed.state_store.load(alloc);
+    defer nested_registry.deinit(alloc);
+    const nested = nested_registry.findPersistent("nested-child") orelse return error.TestUnexpectedResult;
+    const nested_id = nested.id;
+    try std.testing.expectEqual(child_state.Phase.idle, nested.phase);
 
     const delivery_deadline = io_mod.milliTimestamp() + 5_000;
     while (!delayed_sink.entered.load(.acquire) and
@@ -3932,10 +3915,6 @@ test "nested host ADE observation keeps root parent through delayed discovery" {
     if (!delayed_sink.entered.load(.acquire)) return error.TestUnexpectedResult;
     client.reportSessionChanged(next_root_id);
     delayed_sink.release.store(true, .release);
-    try std.testing.expectEqual(
-        subagent_execution.ChildResult.idle,
-        try subagent_host.owner.join(nested_id),
-    );
 
     const serialization_deadline = io_mod.milliTimestamp() + 5_000;
     while (!delayed_sink.delivered.load(.acquire) and
