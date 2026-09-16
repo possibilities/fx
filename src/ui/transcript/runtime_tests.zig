@@ -279,7 +279,6 @@ fn testPaintPlan(
         .footer_clean_allowed = true,
         .synchronized_update = true,
         .cursor_target = .{ .row = selection.bottom_row, .col = 1, .visible = true },
-        .footer_reservation_source = .none,
         .bottom_reserved_rows = 0,
         .preserve_scrollback = true,
     };
@@ -8776,17 +8775,21 @@ test "command output consolidation preserves committed prompt scrollback anchor"
     defer compact_prepared.deinit(alloc);
     const facts = runtime.planTranscriptScroll(&compact_prepared);
     try std.testing.expect(facts.target_visual_offset > facts.source_visual_offset);
-    // The consolidation changed committed rows in place, so this frame has
-    // no ability to materialize the held range: zero release, re-anchor on
-    // the rewritten flow, and mark the finality debt.
-    try std.testing.expect(!facts.source_compatible);
-    try std.testing.expect(facts.recovery_rebase);
-    try std.testing.expectEqual(@as(u32, 0), facts.semantic_rows);
-    try std.testing.expectEqual(@as(u16, 0), facts.planned_rows);
-    try std.testing.expect(facts.finality_hold);
+    // The intervening recorded write rebases the committed prompt/assistant
+    // prefix before the new table is admitted, so release can start here.
+    try std.testing.expect(facts.source_compatible);
+    try std.testing.expect(!facts.recovery_rebase);
+    try std.testing.expect(facts.semantic_rows > 0);
+    try std.testing.expect(facts.planned_rows > 0);
+    try std.testing.expect(std.mem.startsWith(u8, compact_source.bytes, runtime.transcript_commit_state.stable.flow));
+    try std.testing.expect(std.mem.find(u8, runtime.transcript_commit_state.stable.flow, "give me a table") != null);
+    try std.testing.expect(std.mem.find(u8, runtime.transcript_commit_state.stable.flow, "follow-up table row") == null);
+    const history_before_release = runtime.transcriptCommitDiagnostic().history_visual_offset;
     try commitPreparedForTest(&runtime, alloc, &compact_source, &compact_prepared);
+    try std.testing.expect(runtime.transcriptCommitDiagnostic().history_visual_offset > history_before_release);
+    try std.testing.expect(runtime.transcriptCommitDiagnostic().history_visual_offset - history_before_release <= facts.semantic_rows);
 
-    // The following compatible frame settles the debt with final bytes.
+    // This fixture settles in that release; a repeated frame must be quiet.
     var settle_source = try runtime.prepareTranscriptSource(alloc, null);
     defer settle_source.deinit(alloc);
     var settle_prepared = try prepareTestSourceForCurrentArea(
@@ -8797,8 +8800,12 @@ test "command output consolidation preserves committed prompt scrollback anchor"
     defer settle_prepared.deinit(alloc);
     const settle_facts = runtime.planTranscriptScroll(&settle_prepared);
     try std.testing.expect(settle_facts.source_compatible);
-    try std.testing.expect(settle_facts.semantic_rows > 0);
-    try std.testing.expect(settle_facts.planned_rows > 0);
+    try std.testing.expectEqual(@as(u32, 0), settle_facts.semantic_rows);
+    try std.testing.expectEqual(@as(u16, 0), settle_facts.planned_rows);
+    const settled_history = runtime.transcriptCommitDiagnostic().history_visual_offset;
+    try commitPreparedForTest(&runtime, alloc, &settle_source, &settle_prepared);
+    try std.testing.expectEqual(settled_history, runtime.transcriptCommitDiagnostic().history_visual_offset);
+    try std.testing.expectEqual(runtime.transcript_commit_state.stable.visual_offset, settled_history);
 }
 
 fn removeRawEntriesForTest(
@@ -8925,7 +8932,7 @@ test "command output state keeps one authoritative folded hint" {
     try expectRawEntryBytes(
         &runtime,
         old_hint_entry_id,
-        "│ … 1 line more (ctrl o to view)",
+        "│ … 1 line more (ctrl+o to view)",
     );
 
     try runtime.writeCommandOutputChunk(
@@ -8943,7 +8950,7 @@ test "command output state keeps one authoritative folded hint" {
     try expectRawEntryBytes(
         &runtime,
         old_hint_entry_id,
-        "│ … 1 line more (ctrl o to view)",
+        "│ … 1 line more (ctrl+o to view)",
     );
     try expectRawEntryBytes(&runtime, newest_entry_id, "");
 
@@ -9055,7 +9062,7 @@ test "command output folding preserves rows between noncontiguous live rows" {
     try std.testing.expect(before_pos < intervening_pos);
     try std.testing.expect(intervening_pos < after_pos);
     try std.testing.expect(std.mem.indexOf(u8, source.bytes, "command-visible-1") == null);
-    try std.testing.expect(std.mem.indexOf(u8, source.bytes, "ctrl o to view") == null);
+    try std.testing.expect(std.mem.indexOf(u8, source.bytes, "ctrl+o to view") == null);
     try std.testing.expectEqual(@as(usize, 6), runtime.command_output_blocks.items[0].lines.items.len);
 }
 
@@ -9164,7 +9171,7 @@ test "production command pruning preserves deferred replay around a notice" {
     try std.testing.expect(compact_notice_pos < compact.bytes.len);
     try std.testing.expect(std.mem.find(u8, compact.bytes, "output-0") == null);
     try std.testing.expect(std.mem.find(u8, compact.bytes, "output-1") == null);
-    try std.testing.expect(std.mem.find(u8, compact.bytes, "ctrl o to view") == null);
+    try std.testing.expect(std.mem.find(u8, compact.bytes, "ctrl+o to view") == null);
 
     runtime.full_transcript.depth = .full;
     var projection = try runtime.buildFullTranscriptProjection(alloc, null);
@@ -9539,7 +9546,7 @@ test "command output display caps at five physical rows" {
     try std.testing.expectEqual(@as(usize, 5), std.mem.count(u8, projection.bytes.items, "│ line-"));
     try std.testing.expect(std.mem.find(u8, projection.bytes.items, "│ line-4") != null);
     try std.testing.expect(std.mem.find(u8, projection.bytes.items, "│ line-5") == null);
-    try std.testing.expect(std.mem.find(u8, projection.bytes.items, "│ … 21 lines more (ctrl o to view)") != null);
+    try std.testing.expect(std.mem.find(u8, projection.bytes.items, "│ … 21 lines more (ctrl+o to view)") != null);
 }
 
 test "structured retention prunes old raw transcript entries past cap" {
@@ -9680,7 +9687,7 @@ test "hidden command output becomes count-only at the hard cap" {
     try std.testing.expectEqual(@as(usize, 8), block.total_lines);
     const expected_summary = try std.fmt.allocPrint(
         alloc,
-        "│ … {d} lines more (ctrl o to view)",
+        "│ … {d} lines more (ctrl+o to view)",
         .{block.total_lines - @min(@as(usize, 5), block.lines.items.len)},
     );
     defer alloc.free(expected_summary);
@@ -10357,17 +10364,47 @@ test "recorded assistant stream slow path preserves a canonical anchor when rete
         committed_prepared.cursor.cursor_col,
         1,
     );
+    // The synthetic anchor helper does not seal a source. Supply the same
+    // entry identity as a real sealed frame before exercising retention.
+    runtime.transcript_commit_state.stable.retention_identity = try @import("source_preparation.zig").RetentionIdentity.capture(&runtime, alloc, &committed_source);
+    try committed_source.ensureLineIndex(alloc);
     const committed_history_visual_offset = try stableHistoryVisualOffsetForTest(&runtime);
+    const user_start = for (committed_source.line_provenance, 0..) |identity, index| {
+        if (identity == .entry and identity.entry.entry_id == user_id) break index;
+    } else return error.TestExpectedUserEntry;
+    const removed_rows = committed_source.transcript_visual_row_offsets[user_start];
+    try std.testing.expect(removed_rows > 0);
+    const old_boundary = committed_source.byteAtVisualOffset(committed_history_visual_offset);
+    const old_suffix = committed_source.bytes[old_boundary..];
+    const boundary_row = old_suffix[0..std.mem.findScalar(u8, old_suffix, '\n').?];
+    try std.testing.expect(std.mem.find(u8, boundary_row, "long-paste-line-34") != null);
 
     const chunk = "trimmed assistant tail";
     runtime.max_retained_transcript_bytes =
         transcript_store.retainedStructuredBytes(&runtime) + chunk.len - old_prefix.len;
     const assistant_id = try runtime.streamAssistantChunk(alloc, &metrics, chunk);
 
-    try expectStableNormalBufferRecoveryForTest(
-        &runtime,
-        committed_history_visual_offset,
+    var rebased_source = (try runtime.prepareCommittedRetentionSource(alloc)) orelse
+        return error.TestExpectedStableTranscript;
+    defer rebased_source.deinit(alloc);
+    const rebased = runtime.transcript_commit_state.stable;
+    try std.testing.expectEqual(committed_history_visual_offset - removed_rows, rebased.history_visual_offset);
+    try std.testing.expectEqual(rebased.history_visual_offset, rebased.visual_offset);
+    try std.testing.expectEqualStrings(
+        committed_source.bytes[committed_source.hard_line_starts[user_start]..],
+        rebased_source.bytes,
     );
+    try std.testing.expectEqualStrings(
+        committed_source.bytes[old_boundary..],
+        rebased_source.bytes[rebased_source.byteAtVisualOffset(rebased.history_visual_offset)..],
+    );
+    const boundary_identity = rebased_source.line_provenance[rebased.selection.start_line];
+    try std.testing.expect(boundary_identity == .entry);
+    try std.testing.expectEqual(user_id, boundary_identity.entry.entry_id);
+    try std.testing.expectEqual(transcript_blocks.TranscriptEntryClass.user_turn, boundary_identity.entry.entry_class);
+    try std.testing.expect(rebased.flow_materialized);
+    try std.testing.expect(!rebased.normal_buffer_recovery_pending);
+    try std.testing.expect(std.mem.find(u8, rebased_source.bytes, chunk) == null);
     try std.testing.expect(
         transcript_store.retainedStructuredBytes(&runtime) <=
             runtime.max_retained_transcript_bytes,
@@ -16414,8 +16451,8 @@ test "pending replacement notice holds release until the finished replacement se
     try std.testing.expectEqual(@as(u32, 0), quiet_facts.semantic_rows);
     try std.testing.expect(quiet_facts.finality_hold);
 
-    // The finished replacement clears the pin; the incompatible frame
-    // re-anchors with zero release and the next frame settles everything.
+    // Finishing clears the pin and rebases its replacement before planning.
+    // Compatibility permits release; the frame receipt must still accept it.
     try std.testing.expect(try runtime.replaceSemanticNotice(alloc, notice_id, .{
         .topic = "feedback",
         .tone = .success,
@@ -16426,10 +16463,14 @@ test "pending replacement notice holds release until the finished replacement se
     var replaced_prepared = try prepareTestSourceForCurrentArea(&runtime, alloc, &replaced_source);
     defer replaced_prepared.deinit(alloc);
     const replaced_facts = runtime.planTranscriptScroll(&replaced_prepared);
-    try std.testing.expect(!replaced_facts.source_compatible);
-    try std.testing.expectEqual(@as(u32, 0), replaced_facts.semantic_rows);
-    try std.testing.expectEqual(@as(u16, 0), replaced_facts.planned_rows);
+    try std.testing.expect(replaced_source.finality.mutation_pin_start == null);
+    try std.testing.expect(replaced_facts.source_compatible);
+    try std.testing.expect(replaced_facts.semantic_rows > 0);
+    try std.testing.expect(replaced_facts.planned_rows > 0);
+    const before_release = runtime.transcriptCommitDiagnostic().history_visual_offset;
     try commitPreparedForTest(&runtime, alloc, &replaced_source, &replaced_prepared);
+    try std.testing.expectEqual(@min(replaced_facts.semantic_rows, @as(u32, replaced_facts.planned_rows)), runtime.transcriptCommitDiagnostic().history_visual_offset - before_release);
+    try std.testing.expectEqual(replaced_facts.source_visual_offset + @min(replaced_facts.semantic_progress_rows, @as(u32, replaced_facts.planned_rows)), runtime.transcriptCommitDiagnostic().visual_offset);
 
     var settle_source = try runtime.prepareTranscriptSource(alloc, null);
     defer settle_source.deinit(alloc);
