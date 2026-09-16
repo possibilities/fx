@@ -3224,7 +3224,15 @@ test "suppressed project instructions stay disabled during retained context reco
     const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(workspace);
     const calls = [_]ToolCall{toolCall("prior_read", "read_file", "{\"path\":\"prior.txt\"}")};
-    const steps = [_]types.ToolExecutionStep{.{ .tool_calls = @constCast(&calls) }};
+    const results = [_]types.PersistedToolResult{.{
+        .tool_call_id = @constCast("prior_read"),
+        .tool_name = @constCast("read_file"),
+        .status = .success,
+        .output = @constCast("prior file"),
+        .output_bytes = 10,
+        .stored_output_bytes = 10,
+    }};
+    const steps = [_]types.ToolExecutionStep{.{ .tool_calls = @constCast(&calls), .tool_results = @constCast(&results) }};
     const history = [_]types.HistoryTurn{.{ .assistant = .{
         .user = .{ .text = @constCast("prior") },
         .assistant = @constCast("prior result"),
