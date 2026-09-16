@@ -2090,7 +2090,7 @@ fn handleInitialize(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message
     state.max_tool_result_bytes = startup.max_tool_result_bytes;
     state.context_limits = startup.context_limits;
     state.context_limits.applyCommandLine(state.cfg.context_limit_overrides);
-    state.fast_mode = startup.fast_mode and state.provider == startup.provider and
+    state.fast_mode = startup.fast_mode and state.provider.eql(startup.provider) and
         (state.cfg.model_override == null or startup.fast_mode_source != .compiled_default);
     state.effort = state.cfg.effort_override orelse startup.effort;
     state.configured_effort = startup.configured_effort;
@@ -2139,7 +2139,7 @@ fn handleInitialize(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message
             state.selected_model,
             state.cfg.provider_set.select(state.provider).fallbackModelCapabilities(state.selected_model),
         );
-        if (state.cfg.provider_override == .codex) {
+        if (state.cfg.provider_override != null and state.cfg.provider_override.? == .codex) {
             const entries = state.capability_resolver.catalogEntries() orelse
                 return state.writer.writeError(alloc, msg.id, .{
                     .code = ErrorCode.invalid_request,

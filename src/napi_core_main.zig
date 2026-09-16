@@ -498,7 +498,7 @@ const Runtime = struct {
     output: OutputQueue = .{},
     credential: []u8,
     initial_provider: model_provider.ProviderId,
-    allowed_providers: std.EnumSet(model_provider.ProviderId),
+    allowed_providers: std.EnumSet(std.meta.Tag(model_provider.ProviderId)),
     codex_profile_home: ?[]u8,
     uses_host_codex_store: bool,
     model: ?[]u8,
@@ -793,10 +793,10 @@ fn createRuntime(env: c.napi_env, options: c.napi_value) CreateError!*Runtime {
     if (initial_provider == .grok) return error.InvalidAuth;
     const allow_gateway = (getNamedBool(env, options, "allowGateway") catch return error.InvalidAuth) orelse (initial_provider == .gateway);
     const allow_codex = (getNamedBool(env, options, "allowCodex") catch return error.InvalidAuth) orelse false;
-    var allowed_providers = std.EnumSet(model_provider.ProviderId).initEmpty();
+    var allowed_providers = std.EnumSet(std.meta.Tag(model_provider.ProviderId)).initEmpty();
     if (allow_gateway) allowed_providers.insert(.gateway);
     if (allow_codex) allowed_providers.insert(.codex);
-    if (!allowed_providers.contains(initial_provider)) return error.InvalidAuth;
+    if (!allowed_providers.contains(std.meta.activeTag(initial_provider))) return error.InvalidAuth;
     if (allow_gateway and api_key.len == 0) return error.InvalidApiKey;
     const codex_profile_home = getNamedString(env, options, "codexProfileHome", alloc, max_path_bytes) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,

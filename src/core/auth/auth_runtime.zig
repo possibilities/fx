@@ -282,6 +282,9 @@ fn noteRequestPathCredentialVerified(source: credentials.Source) void {
 /// the skip window. Request-path callers use this to bypass a redundant
 /// defensive reload; admission and forced refreshes must not consult it.
 pub fn requestPathCredentialVerifiedRecently(source: credentials.Source) bool {
+    // A source-wide stamp cannot authorize a different libfx store or account.
+    // Codex callers must revalidate their pinned account on every request path.
+    if (source == .chatgpt_subscription) return false;
     const verified_ms = request_path_verified_ms.load(.seq_cst);
     if (verified_ms == 0) return false;
     if (request_path_verified_source.load(.seq_cst) != @intFromEnum(source)) return false;
@@ -5563,4 +5566,11 @@ test "request-path credential verification stamp gates only within the window" {
 
     request_path_verified_ms.store(stampNowMs() -% request_path_verified_window_ms -% 1, .seq_cst);
     try std.testing.expect(!requestPathCredentialVerifiedRecently(.fx_login));
+}
+
+test "Codex request-path verification never crosses store or account authority" {
+    resetRequestPathCredentialVerification();
+    defer resetRequestPathCredentialVerification();
+    noteRequestPathCredentialVerified(.chatgpt_subscription);
+    try std.testing.expect(!requestPathCredentialVerifiedRecently(.chatgpt_subscription));
 }
