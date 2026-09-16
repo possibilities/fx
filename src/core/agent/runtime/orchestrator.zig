@@ -5654,7 +5654,7 @@ fn reconstructProjectContext(
     config: Config,
     job: QueuedPrompt,
 ) !?context_contract.GatheredContextSnapshot {
-    if (!deps.context_enabled) return null;
+    if (!deps.context_enabled or !deps.project_instructions_enabled) return null;
     var retained = try tool_preparation.retainedContextTargets(
         alloc,
         job.history,
@@ -5682,6 +5682,7 @@ fn reconstructProjectContext(
         .access_scope = config.access_scope,
         .targets = targets.items,
         .bounded_reconstruction = true,
+        .project_instructions_enabled = deps.project_instructions_enabled,
         .context_limits = config.context_limits,
     });
     errdefer snapshot.deinit(alloc);
