@@ -261,12 +261,7 @@ fn fetch_cli_catalog(raw: ?*anyopaque, alloc: Allocator, input: gateway_provider
         return .{ .failure = .{ .access = provenance.access, .anonymous_fallback_used = false, .failure = .{ .category = .resource_exhausted } } };
     switch (result) {
         .failure => |failure| return .{ .failure = .{ .access = provenance.access, .anonymous_fallback_used = false, .failure = failure } },
-        .catalog => |value| {
-            var entries = value;
-            defer catalog.freeModelCatalog(alloc, &entries);
-            const ids = catalog.projectModelIds(alloc, entries.items) catch return .{ .failure = .{ .access = provenance.access, .anonymous_fallback_used = false, .failure = .{ .category = .resource_exhausted } } };
-            return .{ .loaded = .{ .ids = ids, .provenance = provenance } };
-        },
+        .catalog => |value| return .{ .loaded = .{ .catalog = value, .provenance = provenance } },
     }
 }
 
