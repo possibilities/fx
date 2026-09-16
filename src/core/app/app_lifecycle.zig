@@ -611,7 +611,7 @@ fn loadStartupStateFromOwnedWorkspace(
     state.credential_source_preference = settings.credential_source;
     if (auth_mode == .local and !state.model_requests_blocked) {
         if (credential_mode) |mode| {
-            const credential_home = authorization_home orelse profile_home;
+            const credential_home = if (state.provider == .configured) profile_home else authorization_home orelse profile_home;
             const resolution = if (credential_home) |home_dir|
                 try credentials.resolveForProviderFromHome(
                     alloc,

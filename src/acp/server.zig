@@ -359,7 +359,7 @@ fn prepareConfiguredCredential(
         );
     defer if (borrowed_authorization_home) |home| alloc.free(home);
     if (state.cfg.home_override) |home| {
-        if (borrowed_authorization_home) |authorization_home| {
+        if (provider != .configured) if (borrowed_authorization_home) |authorization_home| {
             const resolution = try credentials.resolveReadOnlyForProviderFromHome(
                 alloc,
                 provider,
@@ -367,7 +367,7 @@ fn prepareConfiguredCredential(
                 authorization_home,
             );
             return resolution.credential;
-        }
+        };
         return auth_runtime.prepareCredentialFromHome(
             alloc,
             state.cfg.gateway_provider.oauth_transport,
