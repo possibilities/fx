@@ -10,6 +10,7 @@ pub const FailureCause = enum {
     provider_unavailable,
     rate_limited,
     system_resumed,
+    compaction_prepared,
     authentication,
     request_limit_reached,
     content_filter,
