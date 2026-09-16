@@ -304,6 +304,7 @@ pub fn catalogAccessForCredentialAndAccount(
         .chatgpt_subscription => .chatgpt_subscription,
         .grok_subscription => .grok_subscription,
         .host_managed => unreachable,
+        .configured => return .{ .public_only = .no_credential },
         .fx_login => blk: {
             const team = team_context orelse
                 return .{ .public_only = .fx_login_team_required };
@@ -482,6 +483,16 @@ pub fn resolveForProviderWithStore(
     preferred: ?Source,
     chatgpt_store: chatgpt_session.Store,
 ) !Resolution {
+    if (provider == .configured) {
+        var registry = try @import("../config/config_runtime.zig").loadConfiguredProviders(alloc);
+        defer registry.deinit(alloc);
+        const bound = try provider.bind(registry);
+        const definition = registry.get(bound.label()).?;
+        return switch (definition.auth) {
+            .none => .{ .credential = .{ .token = try alloc.dupe(u8, ""), .source = .configured } },
+            .bearer => |env| .{ .credential = try loadEnvCredential(alloc, env, .configured) },
+        };
+    }
     if (provider != .gateway) {
         const source = provider_catalog.find(provider).login_source;
         // An unavailable subscription store is the provider source failing to
@@ -820,7 +831,7 @@ pub fn loadSource(
         .stored_key => loadStoredKeyCredential(alloc, secret_store),
         .chatgpt_subscription => loadChatGptCredential(alloc, transport, .if_needed),
         .grok_subscription => loadGrokCredential(alloc, transport, .if_needed),
-        .host_managed => null,
+        .host_managed, .configured => null,
     };
 }
 
@@ -889,7 +900,7 @@ pub fn sourceExists(
                 },
             };
         },
-        .host_managed => false,
+        .host_managed, .configured => false,
     };
 }
 
@@ -913,7 +924,7 @@ pub fn sourcePresence(
             secret_store.presence(),
         .chatgpt_subscription => chatgpt_session.presence(),
         .grok_subscription => grok_session.presence(),
-        .host_managed => .missing,
+        .host_managed, .configured => .missing,
     };
 }
 
@@ -1474,6 +1485,7 @@ pub fn sourceLabel(source: Source) []const u8 {
         .chatgpt_subscription => "Codex subscription",
         .grok_subscription => "Grok subscription",
         .host_managed => "host managed",
+        .configured => "configured provider",
     };
 }
 
