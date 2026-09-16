@@ -4846,7 +4846,7 @@ pub fn processAgentPrompt(
         effective_lifecycle,
     );
     defer finalization.deinit();
-    runtime_lifecycle.dispatchTurnStartedCheckpoint(lifecycle, .{
+    runtime_lifecycle.dispatchTurnStartedCheckpoint(effective_lifecycle, .{
         .turn_id = effective_job.turn_id,
     });
 
