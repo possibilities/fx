@@ -50,6 +50,9 @@ fn BootstrapDeps(comptime App: type) type {
             types.ReasoningEffort,
             bool,
             bool,
+            ?types.ReasoningEffort,
+            ?bool,
+            ?model_provider.ProviderId,
         ) anyerror!void;
         const InitializePersistenceFn = *const fn (*App, bool) anyerror!void;
         const LoadSkillsFn = *const fn (
@@ -75,6 +78,13 @@ fn BootstrapDeps(comptime App: type) type {
 
 pub fn Runtime(comptime App: type) type {
     return struct {
+        pub const LaunchOverrides = struct {
+            provider: ?model_provider.ProviderId = null,
+            model: ?[]const u8 = null,
+            effort: ?types.ReasoningEffort = null,
+            fast: ?bool = null,
+        };
+
         pub fn bootstrap(
             app: *App,
             footer_rows: u16,
@@ -82,6 +92,7 @@ pub fn Runtime(comptime App: type) type {
             default_agent_step_limit: usize,
             resize_handler: app_lifecycle.ResizeHandler,
             capability_providers: CapabilityProviders,
+            launch_overrides: LaunchOverrides,
         ) !void {
             try bootstrapWithDeps(
                 app,
@@ -90,6 +101,7 @@ pub fn Runtime(comptime App: type) type {
                 default_agent_step_limit,
                 resize_handler,
                 defaultDeps(capability_providers),
+                launch_overrides,
             );
         }
 
@@ -131,6 +143,9 @@ pub fn Runtime(comptime App: type) type {
             effort: types.ReasoningEffort,
             fast_mode: bool,
             fast_mode_model_bound: bool,
+            effort_process_override: ?types.ReasoningEffort,
+            fast_process_override: ?bool,
+            provider_process_override: ?model_provider.ProviderId,
         ) !void {
             try app_session_runtime.Runtime(App).configureStartupPreferences(
                 app,
@@ -141,6 +156,9 @@ pub fn Runtime(comptime App: type) type {
                 effort,
                 fast_mode,
                 fast_mode_model_bound,
+                effort_process_override,
+                fast_process_override,
+                provider_process_override,
             );
         }
 
@@ -158,7 +176,7 @@ pub fn Runtime(comptime App: type) type {
 
         // Neutral one-line summary inline; the full detail stays behind Ctrl+O.
         fn writeCollapsedStartupNotice(app: *App, topic: []const u8, summary_lead: []const u8, detail: []const u8) !void {
-            const summary = try std.fmt.allocPrint(app.alloc, "{s} (ctrl o to view)", .{summary_lead});
+            const summary = try std.fmt.allocPrint(app.alloc, "{s} (ctrl+o to view)", .{summary_lead});
             defer app.alloc.free(summary);
             try app.writeDomainNotice(.{ .topic = topic, .tone = .neutral, .body = summary }, true);
             try app.writeDomainNotice(.{ .topic = topic, .tone = .neutral, .body = detail, .visibility = .full_only }, true);
@@ -171,6 +189,7 @@ pub fn Runtime(comptime App: type) type {
             default_agent_step_limit: usize,
             resize_handler: app_lifecycle.ResizeHandler,
             deps: BootstrapDeps(App),
+            launch_overrides: LaunchOverrides,
         ) !void {
             errdefer app.deinit();
 
@@ -194,8 +213,13 @@ pub fn Runtime(comptime App: type) type {
                     .local,
                 .resize_handler = resize_handler,
                 .fx_version = App.app_version,
+                .provider_override = launch_overrides.provider,
             });
             defer startup.deinit(app.alloc);
+
+            if (launch_overrides.model) |model| {
+                try startup.applyLaunchModelOverride(app.alloc, model);
+            }
 
             app.workspace_root = startup.takeWorkspaceRoot();
             if (comptime @hasDecl(App, "adoptWorkspaceAccess")) {
@@ -259,20 +283,31 @@ pub fn Runtime(comptime App: type) type {
             var selected_model = startup.takeSelectedModel();
             defer if (selected_model.len > 0) app.alloc.free(selected_model);
             if (comptime @hasField(App, "provider_selection")) {
+                app.provider_selection.model_requests_blocked = startup.model_requests_blocked;
+                app.provider_selection.definitions = startup.configured_providers;
+                startup.configured_providers = .{};
                 app.provider_selection.adoptOwned(startup.provider, &selected_model);
             } else {
                 try provider_runtime.replaceModel(app, selected_model);
             }
             const active_model = provider_runtime.model(app);
+            // Per-launch --effort/--fast flags shape runtime state only; the
+            // configured and stored preferences keep their pre-flag values.
+            const persisted_effort = startup.effort;
+            const persisted_fast_mode = startup.fast_mode;
+            startup.applyLaunchTurnOverrides(launch_overrides.effort, launch_overrides.fast);
             try deps.configure_session_preferences(
                 app,
                 startup.provider,
                 startup.configured_model,
                 startup.model_source,
                 active_model,
-                startup.effort,
-                startup.fast_mode,
+                persisted_effort,
+                persisted_fast_mode,
                 startup.fast_mode_model_bound,
+                launch_overrides.effort,
+                launch_overrides.fast,
+                launch_overrides.provider,
             );
             app.permission_engine.mode = startup.permission_mode;
             app.permission_engine.replaceRules(app.alloc, startup.takePermissionRules());
@@ -296,6 +331,9 @@ pub fn Runtime(comptime App: type) type {
             app_permission_runtime.Runtime(App).initializeYoloWarning(app);
             app.statusline_context = startup.statusline_context;
             app.statusline_session = startup.statusline_session;
+            if (comptime @hasField(App, "session_title_generation")) {
+                app.session_title_generation = startup.session_title_generation;
+            }
             if (comptime @hasField(App, "workspace_identity")) {
                 app.workspace_identity.enabled = startup.statusline_workspace;
             }
@@ -485,6 +523,9 @@ const TestCapture = struct {
     configured_effort: types.ReasoningEffort = .auto,
     configured_fast_mode: bool = false,
     configured_fast_mode_model_bound: bool = false,
+    effort_process_override: ?types.ReasoningEffort = null,
+    fast_process_override: ?bool = null,
+    provider_process_override: ?model_provider.ProviderId = null,
     initialize_required: bool = false,
     load_skills_workspace: []const u8 = "",
     load_skills_workspace_root_count: usize = 0,
@@ -618,14 +659,15 @@ const TestApp = struct {
             styles.system_notice_text_style.len > 0 and
             styles.reset_style.len > 0;
         const notice = if (semantic_notice.topic.len > 0)
-            try std.fmt.allocPrint(self.alloc, "● {c}{s}: {s}{s}\n", .{
-                std.ascii.toUpper(semantic_notice.topic[0]),
-                semantic_notice.topic[1..],
+            try std.fmt.allocPrint(self.alloc, "{s} {s}: {s}{s}\n", .{
+                types.noticeGlyph(semantic_notice.tone),
+                semantic_notice.topic,
                 semantic_notice.body,
                 if (semantic_notice.visibility == .full_only) " [full-only]" else "",
             })
         else
-            try std.fmt.allocPrint(self.alloc, "● {s}{s}\n", .{
+            try std.fmt.allocPrint(self.alloc, "{s} {s}{s}\n", .{
+                types.noticeGlyph(semantic_notice.tone),
                 semantic_notice.body,
                 if (semantic_notice.visibility == .full_only) " [full-only]" else "",
             });
@@ -780,6 +822,9 @@ fn configureSessionPreferencesForTest(
     effort: types.ReasoningEffort,
     fast_mode: bool,
     fast_mode_model_bound: bool,
+    effort_process_override: ?types.ReasoningEffort,
+    fast_process_override: ?bool,
+    provider_process_override: ?model_provider.ProviderId,
 ) !void {
     const capture = active_capture.?;
     capture.configured_model_len = @min(
@@ -802,6 +847,9 @@ fn configureSessionPreferencesForTest(
     capture.configured_effort = effort;
     capture.configured_fast_mode = fast_mode;
     capture.configured_fast_mode_model_bound = fast_mode_model_bound;
+    capture.effort_process_override = effort_process_override;
+    capture.fast_process_override = fast_process_override;
+    capture.provider_process_override = provider_process_override;
 }
 
 fn beginFreshPersistedSessionForTest(app: *TestApp) !void {
@@ -844,25 +892,93 @@ fn runBootstrapForTest(app: *TestApp, capture: *TestCapture) !void {
         24,
         resizeHandlerForTest,
         testDeps(),
+        .{},
     );
 }
 
-fn tracePathForTest(alloc: Allocator, tmp: std.testing.TmpDir, name: []const u8) ![]u8 {
-    const io_mod = @import("../shared/io.zig");
-    const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
-    defer alloc.free(root);
-    return std.fs.path.join(alloc, &.{ root, name });
-}
+fn runBootstrapWithOverridesForTest(app: *TestApp, capture: *TestCapture, overrides: Runtime(TestApp).LaunchOverrides) !void {
+    active_capture = capture;
+    active_app_for_pointer_check = app;
+    defer {
+        active_capture = null;
+        active_app_for_pointer_check = null;
+    }
 
-fn readTraceForTest(alloc: Allocator, path: []const u8) ![]u8 {
-    const io_mod = @import("../shared/io.zig");
-    debug_trace.shutdown();
-    var file = try std.Io.Dir.openFileAbsolute(io_mod.getIo(), path, .{});
-    defer file.close(io_mod.getIo());
-    return io_mod.readFileToEnd(alloc, &file, 8192);
+    try Runtime(TestApp).bootstrapWithDeps(
+        app,
+        4,
+        "default-model",
+        24,
+        resizeHandlerForTest,
+        testDeps(),
+        overrides,
+    );
 }
 
 fn resizeHandlerForTest(_: std.posix.SIG) callconv(.c) void {}
+
+test "app_bootstrap_runtime applies interactive launch flag overrides" {
+    const alloc = std.testing.allocator;
+    var capture = TestCapture.init(alloc);
+    var app = TestApp.init(alloc);
+    defer app.deinit();
+
+    try runBootstrapWithOverridesForTest(&app, &capture, .{
+        .model = "launch-model",
+        .effort = types.ReasoningEffort.literal("low"),
+        .fast = true,
+    });
+
+    try std.testing.expectEqualStrings("launch-model", capture.runtimeModel());
+    try std.testing.expectEqualStrings("launch-model", app.selected_model.items);
+    try std.testing.expect(app.fast_mode);
+    try std.testing.expect(app.effort.eql(types.ReasoningEffort.literal("low")));
+    // Stored preferences keep the configured values; the flags stay per-launch.
+    try std.testing.expect(capture.configured_effort.eql(types.ReasoningEffort.literal("high")));
+    try std.testing.expect(!capture.configured_fast_mode);
+    // --fast binds to the launch model so the footer indicator reflects it.
+    try std.testing.expect(capture.configured_fast_mode_model_bound);
+    try std.testing.expectEqualStrings("configured-model", capture.configuredModel());
+    // The process overrides carry the flag values so a resume re-applies them.
+    try std.testing.expect(capture.effort_process_override.?.eql(types.ReasoningEffort.literal("low")));
+    try std.testing.expectEqual(@as(?bool, true), capture.fast_process_override);
+    try std.testing.expectEqual(@as(?model_provider.ProviderId, null), capture.provider_process_override);
+}
+
+test "app_bootstrap_runtime launch provider override marks the provider for resume" {
+    const alloc = std.testing.allocator;
+    var capture = TestCapture.init(alloc);
+    var app = TestApp.init(alloc);
+    defer app.deinit();
+
+    try runBootstrapWithOverridesForTest(&app, &capture, .{
+        .provider = .grok,
+    });
+
+    try std.testing.expectEqual(
+        @as(?model_provider.ProviderId, .grok),
+        capture.provider_process_override,
+    );
+}
+
+test "app_bootstrap_runtime model override drops compiled-default fast mode" {
+    const alloc = std.testing.allocator;
+    var capture = TestCapture.init(alloc);
+    var app = TestApp.init(alloc);
+    defer app.deinit();
+
+    try runBootstrapWithOverridesForTest(&app, &capture, .{
+        .model = "other-model",
+    });
+
+    try std.testing.expectEqualStrings("other-model", capture.runtimeModel());
+    try std.testing.expectEqualStrings("other-model", app.selected_model.items);
+    try std.testing.expect(!app.fast_mode);
+    try std.testing.expect(!capture.configured_fast_mode);
+    try std.testing.expect(capture.configured_effort.eql(types.ReasoningEffort.literal("high")));
+    try std.testing.expectEqual(@as(?types.ReasoningEffort, null), capture.effort_process_override);
+    try std.testing.expectEqual(@as(?bool, null), capture.fast_process_override);
+}
 
 test "app_bootstrap_runtime transfers startup state and starts a fresh session" {
     const alloc = std.testing.allocator;
@@ -910,7 +1026,7 @@ test "app_bootstrap_runtime transfers startup state and starts a fresh session" 
     try std.testing.expectEqualStrings("title", events[5]);
     try std.testing.expectEqual(@as(usize, 1), capture.begin_calls);
     try std.testing.expectEqual(@as(usize, 1), capture.enable_calls);
-    try std.testing.expectEqualStrings("v" ++ build_options.app_version ++ " | workspace", capture.titleText());
+    try std.testing.expectEqualStrings("fx v" ++ build_options.app_version ++ " | workspace", capture.titleText());
 
     try std.testing.expectEqualStrings("/workspace", app.workspace_root);
     try std.testing.expectEqualStrings("api-key", app.auth.apiKey().?);
@@ -1035,8 +1151,8 @@ test "app_bootstrap_runtime reports a bounded skill discovery warning" {
 
     try std.testing.expectEqual(@as(usize, 1), app.skills.diagnostics.len);
     try std.testing.expect(capture.early_notice_palette_initialized);
-    try std.testing.expect(std.mem.find(u8, app.transcript.items, "● Skills: 1 discovery issue; some skills may be missing (ctrl o to view)\n") != null);
-    try std.testing.expect(std.mem.find(u8, app.transcript.items, "● Skills: skill discovery warning:") != null);
+    try std.testing.expect(std.mem.find(u8, app.transcript.items, "* skills: 1 discovery issue; some skills may be missing (ctrl+o to view)\n") != null);
+    try std.testing.expect(std.mem.find(u8, app.transcript.items, "* skills: skill discovery warning:") != null);
     try std.testing.expect(std.mem.find(u8, app.transcript.items, "hostile&#x0a;path/body-sentinel") != null);
     try std.testing.expect(std.mem.find(u8, app.transcript.items, "metadata is invalid (missing_name)") != null);
     try std.testing.expect(std.mem.find(u8, app.transcript.items, " [full-only]\n") != null);
@@ -1051,6 +1167,6 @@ test "app_bootstrap_runtime collapses config diagnostics into one neutral summar
 
     try runBootstrapForTest(&app, &capture);
 
-    try std.testing.expect(std.mem.find(u8, app.transcript.items, "● Config: 2 configuration issues (ctrl o to view)\n") != null);
+    try std.testing.expect(std.mem.find(u8, app.transcript.items, "* config: 2 configuration issues (ctrl+o to view)\n") != null);
     try std.testing.expect(std.mem.find(u8, app.transcript.items, "user: malformed_settings\nproject: settings_too_large [full-only]\n") != null);
 }
