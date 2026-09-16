@@ -1296,7 +1296,11 @@ fn configuredProviderSelection(
     settings: *const config_runtime.Settings,
     provider_override: ?model_provider.ProviderId,
 ) !model_provider.ProviderSelection {
-    const provider = provider_override orelse (try processProviderOverride()) orelse settings.provider orelse .gateway;
+    const process_provider = if (try processProviderOverride()) |provider|
+        try provider.bind(settings.providers orelse .{})
+    else
+        null;
+    const provider = provider_override orelse process_provider orelse settings.provider orelse .gateway;
     const model = settings.models.get(provider) orelse switch (provider) {
         .gateway => default_model,
         .codex => processModelOverride() orelse return error.CodexModelNotSelected,
@@ -1386,7 +1390,7 @@ test "FX_PROVIDER selects one process provider and FX_MODEL supplies its missing
 
     {
         var env = try TestEnv.install(std.testing.allocator, &.{
-            .{ .key = "FX_PROVIDER", .value = "unknown" },
+            .{ .key = "FX_PROVIDER", .value = "invalid provider" },
             .{ .key = "FX_MODEL", .value = "gpt-process" },
         });
         defer env.deinit();

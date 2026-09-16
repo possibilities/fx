@@ -259,8 +259,7 @@ pub fn discoverPathsFromHome(alloc: Allocator, home_dir: []const u8, workspace_r
 
 pub fn providerEnvOverride() ?[]const u8 {
     const raw = io_mod.getenv("FX_PROVIDER") orelse return null;
-    if (std.mem.trim(u8, raw, " \t\r\n").len == 0) return null;
-    return raw;
+    return std.mem.trim(u8, raw, " \t\r\n");
 }
 
 fn resolve_provider_selection(settings: *Settings) !void {
@@ -3785,7 +3784,7 @@ test "ignored workspace provider definitions with broken protocols stay inert du
     try std.testing.expect(result.settings.providers.?.get("shadow") == null);
 }
 
-test "empty FX_PROVIDER is ignored like an empty FX_MODEL" {
+test "empty FX_PROVIDER fails before selected profile startup" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
@@ -3801,11 +3800,10 @@ test "empty FX_PROVIDER is ignored like an empty FX_MODEL" {
     defer home.deinit();
     try home.map.put("FX_PROVIDER", "");
 
-    var result = try loadMergedSettingsDetailedFromHome(std.testing.allocator, home_root, workspace_root);
-    defer result.deinit(std.testing.allocator);
-
-    try std.testing.expect(result.settings.provider == null);
-    try std.testing.expectEqual(ConfigSource.compiled_default, result.sources.provider);
+    try std.testing.expectError(
+        error.InvalidProviderValue,
+        loadMergedSettingsDetailedFromHome(std.testing.allocator, home_root, workspace_root),
+    );
 }
 
 test "invalid user model emits typed diagnostic and project model is ignored" {
