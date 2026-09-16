@@ -24,6 +24,7 @@ const secret = @import("../../auth/secret.zig");
 const auth_transition = @import("../../auth/auth_transition.zig");
 const credentials = @import("../../auth/credentials.zig");
 const credential_authority = @import("../../auth/credential_authority.zig");
+const shape_authority = @import("../../auth/shape_authority.zig");
 const tool_dispatch = @import("../../tooling/tool_dispatch.zig");
 const model_tool_schema = @import("../../tooling/model_tool_schema.zig");
 const command_result_mapping = @import("../../tooling/command_result_mapping.zig");
@@ -1415,10 +1416,16 @@ fn agentShellWriteLeaseSessionId(
         else => error.InvalidTerminalLeaseTrackingInput,
     };
     if (parsed != .object) return error.InvalidTerminalLeaseTrackingInput;
-    const action = parsed.object.get("action") orelse return error.InvalidTerminalLeaseTrackingInput;
+    // The model-facing request may still be wrapped, or may already have been
+    // normalized for internal dispatch. Both name the same command authority.
+    const arguments = if (parsed.object.get("request")) |wrapped| arguments: {
+        if (wrapped != .object) return error.InvalidTerminalLeaseTrackingInput;
+        break :arguments wrapped.object;
+    } else parsed.object;
+    const action = arguments.get("action") orelse return error.InvalidTerminalLeaseTrackingInput;
     if (action != .string) return error.InvalidTerminalLeaseTrackingInput;
     if (!std.mem.eql(u8, action.string, "write")) return null;
-    const session_id = parsed.object.get("session_id") orelse
+    const session_id = arguments.get("session_id") orelse
         return error.InvalidTerminalLeaseTrackingInput;
     if (session_id != .string or session_id.string.len == 0) {
         return error.InvalidTerminalLeaseTrackingInput;
@@ -2790,6 +2797,7 @@ fn commitSelectedContext(
 fn candidateHasApplicableContextDelta(
     arena: Allocator,
     context_registry: context_contract.Registry,
+    project_instructions_enabled: bool,
     config: Config,
     context_delivery_state: *const context_contract.DeliveryState,
     candidate: tool_preparation.Candidate,
@@ -2802,6 +2810,7 @@ fn candidateHasApplicableContextDelta(
     var selected = try context_registry.selectDefaultApplicableContext(arena, .{
         .workspace_root = config.workspace_root,
         .access_scope = config.access_scope,
+        .project_instructions_enabled = project_instructions_enabled,
         .targets = candidate.applicable_targets,
         .delivered_sources = context_delivery_state.delivered_sources.items,
         .evaluated_endpoints = context_delivery_state.evaluated_endpoints.items,
@@ -3668,19 +3677,30 @@ fn recoveryCredentialAuthorityMatches(
     return expected_identity.eql(current_identity);
 }
 
+/// A checkpoint written before shape authority existed carries no shape, and
+/// continuing it is not a shape change. A checkpoint that does carry one must
+/// match: an agent defined differently is not the agent that began the turn.
+fn recoveryShapeAuthorityMatches(
+    checkpoint: session_codec.RecoveryCheckpoint,
+    shape: ?shape_authority.Identity,
+) bool {
+    const expected = checkpoint.authority.shape orelse return true;
+    const current = shape orelse return false;
+    return expected.identity.eql(current);
+}
+
 fn shouldRejectRecoveryAuthority(
     checkpoint: session_codec.RecoveryCheckpoint,
     source: ?types.CredentialSource,
     account_id: ?[]const u8,
+    shape: ?shape_authority.Identity,
 ) bool {
     if (checkpoint.disposition == .history_only) return true;
     const provider_may_have_received_request = checkpoint.outstanding_reservation or
         checkpoint.consumed_provider_attempts > 0;
-    return provider_may_have_received_request and !recoveryCredentialAuthorityMatches(
-        checkpoint,
-        source,
-        account_id,
-    );
+    if (!provider_may_have_received_request) return false;
+    if (!recoveryCredentialAuthorityMatches(checkpoint, source, account_id)) return true;
+    return !recoveryShapeAuthorityMatches(checkpoint, shape);
 }
 
 test "potentially sent recovery rejects missing or changed credential authority" {
@@ -3709,11 +3729,13 @@ test "potentially sent recovery rejects missing or changed credential authority"
         checkpoint,
         .chatgpt_subscription,
         "acct_1",
+        null,
     ));
     try std.testing.expect(shouldRejectRecoveryAuthority(
         checkpoint,
         .chatgpt_subscription,
         "acct_2",
+        null,
     ));
 
     var legacy = checkpoint;
@@ -3723,6 +3745,7 @@ test "potentially sent recovery rejects missing or changed credential authority"
         legacy,
         .chatgpt_subscription,
         "acct_1",
+        null,
     ));
     legacy.authority.credential_source = .ai_gateway_api_key;
     legacy.authority.credential_identity = credential_authority.derive(
@@ -3733,10 +3756,12 @@ test "potentially sent recovery rejects missing or changed credential authority"
         legacy,
         .ai_gateway_api_key,
         null,
+        null,
     ));
     try std.testing.expect(shouldRejectRecoveryAuthority(
         legacy,
         .stored_key,
+        null,
         null,
     ));
     legacy.authority.credential_source = null;
@@ -3746,10 +3771,75 @@ test "potentially sent recovery rejects missing or changed credential authority"
         legacy,
         .chatgpt_subscription,
         "acct_1",
+        null,
     ));
     legacy.disposition = .history_only;
-    try std.testing.expect(shouldRejectRecoveryAuthority(legacy, .chatgpt_subscription, "acct_1"));
-    try std.testing.expect(shouldRejectRecoveryAuthority(legacy, null, null));
+    try std.testing.expect(shouldRejectRecoveryAuthority(legacy, .chatgpt_subscription, "acct_1", null));
+    try std.testing.expect(shouldRejectRecoveryAuthority(legacy, null, null, null));
+}
+
+test "potentially sent recovery rejects a turn begun under a different shape" {
+    const reviewer = shape_authority.derive(.{ .system_prompt = "review carefully" });
+    const builder = shape_authority.derive(.{ .system_prompt = "build quickly" });
+    var checkpoint = session_codec.RecoveryCheckpoint{
+        .turn_id = 1,
+        .user = .{ .text = @constCast("continue") },
+        .assistant_source = @constCast("partial"),
+        .cause = .response_interrupted,
+        .action = .continuing_response,
+        .authority = .{
+            .provider = .codex,
+            .model = @constCast("gpt-5.4"),
+            .credential_source = .chatgpt_subscription,
+            .credential_identity = credential_authority.derive(.chatgpt_subscription, "acct_1"),
+            .shape = .{ .id = @constCast("reviewer"), .identity = reviewer },
+        },
+        .requested_fast_mode = false,
+        .fast_mode = false,
+        .max_provider_attempts = 3,
+        .consumed_provider_attempts = 1,
+    };
+
+    // The same account and the same shape continue.
+    try std.testing.expect(!shouldRejectRecoveryAuthority(
+        checkpoint,
+        .chatgpt_subscription,
+        "acct_1",
+        reviewer,
+    ));
+    // A different shape did not begin this turn, so it may not continue it.
+    try std.testing.expect(shouldRejectRecoveryAuthority(
+        checkpoint,
+        .chatgpt_subscription,
+        "acct_1",
+        builder,
+    ));
+    // Neither may a launch that cannot say what shape it is.
+    try std.testing.expect(shouldRejectRecoveryAuthority(
+        checkpoint,
+        .chatgpt_subscription,
+        "acct_1",
+        null,
+    ));
+
+    // A checkpoint written before shape authority existed still continues.
+    checkpoint.authority.shape = null;
+    try std.testing.expect(!shouldRejectRecoveryAuthority(
+        checkpoint,
+        .chatgpt_subscription,
+        "acct_1",
+        builder,
+    ));
+
+    // Nothing was sent, so no authority change can reject it.
+    checkpoint.authority.shape = .{ .id = @constCast("reviewer"), .identity = reviewer };
+    checkpoint.consumed_provider_attempts = 0;
+    try std.testing.expect(!shouldRejectRecoveryAuthority(
+        checkpoint,
+        .chatgpt_subscription,
+        "acct_1",
+        builder,
+    ));
 }
 
 fn checkpointCause(
@@ -3862,6 +3952,10 @@ fn persistRecoveryCheckpoint(
                 )
             else
                 null,
+            .shape = if (deps.shape) |shape| .{
+                .id = @constCast(deps.shape_label),
+                .identity = shape,
+            } else null,
         },
         .requested_fast_mode = requested_fast_mode,
         .fast_mode = fast_mode,
@@ -3913,6 +4007,7 @@ fn persist_compaction_source(
             .model = @constCast(route_model),
             .credential_source = job.credential_source,
             .credential_identity = if (job.credential_source) |source| credential_authority.derive(source, job.account_id) else null,
+            .shape = if (deps.shape) |shape| .{ .id = @constCast(deps.shape_label), .identity = shape } else null,
         },
         .requested_fast_mode = requested_fast_mode,
         .fast_mode = fast_mode,
@@ -5646,7 +5741,7 @@ fn reconstructProjectContext(
     config: Config,
     job: QueuedPrompt,
 ) !?context_contract.GatheredContextSnapshot {
-    if (!deps.context_enabled) return null;
+    if (!deps.context_enabled or !deps.project_instructions_enabled) return null;
     var retained = try tool_preparation.retainedContextTargets(
         alloc,
         job.history,
@@ -5674,6 +5769,7 @@ fn reconstructProjectContext(
         .access_scope = config.access_scope,
         .targets = targets.items,
         .bounded_reconstruction = true,
+        .project_instructions_enabled = deps.project_instructions_enabled,
         .context_limits = config.context_limits,
     });
     errdefer snapshot.deinit(alloc);
@@ -6639,6 +6735,7 @@ fn processQueuedPromptLoop(
             checkpoint,
             job.credential_source,
             job.account_id,
+            config.shape,
         )) {
             return error.RecoveryCredentialAuthorityChanged;
         }
@@ -9388,6 +9485,7 @@ fn processQueuedPromptLoop(
             var selected = context_registry.selectDefaultApplicableContext(arena, .{
                 .workspace_root = config.workspace_root,
                 .access_scope = config.access_scope,
+                .project_instructions_enabled = deps.project_instructions_enabled,
                 .targets = preparation_batch.applicable_targets.items,
                 .delivered_sources = context_delivery_state.delivered_sources.items,
                 .evaluated_endpoints = context_delivery_state.evaluated_endpoints.items,
@@ -9431,6 +9529,7 @@ fn processQueuedPromptLoop(
                         context_deferred_calls[index] = candidateHasApplicableContextDelta(
                             arena,
                             context_registry,
+                            deps.project_instructions_enabled,
                             config,
                             &context_delivery_state,
                             candidate,
@@ -12144,4 +12243,43 @@ test "malformed duplicate unauthorized and path Vision calls settle no image ids
         &catalog,
     ));
     try std.testing.expectEqual(@as(usize, 0), settled_ids.items.len);
+}
+
+test "prepared compaction checkpoint preserves shape and credential authority" {
+    const support = @import("tests/support.zig");
+    const Sink = struct {
+        checkpoint: ?session_codec.RecoveryCheckpoint = null,
+        fn set(raw: *anyopaque, checkpoint: session_codec.RecoveryCheckpoint) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.checkpoint = try checkpoint.dupe(std.testing.allocator);
+        }
+    };
+    var sink: Sink = .{};
+    defer if (sink.checkpoint) |*checkpoint| checkpoint.deinit(std.testing.allocator);
+    var fake = support.FakeAgentRuntimeDeps.init(std.testing.allocator);
+    defer fake.deinit();
+    var deps = fake.deps();
+    deps.ctx = &sink;
+    deps.recovery_checkpoint = .{ .set = Sink.set };
+    const identity = shape_authority.derive(.{ .system_prompt = "review carefully" });
+    deps.shape = identity;
+    deps.shape_label = "reviewer";
+    var fixture: support.PromptFixture = .{};
+    var job = fixture.job();
+    job.credential_source = .chatgpt_subscription;
+    job.account_id = @constCast("compaction-account");
+    var finalization = TurnFinalizationGuard.init(&deps, 1, support.testLifecycleContext(
+        hooks.RuntimeView.empty(),
+        std.testing.allocator,
+        fixture.workspace_root,
+    ));
+    defer finalization.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    try persist_compaction_source(&deps, &finalization, arena.allocator(), job, &.{}, "model", false, false, 3, 1, .none, .{});
+    const checkpoint = sink.checkpoint.?;
+    try std.testing.expectEqual(@as(@TypeOf(checkpoint.cause), .compaction_prepared), checkpoint.cause);
+    try std.testing.expectEqualStrings("reviewer", checkpoint.authority.shape.?.id);
+    try std.testing.expect(checkpoint.authority.shape.?.identity.eql(identity));
+    try std.testing.expect(checkpoint.authority.credential_identity.?.eql(credential_authority.derive(.chatgpt_subscription, "compaction-account").?));
 }

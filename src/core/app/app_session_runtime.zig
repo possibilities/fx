@@ -17,6 +17,7 @@ const host_target = @import("../hosts/target.zig");
 const diff = @import("../output/diff.zig");
 const diagnostics = @import("../workspace/diagnostics.zig");
 const app_lifecycle = @import("app_lifecycle.zig");
+const app_profile_runtime = @import("app_profile_runtime.zig");
 const provider_runtime = @import("provider_runtime.zig");
 const input_completion_runtime = @import("input_completion_runtime.zig");
 const image_attachments = @import("../images/image_attachments.zig");
@@ -27,6 +28,8 @@ const text_utils = @import("../shared/text_utils.zig");
 const session_runtime = @import("../session/session.zig");
 const session_catalog = @import("../session/session_catalog.zig");
 const session_codec = @import("../session/session_codec.zig");
+const credential_authority = @import("../auth/credential_authority.zig");
+const app_history_home = @import("app_history_home.zig");
 const js_host_session_store = @import("../session/js_host_session_store.zig");
 const session_event = @import("../session/session_event.zig");
 const session_usage = @import("../session/session_usage.zig");
@@ -1316,6 +1319,7 @@ test "persistence in-place initialization preserves empty ownership" {
     try std.testing.expect(persistence.writable == null);
     try std.testing.expect(persistence.subagent_host == null);
     try std.testing.expect(!persistence.fast_mode_model_bound);
+    try std.testing.expect(persistence.process_effort_override == null);
     try std.testing.expect(!persistence.session_picker.active);
     try std.testing.expect(persistence.session_picker_load.task == null);
     try std.testing.expect(!persistence.session_picker_cache.ready);
@@ -1360,6 +1364,8 @@ pub fn Runtime(comptime App: type) type {
             configured_model: []const u8,
             model_source: config_runtime.ModelSource,
             selected_model: []const u8,
+            configured_effort: types.ReasoningEffort,
+            effort_source: config_runtime.ConfigSource,
             effort: types.ReasoningEffort,
             fast_mode: bool,
             fast_mode_model_bound: bool,
@@ -1373,7 +1379,7 @@ pub fn Runtime(comptime App: type) type {
                 .{
                     .provider = provider,
                     .model = @constCast(configured_model),
-                    .effort = effort,
+                    .effort = configured_effort,
                     .fast_mode = fast_mode,
                 },
             );
@@ -1391,7 +1397,8 @@ pub fn Runtime(comptime App: type) type {
                 app.session_persistence.process_model_override =
                     try app.alloc.dupe(u8, selected_model);
             }
-            app.session_persistence.process_effort_override = effort_process_override;
+            app.session_persistence.process_effort_override = effort_process_override orelse
+                (if (effort_source == .process_override) effort else null);
             app.session_persistence.process_fast_override = fast_process_override;
             app.session_persistence.process_provider_override = provider_process_override;
             // A provider override must pin the resolved model too, or a resume
@@ -1409,10 +1416,10 @@ pub fn Runtime(comptime App: type) type {
             required: bool,
         ) !void {
             if (comptime !runtime_profile.allows(App, .durable_sessions)) return;
-            var store = session_store.Store.init(
-                app.alloc,
-                app.workspace_root,
-            ) catch |err| {
+            var store = (if (app_history_home.forApp(app)) |home_dir|
+                session_store.Store.initFromHome(app.alloc, home_dir, app.workspace_root)
+            else
+                session_store.Store.init(app.alloc, app.workspace_root)) catch |err| {
                 if (required) return err;
                 return;
             };
@@ -2803,8 +2810,8 @@ pub fn Runtime(comptime App: type) type {
                     patch.model != null and patch.fast_mode != null;
             }
 
-            var settings_attempt = config_runtime.attemptUserPreferences(
-                app.alloc,
+            var settings_attempt = app_profile_runtime.attemptUserPreferences(
+                app,
                 patch.userSettingsPatch(),
             );
             switch (settings_attempt) {
@@ -3541,7 +3548,7 @@ pub fn Runtime(comptime App: type) type {
                     };
                     defer parsed.deinit();
                     if (parsed.value != .object) return;
-                    const command_value = parsed.value.object.get("command") orelse {
+                    const command_value = tool_args.commandArguments(parsed.value.object).get("command") orelse {
                         try self.attachSessionCommandDisplay(entry_id, call);
                         return;
                     };
@@ -5224,6 +5231,11 @@ pub fn Runtime(comptime App: type) type {
                 value.deinit(app.alloc);
             }
             const usage = try app.session.usage.snapshot(app.alloc);
+            errdefer {
+                var value = usage;
+                value.deinit(app.alloc);
+            }
+            const provenance = try sessionProvenance(app);
             return .{
                 .id = id,
                 .origin_workspace_root = origin,
@@ -5237,6 +5249,36 @@ pub fn Runtime(comptime App: type) type {
                 .total_output_tokens = 0,
                 .permission_state = permission_state,
                 .usage = usage,
+                .provenance = provenance,
+            };
+        }
+
+        /// The shape and credential in effect, recorded beside the session id so
+        /// one history can be read back by the pair that produced it. Shape is
+        /// resolved once at launch; the credential is whichever one this launch
+        /// resolved, borrowed or its own.
+        fn sessionProvenance(app: *App) !?session_codec.SessionProvenance {
+            if (comptime !@hasField(App, "shape")) return null;
+            const identity = app.shape orelse return null;
+            const label = app.shapeLabel();
+            const credential_source = if (comptime @hasDecl(@TypeOf(app.auth), "credentialSource"))
+                app.auth.credentialSource()
+            else
+                null;
+            const account_id = if (comptime @hasDecl(@TypeOf(app.auth), "accountId"))
+                app.auth.accountId()
+            else
+                null;
+            return .{
+                .shape = .{
+                    .id = try app.alloc.dupe(u8, label),
+                    .identity = identity,
+                },
+                .credential_source = credential_source,
+                .credential_identity = if (credential_source) |source|
+                    credential_authority.derive(source, account_id)
+                else
+                    null,
             };
         }
 
@@ -6223,6 +6265,8 @@ test "js-host resume restores transcript context preferences usage and revision"
         .user_global,
         "startup/model",
         .auto,
+        .compiled_default,
+        .auto,
         false,
         true,
         null,
@@ -6314,6 +6358,8 @@ test "js-host resume store failures and missing records fall back to fresh sessi
             .user_global,
             "fresh/model",
             .auto,
+            .compiled_default,
+            .auto,
             false,
             true,
             null,
@@ -6347,6 +6393,8 @@ test "js-host picker request stays unsupported and starts fresh" {
         .user_global,
         "fresh/model",
         .auto,
+        .compiled_default,
+        .auto,
         false,
         true,
         null,
@@ -6375,6 +6423,8 @@ test "js-host completed and interrupted turns propagate revisions preserve owner
         "fresh/model",
         .user_global,
         "fresh/model",
+        .auto,
+        .compiled_default,
         .auto,
         false,
         true,
@@ -6446,6 +6496,8 @@ test "js-host preference changes snapshot the updated session preferences" {
         "fresh/model",
         .user_global,
         "fresh/model",
+        .auto,
+        .compiled_default,
         .auto,
         false,
         true,
@@ -6545,6 +6597,8 @@ fn configureTestPreferences(app: *TestApp) !void {
         "configured/model",
         .user_workspace,
         "configured/model",
+        types.ReasoningEffort.literal("high"),
+        .compiled_default,
         types.ReasoningEffort.literal("high"),
         true,
         true,
@@ -8162,6 +8216,8 @@ test "upgrade resume restores active session with the installed version notice" 
         "configured/model",
         .process_override,
         "env/model",
+        types.ReasoningEffort.literal("low"),
+        .process_override,
         types.ReasoningEffort.literal("high"),
         true,
         false,
@@ -8169,6 +8225,8 @@ test "upgrade resume restores active session with the installed version notice" 
         null,
         null,
     );
+    try std.testing.expect(app.session_persistence.workspace_preferences.?.effort.eql(types.ReasoningEffort.literal("low")));
+    try std.testing.expect(app.session_persistence.process_effort_override.?.eql(types.ReasoningEffort.literal("high")));
     try Runtime(TestApp).initializePersistence(&app, true);
     var calls = [_]types.ToolCall{.{
         .id = "call_read",
@@ -8282,7 +8340,11 @@ test "upgrade resume restores active session with the installed version notice" 
         "saved/model",
         app.session_persistence.session_preferences.?.model,
     );
-    try std.testing.expectEqual(types.ReasoningEffort.literal("medium"), app.effort);
+    try std.testing.expectEqual(types.ReasoningEffort.literal("high"), app.effort);
+    try std.testing.expectEqual(
+        types.ReasoningEffort.literal("medium"),
+        app.session_persistence.session_preferences.?.effort,
+    );
     try std.testing.expect(!app.fast_mode);
 }
 
@@ -9867,6 +9929,8 @@ test "fresh interactive session retains one writable schema-v3 handle" {
         "configured/model",
         .user_workspace,
         "configured/model",
+        types.ReasoningEffort.literal("high"),
+        .compiled_default,
         types.ReasoningEffort.literal("high"),
         true,
         true,

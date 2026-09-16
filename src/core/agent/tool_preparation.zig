@@ -365,7 +365,8 @@ fn isCapturedCommandCall(
     };
     defer parsed.deinit();
     if (parsed.value != .object) return false;
-    const action = parsed.value.object.get("action") orelse return false;
+    const arguments = tool_args.commandArguments(parsed.value.object);
+    const action = arguments.get("action") orelse return false;
     return action == .string and std.mem.eql(u8, action.string, expected_action);
 }
 

@@ -29,6 +29,7 @@ const files = [
   ["sdk/browser.js", "browser.js"],
   ["sdk/node.js", "node.js"],
   ["sdk/fx-sdk.js", "fx-sdk.js"],
+  ["sdk/internal.js", "internal.js"],
   ["sdk/wasm-module.js", "wasm-module.js"],
   ["sdk/core-output.js", "core-output.js"],
   ["sdk/mcp.js", "mcp.js"],

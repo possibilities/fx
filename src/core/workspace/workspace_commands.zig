@@ -85,6 +85,42 @@ pub fn execute(
     action: Action,
     failure_phase: *FailurePhase,
 ) !Result {
+    return executeWithOptionalHome(
+        alloc,
+        null,
+        primary_directory,
+        current,
+        action,
+        failure_phase,
+    );
+}
+
+pub fn executeFromHome(
+    alloc: Allocator,
+    home: []const u8,
+    primary_directory: []const u8,
+    current: *const workspace_access.WorkspaceAccess,
+    action: Action,
+    failure_phase: *FailurePhase,
+) !Result {
+    return executeWithOptionalHome(
+        alloc,
+        home,
+        primary_directory,
+        current,
+        action,
+        failure_phase,
+    );
+}
+
+fn executeWithOptionalHome(
+    alloc: Allocator,
+    profile_home: ?[]const u8,
+    primary_directory: []const u8,
+    current: *const workspace_access.WorkspaceAccess,
+    action: Action,
+    failure_phase: *FailurePhase,
+) !Result {
     failure_phase.* = .stage;
     var add_identity: ?[]u8 = null;
     defer if (add_identity) |identity| alloc.free(identity);
@@ -129,10 +165,10 @@ pub fn execute(
     };
 
     failure_phase.* = .commit;
-    var outcome = config_runtime.mutateWorkspaceDirectory(
-        alloc,
-        durable_patch,
-    ) catch |err| {
+    var outcome = (if (profile_home) |home|
+        config_runtime.mutateWorkspaceDirectoryFromHome(alloc, home, durable_patch)
+    else
+        config_runtime.mutateWorkspaceDirectory(alloc, durable_patch)) catch |err| {
         if (err != error.SettingsCommitIndeterminate) return err;
         failure_phase.* = .reconcile;
         const intended = if (staged) |*access| access else return .{ .indeterminate = .unconfirmed };
@@ -141,6 +177,7 @@ pub fn execute(
             primary_directory,
             current,
             intended,
+            profile_home,
         ) };
     };
     defer outcome.deinit(alloc);
@@ -150,6 +187,7 @@ pub fn execute(
         alloc,
         primary_directory,
         runtime_sources,
+        profile_home,
     );
     errdefer committed.deinit(alloc);
 
@@ -191,8 +229,12 @@ fn loadCommittedWorkspaceAccess(
     alloc: Allocator,
     primary_directory: []const u8,
     staged: *const workspace_access.WorkspaceAccess,
+    profile_home: ?[]const u8,
 ) !workspace_access.WorkspaceAccess {
-    var detailed = try config_runtime.loadMergedSettingsDetailed(alloc, primary_directory);
+    var detailed = if (profile_home) |home|
+        try config_runtime.loadMergedSettingsDetailedFromHome(alloc, home, primary_directory)
+    else
+        try config_runtime.loadMergedSettingsDetailed(alloc, primary_directory);
     defer detailed.deinit(alloc);
     for (detailed.diagnostics) |diagnostic| {
         if (diagnostic.cause == .invalid_additional_directories) return error.InvalidSettingsFormat;
@@ -216,8 +258,12 @@ fn reconcileWorkspaceAccess(
     primary_directory: []const u8,
     current: *const workspace_access.WorkspaceAccess,
     intended: *const workspace_access.WorkspaceAccess,
+    profile_home: ?[]const u8,
 ) !Reconciliation {
-    var detailed = try config_runtime.loadMergedSettingsDetailed(alloc, primary_directory);
+    var detailed = if (profile_home) |home|
+        try config_runtime.loadMergedSettingsDetailedFromHome(alloc, home, primary_directory)
+    else
+        try config_runtime.loadMergedSettingsDetailed(alloc, primary_directory);
     defer detailed.deinit(alloc);
 
     for (detailed.diagnostics) |diagnostic| {
@@ -304,6 +350,65 @@ test "shared workspace mutation owns staging persistence metadata" {
         },
         .indeterminate => return error.TestExpectedEqual,
     }
+}
+
+test "workspace mutation writes only the explicitly selected state root" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "ambient/.fx");
+    try tmp.dir.createDirPath(std.testing.io, "selected/.fx");
+    try tmp.dir.createDir(std.testing.io, "primary", .default_dir);
+    try tmp.dir.createDir(std.testing.io, "shared", .default_dir);
+
+    const ambient_home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "ambient");
+    defer alloc.free(ambient_home);
+    const selected_home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "selected");
+    defer alloc.free(selected_home);
+    const primary = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "primary");
+    defer alloc.free(primary);
+    const shared = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "shared");
+    defer alloc.free(shared);
+
+    var environ = try TestEnv.install(alloc, &.{.{ .key = "HOME", .value = ambient_home }});
+    defer environ.deinit();
+
+    var current = try workspace_access.WorkspaceAccess.init(
+        alloc,
+        primary,
+        &.{},
+        &.{},
+        false,
+    );
+    defer current.deinit(alloc);
+
+    var failure_phase: FailurePhase = .stage;
+    var result = try executeFromHome(
+        alloc,
+        selected_home,
+        primary,
+        &current,
+        .{ .add = shared },
+        &failure_phase,
+    );
+    defer result.deinit(alloc);
+
+    var selected = try config_runtime.loadMergedSettingsDetailedFromHome(
+        alloc,
+        selected_home,
+        primary,
+    );
+    defer selected.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), selected.additional_directories.?.len);
+    try std.testing.expectEqualStrings(shared, selected.additional_directories.?[0]);
+
+    var ambient = try config_runtime.loadMergedSettingsDetailedFromHome(
+        alloc,
+        ambient_home,
+        primary,
+    );
+    defer ambient.deinit(alloc);
+    try std.testing.expect(ambient.additional_directories == null);
 }
 
 test "shared workspace mutations apply stale actions to the latest durable roots" {
@@ -590,7 +695,7 @@ test "workspace access reconciliation accepts only intended or previous saved st
     defer env.deinit();
 
     try writeFixtureFile(tmp.dir, "home/.fx/settings.json", "{}\n");
-    var intended_result = try reconcileWorkspaceAccess(alloc, primary, &current, &intended);
+    var intended_result = try reconcileWorkspaceAccess(alloc, primary, &current, &intended, null);
     defer intended_result.deinit(alloc);
     switch (intended_result) {
         .intended => |access| try std.testing.expectEqual(@as(usize, 0), access.entries.len),
@@ -604,7 +709,7 @@ test "workspace access reconciliation accepts only intended or previous saved st
     );
     defer alloc.free(previous_fixture);
     try writeFixtureFile(tmp.dir, "home/.fx/settings.json", previous_fixture);
-    var previous_result = try reconcileWorkspaceAccess(alloc, primary, &current, &intended);
+    var previous_result = try reconcileWorkspaceAccess(alloc, primary, &current, &intended, null);
     defer previous_result.deinit(alloc);
     switch (previous_result) {
         .previous => |access| {
@@ -621,7 +726,7 @@ test "workspace access reconciliation accepts only intended or previous saved st
     );
     defer alloc.free(third_fixture);
     try writeFixtureFile(tmp.dir, "home/.fx/settings.json", third_fixture);
-    var third_result = try reconcileWorkspaceAccess(alloc, primary, &current, &intended);
+    var third_result = try reconcileWorkspaceAccess(alloc, primary, &current, &intended, null);
     defer third_result.deinit(alloc);
     try std.testing.expect(third_result == .unconfirmed);
 
@@ -632,7 +737,7 @@ test "workspace access reconciliation accepts only intended or previous saved st
     );
     defer alloc.free(invalid_fixture);
     try writeFixtureFile(tmp.dir, "home/.fx/settings.json", invalid_fixture);
-    var invalid_result = try reconcileWorkspaceAccess(alloc, primary, &current, &intended);
+    var invalid_result = try reconcileWorkspaceAccess(alloc, primary, &current, &intended, null);
     defer invalid_result.deinit(alloc);
     try std.testing.expect(invalid_result == .unconfirmed);
 }
@@ -679,7 +784,7 @@ test "workspace access reconciliation rejects a retargeted durable source" {
     try tmp.dir.deleteFile(std.testing.io, "saved-link");
     try tmp.dir.symLink(std.testing.io, "second", "saved-link", .{ .is_directory = true });
 
-    var result = try reconcileWorkspaceAccess(alloc, primary, &current, &intended);
+    var result = try reconcileWorkspaceAccess(alloc, primary, &current, &intended, null);
     defer result.deinit(alloc);
     try std.testing.expect(result == .unconfirmed);
 }

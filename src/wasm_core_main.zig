@@ -90,15 +90,8 @@ fn fetchCliModelCatalog(
     });
     return switch (result) {
         .loaded => |loaded| project: {
-            var catalog = loaded.catalog;
-            defer model_catalog.freeModelCatalog(alloc, &catalog);
-            const ids = model_catalog.projectModelIds(alloc, catalog.items) catch return .{ .failure = .{
-                .access = loaded.provenance.access,
-                .anonymous_fallback_used = loaded.provenance.anonymous_fallback_used,
-                .failure = .{ .category = .resource_exhausted },
-            } };
             break :project .{ .loaded = .{
-                .ids = ids,
+                .catalog = loaded.catalog,
                 .provenance = loaded.provenance,
             } };
         },

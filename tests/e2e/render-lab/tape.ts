@@ -40,3 +40,36 @@ export function readTapeFrames(path: string): TapeFrame[] {
 export function stdoutFrames(path: string): TapeFrame[] {
   return readTapeFrames(path).filter((frame) => frame.kind === 1);
 }
+
+/**
+ * Read a tape that its writer may still be appending to, retrying past a torn
+ * tail until it parses.
+ *
+ * Use this only to capture position markers. A recording is complete once fx
+ * exits, so assertions belong on a settled tape read with `readTapeFrames`:
+ * polling a live one races the writer and reports a missing frame as a failure
+ * when it has merely not landed yet.
+ */
+export async function readLiveTapeFrames(
+  path: string,
+  timeoutMs = 5_000,
+): Promise<TapeFrame[]> {
+  const startedAt = Date.now();
+  for (;;) {
+    try {
+      return readTapeFrames(path);
+    } catch (error) {
+      if (Date.now() - startedAt >= timeoutMs) throw error;
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+  }
+}
+
+export async function liveStdoutFrames(
+  path: string,
+  timeoutMs = 5_000,
+): Promise<TapeFrame[]> {
+  return (await readLiveTapeFrames(path, timeoutMs)).filter(
+    (frame) => frame.kind === 1,
+  );
+}

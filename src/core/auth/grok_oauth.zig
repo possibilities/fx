@@ -61,6 +61,7 @@ const BrowserLoginContext = struct {
     code_verifier: []u8,
     state: []u8,
     transport: oauth_transport.Provider,
+    profile_home: ?[]const u8 = null,
     manual_code_mutex: std.Io.Mutex = .init,
     manual_code: ?[]u8 = null,
     pending_callback: ?browser_callback.Accepted(BrowserCallback) = null,
@@ -121,8 +122,26 @@ pub fn startSignIn(
     alloc: Allocator,
     transport: oauth_transport.Provider,
 ) !bool {
-    try credentials.requireSignInStorage(.grok_subscription);
-    const browser = try prepareBrowserSignIn(alloc, transport);
+    return startSignInFromOptionalHome(runtime, alloc, transport, null);
+}
+
+pub fn startSignInFromHome(
+    runtime: *login_flow.SignInRuntime,
+    alloc: Allocator,
+    transport: oauth_transport.Provider,
+    home: []const u8,
+) !bool {
+    return startSignInFromOptionalHome(runtime, alloc, transport, home);
+}
+
+fn startSignInFromOptionalHome(
+    runtime: *login_flow.SignInRuntime,
+    alloc: Allocator,
+    transport: oauth_transport.Provider,
+    profile_home: ?[]const u8,
+) !bool {
+    if (profile_home == null) try credentials.requireSignInStorage(.grok_subscription);
+    const browser = try prepareBrowserSignIn(alloc, transport, profile_home);
     return runtime.startPrepared(
         alloc,
         browser.prepared,
@@ -147,7 +166,11 @@ fn submitBrowserManualCode(raw: ?*anyopaque, alloc: Allocator, code: []const u8)
     try context.submitManualCode(alloc, code);
 }
 
-fn prepareBrowserSignIn(alloc: Allocator, transport: oauth_transport.Provider) !PreparedBrowserLogin {
+fn prepareBrowserSignIn(
+    alloc: Allocator,
+    transport: oauth_transport.Provider,
+    profile_home: ?[]const u8,
+) !PreparedBrowserLogin {
     const configured_issuer = try configuredEndpoint(alloc, e2e_issuer_url_env, issuer_url);
     defer alloc.free(configured_issuer);
     const configured_token_endpoint = try configuredEndpoint(alloc, e2e_token_url_env, token_url);
@@ -186,6 +209,7 @@ fn prepareBrowserSignIn(alloc: Allocator, transport: oauth_transport.Provider) !
         .code_verifier = code_verifier,
         .state = state,
         .transport = transport,
+        .profile_home = profile_home,
     };
     listener_owned = false;
 
@@ -381,12 +405,17 @@ fn completeSignIn(
     return completion;
 }
 
-fn saveSignIn(_: ?*anyopaque, alloc: Allocator, completion: login_flow.SignInCompletion) !void {
+fn saveSignIn(raw: ?*anyopaque, alloc: Allocator, completion: login_flow.SignInCompletion) !void {
+    const context: *BrowserLoginContext = @ptrCast(@alignCast(raw.?));
     const session = switch (completion) {
         .grok => |session| session,
         .vercel, .chatgpt => return error.InvalidSignInCompletion,
     };
-    try grok_session.saveNewSession(alloc, session);
+    if (context.profile_home) |home| {
+        try grok_session.saveNewSessionFromHome(alloc, home, session);
+    } else {
+        try grok_session.saveNewSession(alloc, session);
+    }
 }
 
 fn finishSignIn(raw: ?*anyopaque, alloc: Allocator, saved: bool) void {
@@ -485,7 +514,26 @@ pub const LogoutResult = struct {
 };
 
 pub fn logout(alloc: Allocator, transport: oauth_transport.Provider) !LogoutResult {
-    var mutation = (try grok_session.beginExistingMutation()) orelse return .{
+    return logoutFromOptionalHome(alloc, transport, null);
+}
+
+pub fn logoutFromHome(
+    alloc: Allocator,
+    transport: oauth_transport.Provider,
+    home: []const u8,
+) !LogoutResult {
+    return logoutFromOptionalHome(alloc, transport, home);
+}
+
+fn logoutFromOptionalHome(
+    alloc: Allocator,
+    transport: oauth_transport.Provider,
+    profile_home: ?[]const u8,
+) !LogoutResult {
+    var mutation = (try if (profile_home) |home|
+        grok_session.beginExistingMutationFromHome(home)
+    else
+        grok_session.beginExistingMutation()) orelse return .{
         .deletion = .missing,
         .revocation_failed = false,
     };
@@ -527,6 +575,29 @@ pub fn loadAccess(
     }
 
     var mutation = (try grok_session.beginExistingMutation()) orelse return null;
+    defer mutation.deinit();
+    var session = (try mutation.load(alloc)) orelse return null;
+    defer session.deinit(alloc);
+
+    if (mode == .force or session.expired(io_mod.milliTimestamp())) {
+        try refreshSession(alloc, transport, &mutation, &session);
+    }
+    return takeAccess(&session);
+}
+
+pub fn loadAccessFromHome(
+    alloc: Allocator,
+    transport: oauth_transport.Provider,
+    mode: RefreshMode,
+    home: []const u8,
+) !?Access {
+    if (mode == .stored) {
+        var session = (try grok_session.loadFromHome(alloc, home)) orelse return null;
+        defer session.deinit(alloc);
+        return takeAccess(&session);
+    }
+
+    var mutation = (try grok_session.beginExistingMutationFromHome(home)) orelse return null;
     defer mutation.deinit();
     var session = (try mutation.load(alloc)) orelse return null;
     defer session.deinit(alloc);

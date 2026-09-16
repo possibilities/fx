@@ -337,7 +337,10 @@ fn matchingColumns(projection: SessionMenuProjection) MetadataColumns {
         const age = session_catalog.relativeActivityAgeCompact(&age_buf, summary.updated_at_ms, projection.now_ms);
         var turns_buf: [32]u8 = undefined;
         const turns = sessionTurnsText(&turns_buf, summary.history_len);
-        cols.title = @max(cols.title, display_width.visibleWidth(session_catalog.displayTitle(summary)));
+        var provenance_buffer: [128]u8 = undefined;
+        const provenance = session_catalog.provenanceLabel(&provenance_buffer, summary);
+        const provenance_width = if (provenance.len > 0) display_width.visibleWidth(provenance) + 3 else 0;
+        cols.title = @max(cols.title, display_width.visibleWidth(session_catalog.displayTitle(summary)) + provenance_width);
         cols.workspace = @max(cols.workspace, display_width.visibleWidth(sessionWorkspaceLabel(summary)));
         cols.age = @max(cols.age, display_width.visibleWidth(age));
         cols.turns = @max(cols.turns, display_width.visibleWidth(turns));
@@ -355,6 +358,11 @@ fn composeTitleRow(
 ) !std.ArrayList(u8) {
     var row: std.ArrayList(u8) = .empty;
     errdefer row.deinit(alloc);
+
+    var provenance_buffer: [128]u8 = undefined;
+    const provenance = session_catalog.provenanceLabel(&provenance_buffer, summary);
+    const title = session_catalog.displayTitle(summary);
+    const provenance_width = display_width.visibleWidth(provenance);
 
     const indent_width: usize = if (width <= 4) 0 else 2;
     if (indent_width > 0) try row.appendSlice(alloc, "  ");
@@ -376,8 +384,12 @@ fn composeTitleRow(
     const content_width: usize = @as(usize, width) -| 1;
     const metadata_overhead = prefix_width + picker_presentation.inline_picker_column_gap_width + metadata_width;
     const available_title_width = content_width -| metadata_overhead;
-    const show_metadata = metadata_width > 0 and available_title_width >= minimum_title_column_width;
-    const measured_title_width = @max(columns.title, display_width.visibleWidth(session_catalog.displayTitle(summary)));
+    // Account provenance takes priority over the optional workspace/age cluster.
+    const minimum_title_width = minimum_title_column_width +
+        (if (provenance_width > 0) provenance_width + 3 else @as(usize, 0));
+    const show_metadata = metadata_width > 0 and available_title_width >= minimum_title_width;
+    const measured_title_width = @max(columns.title, display_width.visibleWidth(title) +
+        (if (provenance_width > 0) provenance_width + 3 else @as(usize, 0)));
     const title_col = if (show_metadata)
         @min(measured_title_width, available_title_width)
     else
@@ -391,7 +403,20 @@ fn composeTitleRow(
     // Selection is signaled by brightness: bold bright white when selected,
     // dim gray otherwise, so the two are clearly distinct. No marker glyph.
     try row.appendSlice(alloc, if (selected) ui_render.selected_completion_style else ui_render.dim_style);
-    try row_text.appendSingleLineMiddleEllipsized(alloc, &row, session_catalog.displayTitle(summary), title_budget);
+    if (provenance_width > 0) {
+        // Clip the title separately so a long title cannot eat the account prefix.
+        // At narrower widths, middle clipping sacrifices shape text before the
+        // suffix containing the account digest.
+        const provenance_budget = @min(provenance_width, title_budget -| 7);
+        const text_budget = title_budget -| (provenance_budget + 3);
+        try row_text.appendSingleLineEllipsized(alloc, &row, title, text_budget);
+        if (provenance_budget > 0) {
+            try row.appendSlice(alloc, " · ");
+            try row_text.appendSingleLineMiddleEllipsized(alloc, &row, provenance, provenance_budget);
+        }
+    } else {
+        try row_text.appendSingleLineMiddleEllipsized(alloc, &row, title, title_budget);
+    }
     try row.appendSlice(alloc, ui_render.reset_style);
 
     if (show_metadata) {
@@ -1011,4 +1036,29 @@ test "resume menu keeps the selected paginated action visible in two rows" {
     var selected_load_more = try composeSessionMenuRow(alloc, projection, 1, 80, 2);
     defer selected_load_more.deinit(alloc);
     try std.testing.expect(std.mem.find(u8, selected_load_more.items, "Load more") != null);
+}
+
+test "resume menu retains account provenance in clipped titles" {
+    const alloc = std.testing.allocator;
+    for ([_]u8{ 0x11, 0x22 }) |account| {
+        const summary = session_store.SessionSummary{
+            .id = @constCast("saved"),
+            .workspace_root = @constCast("/tmp/workspace"),
+            .title = @constCast("A long saved session title that needs clipping"),
+            .created_at_ms = 1,
+            .updated_at_ms = 2,
+            .history_len = 1,
+            .conversation_language = .literal("en"),
+            .shape = .{ .id = @constCast("reviewer"), .identity = .{ .bytes = @splat(3) } },
+            .credential_source = .chatgpt_subscription,
+            .credential_identity = .{ .bytes = .{account} ++ .{0} ** 31 },
+        };
+        for (40..101) |width| {
+            var row = try composeTitleRow(alloc, summary, true, 2, .{}, @intCast(width));
+            defer row.deinit(alloc);
+            const hex = std.fmt.bytesToHex(summary.credential_identity.?.bytes, .lower);
+            try std.testing.expect(std.mem.find(u8, row.items, hex[0..12]) != null);
+            try std.testing.expect(display_width.visibleWidthIgnoringAnsi(row.items) <= width);
+        }
+    }
 }

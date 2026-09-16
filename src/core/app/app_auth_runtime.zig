@@ -14,6 +14,7 @@ const provider_catalog = @import("../auth/provider_catalog.zig");
 const auth_transition = @import("../auth/auth_transition.zig");
 const model_provider = @import("../config/model_provider.zig");
 const model_catalog = @import("../gateway/model_catalog.zig");
+const app_profile_runtime = @import("app_profile_runtime.zig");
 const provider_runtime = @import("provider_runtime.zig");
 const picker_state = @import("../input/picker_state.zig");
 const provider_picker_runtime = @import("provider_picker_runtime.zig");
@@ -93,6 +94,30 @@ pub const PendingPromptCredentialReadiness = enum {
 
 pub fn Runtime(comptime App: type) type {
     return struct {
+        fn selectedStateHome(app: *const App) ?[]const u8 {
+            if (comptime @hasField(App, "profile_home")) return app.profile_home;
+            return null;
+        }
+
+        fn selectedIdentityHome(app: *const App) ?[]const u8 {
+            if (comptime @hasField(App, "identity_home")) return app.identity_home;
+            return null;
+        }
+
+        fn borrowedAuthorizationHome(app: *const App) !?[]u8 {
+            return credentials.borrowedAuthorizationHomeFromLaunch(
+                app.alloc,
+                selectedStateHome(app),
+                selectedIdentityHome(app),
+            );
+        }
+
+        fn borrowsAuthorization(app: *const App) bool {
+            return selectedIdentityHome(app) != null or
+                (selectedStateHome(app) != null and
+                    io_mod.getenv(credentials.read_only_authorization_home_env) != null);
+        }
+
         fn compactionOwnsCredentialFeedback(app: *const App) bool {
             return if (comptime @hasField(App, "submission")) app.submission.compaction_pending else false;
         }
@@ -141,10 +166,38 @@ pub fn Runtime(comptime App: type) type {
             if (hostManagesAuth(app) or (provider != .configured and model_provider.authorizesCredential(provider, app.auth.credentialSource()))) return .unchanged;
             var preferred: ?credentials.Source = null;
             if (provider == .gateway and !host_target.is_wasm) {
-                var settings = try config_runtime.loadMergedSettings(app.alloc, app.workspace_root);
+                var settings = try app_profile_runtime.loadMergedSettings(app);
                 defer settings.deinit(app.alloc);
                 preferred = settings.credential_source;
             }
+            const borrowed_home = try borrowedAuthorizationHome(app);
+            defer if (borrowed_home) |home| app.alloc.free(home);
+            if (provider != .configured) if (borrowed_home) |home| {
+                var resolution = credentials.resolveReadOnlyForProviderFromHome(
+                    app.alloc,
+                    provider,
+                    preferred,
+                    home,
+                ) catch |err| {
+                    if (err == error.OutOfMemory) return error.OutOfMemory;
+                    return .{ .failed = .{
+                        .source = if (provider == .gateway)
+                            preferred orelse .fx_login
+                        else
+                            provider_catalog.find(provider).login_source,
+                        .err = err,
+                    } };
+                };
+                defer if (resolution.credential) |*credential| credential.deinit(app.alloc);
+                if (resolution.credential) |*credential| {
+                    return if (app.auth.adoptCredential(app.alloc, credential))
+                        .selected
+                    else
+                        .unchanged;
+                }
+                if (resolution.failure) |failure| return .{ .failed = failure };
+                return .missing;
+            };
             return app.auth.selectForProvider(app.alloc, provider, preferred);
         }
 
@@ -301,7 +354,10 @@ pub fn Runtime(comptime App: type) type {
             }
             defer if (hold_turn_start) app.worker.releaseTurnStartHold();
             if (logout_provider == .grok) {
-                const outcome = grok_oauth.logout(app.alloc, app.auth.oauthTransport()) catch {
+                const outcome = (if (app_profile_runtime.explicitHome(app)) |profile_home|
+                    grok_oauth.logoutFromHome(app.alloc, app.auth.oauthTransport(), profile_home)
+                else
+                    grok_oauth.logout(app.alloc, app.auth.oauthTransport())) catch {
                     try writeAuthNotice(app, .{
                         .topic = "auth",
                         .tone = .@"error",
@@ -330,7 +386,10 @@ pub fn Runtime(comptime App: type) type {
                 return;
             }
             if (logout_provider == .codex) {
-                const outcome = chatgpt_oauth.logout() catch {
+                const outcome = (if (app_profile_runtime.explicitHome(app)) |profile_home|
+                    chatgpt_oauth.logoutFromHome(profile_home)
+                else
+                    chatgpt_oauth.logout()) catch {
                     try writeAuthNotice(app, .{
                         .topic = "auth",
                         .tone = .@"error",
@@ -351,7 +410,10 @@ pub fn Runtime(comptime App: type) type {
                 try reconcileSubscriptionLogout(app, .codex);
                 return;
             }
-            const result = login_flow.logout(app.alloc, app.auth.oauthTransport()) catch |err| switch (err) {
+            const result = (if (app_profile_runtime.explicitHome(app)) |profile_home|
+                login_flow.logoutFromHome(app.alloc, app.auth.oauthTransport(), profile_home)
+            else
+                login_flow.logout(app.alloc, app.auth.oauthTransport())) catch |err| switch (err) {
                 error.SessionDeleteFailed => {
                     try writeAuthNotice(app, .{
                         .topic = "auth",
@@ -862,8 +924,8 @@ pub fn Runtime(comptime App: type) type {
         }
 
         fn forgetCredentialSource(app: *App) void {
-            var attempt = config_runtime.attemptUserPreferences(
-                app.alloc,
+            var attempt = app_profile_runtime.attemptUserPreferences(
+                app,
                 .{ .clear_credential_source = true },
             );
             defer attempt.deinit(app.alloc);
@@ -920,8 +982,8 @@ pub fn Runtime(comptime App: type) type {
                 return;
             }
 
-            var attempt = config_runtime.attemptUserPreferences(
-                app.alloc,
+            var attempt = app_profile_runtime.attemptUserPreferences(
+                app,
                 .{ .credential_source = source },
             );
             defer attempt.deinit(app.alloc);
@@ -1081,7 +1143,7 @@ pub fn Runtime(comptime App: type) type {
                     return;
                 },
             }
-            var settings = config_runtime.loadMergedSettings(app.alloc, app.workspace_root) catch |err| {
+            var settings = app_profile_runtime.loadMergedSettings(app) catch |err| {
                 debug_trace.logf("provider", "settings load failed err={s}", .{@errorName(err)});
                 try app.writeDomainNotice(.{
                     .topic = "provider",
@@ -1091,6 +1153,8 @@ pub fn Runtime(comptime App: type) type {
                 return;
             };
             defer settings.deinit(app.alloc);
+            const borrowed_home = try borrowedAuthorizationHome(app);
+            defer if (borrowed_home) |home| app.alloc.free(home);
             const catalog_provider = app.providerCatalog(target) orelse {
                 try app.writeDomainNotice(.{
                     .topic = "provider",
@@ -1100,8 +1164,11 @@ pub fn Runtime(comptime App: type) type {
                 return;
             };
             try beginPreparation(app, .{
-                .intent = .{ .provider = .{ .target = target, .allow_login = allow_login, .origin = intent, .fallback = fallback } },
+                // A borrowed authorization is read only, so a missing credential
+                // never opens a sign-in that would write into the borrowed profile.
+                .intent = .{ .provider = .{ .target = target, .allow_login = allow_login and !borrowsAuthorization(app), .origin = intent, .fallback = fallback } },
                 .catalog_provider = catalog_provider,
+                .read_only_home = borrowed_home,
                 .models_path = app.model_cache.models_path,
                 .preferred_source = if (target == .gateway) settings.credential_source else null,
                 .primary_model = if (intent == .post_oauth and provider_runtime.provider(app).eql(target)) provider_runtime.model(app) else null,
@@ -1320,7 +1387,7 @@ pub fn Runtime(comptime App: type) type {
                     }, true);
                 }
             } else {
-                var persistence = config_runtime.attemptUserPreferences(app.alloc, .{
+                var persistence = app_profile_runtime.attemptUserPreferences(app, .{
                     .provider = target,
                     .model_preference = .{
                         .provider = target,
@@ -1418,7 +1485,10 @@ pub fn Runtime(comptime App: type) type {
             if (!app.auth.pickerView().fx_login_session_available) return;
             try app.flushBeforeBlockingExternalWork();
 
-            var selection = login_flow.loadTeamSelection(app.alloc, app.auth.oauthTransport()) catch |err| {
+            var selection = (if (app_profile_runtime.explicitHome(app)) |profile_home|
+                login_flow.loadTeamSelectionFromHome(app.alloc, app.auth.oauthTransport(), profile_home)
+            else
+                login_flow.loadTeamSelection(app.alloc, app.auth.oauthTransport())) catch |err| {
                 debug_trace.logf("auth", "team picker load failed err={s}", .{@errorName(err)});
                 try app.writeDomainNotice(.{
                     .topic = "auth",
@@ -1460,7 +1530,7 @@ pub fn Runtime(comptime App: type) type {
             defer candidate.deinit(app.alloc);
             if (comptime @hasDecl(@TypeOf(app.auth), "beginProviderPreparation") and @hasDecl(App, "providerCatalog") and !host_target.is_wasm) {
                 const catalog_provider = app.providerCatalog(.gateway) orelse return false;
-                var settings = config_runtime.loadMergedSettings(app.alloc, app.workspace_root) catch |err| {
+                var settings = app_profile_runtime.loadMergedSettings(app) catch |err| {
                     debug_trace.logf("auth", "team preparation settings failed err={s}", .{@errorName(err)});
                     try app.writeDomainNotice(.{ .topic = "auth", .tone = .@"error", .body = "Could not load provider preferences. The current team is unchanged." }, true);
                     return false;
@@ -1518,7 +1588,10 @@ pub fn Runtime(comptime App: type) type {
                 return false;
             }
 
-            var selected_team = selection.select(app.alloc, index) catch |err| {
+            var selected_team = (if (app_profile_runtime.explicitHome(app)) |profile_home|
+                selection.selectFromHome(app.alloc, index, profile_home)
+            else
+                selection.select(app.alloc, index)) catch |err| {
                 cancelPromptRetryAfterAuth(app);
                 debug_trace.logf("auth", "team change failed err={s}", .{@errorName(err)});
                 app.auth.closePicker(app.alloc);
@@ -1728,6 +1801,7 @@ pub fn Runtime(comptime App: type) type {
                 if (app.auth.providerPreparationPending()) return;
             }
             if (comptime !@hasDecl(@TypeOf(app.auth), "beginPromptCredentialRefresh")) return;
+            if (borrowsAuthorization(app)) return;
             if (comptime provider_runtime.supported(App)) {
                 if (!model_provider.authorizesCredential(provider_runtime.provider(app), app.auth.credentialSource())) return;
             }
@@ -1749,6 +1823,9 @@ pub fn Runtime(comptime App: type) type {
                 return if (try admitPromptCredential(app)) .current else .rejected;
             }
             if (!try ensurePromptCredential(app)) return .rejected;
+            if (borrowsAuthorization(app)) {
+                return if (app.auth.gatewayCredential() != null) .current else .rejected;
+            }
             const source = app.auth.credentialSource() orelse return .rejected;
             if (!credentials.sourceRefreshable(source)) {
                 return if (app.auth.gatewayCredential() != null) .current else .rejected;
@@ -1789,6 +1866,9 @@ pub fn Runtime(comptime App: type) type {
                 return if (try admitPromptCredential(app)) .current else .rejected;
             }
             if (!try ensurePromptCredential(app)) return .rejected;
+            if (borrowsAuthorization(app)) {
+                return if (app.auth.gatewayCredential() != null) .current else .rejected;
+            }
             if (comptime @hasDecl(@TypeOf(app.auth), "credentialFailure")) {
                 if (app.auth.credentialFailure()) |failure| {
                     if (!failure.retryable()) {
@@ -1805,6 +1885,9 @@ pub fn Runtime(comptime App: type) type {
         }
 
         fn preparePromptCredential(app: *App) !bool {
+            if (borrowsAuthorization(app)) {
+                return app.auth.gatewayCredential() != null;
+            }
             if (comptime @hasDecl(@TypeOf(app.auth), "credentialFailure")) {
                 if (app.auth.credentialFailure()) |failure| {
                     if (failure.requiresSignIn()) {
@@ -2135,6 +2218,50 @@ test "provider switch state machine no-ops rejects busy work and prepares only i
     );
 }
 
+test "interactive credential selection cannot escape the borrowed identity" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "identity/.fx");
+    var file = try tmp.dir.createFile(
+        std.testing.io,
+        "identity/.fx/chatgpt-auth.json",
+        .{ .permissions = std.Io.File.Permissions.fromMode(0o600) },
+    );
+    try file.writeStreamingAll(
+        std.testing.io,
+        "{\"version\":1,\"access_token\":\"identity-token\",\"refresh_token\":\"identity-refresh\",\"expires_at_ms\":4000000000000,\"account_id\":\"identity-account\"}\n",
+    );
+    file.close(std.testing.io);
+    const identity_home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "identity");
+    defer alloc.free(identity_home);
+
+    const IdentityApp = struct {
+        alloc: std.mem.Allocator,
+        identity_home: ?[]const u8,
+        workspace_root: []const u8 = ".",
+        auth: auth_runtime.Runtime,
+    };
+    var app = IdentityApp{
+        .alloc = alloc,
+        .identity_home = identity_home,
+        .auth = auth_runtime.Runtime.init(
+            @import("../auth/api_key_validator.zig").unavailable_provider,
+            @import("../auth/oauth_transport.zig").unavailable_provider,
+            host.unavailable_secret_store,
+        ),
+    };
+    defer app.auth.deinit(alloc);
+
+    try std.testing.expectEqual(
+        auth_runtime.ProviderCredentialSelection.selected,
+        try Runtime(IdentityApp).selectProviderCredential(&app, .codex),
+    );
+    try std.testing.expectEqual(credentials.Source.chatgpt_subscription, app.auth.credentialSource().?);
+    try std.testing.expectEqualStrings("identity-account", app.auth.accountId().?);
+    try std.testing.expectEqualStrings("identity-token", app.auth.gatewayCredential().?.api_key.?);
+}
+
 test "post OAuth catalog selection keeps valid current then saved then first" {
     const entries = [_]model_catalog.ModelCatalogEntry{
         .{ .id = @constCast("first"), .model_type = @constCast("language") },
@@ -2281,6 +2408,15 @@ const TestTeamSelection = struct {
         if (index >= self.teams.items.len) return error.InvalidTeamSelection;
         self.select_count += 1;
         return .{};
+    }
+
+    fn selectFromHome(
+        self: *TestTeamSelection,
+        alloc: std.mem.Allocator,
+        index: usize,
+        _: []const u8,
+    ) error{ InvalidTeamSelection, SessionChanged, NoSession }!TestSelectedTeam {
+        return self.select(alloc, index);
     }
 };
 

@@ -642,6 +642,7 @@ fn encodeConversationMetadataWithTitle(
     state: session_codec.DurableSessionState,
     title: ?[]const u8,
 ) ![]u8 {
+    var provenance_buffers: session_codec.ProvenanceMetadataBuffers = .{};
     return session_codec.encodeSessionMetadata(alloc, .{
         .id = state.id,
         .origin_workspace_root = state.origin_workspace_root,
@@ -655,6 +656,7 @@ fn encodeConversationMetadataWithTitle(
         .fast_mode = state.preferences.fast_mode,
         .title = title,
         .subagent_child = state.subagent_child,
+        .provenance = provenance_buffers.encode(state.provenance),
     });
 }
 
@@ -1003,6 +1005,8 @@ fn load_conversation_state_at_boundary(
     const provider = metadata.value.provider;
     const effort = types.ReasoningEffort.parse(metadata.value.effort) orelse
         return error.InvalidSessionMetadata;
+    var provenance = try session_codec.parseProvenanceMetadata(alloc, metadata.value.provenance);
+    errdefer if (provenance) |*value| value.deinit(alloc);
     return .{
         .id = id,
         .origin_workspace_root = origin,
@@ -1025,6 +1029,7 @@ fn load_conversation_state_at_boundary(
         .usage = usage,
         .recovery_checkpoint = recovery_checkpoint,
         .subagent_child = metadata.value.subagent_child,
+        .provenance = provenance,
     };
 }
 
@@ -2743,6 +2748,7 @@ pub const LoadedWritableSession = struct {
             .fast_mode = metadata.value.fast_mode,
             .title = title,
             .subagent_child = metadata.value.subagent_child,
+            .provenance = metadata.value.provenance,
         });
         defer alloc.free(encoded);
         io_mod.durableReplaceVerified(
@@ -3858,6 +3864,7 @@ fn createNativeSession(
         initial_state.history,
     );
     defer display.deinit(alloc);
+    var provenance_buffers: session_codec.ProvenanceMetadataBuffers = .{};
     const has_initial_title = display.present and
         session_display_metadata.hasPromptCandidate(initial_state.history);
     var conversation_writer = try createConversationStorage(alloc, &writable.dir, .{
@@ -3873,6 +3880,7 @@ fn createNativeSession(
         .fast_mode = initial_state.preferences.fast_mode,
         .title = if (has_initial_title) display.title else null,
         .subagent_child = initial_state.subagent_child,
+        .provenance = provenance_buffers.encode(initial_state.provenance),
     });
     errdefer conversation_writer.deinit();
     for (initial_state.history) |turn| {

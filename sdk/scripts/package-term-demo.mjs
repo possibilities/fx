@@ -10,14 +10,16 @@ const outputDir = resolve(process.argv[2] || resolve(repoRoot, "sdk/dist/term-de
 const htmlPath = resolve(repoRoot, "sdk/term-demo.html");
 const browserPath = resolve(repoRoot, "sdk/browser.js");
 const sdkPath = resolve(repoRoot, "sdk/fx-sdk.js");
+const internalPath = resolve(repoRoot, "sdk/internal.js");
 const coreOutputPath = resolve(repoRoot, "sdk/core-output.js");
 const wasmModulePath = resolve(repoRoot, "sdk/wasm-module.js");
 const wasmPath = resolve(repoRoot, "zig-out/bin/fx-term.wasm");
 
-const [htmlSource, browserBytes, sdkSource, coreOutputBytes, wasmModuleBytes, wasmBytes] = await Promise.all([
+const [htmlSource, browserBytes, sdkSource, internalBytes, coreOutputBytes, wasmModuleBytes, wasmBytes] = await Promise.all([
   readFile(htmlPath, "utf8"),
   readFile(browserPath),
   readFile(sdkPath),
+  readFile(internalPath),
   readFile(coreOutputPath),
   readFile(wasmModulePath),
   readFile(wasmPath),
@@ -25,11 +27,14 @@ const [htmlSource, browserBytes, sdkSource, coreOutputBytes, wasmModuleBytes, wa
 
 const digest = (bytes) => createHash("sha256").update(bytes).digest("hex");
 const integrity = (bytes) => `sha256-${createHash("sha256").update(bytes).digest("base64")}`;
+const internalHash = digest(internalBytes);
+const internalName = `internal.${internalHash}.js`;
 const coreOutputHash = digest(coreOutputBytes);
 const coreOutputName = `core-output.${coreOutputHash}.js`;
 const wasmModuleHash = digest(wasmModuleBytes);
 const wasmModuleName = `wasm-module.${wasmModuleHash}.js`;
 const sdkBytes = Buffer.from(sdkSource.toString()
+  .replace('from "./internal.js";', `from "./${internalName}";`)
   .replace('from "./core-output.js";', `from "./${coreOutputName}";`)
   .replace('from "./wasm-module.js";', `from "./${wasmModuleName}";`));
 const sdkHash = digest(sdkBytes);
@@ -77,6 +82,10 @@ const vercelConfig = {
       headers: [{ key: "Cache-Control", value: "public, max-age=31536000, immutable" }],
     },
     {
+      source: `/${internalName}`,
+      headers: [{ key: "Cache-Control", value: "public, max-age=31536000, immutable" }],
+    },
+    {
       source: `/${coreOutputName}`,
       headers: [{ key: "Cache-Control", value: "public, max-age=31536000, immutable" }],
     },
@@ -98,6 +107,7 @@ await Promise.all([
   writeFile(resolve(outputDir, "index.html"), html),
   writeFile(resolve(outputDir, browserName), packagedBrowser),
   writeFile(resolve(outputDir, sdkName), sdkBytes),
+  writeFile(resolve(outputDir, internalName), internalBytes),
   writeFile(resolve(outputDir, coreOutputName), coreOutputBytes),
   writeFile(resolve(outputDir, wasmModuleName), wasmModuleBytes),
   writeFile(resolve(outputDir, wasmName), wasmBytes),
@@ -108,6 +118,7 @@ const manifest = {
   html: "index.html",
   browser: { file: browserName, sha256: digest(packagedBrowser), bytes: packagedBrowser.byteLength },
   sdk: { file: sdkName, sha256: sdkHash, bytes: sdkBytes.byteLength },
+  internal: { file: internalName, sha256: internalHash, bytes: internalBytes.byteLength },
   coreOutput: { file: coreOutputName, sha256: coreOutputHash, bytes: coreOutputBytes.byteLength },
   wasmModule: { file: wasmModuleName, sha256: wasmModuleHash, bytes: wasmModuleBytes.byteLength },
   wasm: { file: wasmName, sha256: wasmHash, integrity: integrity(wasmBytes), bytes: wasmBytes.byteLength },
@@ -117,6 +128,7 @@ await writeFile(resolve(outputDir, "manifest.json"), `${JSON.stringify(manifest,
 console.log(`packaged ${basename(outputDir)}`);
 console.log(`  ${browserName}`);
 console.log(`  ${sdkName}`);
+console.log(`  ${internalName}`);
 console.log(`  ${coreOutputName}`);
 console.log(`  ${wasmModuleName}`);
 console.log(`  ${wasmName}`);

@@ -59,6 +59,9 @@ pub const Server = struct {
     connection_cancel: ?*const std.atomic.Value(bool) = null,
     subscription_server: ?*Server = null,
     config: McpServerConfig,
+    /// Selected Fx profile home owning this server's stored credentials; the
+    /// runtime binds it and keeps it current, null means the ambient profile.
+    profile_home: ?[]const u8 = null,
     session_generation: ?u64 = null,
     elicitation_capabilities: elicitation.Capabilities = .{},
     completion_state: ?*legacy_url_completion.State = null,

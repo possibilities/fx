@@ -105,17 +105,16 @@ pub fn prepare(
     configs: *OwnedServerConfigs,
     elicitation_capabilities: elicitation.Capabilities,
     legacy_url_completion_sink: ?tool_mcp_runtime.LegacyUrlCompletionSink,
+    profile_home: ?[]const u8,
 ) Allocator.Error!Preparation {
     if (configs.items.items.len == 0) return .{ .ready = null };
 
     const runtime = try alloc.create(mcp_runtime.McpRuntime);
+    errdefer alloc.destroy(runtime);
     runtime.* = mcp_runtime.McpRuntime.initWithElicitation(alloc, elicitation_capabilities);
+    errdefer runtime.deinit();
+    try runtime.setProfileHome(profile_home);
     runtime.setLegacyUrlCompletionSink(legacy_url_completion_sink);
-    var runtime_owned = true;
-    defer if (runtime_owned) {
-        runtime.deinit();
-        alloc.destroy(runtime);
-    };
 
     while (configs.items.items.len > 0) {
         var config = configs.items.orderedRemove(0);
@@ -147,7 +146,6 @@ pub fn prepare(
         ) };
     }
 
-    runtime_owned = false;
     return .{ .ready = runtime };
 }
 

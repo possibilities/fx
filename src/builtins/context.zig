@@ -131,6 +131,7 @@ const SelectionOptions = struct {
     initial_omissions: []const context_contract.ContextOmissionInput = &.{},
     initial_omission_summary: ?context_contract.ContextOmissionSummary = null,
     home: ?[]const u8 = null,
+    profile_home: ?[]const u8 = null,
     initial: bool,
     bounded_reconstruction: bool = false,
     load_project_instruction_files: bool = true,
@@ -202,7 +203,13 @@ fn loadsProjectInstructionFiles() bool {
 }
 
 fn gatherProjectContext(alloc: Allocator, input: InitialContextInput) context_contract.ProviderError!ProviderContext {
-    return gatherProjectContextWithHome(alloc, input, io_mod.getenv("HOME"));
+    const home = io_mod.getenv("HOME");
+    return gatherProjectContextWithHomes(
+        alloc,
+        input,
+        home,
+        input.profile_home orelse home,
+    );
 }
 
 fn gatherProjectContextWithHome(
@@ -210,12 +217,22 @@ fn gatherProjectContextWithHome(
     input: InitialContextInput,
     home: ?[]const u8,
 ) context_contract.ProviderError!ProviderContext {
+    return gatherProjectContextWithHomes(alloc, input, home, home);
+}
+
+fn gatherProjectContextWithHomes(
+    alloc: Allocator,
+    input: InitialContextInput,
+    home: ?[]const u8,
+    profile_home: ?[]const u8,
+) context_contract.ProviderError!ProviderContext {
     return selectProjectContext(alloc, .{
         .workspace_root = input.workspace_root,
         .targets = input.targets,
         .initial_omissions = input.omissions,
         .initial_omission_summary = input.omission_summary,
         .home = home,
+        .profile_home = profile_home,
         .initial = true,
         .bounded_reconstruction = input.bounded_reconstruction,
         .load_project_instruction_files = loadsProjectInstructionFiles(),
@@ -260,6 +277,20 @@ fn selectProjectContext(alloc: Allocator, options: SelectionOptions) context_con
 
     if (options.load_project_instruction_files) {
         if (options.initial) {
+            if (options.profile_home) |profile_home| {
+                const canonical_profile_home: ?[]u8 = io_mod.realpathAlloc(arena, profile_home) catch |err| blk: {
+                    if (err == error.OutOfMemory) return error.OutOfMemory;
+                    try scratch.addOmission(profile_home, .home_unavailable);
+                    break :blk null;
+                };
+                if (canonical_profile_home) |profile_root| {
+                    global_source_path = try std.fs.path.join(arena, &.{ profile_root, ".fx", "AGENTS.md" });
+                    global_rule = try loadRuleForSelection(arena, &scratch, global_source_path.?, options.context_limits.project_instruction_file_bytes);
+                }
+            } else {
+                try scratch.addOmission("HOME", .home_unavailable);
+            }
+
             var launch_home: ?[]const u8 = null;
             if (options.home) |home| {
                 const canonical_home: ?[]u8 = io_mod.realpathAlloc(arena, home) catch |err| blk: {
@@ -268,8 +299,6 @@ fn selectProjectContext(alloc: Allocator, options: SelectionOptions) context_con
                     break :blk null;
                 };
                 if (canonical_home) |home_root| {
-                    global_source_path = try std.fs.path.join(arena, &.{ home_root, ".fx", "AGENTS.md" });
-                    global_rule = try loadRuleForSelection(arena, &scratch, global_source_path.?, options.context_limits.project_instruction_file_bytes);
                     if (pathing.pathInside(home_root, options.workspace_root)) {
                         if (options.bounded_reconstruction) {
                             launch_home = home_root;
@@ -1143,6 +1172,36 @@ test "project instruction file cap keeps a line-safe prefix and reports source f
     try std.testing.expectEqual(@as(usize, 2), context.notices.len);
     try std.testing.expect(std.mem.find(u8, context.notices[0], "effective=12 bytes") != null);
     try std.testing.expect(std.mem.find(u8, context.notices[0], "source=workspace settings") != null);
+}
+
+test "selected profile instructions do not replace workspace home ancestry" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeTestFile(tmp.dir, "ambient/.fx/AGENTS.md", "AMBIENT_GLOBAL_RULE");
+    try writeTestFile(tmp.dir, "ambient/projects/AGENTS.md", "ANCESTOR_RULE");
+    try writeTestFile(tmp.dir, "ambient/projects/work/AGENTS.md", "WORKSPACE_RULE");
+    try writeTestFile(tmp.dir, "selected/.fx/AGENTS.md", "SELECTED_GLOBAL_RULE");
+
+    const ambient_home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "ambient");
+    defer alloc.free(ambient_home);
+    const selected_home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "selected");
+    defer alloc.free(selected_home);
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "ambient/projects/work");
+    defer alloc.free(workspace);
+
+    var context = try gatherProjectContextWithHomes(
+        alloc,
+        .{ .workspace_root = workspace, .profile_home = selected_home },
+        ambient_home,
+        selected_home,
+    );
+    defer context.deinit(alloc);
+    const visible = context.modelVisibleBytes();
+    try std.testing.expect(std.mem.find(u8, visible, "SELECTED_GLOBAL_RULE") != null);
+    try std.testing.expect(std.mem.find(u8, visible, "AMBIENT_GLOBAL_RULE") == null);
+    try std.testing.expect(std.mem.find(u8, visible, "ANCESTOR_RULE") != null);
+    try std.testing.expect(std.mem.find(u8, visible, "WORKSPACE_RULE") != null);
 }
 
 test "project instruction file cap bounds retained memory across large candidates" {

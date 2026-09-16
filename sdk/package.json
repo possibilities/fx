@@ -36,6 +36,7 @@
   },
   "files": [
     "browser.js",
+    "internal.js",
     "node.js",
     "node.cjs",
     "fx-sdk.js",

@@ -193,6 +193,26 @@ pub fn load(
         configured_resource,
         configured_issuer,
         null,
+        null,
+    );
+}
+
+pub fn loadFromHome(
+    alloc: Allocator,
+    server_identity: []const u8,
+    endpoint: []const u8,
+    configured_resource: ?[]const u8,
+    configured_issuer: ?[]const u8,
+    home: []const u8,
+) !?mcp_auth.Credentials {
+    return loadControlled(
+        alloc,
+        server_identity,
+        endpoint,
+        configured_resource,
+        configured_issuer,
+        null,
+        home,
     );
 }
 
@@ -211,6 +231,27 @@ pub fn loadCancellable(
         configured_resource,
         configured_issuer,
         cancel_flag,
+        null,
+    );
+}
+
+pub fn loadCancellableFromHome(
+    alloc: Allocator,
+    server_identity: []const u8,
+    endpoint: []const u8,
+    configured_resource: ?[]const u8,
+    configured_issuer: ?[]const u8,
+    cancel_flag: *const std.atomic.Value(bool),
+    home: []const u8,
+) !?mcp_auth.Credentials {
+    return loadControlled(
+        alloc,
+        server_identity,
+        endpoint,
+        configured_resource,
+        configured_issuer,
+        cancel_flag,
+        home,
     );
 }
 
@@ -221,12 +262,16 @@ fn loadControlled(
     configured_resource: ?[]const u8,
     configured_issuer: ?[]const u8,
     cancel_flag: ?*const std.atomic.Value(bool),
+    profile_home: ?[]const u8,
 ) !?mcp_auth.Credentials {
-    const backend = try storageBackend(alloc, cancel_flag);
-    var locked = (try openLockedDirForReadControlled(
-        backend,
-        cancel_flag,
-    )) orelse return null;
+    const backend: StorageBackend = if (profile_home != null)
+        .profile_file
+    else
+        try storageBackend(alloc, cancel_flag);
+    var locked = (try if (profile_home) |home|
+        openExistingLockedDirFromHomeControlled(home, cancel_flag)
+    else
+        openLockedDirForReadControlled(backend, cancel_flag)) orelse return null;
     defer locked.deinit();
     var store = try loadStoreControlled(
         alloc,
@@ -287,8 +332,32 @@ pub fn save(
     server_identity: []const u8,
     credentials: mcp_auth.Credentials,
 ) !SaveResult {
-    const backend = try storageBackend(alloc, null);
-    var locked = try openOrCreateLockedDir();
+    return saveFromOptionalHome(alloc, server_identity, credentials, null);
+}
+
+pub fn saveFromHome(
+    alloc: Allocator,
+    server_identity: []const u8,
+    credentials: mcp_auth.Credentials,
+    home: []const u8,
+) !SaveResult {
+    return saveFromOptionalHome(alloc, server_identity, credentials, home);
+}
+
+fn saveFromOptionalHome(
+    alloc: Allocator,
+    server_identity: []const u8,
+    credentials: mcp_auth.Credentials,
+    profile_home: ?[]const u8,
+) !SaveResult {
+    const backend: StorageBackend = if (profile_home != null)
+        .profile_file
+    else
+        try storageBackend(alloc, null);
+    var locked = if (profile_home) |home|
+        try openOrCreateLockedDirFromHomeControlled(home, null)
+    else
+        try openOrCreateLockedDir();
     defer locked.deinit();
     var store = try loadStore(alloc, &locked.dir, backend, native_keychain_backend);
     defer store.deinit(alloc);
@@ -319,8 +388,32 @@ pub fn delete(
     server_identity: []const u8,
     endpoint: []const u8,
 ) !DeleteResult {
-    const backend = try storageBackend(alloc, null);
-    var locked = (try openLockedDirForRead(backend)) orelse return .{};
+    return deleteFromOptionalHome(alloc, server_identity, endpoint, null);
+}
+
+pub fn deleteFromHome(
+    alloc: Allocator,
+    server_identity: []const u8,
+    endpoint: []const u8,
+    home: []const u8,
+) !DeleteResult {
+    return deleteFromOptionalHome(alloc, server_identity, endpoint, home);
+}
+
+fn deleteFromOptionalHome(
+    alloc: Allocator,
+    server_identity: []const u8,
+    endpoint: []const u8,
+    profile_home: ?[]const u8,
+) !DeleteResult {
+    const backend: StorageBackend = if (profile_home != null)
+        .profile_file
+    else
+        try storageBackend(alloc, null);
+    var locked = (try if (profile_home) |home|
+        openExistingLockedDirFromHomeControlled(home, null)
+    else
+        openLockedDirForRead(backend)) orelse return .{};
     defer locked.deinit();
     var store = try loadStore(alloc, &locked.dir, backend, native_keychain_backend);
     defer store.deinit(alloc);
@@ -372,6 +465,13 @@ fn openOrCreateLockedDirControlled(
     cancel_flag: ?*const std.atomic.Value(bool),
 ) !LockedDir {
     const home = io_mod.getenv("HOME") orelse return error.HomeNotSet;
+    return openOrCreateLockedDirFromHomeControlled(home, cancel_flag);
+}
+
+fn openOrCreateLockedDirFromHomeControlled(
+    home: []const u8,
+    cancel_flag: ?*const std.atomic.Value(bool),
+) !LockedDir {
     var home_dir = io_mod.VerifiedDir{
         .dir = try std.Io.Dir.openDirAbsolute(io_mod.getIo(), home, .{ .iterate = true }),
     };
@@ -411,6 +511,13 @@ fn openExistingLockedDirControlled(
     cancel_flag: ?*const std.atomic.Value(bool),
 ) !?LockedDir {
     const home = io_mod.getenv("HOME") orelse return error.HomeNotSet;
+    return openExistingLockedDirFromHomeControlled(home, cancel_flag);
+}
+
+fn openExistingLockedDirFromHomeControlled(
+    home: []const u8,
+    cancel_flag: ?*const std.atomic.Value(bool),
+) !?LockedDir {
     var home_dir = io_mod.VerifiedDir{
         .dir = try std.Io.Dir.openDirAbsolute(io_mod.getIo(), home, .{
             .iterate = true,
@@ -1484,6 +1591,84 @@ test "credential store is private atomic and supports restart deletion" {
         null,
         null,
     )) == null);
+}
+
+test "explicit profile home isolates MCP credentials from ambient state" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "ambient");
+    try tmp.dir.createDirPath(std.testing.io, "selected");
+    const ambient_home = try tmp.dir.realPathFileAlloc(std.testing.io, "ambient", alloc);
+    defer alloc.free(ambient_home);
+    const selected_home = try tmp.dir.realPathFileAlloc(std.testing.io, "selected", alloc);
+    defer alloc.free(selected_home);
+    var test_home = try TestHome.init(ambient_home);
+    defer test_home.deinit();
+    test_home.activate();
+
+    var ambient = try testCredentials(
+        alloc,
+        "https://mcp.example/service",
+        "ambient-secret",
+    );
+    defer ambient.deinit(alloc);
+    var selected = try testCredentials(
+        alloc,
+        "https://mcp.example/service",
+        "selected-secret",
+    );
+    defer selected.deinit(alloc);
+    _ = try save(alloc, "server-one", ambient);
+    _ = try saveFromHome(alloc, "server-one", selected, selected_home);
+
+    var ambient_loaded = (try load(
+        alloc,
+        "server-one",
+        "https://mcp.example/service",
+        null,
+        null,
+    )).?;
+    defer ambient_loaded.deinit(alloc);
+    var selected_loaded = (try loadFromHome(
+        alloc,
+        "server-one",
+        "https://mcp.example/service",
+        null,
+        null,
+        selected_home,
+    )).?;
+    defer selected_loaded.deinit(alloc);
+    try std.testing.expectEqualStrings("ambient-secret", ambient_loaded.access_token);
+    try std.testing.expectEqualStrings("selected-secret", selected_loaded.access_token);
+
+    const deleted = try deleteFromHome(
+        alloc,
+        "server-one",
+        "https://mcp.example/service",
+        selected_home,
+    );
+    try std.testing.expectEqual(@as(usize, 1), deleted.removed);
+    try std.testing.expect((try loadFromHome(
+        alloc,
+        "server-one",
+        "https://mcp.example/service",
+        null,
+        null,
+        selected_home,
+    )) == null);
+    var ambient_remaining = (try load(
+        alloc,
+        "server-one",
+        "https://mcp.example/service",
+        null,
+        null,
+    )).?;
+    defer ambient_remaining.deinit(alloc);
+    try std.testing.expectEqualStrings(
+        "ambient-secret",
+        ambient_remaining.access_token,
+    );
 }
 
 test "credential delete sanitizes a store containing only rejected entries" {
