@@ -517,7 +517,7 @@ tmuxTest(
       await waitForGatewayRequest(2);
       await active.waitForText("Thinking", TIMEOUT);
       await active.sendKeys("C-o");
-      await active.waitForText("ctrl o close", TIMEOUT);
+      await active.waitForText("ctrl+o close", TIMEOUT);
       await active.sendHexBytes(["07"]);
       expect(existsSync(editorOpenPath)).toBe(false);
 
