@@ -19,6 +19,9 @@ pub fn Runtime(comptime App: type) type {
             app: *App,
             prompt: []const u8,
         ) ?session_naming.PreparedAdmission {
+            if (comptime @hasField(App, "session_title_generation")) {
+                if (!app.session_title_generation) return null;
+            }
             if (SessionRuntime.cachedSessionTitle(app) != null) return null;
             const session_id = SessionRuntime.activeSessionId(app) orelse return null;
             const credential = app.auth.gatewayCredential() orelse return null;
