@@ -154,7 +154,7 @@ Interface sounds by [cuelume](https://github.com/Danilaa1/cuelume).
 
 ## Fork launch controls
 
-Press `Ctrl+G` to edit the current prompt with `VISUAL`, falling back to `EDITOR`, even while a response is streaming; drafts containing pasted blocks, images, or skills are left unchanged. When an automatic upgrade is ready, press `Ctrl+T` to reload it.
+
 
 On the first submitted prompt, fx starts a small naming request alongside the
 main agent and installs the result as the session's native name without
