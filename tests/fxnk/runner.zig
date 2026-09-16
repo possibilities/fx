@@ -2,6 +2,7 @@ const builtin = @import("builtin");
 const std = @import("std");
 
 const expected_names = [_][]const u8{
+    "core.agent.runtime.orchestrator.test.prepared compaction checkpoint preserves shape and credential authority",
     "core.auth.credentials.test.selected profile configured authorization uses only its connection registry",
     "core.agent.runtime.tests.tool_flow.test.suppressed project instructions stay disabled during retained context reconstruction",
     "core.auth.auth_runtime.test.Codex request-path verification never crosses store or account authority",
