@@ -65,19 +65,21 @@ pub const Settings = struct {
         self.* = .{};
     }
 
-    pub fn setting(self: *Settings, provider: model_provider.ProviderId) *ProviderSetting {
+    pub fn setting(self: *Settings, provider: model_provider.ProviderId) ?*ProviderSetting {
         return switch (provider) {
             .gateway => &self.gateway,
             .codex => &self.codex,
             .grok => &self.grok,
+            .configured => null,
         };
     }
 
-    pub fn settingConst(self: *const Settings, provider: model_provider.ProviderId) *const ProviderSetting {
+    pub fn settingConst(self: *const Settings, provider: model_provider.ProviderId) ?*const ProviderSetting {
         return switch (provider) {
             .gateway => &self.gateway,
             .codex => &self.codex,
             .grok => &self.grok,
+            .configured => null,
         };
     }
 };
@@ -106,11 +108,12 @@ pub const Config = struct {
         self.* = .{};
     }
 
-    pub fn provider(self: *const Config, provider_id: model_provider.ProviderId) *const ProviderConfig {
+    pub fn provider(self: *const Config, provider_id: model_provider.ProviderId) ?*const ProviderConfig {
         return switch (provider_id) {
             .gateway => &self.gateway,
             .codex => &self.codex,
             .grok => &self.grok,
+            .configured => null,
         };
     }
 };
@@ -296,7 +299,7 @@ pub const Runtime = struct {
         input: AdmissionInput,
     ) !?PreparedAdmission {
         const alloc = self.alloc orelse return null;
-        const provider_config = self.config.provider(input.provider_id);
+        const provider_config = self.config.provider(input.provider_id) orelse return null;
         const model = provider_config.model orelse return null;
         if (input.session_id.len == 0 or input.prompt.len == 0) return null;
         const credential_secret = input.credential.secret() orelse "";

@@ -1724,7 +1724,7 @@ fn parseSessionNamingSettings(
     };
     for (provider_entries) |entry| {
         const provider_value = value.object.get(entry.key) orelse continue;
-        const setting = result.setting(entry.provider);
+        const setting = result.setting(entry.provider) orelse unreachable;
         setting.specified = true;
         if (provider_value == .null) continue;
         if (provider_value != .object) return error.InvalidSessionNamingProviderType;
@@ -1766,9 +1766,9 @@ fn mergeSessionNamingSettings(
         model_provider.ProviderId.grok,
     };
     for (providers) |provider| {
-        const source = incoming.setting(provider);
+        const source = incoming.setting(provider) orelse unreachable;
         if (!source.specified) continue;
-        const destination = target.setting(provider);
+        const destination = target.setting(provider) orelse unreachable;
         destination.deinit(alloc);
         destination.* = source.*;
         source.* = .{};
