@@ -538,10 +538,9 @@ const NamingAdmission = struct {
     }
 };
 
-/// Keeps the opening bytes of one naming stream and stops the provider as
-/// soon as a slug can be built from them. The Codex endpoint refuses the
-/// Responses API output bound, so stopping the stream is the only thing that
-/// keeps a naming answer short.
+/// Freezes a bounded opening title while allowing the provider stream to
+/// finish. The Codex endpoint refuses the Responses API output bound; this
+/// limits captured memory rather than generation or billing.
 const TitleCapture = struct {
     task: *Task,
     buffer: [capture_max_bytes]u8 = undefined,
