@@ -1,5 +1,4 @@
 const std = @import("std");
-const types = @import("../shared/types.zig");
 const chatgpt_session = @import("../auth/chatgpt_session.zig");
 const config_runtime = @import("../config/config_runtime.zig");
 const process_provider = @import("../execution/process_provider.zig");
