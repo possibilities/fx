@@ -251,16 +251,37 @@ pub const Runtime = struct {
         self: *Runtime,
         options: ApprovalResolveOptions,
     ) approval_registry.Error!approval_registry.ResolveResult {
-        return switch (try self.approvals.resolve(
+        return self.resolveApprovalObserved(options, null);
+    }
+
+    /// Answers a child's permission and publishes that child's resolution
+    /// through the one observed resolve path, so the child is never released
+    /// before its `AttentionResolved`. When the route cannot observe at the
+    /// worker's release point the resolution is still published, because an
+    /// accepted decision that never publishes would leave the child blocked
+    /// until an unrelated later record repaired it.
+    pub fn resolveApprovalObserved(
+        self: *Runtime,
+        options: ApprovalResolveOptions,
+        observer: ?worker_runtime.DecisionObserver,
+    ) approval_registry.Error!approval_registry.ResolveResult {
+        const observed = try self.approvals.resolveObserved(
             options.request_id,
             options.child_id,
             options.decision,
             options.feedback,
             options.timestamp_ms,
-        )) {
-            .accepted => .accepted,
-            .rejected => .rejected,
-        };
+            observer,
+        );
+        switch (observed.result) {
+            .accepted => {
+                if (!observed.observer_ran) {
+                    if (observer) |value| value.observe_fn(value.context, 0);
+                }
+                return .accepted;
+            },
+            .rejected => return .rejected,
+        }
     }
 
     pub fn issueOperationIdentity(
@@ -2166,6 +2187,7 @@ fn captureAdmission(
         return error.AdmissionFailed;
     defer snapshot.deinit(alloc);
     return domain.captureAdmission(alloc, .{
+        .root_id = snapshot.root_id,
         .parent_id = request.parent_id,
         .source_id = request.source_id,
         .model = request.preferences.model,

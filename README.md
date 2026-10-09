@@ -244,6 +244,8 @@ fx --skills-dir ./team-skills --skills-dir /opt/shared-skills ask "Review this c
 Invocation skill roots are not saved, and skill installation continues to use
 `~/.fx/skills`.
 
+See the [ADE event feed](docs/ade-event-feed.md) to observe hosted TUI agent lifecycle.
+
 ## Connect your Slack account
 
 Run `/mcp add slack` in an fx session, or `fx mcp add slack` from your terminal.

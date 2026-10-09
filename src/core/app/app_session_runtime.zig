@@ -53,6 +53,7 @@ const session_store = @import("../session/session_store.zig");
 const session_catalog_cache = @import("../session/session_catalog_cache.zig");
 const session_summary_codec = @import("../session/session_summary_codec.zig");
 const subagent_tool_host = @import("../subagent/tool_host.zig");
+const approval_registry = @import("../subagent/approval_registry.zig");
 const subagent_child_state = @import("../subagent/child_state.zig");
 const subagent_authority = @import("../subagent/authority.zig");
 const subagent_resume_admission = @import("../subagent/resume_admission.zig");
@@ -1904,6 +1905,7 @@ pub fn Runtime(comptime App: type) type {
                 releaseLiveSessionTransitionHold(app);
             }
             try beginFreshPersistedSession(app);
+            reportSessionIdentityChanged(app);
             enableSessionStores(app);
             try finishLiveSessionTransition(app);
         }
@@ -2332,7 +2334,14 @@ pub fn Runtime(comptime App: type) type {
             const active = &app.session_persistence.writable.?;
             try hydrateResumedSession(app, active.state, &display, notice);
             active.releaseHydrationHistory(app.alloc);
+            reportSessionIdentityChanged(app);
             enableSessionStores(app);
+        }
+
+        fn reportSessionIdentityChanged(app: *App) void {
+            if (comptime @hasDecl(App, "reportSessionIdentityChanged")) {
+                app.reportSessionIdentityChanged(activeSessionId(app));
+            }
         }
 
         /// Makes `v2` the open session, taking ownership, and restores the app
@@ -2353,6 +2362,7 @@ pub fn Runtime(comptime App: type) type {
             v2_owned = false;
             errdefer closeWritableSession(app);
             try hydrateResumedSession(app, resumed.state, &display, notice);
+            reportSessionIdentityChanged(app);
             enableSessionStores(app);
         }
 
@@ -2857,6 +2867,7 @@ pub fn Runtime(comptime App: type) type {
                 );
                 return;
             };
+            reportSessionIdentityChanged(app);
             enableSessionStores(app);
         }
 
@@ -5762,7 +5773,7 @@ pub fn Runtime(comptime App: type) type {
         ) void {
             disableSubagentHost(app);
             const store = if (app.session_persistence.store) |*value| value else return;
-            app.session_persistence.subagent_host = subagent_tool_host.Runtime.create(
+            const host = subagent_tool_host.Runtime.create(
                 app.alloc,
                 store,
                 loaded.active_id,
@@ -5779,6 +5790,27 @@ pub fn Runtime(comptime App: type) type {
                 );
                 return;
             };
+            if (comptime @hasDecl(App, "invalidateSubagentAttentionToken")) {
+                host.approvals.setAttentionInvalidationObserver(.{
+                    .context = app,
+                    .observe_fn = observeSubagentAttentionInvalidation,
+                });
+            }
+            app.session_persistence.subagent_host = host;
+        }
+
+        fn observeSubagentAttentionInvalidation(
+            raw: ?*anyopaque,
+            child_session_id: []const u8,
+            attention_token: approval_registry.AttentionToken,
+        ) void {
+            const app: *App = @ptrCast(@alignCast(raw.?));
+            if (comptime @hasDecl(App, "invalidateSubagentAttentionToken")) {
+                app.invalidateSubagentAttentionToken(
+                    child_session_id,
+                    attention_token,
+                );
+            }
         }
 
         /// Subagents on v2 keep their state in the session's log (D22). A
@@ -5790,7 +5822,7 @@ pub fn Runtime(comptime App: type) type {
                 return;
             };
             children.* = subagent_child_state.V2Children.init(app.alloc, v2, app.workspace_root);
-            app.session_persistence.subagent_host = subagent_tool_host.Runtime.createV2(
+            const host = subagent_tool_host.Runtime.createV2(
                 app.alloc,
                 children,
                 subagentAuthorityResolver(app),
@@ -5804,6 +5836,13 @@ pub fn Runtime(comptime App: type) type {
                 app.alloc.destroy(children);
                 return;
             };
+            if (comptime @hasDecl(App, "invalidateSubagentAttentionToken")) {
+                host.approvals.setAttentionInvalidationObserver(.{
+                    .context = app,
+                    .observe_fn = observeSubagentAttentionInvalidation,
+                });
+            }
+            app.session_persistence.subagent_host = host;
             app.session_persistence.v2_children = children;
         }
 
@@ -6685,12 +6724,19 @@ const TestApp = struct {
         authority_mutex: std.Io.Mutex = .init,
     } = .{},
     mcp_tool_names: std.ArrayList([]u8) = .empty,
+    reported_session_identity_count: usize = 0,
+    last_reported_session_id: ?[]const u8 = null,
 
     fn init(alloc: Allocator, workspace_root: []const u8) !TestApp {
         return .{
             .alloc = alloc,
             .workspace_root = try alloc.dupe(u8, workspace_root),
         };
+    }
+
+    fn reportSessionIdentityChanged(self: *TestApp, session_id: ?[]const u8) void {
+        self.reported_session_identity_count += 1;
+        self.last_reported_session_id = session_id;
     }
 
     fn toolAdvertisementSet(_: *const TestApp) tool_set_contract.ToolSet {
@@ -9687,6 +9733,11 @@ test "canceling a startup session picker starts a writable fresh session" {
 
     try std.testing.expect(!app.session_persistence.session_picker.active);
     try std.testing.expect(app.session_persistence.writable != null);
+    try std.testing.expectEqual(@as(usize, 1), app.reported_session_identity_count);
+    try std.testing.expectEqualStrings(
+        app.session_persistence.writable.?.active_id,
+        app.last_reported_session_id.?,
+    );
 }
 
 test "subagent host publication requires successful registry recovery" {
