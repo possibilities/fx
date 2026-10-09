@@ -478,7 +478,7 @@ const UpgradeRelaunchArguments = struct {
         errdefer result.deinit(alloc);
 
         if (sessions_v2) try result.append(alloc, cli_surface.sessions_v2_arg);
-        if (launch.modifiers.provider_override) |provider| {
+        if (launch.modifiers.provider_override) |*provider| {
             try result.appendPair(alloc, "--provider", provider.label());
         }
         if (launch.modifiers.model_override) |model| {
