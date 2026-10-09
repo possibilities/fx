@@ -58,6 +58,7 @@ pub const Config = struct {
     allow_acp_mcp: bool = true,
     allow_native_tools: bool = true,
     native_tool_set: ?tool_set_contract.ToolSet = null,
+    project_instructions_enabled: bool = true,
     minimal_kernel: bool = false,
     /// Raw prompt image and checkpoint bytes from a libfx host. Null for
     /// hosts that only speak standard ACP, such as `fx acp`.

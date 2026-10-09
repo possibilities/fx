@@ -379,6 +379,10 @@ pub const top_level_flags = [_]TopLevelFlag{
         .description = "Use only --skills-dir roots",
     },
     .{
+        .usage = "--no-project-instructions",
+        .description = "Ignore repository instructions for TUI or ACP",
+    },
+    .{
         .usage = "--provider <name>",
         .description = "Override the model provider for an interactive session (gateway, codex, grok, or a configured name)",
     },
