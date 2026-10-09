@@ -700,7 +700,7 @@ const AskContext = struct {
         turn_end: bool,
         attention_required: bool,
     ) !void {
-        self.notification_player = notification_sound.Player.init(.{
+        self.notification_player = try notification_sound.Player.init(.{
             .ctx = self,
             .emit = emitAskNotificationBell,
         });
@@ -777,6 +777,8 @@ const AskContext = struct {
         // Terminals end with this process. Ending them first also releases
         // any subagent still waiting on one.
         self.terminal_client.closeOwnedTerminals();
+        if (self.notification_player) |*player| player.deinit();
+        self.notification_player = null;
         if (self.subagent_host) |subagent_host| subagent_host.deinit();
         self.subagent_host = null;
         if (self.v2_children) |children| {
