@@ -51,6 +51,7 @@ const expected_names = [_][]const u8{
     "builtins.hooks.lifecycle_state.test.lifecycle reducer pairs a non-null attention kind only with blocked",
     "core.agent.worker_runtime.test.work control snapshot and text update preserve native admission order",
     "core.agent.worker_runtime.test.work control snapshot and update enforce semantic bounds",
+    "core.agent.worker_runtime.test.work control semantic pause blocks and resumes steering consumption",
     "core.control.work_control.test.strict authenticated request decoding preserves opaque turn ids",
     "core.control.work_control.test.request decoding rejects partial authority and extra parameters",
     "core.control.work_control.test.success responses carry correlated authoritative snapshots",
