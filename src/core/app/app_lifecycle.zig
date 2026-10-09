@@ -1080,7 +1080,7 @@ pub fn bootstrapInteractiveApp(cfg: BootstrapConfig) !StartupState {
             .custom => |name| {
                 shared_theme.setSource(name, false);
                 const detected = ui_render.detectTheme(cfg.alloc, cfg.terminal);
-                const custom_theme = shared_theme.resolveNamed(cfg.alloc, name, detected.light, .{ .truecolor = truecolor }) catch |err| blk: {
+                const custom_theme = shared_theme.resolveNamedFromHome(cfg.alloc, cfg.profile_home orelse io_mod.getenv("HOME"), name, detected.light, .{ .truecolor = truecolor }) catch |err| blk: {
                     debug_trace.logf("theme", "custom_theme_resolve_failed name={s} err={s}", .{ name, @errorName(err) });
                     break :blk null;
                 };
@@ -1242,14 +1242,14 @@ pub const ShutdownStageTrace = struct {
 
 /// Persists the shutdown breakdown for the next session's /trace report.
 /// Best-effort: a diagnostics write failure must never fail exit.
-pub fn writeLastShutdownReport(alloc: Allocator, trace: *const ShutdownStageTrace) void {
-    writeLastShutdownReportInner(alloc, trace) catch |err| {
+pub fn writeLastShutdownReport(alloc: Allocator, home: ?[]const u8, trace: *const ShutdownStageTrace) void {
+    writeLastShutdownReportInner(alloc, home, trace) catch |err| {
         debug_trace.logf("shutdown", "last shutdown report write failed err={s}", .{@errorName(err)});
     };
 }
 
-fn writeLastShutdownReportInner(alloc: Allocator, trace: *const ShutdownStageTrace) !void {
-    const home = io_mod.getenv("HOME") orelse return;
+fn writeLastShutdownReportInner(alloc: Allocator, selected_home: ?[]const u8, trace: *const ShutdownStageTrace) !void {
+    const home = selected_home orelse return;
 
     var out: std.Io.Writer.Allocating = .init(alloc);
     defer out.deinit();
@@ -1285,8 +1285,8 @@ fn writeLastShutdownReportInner(alloc: Allocator, trace: *const ShutdownStageTra
 
 /// Reads the persisted shutdown breakdown for the /trace report. Returns the
 /// owned file contents; caller frees. Missing or unreadable file is null.
-pub fn readLastShutdownReport(alloc: Allocator) ?[]u8 {
-    const home = io_mod.getenv("HOME") orelse return null;
+pub fn readLastShutdownReport(alloc: Allocator, selected_home: ?[]const u8) ?[]u8 {
+    const home = selected_home orelse return null;
     const path = profile_paths.lastShutdownReportPath(alloc, home) catch return null;
     defer alloc.free(path);
     var file = std.Io.Dir.openFileAbsolute(io_mod.getIo(), path, .{}) catch return null;
