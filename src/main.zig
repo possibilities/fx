@@ -38,6 +38,7 @@ const app_render_runtime = @import("core/app/app_render_runtime.zig");
 const app_session_runtime = @import("core/app/app_session_runtime.zig");
 const app_upgrade_runtime = @import("core/app/app_upgrade_runtime.zig");
 const app_worker_runtime = @import("core/app/app_worker_runtime.zig");
+const app_work_control_runtime = @import("core/app/app_work_control_runtime.zig");
 const app_workspace_runtime = @import("core/app/app_workspace_runtime.zig");
 const app_callbacks = @import("core/app/app_callbacks.zig");
 const app_commands = @import("core/app/app_commands.zig");
@@ -91,6 +92,7 @@ const github_publish = @import("core/github/github_publish.zig");
 const subagent_domain = @import("core/subagent/domain.zig");
 const subagent_execution = @import("core/subagent/execution.zig");
 const types = @import("core/shared/types.zig");
+const work_control = @import("core/control/work_control.zig");
 const image_attachments = @import("core/images/image_attachments.zig");
 const permissions = @import("core/permissions/permissions.zig");
 const command_runner = @import("core/execution/command_runner.zig");
@@ -426,6 +428,7 @@ const App = struct {
     const SessionAppRuntime = app_session_runtime.Runtime(Self);
     const UpgradeAppRuntime = app_upgrade_runtime.Runtime(Self);
     const WorkerAppRuntime = app_worker_runtime.Runtime(Self);
+    const WorkControlAppRuntime = app_work_control_runtime.Runtime(Self);
     const WorkspaceAppRuntime = app_workspace_runtime.Runtime(Self);
 
     pub fn contextRegistry(self: *const Self) context_contract.Registry {
@@ -607,6 +610,7 @@ const App = struct {
 
     worker_thread: ?std.Thread = null,
     worker: WorkerRuntime = .{},
+    work_control: work_control.Endpoint = .{},
     terminal_client: terminal_client_runtime.Runtime = .{},
     managed_executions: managed_execution.Runtime = managed_execution.Runtime.init(std.heap.c_allocator),
     legacy_process_provider: process_provider.Provider = process_provider.unavailable_provider,
@@ -767,6 +771,9 @@ const App = struct {
                 try types.dupePermissionRuleSet(app.alloc, policy.rules),
             );
             app.launch_permission_policy_active = true;
+        }
+        if (comptime !host_target.is_wasm) {
+            try app.work_control.configureFromEnvironment();
         }
         try WorkspaceAppRuntime.applyLaunch(
             &app,
@@ -982,6 +989,13 @@ const App = struct {
         }
     }
 
+    /// Starts only after init() returns so the listener retains the final App
+    /// address through its pending main-loop handoff.
+    pub fn startWorkControl(self: *App) !void {
+        if (comptime host_target.is_wasm) return;
+        try self.work_control.start();
+    }
+
     pub fn applyReadyUpgradeShortcut(self: *App) !void {
         try UpgradeAppRuntime.applyReadyUpgrade(self);
     }
@@ -1094,6 +1108,7 @@ const App = struct {
         self.auth.stopProviderPreparation();
         // Client.deinit releases the herdr pane (clear agent + label) when enabled.
         self.herdr.deinit();
+        if (comptime !host_target.is_wasm) self.work_control.deinit();
         self.stopStream();
         shutdown_trace.mark("stop_stream");
 
@@ -1607,6 +1622,51 @@ const App = struct {
         return true;
     }
 
+    pub const PromptSubmitIntent = enum { queue, steer };
+
+    /// Applies host-supplied semantic work through the same snapshot and
+    /// worker admission path as interactive submission, with deliberately
+    /// empty image and skill state rather than borrowing the composer.
+    pub fn admitWorkControlPrompt(
+        self: *App,
+        prompt: []const u8,
+        intent: PromptSubmitIntent,
+    ) !worker_runtime.PromptAdmissionResult {
+        const no_images: []const types.ImageAttachment = &.{};
+        const context_targets = if (self.context_enabled)
+            try context_contract.applicableTargetsForImages(self.alloc, no_images)
+        else
+            &.{};
+        defer if (context_targets.len > 0) self.alloc.free(context_targets);
+
+        try AgentAppRuntime.refreshProjectContext(self, context_targets);
+        self.session.setConversationLanguageFromUserMessage(prompt);
+        const queued = try self.snapshotPrompt(
+            prompt,
+            &.{},
+            null,
+            no_images,
+            0,
+            false,
+        );
+        errdefer worker_runtime.freeQueuedPrompt(std.heap.c_allocator, queued);
+        const admission = try self.worker.admitPromptObserved(
+            std.heap.c_allocator,
+            queued,
+            intent == .steer,
+            .{ .ctx = self, .report = reportPromptAdmission },
+        );
+        LifecycleAppRuntime.reportPromptWorking(self);
+        WorkerAppRuntime.syncState(
+            self,
+            app_callbacks.Bindings(App).worker_tool_lifecycle_presenter(self),
+        );
+        return admission;
+    }
+
+    pub fn continuePausedRecovery(self: *App) !bool {
+        return SessionAppRuntime.continuePausedRecovery(self);
+    }
     pub fn queueRecoveryCheckpoint(
         self: *App,
         checkpoint: *const session_codec.RecoveryCheckpoint,
@@ -1636,6 +1696,7 @@ const App = struct {
         turn_id: u64,
         user_prompt_already_presented: bool,
     ) !bool {
+        _ = try self.requestSkillsRefresh();
         const queued = try self.snapshotPrompt(
             prompt,
             skill_tokens,
@@ -3254,6 +3315,7 @@ const App = struct {
 
     pub fn loopCollectFacts(ctx: *anyopaque) !void {
         const self: *App = @ptrCast(@alignCast(ctx));
+        if (comptime !host_target.is_wasm) try WorkControlAppRuntime.collect(self);
         if (!try WorkerAppRuntime.authorizeInteractiveAdmission(self)) return;
 
         if (comptime !host_target.is_wasm) {
