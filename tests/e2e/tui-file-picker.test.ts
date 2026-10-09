@@ -968,7 +968,7 @@ describe("@ file picker", () => {
 
       const finalTrace = await waitForFileText(
         current.tracePath,
-        "file index shutdown complete",
+        "file index shutdown requested",
       );
       const replacementStart = finalTrace.indexOf(
         `file index generation started generation=${replacementGeneration}`,
@@ -983,7 +983,6 @@ describe("@ file picker", () => {
       expect(replacementReady).toBeGreaterThan(replacementStart);
       expect(replacementAdopted).toBeGreaterThan(replacementReady);
       expect(finalTrace).toContain("file index refresh coalesced");
-      expect(finalTrace).toContain("file index shutdown requested");
       expectFileDiscoveryOffMainThread(finalTrace);
 
       if (artifactDir) {

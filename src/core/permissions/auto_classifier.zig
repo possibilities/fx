@@ -321,6 +321,9 @@ pub const ProviderInput = struct {
     account_id: ?[]const u8 = null,
     tenant: ?[]const u8 = null,
     endpoint: []const u8 = "",
+    /// Resolved review-model override (`review_model` setting or
+    /// FX_REVIEW_MODEL). Empty means the provider's compiled default.
+    reviewer_model: []const u8 = "",
     cancel_flag: ?*std.atomic.Value(bool) = null,
     usage: ?*session_usage.Usage = null,
     usage_allocator: std.mem.Allocator = std.heap.c_allocator,
@@ -403,10 +406,7 @@ pub const Reviewer = struct {
         const transport = self.transport orelse return .{ .invalid = .transport_unconfigured };
         var fallback_cancel = std.atomic.Value(bool).init(false);
         const cancel_flag = self.cancel_flag orelse &fallback_cancel;
-        const deadline = std.Io.Clock.Timestamp.fromNow(io_mod.getIo(), .{
-            .clock = .awake,
-            .raw = .fromMilliseconds(self.timeout_ms),
-        });
+        const deadline = reviewAttemptDeadline(self.timeout_ms);
         checkBudget(deadline, cancel_flag) catch |err| return constructionFailure(err);
 
         const review_turn = request.review_turn;
@@ -515,31 +515,60 @@ pub const Reviewer = struct {
         );
 
         var recovery_available = true;
+        var transport_retry_available = true;
+        var attempt: u8 = 1;
+        var send_deadline = deadline;
         while (true) {
-            checkBudget(deadline, cancel_flag) catch |err| return constructionFailure(err);
+            checkBudget(send_deadline, cancel_flag) catch |err| return constructionFailure(err);
             debug_trace.logf(
                 "permission",
-                "event=auto_review_send attempt={d} max_attempts=2 target_call_id={s}",
-                .{ @as(u8, if (recovery_available) 1 else 2), review_turn.target_call_id },
+                "event=auto_review_send attempt={d} max_attempts=3 target_call_id={s}",
+                .{ attempt, review_turn.target_call_id },
             );
             var transport_outcome = transport.send(
                 alloc,
                 self.model,
                 payload,
-                deadline,
+                send_deadline,
                 cancel_flag,
             ) catch |err| switch (err) {
                 error.OutOfMemory, error.Cancelled => return err,
-                else => return .{ .invalid = .transport_call_failed },
+                else => {
+                    if (!transport_retry_available) return .{ .invalid = .transport_call_failed };
+                    transport_retry_available = false;
+                    attempt += 1;
+                    send_deadline = reviewAttemptDeadline(self.timeout_ms);
+                    debug_trace.logf(
+                        "permission",
+                        "event=auto_review_transport_retry reason=call_failed target_call_id={s}",
+                        .{review_turn.target_call_id},
+                    );
+                    continue;
+                },
             };
             switch (transport_outcome) {
                 .cancelled => return error.Cancelled,
-                .timed_out => return .{ .invalid = .transport_timed_out },
+                .timed_out, .transient_failure => {
+                    // One retry with a fresh deadline; permanent failures and
+                    // cancellation are never retried.
+                    const reason: InvalidReason = if (transport_outcome == .timed_out)
+                        .transport_timed_out
+                    else
+                        .transport_transient;
+                    if (!transport_retry_available) return .{ .invalid = reason };
+                    transport_retry_available = false;
+                    attempt += 1;
+                    send_deadline = reviewAttemptDeadline(self.timeout_ms);
+                    debug_trace.logf(
+                        "permission",
+                        "event=auto_review_transport_retry reason={s} target_call_id={s}",
+                        .{ @tagName(reason), review_turn.target_call_id },
+                    );
+                },
                 .permanent_failure => return .{ .invalid = .transport_permanent },
-                .transient_failure => return .{ .invalid = .transport_transient },
                 .completion => |*owned| {
                     defer owned.deinit(alloc);
-                    checkBudget(deadline, cancel_flag) catch |err| return constructionFailure(err);
+                    checkBudget(send_deadline, cancel_flag) catch |err| return constructionFailure(err);
                     const parsed = try parseCompletion(alloc, owned.completion);
                     if (!recovery_available or parsed != .invalid or !parsed.invalid.is_malformed_completion()) return parsed;
                     debug_trace.logf(
@@ -548,6 +577,7 @@ pub const Reviewer = struct {
                         .{ @tagName(parsed.invalid), owned.completion.tool_calls.len, if (owned.completion.content) |content| content.len else 0, review_turn.target_call_id },
                     );
                     recovery_available = false;
+                    attempt += 1;
                 },
             }
         }
@@ -1085,6 +1115,13 @@ fn writeXmlElementText(writer: *std.Io.Writer, value: []const u8) !void {
         '>' => try writer.writeAll("&gt;"),
         else => try writer.writeByte(byte),
     };
+}
+
+fn reviewAttemptDeadline(timeout_ms: u32) std.Io.Clock.Timestamp {
+    return std.Io.Clock.Timestamp.fromNow(io_mod.getIo(), .{
+        .clock = .awake,
+        .raw = .fromMilliseconds(timeout_ms),
+    });
 }
 
 fn checkBudget(
@@ -1850,7 +1887,7 @@ test "review response retries malformed completion once on the same deadline" {
 
 test "review response recovery is bounded and releases every completion" {
     const Fixture = struct {
-        const Mode = enum { recover_clear, recover_caution, invalid_twice, caution, transport, cancel_between, cancel_second, expired };
+        const Mode = enum { recover_clear, recover_caution, invalid_twice, caution, transport, transport_timeout, transport_recover, transport_then_invalid, transport_throws, transport_throws_twice, permanent, cancel_between, cancel_second, expired };
         mode: Mode,
         sends: usize = 0,
         released: usize = 0,
@@ -1865,14 +1902,27 @@ test "review response recovery is bounded and releases every completion" {
         fn send(raw: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, deadline: std.Io.Clock.Timestamp, _: *std.atomic.Value(bool)) !TransportOutcome {
             const self: *@This() = @ptrCast(@alignCast(raw));
             self.sends += 1;
-            try std.testing.expect(self.sends <= 2);
-            if (self.mode == .transport) return .transient_failure;
+            try std.testing.expect(self.sends <= 3);
+            switch (self.mode) {
+                .transport => return .transient_failure,
+                .transport_timeout => return .timed_out,
+                .permanent => return .permanent_failure,
+                .transport_recover => if (self.sends == 1) return .transient_failure,
+                .transport_then_invalid => if (self.sends == 1) return .timed_out,
+                .transport_throws => if (self.sends == 1) return error.ConnectionResetByPeer,
+                .transport_throws_twice => return error.ConnectionResetByPeer,
+                else => {},
+            }
             if (self.mode == .cancel_second and self.sends == 2) self.cancel.store(true, .seq_cst);
             if (self.mode == .expired) {
                 while (std.Io.Clock.Timestamp.compare(std.Io.Clock.Timestamp.now(io_mod.getIo(), .awake), .lt, deadline)) io_mod.sleep(std.time.ns_per_ms);
             }
             const caution = self.mode == .caution or self.mode == .recover_caution;
-            const invalid = self.mode != .caution and (self.sends == 1 or self.mode == .invalid_twice);
+            const invalid = switch (self.mode) {
+                .caution => false,
+                .transport_then_invalid => self.sends == 2,
+                else => self.sends == 1 or self.mode == .invalid_twice,
+            };
             return .{ .completion = .{
                 .context = self,
                 .deinit_fn = release,
@@ -1909,7 +1959,7 @@ test "review response recovery is bounded and releases every completion" {
                 var outcome = try reviewer.review(std.testing.allocator, request);
                 defer outcome.deinit(std.testing.allocator);
                 switch (mode) {
-                    .recover_clear => {
+                    .recover_clear, .transport_recover, .transport_then_invalid, .transport_throws => {
                         try std.testing.expect(outcome == .valid);
                         try std.testing.expectEqual(Decision.clear, outcome.valid.decision);
                     },
@@ -1919,16 +1969,26 @@ test "review response recovery is bounded and releases every completion" {
                     },
                     .invalid_twice => try std.testing.expectEqual(InvalidReason.completion_text, outcome.invalid),
                     .transport => try std.testing.expectEqual(InvalidReason.transport_transient, outcome.invalid),
+                    .transport_timeout => try std.testing.expectEqual(InvalidReason.transport_timed_out, outcome.invalid),
+                    .transport_throws_twice => try std.testing.expectEqual(InvalidReason.transport_call_failed, outcome.invalid),
+                    .permanent => try std.testing.expectEqual(InvalidReason.transport_permanent, outcome.invalid),
                     .expired => try std.testing.expectEqual(InvalidReason.construction_timed_out, outcome.invalid),
                     .cancel_between, .cancel_second => unreachable,
                 }
             }
             const expected_sends: usize = switch (mode) {
-                .caution, .transport, .cancel_between, .expired => 1,
+                .caution, .cancel_between, .expired, .permanent => 1,
+                .transport_then_invalid => 3,
                 else => 2,
             };
+            const expected_released: usize = switch (mode) {
+                .transport, .transport_timeout, .transport_throws_twice, .permanent => 0,
+                .transport_recover, .transport_throws => 1,
+                .transport_then_invalid => 2,
+                else => expected_sends,
+            };
             try std.testing.expectEqual(expected_sends, fixture.sends);
-            try std.testing.expectEqual(if (mode == .transport) @as(usize, 0) else expected_sends, fixture.released);
+            try std.testing.expectEqual(expected_released, fixture.released);
         }
     }
 }
