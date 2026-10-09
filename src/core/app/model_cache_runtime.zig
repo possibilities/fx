@@ -6,6 +6,7 @@ const model_catalog = @import("../gateway/model_catalog.zig");
 const model_catalog_metadata = @import("../gateway/model_catalog_metadata.zig");
 const model_capabilities = @import("../config/model_capabilities.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
+const diagnostics = @import("../workspace/diagnostics.zig");
 const io_mod = @import("../shared/io.zig");
 const list_window = @import("../shared/list_window.zig");
 const text_utils = @import("../shared/text_utils.zig");
@@ -94,6 +95,7 @@ pub const ModelMenuCatalogState = struct {
     source: ?credentials.Source = null,
     public_only_reason: ?credentials.CatalogPublicOnlyReason = null,
     private_models_hidden: bool = false,
+    from_profile_settings: bool = false,
     failure: ?Failure = null,
 
     pub const Failure = struct {
@@ -300,6 +302,7 @@ pub const Runtime = struct {
     cancel_requested: std.atomic.Value(bool) = .init(false),
     requested_access: ?model_catalog.AccessMetadata = null,
     outcome: CatalogOutcome = .{},
+    from_profile_settings: bool = false,
     menu: ModelMenu = .{},
 
     pub fn init(alloc: Allocator, models_path: []const u8) Self {
@@ -320,6 +323,7 @@ pub const Runtime = struct {
         provider: model_catalog.Provider,
         access: credentials.CatalogAccess,
     ) void {
+        self.from_profile_settings = provider.provider_id == .configured;
         if (!self.beginLoad(access, provider.refresh_interval_ms)) return;
 
         const owned_access = OwnedCatalogAccess.init(self.alloc, access) catch {
@@ -350,6 +354,7 @@ pub const Runtime = struct {
         provider: model_catalog.Provider,
         access: credentials.CatalogAccess,
     ) void {
+        self.from_profile_settings = provider.provider_id == .configured;
         if (!self.beginLoad(access, provider.refresh_interval_ms)) return;
 
         const result = model_catalog.fetchWithPublicFallback(provider, self.alloc, .{
@@ -382,7 +387,9 @@ pub const Runtime = struct {
                 null;
             self.state = .ready;
             self.completion_pending = true;
+            const retained_entries = self.catalog.items.len;
             self.mutex.unlock(io_mod.getIo());
+            recordLoadReady(retained_entries, true, loaded.provenance);
             return;
         }
         model_catalog.freeModelCatalog(self.alloc, &self.catalog);
@@ -390,7 +397,9 @@ pub const Runtime = struct {
         self.outcome = .{ .loaded = loaded.provenance };
         self.state = .ready;
         self.completion_pending = true;
+        const loaded_entries = self.catalog.items.len;
         self.mutex.unlock(io_mod.getIo());
+        recordLoadReady(loaded_entries, false, loaded.provenance);
     }
 
     fn beginLoad(self: *Self, access: credentials.CatalogAccess, refresh_interval_ms: ?i64) bool {
@@ -412,7 +421,7 @@ pub const Runtime = struct {
                     loaded.* = .{ .access = requested_access };
                     self.outcome.last_failure = null;
                     if (self.menu.active) {
-                        self.menu.catalog_state = modelMenuCatalogState(self.outcome);
+                        self.menu.catalog_state = modelMenuCatalogState(self.outcome, self.from_profile_settings);
                     }
                     reused_public_catalog = true;
                 }
@@ -479,6 +488,7 @@ pub const Runtime = struct {
         model_catalog.freeModelCatalog(self.alloc, &self.catalog);
         self.catalog = .empty;
         self.outcome = .{};
+        self.from_profile_settings = false;
     }
 
     /// Installs a catalog that was completely fetched and validated before the
@@ -499,11 +509,14 @@ pub const Runtime = struct {
         self.outcome = .{ .loaded = .{
             .access = model_catalog.AccessMetadata.init(access),
         } };
+        self.from_profile_settings = false;
         self.state = .ready;
         self.completion_pending = true;
         self.last_attempt_ms = io_mod.milliTimestamp();
         self.requested_access = model_catalog.AccessMetadata.init(access);
         self.cancel_requested.store(false, .seq_cst);
+        const entries = self.catalog.items.len;
+        diagnostics.recordModelCatalogEvent(false, .load, "outcome=adopted entries={d}", .{entries});
     }
 
     pub fn isLoading(self: *Self) bool {
@@ -570,6 +583,34 @@ pub const Runtime = struct {
         return model_catalog_metadata.fromCatalogEntry(entry.*);
     }
 
+    pub const TraceSnapshot = struct {
+        state: []const u8,
+        entries: usize,
+        last_attempt_ms: i64,
+        failure_category: ?[]const u8,
+        failure_http_status: ?std.http.Status,
+        failure_retryable: bool,
+        anonymous_fallback: bool,
+    };
+
+    /// Point-in-time catalog state for the /trace report; the returned struct
+    /// owns no memory and stays valid after the lock is released.
+    pub fn snapshotForTrace(self: *Self) TraceSnapshot {
+        self.finishThreadIfDone();
+        self.mutex.lockUncancelable(io_mod.getIo());
+        defer self.mutex.unlock(io_mod.getIo());
+        const failure = self.outcome.last_failure;
+        return .{
+            .state = @tagName(self.state),
+            .entries = self.catalog.items.len,
+            .last_attempt_ms = self.last_attempt_ms,
+            .failure_category = if (failure) |failed| @tagName(failed.failure.category) else null,
+            .failure_http_status = if (failure) |failed| failed.failure.http_status else null,
+            .failure_retryable = if (failure) |failed| failed.failure.retryable else false,
+            .anonymous_fallback = if (failure) |failed| failed.anonymous_fallback_used else false,
+        };
+    }
+
     pub fn resolveForRequest(
         self: *Self,
         model: []const u8,
@@ -590,6 +631,9 @@ pub const Runtime = struct {
                     "interactive model catalog lookup outcome={s} model={s}",
                     .{ if (metadata != null) "ready_hit" else "missing_entry", model },
                 );
+                if (metadata == null) {
+                    diagnostics.recordModelCatalogEvent(false, .lookup, "outcome=missing_entry model={s}", .{model});
+                }
                 return model_capabilities.resolveCapabilities(model, metadata);
             }
             self.mutex.unlock(io_mod.getIo());
@@ -602,6 +646,7 @@ pub const Runtime = struct {
                             "interactive model catalog lookup outcome=cancelled model={s}",
                             .{model},
                         );
+                        diagnostics.recordModelCatalogEvent(false, .lookup, "outcome=cancelled model={s}", .{model});
                         return error.Cancelled;
                     }
                     io_mod.sleep(std.time.ns_per_ms);
@@ -612,6 +657,10 @@ pub const Runtime = struct {
                         "interactive model catalog lookup outcome={s} model={s}",
                         .{ if (state == .failed) "cache_failed" else "cache_unavailable", model },
                     );
+                    diagnostics.recordModelCatalogEvent(true, .lookup, "outcome={s} model={s}", .{
+                        if (state == .failed) "cache_failed" else "cache_unavailable",
+                        model,
+                    });
                     return model_capabilities.capabilitiesForModel(model);
                 },
                 .ready => unreachable,
@@ -680,21 +729,42 @@ pub const Runtime = struct {
             else
                 null;
             self.state = .ready;
+            const retained_entries = self.catalog.items.len;
             self.mutex.unlock(io_mod.getIo());
+            recordLoadReady(retained_entries, true, loaded.provenance);
             return;
         }
         model_catalog.freeModelCatalog(self.alloc, &self.catalog);
         self.catalog = loaded.catalog;
         self.outcome = .{ .loaded = loaded.provenance };
         self.state = .ready;
+        const loaded_entries = self.catalog.items.len;
         self.mutex.unlock(io_mod.getIo());
+        recordLoadReady(loaded_entries, false, loaded.provenance);
+    }
+
+    fn recordLoadReady(entries: usize, reused_previous: bool, provenance: model_catalog.Provenance) void {
+        diagnostics.recordModelCatalogEvent(false, .load, "outcome=ready entries={d} reused_previous={s} anonymous_fallback={s} fallback_failure={s}", .{
+            entries,
+            boolLabel(reused_previous),
+            boolLabel(provenance.anonymous_fallback_used),
+            boolLabel(provenance.fallback_failure != null),
+        });
     }
 
     fn markFailed(self: *Self, failure: model_catalog.FailedOutcome) void {
         self.mutex.lockUncancelable(io_mod.getIo());
         self.outcome.last_failure = failure;
         self.state = if (self.outcome.loaded != null and self.catalog.items.len > 0) .ready else .failed;
+        const kept_previous = self.state == .ready;
         self.mutex.unlock(io_mod.getIo());
+        diagnostics.recordModelCatalogEvent(true, .load, "outcome=failed category={s} status={d} retryable={s} anonymous_fallback={s} kept_previous_catalog={s}", .{
+            @tagName(failure.failure.category),
+            if (failure.failure.http_status) |status| @intFromEnum(status) else 0,
+            boolLabel(failure.failure.retryable),
+            boolLabel(failure.anonymous_fallback_used),
+            boolLabel(kept_previous),
+        });
     }
 
     fn cancelAndJoin(self: *Self) void {
@@ -732,11 +802,15 @@ pub const Runtime = struct {
             },
             .ready => try hydrateMenuSnapshot(self.alloc, menu, self.catalog.items),
         }
-        menu.catalog_state = modelMenuCatalogState(self.outcome);
+        menu.catalog_state = modelMenuCatalogState(self.outcome, self.from_profile_settings);
     }
 };
 
-fn modelMenuCatalogState(outcome: CatalogOutcome) ModelMenuCatalogState {
+fn boolLabel(value: bool) []const u8 {
+    return if (value) "true" else "false";
+}
+
+fn modelMenuCatalogState(outcome: CatalogOutcome, from_profile_settings: bool) ModelMenuCatalogState {
     const access = if (outcome.last_failure) |failed|
         if (outcome.loaded == null or failed.anonymous_fallback_used)
             failed.access
@@ -757,6 +831,7 @@ fn modelMenuCatalogState(outcome: CatalogOutcome) ModelMenuCatalogState {
         .source = access.source,
         .public_only_reason = access.public_only_reason,
         .private_models_hidden = access.private_models_may_be_hidden,
+        .from_profile_settings = from_profile_settings,
         .failure = if (failure) |failed| .{
             .category = failed.category,
             .retryable = failed.retryable,
@@ -1382,6 +1457,7 @@ test "model menu owns resolved catalog state and filters without changing catalo
             .has_file_input = true,
             .has_web_search = true,
             .supports_fast_mode = true,
+            .supports_ultrafast_mode = true,
         },
         .{
             .id = @constCast("private/blue-hornbill"),
@@ -1404,6 +1480,7 @@ test "model menu owns resolved catalog state and filters without changing catalo
     try std.testing.expect(runtime.menu.itemAt(0).?.capabilities.supports_vision);
     try std.testing.expectEqual(@as(?u32, 256_000), runtime.menu.itemAt(0).?.capabilities.context_window);
     try std.testing.expect(runtime.menu.itemAt(1).?.capabilities.supports_fast_mode);
+    try std.testing.expect(runtime.menu.itemAt(1).?.capabilities.supports_ultrafast_mode);
     try std.testing.expect(runtime.menu.itemAt(1).?.capabilities.supports_file_input);
     try std.testing.expect(runtime.menu.itemAt(1).?.capabilities.supports_web_search);
 
@@ -1673,4 +1750,34 @@ test "model cache request resolution distinguishes readiness miss failure idle a
         runtime.resolveForRequest("provider/new-reasoning-model", &cancel_flag),
     );
     runtime.state = .ready;
+}
+
+test "model cache request resolution records lookup misses for the trace report" {
+    const alloc = std.testing.allocator;
+    diagnostics.resetForTest();
+    defer diagnostics.resetForTest();
+
+    var runtime = Runtime.init(alloc, "/v1/models");
+    defer runtime.deinit();
+    runtime.state = .ready;
+
+    var cancel_flag = std.atomic.Value(bool).init(false);
+    _ = try runtime.resolveForRequest("zai/glm-5.2", &cancel_flag);
+    _ = try runtime.resolveForRequest("zai/glm-5.2", &cancel_flag);
+
+    runtime.state = .failed;
+    _ = try runtime.resolveForRequest("zai/glm-5.2", &cancel_flag);
+    runtime.state = .idle;
+    _ = try runtime.resolveForRequest("zai/glm-5.2", &cancel_flag);
+
+    var events: [diagnostics.model_catalog_ring_capacity]diagnostics.ModelCatalogEvent = undefined;
+    const count = diagnostics.snapshotModelCatalogEvents(&events);
+    try std.testing.expectEqual(@as(usize, 3), count);
+    try std.testing.expectEqualStrings("lookup", events[0].name());
+    try std.testing.expect(!events[0].failed);
+    try std.testing.expectEqualStrings("outcome=missing_entry model=zai/glm-5.2", events[0].detail());
+    try std.testing.expect(events[1].failed);
+    try std.testing.expect(events[2].failed);
+    try std.testing.expectEqualStrings("outcome=cache_failed model=zai/glm-5.2", events[1].detail());
+    try std.testing.expectEqualStrings("outcome=cache_unavailable model=zai/glm-5.2", events[2].detail());
 }
