@@ -249,14 +249,10 @@ pub fn readSidecarOrFallback(
     alloc: Allocator,
     session_dir: *io_mod.VerifiedDir,
 ) !DisplayMetadata {
-    var file = session_dir.dir.openFile(io_mod.getIo(), sidecar_file, .{
-        .mode = .read_only,
-        .allow_directory = false,
-        .follow_symlinks = false,
-        .resolve_beneath = true,
-    }) catch |err| switch (err) {
+    // A special file, such as a FIFO, is never opened, so it cannot block.
+    var file = io_mod.openExistingReadOnlyRegularFile(session_dir.dir, sidecar_file, .no_follow) catch |err| switch (err) {
         error.FileNotFound => return missingFallback(alloc),
-        error.NotDir, error.SymLinkLoop, error.IsDir => return missingFallback(alloc),
+        error.DurablePathUnsafe, error.NotDir, error.SymLinkLoop, error.IsDir => return missingFallback(alloc),
         else => return err,
     };
     defer file.close(io_mod.getIo());

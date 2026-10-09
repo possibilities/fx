@@ -14,6 +14,7 @@
 
 const std = @import("std");
 const debug_trace = @import("../../core/shared/debug_trace.zig");
+const shared_theme = @import("../../core/shared/theme.zig");
 const types = @import("../../core/shared/types.zig");
 const command_output_content = @import("../../core/tooling/command_output_content.zig");
 const render_engine = @import("../render_engine.zig");
@@ -377,7 +378,8 @@ fn foldedPartialTailBytes(self: anytype, bytes: []const u8, partial_skip_rows: u
 }
 
 fn foldedLineBytes(alloc: Allocator, text: []const u8, stream: command_output_content.Stream) ![]u8 {
-    const style = if (stream == .stderr) "\x1b[38;5;252m" else "\x1b[38;5;245m";
+    const theme = shared_theme.current();
+    const style = if (stream == .stderr) theme.tool_stderr_style else theme.tool_stdout_style;
     const trimmed = stripTrailingNewline(text);
     const reset = "\x1b[0m";
     const bytes = try alloc.alloc(u8, style.len + "│ ".len + trimmed.len + reset.len);

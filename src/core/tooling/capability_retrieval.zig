@@ -170,9 +170,9 @@ pub fn retrieve(
     defer alloc.free(ranked);
     var ranked_count: usize = 0;
     const stats = corpusStats(documents);
-    const query_tokens = request.query.tokenSlice();
     var document_frequencies: [lexical_relevance.max_query_tokens]usize = undefined;
-    for (query_tokens, 0..) |token, index| {
+    for (0..request.query.token_count) |index| {
+        const token = request.query.tokenAt(index);
         document_frequencies[index] = corpusDocumentFrequency(documents, token);
     }
 
@@ -189,7 +189,8 @@ pub fn retrieve(
         var score: f64 = 0;
         const primary_length = primaryLength(document);
         const secondary_length = secondaryLength(document);
-        for (query_tokens, 0..) |token, token_index| {
+        for (0..request.query.token_count) |token_index| {
+            const token = request.query.tokenAt(token_index);
             const primary_tf = primaryTermFrequency(document, token);
             const secondary_tf = secondaryTermFrequency(document, token);
             if (primary_tf > 0) primary_hits += 1;
@@ -222,7 +223,7 @@ pub fn retrieve(
 
         const inventory = request.query.raw.len == 0;
         const clear_match = clearMatch(
-            query_tokens.len,
+            request.query.token_count,
             exact_identity,
             primary_hits,
             secondary_hits,
