@@ -73,6 +73,13 @@ pub const Runtime = struct {
         return self.store != null;
     }
 
+    /// Process exit must not wait on another process holding the profile
+    /// ledger lock. Skips `mutex`, which a blocked publisher holds for the
+    /// whole wait; only the host thread that is exiting reassigns `store`.
+    pub fn abandonLedgerForProcessExit(self: *Runtime) void {
+        if (self.store) |*store| store.abandonLock();
+    }
+
     pub fn snapshot(
         self: *Runtime,
         alloc: Allocator,
@@ -273,6 +280,10 @@ fn buildSnapshot(
         facts,
         incidents[0..incident_count],
     );
+}
+
+test {
+    _ = profile_usage_store;
 }
 
 test "profile runtime snapshots only durable profile facts" {

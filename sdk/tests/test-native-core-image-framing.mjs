@@ -4,7 +4,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { createFxAgent } from "../node.js";
+import { createFxEngine } from "../node.js";
 
 const scriptDir = fileURLToPath(new URL(".", import.meta.url));
 const addon = resolve(process.argv[2] || resolve(scriptDir, "../../zig-out/lib/libfx.node"));
@@ -26,7 +26,7 @@ const sse = (...events) => new Response(
 );
 
 try {
-  agent = await createFxAgent({
+  agent = await createFxEngine({
     backend: "native",
     nativeAddon: addon,
     home,
@@ -55,11 +55,16 @@ try {
       assert.ok(init.body.length < 8 * 1024 * 1024);
       assert.ok(Buffer.from(init.body).toString("base64").length > 8 * 1024 * 1024);
       const payload = JSON.parse(Buffer.from(init.body).toString("utf8"));
-      const received = payload.prompt.flatMap((message) => message.content ?? [])
+      const resultValues = payload.prompt.flatMap((message) => message.content ?? [])
         .filter((part) => part.type === "tool-result")
-        .flatMap((part) => part.output.value ?? [])
-        .filter((part) => part.type === "image-data");
-      assert.deepEqual(received, images.map(() => ({ type: "image-data", data, mediaType: "image/png" })));
+        .flatMap((part) => part.output.value ?? []);
+      assert.ok(resultValues.length > 0);
+      assert.ok(resultValues.every((part) => part.type === "text"));
+      const received = payload.prompt
+        .filter((message) => message.role === "user" && Array.isArray(message.content))
+        .flatMap((message) => message.content)
+        .filter((part) => part.type === "file");
+      assert.deepEqual(received, images.map(() => ({ type: "file", mediaType: "image/png", data: { type: "data", data } })));
       return sse(
         { type: "text-delta", delta: "received images" },
         { type: "finish", finishReason: { unified: "stop", raw: "stop" } },

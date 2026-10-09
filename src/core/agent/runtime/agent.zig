@@ -1,6 +1,8 @@
 const std = @import("std");
 const types = @import("../../shared/types.zig");
 const checkpoint_codec = @import("checkpoint.zig");
+const runtime_prompt_context = @import("prompt_context.zig");
+const debug_trace = @import("../../shared/debug_trace.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -10,6 +12,15 @@ pub const Agent = struct {
     history: std.ArrayList(types.HistoryTurn) = .empty,
     turn_usage: types.Usage = .{},
     fresh: bool = true,
+    /// Last exact provider input-token usage paired with the measured request
+    /// it came from. Carried across turns so the first request of a new turn
+    /// calibrates from real usage instead of the raw serialization estimate.
+    /// Plain value state: no allocation, no deinit work.
+    request_token_calibration: ?RequestTokenCalibrationState = null,
+    /// Estimated tokens of the last request's instructions and tool
+    /// definitions, which compaction cannot shrink. Manual compaction sizes
+    /// its result with it.
+    request_fixed_tokens: ?usize = null,
 
     pub fn deinit(self: *Agent, alloc: Allocator) void {
         self.clearHistory(alloc);
@@ -22,15 +33,20 @@ pub const Agent = struct {
         self.turn_usage = .{};
     }
 
-    pub fn checkpoint(self: *const Agent, alloc: Allocator) checkpoint_codec.Error![]u8 {
-        return checkpoint_codec.encode(alloc, self.history.items, self.turn_usage);
+    /// The history and usage as checkpoint bytes, recording `meta` about the
+    /// agent that saves them. Caller owns the bytes.
+    pub fn checkpoint(self: *const Agent, alloc: Allocator, meta: checkpoint_codec.Meta) checkpoint_codec.Error![]u8 {
+        return checkpoint_codec.encode(alloc, self.history.items, self.turn_usage, meta);
     }
 
+    /// Restores `bytes` into this fresh agent. Returns what the checkpoint
+    /// recorded about the agent that saved it, owned by `alloc`
+    /// (`Meta.free`).
     pub fn restoreCheckpoint(
         self: *Agent,
         alloc: Allocator,
         bytes: []const u8,
-    ) (checkpoint_codec.Error || error{AgentNotFresh})!void {
+    ) (checkpoint_codec.Error || error{AgentNotFresh})!checkpoint_codec.Meta {
         if (!self.fresh or self.history.items.len != 0) {
             return error.AgentNotFresh;
         }
@@ -43,6 +59,9 @@ pub const Agent = struct {
         previous.deinit(alloc);
         self.turn_usage = decoded.usage;
         self.fresh = false;
+        const meta = decoded.meta;
+        decoded.meta = .{};
+        return meta;
     }
 
     pub fn observeUsage(self: *Agent, usage: types.Usage) void {
@@ -67,6 +86,26 @@ pub const Agent = struct {
     pub fn clearHistory(self: *Agent, alloc: Allocator) void {
         for (self.history.items) |turn| types.freeHistoryTurn(alloc, turn);
         self.history.clearRetainingCapacity();
+        // Cleared history no longer resembles the calibrated request.
+        self.request_token_calibration = null;
+    }
+
+    /// Records the calibration for later turns. An empty or oversized model
+    /// id clears instead of storing a value that could never be matched.
+    pub fn storeRequestTokenCalibration(
+        self: *Agent,
+        model: []const u8,
+        cost: runtime_prompt_context.RequestTokenCalibration,
+    ) void {
+        if (model.len == 0 or model.len > max_request_calibration_model_bytes) {
+            if (self.request_token_calibration != null)
+                debug_trace.logf("agent", "dropping request token calibration: unmatchable model id len={d}", .{model.len});
+            self.request_token_calibration = null;
+            return;
+        }
+        var state = RequestTokenCalibrationState{ .model_len = model.len, .cost = cost };
+        @memcpy(state.model[0..model.len], model);
+        self.request_token_calibration = state;
     }
 
     pub fn snapshotHistory(
@@ -105,13 +144,63 @@ pub const Agent = struct {
         self.history = replacement;
         for (previous.items) |turn| types.freeHistoryTurn(alloc, turn);
         previous.deinit(alloc);
+        // Replaced history no longer resembles the calibrated request.
+        self.request_token_calibration = null;
         self.fresh = false;
+    }
+};
+
+const max_request_calibration_model_bytes: usize = 128;
+
+pub const RequestTokenCalibrationState = struct {
+    model: [max_request_calibration_model_bytes]u8 = undefined,
+    model_len: usize = 0,
+    cost: runtime_prompt_context.RequestTokenCalibration = .{
+        .request = .{ .serialized_bytes = 0, .text_tokens = 0, .estimated_input_tokens = 0 },
+        .exact_input_tokens = 0,
+    },
+
+    pub fn modelSlice(self: *const RequestTokenCalibrationState) []const u8 {
+        return self.model[0..self.model_len];
     }
 };
 
 fn addOptional(total: *?u64, value: ?u64) void {
     const amount = value orelse return;
     total.* = std.math.add(u64, total.* orelse 0, amount) catch std.math.maxInt(u64);
+}
+
+test "Agent request token calibration survives startTurn and dies with cleared history" {
+    const alloc = std.testing.allocator;
+    var agent: Agent = .{};
+    defer agent.deinit(alloc);
+
+    const cost = runtime_prompt_context.RequestTokenCalibration{
+        .request = .{ .serialized_bytes = 400, .text_tokens = 100, .estimated_input_tokens = 100 },
+        .exact_input_tokens = 90,
+    };
+    agent.storeRequestTokenCalibration("fixture/model", cost);
+    try std.testing.expect(agent.request_token_calibration != null);
+    try std.testing.expectEqualStrings("fixture/model", agent.request_token_calibration.?.modelSlice());
+    try std.testing.expectEqual(@as(usize, 90), agent.request_token_calibration.?.cost.exact_input_tokens);
+
+    // startTurn must not reset the calibration: the next turn's first request
+    // is exactly what it exists for.
+    agent.startTurn();
+    try std.testing.expect(agent.request_token_calibration != null);
+
+    // An unmatchable model id clears rather than stores.
+    agent.storeRequestTokenCalibration("x" ** (max_request_calibration_model_bytes + 1), cost);
+    try std.testing.expectEqual(@as(?RequestTokenCalibrationState, null), agent.request_token_calibration);
+
+    agent.storeRequestTokenCalibration("fixture/model", cost);
+    agent.clearHistory(alloc);
+    try std.testing.expectEqual(@as(?RequestTokenCalibrationState, null), agent.request_token_calibration);
+
+    // A replaced history invalidates the calibration too.
+    agent.storeRequestTokenCalibration("fixture/model", cost);
+    try agent.restoreHistory(alloc, &.{});
+    try std.testing.expectEqual(@as(?RequestTokenCalibrationState, null), agent.request_token_calibration);
 }
 
 test "Agent startTurn consumes freshness and resets usage" {
@@ -171,12 +260,12 @@ test "Agent checkpoint restores only into a fresh owner" {
         .user = .{ .text = @constCast("before") },
         .assistant = @constCast("after"),
     } });
-    const bytes = try source.checkpoint(alloc);
+    const bytes = try source.checkpoint(alloc, .{});
     defer alloc.free(bytes);
 
     var restored: Agent = .{};
     defer restored.deinit(alloc);
-    try restored.restoreCheckpoint(alloc, bytes);
+    (try restored.restoreCheckpoint(alloc, bytes)).free(alloc);
     try std.testing.expectEqualStrings("before", restored.history.items[0].assistant.user.text);
     try std.testing.expectError(error.AgentNotFresh, restored.restoreCheckpoint(alloc, bytes));
 }
@@ -185,11 +274,11 @@ test "Agent checkpoint restore consumes freshness for empty history" {
     const alloc = std.testing.allocator;
     var source: Agent = .{};
     defer source.deinit(alloc);
-    const bytes = try source.checkpoint(alloc);
+    const bytes = try source.checkpoint(alloc, .{});
     defer alloc.free(bytes);
 
     var restored: Agent = .{};
     defer restored.deinit(alloc);
-    try restored.restoreCheckpoint(alloc, bytes);
+    (try restored.restoreCheckpoint(alloc, bytes)).free(alloc);
     try std.testing.expectError(error.AgentNotFresh, restored.restoreCheckpoint(alloc, bytes));
 }
