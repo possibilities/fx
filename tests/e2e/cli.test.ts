@@ -1084,7 +1084,7 @@ describe("cli: status", () => {
   );
 
   test(
-    "fx status reports the effort a new session starts with, workspace override first",
+    "fx status reports the effort a new session starts with, environment then workspace precedence",
     async () => {
       const root = mkdtempSync(join(tmpdir(), "fx-e2e-status-effort-"));
       try {
@@ -1094,7 +1094,7 @@ describe("cli: status", () => {
         mkdirSync(join(home, ".fx"), { recursive: true, mode: 0o700 });
         mkdirSync(workspace);
         mkdirSync(elsewhere);
-        const env = { ...NO_GATEWAY_AUTH, HOME: home };
+        const env = { ...NO_GATEWAY_AUTH, HOME: home, FX_EFFORT: undefined };
 
         const unset = await runFx(["status", "--json"], { cwd: realpathSync(elsewhere), env });
         expect(unset.code).toBe(0);
@@ -1115,6 +1115,25 @@ describe("cli: status", () => {
         expect(JSON.parse(inWorkspace.stdout.trim()).effort).toBe("low");
         expect(JSON.parse(global.stdout.trim()).effort).toBe("xhigh");
         expect(text.stdout).toContain("[status] effort=xhigh\n");
+        for (const cwd of [workspace, elsewhere]) {
+          for (const args of [["status", "--json"], ["status"]]) {
+            const overridden = await runFx(args, {
+              cwd: realpathSync(cwd),
+              env: { ...env, FX_EFFORT: "high" },
+            });
+            expect(overridden.code).toBe(0);
+            expect(overridden.stderr).toBe("");
+            if (args.includes("--json")) {
+              expect(JSON.parse(overridden.stdout.trim()).effort).toBe("high");
+            } else {
+              expect(overridden.stdout).toContain("[status] effort=high\n");
+            }
+          }
+        }
+        expect(JSON.parse(readFileSync(join(home, ".fx", "settings.json"), "utf8"))).toEqual({
+          effort: "xhigh",
+          workspaces: { [realpathSync(workspace)]: { effort: "low" } },
+        });
       } finally {
         rmSync(root, { recursive: true, force: true });
       }

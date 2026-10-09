@@ -683,7 +683,7 @@ pub fn loadStartupStatusWithAuthMode(
         .selected_model = selected_model.value,
         .owned_selected_model = selected_model.owned,
         .model_origin = ModelOrigin.of(settings, configured_selection.provider, run_model),
-        .effort = settings.effort orelse .auto,
+        .effort = config_runtime.resolveEffort(settings.effort),
         .ultrafast_mode = detailed.ultrafast_mode_env_override orelse (settings.ultrafast_mode orelse false),
         .auth = auth_status,
         .permission_mode = loadPermissionMode(settings.permission_mode),
