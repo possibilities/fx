@@ -159,7 +159,7 @@ const envOverrides = {
   FX_E2E_OPENAI_CODEX_MODELS_URL: `${baseUrl}/chatgpt/models`,
   FX_E2E_OPENAI_CODEX_RESPONSES_URL: `${baseUrl}/chatgpt/responses`,
   FX_E2E_GATEWAY_MODELS_URL: `${baseUrl}/gateway/models`,
-  FX_E2E_GATEWAY_CATALOG_TIMEOUT_MS: "40",
+  FX_E2E_GATEWAY_CATALOG_TIMEOUT_MS: "150",
 };
 // Bun keeps later process.env assignments separate from libc getenv, which
 // the native OAuth transport reads. Start this fixture's worker with its
@@ -262,6 +262,7 @@ try {
     onEvent(event) { events.push(event); },
   });
   const providerConfig = agent.configOptions.find((option) => option.id === "provider");
+  assert.equal("session" in agent, false, "provider authorization must initialize one public Agent");
   assert.deepEqual(providerConfig.options.map((option) => option.value), ["gateway", "codex"]);
   assert.equal(await collectTurn(agent, "use Codex"), "codex 1");
   await agent.setConfig({ provider: "gateway" });
@@ -383,7 +384,7 @@ try {
   assert.ok(Date.now() - startedAt < 500, "close must abort a stalled Gateway catalog fetch");
   closingAgent = null;
   stallGatewayModels = false;
-  process.env.FX_E2E_GATEWAY_CATALOG_TIMEOUT_MS = "40";
+  process.env.FX_E2E_GATEWAY_CATALOG_TIMEOUT_MS = "150";
 
   const profileHome = join(root, "profile-home");
   mkdirSync(join(profileHome, ".fx"), { recursive: true, mode: 0o700 });
@@ -541,6 +542,14 @@ try {
   }
 
   console.log("native Codex core passed: stores, refresh CAS, timeout poisoning, home isolation, catalog, streaming, switching, and profile opt-in");
+} catch (error) {
+  console.error("native Codex fixture progress", {
+    requests: requests.map(({ method, path }) => ({ method, path })),
+    tokenCalls,
+    codexCalls,
+    gatewayCalls,
+  });
+  throw error;
 } finally {
   if (agent) await agent.close().catch(() => {});
   for (const [key, value] of Object.entries(originalEnv)) {

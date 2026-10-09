@@ -5,6 +5,7 @@ const app_session_runtime = @import("app_session_runtime.zig");
 const auto_upgrade = @import("../upgrade/auto_upgrade.zig");
 const acp_runner = @import("../cli/acp_runner.zig");
 const cli_surface = @import("../cli/cli_surface.zig");
+const config_runtime = @import("../config/config_runtime.zig");
 const credentials = @import("../auth/credentials.zig");
 const process_provider = @import("../execution/process_provider.zig");
 const gateway_provider = @import("../gateway/gateway_provider.zig");
@@ -12,8 +13,8 @@ const provider_set = @import("../gateway/provider_set.zig");
 const host = @import("../hosts/host.zig");
 const host_target = @import("../hosts/target.zig");
 const io_mod = @import("../shared/io.zig");
-const config_runtime = @import("../config/config_runtime.zig");
 const prompt_policy = @import("../config/prompt_policy.zig");
+const session_adapter = @import("../session/session_adapter.zig");
 const skill_contract = @import("../skills/skill_contract.zig");
 const command_specs = @import("../slash_commands/command_specs.zig");
 const context_contract = @import("../workspace/context_contract.zig");
@@ -106,14 +107,6 @@ pub const Config = struct {
     acp_runner: acp_runner.Runner,
 };
 
-pub fn run(comptime App: type, alloc: Allocator, args: []const [:0]const u8, cfg: Config) !void {
-    const outcome = try runWithDeps(App, alloc, args, cfg, .{});
-    switch (outcome) {
-        .returned => return,
-        .exit => |code| std.process.exit(code),
-    }
-}
-
 pub const RunOutcome = union(enum) {
     returned,
     exit: u8,
@@ -165,7 +158,8 @@ fn runWithDeps(comptime App: type, alloc: Allocator, args: []const [:0]const u8,
         .exit => |code| return .{ .exit = code },
     }
 
-    return runInteractiveWithDeps(App, false, alloc, &launch, cfg.auth_mode, deps);
+    var app: App = undefined;
+    return runInteractiveWithDeps(App, false, &app, alloc, &launch, cfg.auth_mode, deps);
 }
 
 pub fn runBeforeInteractive(alloc: Allocator, args: []const [:0]const u8, cfg: Config) !BeforeInteractiveResult {
@@ -215,23 +209,27 @@ fn benchEnabled() bool {
     return io_mod.getenv("FX_BENCH") != null;
 }
 
-pub fn runInteractive(comptime App: type, alloc: Allocator, launch: *cli_surface.InteractiveLaunch, auth_mode: credentials.AuthMode) !RunOutcome {
-    return runInteractiveWithDeps(App, false, alloc, launch, auth_mode, .{});
+/// `app` is uninitialized storage that must stay valid until the process
+/// exits: interactive shutdown stops background threads without joining them,
+/// so they can still reach the app after this returns.
+pub fn runInteractive(comptime App: type, app: *App, alloc: Allocator, launch: *cli_surface.InteractiveLaunch, auth_mode: credentials.AuthMode) !RunOutcome {
+    return runInteractiveWithDeps(App, false, app, alloc, launch, auth_mode, .{});
 }
 
 /// Runs the interactive product without native CLI dispatch, process replacement,
 /// or a worker thread. Single-threaded hosts must arrange cooperative prompt work.
 pub fn runInteractiveCooperative(comptime App: type, alloc: Allocator, launch: *cli_surface.InteractiveLaunch, auth_mode: credentials.AuthMode) !RunOutcome {
-    return runInteractiveWithDeps(App, true, alloc, launch, auth_mode, .{});
+    var app: App = undefined;
+    return runInteractiveWithDeps(App, true, &app, alloc, launch, auth_mode, .{});
 }
 
 fn unavailableCliDispatch(_: ?*anyopaque, _: Allocator, _: []const [:0]const u8, _: cli_surface.Config) anyerror!cli_surface.RunResult {
     return error.UnknownCliCommand;
 }
 
-fn runInteractiveWithDeps(comptime App: type, comptime cooperative: bool, alloc: Allocator, launch: *cli_surface.InteractiveLaunch, auth_mode: credentials.AuthMode, deps: RunDeps) !RunOutcome {
+fn runInteractiveWithDeps(comptime App: type, comptime cooperative: bool, app: *App, alloc: Allocator, launch: *cli_surface.InteractiveLaunch, auth_mode: credentials.AuthMode, deps: RunDeps) !RunOutcome {
     const resume_requested = launch.requested_resume != null;
-    var app = App.init(alloc, launch, auth_mode) catch |err| {
+    app.* = App.init(alloc, launch, auth_mode) catch |err| {
         switch (err) {
             error.NotATerminal => {
                 writeStderr(deps, "fx requires an interactive terminal (TTY).\n");
@@ -255,6 +253,12 @@ fn runInteractiveWithDeps(comptime App: type, comptime cooperative: bool, alloc:
             },
             error.NoSavedSessions => {
                 writeStderr(deps, "fx: no saved sessions for this workspace.\n");
+                return .{ .exit = 1 };
+            },
+            error.NoReadableSessions => {
+                // The unreadable sessions can belong to any workspace, so only
+                // the absence of a readable one is tied to this workspace.
+                writeStderr(deps, "fx: no readable saved sessions for this workspace, and some saved sessions are unreadable; run `fx doctor` for recovery guidance.\n");
                 return .{ .exit = 1 };
             },
             error.SessionNotFound => {
@@ -288,6 +292,13 @@ fn runInteractiveWithDeps(comptime App: type, comptime cooperative: bool, alloc:
                 return .{ .exit = 1 };
             },
             else => {
+                // v2 names a storage fault (D29); v1 reports it as it always has.
+                if (session_adapter.enabled(launch.modifiers.sessions_v2)) {
+                    if (v2StorageFaultMessage(err)) |message| {
+                        writeStderr(deps, message);
+                        return .{ .exit = 1 };
+                    }
+                }
                 reportUnexpectedInteractiveError(deps, err);
                 return err;
             },
@@ -298,7 +309,7 @@ fn runInteractiveWithDeps(comptime App: type, comptime cooperative: bool, alloc:
         if (comptime cooperative) {
             app.deinit();
         } else {
-            var shutdown = app.deinitWithResumeHandoff();
+            var shutdown = app.shutdownForProcessExit();
             defer shutdown.deinit(alloc);
             if (shutdown.failure) |err| reportShutdownFailure(deps, err);
         }
@@ -317,12 +328,13 @@ fn runInteractiveWithDeps(comptime App: type, comptime cooperative: bool, alloc:
         if (@hasDecl(App, "startAutoUpgrade")) app.startAutoUpgrade();
         if (@hasDecl(App, "startFileIndex")) app.startFileIndex();
         if (@hasDecl(App, "startWorkControl")) try app.startWorkControl();
-        startWorkerThread(App, &app, deps) catch |err| {
+        startWorkerThread(App, app, deps) catch |err| {
             app.releaseTerminal();
             reportUnexpectedInteractiveError(deps, err);
             return err;
         };
         app.startModelCacheWarmup();
+        if (@hasDecl(App, "startSessionCatalogPreload")) app.startSessionCatalogPreload();
     }
 
     app.run() catch |err| {
@@ -332,7 +344,7 @@ fn runInteractiveWithDeps(comptime App: type, comptime cooperative: bool, alloc:
             if (comptime cooperative) {
                 app.deinit();
             } else {
-                var shutdown = app.deinitWithResumeHandoff();
+                var shutdown = app.shutdownForProcessExit();
                 defer shutdown.deinit(alloc);
                 if (shutdown.failure) |failure| {
                     reportShutdownFailure(deps, failure);
@@ -353,7 +365,7 @@ fn runInteractiveWithDeps(comptime App: type, comptime cooperative: bool, alloc:
     const relaunch_skill_roots = try cloneInvocationSkillRootsForRelaunch(
         App,
         alloc,
-        &app,
+        app,
         relaunch_request != null,
     );
     defer freeInvocationSkillRoots(alloc, relaunch_skill_roots);
@@ -371,7 +383,7 @@ fn runInteractiveWithDeps(comptime App: type, comptime cooperative: bool, alloc:
     const shutdown: app_session_runtime.ShutdownOutcome = if (comptime cooperative) blk: {
         app.deinit();
         break :blk .{};
-    } else app.deinitWithResumeHandoff();
+    } else app.shutdownForProcessExit();
     const handoff_value = shutdown.handoff;
     if (shutdown.failure) |err| {
         if (handoff_value) |value| {
@@ -389,6 +401,7 @@ fn runInteractiveWithDeps(comptime App: type, comptime cooperative: bool, alloc:
                 alloc,
                 launch,
                 handoff.session_id,
+                handoff.sessions_v2,
                 relaunch_skill_roots,
             );
             defer relaunch_args.deinit(alloc);
@@ -426,9 +439,10 @@ fn runInteractiveWithDeps(comptime App: type, comptime cooperative: bool, alloc:
                 &message_buffer,
                 handoff.session_id,
                 resume_handoff_columns,
+                handoff.sessions_v2,
             )
         else
-            formatResumeHandoff(&message_buffer, handoff.session_id)) catch return .returned;
+            formatResumeHandoff(&message_buffer, handoff.session_id, handoff.sessions_v2)) catch return .returned;
         deps.write_stdout(deps.stdout_ctx, message) catch {};
     }
     return .returned;
@@ -457,11 +471,35 @@ const UpgradeRelaunchArguments = struct {
         alloc: Allocator,
         launch: *const cli_surface.InteractiveLaunch,
         session_id: []const u8,
+        sessions_v2: bool,
         invocation_skill_roots: []const []const u8,
     ) !UpgradeRelaunchArguments {
         var result = UpgradeRelaunchArguments{};
         errdefer result.deinit(alloc);
 
+        if (sessions_v2) try result.append(alloc, cli_surface.sessions_v2_arg);
+        if (launch.modifiers.provider_override) |*provider| {
+            try result.appendPair(alloc, "--provider", provider.label());
+        }
+        if (launch.modifiers.model_override) |model| {
+            try result.appendPair(alloc, "--model", model);
+        }
+        if (launch.modifiers.effort_override) |*effort| {
+            try result.appendPair(alloc, "--effort", effort.label());
+        }
+        if (launch.modifiers.fast_override) |fast| {
+            try result.append(alloc, if (fast) "--fast" else "--no-fast");
+        }
+        if (launch.modifiers.ultrafast_override) |ultrafast| {
+            try result.append(alloc, if (ultrafast) "--ultrafast" else "--no-ultrafast");
+        }
+        if (launch.modifiers.provider_order_override) |order| {
+            try result.append(alloc, "--provider-order");
+            try result.appendOwned(alloc, try std.mem.join(alloc, ",", order));
+        }
+        if (launch.modifiers.provider_strict_override) |strict| {
+            try result.append(alloc, if (strict) "--provider-strict" else "--no-provider-strict");
+        }
         for (launch.modifiers.context_limit_overrides) |override| {
             try result.append(alloc, "--context-limit");
             const rendered = switch (override.value) {
@@ -750,16 +788,28 @@ fn writeRealStdout(_: ?*anyopaque, text: []const u8) !void {
     try std.Io.File.stdout().writeStreamingAll(io_mod.getIo(), text);
 }
 
-fn formatResumeHandoff(buffer: []u8, session_id: []const u8) ![]const u8 {
+fn formatResumeHandoff(buffer: []u8, session_id: []const u8, sessions_v2: bool) ![]const u8 {
     return std.fmt.bufPrint(
         buffer,
-        "Continue session with: fx --resume {s}\n",
-        .{session_id},
+        "Continue session with: fx {s}--resume {s}\n",
+        .{ if (sessions_v2) "--sessions-v2 " else "", session_id },
     );
 }
 
 fn formatUnexpectedError(buffer: []u8, err: anyerror) ![]const u8 {
-    return std.fmt.bufPrint(buffer, "fx: {s}\n", .{@errorName(err)});
+    return std.fmt.bufPrint(buffer, "fx: {s}\n", .{config_runtime.modelNotSelectedMessage(err) orelse @errorName(err)});
+}
+
+/// A v2 session that cannot be written at startup, in one sentence; null
+/// for any other error.
+fn v2StorageFaultMessage(err: anyerror) ?[]const u8 {
+    return switch (err) {
+        error.AccessDenied => "fx: this session cannot be opened for writing: permission denied. Check the permissions under ~/.fx/sessions/v2, then resume again.\n",
+        error.ReadOnlyFileSystem => "fx: this session cannot be opened for writing: the disk is read-only.\n",
+        error.NoSpaceLeft => "fx: this session cannot be saved: the disk is full. Free some space, then resume again.\n",
+        error.FileTooBig => "fx: this session cannot be saved: a file-size limit was reached.\n",
+        else => null,
+    };
 }
 
 fn reportUnexpectedInteractiveError(deps: RunDeps, err: anyerror) void {
@@ -774,7 +824,7 @@ fn writeStderr(deps: RunDeps, text: []const u8) void {
 
 fn tryWriteErrorMessage(deps: RunDeps, err: anyerror) void {
     writeStderr(deps, "fx: ");
-    writeStderr(deps, @errorName(err));
+    writeStderr(deps, config_runtime.modelNotSelectedMessage(err) orelse @errorName(err));
     writeStderr(deps, "\n");
 }
 
@@ -907,6 +957,7 @@ const TestCapture = struct {
     record_stderr_event: bool = false,
     record_stdout_event: bool = false,
     resume_handoff_id: ?[]const u8 = null,
+    resume_handoff_sessions_v2: bool = false,
     shutdown_failure: ?anyerror = null,
     raise_sigint_during_deinit: bool = false,
     upgrade_relaunch_path: ?[]const u8 = null,
@@ -1047,13 +1098,13 @@ const TestApp = struct {
         self.* = undefined;
     }
 
-    fn deinitWithResumeHandoff(self: *TestApp) app_session_runtime.ShutdownOutcome {
+    fn shutdownForProcessExit(self: *TestApp) app_session_runtime.ShutdownOutcome {
         const handoff: ?app_session_runtime.ResumeHandoff = if (active_capture.?.resume_handoff_id) |id| blk: {
             const session_id = std.testing.allocator.dupe(u8, id) catch {
                 self.deinit();
                 return .{ .failure = error.OutOfMemory };
             };
-            break :blk .{ .session_id = session_id };
+            break :blk .{ .session_id = session_id, .sessions_v2 = active_capture.?.resume_handoff_sessions_v2 };
         } else null;
         if (active_capture.?.raise_sigint_during_deinit) {
             _ = std.c.raise(std.posix.SIG.INT);
@@ -1284,6 +1335,26 @@ test "app entry bounds graceful-exit SIGINT suppression to handoff lifetime" {
     try std.testing.expectEqual(@as(usize, 1), test_sigint_count.load(.seq_cst));
 }
 
+test "a v2 handoff relaunches and hints with --sessions-v2" {
+    const alloc = std.testing.allocator;
+    var capture = TestCapture.init(.{ .interactive = .{} });
+    defer capture.deinit();
+    capture.resume_handoff_id = "session-123";
+    capture.resume_handoff_sessions_v2 = true;
+    capture.upgrade_relaunch_path = "/tmp/fx-upgraded";
+
+    const outcome = try runWithDeps(TestApp, alloc, &.{}, testConfig(), capture.deps());
+
+    try std.testing.expectEqual(@as(u8, 1), outcome.exit);
+    try std.testing.expectEqual(@as(usize, 5), capture.replace_arg_count);
+    try std.testing.expectEqualStrings("/tmp/fx-upgraded", capture.replaceArg(0));
+    try std.testing.expectEqualStrings("--sessions-v2", capture.replaceArg(1));
+    try std.testing.expectEqualStrings("resume", capture.replaceArg(2));
+    try std.testing.expectEqualStrings("session-123", capture.replaceArg(3));
+    try std.testing.expectEqualStrings("--upgrade-relaunch", capture.replaceArg(4));
+    try std.testing.expect(std.mem.find(u8, capture.stderr.written(), "fx --sessions-v2 resume session-123") != null);
+}
+
 test "app entry relaunches only after teardown with the validated handoff" {
     const alloc = std.testing.allocator;
     var capture = TestCapture.init(.{ .interactive = .{} });
@@ -1364,8 +1435,18 @@ test "app entry preserves every launch control across an upgrade relaunch" {
     const history_home = try alloc.dupe(u8, "/tmp/fx-history");
     const mcp_config_path = try alloc.dupe(u8, "/tmp/fx-shape/.fx/mcp.json");
     const permission_path = try alloc.dupe(u8, "/tmp/fx-policy.json");
+    const provider_order = try alloc.alloc([]const u8, 2);
+    provider_order[0] = try alloc.dupe(u8, "vertex");
+    provider_order[1] = try alloc.dupe(u8, "bedrock");
     var capture = TestCapture.init(.{ .interactive = .{
         .modifiers = .{
+            .provider_override = .gateway,
+            .model_override = try alloc.dupe(u8, "provider/model"),
+            .effort_override = @import("../shared/types.zig").ReasoningEffort.literal("high"),
+            .fast_override = false,
+            .ultrafast_override = true,
+            .provider_order_override = provider_order,
+            .provider_strict_override = true,
             .context_limit_overrides = overrides,
             .additional_directories = directories,
             .saved_directories_suppressed = true,
@@ -1405,6 +1486,17 @@ test "app entry preserves every launch control across an upgrade relaunch" {
     try std.testing.expectEqual(@as(u8, 1), outcome.exit);
     const expected = [_][]const u8{
         "/tmp/fx-upgraded",
+        "--provider",
+        "gateway",
+        "--model",
+        "provider/model",
+        "--effort",
+        "high",
+        "--no-fast",
+        "--ultrafast",
+        "--provider-order",
+        "vertex,bedrock",
+        "--provider-strict",
         "--context-limit",
         "skill_chunk_bytes=4096",
         "--add-dir",
@@ -1448,7 +1540,9 @@ test "app entry preserves every launch control across an upgrade relaunch" {
     }
     try std.testing.expectEqualStrings(
         "fx: upgrade installed, but relaunch failed: InvalidExe\n" ++
-            "Continue session with: fx --context-limit skill_chunk_bytes=4096" ++
+            "Continue session with: fx --provider gateway --model provider/model" ++
+            " --effort high --no-fast --ultrafast --provider-order vertex,bedrock --provider-strict" ++
+            " --context-limit skill_chunk_bytes=4096" ++
             " --add-dir '/tmp/fx extra' --no-additional-dirs" ++
             " --system-prompt-file '/tmp/base prompt.md'" ++
             " --append-system-prompt-file /tmp/first-extra.md" ++
@@ -1766,13 +1860,22 @@ test "app entry maps noninteractive terminal startup to exit one" {
 
 test "app entry maps missing saved sessions to exit one" {
     const alloc = std.testing.allocator;
-    var capture = TestCapture.init(.{ .interactive = .{} });
-    defer capture.deinit();
-    capture.init_error = error.NoSavedSessions;
-    const outcome = try runWithDeps(TestApp, alloc, &.{}, testConfig(), capture.deps());
+    const Case = struct { err: anyerror, stderr: []const u8 };
+    for ([_]Case{
+        .{ .err = error.NoSavedSessions, .stderr = "fx: no saved sessions for this workspace.\n" },
+        .{
+            .err = error.NoReadableSessions,
+            .stderr = "fx: no readable saved sessions for this workspace, and some saved sessions are unreadable; run `fx doctor` for recovery guidance.\n",
+        },
+    }) |case| {
+        var capture = TestCapture.init(.{ .interactive = .{} });
+        defer capture.deinit();
+        capture.init_error = case.err;
+        const outcome = try runWithDeps(TestApp, alloc, &.{}, testConfig(), capture.deps());
 
-    try std.testing.expectEqual(@as(u8, 1), outcome.exit);
-    try std.testing.expectEqualStrings("fx: no saved sessions for this workspace.\n", capture.stderr.written());
+        try std.testing.expectEqual(@as(u8, 1), outcome.exit);
+        try std.testing.expectEqualStrings(case.stderr, capture.stderr.written());
+    }
 }
 
 test "app entry maps unavailable session state to one expected startup failure" {
@@ -1816,6 +1919,38 @@ test "app entry maps unavailable session state to one expected startup failure" 
         try std.testing.expectEqual(@as(usize, 1), capture.stderr_calls);
         try expectEvents(&.{"init:none"});
     }
+}
+
+test "app entry names a v2 storage fault at startup, and v1 keeps the bare error" {
+    const alloc = std.testing.allocator;
+    const cases = [_]struct {
+        init_error: anyerror,
+        message: []const u8,
+    }{
+        .{ .init_error = error.AccessDenied, .message = "fx: this session cannot be opened for writing: permission denied. Check the permissions under ~/.fx/sessions/v2, then resume again.\n" },
+        .{ .init_error = error.ReadOnlyFileSystem, .message = "fx: this session cannot be opened for writing: the disk is read-only.\n" },
+        .{ .init_error = error.NoSpaceLeft, .message = "fx: this session cannot be saved: the disk is full. Free some space, then resume again.\n" },
+        .{ .init_error = error.FileTooBig, .message = "fx: this session cannot be saved: a file-size limit was reached.\n" },
+    };
+    for (cases) |case| {
+        var capture = TestCapture.init(.{ .interactive = .{ .modifiers = .{ .sessions_v2 = true } } });
+        defer capture.deinit();
+        capture.init_error = case.init_error;
+        capture.fail_unexpected_format = true;
+
+        const outcome = try runWithDeps(TestApp, alloc, &.{}, testConfig(), capture.deps());
+
+        try std.testing.expectEqual(@as(u8, 1), outcome.exit);
+        try std.testing.expectEqualStrings(case.message, capture.stderr.written());
+    }
+
+    // Without the flag, v1 reports the bare error name as before.
+    if (session_adapter.enabled(false)) return error.SkipZigTest;
+    var capture = TestCapture.init(.{ .interactive = .{} });
+    defer capture.deinit();
+    capture.init_error = error.AccessDenied;
+    try std.testing.expectError(error.AccessDenied, runWithDeps(TestApp, alloc, &.{}, testConfig(), capture.deps()));
+    try std.testing.expectEqualStrings("fx: AccessDenied\n", capture.stderr.written());
 }
 
 test "app entry returns failure when terminal closure cannot save the session" {

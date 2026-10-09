@@ -65,6 +65,7 @@ pub fn build(b: *std.Build) void {
         }),
     });
     exe.root_module.addImport("build_options", build_options.createModule());
+    const session_manager = addSessionManager(b, exe.root_module, target, optimize, null);
 
     b.installArtifact(exe);
 
@@ -86,9 +87,19 @@ pub fn build(b: *std.Build) void {
         "FX_TEST_PRODUCT_EXE",
         b.getInstallPath(.bin, "fx"),
     );
+    // The session boundary test walks the source tree from here.
+    run_exe_tests.setEnvironmentVariable("FX_TEST_SOURCE_ROOT", b.pathFromRoot("src"));
+
+    // The session manager's own tests, as fx compiles it (no hooks).
+    const session_manager_tests = b.addTest(.{ .root_module = session_manager });
+
+    const run_session_manager_tests = b.addRunArtifact(session_manager_tests);
+    const session_manager_test_step = b.step("test-session-manager", "Run the session manager's tests");
+    session_manager_test_step.dependOn(&run_session_manager_tests.step);
 
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&run_exe_tests.step);
+    test_step.dependOn(&run_session_manager_tests.step);
 
     const fxnk_gate_module = b.createModule(.{
         .root_source_file = b.path("src/fxnk_gate_tests.zig"),
@@ -114,6 +125,7 @@ pub fn build(b: *std.Build) void {
     fxnk_gate_build_options.addOption([]const u8, "update_channel", @tagName(update_channel));
     fxnk_gate_build_options.addOption(WasmSurface, "wasm_surface", .none);
     fxnk_gate_module.addImport("build_options", fxnk_gate_build_options.createModule());
+    _ = addSessionManager(b, fxnk_gate_module, target, optimize, null);
     const fxnk_gate_tests = b.addTest(.{
         .root_module = fxnk_gate_module,
         .test_runner = .{
@@ -172,9 +184,9 @@ pub fn build(b: *std.Build) void {
             "ADE sequence advances through record_too_large and queue_full drops",
             "ADE feed refuses tool arguments that would break record framing",
             "ADE child records keep their captured parent across a main session change",
-            "child approval publishes its resolution before the child is released",
-            "parent prompt approval keeps exact child identity as the only answering surface",
-            "two pending child approvals each resolve exactly once with their own identity",
+            "relationship approval publishes its resolution before the child is released",
+            "production approval bridge keeps exact identity and first winner across both surfaces",
+            "two real pending approvals keep exact identity while each surface wins once",
             "lifecycle reducer carries attention through resolution and turn end",
             "lifecycle reducer ignores unmatched attention resolution",
             "lifecycle reducer keeps main and subagent states independent",
@@ -184,7 +196,7 @@ pub fn build(b: *std.Build) void {
             "strict authenticated request decoding preserves opaque turn ids",
             "request decoding rejects partial authority and extra parameters",
             "success responses carry correlated authoritative snapshots",
-            "interactive interrupt cancels without a native queue editor",
+            "hidden interrupt pauses queued work without opening the human editor",
             "ADE edited path reporting requires successful committed mutation results",
             "ADE terminal mutation completion requires exit-zero proof for durable starts",
             "ADE durable terminal start classifies the declared working directory",
@@ -509,6 +521,7 @@ fn addWasmArtifact(
     });
     if (surface == .core) wasm_exe.stack_size = 1024 * 1024;
     wasm_exe.root_module.addImport("build_options", wasm_options.createModule());
+    _ = addSessionManager(b, wasm_exe.root_module, wasm_target, .ReleaseSmall, true);
 
     const install_wasm = b.addInstallArtifact(wasm_exe, .{});
     const wasm_step = b.step(name ++ "-wasm", description);
@@ -546,6 +559,7 @@ fn addNapiArtifact(
         }),
     });
     lib.root_module.addImport("build_options", napi_options.createModule());
+    _ = addSessionManager(b, lib.root_module, target, .ReleaseSafe, null);
     const node_include = b.option(
         []const u8,
         "node-include-dir",
@@ -582,6 +596,32 @@ fn readGitCommit(b: *std.Build) []const u8 {
     if (code != 0) return "unknown";
     const trimmed = std.mem.trim(u8, out, " \t\r\n");
     return b.allocator.dupe(u8, trimmed) catch "unknown";
+}
+
+/// The session manager as its own module, rooted at its API. It imports
+/// nothing but its own options, and a file cannot belong to two modules, so
+/// fx reaches it only through `@import("session_manager")`.
+fn addSessionManager(
+    b: *std.Build,
+    importer: *std.Build.Module,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+    single_threaded: ?bool,
+) *std.Build.Module {
+    const options = b.addOptions();
+    options.addOption(bool, "hooks", false);
+    options.addOption([]const u8, "trace_dir", b.getInstallPath(.prefix, "session-manager-traces"));
+    options.addOption([]const u8, "src_dir", b.pathFromRoot("src/core/session_manager"));
+    const module = b.createModule(.{
+        .root_source_file = b.path("src/core/session_manager/api.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .single_threaded = single_threaded,
+    });
+    module.addImport("build_options", options.createModule());
+    importer.addImport("session_manager", module);
+    return module;
 }
 
 fn readAppVersion(b: *std.Build) []const u8 {

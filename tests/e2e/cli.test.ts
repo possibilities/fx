@@ -383,13 +383,12 @@ describe("cli: help", () => {
       expect(stdout).toContain("Set name=bytes|off; repeatable");
       expect(stdout).toContain("--add-dir <path>");
       expect(stdout).toContain("--no-native-tools");
-      expect(stdout).toContain("--permissions-file <path>");
-      expect(stdout).toContain("Replace configured rules for TUI or ACP");
-      expect(stdout).toContain("--no-project-instructions");
-      expect(stdout).toContain("--state-dir <path>");
+      expect(stdout).toContain("--tool <name>");
       expect(stdout).toContain("--skills-dir <path>");
       expect(stdout).toContain("--no-default-skills");
-      expect(stdout).toContain("--tool <name>");
+      expect(stdout).toContain("--no-project-instructions");
+      expect(stdout).toContain("--permissions-file <path>");
+      expect(stdout).toContain("Replace configured rules for TUI or ACP");
       expect(stdout).toContain("-c, --continue");
       expect(stdout).toContain("-r");
       expect(stdout).toContain("Open the saved-session picker");
@@ -426,27 +425,33 @@ describe("cli: help", () => {
 Run one noninteractive request
 
 Usage:
-  fx ask [--auto|--full-access] [--model <id>] [--effort <level>] [--fast|--no-fast] [--image PATH] [--system TEXT] [--json] [--quiet] [--prompt-permissions] [--no-save] [--no-color] [--resume <last|id>|--resume-id <id>] [--continue-recovery] [--] <prompt>
+  fx ask [--auto|--full-access] [--model <id>] [--effort <level>] [--fast|--no-fast] [--ultrafast|--no-ultrafast] [--provider-order <a,b,...>] [--provider-strict|--no-provider-strict] [--image PATH] [--system TEXT] [--json] [--quiet] [--prompt-permissions] [--no-save] [--sessions-v2] [--no-color] [--resume <last|id>|--resume-id <id>] [--continue-recovery] [--] <prompt>
 
 Options:
-  --auto                Automatically review unresolved permission requests
-  --full-access         Disable fx permission checks
-  --yolo                Alias for --full-access
-  --model <id>          Override the model for this request
-  --effort <level>      Override the reasoning effort for this request
-  --fast                Enable Fast mode for this request when the model supports it
-  --no-fast             Disable Fast mode for this request
-  --image PATH          Attach an image file; repeat for multiple images
-  --system TEXT         Replace the built-in system prompt for this request
-  --json                Emit machine-readable JSON instead of text
-  --quiet               Suppress assistant output
-  --prompt-permissions  Prompt for Y/N permission approval when stdin is a TTY
-  --no-save             Do not save the session; incompatible with --resume and --resume-id
-  --no-color            Render TTY output without colors or hyperlinks
-  --resume <last|id>    Continue the last session or a session by id
-  --resume-id <id>      Continue a session by exact id
-  --continue-recovery   Resume the paused model response in the selected session
-  --                    Treat every following argument as prompt text
+  --auto                      Automatically review unresolved permission requests
+  --full-access               Disable fx permission checks
+  --yolo                      Alias for --full-access
+  --model <id>                Override the model for this request
+  --effort <level>            Override the reasoning effort for this request
+  --fast                      Enable Fast mode for this request when the model supports it
+  --no-fast                   Disable Fast mode for this request
+  --ultrafast                 Request Ultra mode for this request when the model supports it
+  --no-ultrafast              Disable Ultra mode for this request
+  --provider-order <a,b,...>  Prefer these gateway providers in order for this request
+  --provider-strict           Restrict this request to only the providers in --provider-order
+  --no-provider-strict        Clear the provider restriction for this request
+  --image PATH                Attach an image file; repeat for multiple images
+  --system TEXT               Replace the built-in system prompt for this request
+  --json                      Emit machine-readable JSON instead of text
+  --quiet                     Suppress assistant output
+  --prompt-permissions        Prompt for Y/N permission approval when stdin is a TTY
+  --no-save                   Do not save the session; incompatible with --resume and --resume-id
+  --sessions-v2               Use the experimental v2 session store, also set by FX_SESSIONS_V2=1; its sessions resume only with it
+  --no-color                  Render TTY output without colors or hyperlinks
+  --resume <last|id>          Continue the last session or a session by id
+  --resume-id <id>            Continue a session by exact id
+  --continue-recovery         Resume the paused model response in the selected session
+  --                          Treat every following argument as prompt text
 
 The prompt may be passed as arguments or piped on stdin when no prompt args are given.
 TTY stdout uses the Minimal transcript presentation; redirected stdout emits raw assistant Markdown.
@@ -494,9 +499,11 @@ With --prompt-permissions, JSON and quiet requests may prompt on stderr only whe
         expect(r.code).toBe(0);
         expect(r.stderr).toBe("");
         expect(r.stdout).toContain(
-          "Usage:\n  fx acp [--model <id>] [--effort <name>] [--log-file <path>]",
+          "Usage:\n  fx acp [--model <id>] [--effort <name>] [--ultrafast|--no-ultrafast] [--log-file <path>]",
         );
         expect(r.stdout).toContain("--model <id>");
+        expect(r.stdout).toContain("--ultrafast");
+        expect(r.stdout).toContain("--no-ultrafast");
         expect(r.stdout).toContain("--effort <name>");
         expect(r.stdout).toContain("--log-file <path>");
       }
@@ -531,7 +538,7 @@ With --prompt-permissions, JSON and quiet requests may prompt on stderr only whe
         expect(result.code).toBe(1);
         expect(result.stdout).toBe("");
         expect(result.stderr).toBe(
-          "usage: fx acp [--model <id>] [--effort <name>] [--log-file <path>] [--no-acp-mcp]\n",
+          "usage: fx acp [--model <id>] [--effort <name>] [--ultrafast|--no-ultrafast] [--log-file <path>] [--no-acp-mcp]\n",
         );
       }
     },
@@ -1068,6 +1075,64 @@ describe("cli: status", () => {
           kind: "status",
           update_channel: "dev",
           build_channel: "stable",
+        });
+      } finally {
+        rmSync(root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "fx status reports the effort a new session starts with, environment then workspace precedence",
+    async () => {
+      const root = mkdtempSync(join(tmpdir(), "fx-e2e-status-effort-"));
+      try {
+        const home = join(root, "home");
+        const workspace = join(root, "workspace");
+        const elsewhere = join(root, "elsewhere");
+        mkdirSync(join(home, ".fx"), { recursive: true, mode: 0o700 });
+        mkdirSync(workspace);
+        mkdirSync(elsewhere);
+        const env = { ...NO_GATEWAY_AUTH, HOME: home, FX_EFFORT: undefined };
+
+        const unset = await runFx(["status", "--json"], { cwd: realpathSync(elsewhere), env });
+        expect(unset.code).toBe(0);
+        expect(JSON.parse(unset.stdout.trim()).effort).toBe("auto");
+
+        writeFileSync(
+          join(home, ".fx", "settings.json"),
+          JSON.stringify({ effort: "xhigh", workspaces: { [realpathSync(workspace)]: { effort: "low" } } }) + "\n",
+          { mode: 0o600 },
+        );
+        const inWorkspace = await runFx(["status", "--json"], { cwd: realpathSync(workspace), env });
+        const global = await runFx(["status", "--json"], { cwd: realpathSync(elsewhere), env });
+        const text = await runFx(["status"], { cwd: realpathSync(elsewhere), env });
+        for (const result of [inWorkspace, global, text]) {
+          expect(result.code).toBe(0);
+          expect(result.stderr).toBe("");
+        }
+        expect(JSON.parse(inWorkspace.stdout.trim()).effort).toBe("low");
+        expect(JSON.parse(global.stdout.trim()).effort).toBe("xhigh");
+        expect(text.stdout).toContain("[status] effort=xhigh\n");
+        for (const cwd of [workspace, elsewhere]) {
+          for (const args of [["status", "--json"], ["status"]]) {
+            const overridden = await runFx(args, {
+              cwd: realpathSync(cwd),
+              env: { ...env, FX_EFFORT: "high" },
+            });
+            expect(overridden.code).toBe(0);
+            expect(overridden.stderr).toBe("");
+            if (args.includes("--json")) {
+              expect(JSON.parse(overridden.stdout.trim()).effort).toBe("high");
+            } else {
+              expect(overridden.stdout).toContain("[status] effort=high\n");
+            }
+          }
+        }
+        expect(JSON.parse(readFileSync(join(home, ".fx", "settings.json"), "utf8"))).toEqual({
+          effort: "xhigh",
+          workspaces: { [realpathSync(workspace)]: { effort: "low" } },
         });
       } finally {
         rmSync(root, { recursive: true, force: true });
@@ -2805,7 +2870,7 @@ describe("cli: sessions", () => {
   );
 
   test(
-    "session lists use projections without opening unreadable event logs",
+    "session lists use projections when event logs are unreadable",
     async () => {
       const root = mkdtempSync(join(tmpdir(), "fx-e2e-session-projections-"));
       try {
@@ -3349,7 +3414,7 @@ describe("cli: models", () => {
         expect(result.stderr).toBe("");
         const json = JSON.parse(result.stdout.trim());
         expect(json.ids).toEqual(["gpt-5.6-sol", "gpt-5.6-luna", "gpt-5.4-mini"]);
-        expect(json.models).toEqual([
+        expect(json.models.map(({ id, source, reasoning_efforts }: any) => ({ id, source, reasoning_efforts }))).toEqual([
           {
             id: "gpt-5.6-sol",
             source: "Codex subscription",
@@ -3465,11 +3530,7 @@ describe("cli: models", () => {
             more_count: 0,
             private_models_hidden: true,
             ids: ["public/fallback"],
-            models: [{
-              id: "public/fallback",
-              source: "Vercel AI Gateway",
-              reasoning_efforts: [],
-            }],
+            models: [{ id: "public/fallback", source: "Vercel AI Gateway", reasoning_efforts: [], efforts: [], fast: false, ultrafast: false }],
           });
 
           expect(gateway.modelRequests).toHaveLength(2);
@@ -3490,6 +3551,53 @@ describe("cli: models", () => {
           gateway.stop();
           cleanupIsolatedTestHome(home);
         }
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "fx models --json describes each Gateway model's name, efforts, and speed lanes",
+    async () => {
+      const home = createIsolatedTestHome();
+      const gateway = startFakeGateway([], {
+        models: () => [
+          {
+            id: "openai/astra",
+            name: "Astra ",
+            type: "language",
+            owned_by: "openai",
+            tags: ["tool-use"],
+            reasoning_options: [{ type: "effort", values: ["low", "high"] }],
+            pricing: {
+              service_tiers: {
+                priority: { input: "1", output: "2" },
+                ultrafast: { input: "3", output: "4" },
+              },
+            },
+          },
+          { id: "provider/plain", type: "language", tags: ["tool-use"] },
+        ],
+      });
+
+      try {
+        const result = await runFx(["models", "--json"], {
+          env: modelsGatewayEnv(home, `${gateway.baseUrl}/coding-agent/v1/models`),
+        });
+
+        expect(result.code).toBe(0);
+        expect(result.stderr).toBe("");
+        const json = JSON.parse(result.stdout.trim());
+        expect(json.models).toHaveLength(2);
+        expect(json.models).toEqual(
+          expect.arrayContaining([
+            { id: "openai/astra", source: "Vercel AI Gateway", name: "Astra", reasoning_efforts: ["low", "high"], efforts: ["low", "high"], fast: true, ultrafast: true },
+            { id: "provider/plain", source: "Vercel AI Gateway", reasoning_efforts: [], efforts: [], fast: false, ultrafast: false },
+          ]),
+        );
+      } finally {
+        gateway.stop();
+        cleanupIsolatedTestHome(home);
       }
     },
     TIMEOUT,
@@ -3853,11 +3961,11 @@ describe("cli: models", () => {
             expect(json.ids).not.toContain("private/blue-hornbill");
           }
           expect(json.private_models_hidden).toBe(!scenario.expectPrivate);
-          expect(json.models).toContainEqual({
+          expect(json.models).toContainEqual(expect.objectContaining({
             id: "public/sentinel",
             source: "Vercel AI Gateway",
             reasoning_efforts: ["low", "future-tier", "high"],
-          });
+          }));
           if (scenario.seedFxLogin && !scenario.expiredFxLogin) {
             expect(requests[0]!.headers.get("x-vercel-ai-gateway-team")).toBeNull();
           }
@@ -4618,7 +4726,7 @@ describe("cli: ask success", () => {
       expect(jsonResult.code).toBe(1);
       expect(jsonResult.stderr).toBe("");
       expect(jsonResult.stdout).toBe(
-        '{"output":"","final_output":"","exit_code":1,"model":"","session_id":"","steps":0,"tool_calls":[],"usage":{"input_tokens":null,"output_tokens":null},"error":"PromptResourceLimitExceeded"}\n',
+        '{"output":"","final_output":"","exit_code":1,"model":"","resolved_provider":null,"session_id":"","steps":0,"tool_calls":[],"usage":{"input_tokens":null,"output_tokens":null},"error":"PromptResourceLimitExceeded"}\n',
       );
     },
     120_000,
@@ -5555,7 +5663,7 @@ describe("cli: error handling", () => {
             "fx ask: --no-save cannot be used with --resume or --resume-id",
           );
           expect(rejected.stderr).toContain(
-            "usage: fx ask [--auto|--full-access] [--model <id>] [--effort <level>] [--fast|--no-fast] [--image PATH] [--system TEXT] [--json] [--quiet] [--prompt-permissions] [--no-save]",
+            "usage: fx ask [--auto|--full-access] [--model <id>] [--effort <level>] [--fast|--no-fast] [--ultrafast|--no-ultrafast] [--provider-order <a,b,...>] [--provider-strict|--no-provider-strict] [--image PATH] [--system TEXT] [--json] [--quiet] [--prompt-permissions] [--no-save]",
           );
         }
         expect(gateway.requests).toHaveLength(0);
@@ -5762,7 +5870,6 @@ describe("cli: workspace access", () => {
       expect(unsupportedSkillPolicy.stderr).toContain(
         "--no-default-skills is only supported for interactive, resume, ask, and ACP launches",
       );
-
       const missingNativeTool = await runFx(["--tool"], { env: enabled });
       expect(missingNativeTool.code).toBe(1);
       expect(missingNativeTool.stderr).toContain(
@@ -5812,6 +5919,48 @@ describe("cli: workspace access", () => {
       expect(unsupportedNativeToolSelection.code).toBe(1);
       expect(unsupportedNativeToolSelection.stderr).toContain(
         "--tool is only supported for interactive, resume, ask, and ACP launches",
+      );
+
+      const missingSkillsRoot = await runFx(["--skills-dir"], { env: enabled });
+      expect(missingSkillsRoot.code).toBe(1);
+      expect(missingSkillsRoot.stderr).toContain(
+        "--skills-dir requires a directory path",
+      );
+
+      const duplicateDefaultSkillGate = await runFx(
+        ["--no-default-skills", "--no-default-skills"],
+        { env: enabled },
+      );
+      expect(duplicateDefaultSkillGate.code).toBe(1);
+      expect(duplicateDefaultSkillGate.stderr).toContain(
+        "--no-default-skills may only be specified once",
+      );
+
+      const unsupportedSkillPolicy = await runFx(
+        ["--no-default-skills", "ask", "hello"],
+        { env: enabled },
+      );
+      expect(unsupportedSkillPolicy.code).toBe(1);
+      expect(unsupportedSkillPolicy.stderr).toContain(
+        "--skills-dir and --no-default-skills are only supported for interactive, resume, and ACP launches",
+      );
+
+      const duplicateProjectInstructionGate = await runFx(
+        ["--no-project-instructions", "--no-project-instructions"],
+        { env: enabled },
+      );
+      expect(duplicateProjectInstructionGate.code).toBe(1);
+      expect(duplicateProjectInstructionGate.stderr).toContain(
+        "--no-project-instructions may only be specified once",
+      );
+
+      const unsupportedProjectInstructionGate = await runFx(
+        ["--no-project-instructions", "ask", "hello"],
+        { env: enabled },
+      );
+      expect(unsupportedProjectInstructionGate.code).toBe(1);
+      expect(unsupportedProjectInstructionGate.stderr).toContain(
+        "--no-project-instructions is only supported for interactive, resume, and ACP launches",
       );
     },
     TIMEOUT,

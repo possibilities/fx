@@ -271,8 +271,30 @@ test "cancelled event reads release work before reading another frame" {
     try std.testing.expectEqual(@as(u64, bytes.len), line.next_offset);
 }
 
-pub fn readSubagentChildIdentity(alloc: Allocator, file: std.Io.File) !bool {
-    var envelope = try readSessionStarted(alloc, file);
+/// Reads the child identity only when the first event ends within
+/// `max_bytes` of the log start. A real first event arrives in one positional
+/// read, so the cost never grows with the log; a longer or unterminated first
+/// line fails with `error.TruncatedEventFrame`.
+pub fn readSubagentChildIdentityWithin(
+    alloc: Allocator,
+    file: std.Io.File,
+    max_bytes: usize,
+) !bool {
+    const buffer = try alloc.alloc(u8, max_bytes);
+    defer alloc.free(buffer);
+    var filled: usize = 0;
+    const line_end: ?usize = while (filled < buffer.len) {
+        const count = try file.readPositional(io_mod.getIo(), &.{buffer[filled..]}, filled);
+        if (count == 0) break null;
+        const start = filled;
+        filled += count;
+        if (std.mem.findScalar(u8, buffer[start..filled], '\n')) |newline| break start + newline + 1;
+    } else null;
+    const end = line_end orelse {
+        if (filled == 0) return error.InvalidSessionFormat;
+        return error.TruncatedEventFrame;
+    };
+    var envelope = try decodeSessionStarted(alloc, buffer[0..end]);
     defer envelope.deinit(alloc);
     return envelope.event.session_started.subagent_child;
 }
@@ -282,7 +304,11 @@ fn readSessionStarted(alloc: Allocator, file: std.Io.File) !session_event.Envelo
     const first = try readLineAt(alloc, file, 0, length) orelse
         return error.InvalidSessionFormat;
     defer alloc.free(first.bytes);
-    var envelope = session_event.decodeFrame(alloc, first.bytes) catch |err| switch (err) {
+    return decodeSessionStarted(alloc, first.bytes);
+}
+
+fn decodeSessionStarted(alloc: Allocator, bytes: []const u8) !session_event.Envelope {
+    var envelope = session_event.decodeFrame(alloc, bytes) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         error.UnsupportedEventSchema => return error.UnsupportedSessionSchema,
         else => return error.InvalidSessionFormat,
@@ -857,6 +883,81 @@ test "session replay parser rejects oversized bounded frame" {
     try std.testing.expectError(
         error.EventFrameTooLarge,
         readLineAt(alloc, file, 0, copied.through_event_log_bytes),
+    );
+}
+
+test "bounded child identity reads stop at their limit" {
+    const alloc = std.testing.allocator;
+    const frame = try session_event.encodeLegacyFixtureFrame(alloc, .{
+        .log_generation = .{0x81} ** 16,
+        .seq = 1,
+        .event_id = .{0x91} ** 16,
+        .timestamp_ms = 10,
+        .event = .{ .session_started = .{
+            .id = @constCast("bounded-child"),
+            .created_at_ms = 10,
+            .origin_workspace_root = @constCast("/tmp/origin"),
+            .workspace_root = @constCast("/tmp/current"),
+            .conversation_language = .literal("en"),
+            .subagent_child = true,
+            .preferences = .{
+                .model = @constCast("model-a"),
+                .effort = .auto,
+                .fast_mode = false,
+            },
+        } },
+    });
+    defer alloc.free(frame);
+    try std.testing.expect(std.mem.endsWith(u8, frame, "}\n"));
+    // JSON whitespace keeps the padded event valid while pushing its newline
+    // past the limit.
+    const limit: usize = 4096;
+    const padded = try std.mem.concat(alloc, u8, &.{
+        frame[0 .. frame.len - 2],
+        " " ** 8192,
+        frame[frame.len - 2 ..],
+    });
+    defer alloc.free(padded);
+    const followed = try std.mem.concat(alloc, u8, &.{ frame, "{\"seq\":2}\n" });
+    defer alloc.free(followed);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const Case = struct { name: []const u8, bytes: []const u8 };
+    for ([_]Case{
+        .{ .name = "padded", .bytes = padded },
+        .{ .name = "followed", .bytes = followed },
+        .{ .name = "empty", .bytes = "" },
+        .{ .name = "unterminated", .bytes = frame[0 .. frame.len - 1] },
+    }) |case| {
+        try tmp.dir.writeFile(io_mod.getIo(), .{ .sub_path = case.name, .data = case.bytes });
+    }
+    var padded_file = try tmp.dir.openFile(io_mod.getIo(), "padded", .{});
+    defer padded_file.close(io_mod.getIo());
+    // A limit of exactly the padded length decodes the whole event.
+    try std.testing.expect(try readSubagentChildIdentityWithin(alloc, padded_file, padded.len));
+    try std.testing.expectError(
+        error.TruncatedEventFrame,
+        readSubagentChildIdentityWithin(alloc, padded_file, limit),
+    );
+
+    // Only the first line is decoded, whatever follows it in the read.
+    var followed_file = try tmp.dir.openFile(io_mod.getIo(), "followed", .{});
+    defer followed_file.close(io_mod.getIo());
+    try std.testing.expect(try readSubagentChildIdentityWithin(alloc, followed_file, limit));
+
+    var empty_file = try tmp.dir.openFile(io_mod.getIo(), "empty", .{});
+    defer empty_file.close(io_mod.getIo());
+    try std.testing.expectError(
+        error.InvalidSessionFormat,
+        readSubagentChildIdentityWithin(alloc, empty_file, limit),
+    );
+
+    var unterminated_file = try tmp.dir.openFile(io_mod.getIo(), "unterminated", .{});
+    defer unterminated_file.close(io_mod.getIo());
+    try std.testing.expectError(
+        error.TruncatedEventFrame,
+        readSubagentChildIdentityWithin(alloc, unterminated_file, limit),
     );
 }
 

@@ -3,6 +3,9 @@ const io_mod = @import("../../core/shared/io.zig");
 const pathing = @import("../../core/workspace/pathing.zig");
 const read_tracker = @import("../../core/workspace/read_tracker.zig");
 const text_utils = @import("../../core/shared/text_utils.zig");
+const image_data = @import("../../core/images/image_data.zig");
+const png_downscale = @import("../../core/images/png_downscale.zig");
+const core_types = @import("../../core/shared/types.zig");
 const tool_dispatch = @import("../../core/tooling/tool_dispatch.zig");
 const tool_result_errors = @import("../../core/tooling/tool_result_errors.zig");
 
@@ -151,6 +154,7 @@ pub fn call(ctx: tool_dispatch.DispatchContext, erased: tool_dispatch.ToolInput)
     const rel = pathing.workspaceRelativePath(arena, ctx.workspace_root, target) catch target;
 
     if (!text_utils.isModelSafeText(text)) {
+        if (try imageToolResult(ctx, rel, text, stat.size, truncated_by_size or actual_len != stat.size)) |result| return result;
         tool_dispatch.reportToolResultMemory(ctx, .{
             .model_view_covers_full_file = false,
         });
@@ -181,6 +185,7 @@ fn readFileFailure(alloc: Allocator, err: anyerror, path: []const u8) tool_dispa
     if (tool_result_errors.isFilesystemAccessDenied(err)) {
         return .{ .failure = try tool_result_errors.filesystemAccessDeniedJson(alloc, "read_file", path, err) };
     }
+
     if (err == error.NotRegularFile) {
         const details = [_]tool_result_errors.Detail{
             .{ .name = "field", .value = .{ .string = "path" } },
@@ -215,6 +220,61 @@ fn readIntoBuffer(reader: *std.Io.Reader, buffer: []u8) !usize {
         total += n;
     }
     return total;
+}
+
+/// Raw image bytes that fit the encoded tool-image attach limit.
+const max_attach_image_bytes: usize = image_data.max_encoded_image_bytes / 4 * 3;
+
+/// Attaches supported images within the absolute pixel and encoded byte
+/// limits. Oversized or incompletely read images return their source path and
+/// recovery guidance. Non-image content uses the binary-omitted summary.
+fn imageToolResult(
+    ctx: tool_dispatch.DispatchContext,
+    rel: []const u8,
+    bytes: []const u8,
+    file_size: u64,
+    incomplete_read: bool,
+) tool_dispatch.DispatchError!?tool_dispatch.ToolResult {
+    const mime_type = image_data.detectMediaTypeFromBytes(bytes) orelse return null;
+    const dimensions = image_data.imageDimensions(bytes);
+    const encoded_len = std.base64.standard.Encoder.calcSize(bytes.len);
+    if (incomplete_read or dimensions == null or encoded_len > image_data.max_encoded_image_bytes or
+        dimensions.?.exceeds(image_data.max_single_image_dimension))
+    {
+        tool_dispatch.reportToolResultMemory(ctx, .{ .model_view_covers_full_file = false });
+        const reason = if (incomplete_read)
+            "the file exceeds read_file's 10 MiB read limit"
+        else if (dimensions == null)
+            "the image dimensions could not be verified"
+        else if (encoded_len > image_data.max_encoded_image_bytes)
+            "the image exceeds the 5 MiB encoded attach limit"
+        else
+            "the image exceeds 8000 pixels per side";
+        return .{ .success = try std.fmt.allocPrint(
+            ctx.allocator,
+            "<path>{s}</path>\n<content>image not attached: {s} ({d} bytes); {s}. Use an available image tool to save a smaller copy to a new file, then read_file the copy. If no image tool is available, ask the user before installing one.</content>",
+            .{ rel, mime_type, file_size, reason },
+        ) };
+    }
+    var text: std.Io.Writer.Allocating = .init(ctx.allocator);
+    errdefer text.deinit();
+    text.writer.print("<path>{s}</path>\n<content>image attached ({s}, {d} bytes)</content>", .{ rel, mime_type, file_size }) catch return error.OutOfMemory;
+    const encoded = try ctx.allocator.alloc(u8, encoded_len);
+    errdefer ctx.allocator.free(encoded);
+    _ = std.base64.standard.Encoder.encode(encoded, bytes);
+    const owned_mime = try ctx.allocator.dupe(u8, mime_type);
+    errdefer ctx.allocator.free(owned_mime);
+    const images = try ctx.allocator.alloc(core_types.ToolImage, 1);
+    errdefer ctx.allocator.free(images);
+    images[0] = .{ .data = encoded, .mime_type = owned_mime };
+    tool_dispatch.reportToolResultMemory(ctx, .{
+        .model_view_covers_full_file = true,
+    });
+    return .{ .rich = .{
+        .text = try text.toOwnedSlice(),
+        .images = images,
+        .is_error = false,
+    } };
 }
 
 const LineRecord = struct {
@@ -650,6 +710,183 @@ test "read_file omits binary content using active success output" {
     try std.testing.expectEqual(.success, result.status);
     try std.testing.expect(std.mem.find(u8, result.body, "binary or non-utf8 file omitted") != null);
     try std.testing.expect(!result.tool_result_memory.?.model_view_covers_full_file.?);
+}
+
+const test_png_base64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
+
+fn writeTestImage(dir: std.Io.Dir, name: []const u8, base64: []const u8) !void {
+    const decoder = std.base64.standard.Decoder;
+    const size = try decoder.calcSizeForSlice(base64);
+    const bytes = try std.testing.allocator.alloc(u8, size);
+    defer std.testing.allocator.free(bytes);
+    try decoder.decode(bytes, base64);
+    var file = try dir.createFile(std.testing.io, name, .{});
+    defer file.close(io_mod.getIo());
+    try file.writeStreamingAll(io_mod.getIo(), bytes);
+}
+
+test "read_file attaches a png image to the tool result" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeTestImage(tmp.dir, "pixel.png", test_png_base64);
+    const path = try tmpPath(std.testing.allocator, tmp, "pixel.png");
+    defer std.testing.allocator.free(path);
+    const args = try std.fmt.allocPrint(std.testing.allocator, "{{\"path\":\"{s}\"}}", .{path});
+    defer std.testing.allocator.free(args);
+
+    const result = try dispatchReadFile(std.testing.allocator, args);
+    defer result.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(.success, result.status);
+    try std.testing.expect(std.mem.find(u8, result.body, "image attached (image/png") != null);
+    try std.testing.expectEqual(@as(usize, 1), result.images.len);
+    try std.testing.expectEqualStrings("image/png", result.images[0].mime_type);
+    try std.testing.expectEqualStrings(test_png_base64, result.images[0].data);
+    try std.testing.expect(result.tool_result_memory.?.model_view_covers_full_file.?);
+}
+
+test "read_file detects images by magic bytes regardless of extension" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeTestImage(tmp.dir, "pixel.bin", test_png_base64);
+    const path = try tmpPath(std.testing.allocator, tmp, "pixel.bin");
+    defer std.testing.allocator.free(path);
+    const args = try std.fmt.allocPrint(std.testing.allocator, "{{\"path\":\"{s}\"}}", .{path});
+    defer std.testing.allocator.free(args);
+
+    const result = try dispatchReadFile(std.testing.allocator, args);
+    defer result.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(.success, result.status);
+    try std.testing.expectEqual(@as(usize, 1), result.images.len);
+    try std.testing.expectEqualStrings("image/png", result.images[0].mime_type);
+}
+
+test "read_file reports images over the attach limit without pixels" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    {
+        var file = try tmp.dir.createFile(std.testing.io, "big.png", .{});
+        defer file.close(io_mod.getIo());
+        const header = "\x89PNG\r\n\x1a\n".*;
+        try file.writeStreamingAll(io_mod.getIo(), &header);
+        var remaining: usize = max_attach_image_bytes + 1 - header.len;
+        var filler: [8192]u8 = @splat(0xAB);
+        while (remaining > 0) {
+            const chunk = @min(remaining, filler.len);
+            try file.writeStreamingAll(io_mod.getIo(), filler[0..chunk]);
+            remaining -= chunk;
+        }
+    }
+    const path = try tmpPath(std.testing.allocator, tmp, "big.png");
+    defer std.testing.allocator.free(path);
+    const args = try std.fmt.allocPrint(std.testing.allocator, "{{\"path\":\"{s}\"}}", .{path});
+    defer std.testing.allocator.free(args);
+
+    const result = try dispatchReadFile(std.testing.allocator, args);
+    defer result.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(.success, result.status);
+    try std.testing.expect(std.mem.find(u8, result.body, "image not attached") != null);
+    try std.testing.expectEqual(@as(usize, 0), result.images.len);
+    try std.testing.expect(!result.tool_result_memory.?.model_view_covers_full_file.?);
+}
+
+fn writeTestPngHeader(dir: std.Io.Dir, name: []const u8, width: u32, height: u32) !void {
+    try dir.writeFile(std.testing.io, .{ .sub_path = name, .data = &image_data.testPngHeader(width, height) });
+}
+
+test "read_file attaches a PNG within the single request limit unchanged" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeTestPngHeader(tmp.dir, "frame.png", 3420, 2224);
+    const path = try tmpPath(std.testing.allocator, tmp, "frame.png");
+    defer std.testing.allocator.free(path);
+    const args = try std.fmt.allocPrint(std.testing.allocator, "{{\"path\":\"{s}\"}}", .{path});
+    defer std.testing.allocator.free(args);
+
+    const result = try dispatchReadFile(std.testing.allocator, args);
+    defer result.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(.success, result.status);
+    try std.testing.expect(std.mem.find(u8, result.body, "image attached (image/png") != null);
+    try std.testing.expectEqual(@as(usize, 1), result.images.len);
+}
+
+test "read_file attaches a JPEG that fits the single request limit" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "photo.jpg", .data = &image_data.testJpeg(4032, 3024) });
+    const path = try tmpPath(std.testing.allocator, tmp, "photo.jpg");
+    defer std.testing.allocator.free(path);
+    const args = try std.fmt.allocPrint(std.testing.allocator, "{{\"path\":\"{s}\"}}", .{path});
+    defer std.testing.allocator.free(args);
+
+    const result = try dispatchReadFile(std.testing.allocator, args);
+    defer result.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(.success, result.status);
+    try std.testing.expect(std.mem.find(u8, result.body, "image attached (image/jpeg") != null);
+    try std.testing.expectEqual(@as(usize, 1), result.images.len);
+    try std.testing.expectEqual(@as(?image_data.Dimensions, .{ .width = 4032, .height = 3024 }), image_data.encodedImageDimensions(result.images[0].data));
+    try std.testing.expect(result.tool_result_memory.?.model_view_covers_full_file.?);
+}
+
+test "read_file keeps a byte-oversized PNG at its source path" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const png = try png_downscale.testSolidGrayPng(alloc, 2400, 8, 128);
+    defer alloc.free(png);
+    const padded = try png_downscale.testPaddedPng(alloc, png, image_data.max_encoded_image_bytes);
+    defer alloc.free(padded);
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "padded.png", .data = padded });
+    const path = try tmpPath(alloc, tmp, "padded.png");
+    defer alloc.free(path);
+    const args = try std.fmt.allocPrint(alloc, "{{\"path\":\"{s}\"}}", .{path});
+    defer alloc.free(args);
+
+    const result = try dispatchReadFile(alloc, args);
+    defer result.deinit(alloc);
+
+    try std.testing.expectEqual(.success, result.status);
+    try std.testing.expect(std.mem.find(u8, result.body, "image exceeds the 5 MiB encoded attach limit") != null);
+    try std.testing.expect(std.mem.find(u8, result.body, "<path>") != null);
+    try std.testing.expectEqual(@as(usize, 0), result.images.len);
+    try std.testing.expect(!result.tool_result_memory.?.model_view_covers_full_file.?);
+}
+
+test "read_file attaches an image exactly at the model pixel limit" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeTestPngHeader(tmp.dir, "edge.png", image_data.max_single_image_dimension, image_data.max_single_image_dimension);
+    const path = try tmpPath(std.testing.allocator, tmp, "edge.png");
+    defer std.testing.allocator.free(path);
+    const args = try std.fmt.allocPrint(std.testing.allocator, "{{\"path\":\"{s}\"}}", .{path});
+    defer std.testing.allocator.free(args);
+
+    const result = try dispatchReadFile(std.testing.allocator, args);
+    defer result.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(.success, result.status);
+    try std.testing.expect(std.mem.find(u8, result.body, "image attached (image/png") != null);
+    try std.testing.expectEqual(@as(usize, 1), result.images.len);
+}
+
+test "read_file gives an actionable path for an image over 8000 pixels" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeTestPngHeader(tmp.dir, "huge.png", 8001, 1);
+    const path = try tmpPath(std.testing.allocator, tmp, "huge.png");
+    defer std.testing.allocator.free(path);
+    const args = try std.fmt.allocPrint(std.testing.allocator, "{{\"path\":\"{s}\"}}", .{path});
+    defer std.testing.allocator.free(args);
+    const result = try dispatchReadFile(std.testing.allocator, args);
+    defer result.deinit(std.testing.allocator);
+    try std.testing.expectEqual(.success, result.status);
+    try std.testing.expect(std.mem.find(u8, result.body, "image exceeds 8000 pixels per side") != null);
+    try std.testing.expect(std.mem.find(u8, result.body, path) != null);
+    try std.testing.expectEqual(@as(usize, 0), result.images.len);
 }
 
 test "read_file reports start_line beyond file length" {

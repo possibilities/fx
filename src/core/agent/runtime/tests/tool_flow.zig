@@ -700,17 +700,15 @@ test "parallel skill admission binds identities preserves denies and isolates fa
                 const selected = request.call.resolved_skill orelse return error.MissingSkillBinding;
                 try std.testing.expectEqualStrings("allowed-name", selected.skill.name);
             }
-            var detail: ?[]u8 = null;
             const result = try tool_dispatch.dispatchAuthorizedToolCall(.{
                 .allocator = request.result_allocator,
                 .workspace_root = self.workspace_root,
                 .execution_authority = request.authority,
                 .resolved_skill = request.call.resolved_skill,
-            }, self.registry, request.call, &detail);
+            }, self.registry, request.call);
             return .{
                 .status = if (result.status == .success) .success else .failure,
                 .model_output = result.body,
-                .status_detail = detail,
             };
         }
     };
@@ -5424,7 +5422,7 @@ test "processQueuedPrompt forwards diff payload instead of display text" {
     try std.testing.expectEqualStrings("diff preview", hooks.diff_preview.?);
 }
 
-test "processQueuedPrompt records permission preflight failures as denied tool calls" {
+test "processQueuedPrompt records permission preflight failures as failed tool calls" {
     const alloc = std.testing.allocator;
     const calls = [_]ToolCall{toolCall("call_1", "read_file", "{\"path\":\"a\"}")};
     const completions = [_]FakeCompletion{
@@ -5440,8 +5438,10 @@ test "processQueuedPrompt records permission preflight failures as denied tool c
 
     try runFakePrompt(&gateway, &hooks, fixture.config(), fixture.job());
 
-    try std.testing.expectEqual(@as(usize, 1), hooks.rejected_names.items.len);
-    try std.testing.expectEqualStrings("read_file", hooks.rejected_names.items[0]);
+    // A preflight content failure is a tool failure, not a rejection.
+    try std.testing.expectEqual(@as(usize, 0), hooks.rejected_names.items.len);
+    try std.testing.expectEqual(@as(usize, 1), hooks.failed_names.items.len);
+    try std.testing.expectEqualStrings("read_file", hooks.failed_names.items[0]);
     try std.testing.expectEqual(@as(usize, 0), hooks.executed_names.items.len);
 }
 
@@ -5467,7 +5467,12 @@ test "parallel permission preflight failure terminalizes its started lifecycle" 
 
     try runFakePrompt(&gateway, &hooks, fixture.config(), job);
 
-    try std.testing.expectEqual(@as(usize, 2), hooks.rejected_names.items.len);
+    // The denied web_search stays rejected; the read_file preflight failure
+    // is a tool failure.
+    try std.testing.expectEqual(@as(usize, 1), hooks.rejected_names.items.len);
+    try std.testing.expectEqualStrings("web_search", hooks.rejected_names.items[0]);
+    try std.testing.expectEqual(@as(usize, 1), hooks.failed_names.items.len);
+    try std.testing.expectEqualStrings("read_file", hooks.failed_names.items[0]);
     try std.testing.expectEqual(@as(usize, 0), hooks.executed_names.items.len);
     try expectLifecycleCallIds(hooks.lifecycle_events.items, &.{
         "call_search",
@@ -6211,6 +6216,12 @@ test "processQueuedPrompt pauses retryable failures and preserves execution on t
 
         var config = fixture.config();
         config.max_provider_attempts = 2;
+        // Retryable failures recover autonomously now; park the turn with a
+        // lifecycle pause (the user's try-later) when the retry is scheduled.
+        var pause_flag = std.atomic.Value(bool).init(false);
+        deps.pause_on_auto_retry_status = true;
+        deps.recovery_pause_flag = &pause_flag;
+        config.recovery_pause_flag = &pause_flag;
         switch (case.expected) {
             .paused => try runFakePrompt(
                 &gateway,
@@ -6642,7 +6653,10 @@ test "child target failures settle the batch before and after permission without
         try std.testing.expectEqualStrings("good-neighbor", probe.hooks.executed_call_ids.items[0]);
         try std.testing.expectEqual(@as(usize, if (case.after_permission) 2 else 1), probe.hooks.permission_names.items.len);
         try std.testing.expectEqual(types.TurnPresentationOutcome.completed, probe.hooks.finalized_outcome.?);
-        try std.testing.expectEqual(@as(usize, 1), probe.hooks.rejected_names.items.len);
+        // Target-resolution failures arrive through the permission tool_failure
+        // channel and record as tool failures, not rejections.
+        try std.testing.expectEqual(@as(usize, 1), probe.hooks.failed_names.items.len);
+        try std.testing.expectEqual(@as(usize, 0), probe.hooks.rejected_names.items.len);
     }
 }
 

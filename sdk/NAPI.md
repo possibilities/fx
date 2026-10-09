@@ -43,6 +43,7 @@ Zig Runtime thread runs acp_server.runWithTransport()
         +---- FetchBridge <----> sdk/node.js fetch + AbortController
         |
         +---- SessionBridge <---> sdk/node.js Codex session store
+        +---- AttachmentTable <----> writeCoreAttachment / takeCoreAttachment
         |
         v
 newline-delimited ACP JSON-RPC
@@ -54,12 +55,19 @@ shared createFxAgent() logic in sdk/fx-sdk.js
 `sdk/node.js` supplies a `runtimeFactory` to the shared JavaScript agent implementation. The factory exposes the same small runtime contract expected from the WebAssembly host:
 
 - `write(data)` sends ACP bytes to the addon.
+- `writeAttachment(id, bytes)` copies raw prompt-image or checkpoint bytes to the addon before the frame that references them.
+- `takeAttachment(id)` returns raw checkpoint bytes the core published, or null.
+- `discardAttachments()` drops inbound bytes left by a frame that never reached the core.
 - `closeStdin()` closes the ACP input stream.
 - `setLineHandler(handler)` receives parsed ACP messages.
 - `exited` settles when the native runtime exits.
 - `abort()` aborts Node fetch and closes native input.
 
-Each core has one nonblocking Unix socketpair for readiness. The adapter takes ownership of the reader with `takeCoreReadyFd()` and watches it through `node:net`; Bun adopts the descriptor through `connect()`. The native writer signals when a fetch or Codex session-store request becomes pending, output changes from empty to non-empty, or the core exits. Wake bytes carry no state: JavaScript drains the bounded queues to quiescence and then checks exit state. While a fetch body pump exists it calls only `coreFetchActive()` for that fetch handle; an inactive handle aborts its matching `AbortController` on the next readiness event. ACP output is accumulated to newline boundaries and parsed as JSON. Gateway requests are transferred to Node as bounded request records; Node runs the configured `fetch`, streams bounded response chunks back to Zig, and owns the `AbortController`. This matches the WebAssembly host-fetch boundary and ensures the N-API core never uses the native `std.http` Gateway transport. Codex uses the native provider transport, while its explicit session store crosses a separate bounded bridge. Node runs `load()` and revisioned `commit()` with an `AbortSignal`; the runtime thread never calls N-API.
+Each core has one nonblocking Unix socketpair for readiness. The adapter takes ownership of the reader with `takeCoreReadyFd()` and watches it through `node:net`; Bun adopts the descriptor through `connect()`. The native writer signals when a fetch or Codex session-store request becomes pending, output changes from empty to non-empty, semantic consumption completes, or the core exits. Wake bytes carry no state: JavaScript drains the bounded fetch and output queues to quiescence and then checks exit state. ACP output is accumulated to newline boundaries and parsed as JSON. Gateway requests are transferred to Node as a bounded JSON metadata record plus the raw request body; Node runs the configured `fetch`, streams bounded response chunks back to Zig, and owns the `AbortController`. This matches the WebAssembly host-fetch boundary and ensures the N-API core never uses the native `std.http` Gateway transport.
+
+The body pump observes the matching fetch through `coreFetchDisposition()` under one bridge lock. Separate consumption and active queries can produce a torn observation if the native worker completes between them. Explicit semantic consumption takes precedence over active or retired state and survives normal close and shutdown; HTTP EOF alone does not grant it. JavaScript stops forwarding consumed bytes and drains the remaining HTTP body within 100 ms and 64 KiB without delaying text or result delivery. Cancellation, failure, or an exceeded cleanup bound aborts the body. Runtime destruction waits for owned cleanup to settle. Older compatible addons without the disposition export retain the active-only conservative abort behavior.
+
+Codex uses the native provider transport, while its explicit session store crosses a separate bounded bridge. Node runs `load()` and revisioned `commit()` with an `AbortSignal`; the runtime thread never calls N-API.
 
 The shared JavaScript Agent wrapper emits bounded `transport.start`, `transport.response`, and `transport.error` diagnostics around that host-owned fetch. It allowlists request, generation, model, provider, status, attempt, endpoint, and elapsed-time fields rather than exposing credentials or arbitrary headers.
 
@@ -73,16 +81,20 @@ The native kernel installs host-stream and host model-catalog providers. It does
 
 | Export | Purpose |
 | --- | --- |
-| `libfxApiVersion` | Checks compatibility with the JavaScript loader. Currently `3`. Low-level `createCore` backends must declare this exact version. |
+| `libfxApiVersion` | Checks compatibility with the JavaScript loader. Currently `4`. Low-level `createCore` backends must declare this exact version. |
 | `createCore(options)` | Allocates a runtime and readiness socketpair, then starts its ACP thread. |
 | `takeCoreReadyFd(handle)` | Transfers the readiness reader descriptor to JavaScript exactly once. The caller owns its close. |
 | `writeCore(handle, buffer)` | Appends bytes to the bounded input queue. |
 | `closeCore(handle)` | Closes input and wakes a blocked ACP reader. |
 | `drainCore(handle)` | Returns up to 1 MiB of queued output as a Node Buffer. |
-| `takeCoreFetch(runtime)` | Takes the pending bounded Gateway request, including its positive `fetchHandle`, for Node-owned fetch. |
+| `writeCoreAttachment(handle, id, buffer)` | Copies one raw inbound payload, a prompt image or a restore checkpoint, into the bounded attachment table under a positive `uint32` id. |
+| `takeCoreAttachment(handle, id)` | Removes and returns one outbound payload, a checkpoint, as a Node Buffer, or `null`. |
+| `discardCoreAttachments(handle)` | Drops inbound payloads that no frame consumed. |
+| `takeCoreFetch(runtime)` | Takes the pending bounded Gateway request as `{ request, body }`: a JSON metadata Buffer with the positive `fetchHandle`, method, URL, and headers, and the raw request body Buffer. |
 | `takeCoreCodexSessionOperation(runtime)` | Takes one pending bounded Codex session load or commit for the Node host. |
 | `finishCoreCodexSessionOperation(runtime, operationHandle, status, bytes, revision)` | Completes only the matching Codex session operation; stale completions are ignored. |
 | `coreFetchActive(runtime, fetchHandle)` | Reports whether that request may still receive host response operations. |
+| `coreFetchDisposition(runtime, fetchHandle)` | Atomically reports retired (`0`), active (`1`), or explicitly consumed (`2`) for the exact handle. Matching consumption takes precedence. This additive export is optional for version 4 addons. |
 | `startCoreFetchResponse(runtime, fetchHandle, status)` | Publishes the matching fetch response status. |
 | `pushCoreFetchResponse(runtime, fetchHandle, buffer)` | Appends a bounded matching response chunk. |
 | `finishCoreFetch(runtime, fetchHandle)` / `failCoreFetch(runtime, fetchHandle)` | Completes only the matching host stream successfully or with transport failure. |
@@ -93,7 +105,7 @@ The native kernel installs host-stream and host model-catalog providers. It does
 
 This ABI is internal. Consumers should use `createFxAgent()` from `sdk/node.js`; exposing the primitive functions keeps the native boundary small and testable.
 
-The addon ABI version is independent of the public JavaScript API version, which remains `2`. Only low-level core addons must declare version `3`.
+The addon ABI version is independent of the JavaScript entry points' `libfxApiVersion`, which is `3`, and the shared `fxSdkApiVersion`, which remains `2`. Only low-level core addons must declare version `4`.
 
 Response operations return numeric outcomes: `0` means the operation was stale and ignored, `1` means it was applied, and `2` means a response push encountered bounded backpressure. Stale callbacks never mutate a newer fetch. The addon does not write ambient diagnostics for these outcomes; the JavaScript adapter observes the numeric result and owns any explicit host reporting.
 
@@ -149,7 +161,7 @@ host-fetch bridge. Codex is enabled only when the caller supplies a custom
 session store or explicitly opts into an fx profile with `fxProfileSession()`.
 Grok remains unavailable. Browser and WebAssembly cores remain Gateway-only.
 
-Gateway agent creation does not fetch the model catalog. When a prompt needs model capabilities or context capacity, the shared resolver obtains the catalog through the supplied host fetch and caches its metadata for that agent. Codex authorization is the exception: the authenticated Codex catalog is loaded before native initialization succeeds, so an unavailable catalog or model fails creation. Initial model-visible system context comes only from the host's explicit `instructions`, including text assembled by the MCP and skills adapters.
+Gateway agent creation fetches the model catalog only when validating explicit effort or speed overrides. When a prompt needs model capabilities or context capacity, the shared resolver obtains the catalog through the supplied host fetch and caches its metadata for that agent. Codex authorization is the exception: the authenticated Codex catalog is loaded before native initialization succeeds, so an unavailable catalog or model fails creation. Initial model-visible system context comes only from the host's explicit `instructions`, including text assembled by the MCP and skills adapters.
 
 Host-stream requests do not opt into the Gateway extended-time header. Live paired testing showed that header caused a recurring multi-second pre-header tail for embedded requests. Session identity and affinity headers remain enabled. The shared JavaScript fetch edge retries a thrown host transport error at most once, before any response reaches the Agent. Cancellation prevents the retry, and a second failure keeps the existing rejection behavior.
 
@@ -182,8 +194,10 @@ All untrusted values crossing the native boundary are bounded before allocation 
 | Input queue | 8 MiB |
 | Output queue | 8 MiB |
 | Encoded output message | 64 MiB |
-| Fetch request body and serialized metadata | 8 MiB before body base64 encoding |
-| Fetch request record | 11,184,812 bytes including body base64 encoding |
+| Fetch request body and serialized metadata | 8 MiB |
+| One attachment | 4 MiB |
+| Pending inbound attachments | 8, totaling at most 8 MiB |
+| Pending outbound attachments | 4, totaling at most 8 MiB |
 | Fetch response queue | 8 MiB |
 | Gateway error body | 1 MiB |
 | Codex session snapshot | 64 KiB |
@@ -192,9 +206,11 @@ All untrusted values crossing the native boundary are bounded before allocation 
 | Active runtimes | 64 per process |
 | ACP tool result | 64 KiB text; 8 MiB tagged rich result |
 | ACP history | 100 turns |
-| Agent steps | 64 |
+| Agent steps | Unbounded by default |
 
-The fetch request budget covers the full model request, including retained history and metadata. Its base64 transfer frame has a separate derived bound; accepting one tool result does not reserve space for later requests.
+The fetch request budget covers the full model request, including retained history and metadata. The body crosses to Node unencoded beside its metadata, so the transfer adds no separate bound; accepting one tool result does not reserve space for later requests.
+
+Prompt images and kernel checkpoints also cross the boundary unencoded. JavaScript writes each inbound payload with `writeCoreAttachment()` and then sends the ACP frame that references its id, an image block's `_meta.fx.attachment` or `libfx/restore`'s `checkpointAttachment`; the core thread takes the payload once while handling that frame. `libfx/checkpoint` answers with `checkpointAttachment`, and JavaScript takes those bytes with `takeCoreAttachment()`. The attachment table has its own mutex and stores C-allocator copies, so the core thread never touches JavaScript memory. JavaScript discards unconsumed inbound payloads before attaching new ones.
 
 Host tool responses must also fit the 8 MiB input bound after JSON framing, including the trailing newline. A response that exceeds this bound becomes a small tool error so the model can continue and the agent remains usable.
 
