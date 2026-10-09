@@ -8883,7 +8883,10 @@ describe("acp: model-independent", () => {
           cwd: root.workspace,
           env: fakeGatewayEnv(root, gateway),
         });
-        await startCodeSession(client);
+        await client.request("initialize", { protocolVersion: 1 }, 1);
+        await client.request("session/new", { cwd: root.external, mcpServers: [] }, 2);
+        await client.readLine();
+        await client.request("session/set_mode", { modeId: "auto" }, 3);
         const result = await runPrompt(client, "List available skills.", TIMEOUT);
 
         expect(result.promptResult.result.stopReason).toBe("end_turn");
