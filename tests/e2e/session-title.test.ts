@@ -314,7 +314,7 @@ test.skipIf(SKIP_TMUX)("manual rename wins over an in-flight naming request and 
   }
 }, 45_000);
 test.skipIf(SKIP_TMUX)("tui generates a title after an upgrade relaunch resumes an untitled session", async () => {
-  const root = createFixtureRoot("tui-upgrade-title", JSON.stringify({ statusLine: { session: true } }));
+  const root = createFixtureRoot("tui-upgrade-title", JSON.stringify({ statusLine: { session: true }, session_naming: { gateway: { model: TITLE_MODEL } } }));
   const installDir = join(root.root, "install");
   mkdirSync(installDir);
   const installedFx = join(installDir, "fx");

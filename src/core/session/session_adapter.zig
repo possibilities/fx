@@ -1661,6 +1661,17 @@ pub const Session = struct {
         _ = try self.write(&.{.{ .set = .{ .key = key, .value = value } }});
     }
 
+    pub fn conversationTitle(self: *Session, alloc: Allocator) !?[]u8 {
+        self.mutex.lockUncancelable(io_mod.getIo());
+        defer self.mutex.unlock(io_mod.getIo());
+        var state = try self.handle.state(alloc);
+        defer state.deinit(alloc);
+        const raw = state.title orelse return null;
+        var parsed = try std.json.parseFromSlice([]const u8, alloc, raw, .{});
+        defer parsed.deinit();
+        return try alloc.dupe(u8, parsed.value);
+    }
+
     /// A title the user chose. It differs from the derived one, so a
     /// generated title never replaces it.
     pub fn rename(self: *Session, title: []const u8) !void {

@@ -1007,6 +1007,7 @@ const App = struct {
         self.worker.requestShutdown();
         SessionAppRuntime.requestPersistenceShutdown(self);
         SessionAppRuntime.abandonProfileLedgerForProcessExit(self);
+        SessionNamingAppRuntime.requestStop(self);
         self.upgrader.stopForProcessExit();
         self.file_index.requestStop();
         WorkspaceAppRuntime.requestStop(self);
@@ -1034,6 +1035,8 @@ const App = struct {
         self.worker.deinit(std.heap.c_allocator);
         self.clearPendingImages();
         SessionAppRuntime.deinitPersistenceForProcessExit(self);
+        LifecycleAppRuntime.prepareStopped(self);
+        self.ade_events.deinit();
         self.question_prompt.deinit(self.alloc);
         shutdown_trace.mark("persistence_finalized");
 
