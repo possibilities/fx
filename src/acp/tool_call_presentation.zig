@@ -83,8 +83,7 @@ pub fn describeToolCall(
 }
 
 pub fn activeToolSet(state: *const server.ServerState) tool_set_contract.ToolSet {
-    if (state.host_tools.tools.len > 0) return state.host_tools.toolSet();
-    return nativeToolSet(state.cfg.allow_native_tools);
+    return server.activeToolSet(state);
 }
 
 pub fn nativeToolSet(allow_native_tools: bool) tool_set_contract.ToolSet {

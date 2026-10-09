@@ -8,6 +8,7 @@ const host_attachments = @import("../hosts/host_attachments.zig");
 const credentials = @import("../auth/credentials.zig");
 const mode_registry = @import("../modes/mode_registry.zig");
 const prompt_policy = @import("../config/prompt_policy.zig");
+const tool_set_contract = @import("../tooling/tool_set.zig");
 const context_contract = @import("../workspace/context_contract.zig");
 
 const Allocator = std.mem.Allocator;
@@ -54,6 +55,7 @@ pub const Config = struct {
     saved_directories_suppressed: bool = false,
     allow_acp_mcp: bool = true,
     allow_native_tools: bool = true,
+    native_tool_set: ?tool_set_contract.ToolSet = null,
     minimal_kernel: bool = false,
     /// Raw prompt image and checkpoint bytes from a libfx host. Null for
     /// hosts that only speak standard ACP, such as `fx acp`.

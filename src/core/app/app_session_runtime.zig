@@ -4205,7 +4205,7 @@ pub fn Runtime(comptime App: type) type {
                     };
                     defer parsed.deinit();
                     if (parsed.value != .object) return;
-                    const command_value = parsed.value.object.get("command") orelse {
+                    const command_value = tool_args.commandArguments(parsed.value.object).get("command") orelse {
                         try self.attachSessionCommandDisplay(entry_id, call);
                         return;
                     };
