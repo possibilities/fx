@@ -5,6 +5,7 @@ const command_contract = @import("command_contract.zig");
 const command_environment = @import("command_environment.zig");
 const process_tree = @import("process_tree.zig");
 const io_mod = @import("../shared/io.zig");
+const mem_utils = @import("../shared/mem_utils.zig");
 const self_exe = @import("../shared/self_exe.zig");
 const config_runtime = @import("../config/config_runtime.zig");
 const session_child_store = @import("../session/session_child_store.zig");
@@ -12,6 +13,7 @@ const artifact_digest = @import("../session/artifact_digest.zig");
 const text_utils = @import("../shared/text_utils.zig");
 const types = @import("../shared/types.zig");
 const shell_resolver = @import("../terminal/shell_resolver.zig");
+const shell_snapshot = @import("../terminal/shell_snapshot.zig");
 const darwin_process_spawn = @import("../shared/darwin_process_spawn.zig");
 
 const Allocator = std.mem.Allocator;
@@ -35,6 +37,9 @@ pub const Config = struct {
     timeout_started_ms: ?i64 = null,
     command_artifact_capability: ?*session_child_store.SessionChildCapability = null,
     command_artifact_dir: ?[]const u8 = null,
+    /// Shell snapshot epoch of the remembered grant that admitted a `user`
+    /// profile command, or null when it was not admitted by a grant.
+    shell_grant_epoch: ?u64 = null,
 };
 
 pub const CallbackProjection = enum {
@@ -48,9 +53,27 @@ const command_artifact_log_suffix = ".log";
 const command_artifact_stdout_suffix = ".stdout.log";
 const command_artifact_stderr_suffix = ".stderr.log";
 const pending_output_flush_bytes: usize = 4096;
-const command_output_poll_ms: i64 = 100;
+/// Idle wait between stop checks while capturing output. Reads return as soon
+/// as output arrives, so this bounds only how long a silent command takes to
+/// observe a cancel or force-kill request.
+const capture_stop_poll_ms: i64 = 20;
+/// After a command finishes on its own, capture keeps reading its leftover
+/// output until it has waited this long in total for more. Leftover output is
+/// already in the pipes and reads without waiting, so time spent delivering it
+/// never ends the drain. Only a detached daemon that kept a pipe open can keep
+/// the pipes from reaching end of file, and this bounds waiting on it.
+const natural_completion_wait_ms: i64 = 1_000;
+/// Live delivery of drained output ends this long after a natural completion,
+/// so a reader too slow to keep up with a detached writer cannot hold the
+/// call. Capture keeps reading and collecting the output after that.
+const natural_completion_live_ms: i64 = 10_000;
+/// Most output capture reads after a natural completion. A finished command
+/// leaves at most one pipe buffer per stream behind, and Linux lets a pipe
+/// buffer grow to 1 MiB by default, so reading this much means the command's
+/// own output is done and a detached process is still writing.
+const natural_completion_drain_max_bytes: usize = 2 * 1024 * 1024;
 pub const termination_settle_timeout_ms: i64 = 5_000;
-const supports_foreground_session = builtin.link_libc and
+pub const supports_foreground_session = builtin.link_libc and
     std.process.can_spawn and
     std.process.can_replace and
     builtin.os.tag != .windows and
@@ -61,7 +84,7 @@ const foreground_session_release_byte: u8 = 0x06;
 const foreground_session_setup_timeout_ms: i64 = 5000;
 const foreground_target_termination_grace_ms: i64 = 700;
 const foreground_target_cleanup_wait_ms: i64 = 250;
-const foreground_supervisor_handoff_ms: i64 = command_output_poll_ms * 2;
+const foreground_supervisor_handoff_ms: i64 = 200;
 const foreground_session_replace_failure_exit_code: u8 = 125;
 const foreground_session_failure_nonce_bytes: usize = 16;
 const foreground_session_failure_nonce_hex_bytes: usize = foreground_session_failure_nonce_bytes * 2;
@@ -127,7 +150,8 @@ pub fn runForegroundSessionBootstrap(args: []const [:0]const u8) !void {
     else
         std.fmt.parseInt(i64, args[1], 10) catch
             return error.InvalidForegroundSessionInvocation;
-    if (std.c.setsid() == -1) return error.ForegroundSessionSetupFailed;
+    const command_session = std.c.setsid();
+    if (command_session == -1) return error.ForegroundSessionSetupFailed;
 
     const zio = io_mod.getIo();
     try std.Io.File.stderr().writeStreamingAll(
@@ -208,23 +232,63 @@ pub fn runForegroundSessionBootstrap(args: []const [:0]const u8) !void {
         std.process.exit(foreground_session_replace_failure_exit_code);
     };
     target.stdin = null;
-    target_input.writeStreamingAll(zio, script) catch |err| {
+    var script_writer: ?std.Thread = null;
+    if (script.len <= foreground_session_inline_script_bytes) {
+        target_input.writeStreamingAll(zio, script) catch |err| {
+            target_input.close(zio);
+            target.kill(zio);
+            writeForegroundSessionReplaceFailure(failure_nonce, err);
+            std.process.exit(foreground_session_replace_failure_exit_code);
+        };
         target_input.close(zio);
-        target.kill(zio);
-        writeForegroundSessionReplaceFailure(failure_nonce, err);
-        std.process.exit(foreground_session_replace_failure_exit_code);
-    };
-    target_input.close(zio);
+    } else {
+        // A large script can exceed the pipe buffer, and on macOS the target
+        // stays suspended until waitForForegroundTarget resumes it, so it is
+        // written while the target runs. The target already exec'd with the
+        // default SIGPIPE disposition; ignoring it here only keeps a target
+        // that stops reading from killing the supervisor.
+        const ignore_action: std.posix.Sigaction = .{
+            .handler = .{ .handler = std.posix.SIG.IGN },
+            .mask = std.posix.sigemptyset(),
+            .flags = 0,
+        };
+        std.posix.sigaction(std.posix.SIG.PIPE, &ignore_action, null);
+        script_writer = std.Thread.spawn(
+            .{},
+            writeForegroundTargetScript,
+            .{ target_input, script },
+        ) catch |err| {
+            target_input.close(zio);
+            target.kill(zio);
+            writeForegroundSessionReplaceFailure(failure_nonce, err);
+            std.process.exit(foreground_session_replace_failure_exit_code);
+        };
+    }
     const term = waitForForegroundTarget(
         &target,
         if (process_witness) |*witness| witness else null,
         deadline_ms,
+        command_session,
     ) catch |err| {
         target.kill(zio);
         writeForegroundSessionReplaceFailure(failure_nonce, err);
         std.process.exit(foreground_session_replace_failure_exit_code);
     };
+    // The target has exited, so the writer finished or saw a broken pipe.
+    if (script_writer) |writer| writer.join();
     exitForegroundSessionSupervisor(term);
+}
+
+/// Scripts up to this size fit in any pipe buffer, so they are written before
+/// the target is resumed.
+const foreground_session_inline_script_bytes: usize = 4096;
+
+fn writeForegroundTargetScript(target_input: std.Io.File, script: []const u8) void {
+    const zio = io_mod.getIo();
+    target_input.writeStreamingAll(zio, script) catch |err| {
+        debug_trace.logf("core", "foreground session script write stopped err={s}", .{@errorName(err)});
+    };
+    target_input.close(zio);
 }
 
 fn recordForegroundSessionTermination(signal: std.posix.SIG) callconv(.c) void {
@@ -306,6 +370,8 @@ const ChildWaiter = struct {
     io: std.Io,
     ready: std.atomic.Value(bool) = .init(false),
     result: std.process.Child.WaitError!std.process.Child.Term = undefined,
+    /// When the wait returned. Valid once `ready` is observed.
+    completed_ms: i64 = 0,
     future: ?std.Io.Future(void) = null,
 
     fn init(child: *std.process.Child) ChildWaiter {
@@ -325,6 +391,7 @@ const ChildWaiter = struct {
 
     fn waitMain(self: *ChildWaiter) void {
         self.result = self.child.wait(self.io);
+        self.completed_ms = io_mod.milliTimestamp();
         self.ready.store(true, .release);
     }
 
@@ -358,6 +425,7 @@ fn waitForForegroundTarget(
     target: *std.process.Child,
     process_witness: ?*const process_tree.DarwinProcessWitness,
     deadline_ms: ?i64,
+    command_session: std.posix.pid_t,
 ) !std.process.Child.Term {
     const target_pid = target.id orelse return error.ForegroundTargetMissing;
     var descendants = try process_tree.Tracker.init(std.heap.page_allocator);
@@ -426,15 +494,20 @@ fn waitForForegroundTarget(
                 );
                 return term;
             }
-            const count = try cleanupCompletedForegroundTarget(
+            const cleanup = try cleanupCompletedForegroundTarget(
                 &descendants,
                 target_pid,
+                command_session,
             );
-            if (count > 0) {
+            if (cleanup.terminated > 0 or cleanup.kept_detached > 0 or cleanup.incomplete) {
                 debug_trace.logf(
                     "core",
-                    "captured command target completed; tracked descendants terminated count={d}",
-                    .{count},
+                    "captured command target completed; tracked descendants terminated count={d} detached daemons kept count={d} incomplete={s}",
+                    .{
+                        cleanup.terminated,
+                        cleanup.kept_detached,
+                        if (cleanup.incomplete) "true" else "false",
+                    },
                 );
             }
             return term;
@@ -443,29 +516,47 @@ fn waitForForegroundTarget(
     }
 }
 
+const CompletedTargetCleanup = struct {
+    terminated: usize = 0,
+    kept_detached: usize = 0,
+    /// The latest pass could not inspect or signal every tracked process.
+    incomplete: bool = false,
+
+    fn record(self: *CompletedTargetCleanup, delivery: process_tree.CompletionDelivery) void {
+        self.terminated += delivery.delivery.delivered;
+        self.kept_detached = delivery.kept_detached;
+        self.incomplete = delivery.delivery.incomplete;
+    }
+};
+
+/// Stops what a naturally completed command left in its session. Daemons
+/// that moved to their own session keep running, so background servers that
+/// tools start survive between calls. Cancellation, timeout, and owner loss
+/// still stop them.
 fn cleanupCompletedForegroundTarget(
     descendants: *process_tree.Tracker,
     target_pid: std.posix.pid_t,
-) !usize {
+    command_session: std.posix.pid_t,
+) !CompletedTargetCleanup {
     const started_ms = io_mod.milliTimestamp();
-    var signaled: usize = 0;
+    var cleanup: CompletedTargetCleanup = .{};
     var empty_scans: u8 = 0;
     while (io_mod.milliTimestamp() - started_ms <
         foreground_target_cleanup_wait_ms)
     {
         try refreshForegroundTargetTree(descendants, target_pid);
-        signaled += descendants.signalAll(std.posix.SIG.KILL);
-        if (descendants.anyAlive()) {
+        cleanup.record(descendants.signalAttached(std.posix.SIG.KILL, command_session));
+        if (descendants.anyAttachedAlive(command_session)) {
             empty_scans = 0;
         } else {
             empty_scans += 1;
-            if (empty_scans >= 2) return signaled;
+            if (empty_scans >= 2) return cleanup;
         }
         io_mod.sleep(std.time.ns_per_ms);
     }
     try refreshForegroundTargetTree(descendants, target_pid);
-    signaled += descendants.signalAll(std.posix.SIG.KILL);
-    return signaled;
+    cleanup.record(descendants.signalAttached(std.posix.SIG.KILL, command_session));
+    return cleanup;
 }
 
 fn refreshForegroundTargetTree(
@@ -606,7 +697,7 @@ pub fn executeCommand(
     cwd: []const u8,
 ) !command_contract.RunCommandResult {
     var scratch_state = std.heap.ArenaAllocator.init(arena);
-    defer scratch_state.deinit();
+    defer mem_utils.deinit_arena(scratch_state);
     const scratch = scratch_state.allocator();
 
     var effective_cfg = cfg;
@@ -629,12 +720,20 @@ pub fn executeCommandInEnvironment(
     }
 
     var scratch_state = std.heap.ArenaAllocator.init(arena);
-    defer scratch_state.deinit();
+    defer mem_utils.deinit_arena(scratch_state);
     const scratch = scratch_state.allocator();
 
     var effective_cfg = cfg;
     if (effective_cfg.timeout_started_ms == null) effective_cfg.timeout_started_ms = io_mod.milliTimestamp();
     try ExecutionControl.init(effective_cfg).check();
+    switch (environment) {
+        .user => |shell_path| if (snapshotEligible(shell_path, command)) {
+            if (try executeWithSnapshot(arena, scratch, effective_cfg, command, cwd, shell_path)) |result| {
+                return result;
+            }
+        },
+        else => {},
+    }
     const invocation = try shell_resolver.capturedInvocation(scratch, environment, command);
     debug_trace.logf(
         "core",
@@ -650,6 +749,115 @@ pub fn executeCommandInEnvironment(
         &invocation,
     );
 }
+
+fn snapshotEligible(shell_path: []const u8, command: []const u8) bool {
+    if (comptime !shell_snapshot.isSupported() or !supports_foreground_session) return false;
+    // A NUL cannot travel through the stdin script; keep today's argv path,
+    // which rejects it at spawn.
+    return shell_resolver.shellKind(shell_path) != null and
+        std.mem.findScalar(u8, command, 0) == null;
+}
+
+/// The result for a command whose remembered approval predates a shell
+/// refresh. Nothing ran; requesting the command again asks for approval.
+fn approvalResetResult(
+    arena: Allocator,
+    command: []const u8,
+    cwd: []const u8,
+) !command_contract.RunCommandResult {
+    debug_trace.logf("core", "command runner rejected stale shell approval", .{});
+    return formatOutputWithStatus(
+        arena,
+        command,
+        cwd,
+        .{ .exit_code = 126 },
+        "",
+        "fx did not run this command: the shell startup files changed after it was approved. Request it again to ask for approval.\n",
+        null,
+        false,
+    );
+}
+
+/// Runs a `user` profile command in a clean shell restored from the process
+/// snapshot. Returns null when the command must use full startup instead:
+/// no snapshot is available, or its replay failed before the command started.
+fn executeWithSnapshot(
+    arena: Allocator,
+    scratch: Allocator,
+    cfg: Config,
+    command: []const u8,
+    cwd: []const u8,
+    shell_path: []const u8,
+) !?command_contract.RunCommandResult {
+    const owner = shell_snapshot.processOwner();
+    const acquired = owner.acquire(shell_path, cwd, .{
+        .cancel_flag = cfg.cancel_flag,
+        .deadline_ms = ExecutionControl.init(cfg).deadlineMs(),
+    }) catch |err| return switch (err) {
+        error.Cancelled => error.CancelledBeforeExecution,
+        error.TimeoutExpired => error.TimeoutExpired,
+    };
+    const lease = switch (acquired) {
+        .snapshot => |value| value,
+        .full_startup => {
+            if (cfg.shell_grant_epoch) |epoch| {
+                if (epoch != owner.approvalEpoch()) return try approvalResetResult(arena, command, cwd);
+            }
+            return null;
+        },
+    };
+    defer lease.release();
+    const generation = lease.generation;
+    if (cfg.shell_grant_epoch) |epoch| {
+        if (epoch != generation.epoch) return try approvalResetResult(arena, command, cwd);
+    }
+
+    var nonce_raw: [foreground_session_failure_nonce_bytes]u8 = undefined;
+    io_mod.getIo().random(&nonce_raw);
+    const nonce = std.fmt.bytesToHex(nonce_raw, .lower);
+    const failure_marker = try std.mem.concat(scratch, u8, &.{
+        shell_resolver.snapshot_replay_failure_prefix,
+        &nonce,
+    });
+    const invocation = try shell_resolver.snapshotInvocation(scratch, generation.shell_path, failure_marker);
+    const script = try shell_resolver.snapshotScript(scratch, generation.replay, command);
+    debug_trace.logf(
+        "core",
+        "command runner snapshot generation={d} shell={s} replay_bytes={d}",
+        .{ generation.id, generation.shell_path, generation.replay.len },
+    );
+    const result = try executeProcessWithScript(
+        scratch,
+        cfg,
+        invocation.argv(),
+        cwd,
+        script,
+        &generation.environ,
+    );
+    if (snapshotReplayFailed(result, failure_marker)) {
+        // The replay stopped before the command started, so the command has
+        // not run. Fail this snapshot and let the caller run it once with
+        // full startup.
+        debug_trace.logf(
+            "core",
+            "command runner snapshot replay failed generation={d}; rerunning with full startup",
+            .{generation.id},
+        );
+        owner.markReplayFailed(generation);
+        return null;
+    }
+    return try formatCollectedOutput(arena, command, cwd, result);
+}
+
+fn snapshotReplayFailed(result: CollectedProcess, failure_marker: []const u8) bool {
+    return switch (result.status) {
+        .exit_code => |code| code == shell_snapshot_replay_failure_exit_code and
+            std.mem.find(u8, result.stderr, failure_marker) != null,
+        else => false,
+    };
+}
+
+const shell_snapshot_replay_failure_exit_code: i64 = 125;
 
 const ExecutionControl = struct {
     cancel_flag: ?*std.atomic.Value(bool),
@@ -1106,12 +1314,14 @@ fn executeProcessWithInput(
     );
 }
 
+/// `environ_map` replaces the inherited environment for the command when set.
 fn executeProcessWithScript(
     scratch: Allocator,
     cfg: Config,
     argv: []const []const u8,
     cwd: []const u8,
     script: []const u8,
+    environ_map: ?*const std.process.Environ.Map,
 ) !CollectedProcess {
     if (comptime supports_foreground_session) {
         return executeProcessWithDetachedSession(
@@ -1120,6 +1330,7 @@ fn executeProcessWithScript(
             argv,
             cwd,
             script,
+            environ_map,
         );
     }
     return executeProcessWithScriptUnisolated(
@@ -1128,6 +1339,7 @@ fn executeProcessWithScript(
         argv,
         cwd,
         script,
+        environ_map,
     );
 }
 
@@ -1142,6 +1354,7 @@ fn executeProcessWithDetachedSession(
     argv: []const []const u8,
     cwd: []const u8,
     script: []const u8,
+    environ_map: ?*const std.process.Environ.Map,
 ) !CollectedProcess {
     const executable = try foregroundSessionExecutable(scratch);
     var nonce_bytes: [foreground_session_failure_nonce_bytes]u8 = undefined;
@@ -1171,12 +1384,14 @@ fn executeProcessWithDetachedSession(
     try helper_argv.appendSlice(scratch, argv);
 
     const started_ms = io_mod.milliTimestamp();
+    // The supervisor passes its environment through to the target shell.
     var child = try std.process.spawn(io_mod.getIo(), .{
         .argv = helper_argv.items,
         .stdin = .pipe,
         .stdout = .pipe,
         .stderr = .pipe,
         .cwd = .{ .path = cwd },
+        .environ_map = environ_map,
     });
 
     var output = OutputCollector.init(scratch, cfg);
@@ -1218,10 +1433,11 @@ fn executeProcessWithDetachedSession(
         process_group_id,
         .foreground_supervisor,
     );
+    // Judge the deadline at the supervisor's exit, not after the output drain.
     collected.source = reconcileForegroundTerminationSource(
         collected.source,
         deadline_ms,
-        io_mod.milliTimestamp(),
+        collected.natural_completion_ms orelse io_mod.milliTimestamp(),
     );
     const duration_ms = elapsedMs(started_ms, io_mod.milliTimestamp());
 
@@ -1237,6 +1453,53 @@ fn executeProcessWithDetachedSession(
         collected.source,
         cfg.force_cancel_flag != null,
     );
+}
+
+/// Starts `argv` in a new session through the foreground supervisor, so it
+/// has no controlling terminal: an interactive login shell can neither stop
+/// on nor draw over the terminal fx runs in. The target's stdin is empty;
+/// stdout and stderr are pipes. `child.stdin` stays open as the supervisor's
+/// lifeline: closing it ends the session. The caller owns the child and its
+/// process group.
+pub fn spawnDetachedSession(
+    scratch: Allocator,
+    argv: []const []const u8,
+    cwd: []const u8,
+    environ_map: ?*const std.process.Environ.Map,
+) !std.process.Child {
+    if (comptime !supports_foreground_session) return error.OperationUnsupported;
+    const executable = try foregroundSessionExecutable(scratch);
+    var helper_argv: std.ArrayList([]const u8) = .empty;
+    try helper_argv.appendSlice(scratch, &.{ executable, foreground_session_token, "none" });
+    try helper_argv.appendSlice(scratch, argv);
+    var child = try std.process.spawn(io_mod.getIo(), .{
+        .argv = helper_argv.items,
+        .stdin = .pipe,
+        .stdout = .pipe,
+        .stderr = .pipe,
+        .cwd = .{ .path = cwd },
+        .environ_map = environ_map,
+    });
+    var phase: ForegroundSessionPhase = .pre_ready;
+    errdefer cleanupForegroundSessionChild(&child, phase);
+    try waitForForegroundSessionReady(&child, .{ .max_command_output_bytes = 0 });
+    phase = .group_ready;
+
+    const input = child.stdin orelse return error.SpawnFailed;
+    var nonce_bytes: [foreground_session_failure_nonce_bytes]u8 = undefined;
+    io_mod.getIo().random(&nonce_bytes);
+    const nonce = std.fmt.bytesToHex(nonce_bytes, .lower);
+    var control: [foreground_session_control_bytes]u8 = undefined;
+    @memcpy(control[0..nonce.len], &nonce);
+    control[foreground_session_release_index] = foreground_session_release_byte;
+    std.mem.writeInt(
+        u64,
+        control[foreground_session_script_length_index..][0..foreground_session_script_length_bytes],
+        0,
+        .little,
+    );
+    try input.writeStreamingAll(io_mod.getIo(), &control);
+    return child;
 }
 
 fn foregroundSessionExecutable(scratch: Allocator) ![]const u8 {
@@ -1340,6 +1603,7 @@ fn executeProcessWithScriptUnisolated(
     argv: []const []const u8,
     cwd: []const u8,
     script: []const u8,
+    environ_map: ?*const std.process.Environ.Map,
 ) !CollectedProcess {
     const started_ms = io_mod.milliTimestamp();
     var child = try std.process.spawn(io_mod.getIo(), .{
@@ -1349,6 +1613,7 @@ fn executeProcessWithScriptUnisolated(
         .stderr = .pipe,
         .cwd = .{ .path = cwd },
         .pgid = if (builtin.os.tag != .windows and builtin.os.tag != .wasi) 0 else null,
+        .environ_map = environ_map,
     });
 
     var output = OutputCollector.init(scratch, cfg);
@@ -1598,6 +1863,7 @@ fn executeRawBashWithResultCommand(
         &argv,
         cwd,
         execution_command,
+        null,
     );
     return formatCollectedOutput(alloc, result_command, cwd, result);
 }
@@ -1619,6 +1885,7 @@ fn executeRawInvocation(
         invocation.argv(),
         cwd,
         "",
+        null,
     );
     return formatCollectedOutput(alloc, command, cwd, result);
 }
@@ -1741,9 +2008,13 @@ test "zsh user profile reports natural SIGTERM after alias-safe startup" {
     try std.testing.expectEqual(@as(?i64, null), foreground.exit_code);
     try std.testing.expectEqual(@as(?u32, @intFromEnum(std.posix.SIG.TERM)), foreground.signal);
 
-    const debug_output = try readAbsoluteFile(arena, debug_log, 4096);
-    try std.testing.expect(std.mem.find(u8, debug_output, "builtin trap - TERM") != null);
+    // The startup files ran once into the snapshot. The aliased `builtin`
+    // could not intercept the alias-safe `\builtin eval` that runs the
+    // command, and the replayed TRAPDEBUG still observed it.
+    const debug_output = try readAbsoluteFile(arena, debug_log, 64 * 1024);
+    try std.testing.expect(std.mem.find(u8, debug_output, "builtin eval") != null);
     try std.testing.expect(std.mem.find(u8, debug_output, "kill -TERM $$") != null);
+    try std.testing.expect(std.mem.find(u8, signaled.output, "INTERCEPTED") == null);
 
     const trapped = try executeCommandInEnvironment(
         config,
@@ -1754,6 +2025,256 @@ test "zsh user profile reports natural SIGTERM after alias-safe startup" {
     );
     try std.testing.expectEqual(@as(?i64, 42), trapped.command_result.?.exit_code);
     try std.testing.expectEqual(@as(?u32, null), trapped.command_result.?.signal);
+}
+
+const SnapshotTestShell = struct { home: []const u8, workspace: []const u8, shell: []const u8 };
+
+fn writeSnapshotTestShell(
+    arena: Allocator,
+    tmp: *std.testing.TmpDir,
+    zshrc: []const u8,
+) !SnapshotTestShell {
+    return writeSnapshotTestShellFor(arena, tmp, "zsh", ".zshrc", zshrc);
+}
+
+/// Writes a wrapper named after the shell that pins HOME (and ZDOTDIR) to a
+/// temporary home holding `rc_name`.
+fn writeSnapshotTestShellFor(
+    arena: Allocator,
+    tmp: *std.testing.TmpDir,
+    shell_name: []const u8,
+    rc_name: []const u8,
+    rc: []const u8,
+) !SnapshotTestShell {
+    try tmp.dir.createDirPath(io_mod.getIo(), "home");
+    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
+    try tmp.dir.createDirPath(io_mod.getIo(), "wrapper");
+    const home = try io_mod.dirRealpathAlloc(arena, tmp.dir, "home");
+    const workspace = try io_mod.dirRealpathAlloc(arena, tmp.dir, "workspace");
+    const wrapper_dir = try io_mod.dirRealpathAlloc(arena, tmp.dir, "wrapper");
+    const rc_path = try std.fs.path.join(arena, &.{ "home", rc_name });
+    try tmp.dir.writeFile(io_mod.getIo(), .{ .sub_path = rc_path, .data = rc });
+    const source = try std.fmt.allocPrint(
+        arena,
+        "#!/bin/sh\nexport HOME={s}\nexport ZDOTDIR={s}\nexec /bin/{s} \"$@\"\n",
+        .{ try shellQuote(arena, home), try shellQuote(arena, home), shell_name },
+    );
+    const wrapper_path = try std.fs.path.join(arena, &.{ "wrapper", shell_name });
+    var wrapper = try tmp.dir.createFile(io_mod.getIo(), wrapper_path, .{ .truncate = true });
+    defer wrapper.close(io_mod.getIo());
+    try wrapper.writeStreamingAll(io_mod.getIo(), source);
+    try wrapper.setPermissions(io_mod.getIo(), std.Io.File.Permissions.fromMode(0o700));
+    return .{
+        .home = home,
+        .workspace = workspace,
+        .shell = try std.fs.path.join(arena, &.{ wrapper_dir, shell_name }),
+    };
+}
+
+test "bash user profile commands reuse one startup-file snapshot" {
+    if (comptime !shell_snapshot.isSupported() or !supports_foreground_session) return;
+    std.Io.Dir.accessAbsolute(io_mod.getIo(), "/bin/bash", .{}) catch
+        return error.SkipZigTest;
+
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const paths = try writeSnapshotTestShellFor(
+        arena,
+        &tmp,
+        "bash",
+        ".bash_profile",
+        "printf 'loaded\\n' >> \"$HOME/rc-loads.log\"\n" ++
+            "alias fxsnap_alias='printf alias-ok'\n" ++
+            "fxsnap_fn() { printf function-ok; }\n" ++
+            "export PATH=\"$HOME/marker-bin:$PATH\"\n" ++
+            "export FXSNAP_EXPORT=exported\n",
+    );
+
+    const config = Config{ .max_command_output_bytes = 64 * 1024 };
+    const first = try executeCommandInEnvironment(
+        config,
+        arena,
+        "fxsnap_alias; echo; fxsnap_fn; echo; echo $FXSNAP_EXPORT; " ++
+            "case :$PATH: in *:$HOME/marker-bin:*) echo path-ok;; esac; cat; echo stdin-closed",
+        paths.workspace,
+        .{ .user = paths.shell },
+    );
+    inline for (.{ "alias-ok", "function-ok", "exported", "path-ok", "stdin-closed" }) |expected| {
+        try std.testing.expect(std.mem.find(u8, first.output, expected) != null);
+    }
+    try std.testing.expect(std.mem.startsWith(u8, first.output, "exit_code=0\n"));
+
+    _ = try executeCommandInEnvironment(config, arena, "cd /; export FXSNAP_LEAK=1", paths.workspace, .{ .user = paths.shell });
+    const third = try executeCommandInEnvironment(
+        config,
+        arena,
+        "echo \"pwd=$PWD leak=${FXSNAP_LEAK-unset}\"; exit 7",
+        paths.workspace,
+        .{ .user = paths.shell },
+    );
+    const expected_pwd = try std.fmt.allocPrint(arena, "pwd={s} leak=unset", .{paths.workspace});
+    try std.testing.expect(std.mem.find(u8, third.output, expected_pwd) != null);
+    try std.testing.expectEqual(@as(?i64, 7), third.command_result.?.exit_code);
+
+    const loads_path = try std.fs.path.join(arena, &.{ paths.home, "rc-loads.log" });
+    try std.testing.expectEqualStrings("loaded\n", try readAbsoluteFile(arena, loads_path, 4096));
+}
+
+test "user profile commands reuse one startup-file snapshot" {
+    if (comptime !shell_snapshot.isSupported() or !supports_foreground_session) return;
+    std.Io.Dir.accessAbsolute(io_mod.getIo(), "/bin/zsh", .{}) catch
+        return error.SkipZigTest;
+
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    // Thousands of functions push the replay past the pipe buffer, so the
+    // supervisor must stream it while the shell reads.
+    const paths = try writeSnapshotTestShell(
+        arena,
+        &tmp,
+        "print -r -- loaded >> \"$HOME/rc-loads.log\"\n" ++
+            "alias fxsnap_alias='print -r -- alias-ok'\n" ++
+            "fxsnap_fn() { print -r -- function-ok; }\n" ++
+            "export PATH=\"$HOME/marker-bin:$PATH\"\n" ++
+            "export FXSNAP_EXPORT=exported\n" ++
+            "for i in {1..3000}; do eval \"fxsnap_bulk_$i() { print -r -- bulk-$i; }\"; done\n",
+    );
+
+    const config = Config{ .max_command_output_bytes = 64 * 1024 };
+    const first = try executeCommandInEnvironment(
+        config,
+        arena,
+        "fxsnap_alias; fxsnap_fn; print -r -- $FXSNAP_EXPORT; " ++
+            "case :$PATH: in *:$HOME/marker-bin:*) print -r -- path-ok;; esac; " ++
+            "fxsnap_bulk_2999; cat; print -r -- stdin-closed",
+        paths.workspace,
+        .{ .user = paths.shell },
+    );
+    inline for (.{ "alias-ok", "function-ok", "exported", "path-ok", "bulk-2999", "stdin-closed" }) |expected| {
+        try std.testing.expect(std.mem.find(u8, first.output, expected) != null);
+    }
+    try std.testing.expect(std.mem.startsWith(u8, first.output, "exit_code=0\n"));
+
+    _ = try executeCommandInEnvironment(
+        config,
+        arena,
+        "cd /; export FXSNAP_LEAK=1; alias fxsnap_new='print leaked'",
+        paths.workspace,
+        .{ .user = paths.shell },
+    );
+    const third = try executeCommandInEnvironment(
+        config,
+        arena,
+        "print -r -- \"pwd=$PWD leak=${FXSNAP_LEAK-unset}\"; " ++
+            "alias fxsnap_new >/dev/null 2>&1 || print -r -- alias-unset; exit 7",
+        paths.workspace,
+        .{ .user = paths.shell },
+    );
+    const expected_pwd = try std.fmt.allocPrint(arena, "pwd={s} leak=unset", .{paths.workspace});
+    try std.testing.expect(std.mem.find(u8, third.output, expected_pwd) != null);
+    try std.testing.expect(std.mem.find(u8, third.output, "alias-unset") != null);
+    try std.testing.expectEqual(@as(?i64, 7), third.command_result.?.exit_code);
+
+    const loads_path = try std.fs.path.join(arena, &.{ paths.home, "rc-loads.log" });
+    const loads = try readAbsoluteFile(arena, loads_path, 4096);
+    try std.testing.expectEqualStrings("loaded\n", loads);
+}
+
+test "user profile command with an approval from an earlier shell epoch does not run" {
+    if (comptime !shell_snapshot.isSupported() or !supports_foreground_session) return;
+    std.Io.Dir.accessAbsolute(io_mod.getIo(), "/bin/zsh", .{}) catch
+        return error.SkipZigTest;
+    shell_snapshot.resetProcessOwnerForTest(shell_snapshot.real_capture_fn);
+    defer shell_snapshot.resetProcessOwnerForTest(shell_snapshot.real_capture_fn);
+
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const paths = try writeSnapshotTestShell(arena, &tmp, "alias fxsnap_alias='print -r -- alias-ok'\n");
+    const marker_path = try std.fs.path.join(arena, &.{ paths.workspace, "ran.log" });
+    const command = try std.fmt.allocPrint(arena, "print -r -- ran >> {s}", .{try shellQuote(arena, marker_path)});
+
+    // The grant was checked under epoch 0; a refresh moved the shell to 1.
+    shell_snapshot.processOwner().markDirty(.user_reload);
+    const stale = try executeCommandInEnvironment(
+        .{ .max_command_output_bytes = 16 * 1024, .shell_grant_epoch = 0 },
+        arena,
+        command,
+        paths.workspace,
+        .{ .user = paths.shell },
+    );
+    try std.testing.expectEqual(@as(?i64, 126), stale.command_result.?.exit_code);
+    try std.testing.expect(std.mem.find(u8, stale.output, "changed after it was approved") != null);
+    std.Io.Dir.accessAbsolute(io_mod.getIo(), marker_path, .{}) catch |err| {
+        try std.testing.expectEqual(error.FileNotFound, err);
+    };
+
+    const current = try executeCommandInEnvironment(
+        .{ .max_command_output_bytes = 16 * 1024, .shell_grant_epoch = shell_snapshot.processOwner().approvalEpoch() },
+        arena,
+        command,
+        paths.workspace,
+        .{ .user = paths.shell },
+    );
+    try std.testing.expectEqual(@as(?i64, 0), current.command_result.?.exit_code);
+    try std.testing.expectEqualStrings("ran\n", try readAbsoluteFile(arena, marker_path, 4096));
+}
+
+fn brokenReplayCapture(request: shell_snapshot.CaptureRequest) shell_snapshot.CaptureOutcome {
+    const generation = shell_snapshot.Generation.create() catch return .{ .failed = .out_of_memory };
+    const alloc = generation.arena.allocator();
+    generation.shell_path = alloc.dupe(u8, request.shell_path) catch {
+        generation.destroy();
+        return .{ .failed = .out_of_memory };
+    };
+    generation.replay = "fxsnap_broken() {\n";
+    generation.environ.put("PATH", "/usr/bin:/bin") catch {};
+    return .{ .ready = generation };
+}
+
+test "user profile command reruns once with full startup after a failed replay" {
+    if (comptime !shell_snapshot.isSupported() or !supports_foreground_session) return;
+    std.Io.Dir.accessAbsolute(io_mod.getIo(), "/bin/zsh", .{}) catch
+        return error.SkipZigTest;
+    shell_snapshot.resetProcessOwnerForTest(brokenReplayCapture);
+    defer shell_snapshot.resetProcessOwnerForTest(shell_snapshot.real_capture_fn);
+
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const paths = try writeSnapshotTestShell(
+        arena,
+        &tmp,
+        "print -r -- loaded >> \"$HOME/rc-loads.log\"\n",
+    );
+    const marker_path = try std.fs.path.join(arena, &.{ paths.workspace, "runs.log" });
+    const command = try std.fmt.allocPrint(arena, "print -r -- ran >> {s}; print -r -- done", .{try shellQuote(arena, marker_path)});
+    const config = Config{ .max_command_output_bytes = 16 * 1024 };
+
+    const result = try executeCommandInEnvironment(config, arena, command, paths.workspace, .{ .user = paths.shell });
+    try std.testing.expect(std.mem.startsWith(u8, result.output, "exit_code=0\n"));
+    try std.testing.expect(std.mem.find(u8, result.output, "done") != null);
+    try std.testing.expect(std.mem.find(u8, result.output, shell_resolver.snapshot_replay_failure_prefix) == null);
+    try std.testing.expectEqualStrings("ran\n", try readAbsoluteFile(arena, marker_path, 4096));
+
+    // Later commands fall back to full startup without retrying the replay.
+    _ = try executeCommandInEnvironment(config, arena, command, paths.workspace, .{ .user = paths.shell });
+    try std.testing.expectEqualStrings("ran\nran\n", try readAbsoluteFile(arena, marker_path, 4096));
+    const loads_path = try std.fs.path.join(arena, &.{ paths.home, "rc-loads.log" });
+    try std.testing.expectEqualStrings("loaded\nloaded\n", try readAbsoluteFile(arena, loads_path, 4096));
+    var notice_buffer: [256]u8 = undefined;
+    const notice = shell_snapshot.processOwner().takeUiNotice(&notice_buffer).?;
+    try std.testing.expect(std.mem.find(u8, notice, "could not be restored") != null);
 }
 
 fn formatOutput(alloc: Allocator, command: []const u8, cwd: []const u8, term: std.process.Child.Term, stdout_raw: []const u8, stderr_raw: []const u8, duration_ms: ?u64) !command_contract.RunCommandResult {
@@ -1861,7 +2382,7 @@ fn writePreviewEnvelope(alloc: Allocator, writer: *std.Io.Writer, label: []const
 
     try writer.print("<{s}>\n", .{label});
     var scratch_state = std.heap.ArenaAllocator.init(alloc);
-    defer scratch_state.deinit();
+    defer mem_utils.deinit_arena(scratch_state);
     const scratch = scratch_state.allocator();
 
     if (preview.total_bytes <= preview.max_bytes) {
@@ -1904,6 +2425,8 @@ const TerminationSource = enum {
 const CollectedOutput = struct {
     source: TerminationSource,
     output_incomplete: bool = false,
+    /// When the leader was seen exiting on its own, before any output drain.
+    natural_completion_ms: ?i64 = null,
 };
 
 fn reconcileForegroundTerminationSource(
@@ -1973,6 +2496,9 @@ const OutputChunkEmitter = struct {
     stdout_pending: std.ArrayList(u8) = .empty,
     stderr_pending: std.ArrayList(u8) = .empty,
     presentation_suppressed: bool = false,
+    /// Set during the drain after a natural completion. Live delivery ends at
+    /// this time or on a cancel, while the output is still collected.
+    live_until_ms: ?i64 = null,
 
     fn deinit(self: *@This(), arena: Allocator) void {
         self.stdout_pending.deinit(arena);
@@ -2021,16 +2547,29 @@ const OutputChunkEmitter = struct {
             return;
         };
 
-        while (std.mem.findScalar(u8, pending.items, '\n')) |newline_index| {
-            const line = pending.items[0 .. newline_index + 1];
+        var line_start: usize = 0;
+        while (std.mem.findScalarPos(u8, pending.items, line_start, '\n')) |newline_index| {
+            if (self.liveDeliveryEnded(cfg)) {
+                self.suppressPresentation(error.OutputDrainInterrupted);
+                return;
+            }
+            const line = pending.items[line_start .. newline_index + 1];
             emitOutputChunk(ctx, callback, cfg.output_chunk_lifecycle_id, stream, line, cfg.callback_projection) catch |err| {
                 self.suppressPresentation(err);
                 return;
             };
-
-            const remaining = pending.items.len - (newline_index + 1);
-            std.mem.copyForwards(u8, pending.items[0..remaining], pending.items[newline_index + 1 ..]);
+            line_start = newline_index + 1;
+        }
+        if (line_start > 0) {
+            const remaining = pending.items.len - line_start;
+            std.mem.copyForwards(u8, pending.items[0..remaining], pending.items[line_start..]);
             pending.items.len = remaining;
+        }
+        // The final flush always delivers the last partial line. It is one
+        // callback, so it cannot stretch the drain.
+        if (!flush_remainder and pending.items.len > 0 and self.liveDeliveryEnded(cfg)) {
+            self.suppressPresentation(error.OutputDrainInterrupted);
+            return;
         }
 
         if (!flush_remainder and pending.items.len >= pending_output_flush_bytes) {
@@ -2048,6 +2587,11 @@ const OutputChunkEmitter = struct {
             };
             pending.clearRetainingCapacity();
         }
+    }
+
+    fn liveDeliveryEnded(self: *const @This(), cfg: Config) bool {
+        const until_ms = self.live_until_ms orelse return false;
+        return cancelRequested(cfg.cancel_flag) or io_mod.milliTimestamp() >= until_ms;
     }
 
     fn suppressPresentation(self: *@This(), err: anyerror) void {
@@ -2369,26 +2913,26 @@ fn collectOutput(
     var emitter: OutputChunkEmitter = .{};
     defer emitter.deinit(arena);
 
-    const started_ms = ExecutionControl.init(cfg).started_ms;
+    const control = ExecutionControl.init(cfg);
+    const started_ms = control.started_ms;
+    const deadline_ms = control.deadlineMs();
     var signal_started_ms: ?i64 = null;
     var force_kill_sent = false;
     var streams_finished = false;
     var output_incomplete = false;
+    var natural_drain: ?NaturalDrain = null;
 
     while (true) {
-        try updateTerminationSignal(
-            observer,
-            process_group_id,
-            termination_protocol,
-            cfg,
-            started_ms,
-            source,
-            &signal_started_ms,
-            &force_kill_sent,
-        );
+        // Observe the leader before any deadline or cancel so a command that
+        // already exited on its own is never signaled or reclassified.
         if (leader_status.* == null) {
             if (observer.observe()) |status| {
                 leader_status.* = status;
+                if (source.* == .natural) {
+                    const drain: NaturalDrain = .{ .completed_ms = observer.waiter.completed_ms };
+                    emitter.live_until_ms = drain.liveUntilMs(deadline_ms);
+                    natural_drain = drain;
+                }
                 if (process_group_id) |pid| {
                     if (source.* == .natural) {
                         terminateRemainingProcessGroup(pid);
@@ -2406,6 +2950,18 @@ fn collectOutput(
                     }
                 }
             }
+        }
+        if (natural_drain == null) {
+            try updateTerminationSignal(
+                observer,
+                process_group_id,
+                termination_protocol,
+                cfg,
+                started_ms,
+                source,
+                &signal_started_ms,
+                &force_kill_sent,
+            );
         }
 
         const now_ms = io_mod.milliTimestamp();
@@ -2429,6 +2985,39 @@ fn collectOutput(
             );
             break;
         }
+        if (natural_drain) |*drain| drain_stop: {
+            if (streams_finished) break :drain_stop;
+            const reason = drain.stop(
+                now_ms,
+                cancelRequested(cfg.cancel_flag),
+                deadline_ms,
+            ) orelse break :drain_stop;
+            const cuts_output = drain.cutsCommandOutput(reason);
+            if (cuts_output and !drain.confirming) {
+                // One more read shows whether the command's own output is
+                // still waiting or has all been read.
+                drain.confirming = true;
+                break :drain_stop;
+            }
+            debug_trace.logf(
+                "core",
+                "captured command output drain stopped after natural completion reason={s} bytes={d} waited_ms={d} output_cut={s}",
+                .{
+                    @tagName(reason),
+                    drain.bytes,
+                    @divTrunc(drain.waited_ns, std.time.ns_per_ms),
+                    if (cuts_output) "true" else "false",
+                },
+            );
+            if (cuts_output) {
+                recordOutputDrainFailure(
+                    &output_incomplete,
+                    @tagName(reason),
+                    error.OutputDrainInterrupted,
+                );
+            }
+            break;
+        }
 
         if (streams_finished) {
             if (source.* == .natural or
@@ -2442,13 +3031,22 @@ fn collectOutput(
             continue;
         }
 
-        const keep_reading = if (multi_reader.fill(4096, .{ .duration = .{ .raw = .{ .nanoseconds = command_output_poll_ms * std.time.ns_per_ms }, .clock = .awake } }))
+        const fill_started_ns = io_mod.nanoTimestamp();
+        var fill_timed_out = false;
+        const keep_reading = if (multi_reader.fill(4096, .{ .duration = .{ .raw = .{ .nanoseconds = capture_stop_poll_ms * std.time.ns_per_ms }, .clock = .awake } }))
             true
         else |err| switch (err) {
             error.EndOfStream => false,
-            error.Timeout => true,
+            error.Timeout => blk: {
+                fill_timed_out = true;
+                break :blk true;
+            },
             else => |e| blk: {
-                if (source.* != .natural or cancelRequested(cfg.cancel_flag)) return e;
+                if (source.* != .natural or
+                    (natural_drain == null and cancelRequested(cfg.cancel_flag)))
+                {
+                    return e;
+                }
                 recordOutputDrainFailure(
                     &output_incomplete,
                     "reader_coordination",
@@ -2460,6 +3058,13 @@ fn collectOutput(
 
         const stdout_buf = stdout_r.buffered();
         const stderr_buf = stderr_r.buffered();
+        if (natural_drain) |*drain| {
+            drain.record(
+                stdout_buf.len + stderr_buf.len,
+                fill_timed_out,
+                io_mod.nanoTimestamp() - fill_started_ns,
+            );
+        }
         if (stdout_buf.len > 0) {
             try emitter.append(arena, output, .stdout, stdout_buf, cfg);
             stdout_r.tossBuffered();
@@ -2472,7 +3077,9 @@ fn collectOutput(
             }
             stderr_r.tossBuffered();
         }
-        if (emitter.presentation_suppressed and cancelRequested(cfg.cancel_flag)) {
+        if (natural_drain == null and emitter.presentation_suppressed and
+            cancelRequested(cfg.cancel_flag))
+        {
             return error.Cancelled;
         }
         if (source.* == .natural) {
@@ -2502,8 +3109,73 @@ fn collectOutput(
     return .{
         .source = source.*,
         .output_incomplete = output_incomplete,
+        .natural_completion_ms = if (natural_drain) |drain| drain.completed_ms else null,
     };
 }
+
+/// Leftover-output drain after a command finishes on its own.
+const NaturalDrain = struct {
+    completed_ms: i64,
+    waited_ns: i128 = 0,
+    bytes: usize = 0,
+    /// A read that found nothing for a whole poll shows the command's own
+    /// leftover output has all been read. Later output is a daemon's.
+    leftover_read: bool = false,
+    /// One more read is confirming whether a stop would cut command output.
+    confirming: bool = false,
+
+    const Stop = enum {
+        wait_limit,
+        cancelled,
+        deadline,
+        byte_limit,
+    };
+
+    /// Records one read. Every wait counts, because leftover output reads
+    /// without waiting and only a detached writer makes capture wait.
+    fn record(self: *NaturalDrain, read_len: usize, timed_out: bool, waited_ns: i128) void {
+        self.bytes +|= read_len;
+        self.waited_ns +|= @max(waited_ns, 0);
+        if (timed_out) self.leftover_read = true;
+        // A read that returns nothing without timing out ended one stream,
+        // which settles nothing about the other, so confirmation starts over.
+        if (read_len == 0) self.confirming = false;
+    }
+
+    /// Reading ends at end of file, at the wait limit, on a cancel, at the
+    /// deadline, or once the byte budget shows a detached writer.
+    fn stop(
+        self: NaturalDrain,
+        now_ms: i64,
+        cancel_requested: bool,
+        deadline_ms: ?i64,
+    ) ?Stop {
+        if (cancel_requested) return .cancelled;
+        if (deadline_ms) |deadline| {
+            if (now_ms >= deadline) return .deadline;
+        }
+        if (self.bytes >= natural_completion_drain_max_bytes) return .byte_limit;
+        if (self.waited_ns >= natural_completion_wait_ms * std.time.ns_per_ms) return .wait_limit;
+        return null;
+    }
+
+    /// Whether stopping now can drop the command's own output. The wait limit
+    /// and the byte budget are reached only after that output was read.
+    fn cutsCommandOutput(self: NaturalDrain, reason: Stop) bool {
+        return switch (reason) {
+            .cancelled, .deadline => !self.leftover_read,
+            .wait_limit, .byte_limit => false,
+        };
+    }
+
+    /// When live delivery of drained output ends, so a slow reader cannot
+    /// hold the drain past its deadline or live limit.
+    fn liveUntilMs(self: NaturalDrain, deadline_ms: ?i64) i64 {
+        const limit_ms = self.completed_ms + natural_completion_live_ms;
+        const deadline = deadline_ms orelse return limit_ms;
+        return @min(deadline, limit_ms);
+    }
+};
 
 fn recordMultiReaderFailure(
     multi_reader: *const std.Io.File.MultiReader,
@@ -2576,6 +3248,7 @@ const CollectedTermination = struct {
     source: TerminationSource,
     status: command_contract.CommandStatus,
     output_incomplete: bool = false,
+    natural_completion_ms: ?i64 = null,
 };
 
 fn collectSpawnedProcess(
@@ -2652,6 +3325,7 @@ fn collectSpawnedProcess(
         .source = collected_output.source,
         .status = status,
         .output_incomplete = output_incomplete,
+        .natural_completion_ms = collected_output.natural_completion_ms,
     };
 }
 
@@ -2728,10 +3402,19 @@ fn updateTerminationSignal(
     }
 
     if (signal_started_ms.*) |sent_ms| {
-        if (!force_kill_sent.* and now_ms - sent_ms >= 800) {
-            try observer.signal(process_group_id, termination_protocol, .force);
-            debug_trace.logf("core", "command force-killed after termination grace expired", .{});
-            force_kill_sent.* = true;
+        if (!force_kill_sent.*) {
+            // A force request (process exit) escalates a cooperative stop
+            // that is still inside its grace window.
+            const grace_expired = now_ms - sent_ms >= 800;
+            if (grace_expired or cancelRequested(cfg.force_cancel_flag)) {
+                try observer.signal(process_group_id, termination_protocol, .force);
+                debug_trace.logf(
+                    "core",
+                    "command force-killed reason={s}",
+                    .{if (grace_expired) "termination_grace_expired" else "force_cancel"},
+                );
+                force_kill_sent.* = true;
+            }
         }
     }
 }
@@ -3322,6 +4005,7 @@ test "detached session preserves replacement failure with a zero output budget" 
             &argv,
             "/tmp",
             "",
+            null,
         ),
     );
 }
@@ -4688,7 +5372,7 @@ test "natural command completion terminates background child with redirected str
     try expectProcessGone(pid);
 }
 
-test "natural command completion terminates redirected descendant after setsid" {
+test "natural command completion keeps a daemon that detached after setsid" {
     if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return;
 
     const alloc = std.testing.allocator;
@@ -4698,8 +5382,8 @@ test "natural command completion terminates redirected descendant after setsid" 
     defer alloc.free(workspace);
     const pid_path = try std.fs.path.join(alloc, &.{ workspace, "escaped-child.pid" });
     defer alloc.free(pid_path);
-    // Natural cleanup may kill the child before it publishes its PID unless
-    // the parent waits for readiness after setsid and stream redirection.
+    // Natural cleanup stops the child while it is still in the command
+    // session, so the parent waits for readiness after setsid and redirection.
     const command = try std.fmt.allocPrint(
         alloc,
         "python3 -c 'import os,time\n" ++
@@ -4728,14 +5412,648 @@ test "natural command completion terminates redirected descendant after setsid" 
     defer alloc.free(result.output);
     try std.testing.expectEqual(@as(?i64, 0), result.command_result.?.exit_code);
 
-    const pid_text = try readAbsoluteFile(alloc, pid_path, 64);
-    defer alloc.free(pid_text);
-    const pid = try std.fmt.parseInt(
-        std.posix.pid_t,
-        std.mem.trim(u8, pid_text, " \t\r\n"),
-        10,
+    const pids = try readPidsForTest(alloc, pid_path);
+    defer alloc.free(pids);
+    defer stopProcessesForTest(pids);
+    try std.testing.expectEqual(@as(usize, 1), pids.len);
+    try std.testing.expect(try process_tree.processIsAlive(alloc, pids[0]));
+}
+
+test "natural command completion keeps a double-forked daemon and its children" {
+    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return;
+
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(workspace);
+    const pid_path = try std.fs.path.join(alloc, &.{ workspace, "daemon.pids" });
+    defer alloc.free(pid_path);
+    // The daemon keeps every inherited descriptor except the output streams,
+    // like CLIs that spawn a detached background server and a browser child.
+    const command = try std.fmt.allocPrint(
+        alloc,
+        "python3 -c 'import os,time\n" ++
+            "ready_r,ready_w=os.pipe()\n" ++
+            "if os.fork() == 0:\n" ++
+            " os.close(ready_r)\n" ++
+            " os.setsid()\n" ++
+            " if os.fork() > 0: os._exit(0)\n" ++
+            " null=os.open(\"/dev/null\",os.O_RDWR)\n" ++
+            " os.dup2(null,0); os.dup2(null,1); os.dup2(null,2)\n" ++
+            " worker=os.fork()\n" ++
+            " if worker == 0:\n" ++
+            "  time.sleep(30)\n" ++
+            "  os._exit(0)\n" ++
+            " with open(\"{s}\",\"w\") as f: f.write(str(os.getpid())+\" \"+str(worker))\n" ++
+            " os.write(ready_w,b\"R\"); os.close(ready_w)\n" ++
+            " time.sleep(30)\n" ++
+            " os._exit(0)\n" ++
+            "os.close(ready_w)\n" ++
+            "if os.read(ready_r,1) != b\"R\": raise SystemExit(1)\n" ++
+            "print(\"DAEMON-STARTED\")'",
+        .{pid_path},
     );
-    try expectProcessGone(pid);
+    defer alloc.free(command);
+
+    const result = try executeCommand(.{
+        .max_command_output_bytes = 1024,
+        .timeout_ms = 10_000,
+    }, alloc, command, workspace);
+    defer alloc.free(result.output);
+    try std.testing.expectEqual(@as(?i64, 0), result.command_result.?.exit_code);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "DAEMON-STARTED") != null);
+
+    const pids = try readPidsForTest(alloc, pid_path);
+    defer alloc.free(pids);
+    defer stopProcessesForTest(pids);
+    try std.testing.expectEqual(@as(usize, 2), pids.len);
+    for (pids) |pid| {
+        try std.testing.expect(try process_tree.processIsAlive(alloc, pid));
+    }
+}
+
+test "natural command completion returns while a detached daemon keeps command output" {
+    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return;
+
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(workspace);
+    const pid_path = try std.fs.path.join(alloc, &.{ workspace, "output-holder.pid" });
+    defer alloc.free(pid_path);
+    // The daemon keeps a duplicate of the output pipe on a high descriptor,
+    // so end of file never arrives while it runs.
+    const command = try std.fmt.allocPrint(
+        alloc,
+        "python3 -c 'import os,time\n" ++
+            "ready_r,ready_w=os.pipe()\n" ++
+            "if os.fork() == 0:\n" ++
+            " os.close(ready_r)\n" ++
+            " os.setsid()\n" ++
+            " kept=os.dup(1)\n" ++
+            " null=os.open(\"/dev/null\",os.O_RDWR)\n" ++
+            " os.dup2(null,0); os.dup2(null,1); os.dup2(null,2)\n" ++
+            " with open(\"{s}\",\"w\") as f: f.write(str(os.getpid()))\n" ++
+            " os.write(ready_w,b\"R\"); os.close(ready_w)\n" ++
+            " time.sleep(30)\n" ++
+            " os._exit(0)\n" ++
+            "os.close(ready_w)\n" ++
+            "if os.read(ready_r,1) != b\"R\": raise SystemExit(1)\n" ++
+            "print(\"BEFORE-EXIT\", flush=True)'",
+        .{pid_path},
+    );
+    defer alloc.free(command);
+
+    const started_ms = io_mod.milliTimestamp();
+    const result = try executeCommand(.{
+        .max_command_output_bytes = 1024,
+        .timeout_ms = 10_000,
+    }, alloc, command, workspace);
+    defer alloc.free(result.output);
+    const elapsed_ms = io_mod.milliTimestamp() - started_ms;
+    try std.testing.expectEqual(@as(?i64, 0), result.command_result.?.exit_code);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "BEFORE-EXIT") != null);
+    try std.testing.expect(elapsed_ms >= natural_completion_wait_ms);
+    try std.testing.expect(elapsed_ms < 5_000);
+
+    const pids = try readPidsForTest(alloc, pid_path);
+    defer alloc.free(pids);
+    defer stopProcessesForTest(pids);
+    try std.testing.expectEqual(@as(usize, 1), pids.len);
+    try std.testing.expect(try process_tree.processIsAlive(alloc, pids[0]));
+}
+
+test "natural command completion keeps a detached daemon that hides its descriptors" {
+    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return;
+
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(workspace);
+    const pid_path = try std.fs.path.join(alloc, &.{ workspace, "hidden-daemon.pid" });
+    defer alloc.free(pid_path);
+    // Like ssh-agent, the daemon turns off Linux process inspection, then it
+    // closes every descriptor. Neither may decide whether it survives.
+    const command = try std.fmt.allocPrint(
+        alloc,
+        "python3 -c 'import ctypes,os,sys,time\n" ++
+            "ready_r,ready_w=os.pipe()\n" ++
+            "if os.fork() == 0:\n" ++
+            " os.close(ready_r)\n" ++
+            " os.setsid()\n" ++
+            " if sys.platform.startswith(\"linux\"): ctypes.CDLL(None).prctl(4,0,0,0,0)\n" ++
+            " with open(\"{s}\",\"w\") as f: f.write(str(os.getpid()))\n" ++
+            " os.write(ready_w,b\"R\")\n" ++
+            " os.closerange(0,65536)\n" ++
+            " time.sleep(30)\n" ++
+            " os._exit(0)\n" ++
+            "os.close(ready_w)\n" ++
+            "if os.read(ready_r,1) != b\"R\": raise SystemExit(1)\n" ++
+            "time.sleep(0.1)'",
+        .{pid_path},
+    );
+    defer alloc.free(command);
+
+    const result = try executeCommand(.{
+        .max_command_output_bytes = 1024,
+        .timeout_ms = 10_000,
+    }, alloc, command, workspace);
+    defer alloc.free(result.output);
+    try std.testing.expectEqual(@as(?i64, 0), result.command_result.?.exit_code);
+
+    const pids = try readPidsForTest(alloc, pid_path);
+    defer alloc.free(pids);
+    defer stopProcessesForTest(pids);
+    try std.testing.expectEqual(@as(usize, 1), pids.len);
+    try std.testing.expect(try process_tree.processIsAlive(alloc, pids[0]));
+}
+
+test "natural completion drain counts every wait and cuts output only before the leftover is read" {
+    const wait_limit_ns: i128 = natural_completion_wait_ms * std.time.ns_per_ms;
+    var drain: NaturalDrain = .{ .completed_ms = 1_000 };
+    // Leftover output reads without waiting, however slowly it is delivered.
+    drain.record(4096, false, 0);
+    try std.testing.expectEqual(@as(?NaturalDrain.Stop, null), drain.stop(9_000, false, null));
+    try std.testing.expect(drain.cutsCommandOutput(.cancelled));
+    try std.testing.expect(drain.cutsCommandOutput(.deadline));
+    try std.testing.expect(!drain.cutsCommandOutput(.wait_limit));
+    try std.testing.expect(!drain.cutsCommandOutput(.byte_limit));
+
+    // Waits count even when a detached writer's output ends them.
+    drain.record(16, false, wait_limit_ns - 1);
+    try std.testing.expectEqual(@as(?NaturalDrain.Stop, null), drain.stop(9_000, false, null));
+    drain.record(16, false, 1);
+    try std.testing.expectEqual(@as(?NaturalDrain.Stop, .wait_limit), drain.stop(9_000, false, null));
+
+    // A stream reaching end of file restarts a confirmation but proves
+    // nothing about the other stream.
+    drain.confirming = true;
+    drain.record(0, false, 0);
+    try std.testing.expect(!drain.confirming);
+    try std.testing.expect(drain.cutsCommandOutput(.cancelled));
+
+    // A read that finds nothing for a whole poll shows the command's own
+    // output is done.
+    drain.record(0, true, 0);
+    try std.testing.expect(!drain.cutsCommandOutput(.cancelled));
+    try std.testing.expect(!drain.cutsCommandOutput(.deadline));
+
+    var busy: NaturalDrain = .{ .completed_ms = 1_000 };
+    busy.record(0, false, -5);
+    try std.testing.expectEqual(@as(i128, 0), busy.waited_ns);
+    try std.testing.expectEqual(@as(?NaturalDrain.Stop, .cancelled), busy.stop(1_001, true, null));
+    try std.testing.expectEqual(@as(?NaturalDrain.Stop, .deadline), busy.stop(1_500, false, 1_500));
+    try std.testing.expectEqual(@as(?NaturalDrain.Stop, null), busy.stop(1_499, false, 1_500));
+    // The live limit ends only delivery. Reading continues past it.
+    const limit_ms = busy.completed_ms + natural_completion_live_ms;
+    try std.testing.expectEqual(@as(?NaturalDrain.Stop, null), busy.stop(limit_ms + 1, false, null));
+    try std.testing.expectEqual(limit_ms, busy.liveUntilMs(null));
+    try std.testing.expectEqual(@as(i64, 1_500), busy.liveUntilMs(1_500));
+    try std.testing.expectEqual(limit_ms, busy.liveUntilMs(limit_ms + 1));
+    busy.record(natural_completion_drain_max_bytes, false, 0);
+    try std.testing.expectEqual(@as(?NaturalDrain.Stop, .byte_limit), busy.stop(1_499, false, null));
+}
+
+const SlowOutputConsumer = struct {
+    delay_ms: u64,
+    lines: usize = 0,
+
+    fn onChunk(ctx: *anyopaque, _: ?types.ToolLifecycleId, _: CommandOutputStream, bytes: []const u8) !void {
+        const self: *@This() = @ptrCast(@alignCast(ctx));
+        self.lines += std.mem.countScalar(u8, bytes, '\n');
+        io_mod.sleep(self.delay_ms * std.time.ns_per_ms);
+    }
+};
+
+test "natural completion delivers all leftover output to a slow consumer" {
+    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return;
+
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(workspace);
+    // The command exits with its last lines still in the pipe, and delivery
+    // takes 10 ms per line, so draining them takes well over one second.
+    var consumer = SlowOutputConsumer{ .delay_ms = 10 };
+    const result = try executeCommand(.{
+        .max_command_output_bytes = 1024,
+        .timeout_ms = 30_000,
+        .output_chunk_ctx = @ptrCast(&consumer),
+        .on_output_chunk = SlowOutputConsumer.onChunk,
+    }, alloc, "python3 -c 'import sys; sys.stdout.write((\"y\"*99+\"\\n\")*200)'", workspace);
+    defer alloc.free(result.output);
+    const command_result = result.command_result.?;
+    try std.testing.expectEqual(@as(?i64, 0), command_result.exit_code);
+    try std.testing.expectEqual(@as(usize, 20_000), command_result.stdout_bytes);
+    try std.testing.expect(!command_result.output_incomplete);
+}
+
+test "natural command completion stops a same-session process that left the process group" {
+    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return;
+
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(workspace);
+    const pid_path = try std.fs.path.join(alloc, &.{ workspace, "own-group.pid" });
+    defer alloc.free(pid_path);
+    // A process group kill cannot reach this child, so only the session
+    // rule stops it.
+    const command = try std.fmt.allocPrint(
+        alloc,
+        "python3 -c 'import os,time\n" ++
+            "ready_r,ready_w=os.pipe()\n" ++
+            "if os.fork() == 0:\n" ++
+            " os.close(ready_r)\n" ++
+            " os.setpgid(0,0)\n" ++
+            " null=os.open(\"/dev/null\",os.O_RDWR)\n" ++
+            " os.dup2(null,0); os.dup2(null,1); os.dup2(null,2)\n" ++
+            " with open(\"{s}\",\"w\") as f: f.write(str(os.getpid()))\n" ++
+            " os.write(ready_w,b\"R\"); os.close(ready_w)\n" ++
+            " time.sleep(30)\n" ++
+            " os._exit(0)\n" ++
+            "os.close(ready_w)\n" ++
+            "if os.read(ready_r,1) != b\"R\": raise SystemExit(1)'",
+        .{pid_path},
+    );
+    defer alloc.free(command);
+
+    const result = try executeCommand(.{
+        .max_command_output_bytes = 1024,
+        .timeout_ms = 10_000,
+    }, alloc, command, workspace);
+    defer alloc.free(result.output);
+    try std.testing.expectEqual(@as(?i64, 0), result.command_result.?.exit_code);
+
+    const pids = try readPidsForTest(alloc, pid_path);
+    defer alloc.free(pids);
+    defer stopProcessesForTest(pids);
+    try std.testing.expectEqual(@as(usize, 1), pids.len);
+    try expectProcessGone(pids[0]);
+}
+
+test "natural completion keeps its exit when the deadline passes during the output drain" {
+    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return;
+
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(workspace);
+    const pid_path = try std.fs.path.join(alloc, &.{ workspace, "drain-deadline.pid" });
+    defer alloc.free(pid_path);
+    const timeout_ms: usize = 3_000;
+    // The command exits about 800 ms before its deadline while a detached
+    // daemon keeps the output open, so the deadline lands inside the drain.
+    // Its last line has no newline, so only the final flush delivers it live.
+    const command = try std.fmt.allocPrint(
+        alloc,
+        "python3 -c 'import os,sys,time\n" ++
+            "ready_r,ready_w=os.pipe()\n" ++
+            "if os.fork() == 0:\n" ++
+            " os.close(ready_r)\n" ++
+            " os.setsid()\n" ++
+            " kept=os.dup(1)\n" ++
+            " null=os.open(\"/dev/null\",os.O_RDWR)\n" ++
+            " os.dup2(null,0); os.dup2(null,1); os.dup2(null,2)\n" ++
+            " with open(\"{s}\",\"w\") as f: f.write(str(os.getpid()))\n" ++
+            " os.write(ready_w,b\"R\"); os.close(ready_w)\n" ++
+            " time.sleep(30)\n" ++
+            " os._exit(0)\n" ++
+            "os.close(ready_w)\n" ++
+            "if os.read(ready_r,1) != b\"R\": raise SystemExit(1)\n" ++
+            "time.sleep(2.2)\n" ++
+            "sys.stdout.write(\"FINISHED-BEFORE-DEADLINE\"); sys.stdout.flush()'",
+        .{pid_path},
+    );
+    defer alloc.free(command);
+
+    var recorder = LiveOutputRecorder{};
+    defer recorder.delivered.deinit(std.testing.allocator);
+    const started_ms = io_mod.milliTimestamp();
+    const result = try executeCommand(.{
+        .max_command_output_bytes = 1024,
+        .timeout_ms = timeout_ms,
+        .output_chunk_ctx = @ptrCast(&recorder),
+        .on_output_chunk = LiveOutputRecorder.onChunk,
+    }, alloc, command, workspace);
+    defer alloc.free(result.output);
+    const elapsed_ms = io_mod.milliTimestamp() - started_ms;
+    try std.testing.expectEqual(@as(?i64, 0), result.command_result.?.exit_code);
+    try std.testing.expect(
+        std.mem.indexOf(u8, result.output, "FINISHED-BEFORE-DEADLINE") != null,
+    );
+    try std.testing.expect(elapsed_ms < @as(i64, timeout_ms) + 1_000);
+    try std.testing.expect(!result.command_result.?.output_incomplete);
+    try std.testing.expect(std.mem.endsWith(u8, recorder.delivered.items, "FINISHED-BEFORE-DEADLINE"));
+
+    const pids = try readPidsForTest(alloc, pid_path);
+    defer alloc.free(pids);
+    defer stopProcessesForTest(pids);
+    try std.testing.expectEqual(@as(usize, 1), pids.len);
+    try std.testing.expect(try process_tree.processIsAlive(alloc, pids[0]));
+}
+
+test "natural completion stops waiting on a detached daemon that keeps writing" {
+    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return;
+
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(workspace);
+    const pid_path = try std.fs.path.join(alloc, &.{ workspace, "chatty-daemon.pid" });
+    defer alloc.free(pid_path);
+    // The daemon writes to the command's output every 5 ms, so the pipes
+    // never reach end of file and no read waits a whole poll.
+    const command = try std.fmt.allocPrint(
+        alloc,
+        "python3 -c 'import os,time\n" ++
+            "ready_r,ready_w=os.pipe()\n" ++
+            "if os.fork() == 0:\n" ++
+            " os.close(ready_r)\n" ++
+            " os.setsid()\n" ++
+            " with open(\"{s}\",\"w\") as f: f.write(str(os.getpid()))\n" ++
+            " os.write(ready_w,b\"R\"); os.close(ready_w)\n" ++
+            " end=time.time()+30\n" ++
+            " while time.time() < end:\n" ++
+            "  os.write(1,b\"tick\\n\")\n" ++
+            "  time.sleep(0.005)\n" ++
+            " os._exit(0)\n" ++
+            "os.close(ready_w)\n" ++
+            "if os.read(ready_r,1) != b\"R\": raise SystemExit(1)\n" ++
+            "print(\"COMMAND-DONE\", flush=True)'",
+        .{pid_path},
+    );
+    defer alloc.free(command);
+
+    const started_ms = io_mod.milliTimestamp();
+    const result = try executeCommand(.{
+        .max_command_output_bytes = 1024,
+        .timeout_ms = 10_000,
+    }, alloc, command, workspace);
+    defer alloc.free(result.output);
+    const elapsed_ms = io_mod.milliTimestamp() - started_ms;
+
+    const pids = try readPidsForTest(alloc, pid_path);
+    defer alloc.free(pids);
+    defer stopProcessesForTest(pids);
+    const command_result = result.command_result.?;
+    try std.testing.expectEqual(@as(?i64, 0), command_result.exit_code);
+    try std.testing.expect(!command_result.output_incomplete);
+    try std.testing.expect(elapsed_ms < 5_000);
+}
+
+const CancelOnOutput = struct {
+    cancel: *std.atomic.Value(bool),
+    needle: []const u8,
+    /// Matching chunks to receive before cancelling.
+    cancel_after: usize = 1,
+    /// Time each matching chunk takes to deliver.
+    delay_ms: u64 = 0,
+    seen: usize = 0,
+
+    fn onChunk(ctx: *anyopaque, _: ?types.ToolLifecycleId, _: CommandOutputStream, bytes: []const u8) !void {
+        const self: *@This() = @ptrCast(@alignCast(ctx));
+        if (std.mem.indexOf(u8, bytes, self.needle) == null) return;
+        self.seen += 1;
+        io_mod.sleep(self.delay_ms * std.time.ns_per_ms);
+        if (self.seen >= self.cancel_after) self.cancel.store(true, .release);
+    }
+};
+
+test "natural completion ends live delivery of drained output at a cancel" {
+    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return;
+
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(workspace);
+    const pid_path = try std.fs.path.join(alloc, &.{ workspace, "burst-daemon.pid" });
+    defer alloc.free(pid_path);
+    // After the command exits, the daemon writes 200 lines at once, and the
+    // reader takes 20 ms per line and cancels at the 20th.
+    const command = try std.fmt.allocPrint(
+        alloc,
+        "python3 -c 'import os,time\n" ++
+            "ready_r,ready_w=os.pipe()\n" ++
+            "if os.fork() == 0:\n" ++
+            " os.close(ready_r)\n" ++
+            " os.setsid()\n" ++
+            " with open(\"{s}\",\"w\") as f: f.write(str(os.getpid()))\n" ++
+            " os.write(ready_w,b\"R\"); os.close(ready_w)\n" ++
+            " time.sleep(0.3)\n" ++
+            " os.write(1,b\"\".join(b\"DAEMON-LINE-%03d\\n\" % i for i in range(200)))\n" ++
+            " time.sleep(30)\n" ++
+            " os._exit(0)\n" ++
+            "os.close(ready_w)\n" ++
+            "if os.read(ready_r,1) != b\"R\": raise SystemExit(1)\n" ++
+            "print(\"COMMAND-DONE\", flush=True)'",
+        .{pid_path},
+    );
+    defer alloc.free(command);
+
+    var cancel = std.atomic.Value(bool).init(false);
+    var trigger = CancelOnOutput{
+        .cancel = &cancel,
+        .needle = "DAEMON-LINE",
+        .cancel_after = 20,
+        .delay_ms = 20,
+    };
+    const result = try executeCommand(.{
+        .max_command_output_bytes = 1024,
+        .timeout_ms = 10_000,
+        .cancel_flag = &cancel,
+        .output_chunk_ctx = @ptrCast(&trigger),
+        .on_output_chunk = CancelOnOutput.onChunk,
+    }, alloc, command, workspace);
+    defer alloc.free(result.output);
+
+    const pids = try readPidsForTest(alloc, pid_path);
+    defer alloc.free(pids);
+    defer stopProcessesForTest(pids);
+    const command_result = result.command_result.?;
+    try std.testing.expectEqual(@as(usize, 20), trigger.seen);
+    try std.testing.expectEqual(@as(?i64, 0), command_result.exit_code);
+    try std.testing.expect(!command_result.output_incomplete);
+}
+
+test "natural completion keeps complete output when a cancel follows the command's last line" {
+    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return;
+
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(workspace);
+    // Delivering the last line takes long enough for the command to exit
+    // and both pipes to reach end of file before the cancel lands.
+    var cancel = std.atomic.Value(bool).init(false);
+    var trigger = CancelOnOutput{ .cancel = &cancel, .needle = "FINAL-LINE", .delay_ms = 300 };
+    const result = try executeCommand(.{
+        .max_command_output_bytes = 1024,
+        .timeout_ms = 10_000,
+        .cancel_flag = &cancel,
+        .output_chunk_ctx = @ptrCast(&trigger),
+        .on_output_chunk = CancelOnOutput.onChunk,
+    }, alloc, "printf 'FINAL-LINE\\n'", workspace);
+    defer alloc.free(result.output);
+    const command_result = result.command_result.?;
+    try std.testing.expect(cancel.load(.acquire));
+    try std.testing.expectEqual(@as(?i64, 0), command_result.exit_code);
+    try std.testing.expectEqual(@as(?u32, null), command_result.signal);
+    try std.testing.expect(!command_result.output_incomplete);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "FINAL-LINE") != null);
+}
+
+test "natural completion keeps complete output when a cancel follows only daemon output" {
+    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return;
+
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(workspace);
+    const pid_path = try std.fs.path.join(alloc, &.{ workspace, "late-daemon.pid" });
+    defer alloc.free(pid_path);
+    // The daemon writes once after the command exits, and that output
+    // triggers the cancel, so only daemon output is left unread.
+    const command = try std.fmt.allocPrint(
+        alloc,
+        "python3 -c 'import os,time\n" ++
+            "ready_r,ready_w=os.pipe()\n" ++
+            "if os.fork() == 0:\n" ++
+            " os.close(ready_r)\n" ++
+            " os.setsid()\n" ++
+            " with open(\"{s}\",\"w\") as f: f.write(str(os.getpid()))\n" ++
+            " os.write(ready_w,b\"R\"); os.close(ready_w)\n" ++
+            " time.sleep(0.6)\n" ++
+            " os.write(1,b\"LATE-DAEMON-OUTPUT\\n\")\n" ++
+            " time.sleep(30)\n" ++
+            " os._exit(0)\n" ++
+            "os.close(ready_w)\n" ++
+            "if os.read(ready_r,1) != b\"R\": raise SystemExit(1)\n" ++
+            "print(\"COMMAND-DONE\", flush=True)'",
+        .{pid_path},
+    );
+    defer alloc.free(command);
+
+    var cancel = std.atomic.Value(bool).init(false);
+    var trigger = CancelOnOutput{ .cancel = &cancel, .needle = "LATE-DAEMON-OUTPUT" };
+    const started_ms = io_mod.milliTimestamp();
+    const result = try executeCommand(.{
+        .max_command_output_bytes = 1024,
+        .timeout_ms = 10_000,
+        .cancel_flag = &cancel,
+        .output_chunk_ctx = @ptrCast(&trigger),
+        .on_output_chunk = CancelOnOutput.onChunk,
+    }, alloc, command, workspace);
+    defer alloc.free(result.output);
+    const elapsed_ms = io_mod.milliTimestamp() - started_ms;
+
+    const pids = try readPidsForTest(alloc, pid_path);
+    defer alloc.free(pids);
+    defer stopProcessesForTest(pids);
+    const command_result = result.command_result.?;
+    try std.testing.expect(cancel.load(.acquire));
+    try std.testing.expectEqual(@as(?i64, 0), command_result.exit_code);
+    try std.testing.expectEqual(@as(?u32, null), command_result.signal);
+    try std.testing.expect(!command_result.output_incomplete);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "COMMAND-DONE") != null);
+    try std.testing.expect(elapsed_ms < 3_000);
+}
+
+const LiveOutputRecorder = struct {
+    delivered: std.ArrayList(u8) = .empty,
+    calls: usize = 0,
+
+    fn onChunk(ctx: *anyopaque, _: ?types.ToolLifecycleId, _: CommandOutputStream, bytes: []const u8) !void {
+        const self: *@This() = @ptrCast(@alignCast(ctx));
+        self.calls += 1;
+        try self.delivered.appendSlice(std.testing.allocator, bytes);
+    }
+};
+
+test "output emitter delivers each line once and flushes the last partial line after live delivery ends" {
+    const alloc = std.testing.allocator;
+    var recorder = LiveOutputRecorder{};
+    defer recorder.delivered.deinit(alloc);
+    const cfg: Config = .{
+        .max_command_output_bytes = 1024,
+        .output_chunk_ctx = @ptrCast(&recorder),
+        .on_output_chunk = LiveOutputRecorder.onChunk,
+    };
+
+    var emitter: OutputChunkEmitter = .{};
+    defer emitter.deinit(alloc);
+    emitter.emitPending(alloc, &emitter.stdout_pending, .stdout, "one\ntw", cfg, false);
+    emitter.emitPending(alloc, &emitter.stdout_pending, .stdout, "o\nthree\nfour", cfg, false);
+    try std.testing.expectEqualStrings("one\ntwo\nthree\n", recorder.delivered.items);
+    try std.testing.expectEqual(@as(usize, 3), recorder.calls);
+
+    // Once live delivery has ended, the final flush still delivers the last
+    // partial line.
+    emitter.live_until_ms = 0;
+    emitter.flush(alloc, cfg);
+    try std.testing.expectEqualStrings("one\ntwo\nthree\nfour", recorder.delivered.items);
+    try std.testing.expectEqual(@as(usize, 4), recorder.calls);
+
+    // Later lines are collected by the caller but no longer delivered live.
+    var ended: OutputChunkEmitter = .{ .live_until_ms = 0 };
+    defer ended.deinit(alloc);
+    ended.emitPending(alloc, &ended.stdout_pending, .stdout, "late\n", cfg, false);
+    try std.testing.expect(ended.presentation_suppressed);
+    try std.testing.expectEqual(@as(usize, 4), recorder.calls);
+}
+
+test "natural completion marks output incomplete when the deadline cuts leftover output" {
+    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return;
+
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(workspace);
+    // The command exits at once, but delivering its 200 lines takes about
+    // four seconds, so the deadline lands while its output is still unread.
+    var consumer = SlowOutputConsumer{ .delay_ms = 20 };
+    const result = try executeCommand(.{
+        .max_command_output_bytes = 1024,
+        .timeout_ms = 1_000,
+        .output_chunk_ctx = @ptrCast(&consumer),
+        .on_output_chunk = SlowOutputConsumer.onChunk,
+    }, alloc, "python3 -c 'import sys; sys.stdout.write((\"y\"*99+\"\\n\")*200)'", workspace);
+    defer alloc.free(result.output);
+    const command_result = result.command_result.?;
+    try std.testing.expectEqual(@as(?i64, 0), command_result.exit_code);
+    try std.testing.expect(!command_result.timed_out);
+    try std.testing.expect(command_result.output_incomplete);
+    // Live delivery ends at the deadline, so the confirming read is not
+    // delivered line by line.
+    try std.testing.expect(consumer.lines < 100);
+}
+
+/// Reads whitespace-separated PIDs. The caller owns the returned slice.
+fn readPidsForTest(alloc: Allocator, path: []const u8) ![]std.posix.pid_t {
+    const text = try readAbsoluteFile(alloc, path, 256);
+    defer alloc.free(text);
+    var pids: std.ArrayList(std.posix.pid_t) = .empty;
+    errdefer pids.deinit(alloc);
+    var tokens = std.mem.tokenizeAny(u8, text, " \t\r\n");
+    while (tokens.next()) |token| {
+        try pids.append(alloc, try std.fmt.parseInt(std.posix.pid_t, token, 10));
+    }
+    return pids.toOwnedSlice(alloc);
+}
+
+fn stopProcessesForTest(pids: []const std.posix.pid_t) void {
+    for (pids) |pid| std.posix.kill(pid, std.posix.SIG.KILL) catch {};
 }
 
 test "cancellation preserves grace and removes an escaped descendant" {

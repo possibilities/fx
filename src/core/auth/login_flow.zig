@@ -239,6 +239,58 @@ pub const PreparedLogin = struct {
     }
 };
 
+pub const BrowserPreparedOptions = struct {
+    issuer: []const u8,
+    authorization_endpoint_suffix: []const u8,
+    /// Ownership transfers to the returned login on success.
+    token_endpoint: []u8,
+    /// Ownership transfers to the returned login on success.
+    verification_uri: []u8,
+    client_id: []const u8,
+    expires_in: i64,
+};
+
+/// Builds the device-shaped storage used by browser OAuth flows. On failure,
+/// caller-owned option fields remain owned by the caller.
+pub fn prepareBrowserLogin(
+    alloc: Allocator,
+    options: BrowserPreparedOptions,
+) !PreparedLogin {
+    const issuer = try alloc.dupe(u8, options.issuer);
+    errdefer alloc.free(issuer);
+    const authorization_endpoint = try std.fmt.allocPrint(
+        alloc,
+        "{s}{s}",
+        .{
+            std.mem.trimEnd(u8, options.issuer, "/"),
+            options.authorization_endpoint_suffix,
+        },
+    );
+    errdefer alloc.free(authorization_endpoint);
+    const device_code = try alloc.dupe(u8, "");
+    errdefer secret.zeroAndFree(alloc, device_code);
+    const user_code = try alloc.dupe(u8, "");
+    errdefer alloc.free(user_code);
+    const client_id = try alloc.dupe(u8, options.client_id);
+    errdefer alloc.free(client_id);
+
+    return .{
+        .metadata = .{
+            .issuer = issuer,
+            .device_authorization_endpoint = authorization_endpoint,
+            .token_endpoint = options.token_endpoint,
+        },
+        .device = .{
+            .device_code = device_code,
+            .user_code = user_code,
+            .verification_uri = options.verification_uri,
+            .expires_in = options.expires_in,
+            .interval = 1,
+        },
+        .client_id = client_id,
+    };
+}
+
 pub const CompleteSignInFn = *const fn (
     ?*anyopaque,
     Allocator,
@@ -1488,6 +1540,45 @@ fn check_take_login_session_allocation_failures(alloc: Allocator) !void {
 fn freeTeams(alloc: Allocator, teams: *std.ArrayList(Team)) void {
     for (teams.items) |*team| team.deinit(alloc);
     teams.deinit(alloc);
+}
+
+fn checkBrowserPreparedAllocationFailures(alloc: Allocator) !void {
+    const token_endpoint = try alloc.dupe(u8, "https://issuer.test/token");
+    var token_endpoint_owned = true;
+    errdefer if (token_endpoint_owned) alloc.free(token_endpoint);
+    const verification_uri = try alloc.dupe(u8, "https://issuer.test/authorize?state=state");
+    var verification_uri_owned = true;
+    errdefer if (verification_uri_owned) alloc.free(verification_uri);
+
+    var prepared = try prepareBrowserLogin(alloc, .{
+        .issuer = "https://issuer.test",
+        .authorization_endpoint_suffix = "/authorize",
+        .token_endpoint = token_endpoint,
+        .verification_uri = verification_uri,
+        .client_id = "client",
+        .expires_in = 300,
+    });
+    token_endpoint_owned = false;
+    verification_uri_owned = false;
+    defer prepared.deinit(alloc);
+
+    try std.testing.expectEqualStrings(
+        "https://issuer.test/authorize",
+        prepared.metadata.device_authorization_endpoint,
+    );
+    try std.testing.expectEqualStrings(
+        "https://issuer.test/authorize?state=state",
+        prepared.device.verification_uri,
+    );
+    try std.testing.expectEqualStrings("client", prepared.client_id);
+}
+
+test "browser login preparation cleans up allocation failures" {
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        checkBrowserPreparedAllocationFailures,
+        .{},
+    );
 }
 
 test "team parsing cleans up allocation failures" {
