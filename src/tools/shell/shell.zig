@@ -7,6 +7,7 @@ const debug_trace = @import("../../core/shared/debug_trace.zig");
 const managed_execution = @import("../../core/execution/managed_execution.zig");
 const managed_contract = @import("../../core/execution/managed_execution_contract.zig");
 const io_mod = @import("../../core/shared/io.zig");
+const mem_utils = @import("../../core/shared/mem_utils.zig");
 const pathing = @import("../../core/workspace/pathing.zig");
 const terminal_identity = @import("../../core/terminal/identity.zig");
 const terminal_action_executor = @import("../../core/terminal/action_executor.zig");
@@ -14,6 +15,7 @@ const terminal_managed_observer = @import("../../core/terminal/managed_observer.
 const terminal_operation = @import("../../core/terminal/operation.zig");
 const terminal_store = @import("../../core/terminal/store.zig");
 const shell_resolver = @import("../../core/terminal/shell_resolver.zig");
+const shell_snapshot = @import("../../core/terminal/shell_snapshot.zig");
 const sort_utils = @import("../../core/shared/sort_utils.zig");
 const terminal_contracts = @import("../../core/terminal/contracts.zig");
 const tool_args = @import("../../core/tooling/tool_args.zig");
@@ -51,6 +53,7 @@ pub const Input = struct {
     tty: bool = false,
     yield_time_ms: u32 = managed_contract.default_yield_time_ms,
     timeout_ms: ?u64 = null,
+    reload: bool = false,
     session_id: ?[]const u8 = null,
     chars: ?[]const u8 = null,
     force: bool = false,
@@ -72,7 +75,7 @@ pub const ActionFieldContract = struct {
 pub fn actionFieldContract(action: Action) ActionFieldContract {
     return switch (action) {
         .run => .{
-            .allowed = &.{ "action", "command", "cwd", "profile", "shell", "tty", "yield_time_ms", "timeout_ms" },
+            .allowed = &.{ "action", "command", "cwd", "profile", "shell", "tty", "yield_time_ms", "timeout_ms", "reload" },
             .required = &.{ "action", "command" },
             .conflicts = &.{.{ "profile", "shell" }},
         },
@@ -110,7 +113,7 @@ fn decode_input(
     args_json: []const u8,
 ) tool_dispatch.DispatchError!?tool_dispatch.ToolInput {
     var arena_state = std.heap.ArenaAllocator.init(ctx.allocator);
-    defer arena_state.deinit();
+    defer mem_utils.deinit_arena(arena_state);
     const arena = arena_state.allocator();
     var raw = std.json.parseFromSliceLeaky(
         std.json.Value,
@@ -181,7 +184,7 @@ fn effective_interact_yield_time(has_input: bool, requested_ms: u32) u32 {
 // Advisory only: none of these values enters the executable decode path.
 fn request_correction(alloc: Allocator, args_json: []const u8, supports_tty: bool) Allocator.Error![]u8 {
     var arena_state = std.heap.ArenaAllocator.init(alloc);
-    defer arena_state.deinit();
+    defer mem_utils.deinit_arena(arena_state);
     const arena = arena_state.allocator();
     if (args_json.len > 16 * 1024) {
         return correction_json(alloc, &.{"Request is too large to suggest a repair; submit the intended action with only its required fields."}, null);
@@ -465,7 +468,7 @@ pub fn validate(
 ) tool_dispatch.DispatchError!?[]u8 {
     const input = erased.as(OwnedInput).value;
     var arena_state = std.heap.ArenaAllocator.init(ctx.allocator);
-    defer arena_state.deinit();
+    defer mem_utils.deinit_arena(arena_state);
     const arena = arena_state.allocator();
     return switch (input.action) {
         .run => validateRun(ctx, arena, input),
@@ -533,8 +536,11 @@ fn callRun(
         else => return unavailable(ctx),
     };
     const command = input.command orelse return unavailable(ctx);
+    // Admission never lets a remembered grant authorize a reload, so the
+    // command runs under the startup files its approval was given for.
+    if (input.reload) shell_snapshot.processOwner().markDirty(.agent_reload);
     var request_arena_state = std.heap.ArenaAllocator.init(ctx.allocator);
-    defer request_arena_state.deinit();
+    defer mem_utils.deinit_arena(request_arena_state);
     const request_arena = request_arena_state.allocator();
     const cwd = resolveCwd(request_arena, ctx, input.cwd) catch |err| {
         if (err == error.OutOfMemory) return error.OutOfMemory;
@@ -586,7 +592,39 @@ fn callRun(
         return runtimeFailure(ctx, err);
     };
     defer prepared.deinit(ctx.allocator);
-    return finishPrepared(ctx, runtime, &prepared, .command);
+    const result = try finishPrepared(ctx, runtime, &prepared, .command);
+    return attachSnapshotNotice(ctx.allocator, result) catch |err| {
+        result.deinit(ctx.allocator);
+        return err;
+    };
+}
+
+/// Adds the pending shell snapshot fallback notice to a JSON run result, so
+/// the model and ACP clients learn once that startup files run per command.
+fn attachSnapshotNotice(
+    alloc: Allocator,
+    result: tool_dispatch.ToolResult,
+) Allocator.Error!tool_dispatch.ToolResult {
+    const body = switch (result) {
+        .success, .failure => |value| value,
+        .rich => return result,
+    };
+    if (body.len == 0 or body[body.len - 1] != '}') return result;
+    const notice = (try shell_snapshot.processOwner().takeResultNotice(alloc)) orelse return result;
+    defer alloc.free(notice);
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    errdefer out.deinit();
+    out.writer.writeAll(body[0 .. body.len - 1]) catch return error.OutOfMemory;
+    out.writer.writeAll(",\"notice\":") catch return error.OutOfMemory;
+    std.json.Stringify.value(notice, .{}, &out.writer) catch return error.OutOfMemory;
+    out.writer.writeByte('}') catch return error.OutOfMemory;
+    const updated = try out.toOwnedSlice();
+    alloc.free(body);
+    return switch (result) {
+        .success => .{ .success = updated },
+        .failure => .{ .failure = updated },
+        .rich => unreachable,
+    };
 }
 
 fn callInteract(
@@ -595,8 +633,11 @@ fn callInteract(
 ) tool_dispatch.DispatchError!tool_dispatch.ToolResult {
     const runtime = ctx.managed_executions orelse return unavailable(ctx);
     const session_id = input.session_id orelse return unavailable(ctx);
-    ensureOwnedTtyIndexed(ctx, runtime, session_id) catch |err|
-        return runtimeFailure(ctx, err);
+    switch (ensureOwnedTtyIndexed(ctx, runtime, session_id) catch |err|
+        return runtimeFailure(ctx, err)) {
+        .indexed => {},
+        .ended_with_owner => return terminalEndedWithOwner(ctx, session_id),
+    }
     const chars = input.chars orelse "";
     const yield_time_ms = effective_interact_yield_time(chars.len != 0, input.yield_time_ms);
     if (runtime.isTombstone(session_id)) {
@@ -629,8 +670,11 @@ fn callStop(
 ) tool_dispatch.DispatchError!tool_dispatch.ToolResult {
     const runtime = ctx.managed_executions orelse return unavailable(ctx);
     const session_id = input.session_id orelse return unavailable(ctx);
-    ensureOwnedTtyIndexed(ctx, runtime, session_id) catch |err|
-        return runtimeFailure(ctx, err);
+    switch (ensureOwnedTtyIndexed(ctx, runtime, session_id) catch |err|
+        return runtimeFailure(ctx, err)) {
+        .indexed => {},
+        .ended_with_owner => return terminalEndedWithOwner(ctx, session_id),
+    }
     if (runtime.isTombstone(session_id)) {
         if (runtime.retainedTerminalSnapshot(ctx.allocator, session_id) catch |err|
             return runtimeFailure(ctx, err)) |retained|
@@ -687,7 +731,7 @@ fn callTtyRun(
     };
     defer ctx.allocator.free(@constCast(cwd));
     var shell_arena_state = std.heap.ArenaAllocator.init(ctx.allocator);
-    defer shell_arena_state.deinit();
+    defer mem_utils.deinit_arena(shell_arena_state);
     var login_shell_buffer: [4096]u8 = undefined;
     const configured = shell_resolver.configuredLoginShellInto(&login_shell_buffer);
     const shell = ttyShell(shell_arena_state.allocator(), input, configured) catch |err|
@@ -1240,10 +1284,28 @@ fn ensureOwnedTtyIndexed(
     ctx: tool_dispatch.DispatchContext,
     runtime: *managed_execution.Runtime,
     session_id: []const u8,
-) !void {
-    if (runtime.stateFor(session_id) != null) return;
-    const observer = ttyObserverContext(ctx, runtime) orelse return;
-    try terminal_managed_observer.syncOwned(observer);
+) !terminal_managed_observer.SyncOutcome {
+    if (runtime.stateFor(session_id) != null) return .indexed;
+    const observer = ttyObserverContext(ctx, runtime) orelse return .indexed;
+    return terminal_managed_observer.syncOwned(observer, session_id);
+}
+
+/// Terminals end with the fx process that starts them and are never
+/// reattached, so the agent is told to start a new one.
+fn terminalEndedWithOwner(
+    ctx: tool_dispatch.DispatchContext,
+    session_id: []const u8,
+) tool_dispatch.DispatchError!tool_dispatch.ToolResult {
+    var out: std.Io.Writer.Allocating = .init(ctx.allocator);
+    errdefer out.deinit();
+    std.json.Stringify.value(.{ .@"error" = .{
+        .tool = "shell",
+        .code = tool_result_errors.terminal_ended_error_code,
+        .session_id = session_id,
+        .message = "This terminal ended when the fx process that started it exited. It cannot be resumed. Start a new terminal with shell action run and tty true.",
+        .retryable = false,
+    } }, .{}, &out.writer) catch return error.OutOfMemory;
+    return .{ .failure = try out.toOwnedSlice() };
 }
 
 fn refreshTtyExecution(
@@ -1829,7 +1891,7 @@ pub fn isIrreversible(_: tool_dispatch.ToolInput) bool {
 test "shell action fields are closed and command authority covers every run" {
     try std.testing.expectEqualSlices(
         []const u8,
-        &.{ "action", "command", "cwd", "profile", "shell", "tty", "yield_time_ms", "timeout_ms" },
+        &.{ "action", "command", "cwd", "profile", "shell", "tty", "yield_time_ms", "timeout_ms", "reload" },
         actionFieldContract(.run).allowed,
     );
     try std.testing.expectEqualSlices(
@@ -2645,8 +2707,6 @@ test "registered shell empty observation waits through one managed execution" {
             .source = .yolo,
         },
     };
-    var start_status_detail: ?[]u8 = null;
-    defer if (start_status_detail) |detail| alloc.free(detail);
     const started = try tool_dispatch.dispatchAuthorizedToolCall(
         .{
             .allocator = alloc,
@@ -2668,7 +2728,6 @@ test "registered shell empty observation waits through one managed execution" {
             .name = "shell",
             .arguments_json = "{\"action\":\"run\",\"command\":\"sleep 2; printf done\",\"cwd\":\"/tmp\",\"profile\":\"clean\",\"yield_time_ms\":0}",
         },
-        &start_status_detail,
     );
     defer started.deinit(alloc);
     try std.testing.expectEqual(tool_dispatch.DispatchResult.Status.success, started.status);
@@ -2684,8 +2743,6 @@ test "registered shell empty observation waits through one managed execution" {
     );
     defer alloc.free(interact_arguments);
 
-    var wait_status_detail: ?[]u8 = null;
-    defer if (wait_status_detail) |detail| alloc.free(detail);
     var command_result_json: ?[]const u8 = null;
     defer if (command_result_json) |json| alloc.free(@constCast(json));
     var tool_result_memory: ?types.ToolResultMemory = null;
@@ -2711,7 +2768,6 @@ test "registered shell empty observation waits through one managed execution" {
             .name = "shell",
             .arguments_json = interact_arguments,
         },
-        &wait_status_detail,
     );
     defer waited.deinit(alloc);
     try std.testing.expectEqual(tool_dispatch.DispatchResult.Status.success, waited.status);
@@ -2782,4 +2838,31 @@ test "shell delivery advances only after result commit" {
         replayed.snapshot.execution_id,
         replayed.reservation_id,
     );
+}
+
+fn timedOutSnapshotCapture(_: shell_snapshot.CaptureRequest) shell_snapshot.CaptureOutcome {
+    return .{ .failed = .timed_out };
+}
+
+test "shell run result carries a snapshot fallback notice once" {
+    const alloc = std.testing.allocator;
+    shell_snapshot.resetProcessOwnerForTest(timedOutSnapshotCapture);
+    defer shell_snapshot.resetProcessOwnerForTest(shell_snapshot.real_capture_fn);
+    try std.testing.expect((try shell_snapshot.processOwner().acquire("/bin/zsh", "/tmp", .{})) == .full_startup);
+
+    const plain = try attachSnapshotNotice(alloc, .{ .failure = try alloc.dupe(u8, "shell result is unavailable") });
+    defer plain.deinit(alloc);
+    try std.testing.expectEqualStrings("shell result is unavailable", plain.failure);
+
+    const first = try attachSnapshotNotice(alloc, .{ .success = try alloc.dupe(u8, "{\"state\":\"completed\"}") });
+    defer first.deinit(alloc);
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, first.success, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("completed", parsed.value.object.get("state").?.string);
+    const notice = parsed.value.object.get("notice").?.string;
+    try std.testing.expect(std.mem.find(u8, notice, "did not finish within 10 s") != null);
+
+    const second = try attachSnapshotNotice(alloc, .{ .success = try alloc.dupe(u8, "{\"state\":\"completed\"}") });
+    defer second.deinit(alloc);
+    try std.testing.expectEqualStrings("{\"state\":\"completed\"}", second.success);
 }

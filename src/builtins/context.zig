@@ -1,7 +1,6 @@
 const std = @import("std");
 const debug_trace = @import("../core/shared/debug_trace.zig");
 const host = @import("../core/hosts/host.zig");
-const host_target = @import("../core/hosts/target.zig");
 const io_mod = @import("../core/shared/io.zig");
 const model_context_encoding = @import("../core/shared/model_context_encoding.zig");
 const pathing = @import("../core/workspace/pathing.zig");
@@ -26,8 +25,39 @@ const StaticContextInput = context_contract.StaticContextInput;
 const TransientContextInput = context_contract.TransientContextInput;
 const workspace_access = @import("../core/workspace/workspace_access.zig");
 const sort_utils = @import("../core/shared/sort_utils.zig");
+const shell_resolver = @import("../core/terminal/shell_resolver.zig");
 
 pub const gateway_system_prompt = @embedFile("system_prompt.md");
+
+const terminal_identity = "You are fx, a local coding CLI assistant with tool access.";
+const terminal_rendering = "Write responses in GitHub-flavored Markdown, which fx renders in the terminal.";
+const terminal_table_emphasis = "Use bold sparingly, and never inside tables, since fx already bolds table headers.";
+
+/// The base prompt for hosts that present fx inside another application
+/// rather than a terminal. Only the terminal identity and rendering claims
+/// differ; a wording change in the base prompt fails the build here.
+pub const embedded_system_prompt = embedded: {
+    @setEvalBranchQuota(4_000_000);
+    var text: []const u8 = gateway_system_prompt;
+    text = replaceOnce(
+        text,
+        terminal_identity,
+        "You are fx, a coding agent with tool access. A client application hosts this conversation and displays your replies; do not describe yourself as running in a terminal.",
+    );
+    text = replaceOnce(text, terminal_rendering, "Write responses in GitHub-flavored Markdown, which the client application renders.");
+    text = replaceOnce(text, terminal_table_emphasis, "Use bold sparingly.");
+    const final = text[0..text.len].*;
+    break :embedded &final;
+};
+
+fn replaceOnce(comptime haystack: []const u8, comptime needle: []const u8, comptime replacement: []const u8) []const u8 {
+    const index = std.mem.find(u8, haystack, needle) orelse
+        @compileError("system prompt no longer contains: " ++ needle);
+    if (std.mem.find(u8, haystack[index + needle.len ..], needle) != null) {
+        @compileError("system prompt repeats: " ++ needle);
+    }
+    return haystack[0..index] ++ replacement ++ haystack[index + needle.len ..];
+}
 
 pub fn modelPromptOverlay(model: []const u8) ?[]const u8 {
     _ = model;
@@ -36,6 +66,7 @@ pub fn modelPromptOverlay(model: []const u8) ?[]const u8 {
 
 pub const prompt_policy = prompt_policy_contract.Policy{
     .system_prompt = gateway_system_prompt,
+    .embedded_system_prompt = embedded_system_prompt,
     .model_prompt_overlay_fn = modelPromptOverlay,
 };
 
@@ -90,6 +121,12 @@ const RuleLoad = union(enum) {
     omitted: context_contract.OmissionReason,
 };
 
+/// How a selection reads candidate rule files once instruction files are available.
+const RuleFiles = union(enum) {
+    filesystem,
+    host: context_contract.InstructionFileReader,
+};
+
 const ReconstructionBudget = struct {
     const candidate_limit = 128;
     const read_limit = 64 * 1024 * 1024;
@@ -134,7 +171,7 @@ const SelectionOptions = struct {
     profile_home: ?[]const u8 = null,
     initial: bool,
     bounded_reconstruction: bool = false,
-    load_project_instruction_files: bool = true,
+    instruction_files: context_contract.InstructionFiles = .filesystem,
     context_limits: context_limits.Values = .{},
 };
 
@@ -198,12 +235,12 @@ const SelectionScratch = struct {
     }
 };
 
-fn loadsProjectInstructionFiles() bool {
-    return !host_target.is_wasm;
-}
-
 fn gatherProjectContext(alloc: Allocator, input: InitialContextInput) context_contract.ProviderError!ProviderContext {
-    const home = io_mod.getenv("HOME");
+    const home: ?[]const u8 = switch (input.instruction_files) {
+        .filesystem => io_mod.getenv("HOME"),
+        .host => |host_files| host_files.home,
+        .host_unreadable, .none => null,
+    };
     return gatherProjectContextWithHomes(
         alloc,
         input,
@@ -235,7 +272,7 @@ fn gatherProjectContextWithHomes(
         .profile_home = profile_home,
         .initial = true,
         .bounded_reconstruction = input.bounded_reconstruction,
-        .load_project_instruction_files = loadsProjectInstructionFiles(),
+        .instruction_files = input.instruction_files,
         .context_limits = input.context_limits,
     });
 }
@@ -247,7 +284,7 @@ fn selectApplicableProjectContext(alloc: Allocator, input: LaterContextInput) co
         .delivered_sources = input.delivered_sources,
         .evaluated_endpoints = input.evaluated_endpoints,
         .initial = false,
-        .load_project_instruction_files = loadsProjectInstructionFiles(),
+        .instruction_files = input.instruction_files,
         .context_limits = input.context_limits,
     });
 }
@@ -275,17 +312,37 @@ fn selectProjectContext(alloc: Allocator, options: SelectionOptions) context_con
         try scratch.addRankingEndpoint(options.workspace_root);
     }
 
-    if (options.load_project_instruction_files) {
+    const rule_files: ?RuleFiles = switch (options.instruction_files) {
+        .filesystem => .filesystem,
+        .host => |host_files| .{ .host = host_files.reader },
+        .host_unreadable => blk: {
+            if (options.initial) {
+                const source = if (std.fs.path.isAbsolute(options.workspace_root))
+                    try std.fs.path.join(arena, &.{ options.workspace_root, "AGENTS.md" })
+                else
+                    options.workspace_root;
+                try scratch.addOmission(source, .host_unreadable);
+            }
+            break :blk null;
+        },
+        .none => null,
+    };
+
+    var usable: std.ArrayList(*RuleCandidate) = .empty;
+    if (rule_files) |files| {
         if (options.initial) {
             if (options.profile_home) |profile_home| {
-                const canonical_profile_home: ?[]u8 = io_mod.realpathAlloc(arena, profile_home) catch |err| blk: {
-                    if (err == error.OutOfMemory) return error.OutOfMemory;
-                    try scratch.addOmission(profile_home, .home_unavailable);
-                    break :blk null;
+                const canonical_profile_home: ?[]const u8 = switch (files) {
+                    .filesystem => io_mod.realpathAlloc(arena, profile_home) catch |err| blk: {
+                        if (err == error.OutOfMemory) return error.OutOfMemory;
+                        try scratch.addOmission(profile_home, .home_unavailable);
+                        break :blk null;
+                    },
+                    .host => profile_home,
                 };
                 if (canonical_profile_home) |profile_root| {
                     global_source_path = try std.fs.path.join(arena, &.{ profile_root, ".fx", "AGENTS.md" });
-                    global_rule = try loadRuleForSelection(arena, &scratch, global_source_path.?, options.context_limits.project_instruction_file_bytes);
+                    global_rule = try loadRuleForSelection(arena, &scratch, files, global_source_path.?, options.context_limits.project_instruction_file_bytes);
                 }
             } else {
                 try scratch.addOmission("HOME", .home_unavailable);
@@ -293,10 +350,14 @@ fn selectProjectContext(alloc: Allocator, options: SelectionOptions) context_con
 
             var launch_home: ?[]const u8 = null;
             if (options.home) |home| {
-                const canonical_home: ?[]u8 = io_mod.realpathAlloc(arena, home) catch |err| blk: {
-                    if (err == error.OutOfMemory) return error.OutOfMemory;
-                    try scratch.addOmission(home, .home_unavailable);
-                    break :blk null;
+                const canonical_home: ?[]const u8 = switch (files) {
+                    .filesystem => io_mod.realpathAlloc(arena, home) catch |err| blk: {
+                        if (err == error.OutOfMemory) return error.OutOfMemory;
+                        try scratch.addOmission(home, .home_unavailable);
+                        break :blk null;
+                    },
+                    // Host homes are validated, normalized absolute host paths.
+                    .host => home,
                 };
                 if (canonical_home) |home_root| {
                     if (pathing.pathInside(home_root, options.workspace_root)) {
@@ -318,7 +379,7 @@ fn selectProjectContext(alloc: Allocator, options: SelectionOptions) context_con
                 if (global_source_path == null or
                     !std.mem.eql(u8, global_source_path.?, project_source))
                 {
-                    project_rule = try loadRuleForSelection(arena, &scratch, project_source, options.context_limits.project_instruction_file_bytes);
+                    project_rule = try loadRuleForSelection(arena, &scratch, files, project_source, options.context_limits.project_instruction_file_bytes);
                 }
             } else {
                 try scratch.addOmission(options.workspace_root, .unsafe_target);
@@ -332,19 +393,18 @@ fn selectProjectContext(alloc: Allocator, options: SelectionOptions) context_con
         for (options.targets) |target| {
             try collectTargetCandidates(arena, &scratch, options, target);
         }
-    }
 
-    var usable: std.ArrayList(*RuleCandidate) = .empty;
-    for (scratch.candidates.items) |*candidate| {
-        switch (try loadRuleWithBudget(arena, candidate.source, options.context_limits.project_instruction_file_bytes, if (scratch.work_budget) |*budget| budget else null)) {
-            .body => |body| {
-                candidate.body = body.text;
-                candidate.observed_bytes = body.observed_bytes;
-                candidate.distance = minimumDistance(candidate.scope, scratch.ranking_endpoints.items);
-                try usable.append(arena, candidate);
-            },
-            .missing, .blank => {},
-            .omitted => |reason| try scratch.addOmission(candidate.source, reason),
+        for (scratch.candidates.items) |*candidate| {
+            switch (try loadRuleWithBudget(arena, files, candidate.source, options.context_limits.project_instruction_file_bytes, if (scratch.work_budget) |*budget| budget else null)) {
+                .body => |body| {
+                    candidate.body = body.text;
+                    candidate.observed_bytes = body.observed_bytes;
+                    candidate.distance = minimumDistance(candidate.scope, scratch.ranking_endpoints.items);
+                    try usable.append(arena, candidate);
+                },
+                .missing, .blank => {},
+                .omitted => |reason| try scratch.addOmission(candidate.source, reason),
+            }
         }
     }
 
@@ -437,6 +497,7 @@ fn selectProjectContext(alloc: Allocator, options: SelectionOptions) context_con
 fn loadRuleForSelection(
     arena: Allocator,
     scratch: *SelectionScratch,
+    files: RuleFiles,
     source: []const u8,
     limit: context_limits.Resolved,
 ) !?LoadedRule {
@@ -450,7 +511,7 @@ fn loadRuleForSelection(
             },
         }
     }
-    switch (try loadRuleWithBudget(arena, source, limit, if (scratch.work_budget) |*budget| budget else null)) {
+    switch (try loadRuleWithBudget(arena, files, source, limit, if (scratch.work_budget) |*budget| budget else null)) {
         .body => |body| {
             try scratch.addDelivered(source);
             return .{ .source = source, .body = body.text, .observed_bytes = body.observed_bytes };
@@ -541,10 +602,81 @@ fn appendRuleCandidate(
 }
 
 fn loadRule(arena: Allocator, path: []const u8, limit: context_limits.Resolved) Allocator.Error!RuleLoad {
-    return loadRuleWithBudget(arena, path, limit, null);
+    return loadFilesystemRule(arena, path, limit, null);
 }
 
 fn loadRuleWithBudget(
+    arena: Allocator,
+    files: RuleFiles,
+    path: []const u8,
+    limit: context_limits.Resolved,
+    work_budget: ?*ReconstructionBudget,
+) Allocator.Error!RuleLoad {
+    return switch (files) {
+        .filesystem => loadFilesystemRule(arena, path, limit, work_budget),
+        .host => |reader| loadHostRule(arena, reader, path, limit, work_budget),
+    };
+}
+
+/// Bytes a loader reads for one rule: the line-safe prefix plus one UTF-8 sequence.
+fn ruleReadLength(limit: context_limits.Resolved) usize {
+    return @min(limit.effectiveBytes() +| 3, context_limits.emergency_ceiling_bytes);
+}
+
+/// The model-visible body of a rule whose first bytes are `prefix`. Borrows `prefix`.
+fn ruleBody(prefix: []const u8, observed_bytes: usize, limit: context_limits.Resolved) RuleLoad {
+    const prefix_len = context_limits.lineSafePrefixLength(prefix, limit.effectiveBytes());
+    const trimmed = std.mem.trim(u8, prefix[0..prefix_len], trim_chars);
+    return .{ .body = .{ .text = trimmed, .observed_bytes = observed_bytes } };
+}
+
+fn hostReadLength(limit: context_limits.Resolved, max_read_bytes: usize) usize {
+    return @min(ruleReadLength(limit), max_read_bytes);
+}
+
+fn loadHostRule(
+    arena: Allocator,
+    reader: context_contract.InstructionFileReader,
+    path: []const u8,
+    limit: context_limits.Resolved,
+    work_budget: ?*ReconstructionBudget,
+) Allocator.Error!RuleLoad {
+    const read_len = hostReadLength(limit, reader.max_read_bytes);
+    // Reserve the bounded read before it happens; the host cannot report size first.
+    if (work_budget) |budget| {
+        if (!budget.admit_reads(read_len, 0)) return .{ .omitted = .oversized };
+    }
+    const read = reader.read(arena, path, read_len) catch |err| return switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        error.HostUnreadable => .{ .omitted = .host_unreadable },
+        error.UnsafePath => .{ .omitted = .unsafe_target },
+        error.Unreadable => .{ .omitted = .unreadable },
+    };
+    const file = read orelse return .missing;
+    return classifyHostRule(file, limit, reader.max_read_bytes);
+}
+
+/// Applies the filesystem loader's size, encoding, and prefix rules to bytes a
+/// host delivered. The result borrows `file.bytes`.
+fn classifyHostRule(file: context_contract.InstructionFile, limit: context_limits.Resolved, max_read_bytes: usize) RuleLoad {
+    if (file.total_bytes > context_limits.emergency_ceiling_bytes) return .{ .omitted = .oversized };
+    const observed_bytes: usize = @intCast(file.total_bytes);
+    const read_len = hostReadLength(limit, max_read_bytes);
+    if (file.bytes.len != @min(observed_bytes, read_len)) return .{ .omitted = .unreadable };
+    // A host bound below the rule's prefix would otherwise truncate it silently.
+    if (observed_bytes > read_len and read_len < ruleReadLength(limit)) return .{ .omitted = .oversized };
+
+    var validator: text_utils.IncrementalUtf8Validator = .{};
+    validator.append(file.bytes) catch return .{ .omitted = .unreadable };
+    const complete = file.bytes.len == observed_bytes;
+    if (complete) validator.finish() catch return .{ .omitted = .unreadable };
+    // Unread bytes past the prefix count as content, as the filesystem loader
+    // would see them while validating the whole file.
+    if (complete and std.mem.trim(u8, file.bytes, trim_chars).len == 0) return .blank;
+    return ruleBody(file.bytes, observed_bytes, limit);
+}
+
+fn loadFilesystemRule(
     arena: Allocator,
     path: []const u8,
     limit: context_limits.Resolved,
@@ -603,10 +735,7 @@ fn loadRuleWithBudget(
     const observed_bytes = std.math.cast(usize, opened_stat.size) orelse return .{ .omitted = .oversized };
     if (observed_bytes > context_limits.emergency_ceiling_bytes) return .{ .omitted = .oversized };
 
-    const read_len = @min(
-        observed_bytes,
-        @min(limit.effectiveBytes() +| 3, context_limits.emergency_ceiling_bytes),
-    );
+    const read_len = @min(observed_bytes, ruleReadLength(limit));
     if (work_budget) |budget| {
         if (!budget.admit_reads(observed_bytes, read_len)) return .{ .omitted = .oversized };
     }
@@ -617,9 +746,7 @@ fn loadRuleWithBudget(
     const bytes_read = file.readPositionalAll(io_mod.getIo(), content, 0) catch
         return .{ .omitted = .unreadable };
     if (bytes_read != read_len) return .{ .omitted = .unreadable };
-    const prefix_len = context_limits.lineSafePrefixLength(content, limit.effectiveBytes());
-    const trimmed = std.mem.trim(u8, content[0..prefix_len], trim_chars);
-    return .{ .body = .{ .text = trimmed, .observed_bytes = observed_bytes } };
+    return ruleBody(content, observed_bytes, limit);
 }
 
 fn validateRuleUtf8(file: *std.Io.File, byte_count: usize) !bool {
@@ -854,6 +981,7 @@ fn writeOmissionRepair(writer: *std.Io.Writer, reason: context_contract.Omission
         .non_regular => try writer.writeAll("replace the source with a regular file"),
         .symlink => try writer.writeAll("replace the symlink with a regular file"),
         .selection_cap => try writer.writeAll("reduce applicable AGENTS.md files"),
+        .host_unreadable => try writer.writeAll("add readFile to the host workspace adapter"),
     }
 }
 
@@ -1053,7 +1181,7 @@ test "reconstruction budget omits file before validation and does not deliver it
         .arena = arena_state.allocator(),
         .work_budget = .{ .admitted_read_bytes = ReconstructionBudget.read_limit - 7 },
     };
-    try std.testing.expectEqual(@as(?LoadedRule, null), try loadRuleForSelection(scratch.arena, &scratch, source, (context_limits.Values{}).project_instruction_file_bytes));
+    try std.testing.expectEqual(@as(?LoadedRule, null), try loadRuleForSelection(scratch.arena, &scratch, .filesystem, source, (context_limits.Values{}).project_instruction_file_bytes));
     try std.testing.expectEqual(@as(usize, 0), scratch.delivered_sources.items.len);
     try std.testing.expectEqual(@as(usize, 1), scratch.omissions.items.len);
     try std.testing.expectEqual(context_contract.OmissionReason.oversized, scratch.omissions.items[0].reason);
@@ -1772,8 +1900,295 @@ test "later added-root targets are evaluated without loading added instructions"
     try std.testing.expect(std.mem.find(u8, context.modelVisibleBytes(), "target outside workspace") == null);
 }
 
-test "native hosts still load project instruction files" {
-    try std.testing.expect(loadsProjectInstructionFiles());
+const FakeInstructionHost = struct {
+    const File = struct {
+        path: []const u8,
+        content: []const u8,
+        total_bytes: ?u64 = null,
+    };
+
+    var files: []const File = &.{};
+    var failure: ?context_contract.InstructionFileError = null;
+    var reads: usize = 0;
+    var last_max_bytes: usize = 0;
+
+    const reader = context_contract.InstructionFileReader{ .read_fn = read, .max_read_bytes = std.math.maxInt(usize) };
+    const instruction_files = context_contract.InstructionFiles{ .host = .{
+        .home = "/home/visitor",
+        .reader = reader,
+    } };
+
+    fn read(alloc: Allocator, path: []const u8, max_bytes: usize) context_contract.InstructionFileError!?context_contract.InstructionFile {
+        reads += 1;
+        last_max_bytes = max_bytes;
+        if (failure) |err| return err;
+        for (files) |file| {
+            if (!std.mem.eql(u8, file.path, path)) continue;
+            const len = @min(file.content.len, max_bytes);
+            return .{
+                .bytes = try alloc.dupe(u8, file.content[0..len]),
+                .total_bytes = file.total_bytes orelse file.content.len,
+            };
+        }
+        return null;
+    }
+
+    fn reset(next_files: []const File) void {
+        files = next_files;
+        failure = null;
+        reads = 0;
+        last_max_bytes = 0;
+    }
+};
+
+test "host instruction files deliver global and project rules from host paths" {
+    const alloc = std.testing.allocator;
+    FakeInstructionHost.reset(&.{
+        .{ .path = "/home/visitor/.fx/AGENTS.md", .content = "GLOBAL_HOST_RULE\n" },
+        .{ .path = "/workspace/AGENTS.md", .content = "PROJECT_HOST_RULE\n" },
+    });
+    defer FakeInstructionHost.reset(&.{});
+
+    var context = try gatherProjectContext(alloc, .{
+        .workspace_root = "/workspace",
+        .instruction_files = FakeInstructionHost.instruction_files,
+    });
+    defer context.deinit(alloc);
+
+    const visible = context.modelVisibleBytes();
+    try std.testing.expect(std.mem.startsWith(u8, visible, "<project-instructions-guidance>\n"));
+    try std.testing.expect(std.mem.find(u8, visible, "<global-rules from=\"/home/visitor/.fx/AGENTS.md\">\nGLOBAL_HOST_RULE\n</global-rules>") != null);
+    try std.testing.expect(std.mem.find(u8, visible, "<project-rules from=\"/workspace/AGENTS.md\">\nPROJECT_HOST_RULE\n</project-rules>") != null);
+    try std.testing.expect(std.mem.find(u8, visible, "home unavailable") == null);
+    try std.testing.expectEqual(@as(usize, 2), context.delivered_sources.len);
+    try std.testing.expectEqualStrings("/home/visitor/.fx/AGENTS.md", context.delivered_sources[0]);
+    try std.testing.expectEqualStrings("/workspace/AGENTS.md", context.delivered_sources[1]);
+    try std.testing.expectEqual(@as(usize, 0), context.notices.len);
+    try std.testing.expectEqual(ruleReadLength((context_limits.Values{}).project_instruction_file_bytes), FakeInstructionHost.last_max_bytes);
+}
+
+test "host instruction files stay silent when no rule exists" {
+    const alloc = std.testing.allocator;
+    FakeInstructionHost.reset(&.{});
+
+    var context = try gatherProjectContext(alloc, .{
+        .workspace_root = "/home/visitor/project",
+        .instruction_files = FakeInstructionHost.instruction_files,
+    });
+    defer context.deinit(alloc);
+
+    try std.testing.expect(context.content == null);
+    try std.testing.expectEqual(@as(usize, 2), FakeInstructionHost.reads);
+    try std.testing.expectEqual(@as(usize, 0), context.notices.len);
+}
+
+test "host workspace without instruction file access reports the omission once" {
+    const alloc = std.testing.allocator;
+    var context = try gatherProjectContext(alloc, .{
+        .workspace_root = "/workspace",
+        .instruction_files = .host_unreadable,
+    });
+    defer context.deinit(alloc);
+
+    try std.testing.expectEqualStrings(
+        "<project-rules-omitted from=\"/workspace/AGENTS.md\" reason=\"host cannot read instruction files\" />",
+        context.modelVisibleBytes(),
+    );
+    try std.testing.expectEqual(@as(usize, 1), context.notices.len);
+    try std.testing.expect(std.mem.find(u8, context.notices[0], "reason=host cannot read instruction files") != null);
+    try std.testing.expect(std.mem.find(u8, context.notices[0], "repair=add readFile to the host workspace adapter") != null);
+
+    var later = try selectApplicableProjectContext(alloc, .{
+        .workspace_root = "/workspace",
+        .targets = &.{.{ .path = "/workspace/src/main.zig", .kind = .file }},
+        .delivered_sources = &.{},
+        .evaluated_endpoints = context.evaluated_endpoints,
+        .instruction_files = .host_unreadable,
+    });
+    defer later.deinit(alloc);
+    try std.testing.expect(later.content == null);
+    try std.testing.expectEqual(@as(usize, 0), later.notices.len);
+}
+
+test "hosts without a workspace read no instruction files" {
+    const alloc = std.testing.allocator;
+    var context = try gatherProjectContext(alloc, .{
+        .workspace_root = "/",
+        .instruction_files = .none,
+    });
+    defer context.deinit(alloc);
+
+    try std.testing.expect(context.content == null);
+    try std.testing.expectEqual(@as(usize, 0), context.notices.len);
+}
+
+test "host instruction reads apply the file limit and report truncation" {
+    const alloc = std.testing.allocator;
+    FakeInstructionHost.reset(&.{
+        .{ .path = "/workspace/AGENTS.md", .content = "PROJECT-ONE\nPROJECT-TWO\n" },
+    });
+    defer FakeInstructionHost.reset(&.{});
+    var limits = context_limits.Values{};
+    limits.project_instruction_file_bytes = .{ .value = .{ .bytes = 12 }, .source = .user_workspace };
+
+    var context = try gatherProjectContext(alloc, .{
+        .workspace_root = "/workspace",
+        .context_limits = limits,
+        .instruction_files = FakeInstructionHost.instruction_files,
+    });
+    defer context.deinit(alloc);
+
+    const visible = context.modelVisibleBytes();
+    try std.testing.expectEqual(@as(usize, 15), FakeInstructionHost.last_max_bytes);
+    try std.testing.expect(std.mem.find(u8, visible, "<project-rules from=\"/workspace/AGENTS.md\">\nPROJECT-ONE\n</project-rules>") != null);
+    try std.testing.expect(std.mem.find(u8, visible, "PROJECT-TWO") == null);
+    try std.testing.expect(std.mem.find(u8, visible, "observed_bytes=\"24\" effective_bytes=\"12\"") != null);
+    try std.testing.expectEqual(@as(usize, 1), context.notices.len);
+    try std.testing.expect(std.mem.find(u8, context.notices[0], "effective=12 bytes") != null);
+}
+
+test "host instruction read failures become explicit omissions" {
+    const alloc = std.testing.allocator;
+    const cases = [_]struct {
+        failure: context_contract.InstructionFileError,
+        reason: []const u8,
+    }{
+        .{ .failure = error.HostUnreadable, .reason = "reason=\"host cannot read instruction files\"" },
+        .{ .failure = error.Unreadable, .reason = "reason=\"unreadable rule file\"" },
+        .{ .failure = error.UnsafePath, .reason = "reason=\"unsafe target\"" },
+    };
+    defer FakeInstructionHost.reset(&.{});
+    for (cases) |case| {
+        FakeInstructionHost.reset(&.{});
+        FakeInstructionHost.failure = case.failure;
+        var context = try gatherProjectContext(alloc, .{
+            .workspace_root = "/home/visitor/project",
+            .instruction_files = FakeInstructionHost.instruction_files,
+        });
+        defer context.deinit(alloc);
+
+        const visible = context.modelVisibleBytes();
+        try std.testing.expect(std.mem.find(u8, visible, "<project-rules-omitted from=\"/home/visitor/project/AGENTS.md\"") != null);
+        try std.testing.expect(std.mem.find(u8, visible, case.reason) != null);
+        try std.testing.expectEqual(@as(usize, 0), context.delivered_sources.len);
+        try std.testing.expectEqual(@as(usize, 2), context.notices.len);
+    }
+}
+
+test "host instruction reads reserve reconstruction budget before reading" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    FakeInstructionHost.reset(&.{.{ .path = "/workspace/AGENTS.md", .content = "RULE" }});
+    defer FakeInstructionHost.reset(&.{});
+    var scratch = SelectionScratch{
+        .arena = arena_state.allocator(),
+        .work_budget = .{ .admitted_read_bytes = ReconstructionBudget.read_limit - 7 },
+    };
+
+    try std.testing.expectEqual(@as(?LoadedRule, null), try loadRuleForSelection(
+        scratch.arena,
+        &scratch,
+        .{ .host = FakeInstructionHost.reader },
+        "/workspace/AGENTS.md",
+        (context_limits.Values{}).project_instruction_file_bytes,
+    ));
+    try std.testing.expectEqual(@as(usize, 0), FakeInstructionHost.reads);
+    try std.testing.expectEqual(context_contract.OmissionReason.oversized, scratch.omissions.items[0].reason);
+}
+
+test "host instruction reads reserve only the host read bound" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    FakeInstructionHost.reset(&.{.{ .path = "/workspace/AGENTS.md", .content = "RULE" }});
+    defer FakeInstructionHost.reset(&.{});
+    var scratch = SelectionScratch{
+        .arena = arena_state.allocator(),
+        .work_budget = .{ .admitted_read_bytes = ReconstructionBudget.read_limit - 128 },
+    };
+    const unbounded_limit: context_limits.Resolved = .{ .value = .off, .source = .command_line };
+
+    const rule = (try loadRuleForSelection(
+        scratch.arena,
+        &scratch,
+        .{ .host = .{ .read_fn = FakeInstructionHost.read, .max_read_bytes = 64 } },
+        "/workspace/AGENTS.md",
+        unbounded_limit,
+    )) orelse return error.TestExpectedEqual;
+    try std.testing.expectEqualStrings("RULE", rule.body);
+    try std.testing.expectEqual(@as(usize, 64), FakeInstructionHost.last_max_bytes);
+    try std.testing.expectEqual(ReconstructionBudget.read_limit - 64, scratch.work_budget.?.admitted_read_bytes);
+}
+
+test "host instruction files load scoped rules for later targets" {
+    const alloc = std.testing.allocator;
+    FakeInstructionHost.reset(&.{
+        .{ .path = "/workspace/AGENTS.md", .content = "PROJECT_HOST_RULE" },
+        .{ .path = "/workspace/src/AGENTS.md", .content = "SCOPED_HOST_RULE" },
+    });
+    defer FakeInstructionHost.reset(&.{});
+
+    var later = try selectApplicableProjectContext(alloc, .{
+        .workspace_root = "/workspace",
+        .targets = &.{.{ .path = "/workspace/src/main.zig", .kind = .file }},
+        .delivered_sources = &.{"/workspace/AGENTS.md"},
+        .evaluated_endpoints = &.{"/workspace"},
+        .instruction_files = FakeInstructionHost.instruction_files,
+    });
+    defer later.deinit(alloc);
+
+    try std.testing.expectEqualStrings(
+        "<project-instructions-guidance>\n" ++ project_instruction_guidance ++ "\n</project-instructions-guidance>\n\n" ++
+            "<scoped-rules from=\"/workspace/src/AGENTS.md\" scope=\"/workspace/src\">\nSCOPED_HOST_RULE\n</scoped-rules>",
+        later.modelVisibleBytes(),
+    );
+    try std.testing.expectEqual(@as(usize, 1), FakeInstructionHost.reads);
+}
+
+test "host rule classification matches filesystem size and encoding rules" {
+    const limit: context_limits.Resolved = .{ .value = .{ .bytes = 8 }, .source = .command_line };
+    const unbounded = std.math.maxInt(usize);
+    var buffer: [16]u8 = undefined;
+    const Case = struct {
+        bytes: []const u8,
+        total_bytes: u64,
+        max_read_bytes: usize = std.math.maxInt(usize),
+    };
+    const classify = struct {
+        fn run(storage: []u8, case: Case, rule_limit: context_limits.Resolved) RuleLoad {
+            @memcpy(storage[0..case.bytes.len], case.bytes);
+            return classifyHostRule(.{ .bytes = storage[0..case.bytes.len], .total_bytes = case.total_bytes }, rule_limit, case.max_read_bytes);
+        }
+    }.run;
+
+    try std.testing.expectEqual(@as(usize, 11), hostReadLength(limit, unbounded));
+    switch (classify(&buffer, .{ .bytes = " rule \n", .total_bytes = 7 }, limit)) {
+        .body => |body| {
+            try std.testing.expectEqualStrings("rule", body.text);
+            try std.testing.expectEqual(@as(usize, 7), body.observed_bytes);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+    try std.testing.expectEqual(RuleLoad.blank, classify(&buffer, .{ .bytes = " \n\t", .total_bytes = 3 }, limit));
+    try std.testing.expectEqual(RuleLoad{ .omitted = .unreadable }, classify(&buffer, .{ .bytes = "ok\xff", .total_bytes = 3 }, limit));
+    // A truncated read may end inside one UTF-8 sequence.
+    switch (classify(&buffer, .{ .bytes = "line one\n\xe2\x82", .total_bytes = 40 }, limit)) {
+        .body => |body| {
+            try std.testing.expectEqualStrings("line one", body.text);
+            try std.testing.expectEqual(@as(usize, 40), body.observed_bytes);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+    try std.testing.expectEqual(RuleLoad{ .omitted = .unreadable }, classify(&buffer, .{ .bytes = "line\xffone\n\xe2\x82", .total_bytes = 40 }, limit));
+    // The reader must deliver exactly the requested prefix of the file.
+    try std.testing.expectEqual(RuleLoad{ .omitted = .unreadable }, classify(&buffer, .{ .bytes = "short", .total_bytes = 40 }, limit));
+    try std.testing.expectEqual(RuleLoad{ .omitted = .unreadable }, classify(&buffer, .{ .bytes = "rule", .total_bytes = 3 }, limit));
+    try std.testing.expectEqual(RuleLoad{ .omitted = .oversized }, classify(&buffer, .{ .bytes = "", .total_bytes = context_limits.emergency_ceiling_bytes + 1 }, limit));
+    // A host bound below the rule prefix omits larger files instead of truncating them.
+    try std.testing.expectEqual(RuleLoad{ .omitted = .oversized }, classify(&buffer, .{ .bytes = "line", .total_bytes = 40, .max_read_bytes = 4 }, limit));
+    switch (classify(&buffer, .{ .bytes = "rule", .total_bytes = 4, .max_read_bytes = 4 }, limit)) {
+        .body => |body| try std.testing.expectEqualStrings("rule", body.text),
+        else => return error.TestUnexpectedResult,
+    }
 }
 
 test "hosts without instruction files keep client omissions and skip home probes" {
@@ -1787,7 +2202,7 @@ test "hosts without instruction files keep client omissions and skip home probes
         }},
         .home = "/repo",
         .initial = true,
-        .load_project_instruction_files = false,
+        .instruction_files = .none,
     });
     defer context.deinit(alloc);
 
@@ -2138,7 +2553,7 @@ fn buildTurnContextFragment(arena: Allocator, workspace_root: []const u8) ![]con
     const cwd = currentWorkingDirectory(arena) catch "(unavailable)";
     const os_text = try host.operatingSystemText(arena);
     const date_text = try todayUtcText(arena);
-    const shell = shellPath() orelse "(unknown)";
+    const shell = shellPath(arena) orelse "(unknown)";
     const home = homeDir() orelse "(unknown)";
     const git = collectGitInfo(arena, workspace_root) catch GitInfo{};
 
@@ -2212,7 +2627,17 @@ fn currentWorkingDirectory(arena: Allocator) ![]const u8 {
     return std.process.currentPathAlloc(io_mod.getIo(), arena);
 }
 
-fn shellPath() ?[]const u8 {
+/// Reports the shell the shell tool runs for the user profile, falling back to
+/// the environment when no login shell resolves (for example on Windows).
+fn shellPath(arena: Allocator) ?[]const u8 {
+    var login_shell_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const login_shell = shell_resolver.configuredLoginShellInto(&login_shell_buffer);
+    if (shell_resolver.environment(arena, login_shell, .user)) |resolved| {
+        switch (resolved) {
+            .user => |path| return path,
+            else => {},
+        }
+    } else |_| {}
     return io_mod.getenv("SHELL") orelse io_mod.getenv("COMSPEC");
 }
 
@@ -2739,6 +3164,22 @@ test "git info reads branch from HEAD" {
     const info = try collectGitInfo(arena, workspace);
     try std.testing.expectEqualStrings("main", info.branch.?);
     try std.testing.expectEqual(GitWorktreeState.unknown, info.worktree);
+}
+
+test "turn context reports the shell tool's login shell" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const login_shell = shell_resolver.configuredLoginShellInto(&buffer) orelse
+        return error.SkipZigTest;
+    const expected = switch (try shell_resolver.environment(arena, login_shell, .user)) {
+        .user => |path| path,
+        else => return error.TestUnexpectedResult,
+    };
+    const fragment = try buildTurnContextFragment(arena, "/tmp");
+    const line = try std.fmt.allocPrint(arena, "shell_path: {s}\n", .{expected});
+    try std.testing.expect(std.mem.indexOf(u8, fragment, line) != null);
 }
 
 test "turn context keeps branch metadata inside its field" {
@@ -3271,6 +3712,12 @@ test "gateway_system_prompt: source routing" {
 test "gateway_system_prompt: concise interaction and concrete blockers" {
     try expectDefaultPromptContains("Reply in the same natural language as the user's latest message unless asked to switch.");
     try expectDefaultPromptContains("Keep responses short and practical.");
+    try expectDefaultPromptDoesNotContain("use markdown unless requested");
+    try expectDefaultPromptContains("Write responses in GitHub-flavored Markdown, which fx renders in the terminal.");
+    try expectDefaultPromptContains("Use a table for comparisons or data with several attributes per item");
+    try expectDefaultPromptContains("fenced code blocks only for code, commands to run, or verbatim output");
+    try expectDefaultPromptContains("answer simple questions in plain sentences");
+    try expectDefaultPromptContains("Use bold sparingly, and never inside tables");
     try expectDefaultPromptContains("Before the first tool call in a tool-driven task, always send one brief user-visible update");
     try expectDefaultPromptContains("Never start the first tool silently.");
     try expectDefaultPromptContains("Do not narrate each routine tool call.");
@@ -3316,6 +3763,25 @@ test "gateway_system_prompt: static guidance is capability-neutral" {
     try expectDefaultPromptDoesNotContain("Use task only for focused delegated work");
     try expectDefaultPromptContains("Persist until the task is handled");
     try expectDefaultPromptContains("memory or general knowledge");
+}
+
+test "embedded system prompt drops only terminal identity and rendering claims" {
+    // The only remaining mention is the instruction not to claim a terminal.
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, embedded_system_prompt, "terminal"));
+    try std.testing.expect(std.mem.find(u8, embedded_system_prompt, terminal_identity) == null);
+    try std.testing.expect(std.mem.find(u8, embedded_system_prompt, terminal_rendering) == null);
+    try std.testing.expect(std.mem.find(u8, embedded_system_prompt, "bolds table headers") == null);
+    try std.testing.expect(std.mem.find(u8, embedded_system_prompt, "A client application hosts this conversation") != null);
+    try std.testing.expect(std.mem.find(u8, embedded_system_prompt, "which the client application renders") != null);
+    // Every other section is shared with the terminal prompt.
+    try std.testing.expect(std.mem.find(u8, embedded_system_prompt, "# Safety") != null);
+    try std.testing.expect(std.mem.find(u8, embedded_system_prompt, "# Tools and verification") != null);
+    try std.testing.expectEqual(
+        std.mem.count(u8, gateway_system_prompt, "\n"),
+        std.mem.count(u8, embedded_system_prompt, "\n"),
+    );
+    try std.testing.expectEqualStrings(embedded_system_prompt, prompt_policy.systemPromptFor(false));
+    try std.testing.expectEqualStrings(gateway_system_prompt, prompt_policy.systemPromptFor(true));
 }
 
 test "model prompt overlay is opt-in and transient guidance stays out of the base prompt" {

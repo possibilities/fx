@@ -14,6 +14,7 @@ const max_record_bytes: usize = 16 * 1024;
 const max_records: usize = 200_000;
 const compaction_threshold_bytes: u64 = 8 * 1024 * 1024;
 const retention_ms: i64 = std.time.ms_per_day * 35;
+const compaction_slack_ms: i64 = std.time.ms_per_day;
 const private_dir_permissions = std.Io.Dir.Permissions.fromMode(0o700);
 const private_file_permissions = std.Io.File.Permissions.fromMode(0o600);
 
@@ -219,10 +220,28 @@ fn absorbRecord(index: *RecordIndex, alloc: Allocator, record: ParsedRecord) !vo
     }
 }
 
-fn absorbBytes(index: *RecordIndex, alloc: Allocator, bytes: []const u8) !void {
+/// Lines parsed between checks of the abandon flag. A full parse of a large
+/// ledger takes hundreds of milliseconds; process exit should not wait for it.
+const abandon_check_lines: usize = 256;
+
+/// Parses whole ledger lines into `index`. When `abandoned` is set, it is
+/// checked every `abandon_check_lines` lines and ends the parse early.
+fn absorbBytes(
+    index: *RecordIndex,
+    alloc: Allocator,
+    bytes: []const u8,
+    abandoned: ?*const std.atomic.Value(bool),
+) !void {
     var lines = std.mem.splitScalar(u8, bytes, '\n');
+    var parsed: usize = 0;
     while (lines.next()) |line| {
         if (line.len == 0) continue;
+        if (abandoned) |flag| {
+            if (parsed % abandon_check_lines == 0 and flag.load(.acquire)) {
+                return error.UsageLockAbandoned;
+            }
+        }
+        parsed += 1;
         index.record_count += 1;
         if (index.record_count > max_records or line.len > max_record_bytes) {
             return error.UsageCapacityExceeded;
@@ -252,7 +271,11 @@ pub const Store = struct {
     durable_home: ?io_mod.VerifiedDir = null,
     lock_ops: io_mod.LockOps = .{},
     index: ?RecordIndex = null,
-    index_alloc: ?Allocator = null,
+    /// Owns every allocation in `index`. Per-call allocators only back
+    /// temporaries: allocator identity cannot be compared across calls
+    /// because `std.heap.c_allocator.ptr` is undefined.
+    index_alloc: Allocator,
+    lock_abandoned: std.atomic.Value(bool) = .init(false),
 
     pub fn initFromHome(alloc: Allocator, home_path: []const u8) !Store {
         const owned_home = try alloc.dupe(u8, home_path);
@@ -260,6 +283,7 @@ pub const Store = struct {
         return .{
             .home_path = owned_home,
             .durable_home = try openExistingDurableHome(home_path),
+            .index_alloc = alloc,
         };
     }
 
@@ -292,6 +316,7 @@ pub const Store = struct {
         var lock = self.acquireLock() catch |err| switch (err) {
             error.LockBusy => return error.UsageLockBusy,
             error.LockUnsupported => return error.UsageLockUnsupported,
+            error.Cancelled => return error.UsageLockAbandoned,
             else => return err,
         };
         defer lock.release();
@@ -400,8 +425,10 @@ pub const Store = struct {
             now_ms,
             compacted_before_append,
         );
-        self.noteAppendedRecords(alloc, append_bytes.written(), next_length, compacted_before_append);
-        if (compact_after) {
+        self.noteAppendedRecords(append_bytes.written(), next_length, compacted_before_append);
+        // The append is committed; compaction can wait for a later append
+        // rather than hold up process exit with a full rewrite.
+        if (compact_after and !self.lock_abandoned.load(.acquire)) {
             if (file) |open_file| {
                 open_file.close(io_mod.getIo());
                 file = null;
@@ -421,11 +448,6 @@ pub const Store = struct {
         file: std.Io.File,
         boundary: u64,
     ) !*RecordIndex {
-        if (self.index_alloc) |index_alloc| {
-            if (index_alloc.ptr != alloc.ptr or index_alloc.vtable != alloc.vtable) {
-                self.invalidateIndex();
-            }
-        }
         if (self.index) |*index| {
             if (boundary == index.boundary and verifyTailSample(index, file)) return index;
             if (boundary > index.boundary and self.tryAbsorbTail(alloc, index, file, boundary)) {
@@ -435,7 +457,7 @@ pub const Store = struct {
         }
         if (boundary > max_file_bytes) return error.UsageCapacityExceeded;
         var fresh: RecordIndex = .{};
-        errdefer fresh.deinit(alloc);
+        errdefer fresh.deinit(self.index_alloc);
         if (boundary > 0) {
             const byte_len = std.math.cast(usize, boundary) orelse
                 return error.UsageCapacityExceeded;
@@ -444,12 +466,11 @@ pub const Store = struct {
             const read_count = try file.readPositionalAll(io_mod.getIo(), bytes, 0);
             if (read_count != byte_len) return error.UsageReadFailed;
             if (bytes[bytes.len - 1] != '\n') return error.UsageStoreIncomplete;
-            try absorbBytes(&fresh, alloc, bytes);
+            try absorbBytes(&fresh, self.index_alloc, bytes, &self.lock_abandoned);
             fresh.boundary = boundary;
             fresh.captureTailSample(bytes);
         }
         self.index = fresh;
-        self.index_alloc = alloc;
         return &self.index.?;
     }
 
@@ -460,7 +481,6 @@ pub const Store = struct {
         file: std.Io.File,
         boundary: u64,
     ) bool {
-        _ = self;
         if (boundary - index.boundary > max_file_bytes) return false;
         if (!verifyTailSample(index, file)) return false;
         const start = index.boundary;
@@ -470,7 +490,7 @@ pub const Store = struct {
         const read_count = file.readPositionalAll(io_mod.getIo(), bytes, start) catch return false;
         if (read_count != tail_len) return false;
         if (bytes.len == 0 or bytes[bytes.len - 1] != '\n') return false;
-        absorbBytes(index, alloc, bytes) catch return false;
+        absorbBytes(index, self.index_alloc, bytes, &self.lock_abandoned) catch return false;
         index.boundary = boundary;
         index.captureTailSample(bytes);
         index.incremental_absorbs += 1;
@@ -481,7 +501,6 @@ pub const Store = struct {
     /// lines we wrote; a compaction replaced the content instead.
     fn noteAppendedRecords(
         self: *Store,
-        alloc: Allocator,
         written: []const u8,
         final_length: u64,
         content_replaced: bool,
@@ -491,7 +510,7 @@ pub const Store = struct {
             return;
         }
         const index = &(self.index orelse return);
-        absorbBytes(index, alloc, written) catch {
+        absorbBytes(index, self.index_alloc, written, null) catch {
             self.invalidateIndex();
             return;
         };
@@ -500,11 +519,8 @@ pub const Store = struct {
     }
 
     fn invalidateIndex(self: *Store) void {
-        if (self.index) |*index| {
-            if (self.index_alloc) |index_alloc| index.deinit(index_alloc);
-        }
+        if (self.index) |*index| index.deinit(self.index_alloc);
         self.index = null;
-        self.index_alloc = null;
     }
 
     /// Loads one stable read-only boundary without creating profile state.
@@ -582,12 +598,20 @@ pub const Store = struct {
     }
 
     fn acquireLock(self: *Store) !io_mod.TimedAdvisoryLock {
-        return io_mod.acquireTimedAdvisoryLockWithOps(
+        return io_mod.acquireTimedAdvisoryLockCancellableWithOps(
             &self.durable_home.?,
             usage_lock_file,
             lock_deadline_ms,
+            &self.lock_abandoned,
             self.lock_ops,
         );
+    }
+
+    /// Stops acquiring the profile-wide ledger lock and ends a wait that is
+    /// already in progress. Unpublished usage stays in the session state and
+    /// the usage recovery registry.
+    pub fn abandonLock(self: *Store) void {
+        self.lock_abandoned.store(true, .release);
     }
 
     fn acquireExistingLock(self: *Store) !?io_mod.TimedAdvisoryLock {
@@ -730,7 +754,7 @@ pub const Store = struct {
 
         var index: RecordIndex = .{};
         defer index.deinit(alloc);
-        try absorbBytes(&index, alloc, bytes);
+        try absorbBytes(&index, alloc, bytes, null);
         return index.toLoaded(alloc);
     }
 
@@ -817,9 +841,11 @@ fn hasExpiredRecords(index: *const RecordIndex, now_ms: i64) bool {
 /// Age-only expiry for the after-append check. A resolved pending marker is
 /// redundant, but it is a ~100 byte line; rewriting the whole ledger to drop it
 /// right after every turn would cost far more than keeping it until genuinely
-/// aged records accumulate.
+/// aged records accumulate. Records age past retention continuously, so the
+/// check waits for `compaction_slack_ms` of aged records; otherwise every
+/// append would rewrite the ledger.
 fn hasAgedRecords(index: *const RecordIndex, now_ms: i64) bool {
-    const cutoff_ms = retentionCutoff(now_ms);
+    const cutoff_ms = std.math.sub(i64, retentionCutoff(now_ms), compaction_slack_ms) catch 0;
     for (index.facts.items) |fact| {
         if (fact.created_at_ms < cutoff_ms) return true;
     }
@@ -1723,7 +1749,21 @@ test "profile usage compaction eligibility requires expired records" {
         false,
     ));
     loaded.pending = &.{};
-    loaded.facts[0].created_at_ms = now_ms - std.time.ms_per_day * 36;
+    // Records age past retention continuously. One that only just crossed it
+    // can be reclaimed at capacity, but must not rewrite the ledger after
+    // every append.
+    loaded.facts[0].created_at_ms = now_ms - retention_ms - std.time.ms_per_hour;
+    index.deinit(alloc);
+    index = try testIndexFromLoaded(alloc, loaded);
+    try std.testing.expect(hasExpiredRecords(&index, now_ms));
+    try std.testing.expect(!shouldCompactAfterAppend(
+        compaction_threshold_bytes + 1,
+        &index,
+        now_ms,
+        now_ms,
+        false,
+    ));
+    loaded.facts[0].created_at_ms = now_ms - retention_ms - compaction_slack_ms - 1;
     index.deinit(alloc);
     index = try testIndexFromLoaded(alloc, loaded);
     try std.testing.expect(hasExpiredRecords(&index, now_ms));
@@ -1929,6 +1969,113 @@ test "profile usage store merges foreign appends incrementally" {
     try std.testing.expect(ids.contains("gen_01ARZ3NDEKTSV4RRFFQ69G5FAV"));
     try std.testing.expect(ids.contains("gen_01ARZ3NDEKTSV4RRFFQ69G5FAW"));
     try std.testing.expect(ids.contains("gen_01ARZ3NDEKTSV4RRFFQ69G5FAX"));
+}
+
+test "profile usage index survives appends through allocators without a stable identity" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(home);
+    var store = try Store.initFromHome(alloc, home);
+    defer store.deinit(alloc);
+
+    var fact = try makeTestFact(alloc, "gen_01ARZ3NDEKTSV4RRFFQ69G5FAV", 1000, 10);
+    defer fact.deinit(alloc);
+    try std.testing.expectEqual(AppendOutcome.appended, try store.appendFact(alloc, fact));
+    // Only the resident index carries this value; a rebuild resets it.
+    store.index.?.incremental_absorbs = 7;
+
+    // `std.heap.c_allocator.ptr` is undefined, so release builds can hand
+    // the store a different pointer on every call.
+    var call_alloc = std.heap.c_allocator;
+    call_alloc.ptr = @ptrFromInt(0x1000);
+    try std.testing.expectEqual(AppendOutcome.duplicate, try store.appendFact(call_alloc, fact));
+    try std.testing.expectEqual(@as(usize, 7), store.index.?.incremental_absorbs);
+}
+
+test "abandoning the profile usage lock ends a wait on another holder" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(home);
+    var holder = try Store.initFromHome(alloc, home);
+    defer holder.deinit(alloc);
+    var exiting = try Store.initFromHome(alloc, home);
+    defer exiting.deinit(alloc);
+
+    var first = try makeTestFact(alloc, "gen_01ARZ3NDEKTSV4RRFFQ69G5FAV", 1000, 10);
+    defer first.deinit(alloc);
+    var second = try makeTestFact(alloc, "gen_01ARZ3NDEKTSV4RRFFQ69G5FAW", 2000, 20);
+    defer second.deinit(alloc);
+    try std.testing.expectEqual(AppendOutcome.appended, try holder.appendFact(alloc, first));
+
+    const Worker = struct {
+        store: *Store,
+        fact: usage_report.GenerationFact,
+        started: std.atomic.Value(bool) = .init(false),
+        result: ?anyerror = null,
+
+        fn run(self: *@This()) void {
+            self.started.store(true, .seq_cst);
+            _ = self.store.appendFact(std.heap.c_allocator, self.fact) catch |err| {
+                self.result = err;
+            };
+        }
+    };
+    var worker = Worker{ .store = &exiting, .fact = second };
+    {
+        var lock = try holder.acquireLock();
+        defer lock.release();
+        const thread = try std.Thread.spawn(.{}, Worker.run, .{&worker});
+        while (!worker.started.load(.seq_cst)) std.Thread.yield() catch {};
+        // Well inside the lock deadline, so only the abandon can end the wait.
+        io_mod.sleep(50 * std.time.ns_per_ms);
+        exiting.abandonLock();
+        thread.join();
+    }
+
+    try std.testing.expectEqual(@as(?anyerror, error.UsageLockAbandoned), worker.result);
+    var loaded = try holder.load(alloc);
+    defer loaded.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), loaded.facts.len);
+}
+
+test "abandoning the profile usage lock stops a ledger parse that already holds the lock" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(home);
+    var writer = try Store.initFromHome(alloc, home);
+    defer writer.deinit(alloc);
+    var exiting = try Store.initFromHome(alloc, home);
+    defer exiting.deinit(alloc);
+
+    var first = try makeTestFact(alloc, "gen_01ARZ3NDEKTSV4RRFFQ69G5FAV", 1000, 10);
+    defer first.deinit(alloc);
+    var second = try makeTestFact(alloc, "gen_01ARZ3NDEKTSV4RRFFQ69G5FAW", 2000, 20);
+    defer second.deinit(alloc);
+    try std.testing.expectEqual(AppendOutcome.appended, try writer.appendFact(alloc, first));
+
+    // Process exit abandons the lock after this store took it, so the append
+    // reaches its first full parse of the ledger with the flag already set.
+    const AbandonAfterLock = struct {
+        fn tryLock(ctx: ?*anyopaque, file: std.Io.File) anyerror!bool {
+            const abandoned: *std.atomic.Value(bool) = @ptrCast(@alignCast(ctx.?));
+            const locked = try file.tryLock(io_mod.getIo(), .exclusive);
+            if (locked) abandoned.store(true, .release);
+            return locked;
+        }
+    };
+    exiting.lock_ops = .{ .ctx = &exiting.lock_abandoned, .try_lock = AbandonAfterLock.tryLock };
+
+    try std.testing.expectError(error.UsageLockAbandoned, exiting.appendFact(alloc, second));
+    try std.testing.expect(exiting.index == null);
+    var loaded = try writer.load(alloc);
+    defer loaded.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), loaded.facts.len);
 }
 
 test "profile usage store caps incident records in the ledger file" {
