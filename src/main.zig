@@ -892,6 +892,7 @@ const App = struct {
         self.releaseTerminal();
         shutdown_trace.mark("terminal_released");
 
+        if (comptime !host_target.is_wasm) self.work_control.deinit();
         self.auth.stopProviderPreparation();
         // Client.deinit releases the herdr pane (clear agent + label) when enabled.
         self.herdr.deinit();
