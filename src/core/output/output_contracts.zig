@@ -918,7 +918,7 @@ pub const ModelListSnapshot = struct {
                 if (i > 0) try out.writer.writeByte(',');
                 try out.writer.writeAll("{\"id\":");
                 try std.json.Stringify.value(id, .{}, &out.writer);
-                if (self.provider != .gateway) {
+                if (self.provider != .gateway or has_details) {
                     try out.writer.writeAll(",\"source\":");
                     try std.json.Stringify.value(providerDisplayName(&self.provider), .{}, &out.writer);
                 }
@@ -935,6 +935,12 @@ pub const ModelListSnapshot = struct {
             try w.writeAll(",\"name\":");
             try std.json.Stringify.value(name, .{}, w);
         }
+        try w.writeAll(",\"reasoning_efforts\":[");
+        for (detail.efforts.slice(), 0..) |effort, effort_index| {
+            if (effort_index > 0) try w.writeByte(',');
+            try std.json.Stringify.value(effort.label(), .{}, w);
+        }
+        try w.writeByte(']');
         try w.writeAll(",\"efforts\":[");
         for (detail.efforts.slice(), 0..) |effort, i| {
             if (i > 0) try w.writeByte(',');
@@ -2390,8 +2396,8 @@ test "model list json describes each shown model when details are known" {
     try std.testing.expectEqualStrings(
         "{\"kind\":\"models\",\"count\":3,\"shown_count\":2,\"more_count\":1,\"private_models_hidden\":false," ++
             "\"ids\":[\"openai/gpt-6-astra\",\"provider/plain\"],\"models\":[" ++
-            "{\"id\":\"openai/gpt-6-astra\",\"name\":\"GPT-6 Astra\",\"efforts\":[\"low\",\"xhigh\"],\"fast\":true,\"ultrafast\":true}," ++
-            "{\"id\":\"provider/plain\",\"efforts\":[],\"fast\":false,\"ultrafast\":false}]}",
+            "{\"id\":\"openai/gpt-6-astra\",\"source\":\"Vercel AI Gateway\",\"name\":\"GPT-6 Astra\",\"reasoning_efforts\":[\"low\",\"xhigh\"],\"efforts\":[\"low\",\"xhigh\"],\"fast\":true,\"ultrafast\":true}," ++
+            "{\"id\":\"provider/plain\",\"source\":\"Vercel AI Gateway\",\"reasoning_efforts\":[],\"efforts\":[],\"fast\":false,\"ultrafast\":false}]}",
         json,
     );
 }
@@ -3349,3 +3355,25 @@ pub const SlackSnapshot = struct {
         return out.toOwnedSlice();
     }
 };
+
+test "model list JSON preserves ordered reasoning efforts per provider model" {
+    const ids = [_][]const u8{"gpt-future"};
+    const details = [_]ModelDetail{.{
+        .efforts = .fromSlice(&.{
+            types.ReasoningEffort.literal("future-tier"),
+            types.ReasoningEffort.literal("medium"),
+        }),
+    }};
+    const json = try (ModelListSnapshot{
+        .ids = &ids,
+        .details = &details,
+        .provider = .codex,
+    }).renderJson(std.testing.allocator);
+    defer std.testing.allocator.free(json);
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, json, .{});
+    defer parsed.deinit();
+    const efforts = parsed.value.object.get("models").?.array.items[0].object.get("reasoning_efforts").?.array.items;
+    try std.testing.expectEqual(@as(usize, 2), efforts.len);
+    try std.testing.expectEqualStrings("future-tier", efforts[0].string);
+    try std.testing.expectEqualStrings("medium", efforts[1].string);
+}
