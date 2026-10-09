@@ -472,11 +472,12 @@ describe("modern MCP Streamable HTTP", () => {
       expect(saved).toContain("MCP reconnection started");
       await tui.waitForText("MCP configuration reloaded successfully.", 15_000);
       await tui.sendText("/mcp list");
-      const health = await tui.waitForText("MCP health (1 server):", 10_000);
-      expect(health).toMatch(/prisma[\s\S]{0,240}transport=http state=ready/);
-      expect(health).toContain(
-        "negotiated_name=modern-http-fixture negotiated_version=unavailable protocol=2026-07-28",
-      );
+      const menu = await tui.waitForText("[Servers]", 10_000);
+      expect(menu).toMatch(/prisma[\s\S]{0,120}Ready/);
+      await tui.sendKeys("Enter");
+      const details = await tui.waitForText("Protocol", 5_000);
+      expect(details).toMatch(/Transport\s+http/);
+      expect(details).toMatch(/Protocol\s+2026-07-28/);
 
       const profile = JSON.parse(
         readFileSync(join(root.home, ".fx", "mcp.json"), "utf8"),
@@ -1488,10 +1489,7 @@ describe("modern MCP Streamable HTTP", () => {
       await tui.sendText("Call the HTTP MCP fixture.");
       await tui.waitForText("MCP server fixture requests confirmed", 20_000);
       await tui.sendKeys("1");
-      await tui.waitForText(
-        "Review the completed form requested by MCP server fixture",
-        20_000,
-      );
+      await tui.waitForText("Current values:", 20_000);
       await tui.sendKeys("1");
       await tui.waitForText("HTTP form elicitation complete.", 20_000);
 

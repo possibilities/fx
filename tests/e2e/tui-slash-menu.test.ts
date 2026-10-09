@@ -1036,7 +1036,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       ).toBe(69);
       expect(closedComposerRow).toBe(73);
       await session.sendLiteralText("/");
-      await session.waitForText("Commands 35", 5_000);
+      await session.waitForText("Commands 36", 5_000);
       const afterSlash = await capture("after-slash");
       expect(visibleTranscriptTailRow(afterSlash)).toBe(60);
       expect(composerRow(afterSlash)).toBe(64);
@@ -1561,7 +1561,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       await session.waitForComposer(10_000);
 
       await session.sendText("/help");
-      let grid = await waitForHelpMenu(session, 35);
+      let grid = await waitForHelpMenu(session, 36);
       let pane = grid.join("\n");
       expect(pane).toContain("𝒇x");
       expect(pane).toContain("Run /help for commands");
@@ -1577,7 +1577,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       grid = await waitForHelpMenu(session, 5);
       expect(grid.join("\n")).toContain("[General]");
       await session.sendKeys("BTab");
-      grid = await waitForHelpMenu(session, 35);
+      grid = await waitForHelpMenu(session, 36);
       expect(grid.join("\n")).toContain("[All]");
 
       await session.sendLiteralText("clipboard");
@@ -1588,11 +1588,11 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       expect(pane).not.toContain("/clear");
 
       await session.sendKeys("C-u");
-      await waitForHelpMenu(session, 35);
+      await waitForHelpMenu(session, 36);
       await session.sendKeys("Down");
       await session.sendKeys("Enter");
       pane = await session.waitForPane(
-        (current) => hasEmptyComposer(current) && !current.includes("Commands 35"),
+        (current) => hasEmptyComposer(current) && !current.includes("Commands 36"),
         5_000,
       );
       expect(composerContains(pane, "/clear")).toBe(false);
@@ -1601,7 +1601,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
 
       await session.sendKeys("C-u");
       await session.sendText("/help");
-      await waitForHelpMenu(session, 35);
+      await waitForHelpMenu(session, 36);
       await session.sendLiteralText("additional directories");
       await waitForHelpMenu(session, 1);
       await session.sendKeys("Enter");
@@ -1618,7 +1618,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
 
       await session.sendKeys("C-u");
       await session.sendText("/help");
-      await waitForHelpMenu(session, 35);
+      await waitForHelpMenu(session, 36);
       await session.sendLiteralText("no command can match this query");
       await session.waitForText("No commands found.", 5_000);
       await session.sendKeys("Escape");
@@ -2647,7 +2647,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       expect(alternateCount("\x1b[?1049l")).toBe(leavesBeforeSkills);
 
       await session.sendText("/help");
-      grid = await waitForHelpMenu(session, 35);
+      grid = await waitForHelpMenu(session, 36);
       expect(grid.join("\n")).toContain("Run /help for commands");
       expect(alternateCount("\x1b[?1049h")).toBe(entersBeforeSkills);
       expect(alternateCount("\x1b[?1049l")).toBe(leavesBeforeSkills);
@@ -2955,7 +2955,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
     "Ctrl+P opens the model picker and returns the draft untouched",
     async () => {
       const fixture = createModelsMenuFixture();
-      const currentModel = "anthropic/claude-opus-4.8";
+      const currentModel = "private-team/staged-model";
       const selectedModel = "private-team/plain-model";
       gateway = startFakeGateway([], {
         models: [
@@ -3020,8 +3020,8 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
         5_000,
       );
 
-      // Enter on a filtered row applies the model directly and still returns
-      // the draft instead of seeding the inline /model stages.
+      // A model without effort or Fast options applies on Enter and returns
+      // the draft.
       await session.sendKeys("C-p");
       await waitForModelsMenu(session, 2);
       await session.sendLiteralText("plain");
@@ -3037,6 +3037,48 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
 
       const settings = JSON.parse(readFileSync(fixture.settingsPath, "utf8")) as { models?: { gateway?: string } };
       expect(settings.models?.gateway).toBe(selectedModel);
+
+      // A model with effort and Fast options continues into the same inline
+      // stages /model offers, and the draft returns once the model applies.
+      await session.sendKeys("C-p");
+      await waitForModelsMenu(session, 2);
+      await session.sendLiteralText("staged");
+      // The transcript already names the plain model; only its catalog row
+      // must be filtered out.
+      await session.waitForPane(
+        (current) =>
+          current.includes(currentModel) &&
+          !current.split("\n").some((line) => line.includes(selectedModel) && !line.includes("Switched to")),
+        5_000,
+      );
+      await session.sendKeys("Enter");
+      await session.waitForPane(
+        (current) => composerContains(current, `/model ${currentModel}`) && current.includes("xhigh"),
+        5_000,
+      );
+      pane = await session.capturePane();
+      expect(composerContains(pane, "hello drXaft")).toBe(false);
+      await session.sendLiteralText("xhigh");
+      await session.sendKeys("Enter");
+      await session.waitForPane(
+        (current) => composerContains(current, `/model ${currentModel} xhigh`) && current.includes("normal"),
+        5_000,
+      );
+      await session.sendLiteralText("normal");
+      await session.sendKeys("Enter");
+      await session.waitForText(`* Switched to ${currentModel}`, 5_000);
+      await session.waitForPane((current) => composerContains(current, "hello drXaft"), 5_000);
+      pane = await session.capturePane();
+      expect(composerContains(pane, "/model")).toBe(false);
+
+      const staged = JSON.parse(readFileSync(fixture.settingsPath, "utf8")) as {
+        models?: { gateway?: string };
+        effort?: string;
+        fast_mode?: boolean;
+      };
+      expect(staged.models?.gateway).toBe(currentModel);
+      expect(staged.effort).toBe("xhigh");
+      expect(staged.fast_mode).toBe(false);
       expect(session.isAlive()).toBe(true);
       expect(readFileSync(fixture.stderrPath, "utf8")).toBe("");
 
@@ -3147,7 +3189,8 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       const pane = (await session.capturePaneGrid()).join("\n");
       expect(hasEmptyComposer(pane)).toBe(true);
       expect(pane).not.toContain("Reasoning effort");
-      expect(pane).not.toContain("default");
+      expect(pane).toContain(`Switched to ${selectedModel} (effort: default, speed: normal)`);
+      expect(pane.split("\n").find((line) => line.startsWith("auto · "))).toBe("auto · deepseek-v4-pro-0813");
       expect(JSON.parse(readFileSync(fixture.settingsPath, "utf8")).models.gateway).toBe(selectedModel);
       expect(await session.paneTitle()).toBe(runningBinaryTitle(fixture.workspace));
       expect(session.isAlive()).toBe(true);
@@ -3746,7 +3789,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       await session.waitForComposer(10_000);
 
       await session.sendLiteralText("/");
-      await session.waitForText("Commands 35", 5_000);
+      await session.waitForText("Commands 36", 5_000);
 
       for (let i = 0; i < 5; i += 1) {
         await session.sendKeys("Down");

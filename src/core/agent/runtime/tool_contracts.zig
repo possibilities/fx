@@ -73,12 +73,30 @@ pub const SecondaryPublicationReport = struct {
     }
 };
 
+/// Machine-readable provenance for a failed tool execution, so downstream
+/// diagnostics can distinguish a denial (never authorized to run) from a
+/// failure of an already-authorized execution.
+pub const ToolFailureKind = enum(u8) {
+    /// Producer did not declare a kind.
+    none,
+    /// The action was not authorized to execute (invalid or missing
+    /// authority, approval required, approved binding invalidated, cancelled).
+    denied,
+    /// Authorized execution failed before any effect (semantic mismatch,
+    /// invalid input, size limits).
+    preflight,
+    /// Authorized execution failed at the effect boundary (stale preview,
+    /// I/O failure before commit).
+    apply,
+};
+
 pub const ToolExecutionResult = struct {
     model_content_kind: tool_dispatch.ModelContentKind = .ordinary,
     model_output: []const u8,
     status: ToolExecutionStatus = .success,
     cancelled: bool = false,
     status_detail: ?[]const u8 = null,
+    failure_kind: ToolFailureKind = .none,
     diff_entry: ?DiffEntryPayload = null,
     finish_turn: bool = false,
     system_notice: ?[]const u8 = null,

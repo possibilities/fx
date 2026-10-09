@@ -2,7 +2,7 @@
 import { strict as assert } from "node:assert";
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { cp, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { cp, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -28,6 +28,7 @@ try {
     filter: (path) => !path.split("/").some((part) => part === "node_modules" || part === "dist"),
   });
   await cp(join(root, "LICENSE"), join(mirror, "LICENSE"));
+  await symlink(join(root, "sdk/durable/node_modules"), join(mirror, "sdk/durable/node_modules"), "dir");
   await mkdir(join(mirror, "zig-out/bin"), { recursive: true });
   await mkdir(join(mirror, "zig-out/lib"), { recursive: true });
   // Opaque packaging fixtures: this test imports JavaScript, never loads a
