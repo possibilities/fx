@@ -42,17 +42,20 @@ pub fn loadSkills(
     invocation_skill_roots: []const []const u8,
     root_policy: skill_contract.RootPolicy,
 ) LoadSkillsError!LoadedSkills {
-    const home = (try resolveSkillsHome(alloc)) orelse return .{};
-    defer alloc.free(home);
-    const dir = try profile_paths.managedSkillsDir(alloc, home);
+    const home = try resolveSkillsHome(alloc);
+    defer if (home) |value| alloc.free(value);
+    if (home == null and invocation_skill_roots.len == 0) return .{};
+    const dir = if (home) |value| try profile_paths.managedSkillsDir(alloc, value) else try alloc.dupe(u8, "");
     errdefer alloc.free(dir);
+    var effective_policy = root_policy;
+    if (home == null) effective_policy.managed_root_source = null;
     const discovery = try skill_runtime.loadVisibleSkillsWithInvocationRoots(
         alloc,
         workspace_root,
         home,
         dir,
         invocation_skill_roots,
-        root_policy,
+        effective_policy,
     );
 
     return .{
