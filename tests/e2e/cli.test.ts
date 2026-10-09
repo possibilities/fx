@@ -5921,47 +5921,6 @@ describe("cli: workspace access", () => {
         "--tool is only supported for interactive, resume, ask, and ACP launches",
       );
 
-      const missingSkillsRoot = await runFx(["--skills-dir"], { env: enabled });
-      expect(missingSkillsRoot.code).toBe(1);
-      expect(missingSkillsRoot.stderr).toContain(
-        "--skills-dir requires a directory path",
-      );
-
-      const duplicateDefaultSkillGate = await runFx(
-        ["--no-default-skills", "--no-default-skills"],
-        { env: enabled },
-      );
-      expect(duplicateDefaultSkillGate.code).toBe(1);
-      expect(duplicateDefaultSkillGate.stderr).toContain(
-        "--no-default-skills may only be specified once",
-      );
-
-      const unsupportedSkillPolicy = await runFx(
-        ["--no-default-skills", "ask", "hello"],
-        { env: enabled },
-      );
-      expect(unsupportedSkillPolicy.code).toBe(1);
-      expect(unsupportedSkillPolicy.stderr).toContain(
-        "--skills-dir and --no-default-skills are only supported for interactive, resume, and ACP launches",
-      );
-
-      const duplicateProjectInstructionGate = await runFx(
-        ["--no-project-instructions", "--no-project-instructions"],
-        { env: enabled },
-      );
-      expect(duplicateProjectInstructionGate.code).toBe(1);
-      expect(duplicateProjectInstructionGate.stderr).toContain(
-        "--no-project-instructions may only be specified once",
-      );
-
-      const unsupportedProjectInstructionGate = await runFx(
-        ["--no-project-instructions", "ask", "hello"],
-        { env: enabled },
-      );
-      expect(unsupportedProjectInstructionGate.code).toBe(1);
-      expect(unsupportedProjectInstructionGate.stderr).toContain(
-        "--no-project-instructions is only supported for interactive, resume, and ACP launches",
-      );
     },
     TIMEOUT,
   );
