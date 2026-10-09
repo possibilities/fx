@@ -9379,7 +9379,7 @@ describe("acp: model-independent", () => {
           args: ["--permissions-file", policyPath, "acp"],
           env: fakeGatewayEnv(root, gateway),
         });
-        await startCodeSession(client);
+        await startAutoSession(client);
         await client.request("session/set_mode", { modeId: "ask" }, 4);
         client.setPermissionOption("reject_once");
 
