@@ -1,5 +1,6 @@
 const std = @import("std");
 
+pub const mcp_add_usage = "mcp add slack | mcp add NAME COMMAND [ARGS...] | mcp add --transport http NAME URL";
 pub const mcp_auth_usage = "mcp auth NAME";
 const display_width = @import("../shared/display_width.zig");
 const list_window = @import("../shared/list_window.zig");
@@ -19,6 +20,7 @@ pub const TopLevelKind = enum {
     status,
     permissions,
     mcp,
+    slack,
     models,
     provider,
     doctor,
@@ -39,7 +41,6 @@ pub const SlashKind = enum {
     new_session,
     reset_session,
     resume_session,
-    continue_recovery,
     rename_session,
     help,
     login,
@@ -65,9 +66,11 @@ pub const SlashKind = enum {
     credits,
     paste,
     fast,
+    ultrafast,
     statusline,
     notifications,
     workspace,
+    shell,
     version,
 };
 
@@ -1692,7 +1695,7 @@ test "ACP help documents accepted options" {
     defer std.testing.allocator.free(text);
 
     try std.testing.expect(std.mem.find(u8, text, "fx acp\n") != null);
-    try std.testing.expect(std.mem.find(u8, text, "Usage:\n  fx acp [--model <id>] [--log-file <path>]") != null);
+    try std.testing.expect(std.mem.find(u8, text, "Usage:\n  fx acp [--model <id>] [--ultrafast|--no-ultrafast] [--log-file <path>]") != null);
     try std.testing.expect(std.mem.find(u8, text, "--model <id>") != null);
     try std.testing.expect(std.mem.find(u8, text, "--log-file <path>") != null);
 }
@@ -1770,7 +1773,7 @@ test "slash completion categories follow canonical entries" {
 test "help catalog groups visible commands and searches all command metadata" {
     const registry = testSlashRegistry();
 
-    try std.testing.expectEqual(@as(usize, 35), helpCatalogCount(registry, ""));
+    try std.testing.expectEqual(@as(usize, 36), helpCatalogCount(registry, ""));
     try std.testing.expectEqualStrings("/help", helpCatalogSpecAt(registry, "", 0).?.command);
     try std.testing.expectEqual(@as(usize, 5), helpCatalogCategoryCount(registry, "", .general));
     try std.testing.expectEqual(@as(usize, 3), helpCatalogCount(registry, "appearance"));
@@ -2140,3 +2143,18 @@ test "top-level help lines fit representative terminal widths" {
         try expectAllLinesFit(text, width);
     }
 }
+
+pub const slack_install_spec: TopLevelSpec = .{
+    .kind = .slack,
+    .token = "slack",
+    .usage = "slack <install|status|refresh> [--json]",
+    .summary = "Install and manage the workspace Slack bot locally",
+    .options = &.{.{ .flag = "--json", .description = "Emit installation metadata without credentials" }},
+    .details = &.{
+        "install opens Slack authorization through fx.sh and saves the bot credentials on this computer.",
+        "status shows local installation metadata; refresh renews tokens without browser authorization.",
+        "This is a workspace bot installer. Employee MCP login remains fx mcp auth NAME.",
+        "Credentials are saved in ~/.fx/slack/installation.json with owner-only permissions.",
+        "Refresh runs only when requested; no background service is installed.",
+    },
+};
