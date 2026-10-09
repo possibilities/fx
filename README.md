@@ -74,6 +74,8 @@ UTF-8 files without NUL bytes and may contain at most 256 KiB combined. File
 errors stop the launch. For `fx ask`, these options cannot be combined with
 the inline `--system` option.
 
+Press `Ctrl+G` to edit the current prompt with `VISUAL`, falling back to `EDITOR`, even while a response is streaming; drafts containing pasted blocks, images, or skills are left unchanged. When an automatic upgrade is ready, press `Ctrl+T` to reload it.
+
 In tmux, use your usual prefix bindings to switch sessions or enter copy mode.
 fx preserves those tmux views while resizing, including when the switcher zooms a split pane.
 
