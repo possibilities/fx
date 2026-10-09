@@ -193,6 +193,7 @@ pub fn build(b: *std.Build) void {
             "lifecycle reducer pairs a non-null attention kind only with blocked",
             "work control snapshot and text update preserve native admission order",
             "work control snapshot and update enforce semantic bounds",
+            "work control semantic pause blocks and resumes steering consumption",
             "strict authenticated request decoding preserves opaque turn ids",
             "request decoding rejects partial authority and extra parameters",
             "success responses carry correlated authoritative snapshots",
