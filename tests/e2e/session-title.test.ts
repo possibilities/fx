@@ -294,8 +294,8 @@ test.skipIf(SKIP_TMUX)("tui generates a title after an upgrade relaunch resumes 
     });
     await tui.waitForStableComposer(15000);
     // No prompt before the relaunch: the session stays pristine and untitled.
-    await tui.waitForText("update ready: ctrl+g to reload", 60_000);
-    await tui.sendHexBytes(["07"]);
+    await tui.waitForText("update ready: ctrl+t to reload", 60_000);
+    await tui.sendHexBytes(["14"]);
     await tui.waitForStableComposer(15000);
 
     // Pin the resume leg: the relaunch must resume the same session, not start
