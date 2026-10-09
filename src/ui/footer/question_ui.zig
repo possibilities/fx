@@ -247,7 +247,7 @@ fn questionOptionLabel(
 ) []const u8 {
     if (!opt.is_freeform_slot) return opt.label;
     return if (entry.freeform_buffer.len == 0)
-        question_prompt.freeform_option_label
+        opt.label
     else
         entry.freeform_buffer;
 }

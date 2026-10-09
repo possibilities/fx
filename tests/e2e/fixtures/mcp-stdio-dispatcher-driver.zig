@@ -1660,12 +1660,22 @@ fn runRuntimeRecoveryControl(
     call_joined = true;
     defer if (call.response) |response| alloc.free(response);
 
-    const expected_error: anyerror = if (std.mem.eql(u8, control, "cancel"))
-        error.Cancelled
-    else
-        error.McpRequestTimedOut;
-    if (call.err == null or call.err.? != expected_error) {
-        return error.WrongRecoveryControlError;
+    if (std.mem.eql(u8, control, "cancel")) {
+        if (call.err == null or call.err.? != error.Cancelled) {
+            return error.WrongRecoveryControlError;
+        }
+    } else {
+        // The call reports why the stopped server could not be restarted.
+        const response = call.response orelse return error.WrongRecoveryControlError;
+        if (std.mem.find(u8, response, "server_restart_failed") == null or
+            std.mem.find(u8, response, "did not complete startup within 500 ms (startup_timeout_ms)") == null)
+        {
+            var stderr_buf: [1024]u8 = undefined;
+            var stderr = std.Io.File.stderr().writer(io, &stderr_buf);
+            try stderr.interface.print("unexpected recovery result: {s}\n", .{response});
+            try stderr.interface.flush();
+            return error.WrongRecoveryControlResult;
+        }
     }
     const control_elapsed_ms = if (control_started_ms) |started_ms|
         milliTimestamp(io) - started_ms

@@ -20,6 +20,7 @@ import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { FX_BIN, REPO_ROOT, runFx } from "../evals/eval-helpers";
+import { jpegHeader, solidPng } from "./fixtures/image-encoding";
 import { fakeGatewaySse, fakeGatewayTitleDefault, hasEmptyComposer, TITLE_GENERATION_MARKER, TmuxSession, tmuxAvailable } from "./tmux-helpers";
 
 const TIMEOUT = 15_000;
@@ -1124,77 +1125,193 @@ describe("Vision route fake Gateway", () => {
   );
 
   test(
-    "fx ask normalizes encoded-oversized native images on macOS and rejects elsewhere",
+    "fx ask withholds byte-oversized native images instead of normalizing or rejecting",
     async () => {
       const root = createIsolatedRoot();
       const oversizedPath = join(root.workspace, "encoded-oversized.png");
       copyFileSync(IMAGE_PATH, oversizedPath);
       truncateSync(oversizedPath, (5 * 1024 * 1024 * 3) / 4 + 1);
-      const notice = "Unable to prepare this image for upload. Use a smaller image.";
-      const gateway = startImageGateway(
-        process.platform === "darwin" ? [sseText("Normalized native image answer")] : [],
-      );
+      const gateway = startImageGateway([sseText("Byte-oversized native image answer")]);
       try {
-        if (process.platform === "darwin") {
-          const result = await runFx(
-            [
-              "ask",
-              "--json",
-              "--no-save",
-              "--no-color",
-              "--image",
-              oversizedPath,
-              "Describe the attached image.",
-            ],
-            {
-              cwd: root.workspace,
-              env: fakeGatewayEnv(root, gateway, GEMINI_MODEL),
-              timeoutMs: TIMEOUT,
-            },
-          );
-
-          const json = parseFxJson(result);
-          expect(json.output).toContain("Normalized native image answer");
-          expect(json.tool_calls).toHaveLength(0);
-          expect(result.stderr).toBe("");
-          expect(gateway.chatRequests).toHaveLength(1);
-          const parts = nativeFileParts(gateway.chatRequests[0]!.body);
-          expect(parts).toHaveLength(1);
-          expect(parts[0]!.mediaType).toBe("image/jpeg");
-          expect(parts[0]!.data.data.length).toBeLessThanOrEqual(5 * 1024 * 1024);
-          return;
-        }
-
-        const textResult = await runFx(
-          ["ask", "--no-save", "--image", oversizedPath, "Describe the image."],
+        const result = await runFx(
+          [
+            "ask",
+            "--json",
+            "--no-save",
+            "--no-color",
+            "--image",
+            oversizedPath,
+            "Describe the attached image.",
+          ],
           {
             cwd: root.workspace,
             env: fakeGatewayEnv(root, gateway, GEMINI_MODEL),
             timeoutMs: TIMEOUT,
           },
         );
-        expect(textResult.code).toBe(1);
-        expect(textResult.stdout).toBe("");
-        expect(textResult.stderr).toContain(notice);
 
-        const jsonResult = await runFx(
-          ["ask", "--json", "--no-save", "--image", oversizedPath, "Describe the image."],
-          {
-            cwd: root.workspace,
-            env: fakeGatewayEnv(root, gateway, GEMINI_MODEL),
-            timeoutMs: TIMEOUT,
-          },
-        );
-        const errorJson = parseFxErrorJson(jsonResult);
-        expect(errorJson.error).toBe("ImagePreparationFailed");
-        expect(jsonResult.stderr).toBe("");
-        expect(gateway.chatRequests).toHaveLength(0);
+        const json = parseFxJson(result);
+        expect(json.exit_code).toBe(0);
+        expect(json.output).toContain("Byte-oversized native image answer");
+        expect(json.tool_calls).toHaveLength(0);
+        expect(gateway.chatRequests).toHaveLength(1);
+        const body = gateway.chatRequests[0]!.body;
+        expect(nativeFileParts(body)).toHaveLength(0);
+        expect(body).toContain("This request permits at most 8000 per side and 5 MiB encoded per image.");
+        expect(body).toContain("The original is saved at ");
+        expect(body).toContain("then read_file the copy.");
+        expect(result.stderr).toBe("");
       } finally {
         gateway.stop();
         rmSync(root.root, { recursive: true, force: true });
       }
     },
     TIMEOUT,
+  );
+
+  test(
+    "fx ask sends single-request native PNG images byte-for-byte below the 8000-pixel limit",
+    async () => {
+      const root = createIsolatedRoot();
+      const widePath = join(root.workspace, "wide-screenshot.png");
+      const original = solidPng(3420, 2224);
+      writeFileSync(widePath, original);
+      const gateway = startImageGateway([sseText("Wide native image answer")]);
+      try {
+        const result = await runFx(
+          [
+            "ask",
+            "--json",
+            "--no-save",
+            "--no-color",
+            "--image",
+            widePath,
+            "Describe the attached image.",
+          ],
+          {
+            cwd: root.workspace,
+            env: fakeGatewayEnv(root, gateway, GEMINI_MODEL),
+            timeoutMs: TIMEOUT,
+          },
+        );
+
+        const json = parseFxJson(result);
+        expect(json.output).toContain("Wide native image answer");
+        expect(result.stderr).toBe("");
+        expect(gateway.chatRequests).toHaveLength(1);
+        const parts = nativeFileParts(gateway.chatRequests[0]!.body);
+        expect(parts).toHaveLength(1);
+        expect(parts[0]!.mediaType).toBe("image/png");
+        expect(parts[0]!.data.data).toBe(original.toString("base64"));
+      } finally {
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "fx ask withholds native JPEG images over the 8000-pixel limit with saved-path guidance",
+    async () => {
+      const root = createIsolatedRoot();
+      const photoPath = join(root.workspace, "photo.jpg");
+      writeFileSync(photoPath, jpegHeader(8001, 1));
+      const gateway = startImageGateway([sseText("Photo note answer")]);
+      try {
+        const result = await runFx(
+          ["ask", "--json", "--no-save", "--image", photoPath, "Describe the attached image."],
+          { cwd: root.workspace, env: fakeGatewayEnv(root, gateway, GEMINI_MODEL), timeoutMs: TIMEOUT },
+        );
+        expect(parseFxJson(result).output).toContain("Photo note answer");
+        expect(gateway.chatRequests).toHaveLength(1);
+        const body = gateway.chatRequests[0]!.body;
+        expect(nativeFileParts(body)).toHaveLength(0);
+        expect(body).toContain(
+          "[Image #1 not sent: image/jpeg is 8001x1 pixels. This request permits at most 8000 per side and 5 MiB encoded per image. The original is saved at ",
+        );
+        expect(body).toContain(
+          "Use an available image tool to save a smaller copy to a new file ending in .jpg, then read_file the copy.",
+        );
+        expect(result.stderr).toBe("");
+      } finally {
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test.skipIf(!tmuxAvailable())(
+    "tmux consumes /image when its pasted path becomes a prompt attachment",
+    async () => {
+      const root = createIsolatedRoot();
+      const photoPath = join(root.workspace, "photo.jpg");
+      writeFileSync(photoPath, jpegHeader(8001, 1));
+      const gateway = startImageGateway([
+        sseText("TUI oversized image recovery answer"),
+        sseText("TUI pasted slash image answer"),
+      ]);
+      const stderrPath = join(root.root, "stderr.log");
+      writeFileSync(stderrPath, "");
+      let session: TmuxSession | null = null;
+      try {
+        session = await TmuxSession.create({
+          cmd: FX_BIN,
+          cwd: root.workspace,
+          env: {
+            ...fakeGatewayEnv(root, gateway, GEMINI_MODEL),
+            FX_AUTO_UPGRADE: "0",
+            NO_COLOR: "1",
+          },
+          stderrPath,
+          width: 140,
+          height: 50,
+        });
+        await session.waitForPane(hasEmptyComposer, TIMEOUT);
+        await session.sendLiteral("/image ");
+        await session.pasteText(photoPath);
+        const draft = await session.captureFullScrollback();
+        expect(draft).toContain("[Image 1]");
+        expect(draft).not.toContain("/image ");
+        await session.sendText(" Describe the attached image.");
+        await session.waitForText("TUI oversized image recovery answer", TIMEOUT);
+        await session.waitForPane(hasEmptyComposer, TIMEOUT);
+        const scrollback = await session.captureFullScrollbackEscapes();
+        expect(scrollback).toContain("TUI oversized image recovery answer");
+        expect(scrollback).not.toContain("An attached image was not sent");
+        expect(scrollback).not.toContain("[Image #1 not sent");
+
+        expect(gateway.chatRequests).toHaveLength(1);
+        const body = gateway.chatRequests[0]!.body;
+        expect(nativeFileParts(body)).toHaveLength(0);
+        expect(body).toContain(
+          "[Image #1 not sent: image/jpeg is 8001x1 pixels. This request permits at most 8000 per side and 5 MiB encoded per image. The original is saved at ",
+        );
+        expect(body).toContain("then read_file the copy.");
+
+        await session.pasteText(`/image ${photoPath}`);
+        const secondDraft = await session.captureFullScrollback();
+        expect(secondDraft).toContain("[Image 2]");
+        expect(secondDraft).not.toContain("/image ");
+        await session.sendText(" Describe the second image.");
+        await session.waitForText("TUI pasted slash image answer", TIMEOUT);
+        await session.waitForPane(hasEmptyComposer, TIMEOUT);
+        expect(gateway.chatRequests).toHaveLength(2);
+        expect(nativeFileParts(gateway.chatRequests[1]!.body)).toHaveLength(0);
+        expect(gateway.chatRequests[1]!.body).toContain("then read_file the copy.");
+        expect(readFileSync(stderrPath, "utf8")).toBe("");
+
+        await session.sendText("/quit");
+        expect(await session.waitForSessionEnd(TIMEOUT)).toBe(true);
+        session = null;
+      } finally {
+        if (session) await session.kill();
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    30_000,
   );
 
   test.each(["plain", "prose-replay", "mixed-replay"] as const)(
@@ -3220,7 +3337,8 @@ test.skipIf(!tmuxAvailable())("TUI recovery retains images through failure and c
     rmSync(input);
     session = await TmuxSession.create({ cmd: `${FX_BIN} --resume ${id}`, cwd: root.workspace, env, isolated: true, remainOnExit: true });
     await session.waitForStableComposer(TIMEOUT);
-    await session.sendText("/continue");
+    // A pending recovery checkpoint continues automatically on resume.
+    await session.waitForText(/continues\s+automatically/, TIMEOUT);
     await session.waitForText("TUI_RECOVERY_IMAGE_COMPLETE", TIMEOUT);
     await session.waitForStableComposer(TIMEOUT);
     expect(nativeFileParts(gateway.chatRequests[2]!.body)[0]!.data.data).toBe(original);
