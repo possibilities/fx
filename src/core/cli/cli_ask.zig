@@ -1924,7 +1924,7 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
         presenter = try ask_presentation.Runtime.init(alloc, .{
             .text = owned_prompt,
             .images = @constCast(options.images),
-        }, options.output_mode == .terminal_no_color);
+        }, options.output_mode == .terminal_no_color, cfg.profile_home orelse io_mod.getenv("HOME"));
         ctx.presenter = &presenter.?;
     }
     try ctx.configureNotifications(
