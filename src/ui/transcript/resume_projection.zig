@@ -336,7 +336,7 @@ pub const ResumeProjection = struct {
         const wrapped = try diff.wrapWithMarkers(c_alloc, id, payload.preview);
         defer c_alloc.free(wrapped);
         _ = try self.appendRawClassified(wrapped, .diff_block);
-        try self.pending_diffs.append(c_alloc, .{ .id = id, .full = payload.full });
+        try self.pending_diffs.append(c_alloc, .{ .id = id, .full = payload.full, .deferred = payload.deferred });
         c_alloc.free(payload.preview);
         owns_payload = false;
         self.next_diff_id += 1;
