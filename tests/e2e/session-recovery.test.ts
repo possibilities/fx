@@ -775,7 +775,7 @@ describe("session recovery", () => {
         const recoveredId = JSON.parse(recovered.stdout).recovered_id;
         expect(recoveredId).not.toBe(id);
         const targetMetadata = join(fixture.home, ".fx", "sessions", recoveredId, "session.json");
-        expect(JSON.parse(readFileSync(targetMetadata, "utf8")).title).toBe(explicitTitle);
+        expect(JSON.parse(readFileSync(targetMetadata, "utf8")).title ?? null).toBe(explicitTitle);
         const continued = await runFx([
           "ask", "--json", "--auto", "--resume-id", recoveredId, "First real recovery prompt",
         ], { cwd: fixture.workspace, env: gatewayEnv(fixture, gateway), timeoutMs: TIMEOUT });
