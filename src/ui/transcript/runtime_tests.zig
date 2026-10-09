@@ -1,5 +1,7 @@
 const std = @import("std");
+const display_width = @import("../../core/shared/display_width.zig");
 const io_mod = @import("../../core/shared/io.zig");
+const shared_theme = @import("../../core/shared/theme.zig");
 const types = @import("../../core/shared/types.zig");
 const command_output_content = @import("../../core/tooling/command_output_content.zig");
 const full_transcript_screen = @import("../full_transcript_screen.zig");
@@ -11401,7 +11403,7 @@ test "theme retint preserves a capped canonical anchor and visual geometry" {
     );
     const committed_diagnostic = runtime.transcriptCommitDiagnostic();
 
-    try runtime.retintEntriesForTheme(alloc, false, true);
+    try runtime.retintEntriesForTheme(alloc, shared_theme.fx_dark, shared_theme.fx_light);
 
     try std.testing.expectEqualDeep(
         committed_diagnostic,
@@ -11459,7 +11461,7 @@ test "theme retint preserves a capped canonical anchor and visual geometry" {
     const retinted_diagnostic = runtime.transcriptCommitDiagnostic();
     const retinted_bytes = try alloc.dupe(u8, retinted_source.bytes);
     defer alloc.free(retinted_bytes);
-    try runtime.retintEntriesForTheme(alloc, true, true);
+    try runtime.retintEntriesForTheme(alloc, shared_theme.fx_light, shared_theme.fx_light);
     var unchanged_source = try runtime.prepareTranscriptSource(alloc, null);
     defer unchanged_source.deinit(alloc);
     try std.testing.expectEqualStrings(retinted_bytes, unchanged_source.bytes);
@@ -11502,7 +11504,7 @@ test "light to dark theme retint preserves retention with equal-width tokens" {
         1,
     );
 
-    try runtime.retintEntriesForTheme(alloc, true, false);
+    try runtime.retintEntriesForTheme(alloc, shared_theme.fx_light, shared_theme.fx_dark);
 
     try std.testing.expectEqual(
         transcript_runtime.TranscriptCommitDiagnosticState.stable,
@@ -11564,7 +11566,7 @@ fn checkThemeRetintAllocationFailures(alloc: Allocator) !void {
     const pending_repaints_before = runtime.render_requests.pendingReasonCount();
     const cache_origin_before = runtime.transcript_cache_origin_untrimmed;
 
-    runtime.retintEntriesForTheme(alloc, false, true) catch |err| {
+    runtime.retintEntriesForTheme(alloc, shared_theme.fx_dark, shared_theme.fx_light) catch |err| {
         var source_after = try runtime.prepareTranscriptSource(std.testing.allocator, null);
         defer source_after.deinit(std.testing.allocator);
         try std.testing.expectEqualStrings(source_before.bytes, source_after.bytes);
@@ -14516,7 +14518,7 @@ test "visual epoch retains command output blocks and detail associations" {
     try runtime.flushCommandOutputSummaryForLifecycle(alloc, &metrics, styles, id, true);
     _ = try runtime.applyToolLifecycle(alloc, .{ .terminal = .{
         .id = id,
-        .outcome = .{ .kind = .completed, .summary = "Retained command complete" },
+        .outcome = .{ .kind = .completed, .summary = "Ran true" },
         .result = "retained command result\n",
         .result_memory = .{ .command_process_presentation = .{ .exit_code = 0 } },
     } });
@@ -14549,7 +14551,8 @@ test "visual epoch retains command output blocks and detail associations" {
             null,
         );
         defer alloc.free(full);
-        try std.testing.expect(std.mem.find(u8, full, "Retained command complete") != null);
+        // The row renders styled; assert on the command text inside it.
+        try std.testing.expect(std.mem.find(u8, full, "true") != null);
         try std.testing.expect(std.mem.find(u8, full, "retained command result") != null);
     }
     runtime.clearTranscript(alloc);
@@ -14692,9 +14695,28 @@ test "authoritative lifecycle can place a provisional row after the latest trans
         null,
     );
     defer alloc.free(full);
-    const notice_index = std.mem.find(u8, full, "Auto agent approved").?;
-    const completed_index = std.mem.find(u8, full, "Ran printf approved").?;
+    // Tool rows style the command verb; compare against plain text.
+    const plain = try plainTextForTest(alloc, full);
+    defer alloc.free(plain);
+    const notice_index = std.mem.find(u8, plain, "Auto agent approved").?;
+    const completed_index = std.mem.find(u8, plain, "Ran printf approved").?;
     try std.testing.expect(notice_index < completed_index);
+}
+
+fn plainTextForTest(alloc: std.mem.Allocator, styled: []const u8) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(alloc);
+    var i: usize = 0;
+    while (i < styled.len) {
+        const next = display_width.ansiSequenceEnd(styled, i);
+        if (next != i) {
+            i = next;
+            continue;
+        }
+        try out.append(alloc, styled[i]);
+        i += 1;
+    }
+    return out.toOwnedSlice(alloc);
 }
 
 test "coalesced approval lifecycle reposition preserves an authoritative committed anchor" {
@@ -15302,7 +15324,7 @@ test "late zero-output command settlement reserves distinct presentation entries
         );
         try std.testing.expectEqual(
             @as(usize, 1),
-            std.mem.count(u8, rendered.bytes, "Ran true"),
+            std.mem.count(u8, rendered.bytes, "Ran \x1b[38;5;245m\x1b[38;5;252mtrue\x1b[39m"),
         );
         const detail = runtime.toolDetailForEntry(runtime.toolActivityRecord(id).?.entry_id).?;
         try std.testing.expectEqual(types.ToolOutcomeKind.completed, detail.outcome.?);
@@ -15818,7 +15840,7 @@ fn checkCommandProcessTerminalAllocationFailuresImpl(alloc: Allocator) !void {
         try std.testing.expect(detail.command_output_entry_id == null);
         const status = runtime.toolStatusEntryLabel(entry_id).?;
         try std.testing.expect(std.mem.find(u8, status, "run_command") != null);
-        try std.testing.expect(std.mem.find(u8, status, "Ran true") == null);
+        try std.testing.expect(std.mem.find(u8, status, "\x1b[38;5;250mtrue\x1b[39m") == null);
         return err;
     };
 
@@ -16741,4 +16763,112 @@ test "finality candidates retain the global pin for an unidentified tool row" {
     defer source.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 0), source.finality.tool_turn_floors.len);
     try std.testing.expect(source.finality.mutation_pin_start != null);
+}
+
+test "grouped completed command rows shell-highlight quoted strings over the row base" {
+    const alloc = std.testing.allocator;
+    var runtime = TranscriptRuntime{
+        .layout = transcriptTestLayout(100, 14, 10),
+        .owned_top_row = 1,
+    };
+    defer runtime.deinit(alloc);
+
+    const id = types.ToolLifecycleId{ .turn_id = 1, .call_id = "cmd-1" };
+    _ = try runtime.applyToolLifecycle(alloc, .{ .authoritative_started = .{
+        .id = id,
+        .presentation_group_id = null,
+        .reconciles_provisional_call_id = null,
+        .tool_name = "shell",
+        .activity_kind = .command,
+    } });
+    try runtime.setToolCommandMetadata(alloc, id, "printf 'hello world'", "Ran");
+    _ = try runtime.applyToolLifecycle(alloc, .{ .terminal = .{
+        .id = id,
+        .outcome = .{ .kind = .completed, .summary = "Ran printf 'hello world'" },
+    } });
+
+    var source = try runtime.prepareTranscriptSource(alloc, null);
+    defer source.deinit(alloc);
+
+    // The action label keeps the row's ambient style; the command verb and
+    // quoted string pick up syntax palette colors and return to the row base
+    // after their closes.
+    try std.testing.expect(std.mem.find(u8, source.bytes, "Ran \x1b[38;5;245m\x1b[38;5;252mprintf\x1b[39m\x1b[38;5;245m") != null);
+    try std.testing.expect(std.mem.find(u8, source.bytes, "\x1b[38;5;250m'hello world'\x1b[39m\x1b[38;5;245m") != null);
+}
+
+test "multi-word command labels stay intact when a syntax token follows" {
+    const alloc = std.testing.allocator;
+    var runtime = TranscriptRuntime{
+        .layout = transcriptTestLayout(100, 14, 10),
+        .owned_top_row = 1,
+    };
+    defer runtime.deinit(alloc);
+
+    const id = types.ToolLifecycleId{ .turn_id = 1, .call_id = "cmd-timeout" };
+    _ = try runtime.applyToolLifecycle(alloc, .{ .authoritative_started = .{
+        .id = id,
+        .presentation_group_id = null,
+        .reconciles_provisional_call_id = null,
+        .tool_name = "shell",
+        .activity_kind = .command,
+    } });
+    try runtime.setToolCommandMetadata(alloc, id, "sleep 5", "Timed out");
+    _ = try runtime.applyToolLifecycle(alloc, .{ .terminal = .{
+        .id = id,
+        .outcome = .{ .kind = .completed, .summary = "Timed out sleep 5" },
+    } });
+
+    var source = try runtime.prepareTranscriptSource(alloc, null);
+    defer source.deinit(alloc);
+
+    // A first-space split would open the base style between "Timed" and
+    // "out"; the recorded label keeps both words ahead of the base open.
+    try std.testing.expect(std.mem.find(u8, source.bytes, "Timed out \x1b[38;5;245m") != null);
+    // The command word colors; the bare number argument stays plain.
+    try std.testing.expect(std.mem.find(u8, source.bytes, "\x1b[38;5;252msleep\x1b[39m") != null);
+    try std.testing.expect(std.mem.find(u8, source.bytes, "\x1b[38;5;250m5\x1b[39m") == null);
+}
+
+test "retint rewrites custom theme colors on a variant flip" {
+    const alloc = std.testing.allocator;
+    var runtime = TranscriptRuntime{
+        .layout = transcriptTestLayout(80, 14, 10),
+        .owned_top_row = 1,
+    };
+    defer runtime.deinit(alloc);
+    try runtime.enableShadowVt(alloc);
+
+    var custom_dark = shared_theme.fx_dark;
+    custom_dark.name = "probe-dark";
+    custom_dark.statusline_style = "\x1b[38;5;201m";
+    custom_dark.syntax.keyword_style = "\x1b[38;5;202m";
+    var custom_light = shared_theme.fx_light;
+    custom_light.name = "probe-light";
+    custom_light.statusline_style = "\x1b[38;5;89m";
+    custom_light.syntax.keyword_style = "\x1b[38;5;90m";
+
+    _ = try runtime.appendRawTranscriptEntryClassified(
+        alloc,
+        "\x1b[38;5;201mMuted row\x1b[39m\n",
+        .subagent_status,
+    );
+    _ = try runtime.appendRawTranscriptEntryClassified(
+        alloc,
+        "\x1b[38;5;202mKeyword row\x1b[39m\n",
+        .subagent_status,
+    );
+    // Terminal output is user content: never retinted.
+    _ = try runtime.appendRawTranscriptEntryClassified(
+        alloc,
+        "\x1b[38;5;201muser output\x1b[39m\n",
+        .command_output,
+    );
+
+    try runtime.retintEntriesForTheme(alloc, custom_dark, custom_light);
+
+    const muted = runtime.transcript.items;
+    try std.testing.expect(std.mem.find(u8, muted, "\x1b[38;5;89mMuted row") != null);
+    try std.testing.expect(std.mem.find(u8, muted, "\x1b[38;5;90mKeyword row") != null);
+    try std.testing.expect(std.mem.find(u8, muted, "\x1b[38;5;201muser output") != null);
 }

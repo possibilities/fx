@@ -10,6 +10,7 @@ const assistant_presentation = @import("../core/agent/assistant_presentation.zig
 const main = @import("../main.zig");
 const theme_detection = @import("terminal/theme_detection.zig");
 const theme_protocol = @import("terminal/theme_protocol.zig");
+const shared_theme = @import("../core/shared/theme.zig");
 const visual_layout = @import("input/visual_layout.zig");
 const update_target = @import("../core/upgrade/update_target.zig");
 
@@ -23,34 +24,26 @@ const user_message_card = @import("assistant/user_message_card.zig");
 pub const welcome_message_reserved_rows: u16 = 11;
 
 pub var is_light: bool = false;
-pub var divider_style: []const u8 = "\x1b[38;5;240m";
-pub var hint_style: []const u8 = "\x1b[38;5;255m";
-pub var statusline_style: []const u8 = "\x1b[38;5;245m";
-pub var tag_style: []const u8 = "\x1b[1;38;5;255m";
-pub var subtitle_style: []const u8 = "\x1b[1;38;5;255m";
-pub var system_notice_label_style: []const u8 = "\x1b[1;38;5;252m";
-pub var system_notice_text_style: []const u8 = "\x1b[38;5;250m";
-pub var dim_style: []const u8 = "\x1b[38;5;245m";
-pub var warning_style: []const u8 = "\x1b[38;5;252m";
-pub var green_style: []const u8 = "\x1b[38;5;252m";
-pub var red_style: []const u8 = "\x1b[38;5;252m";
-pub var diff_added_style: []const u8 = "\x1b[38;5;252m";
-pub var diff_removed_style: []const u8 = "\x1b[38;5;252m";
-// The line number and +/- sign carry the only color in an otherwise
-// monochrome diff: green for additions (#30A46C), red for deletions
-// (#E5484D). The line text stays neutral. Truecolor when the terminal
-// supports it, 256-color fallback otherwise.
-const diff_added_marker_truecolor = "\x1b[38;2;48;164;108m";
-const diff_removed_marker_truecolor = "\x1b[38;2;229;72;77m";
-const diff_added_marker_fallback = "\x1b[38;5;71m";
-const diff_removed_marker_fallback = "\x1b[38;5;167m";
-pub var diff_added_marker_style: []const u8 = diff_added_marker_fallback;
-pub var diff_removed_marker_style: []const u8 = diff_removed_marker_fallback;
-pub var approval_button_active_style: []const u8 = "\x1b[48;5;255m\x1b[38;5;235m\x1b[1m";
-pub var approval_button_inactive_style: []const u8 = "\x1b[48;5;239m\x1b[38;5;255m";
-pub var selected_completion_style: []const u8 = "\x1b[1;38;5;255m";
+pub var divider_style: []const u8 = shared_theme.fx_dark.divider_style;
+pub var hint_style: []const u8 = shared_theme.fx_dark.hint_style;
+pub var statusline_style: []const u8 = shared_theme.fx_dark.statusline_style;
+pub var tag_style: []const u8 = shared_theme.fx_dark.tag_style;
+pub var subtitle_style: []const u8 = shared_theme.fx_dark.subtitle_style;
+pub var system_notice_label_style: []const u8 = shared_theme.fx_dark.system_notice_label_style;
+pub var system_notice_text_style: []const u8 = shared_theme.fx_dark.system_notice_text_style;
+pub var dim_style: []const u8 = shared_theme.fx_dark.dim_style;
+pub var warning_style: []const u8 = shared_theme.fx_dark.warning_style;
+pub var green_style: []const u8 = shared_theme.fx_dark.green_style;
+pub var red_style: []const u8 = shared_theme.fx_dark.red_style;
+pub var diff_added_style: []const u8 = shared_theme.fx_dark.diff_added_style;
+pub var diff_removed_style: []const u8 = shared_theme.fx_dark.diff_removed_style;
+pub var diff_added_marker_style: []const u8 = "";
+pub var diff_removed_marker_style: []const u8 = "";
+pub var approval_button_active_style: []const u8 = shared_theme.fx_dark.approval_button_active_style;
+pub var approval_button_inactive_style: []const u8 = shared_theme.fx_dark.approval_button_inactive_style;
+pub var selected_completion_style: []const u8 = shared_theme.fx_dark.selected_completion_style;
 // Statusbar permissions "auto": a step brighter than the statusline gray.
-pub var permission_auto_style: []const u8 = "\x1b[38;5;252m";
+pub var permission_auto_style: []const u8 = shared_theme.fx_dark.permission_auto_style;
 var active_terminal_background: ?TerminalRgb = null;
 
 var truecolor_enabled: bool = true;
@@ -59,59 +52,59 @@ pub fn setTruecolorSupport(enabled: bool) void {
     truecolor_enabled = enabled;
 }
 
+// A configured light|dark pin (FX_THEME or the settings "theme" key) locks the
+// variant. Custom themes keep the live monitor so terminal mode flips
+// re-resolve the theme pair without a restart.
+pub fn themeInputLocked() bool {
+    return explicitThemeOverride() != null or shared_theme.variantPinned();
+}
+
+pub fn truecolorIsEnabled() bool {
+    return truecolor_enabled;
+}
+
 pub fn initTheme(light: bool, terminal_bg: ?TerminalRgb) void {
-    is_light = light;
+    applyTheme(shared_theme.builtin(light), terminal_bg);
+}
+
+pub fn applyTheme(theme: shared_theme.Theme, terminal_bg: ?TerminalRgb) void {
+    shared_theme.activate(theme);
+    is_light = theme.light;
     active_terminal_background = terminal_bg;
-    assistant_presentation.setInlineCodeTheme(light);
-    if (light) {
-        divider_style = "\x1b[38;5;250m";
-        hint_style = "\x1b[38;5;235m";
-        statusline_style = "\x1b[38;5;241m";
-        tag_style = "\x1b[1;38;5;235m";
-        subtitle_style = "\x1b[1;38;5;235m";
-        system_notice_label_style = "\x1b[1;38;5;238m";
-        system_notice_text_style = "\x1b[38;5;241m";
-        dim_style = "\x1b[38;5;247m";
-        warning_style = "\x1b[38;5;238m";
-        green_style = "\x1b[38;5;238m";
-        red_style = "\x1b[38;5;238m";
-        diff_added_style = "\x1b[38;5;238m";
-        diff_removed_style = "\x1b[38;5;238m";
-        approval_button_active_style = "\x1b[48;5;236m\x1b[38;5;255m\x1b[1m";
-        approval_button_inactive_style = "\x1b[48;5;251m\x1b[38;5;237m";
-        selected_completion_style = "\x1b[1;38;5;235m";
-        permission_auto_style = "\x1b[38;5;238m";
+    assistant_presentation.applyTheme(theme);
+    divider_style = theme.divider_style;
+    hint_style = theme.hint_style;
+    statusline_style = theme.statusline_style;
+    tag_style = theme.tag_style;
+    subtitle_style = theme.subtitle_style;
+    system_notice_label_style = theme.system_notice_label_style;
+    system_notice_text_style = theme.system_notice_text_style;
+    dim_style = theme.dim_style;
+    warning_style = theme.warning_style;
+    green_style = theme.green_style;
+    red_style = theme.red_style;
+    diff_added_style = theme.diff_added_style;
+    diff_removed_style = theme.diff_removed_style;
+    approval_button_active_style = theme.approval_button_active_style;
+    approval_button_inactive_style = theme.approval_button_inactive_style;
+    selected_completion_style = theme.selected_completion_style;
+    permission_auto_style = theme.permission_auto_style;
+
+    // Terminal-following defaults keep diff markers monochrome. An explicit
+    // light/dark pin or named theme enables its green/red marker colors.
+    const theme_selected = shared_theme.variantPinned() or shared_theme.sourceName() != null;
+    if (!theme_selected) {
+        diff_added_marker_style = "";
+        diff_removed_marker_style = "";
+    } else if (truecolor_enabled) {
+        diff_added_marker_style = theme.diff_added_marker_truecolor;
+        diff_removed_marker_style = theme.diff_removed_marker_truecolor;
     } else {
-        divider_style = "\x1b[38;5;240m";
-        hint_style = "\x1b[38;5;255m";
-        statusline_style = "\x1b[38;5;245m";
-        tag_style = "\x1b[1;38;5;255m";
-        subtitle_style = "\x1b[1;38;5;255m";
-        system_notice_label_style = "\x1b[1;38;5;252m";
-        system_notice_text_style = "\x1b[38;5;250m";
-        dim_style = "\x1b[38;5;245m";
-        warning_style = "\x1b[38;5;252m";
-        green_style = "\x1b[38;5;252m";
-        red_style = "\x1b[38;5;252m";
-        diff_added_style = "\x1b[38;5;252m";
-        diff_removed_style = "\x1b[38;5;252m";
-        approval_button_active_style = "\x1b[48;5;255m\x1b[38;5;235m\x1b[1m";
-        approval_button_inactive_style = "\x1b[48;5;239m\x1b[38;5;255m";
-        selected_completion_style = "\x1b[1;38;5;255m";
-        permission_auto_style = "\x1b[38;5;252m";
+        diff_added_marker_style = theme.diff_added_marker_fallback;
+        diff_removed_marker_style = theme.diff_removed_marker_fallback;
     }
 
-    // The diff marker green/red reads the same on light and dark, so it is set
-    // once here rather than per-theme.
-    if (truecolor_enabled) {
-        diff_added_marker_style = diff_added_marker_truecolor;
-        diff_removed_marker_style = diff_removed_marker_truecolor;
-    } else {
-        diff_added_marker_style = diff_added_marker_fallback;
-        diff_removed_marker_style = diff_removed_marker_fallback;
-    }
-
-    user_message_card.setStyle(light, terminal_bg);
+    user_message_card.applyTheme(theme, terminal_bg);
 }
 
 pub fn themeNeedsUpdate(light: bool, terminal_bg: ?TerminalRgb) bool {
@@ -123,6 +116,7 @@ pub fn themeNeedsUpdate(light: bool, terminal_bg: ?TerminalRgb) bool {
 
 // Explicit theme overrides skip OSC 11, leaving `rgb` null for fallback shading.
 pub const explicitThemeOverride = theme_detection.explicitThemeOverride;
+pub const explicitThemeName = theme_detection.explicitThemeName;
 pub const detectTheme = theme_detection.detectTheme;
 pub const parseOsc11Response = theme_protocol.parseOsc11Response;
 pub const truecolorSupportedForValues = theme_protocol.truecolorSupportedForValues;
@@ -200,6 +194,7 @@ pub fn welcomeMessage(alloc: std.mem.Allocator) ![]u8 {
 }
 
 pub const StatuslineItems = struct {
+    ultrafast_indicator_active: bool = false,
     workspace_label: []const u8 = "",
     git_branch: ?[]const u8 = null,
     context_used: u64 = 0,
@@ -398,7 +393,12 @@ fn appendSessionStatusSegments(
     if (model_supports_effort and !effort.isDefault()) {
         appendStatusSegment(out, end, effort.displayLabel());
     }
-    if (fast_indicator_active) {
+    if (statusline.ultrafast_indicator_active) {
+        const marker_style = if (truecolor_enabled) "\x1b[38;2;255;204;0m" else "\x1b[38;5;220m";
+        var marker_buf: [64]u8 = undefined;
+        const marker = std.fmt.bufPrint(&marker_buf, "{s}⚡︎{s}", .{ marker_style, statusline_style }) catch "⚡︎";
+        appendStatusSegment(out, end, marker);
+    } else if (fast_indicator_active) {
         appendStatusSegment(out, end, "⚡︎");
     }
     if (statusline.session_title) |title| {
@@ -796,9 +796,11 @@ pub fn formatResumeHandoff(
     buffer: []u8,
     session_id: []const u8,
     terminal_cols: u16,
+    sessions_v2: bool,
 ) ![]const u8 {
     const label = "Continue session with:";
-    const command = "fx --resume ";
+    // A v2 session resumes only with the flag that saved it.
+    const command = if (sessions_v2) "fx --sessions-v2 --resume " else "fx --resume ";
     const single_row_width = label.len + 1 + command.len + session_id.len;
     const separator = if (single_row_width <= terminal_cols) " " else "\n  ";
     return std.fmt.bufPrint(
@@ -806,6 +808,49 @@ pub fn formatResumeHandoff(
         "{s}{s}{s}{s}{s}{s}\n",
         .{ dim_style, label, separator, command, session_id, reset_style },
     );
+}
+
+test "diff markers are monochrome by default and colored for selected themes" {
+    const saved_truecolor = truecolorIsEnabled();
+    defer {
+        shared_theme.setSource(null, false);
+        setTruecolorSupport(saved_truecolor);
+        initTheme(false, null);
+    }
+
+    shared_theme.setSource(null, false);
+    setTruecolorSupport(true);
+    initTheme(false, null);
+    try std.testing.expectEqualStrings("", diff_added_marker_style);
+    try std.testing.expectEqualStrings("", diff_removed_marker_style);
+    initTheme(true, null);
+    try std.testing.expectEqualStrings("", diff_added_marker_style);
+    try std.testing.expectEqualStrings("", diff_removed_marker_style);
+
+    // Explicit builtin pins are configured themes even though they use the
+    // same palette as the terminal-following default.
+    shared_theme.setSource(null, true);
+    initTheme(false, null);
+    try std.testing.expectEqualStrings(shared_theme.fx_dark.diff_added_marker_truecolor, diff_added_marker_style);
+    try std.testing.expectEqualStrings(shared_theme.fx_dark.diff_removed_marker_truecolor, diff_removed_marker_style);
+    setTruecolorSupport(false);
+    initTheme(true, null);
+    try std.testing.expectEqualStrings(shared_theme.fx_light.diff_added_marker_fallback, diff_added_marker_style);
+    try std.testing.expectEqualStrings(shared_theme.fx_light.diff_removed_marker_fallback, diff_removed_marker_style);
+
+    // A named theme remains explicitly selected when its file is missing and
+    // startup falls back to the builtin variant.
+    shared_theme.setSource("missing-light", false);
+    initTheme(true, null);
+    try std.testing.expectEqualStrings(shared_theme.fx_light.diff_added_marker_fallback, diff_added_marker_style);
+    try std.testing.expectEqualStrings(shared_theme.fx_light.diff_removed_marker_fallback, diff_removed_marker_style);
+
+    var custom = shared_theme.fx_dark;
+    custom.diff_added_marker_fallback = "[custom-add]";
+    custom.diff_removed_marker_fallback = "[custom-remove]";
+    applyTheme(custom, null);
+    try std.testing.expectEqualStrings("[custom-add]", diff_added_marker_style);
+    try std.testing.expectEqualStrings("[custom-remove]", diff_removed_marker_style);
 }
 
 test "initTheme sets light mode styles" {
@@ -824,17 +869,24 @@ test "resume handoff uses one row only when the full instruction fits" {
 
     const single_row = "Continue session with: fx --resume session-123";
     var exact_buffer: [128]u8 = undefined;
-    const exact = try formatResumeHandoff(&exact_buffer, "session-123", single_row.len);
+    const exact = try formatResumeHandoff(&exact_buffer, "session-123", single_row.len, false);
     try std.testing.expectEqualStrings(
         "\x1b[38;5;245mContinue session with: fx --resume session-123\x1b[0m\n",
         exact,
     );
 
     var narrow_buffer: [128]u8 = undefined;
-    const narrow = try formatResumeHandoff(&narrow_buffer, "session-123", single_row.len - 1);
+    const narrow = try formatResumeHandoff(&narrow_buffer, "session-123", single_row.len - 1, false);
     try std.testing.expectEqualStrings(
         "\x1b[38;5;245mContinue session with:\n  fx --resume session-123\x1b[0m\n",
         narrow,
+    );
+
+    var v2_buffer: [128]u8 = undefined;
+    const v2 = try formatResumeHandoff(&v2_buffer, "session-123", 80, true);
+    try std.testing.expectEqualStrings(
+        "\x1b[38;5;245mContinue session with: fx --sessions-v2 --resume session-123\x1b[0m\n",
+        v2,
     );
 }
 
@@ -843,7 +895,7 @@ test "resume handoff follows the active muted theme shade" {
     defer initTheme(false, null);
 
     var buffer: [128]u8 = undefined;
-    const message = try formatResumeHandoff(&buffer, "session-123", 80);
+    const message = try formatResumeHandoff(&buffer, "session-123", 80, false);
     try std.testing.expectEqualStrings(
         "\x1b[38;5;247mContinue session with: fx --resume session-123\x1b[0m\n",
         message,
@@ -972,6 +1024,43 @@ test "buildHintLine uses a monochrome lightning marker for fast mode" {
     const line = buildHintLine(false, true, "anthropic/claude-opus-4.8", .ask, true, types.ReasoningEffort.literal("low"), true, .{}, 80, &buf);
     try std.testing.expectEqualStrings("ask · opus 4.8 · low · ⚡︎", line);
     try std.testing.expectEqual(@as(usize, 25), display_width.visibleWidthIgnoringAnsi(line));
+}
+
+test "buildHintLine uses one vivid yellow lightning marker for Ultrafast in both themes" {
+    const terminal_engine = @import("../core/terminal/engine.zig");
+    defer initTheme(false, null);
+    defer setTruecolorSupport(true);
+    for ([_]bool{ false, true }) |light| {
+        initTheme(light, null);
+        for ([_]bool{ true, false }) |truecolor| {
+            setTruecolorSupport(truecolor);
+            var buf: [128]u8 = undefined;
+            const line = buildHintLine(false, true, "openai/gpt-6-astra", .auto, true, types.ReasoningEffort.literal("xhigh"), true, .{ .ultrafast_indicator_active = true }, 80, &buf);
+            var expected_buf: [128]u8 = undefined;
+            const yellow = if (truecolor) "\x1b[38;2;255;204;0m" else "\x1b[38;5;220m";
+            const expected = try std.fmt.bufPrint(&expected_buf, "{s}auto{s} · gpt-6-astra · xhigh · {s}⚡︎{s}", .{ permission_auto_style, statusline_style, yellow, statusline_style });
+            try std.testing.expectEqualStrings(expected, line);
+            try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, line, "⚡︎"));
+            try std.testing.expectEqual(@as(usize, 31), display_width.visibleWidthIgnoringAnsi(line));
+            var grid = try terminal_engine.Grid.init(std.testing.allocator, 80, 1);
+            defer grid.deinit();
+            try grid.feed(line);
+            const marker_color: terminal_engine.Color = if (truecolor) .{ .rgb = .{ .r = 255, .g = 204, .b = 0 } } else .{ .indexed = 220 };
+            var markers: usize = 0;
+            for (grid.cells) |cell| {
+                if (cell.codepoint != 0x26a1) continue;
+                markers += 1;
+                try std.testing.expect(cell.style.fg.eql(marker_color));
+                try std.testing.expect(!cell.style.flags.dim);
+            }
+            try std.testing.expectEqual(@as(usize, 1), markers);
+            try std.testing.expect(grid.current_style.fg.eql(.{ .indexed = if (light) 241 else 245 }));
+            for (0..32) |width| {
+                const clipped = buildHintLine(false, true, "openai/gpt-6-astra", .auto, false, types.ReasoningEffort.literal("xhigh"), true, .{ .ultrafast_indicator_active = true }, @intCast(width), &buf);
+                try std.testing.expect(display_width.visibleWidthIgnoringAnsi(clipped) <= width);
+            }
+        }
+    }
 }
 
 test "buildHintLine shows effort when active" {

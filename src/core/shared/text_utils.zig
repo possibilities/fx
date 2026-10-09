@@ -379,6 +379,33 @@ pub fn encodeTerminalSafe(
     };
 }
 
+/// Like `encodeTerminalSafe`, but first flattens every run of ASCII
+/// whitespace (including line breaks and tabs) into a single space and trims
+/// the ends, so multi-line human-readable text stays readable inside a
+/// one-line summary. Non-whitespace control bytes and invalid UTF-8 still get
+/// visible `\xNN` escapes.
+pub fn encodeTerminalSafeInline(
+    alloc: std.mem.Allocator,
+    raw: []const u8,
+    max_encoded_bytes: usize,
+) error{OutOfMemory}!EncodedText {
+    var flattened: std.ArrayList(u8) = .empty;
+    defer flattened.deinit(alloc);
+    var pending_space = false;
+    for (raw) |byte| {
+        if (std.ascii.isWhitespace(byte)) {
+            pending_space = flattened.items.len > 0;
+            continue;
+        }
+        if (pending_space) {
+            try flattened.append(alloc, ' ');
+            pending_space = false;
+        }
+        try flattened.append(alloc, byte);
+    }
+    return encodeTerminalSafe(alloc, flattened.items, max_encoded_bytes);
+}
+
 /// Returns true when `raw` is valid printable terminal text and
 /// `encodeTerminalSafe` would preserve it byte-for-byte.
 pub fn isTerminalSafe(raw: []const u8) bool {
@@ -1146,6 +1173,45 @@ test "encodeTerminalSafe visibly escapes controls line breaks and invalid UTF-8"
     try std.testing.expect(std.mem.indexOfScalar(u8, encoded.bytes, '\n') == null);
     try std.testing.expect(std.unicode.utf8ValidateSlice(encoded.bytes));
     try std.testing.expect(!encoded.truncated);
+}
+
+test "encodeTerminalSafeInline flattens whitespace runs and trims the ends" {
+    const raw = "  {\n  \"success\": false,\r\n\t\"info\": \"nope\"}\n";
+    var encoded = try encodeTerminalSafeInline(std.testing.allocator, raw, 256);
+    defer encoded.deinit(std.testing.allocator);
+
+    try std.testing.expectEqualStrings(
+        "{ \"success\": false, \"info\": \"nope\"}",
+        encoded.bytes,
+    );
+    try std.testing.expect(!encoded.truncated);
+}
+
+test "encodeTerminalSafeInline still escapes dangerous controls and invalid UTF-8" {
+    const raw = "a\x1b[31m\nb\x07\xff";
+    var encoded = try encodeTerminalSafeInline(std.testing.allocator, raw, 256);
+    defer encoded.deinit(std.testing.allocator);
+
+    try std.testing.expectEqualStrings("a\\x1b[31m b\\x07\\xff", encoded.bytes);
+    try std.testing.expect(std.mem.indexOfScalar(u8, encoded.bytes, 0x1b) == null);
+    try std.testing.expect(std.mem.indexOfScalar(u8, encoded.bytes, '\n') == null);
+    try std.testing.expect(std.unicode.utf8ValidateSlice(encoded.bytes));
+}
+
+test "encodeTerminalSafeInline collapses whitespace-only input to empty" {
+    var encoded = try encodeTerminalSafeInline(std.testing.allocator, " \n\t\r\n ", 256);
+    defer encoded.deinit(std.testing.allocator);
+
+    try std.testing.expectEqualStrings("", encoded.bytes);
+    try std.testing.expect(!encoded.truncated);
+}
+
+test "encodeTerminalSafeInline applies the byte budget after flattening" {
+    var encoded = try encodeTerminalSafeInline(std.testing.allocator, "one  two\nthree", 8);
+    defer encoded.deinit(std.testing.allocator);
+
+    try std.testing.expectEqualStrings("one t...", encoded.bytes);
+    try std.testing.expect(encoded.truncated);
 }
 
 test "isTerminalSafe matches byte-preserving terminal encoding" {
