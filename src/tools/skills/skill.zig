@@ -141,7 +141,13 @@ fn prepareInput(ctx: tool_dispatch.DispatchContext, input: *const Input) !skill_
             return skill_invocation.prepareIdentity(ctx.allocator, .{ .skills = locations.skills, .diagnostics = locations.diagnostics }, input.name, path, ctx.max_tool_result_bytes);
         }
     }
-    var discovery = try builtin_skills.loadVisibleSkillsForTool(ctx.allocator, ctx.workspace_root, ctx.skills_dir, ctx.invocation_skill_roots);
+    var discovery = try builtin_skills.loadVisibleSkillsForTool(
+        ctx.allocator,
+        ctx.workspace_root,
+        ctx.skills_dir,
+        ctx.invocation_skill_roots,
+        ctx.skill_root_policy orelse builtin_skills.root_policy,
+    );
     defer discovery.deinit(ctx.allocator);
     skill_runtime.traceDiagnostics("skill_tool", discovery.diagnostics);
     return skill_invocation.prepareIdentity(ctx.allocator, .{ .skills = discovery.skills, .diagnostics = discovery.diagnostics }, input.name, location, ctx.max_tool_result_bytes);
@@ -193,6 +199,7 @@ fn loadByIdentity(
     workspace_root: []const u8,
     skills_dir: []const u8,
     invocation_skill_roots: []const []const u8,
+    root_policy: @import("../../core/skills/skill_contract.zig").RootPolicy,
     name: []const u8,
     location: ?[]const u8,
     resource: ?[]const u8,
@@ -205,6 +212,7 @@ fn loadByIdentity(
         workspace_root,
         skills_dir,
         invocation_skill_roots,
+        root_policy,
     );
     defer discovery.deinit(alloc);
     skill_runtime.traceDiagnostics("skill_tool", discovery.diagnostics);

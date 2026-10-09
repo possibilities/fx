@@ -264,6 +264,7 @@ pub const DispatchContext = struct {
     max_tool_result_bytes: usize = tool_result_limits.default_max_tool_result_bytes,
     max_command_output_bytes: usize = tool_result_limits.default_max_tool_result_bytes,
     skills_dir: []const u8 = "",
+    skill_root_policy: ?skill_contract.RootPolicy = null,
     skill_locations: ?*const skill_contract.Locations = null,
     resolved_skill: ?*const skill_contract.PreparedSkill = null,
     invocation_skill_roots: []const []const u8 = &.{},

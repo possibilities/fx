@@ -595,6 +595,7 @@ const App = struct {
     mcp: app_mcp_runtime.State = .{},
     skills: skill_runtime.Runtime = .{},
     invocation_skill_roots: [][]u8 = &.{},
+    skill_root_policy: @import("core/skills/skill_contract.zig").RootPolicy = builtin_skills.root_policy,
     context_snapshot: context_contract.GatheredContextSnapshot = .{},
     file_index: file_index_mod.FileIndex = .{},
     context_enabled: bool = true,
@@ -667,6 +668,10 @@ const App = struct {
         );
         usage_dashboard_runtime.Runtime.initInto(&app.usage_dashboard, std.heap.c_allocator);
         app_session_runtime.Persistence.initInto(&app.session_persistence);
+        app.skill_root_policy = launch.modifiers.skillRootPolicy(if (comptime host_target.is_wasm)
+            wasm_skill_root_policy
+        else
+            builtin_skills.root_policy);
         InputRuntime.initInto(&app.input_runtime);
         SessionRuntime.initIntoWithProviders(
             &app.session,
@@ -708,7 +713,7 @@ const App = struct {
             handle_sigwinch,
             .{
                 .load_mcp_runtime = if (comptime host_target.is_wasm) loadNoMcpRuntime else builtin_mcp.loadRuntime,
-                .skill_root_policy = if (comptime host_target.is_wasm) wasm_skill_root_policy else builtin_skills.root_policy,
+                .skill_root_policy = app.skill_root_policy,
                 .invocation_skill_roots = launch.modifiers.invocation_skill_roots,
                 .terminal_title = app.terminalTitle(),
             },
@@ -2082,7 +2087,7 @@ const App = struct {
     pub fn requestSkillsRefresh(self: *App) !u64 {
         const home = try app_runtime_setup.resolveSkillsHome(std.heap.c_allocator);
         defer if (home) |value| std.heap.c_allocator.free(value);
-        var root_policy = builtin_skills.root_policy;
+        var root_policy = self.skill_root_policy;
         root_policy.invocation_roots = self.invocation_skill_roots;
         return self.skills.requestRefresh(
             std.heap.c_allocator,
@@ -2110,7 +2115,7 @@ const App = struct {
     }
 
     fn pollSkillsRefresh(self: *App) !skill_runtime.RefreshCompletion {
-        var root_policy = builtin_skills.root_policy;
+        var root_policy = self.skill_root_policy;
         root_policy.invocation_roots = self.invocation_skill_roots;
         const completion = try self.skills.pollRefresh(
             std.heap.c_allocator,
@@ -3878,6 +3883,8 @@ test "full entry config commands also use early threaded io" {
         @as([:0]const u8, "--context-limit=project_bytes=2048"),
         @as([:0]const u8, "--no-additional-dirs"),
         @as([:0]const u8, "--no-native-tools"),
+        @as([:0]const u8, "--no-default-skills"),
+        @as([:0]const u8, "--skills-dir=/tmp/acp-skills"),
         @as([:0]const u8, "acp"),
     }));
     try std.testing.expect(needsFullEntryConfig(&.{
