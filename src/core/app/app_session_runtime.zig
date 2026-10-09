@@ -3351,7 +3351,7 @@ pub fn Runtime(comptime App: type) type {
                     try app.session.appendHistoryEntry(app.alloc, prepared);
                 }
                 if (snapshot_file_ownership) |ownership| ownership.transfer();
-                ensureCachedSessionTitle(app) catch {};
+                ensureCachedSessionTitleLocked(app) catch {};
                 return .committed;
             }
             const loaded = if (app.session_persistence.writable) |*value|
@@ -3659,18 +3659,19 @@ pub fn Runtime(comptime App: type) type {
             return if (app.session_title.items.len == 0) null else app.session_title.items;
         }
 
-        /// Returns the cached title only when the active session's conversation
-        /// manifest names the same value. Resume can derive a cosmetic title
+        /// Returns the cached title only when the active session's durable
+        /// backend names the same value. Resume can derive a cosmetic title
         /// from legacy history when no title was committed; raw metadata
         /// observers must not mistake that fallback for a committed native name.
         pub fn durableCachedSessionTitle(app: *App) ?[]const u8 {
             if (comptime !@hasField(App, "session_persistence")) return null;
             const title = cachedSessionTitle(app) orelse return null;
-            const loaded = if (app.session_persistence.writable) |*value|
-                value
+            const stored = if (app.session_persistence.v2) |v2|
+                v2.conversationTitle(app.alloc) catch return null
+            else if (app.session_persistence.writable) |*loaded|
+                loaded.conversationTitle(app.alloc) catch return null
             else
                 return null;
-            const stored = loaded.conversationTitle(app.alloc) catch return null;
             defer if (stored) |value| app.alloc.free(value);
             const committed = stored orelse return null;
             if (!std.mem.eql(u8, committed, title)) return null;
@@ -3684,7 +3685,7 @@ pub fn Runtime(comptime App: type) type {
             if (comptime !@hasField(App, "session_title")) return;
             if (app.session_title.items.len > 0) return;
             if (comptime @hasField(App, "session_persistence")) {
-                if (app.session_persistence.writable != null) {
+                if (app.session_persistence.writable != null or app.session_persistence.v2 != null) {
                     app.session_persistence.write_mutex.lockUncancelable(io_mod.getIo());
                     defer app.session_persistence.write_mutex.unlock(io_mod.getIo());
                     return ensureCachedSessionTitleLocked(app);
@@ -3866,7 +3867,7 @@ pub fn Runtime(comptime App: type) type {
             try persistActiveSessionTitle(app, title);
         }
 
-        /// Installs one native title through upstream's conversation-manifest
+        /// Installs one native title through upstream's selected-backend
         /// rename for generated, derived, and manually supplied names. The
         /// conversation log is the history authority; no retired sidecar or
         /// index cache is written. Publication to observers happens only after
@@ -3883,15 +3884,18 @@ pub fn Runtime(comptime App: type) type {
         /// The first-turn title for a caller that already holds the session
         /// write mutex with a writable session. Upstream's conversation layer
         /// commits the derived title itself when the first turn lands, so a
-        /// title already in the manifest is adopted rather than re-derived;
+        /// title already in the durable backend is adopted rather than re-derived;
         /// only a conversation without one is named here, in place, because
         /// the manifest rename must not lock again.
         fn ensureCachedSessionTitleLocked(app: *App) !void {
             if (comptime !@hasField(App, "session_title")) return;
             if (app.session_title.items.len > 0) return;
             {
-                const loaded = &app.session_persistence.writable.?;
-                if (try loaded.conversationTitle(app.alloc)) |stored| {
+                const title = if (app.session_persistence.v2) |v2|
+                    try v2.conversationTitle(app.alloc)
+                else
+                    try app.session_persistence.writable.?.conversationTitle(app.alloc);
+                if (title) |stored| {
                     defer app.alloc.free(stored);
                     try publishSessionTitle(app, stored);
                     return;
@@ -6845,8 +6849,14 @@ const TestApp = struct {
             self.reported_session_metadata_title[0..self.reported_session_metadata_title_len],
             title[0..self.reported_session_metadata_title_len],
         );
-        const loaded = if (self.session_persistence.writable) |*value| value else return;
-        const stored = loaded.conversationTitle(self.alloc) catch return;
+        const stored = if (self.session_persistence.v2) |v2| blk: {
+            var durable = v2.durableState(self.alloc, self.workspace_root) catch return;
+            defer durable.deinit(self.alloc);
+            break :blk if (durable.title) |value| self.alloc.dupe(u8, value) catch return else null;
+        } else if (self.session_persistence.writable) |*loaded|
+            loaded.conversationTitle(self.alloc) catch return
+        else
+            return;
         defer if (stored) |value| self.alloc.free(value);
         self.reported_session_metadata_after_commit = if (stored) |value|
             std.mem.eql(u8, value, title)
@@ -12421,11 +12431,15 @@ test "renameActiveSession requires an active session" {
 
 fn expectActiveTitleDurable(app: *TestApp, expected: []const u8) !void {
     const alloc = std.testing.allocator;
-    const loaded = &app.session_persistence.writable.?;
-    const stored = (try loaded.conversationTitle(alloc)) orelse return error.TestExpectedDurableTitle;
+    const stored = if (app.session_persistence.v2) |v2| blk: {
+        var durable = try v2.durableState(alloc, app.workspace_root);
+        defer durable.deinit(alloc);
+        break :blk try alloc.dupe(u8, durable.title orelse return error.TestExpectedDurableTitle);
+    } else (try app.session_persistence.writable.?.conversationTitle(alloc)) orelse return error.TestExpectedDurableTitle;
     defer alloc.free(stored);
     try std.testing.expectEqualStrings(expected, stored);
-    try std.testing.expectEqualStrings(expected, Runtime(TestApp).durableCachedSessionTitle(app).?);
+    const cached = Runtime(TestApp).durableCachedSessionTitle(app) orelse return error.TestExpectedDurableCachedTitle;
+    try std.testing.expectEqualStrings(expected, cached);
 }
 
 test "renameActiveSession persists the title only in session metadata" {
@@ -12504,53 +12518,65 @@ test "renameActiveSession persists the title only in session metadata" {
 }
 
 test "fallback generated and manual titles share one durable metadata path" {
-    const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
+    for ([_]bool{ false, true }) |sessions_v2| {
+        const alloc = std.testing.allocator;
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
 
-    const paths = try testPaths(alloc, &tmp);
-    defer {
-        alloc.free(paths.home);
-        alloc.free(paths.workspace);
+        const paths = try testPaths(alloc, &tmp);
+        defer {
+            alloc.free(paths.home);
+            alloc.free(paths.workspace);
+        }
+        const home = try TestHome.install(alloc, paths.home);
+        defer home.deinit();
+
+        const fx_dir = try std.fs.path.joinZ(alloc, &.{ paths.home, ".fx" });
+        defer alloc.free(fx_dir);
+        if (std.c.chmod(fx_dir.ptr, 0o700) != 0) return error.TestChmodFailed;
+        var app = try TestApp.init(alloc, paths.workspace);
+        defer app.deinit();
+        try configureTestPreferences(&app);
+        app.session_persistence.sessions_v2 = sessions_v2;
+        try Runtime(TestApp).initializePersistence(&app, true);
+        try Runtime(TestApp).beginFreshPersistedSession(&app);
+        Runtime(TestApp).enableSessionStores(&app);
+
+        const turn = try session_runtime.makeAssistantTurn(
+            alloc,
+            "fallback title from the admitted first user prompt",
+            "answer",
+        );
+        defer session_runtime.freeHistoryTurn(alloc, turn);
+        try Runtime(TestApp).appendHistoryTurn(&app, turn);
+        try expectActiveTitleDurable(&app, "fallback title from the admitted first user prompt");
+        try std.testing.expect(app.reported_session_metadata_after_commit);
+        try std.testing.expectEqualStrings(
+            "fallback title from the admitted first user prompt",
+            app.reportedSessionMetadataTitle(),
+        );
+
+        app.reported_session_metadata_after_commit = false;
+        try Runtime(TestApp).applyGeneratedSessionTitle(&app, "Generated native title");
+        try expectActiveTitleDurable(&app, "Generated native title");
+        try std.testing.expect(app.reported_session_metadata_after_commit);
+        try std.testing.expectEqualStrings("Generated native title", app.reportedSessionMetadataTitle());
+        try std.testing.expectEqual(@as(usize, 0), app.cancelled_session_name_count);
+
+        app.reported_session_metadata_after_commit = false;
+        try Runtime(TestApp).renameActiveSession(&app, "Manual native title");
+        try expectActiveTitleDurable(&app, "Manual native title");
+        try std.testing.expect(app.reported_session_metadata_after_commit);
+        try std.testing.expectEqualStrings("Manual native title", app.reportedSessionMetadataTitle());
+        try std.testing.expectEqual(@as(usize, 1), app.cancelled_session_name_count);
+        try std.testing.expectEqual(@as(usize, 3), app.reported_session_metadata_count);
+        const session_id = try alloc.dupe(u8, Runtime(TestApp).activeSessionId(&app).?);
+        defer alloc.free(session_id);
+        Runtime(TestApp).closeWritableSession(&app);
+        app.requested_resume = .{ .id = try alloc.dupe(u8, session_id) };
+        try Runtime(TestApp).resumeRequestedSession(&app);
+        try expectActiveTitleDurable(&app, "Manual native title");
     }
-    const home = try TestHome.install(alloc, paths.home);
-    defer home.deinit();
-
-    var app = try TestApp.init(alloc, paths.workspace);
-    defer app.deinit();
-    try configureTestPreferences(&app);
-    try Runtime(TestApp).initializePersistence(&app, true);
-    try Runtime(TestApp).beginFreshPersistedSession(&app);
-    Runtime(TestApp).enableSessionStores(&app);
-
-    const turn = try session_runtime.makeAssistantTurn(
-        alloc,
-        "fallback title from the admitted first user prompt",
-        "answer",
-    );
-    defer session_runtime.freeHistoryTurn(alloc, turn);
-    try Runtime(TestApp).appendHistoryTurn(&app, turn);
-    try expectActiveTitleDurable(&app, "fallback title from the admitted first user prompt");
-    try std.testing.expect(app.reported_session_metadata_after_commit);
-    try std.testing.expectEqualStrings(
-        "fallback title from the admitted first user prompt",
-        app.reportedSessionMetadataTitle(),
-    );
-
-    app.reported_session_metadata_after_commit = false;
-    try Runtime(TestApp).applyGeneratedSessionTitle(&app, "Generated native title");
-    try expectActiveTitleDurable(&app, "Generated native title");
-    try std.testing.expect(app.reported_session_metadata_after_commit);
-    try std.testing.expectEqualStrings("Generated native title", app.reportedSessionMetadataTitle());
-    try std.testing.expectEqual(@as(usize, 0), app.cancelled_session_name_count);
-
-    app.reported_session_metadata_after_commit = false;
-    try Runtime(TestApp).renameActiveSession(&app, "Manual native title");
-    try expectActiveTitleDurable(&app, "Manual native title");
-    try std.testing.expect(app.reported_session_metadata_after_commit);
-    try std.testing.expectEqualStrings("Manual native title", app.reportedSessionMetadataTitle());
-    try std.testing.expectEqual(@as(usize, 1), app.cancelled_session_name_count);
-    try std.testing.expectEqual(@as(usize, 3), app.reported_session_metadata_count);
 }
 
 test "generated title committed before first history remains authoritative in the conversation metadata" {
