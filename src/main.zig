@@ -2085,7 +2085,7 @@ const App = struct {
         const completion = try self.skills.pollRefresh(
             std.heap.c_allocator,
             self.workspace_root,
-            builtin_skills.root_policy,
+            self.skill_root_policy,
         );
         if (completion == .adopted) {
             skill_runtime.traceDiagnostics(
