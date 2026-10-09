@@ -272,7 +272,8 @@ on `main`. Run focused checks in the carry worktree, compose every current
 carry into a clean candidate, then run before publishing any affected carry:
 
 ```bash
-/Users/arthack/workshops/fxnk/scripts/local-gate.sh --worktree "$composition_worktree"
+MAINTAIN_UPSTREAM_SHA="$cycle_upstream_sha" \
+  ~/workshops/fxnk/scripts/local-gate.sh --worktree "$composition_worktree"
 ```
 
 The gate builds ReleaseSafe, runs narrow carried-unit canaries and focused
@@ -464,8 +465,8 @@ The canonical repository is `vercel-labs/fx` on GitHub. All URLs, links, and ref
 
 1. Run the focused tests for the changed path.
 2. Compose every current carry head into a clean Integration candidate.
-3. Run `/Users/arthack/workshops/fxnk/scripts/local-gate.sh --worktree "$PWD"` from that exact
-   composition worktree.
+3. Run `~/workshops/fxnk/scripts/local-gate.sh --worktree "$PWD"` from that exact
+   composition worktree with `MAINTAIN_UPSTREAM_SHA` set to the captured upstream SHA.
 4. Exercise the composition locally with the freshly built `./zig-out/bin/fx`.
 5. Commit the clean result and publish affected carries with Integration under
    exact leases.
