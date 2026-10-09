@@ -175,9 +175,9 @@ async function waitForJsonFile(
 }
 
 describe.skipIf(!tmuxAvailable())("ADE event feed", () => {
-  test(
-    "publishes ordered main, attention, subagent, and shutdown lifecycle records",
-    async () => {
+  test.each([false, true])(
+    "publishes ordered main, attention, subagent, and shutdown lifecycle records (sessions v2: %s)",
+    async (sessionsV2) => {
       const tempRoot = existsSync("/private/tmp") ? "/private/tmp" : tmpdir();
       root = realpathSync(mkdtempSync(join(tempRoot, "fx-ade-feed-e2e-")));
       const home = join(root, "home");
@@ -186,7 +186,7 @@ describe.skipIf(!tmuxAvailable())("ADE event feed", () => {
       const socketPath = join(root, "ade.sock");
       const checkpointPath = join(root, "git-roots.json");
       const stderrPath = join(root, "stderr.log");
-      mkdirSync(join(home, ".fx"), { recursive: true });
+      mkdirSync(join(home, ".fx"), { recursive: true, mode: 0o700 });
       mkdirSync(workspace);
       mkdirSync(secondWorkspace);
       expect(Bun.spawnSync(["git", "init", "-q", workspace]).exitCode).toBe(
@@ -263,9 +263,7 @@ describe.skipIf(!tmuxAvailable())("ADE event feed", () => {
         models: [{ id: FAKE_GATEWAY_MODEL, type: "language", tags: ["tool-use"] }],
       });
 
-      session = await TmuxSession.create({
-        cwd: realpathSync(workspace),
-        env: {
+      const launchEnv = {
           HOME: realpathSync(home),
           AI_GATEWAY_API_KEY: "ade-event-feed-key",
           VERCEL_OIDC_TOKEN: undefined,
@@ -273,11 +271,15 @@ describe.skipIf(!tmuxAvailable())("ADE event feed", () => {
           FX_GATEWAY_CHAT_URL: gateway.chatUrl,
           FX_MODEL: FAKE_GATEWAY_MODEL,
           FX_AUTO_UPGRADE: "0",
+          FX_SESSIONS_V2: sessionsV2 ? "1" : "0",
           FX_ADE_SOCKET_PATH: socketPath,
           FX_ADE_INSTANCE_ID: INSTANCE_ID,
           FX_ADE_CHECKPOINT_PATH: checkpointPath,
           NO_COLOR: "1",
-        },
+      };
+      session = await TmuxSession.create({
+        cwd: realpathSync(workspace),
+        env: launchEnv,
         width: 100,
         height: 28,
         stderrPath,
@@ -315,11 +317,18 @@ describe.skipIf(!tmuxAvailable())("ADE event feed", () => {
       expect(metadataSessionId).not.toBeNull();
       // The title is durable only in the conversation manifest; no display
       // sidecar exists any more.
-      const manifest = JSON.parse(readFileSync(
-        join(home, ".fx", "sessions", metadataSessionId!, "session.json"),
-        "utf8",
-      )) as { title?: unknown };
-      expect(manifest.title).toBe("ade-native-session-title");
+      if (sessionsV2) {
+        const lines = readFileSync(join(home, ".fx", "sessions", "v2", metadataSessionId!, "log.jsonl"), "utf8")
+          .trim().split("\n").map((line) => JSON.parse(line));
+        expect(lines.filter((line) => line.kind === "set" && line.key === "title").at(-1)?.value)
+          .toBe("ade-native-session-title");
+      } else {
+        const manifest = JSON.parse(readFileSync(
+          join(home, ".fx", "sessions", metadataSessionId!, "session.json"),
+          "utf8",
+        )) as { title?: unknown };
+        expect(manifest.title).toBe("ade-native-session-title");
+      }
       expect(existsSync(
         join(home, ".fx", "sessions", metadataSessionId!, "display.json"),
       )).toBe(false);
@@ -429,19 +438,31 @@ describe.skipIf(!tmuxAvailable())("ADE event feed", () => {
       // asserts about discovery after a child completes: the parent and child
       // both persist, and the parent is the session holding the child
       // registry, which is what keeps a child private to it.
-      const sessionsRoot = join(home, ".fx", "sessions");
+      const sessionsRoot = sessionsV2
+        ? join(home, ".fx", "sessions", "v2")
+        : join(home, ".fx", "sessions");
       const persisted = readdirSync(sessionsRoot, { withFileTypes: true })
         .filter((entry) =>
           entry.isDirectory() &&
-          existsSync(join(sessionsRoot, entry.name, "session.json"))
+          existsSync(join(sessionsRoot, entry.name, sessionsV2 ? "log.jsonl" : "session.json"))
         )
         .map((entry) => entry.name);
       expect(persisted).toContain(originalMainSession);
       expect(persisted).toContain(childAttention.context.session_id);
-      const registryOwners = persisted.filter((id) =>
-        existsSync(join(sessionsRoot, id, "subagent", "children.json"))
-      );
-      expect(registryOwners).toEqual([originalMainSession]);
+      if (sessionsV2) {
+        const parentLines = readFileSync(join(sessionsRoot, originalMainSession!, "log.jsonl"), "utf8")
+          .trim().split("\n").map((line) => JSON.parse(line));
+        expect(parentLines.some((line) => line.kind === "child_spawned" && line.child === childAttention.context.session_id))
+          .toBe(true);
+        const childLines = readFileSync(join(sessionsRoot, childAttention.context.session_id!, "log.jsonl"), "utf8")
+          .trim().split("\n").map((line) => JSON.parse(line));
+        expect(childLines[0].parent).toBe(originalMainSession);
+      } else {
+        const registryOwners = persisted.filter((id) =>
+          existsSync(join(sessionsRoot, id, "subagent", "children.json"))
+        );
+        expect(registryOwners).toEqual([originalMainSession]);
+      }
 
       await session.waitForComposer(TIMEOUT);
       await session.sendText("/quit");
@@ -553,6 +574,23 @@ describe.skipIf(!tmuxAvailable())("ADE event feed", () => {
       )).toBe(false);
       expect(records.every((record) => record.context.workspace_root === realpathSync(workspace)))
         .toBe(true);
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+      await session.kill();
+      session = await TmuxSession.create({
+        cmd: `${JSON.stringify(FX_BIN)} resume ${originalMainSession}`,
+        cwd: realpathSync(workspace),
+        env: { ...launchEnv, FX_ADE_INSTANCE_ID: "ade-resumed-instance" },
+        stderrPath,
+      });
+      await session.waitForComposer(TIMEOUT);
+      const resumedMetadata = await receiver.waitFor((record) =>
+        record.instance_id === "ade-resumed-instance" &&
+        record.event === "SessionMetadataChanged"
+      );
+      expect(resumedMetadata.context.session_id).toBe(originalMainSession);
+      expect(resumedMetadata.payload.title).toBe("ade-native-session-title");
+      await session.sendText("/quit");
+      expect(await session.waitForSessionEnd(TIMEOUT)).toBe(true);
       expect(readFileSync(stderrPath, "utf8")).toBe("");
     },
     60_000,
