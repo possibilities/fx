@@ -16,11 +16,25 @@ const unicode_simple_fold = @import("unicode_simple_fold.zig");
 const pathing = @import("pathing.zig");
 const workspace_access = @import("workspace_access.zig");
 const workspace_files = @import("workspace_files.zig");
+const file_index_cache = @import("file_index_cache.zig");
 
 const Allocator = std.mem.Allocator;
 
 pub const max_indexed_files: usize = 100_000;
 pub const max_path_len: u32 = 2048;
+
+const sha256_digest_len = std.crypto.hash.sha2.Sha256.digest_length;
+
+fn rootsDigest(roots: []const []const u8) [sha256_digest_len]u8 {
+    var digest = std.crypto.hash.sha2.Sha256.init(.{});
+    for (roots) |root| {
+        digest.update(root);
+        digest.update(&.{0});
+    }
+    var sum: [sha256_digest_len]u8 = undefined;
+    digest.final(&sum);
+    return sum;
+}
 
 pub const CandidateKind = enum(u8) {
     file,
@@ -94,6 +108,9 @@ pub const ReadableRevision = struct {
 const Generation = struct {
     id: usize,
     scope_epoch: u64 = 0,
+    /// Cache-sourced generations publish fast from the persisted index and
+    /// always trigger one real scan behind them.
+    from_cache: bool = false,
     paths_buf: []u8 = &.{},
     lower_buf: []u8 = &.{},
     offsets: []u32 = &.{},
@@ -272,6 +289,9 @@ pub const FileIndex = struct {
     thread: ?std.Thread = null,
     generation: usize = 0,
     initial_failed: bool = false,
+    /// Digest of the roots whose persisted cache this process already consumed.
+    /// A scope switch to different roots may load its own cache.
+    cache_attempted_digest: ?[sha256_digest_len]u8 = null,
 
     pub fn requestStop(self: *FileIndex) void {
         self.stop_requested.store(true, .seq_cst);
@@ -346,6 +366,15 @@ pub const FileIndex = struct {
             self.loading_generation != null or
             self.stop_requested.load(.seq_cst)) return false;
 
+        // The persisted cache is consumed at most once per scope: the first
+        // generation paints from disk, then a real scan replaces it.
+        const roots_digest = rootsDigest(self.roots);
+        const allow_cache = if (self.cache_attempted_digest) |attempted|
+            !std.mem.eql(u8, &attempted, &roots_digest)
+        else
+            true;
+        if (allow_cache) self.cache_attempted_digest = roots_digest;
+
         const generation_id = self.generation + 1;
         const loading = Generation.create(alloc, generation_id) catch |err| {
             if (self.active_generation == null) self.initial_failed = true;
@@ -361,6 +390,7 @@ pub const FileIndex = struct {
             alloc,
             self.roots,
             &self.stop_requested,
+            allow_cache,
         }) catch |err| {
             self.loading_generation = null;
             loading.destroy(alloc);
@@ -368,7 +398,7 @@ pub const FileIndex = struct {
             debug_trace.logf("core", "file index generation spawn failed generation={d} err={s}", .{ generation_id, @errorName(err) });
             return false;
         };
-        debug_trace.logf("core", "file index generation started generation={d} caller_thread={d}", .{ generation_id, std.Thread.getCurrentId() });
+        debug_trace.logf("core", "file index generation started generation={d} caller_thread={d} from_cache={}", .{ generation_id, std.Thread.getCurrentId(), allow_cache });
         return true;
     }
 
@@ -385,6 +415,7 @@ pub const FileIndex = struct {
         debug_trace.logf("core", "file index generation joined generation={d} state={s}", .{ loading.id, @tagName(terminal_state) });
 
         var visible_changed = false;
+        const adopted_from_cache = terminal_state == .ready and loading.from_cache;
         switch (terminal_state) {
             .loading => unreachable,
             .ready => {
@@ -392,7 +423,7 @@ pub const FileIndex = struct {
                 self.active_generation = loading;
                 self.loading_generation = null;
                 self.initial_failed = false;
-                debug_trace.logf("core", "file index generation adopted generation={d} count={d}", .{ loading.id, loading.count() });
+                debug_trace.logf("core", "file index generation adopted generation={d} count={d} from_cache={}", .{ loading.id, loading.count(), loading.from_cache });
                 if (previous) |generation| generation.destroy(alloc);
                 visible_changed = true;
             },
@@ -415,6 +446,14 @@ pub const FileIndex = struct {
                 self.scope_epoch = pending.epoch;
                 _ = self.startLoad(alloc);
             }
+        }
+        // A cache-painted generation is a preview only: one real scan follows
+        // it and replaces it, unless a pending scope already started that load.
+        if (adopted_from_cache and
+            !self.stop_requested.load(.seq_cst) and
+            self.thread == null)
+        {
+            _ = self.startLoad(alloc);
         }
         return visible_changed;
     }
@@ -741,9 +780,10 @@ fn loaderThreadMain(
     alloc: Allocator,
     roots: []const []const u8,
     stop_requested: *std.atomic.Value(bool),
+    allow_cache: bool,
 ) void {
     debug_trace.logf("core", "file index loader entered generation={d} worker_thread={d}", .{ generation.id, std.Thread.getCurrentId() });
-    const outcome = loadGeneration(generation, alloc, roots, stop_requested);
+    const outcome = loadGeneration(generation, alloc, roots, stop_requested, allow_cache);
     publishLoaderOutcomeAfterCleanup(generation, outcome);
 }
 
@@ -752,6 +792,7 @@ fn loadGeneration(
     alloc: Allocator,
     roots: []const []const u8,
     stop_requested: *std.atomic.Value(bool),
+    allow_cache: bool,
 ) LoaderOutcome {
     if (isStopRequested(stop_requested)) return .canceled;
 
@@ -759,9 +800,35 @@ fn loadGeneration(
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
+    if (allow_cache) {
+        if (file_index_cache.load(arena, roots) catch |err| blk: {
+            if (err == error.OutOfMemory) return .{ .failed = .{ .stage = .discovery, .err = err } };
+            break :blk null;
+        }) |loaded_value| {
+            var loaded = loaded_value;
+            defer loaded.deinit(arena);
+            generation.from_cache = true;
+            generation.fillProgressive(alloc, .{ .typed = .{
+                .candidates = loaded.candidates,
+                .indices = null,
+            } }, stop_requested) catch |err| {
+                if (err == error.Canceled or isStopRequested(stop_requested)) return .canceled;
+                return .{ .failed = .{ .stage = .storage, .err = err } };
+            };
+            if (isStopRequested(stop_requested)) return .canceled;
+            debug_trace.logf("core", "file index cache painted generation={d} count={d}", .{ generation.id, generation.count() });
+            return .ready;
+        }
+    }
+
     const candidates = discoverScopeCandidates(arena, roots, stop_requested) catch |err| {
         if (err == error.Canceled or isStopRequested(stop_requested)) return .canceled;
         return .{ .failed = .{ .stage = .discovery, .err = err } };
+    };
+
+    // Persist before the fill so even a canceled publish leaves a warm cache.
+    file_index_cache.save(arena, roots, candidates) catch |err| {
+        debug_trace.logf("core", "file index cache not saved generation={d} err={s}", .{ generation.id, @errorName(err) });
     };
 
     generation.fillProgressive(alloc, .{ .typed = .{
@@ -2435,6 +2502,115 @@ test "search rejects queries longer than max_path_len" {
 
     var search: TestSearchBuffer(1) = .{};
     try std.testing.expectEqual(@as(usize, 0), (try search.run(&index, query)).len);
+}
+
+test "persisted file index paints a stale preview and the real scan replaces it" {
+    const alloc = std.testing.allocator;
+    // The tree must live outside this repository: repo-contained temp dirs
+    // become git-authoritative, and a git failure would replace the walk.
+    var random_suffix: [8]u8 = undefined;
+    io_mod.getIo().random(&random_suffix);
+    const base = try std.fmt.allocPrint(alloc, "/tmp/fx-fileidx-{s}", .{std.fmt.bytesToHex(random_suffix, .lower)});
+    defer alloc.free(base);
+    const zio = io_mod.getIo();
+    var base_dir = try std.Io.Dir.openDirAbsolute(zio, "/", .{});
+    defer base_dir.close(zio);
+    const base_rel = std.mem.trimStart(u8, base, "/");
+    const home_rel = try std.fmt.allocPrint(alloc, "{s}/home", .{base_rel});
+    defer alloc.free(home_rel);
+    const work_rel = try std.fmt.allocPrint(alloc, "{s}/work", .{base_rel});
+    defer alloc.free(work_rel);
+    try base_dir.createDirPath(zio, home_rel);
+    defer base_dir.deleteTree(zio, base_rel) catch {};
+    try base_dir.createDirPath(zio, work_rel);
+
+    const home_joined = try std.fs.path.join(alloc, &.{ base, "home" });
+    defer alloc.free(home_joined);
+    const work_joined = try std.fs.path.join(alloc, &.{ base, "work" });
+    defer alloc.free(work_joined);
+    const home = try io_mod.realpathAlloc(alloc, home_joined);
+    defer alloc.free(home);
+    const root = try io_mod.realpathAlloc(alloc, work_joined);
+    defer alloc.free(root);
+
+    var work_dir = try std.Io.Dir.openDirAbsolute(zio, root, .{});
+    defer work_dir.close(zio);
+    for ([_][]const u8{ "main.zig", "lib.zig" }) |name| {
+        var file = try work_dir.createFile(zio, name, .{ .truncate = true });
+        file.close(zio);
+    }
+
+    const empty_environ = struct {
+        var map: ?*std.process.Environ.Map = null;
+        fn get() !*const std.process.Environ.Map {
+            if (map) |value| return value;
+            const value = try std.heap.page_allocator.create(std.process.Environ.Map);
+            value.* = std.process.Environ.Map.init(std.heap.page_allocator);
+            map = value;
+            return value;
+        }
+    };
+    {
+        const empty = try empty_environ.get();
+        io_mod.setEnvironMap(empty);
+    }
+    var home_map = std.process.Environ.Map.init(alloc);
+    defer home_map.deinit();
+    try home_map.put("HOME", home);
+    io_mod.setEnvironMap(&home_map);
+    defer {
+        if (empty_environ.get()) |empty| {
+            io_mod.setEnvironMap(empty);
+        } else |_| {}
+    }
+
+    const scope = workspace_access.AccessScope.primaryOnly(root);
+    const roots = [_][]const u8{root};
+
+    // First launch: real scan, no cache yet.
+    var first = FileIndex{};
+    defer first.deinit(alloc);
+    first.ensureScopeEpoch(alloc, scope, 1);
+    var adoptions: usize = 0;
+    var deadline = io_mod.milliTimestamp() + 5000;
+    while (io_mod.milliTimestamp() < deadline) {
+        if (first.joinThreadIfDone(alloc)) adoptions += 1;
+        if (first.currentState() == .ready and first.thread == null) break;
+        sleepBlocking(1);
+    }
+    const scanned_count = first.count();
+    try std.testing.expectEqual(@as(usize, 1), adoptions);
+    try std.testing.expect(scanned_count >= 2);
+    var cached = (try file_index_cache.loadFrom(alloc, home, &roots)).?;
+    defer cached.deinit(alloc);
+    try std.testing.expect(cached.candidates.len > 0);
+
+    // The tree changes between launches.
+    {
+        var file = try work_dir.createFile(zio, "added.zig", .{ .truncate = true });
+        file.close(zio);
+    }
+
+    // Second launch: the cache paints one preview generation, then the real
+    // scan replaces it with the added file.
+    var second = FileIndex{};
+    defer second.deinit(alloc);
+    second.ensureScopeEpoch(alloc, scope, 2);
+    adoptions = 0;
+    var counts: [2]usize = .{ 0, 0 };
+    deadline = io_mod.milliTimestamp() + 5000;
+    while (io_mod.milliTimestamp() < deadline and adoptions < 2) {
+        if (second.joinThreadIfDone(alloc)) {
+            counts[adoptions] = second.count();
+            adoptions += 1;
+        }
+        if (adoptions == 2) break;
+        sleepBlocking(1);
+    }
+    try std.testing.expectEqual(@as(usize, 2), adoptions);
+    try std.testing.expectEqual(scanned_count, counts[0]);
+    try std.testing.expectEqual(scanned_count + 1, counts[1]);
+    try std.testing.expectEqual(.ready, second.currentState());
 }
 
 test "buildFromRaw omits unsafe controls and preserves neighboring safe paths" {
