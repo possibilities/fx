@@ -66,17 +66,20 @@ pub fn Runtime(comptime App: type) type {
         }
 
         fn interrupt(app: *App, request_id: []const u8) ![]u8 {
+            if (app.approval_prompt.isActive() and approvalTargetsSubagent(app)) {
+                return error.SubagentControlUnsupported;
+            }
+            if (!app.approval_prompt.isActive() and !app.question_prompt.isActive() and !app.stream.active) {
+                return error.NoActiveWork;
+            }
+            _ = app.worker.pauseQueue();
             if (app.approval_prompt.isActive()) {
-                if (approvalTargetsSubagent(app)) return error.SubagentControlUnsupported;
                 try ApprovalRuntime.cancelApprovalOperation(app);
             } else if (app.question_prompt.isActive()) {
                 try QuestionRuntime.cancelQuestionPrompt(app);
             } else if (app.stream.active) {
                 try InterruptRuntime.cancelActiveOperation(app);
-            } else {
-                return error.NoActiveWork;
             }
-            _ = app.worker.pauseQueue();
             var snapshot = try takeSnapshot(app);
             defer snapshot.deinit(std.heap.c_allocator);
             return work_control.encodeMutationResponse(
@@ -125,10 +128,8 @@ pub fn Runtime(comptime App: type) type {
         }
 
         fn approvalTargetsSubagent(app: *App) bool {
-            if (comptime !@hasField(App, "subagents")) return false;
-            if (comptime !@hasDecl(@TypeOf(app.subagents), "mainApprovalBinding")) return false;
             const request = app.approval_prompt.request orelse return false;
-            return app.subagents.mainApprovalBinding(request.id) != null;
+            return request.origin == .subagent;
         }
     };
 }
