@@ -11,11 +11,12 @@ import {
   readFileSync,
   readdirSync,
   realpathSync,
+  statSync,
   rmSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import { FX_BIN, runFx } from "../evals/eval-helpers";
 import {
   FAKE_GATEWAY_MODEL,
@@ -114,6 +115,73 @@ async function continueSession(
 }
 
 const LEGACY_TITLE = "Synthetic legacy recovery conversation";
+
+test("resume writes a replay cache and replays identically with it corrupt or missing", async () => {
+  const fixture = createFixture("fx-history-cache-");
+  const gateway = startFakeGateway([
+    fakeGatewayFinalText("CACHE_BASELINE_TURN"),
+    fakeGatewayFinalText("CACHE_CONTINUED_TURN"),
+    fakeGatewayFinalText("CACHE_CORRUPTED_TURN"),
+    fakeGatewayFinalText("CACHE_REBUILT_TURN"),
+    fakeGatewayFinalText("CACHE_UPGRADED_TURN"),
+  ]);
+  try {
+    const id = await createSavedSession(fixture, gateway);
+    const sessionDir = join(fixture.home, ".fx", "sessions", id);
+    const cachePath = join(sessionDir, "history-cache.bin");
+
+    // Fresh sessions keep the minimal footprint; the first writable resume
+    // builds the cache.
+    expect(existsSync(cachePath)).toBe(false);
+
+    const continued = await continueSession(fixture, gateway, id);
+    expect(continued.code).toBe(0);
+    expect(continued.stderr).toBe("");
+    expect(JSON.parse(continued.stdout).output).toBe("CACHE_CONTINUED_TURN");
+    expect(gateway.requests[1]!.body).toContain("CACHE_BASELINE_TURN");
+    expect(existsSync(cachePath)).toBe(true);
+    const baselineSize = statSync(cachePath).size;
+    expect(baselineSize).toBeGreaterThan(0);
+
+    // Corrupt one cache payload byte: the next resume must stay correct via
+    // the log fallback (prefix CRC rejection or full rebuild).
+    const bytes = readFileSync(cachePath);
+    bytes[bytes.byteLength - 4] = bytes[bytes.byteLength - 4]! ^ 0xff;
+    writeFileSync(cachePath, bytes, { mode: 0o600 });
+    const corrupted = await continueSession(fixture, gateway, id);
+    expect(corrupted.code).toBe(0);
+    expect(corrupted.stderr).toBe("");
+    expect(JSON.parse(corrupted.stdout).output).toBe("CACHE_CORRUPTED_TURN");
+    expect(gateway.requests[2]!.body).toContain("CACHE_CONTINUED_TURN");
+    expect(existsSync(cachePath)).toBe(true);
+
+    // A deleted cache is rebuilt by the next writable resume.
+    rmSync(cachePath);
+    const rebuilt = await continueSession(fixture, gateway, id);
+    expect(rebuilt.code).toBe(0);
+    expect(rebuilt.stderr).toBe("");
+    expect(JSON.parse(rebuilt.stdout).output).toBe("CACHE_REBUILT_TURN");
+    expect(gateway.requests[3]!.body).toContain("CACHE_CORRUPTED_TURN");
+    expect(existsSync(cachePath)).toBe(true);
+    expect(statSync(cachePath).size).toBeGreaterThan(baselineSize);
+
+    const versionOffset = Buffer.byteLength("fx-history-cache\x1a\n");
+    const outdatedCache = readFileSync(cachePath);
+    expect(outdatedCache.readBigUInt64LE(versionOffset)).toBe(3n);
+    outdatedCache.writeBigUInt64LE(2n, versionOffset);
+    writeFileSync(cachePath, outdatedCache, { mode: 0o600 });
+    const upgraded = await continueSession(fixture, gateway, id);
+    expect(upgraded.code).toBe(0);
+    expect(upgraded.stderr).toBe("");
+    expect(JSON.parse(upgraded.stdout).output).toBe("CACHE_UPGRADED_TURN");
+    expect(gateway.requests[4]!.body).toContain("CACHE_REBUILT_TURN");
+    expect(gateway.requests[4]!.body).toContain("CACHE_BASELINE_TURN");
+    expect(readFileSync(cachePath).readBigUInt64LE(versionOffset)).toBe(3n);
+  } finally {
+    gateway.stop();
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+});
 
 test("latest resume preserves an unrelated pending authority directory", async () => {
   const fixture = createFixture("fx-latest-pending-");
@@ -877,7 +945,7 @@ describe("session recovery", () => {
     }
   }, TIMEOUT);
 
-  test.skipIf(!tmuxAvailable())("latest resume reuses legacy ranking after opening the resume picker", async () => {
+  test.skipIf(!tmuxAvailable())("latest resume reuses the session index after opening the resume picker", async () => {
     const fixture = createFixture("fx-continue-ranking-cache-");
     const legacy = createLegacySession(fixture, 3);
     const gateway = startFakeGateway([fakeGatewayFinalText("LATEST_CACHE_HISTORY")]);
@@ -894,9 +962,11 @@ describe("session recovery", () => {
         });
         await tui.waitForComposer(TIMEOUT);
         await tui.waitForText("LATEST_CACHE_HISTORY", TIMEOUT);
-        expect(readFileSync(trace, "utf8")).toContain(iteration === 0
-          ? "legacy ranking cache reused=0 refreshed=1"
-          : "legacy ranking cache reused=1 refreshed=0");
+        // The first latest resume classifies every session; once the picker
+        // has saved the index, the untouched legacy row is reused unopened.
+        expect(readFileSync(trace, "utf8")).toMatch(iteration === 0
+          ? /session catalog cache reused=0 records=\d+/
+          : /session catalog cache reused=[1-9]\d* records=\d+/);
         if (iteration === 0) {
           await tui.sendText("/resume");
           await tui.waitForText(LEGACY_TITLE, TIMEOUT);
@@ -988,6 +1058,12 @@ describe("session recovery", () => {
           }
           await tui.waitForText(LEGACY_PARTIAL, TIMEOUT);
           await tui.waitForComposer(TIMEOUT);
+          if (blankSessionDir && expectedSessionIds.includes(basename(blankSessionDir))) {
+            // Switching away from the untouched startup session removes it.
+            expectedSessionIds.splice(expectedSessionIds.indexOf(basename(blankSessionDir)), 1);
+            await tui.waitForPane(() => !existsSync(blankSessionDir!), TIMEOUT);
+            expect(sessionEntries()).toEqual(expectedSessionIds);
+          }
           const scrollback = await tui.captureFullScrollbackEscapes();
           expect(scrollback).toContain(LEGACY_ANSWER);
           expect(scrollback.split(LEGACY_PARTIAL)).toHaveLength(2);
@@ -1012,7 +1088,7 @@ describe("session recovery", () => {
           expect(gateway.requests).toHaveLength(index);
           expect(gateway.classifierRequests).toHaveLength(0);
           expect(sessionEntries()).toEqual(expectedSessionIds);
-          if (blankSessionDir) expect(readFileSync(join(blankSessionDir, "events.jsonl"), "utf8")).toBe("");
+          if (blankSessionDir) expect(existsSync(blankSessionDir)).toBe(false);
           await tui.kill();
           tui = null;
         }
@@ -1179,7 +1255,9 @@ describe("session recovery", () => {
         expect(result.killSent).toBe(false);
         expect(result.code).toBe(1);
         expect(result.elapsedMs).toBeLessThan(5_000);
-        expect(result.stdout + result.stderr).toContain("SessionPathUnsafe");
+        // The unreadable session is skipped exactly as every listing skips it,
+        // and the error says unreadable sessions exist, as `fx session last` does.
+        expect(result.stdout + result.stderr).toContain("NoReadableSessions");
         expect(gateway.requests).toHaveLength(fenced ? 0 : 1);
         expect(gateway.classifierRequests).toHaveLength(0);
         expect(readdirSync(source, { recursive: true }).sort()).toEqual(namesBefore);
@@ -1191,7 +1269,9 @@ describe("session recovery", () => {
         for (const [path, digest] of Object.entries(before)) {
           expect(createHash("sha256").update(readFileSync(join(source, path))).digest("hex")).toBe(digest);
         }
-        expect(readdirSync(join(fixture.home, ".fx", "sessions"))).toEqual([id]);
+        // Only the derived session index may appear beside the untouched session.
+        expect(readdirSync(join(fixture.home, ".fx", "sessions")).filter((name) => name !== ".resume-catalog"))
+          .toEqual([id]);
       } finally {
         gateway.stop();
         rmSync(fixture.root, { recursive: true, force: true });
@@ -1240,6 +1320,8 @@ describe("session recovery", () => {
         .sort();
       expect(files).toEqual([
         "events.jsonl",
+        // Replay cache built by the writable resume; derived from events.jsonl.
+        "history-cache.bin",
         "permissions.json",
         "session.json",
         "session.lock",

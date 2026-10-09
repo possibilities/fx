@@ -1,11 +1,12 @@
 const std = @import("std");
 const agent_runtime = @import("../agent/agent_runtime.zig");
 const agent_stream_provider = @import("../agent/stream_provider.zig");
-const runtime_context_compaction = @import("../agent/runtime/context_compaction.zig");
 const compaction_activity = @import("../output/compaction_activity.zig");
-const runtime_prompt_context = @import("../agent/runtime/prompt_context.zig");
 const command_admission = @import("../permissions/command_admission.zig");
 const permission_auto_classifier = @import("../permissions/auto_classifier.zig");
+const shared_theme = @import("../shared/theme.zig");
+const code_highlight = @import("../agent/presentation/code_highlight.zig");
+const code_highlight_languages = @import("../agent/presentation/code_highlight_languages.zig");
 const app_callbacks = @import("app_callbacks.zig");
 const runtime_profile = @import("../hosts/runtime_profile.zig");
 const host = @import("../hosts/host.zig");
@@ -25,7 +26,9 @@ const permission_gate = @import("../permissions/permission_gate.zig");
 const permissions = @import("../permissions/permissions.zig");
 const prompt_policy_contract = @import("../config/prompt_policy.zig");
 const model_provider = @import("../config/model_provider.zig");
+const model_capabilities = @import("../config/model_capabilities.zig");
 const session_runtime = @import("../session/session.zig");
+const result_store = @import("../session/result_store.zig");
 const session_child_store = @import("../session/session_child_store.zig");
 const skill_runtime = @import("../skills/skill_runtime.zig");
 const subagent_agent_adapter = @import("../subagent/agent_adapter.zig");
@@ -87,6 +90,21 @@ pub fn Runtime(comptime App: type) type {
                 return app.workspaceHostInfo();
             }
             return null;
+        }
+
+        const TurnWorkspace = struct {
+            root: []const u8,
+            access_scope: ?workspace_access.AccessScope,
+        };
+
+        /// A host workspace owns the root that tools, turns, and project
+        /// context use; otherwise the app's local workspace does.
+        fn turnWorkspace(app: *const App) TurnWorkspace {
+            if (appHostWorkspaceInfo(app)) |info| return .{
+                .root = info.root(),
+                .access_scope = workspace_access.AccessScope.primaryOnly(info.root()),
+            };
+            return .{ .root = app.workspace_root, .access_scope = appAccessScope(app) };
         }
 
         fn modelVisibleProjectContext(app: *App) []const u8 {
@@ -171,10 +189,7 @@ pub fn Runtime(comptime App: type) type {
             authority: ?ToolAuthorityView,
         ) tool_runtime.Context {
             const host_workspace = appHostWorkspaceInfo(app);
-            const workspace_root = if (host_workspace) |info|
-                info.root()
-            else
-                app.workspace_root;
+            const workspace = turnWorkspace(app);
             const agent_settings = app.worker.effectiveAgentTurnSettings();
             const permission_snapshot = if (authority) |snapshot|
                 worker_runtime.PermissionSnapshot{
@@ -203,11 +218,8 @@ pub fn Runtime(comptime App: type) type {
             else
                 provider_set.Bundle.Capabilities{};
             var ctx: tool_runtime.Context = .{
-                .workspace_root = workspace_root,
-                .access_scope = if (host_workspace != null)
-                    workspace_access.AccessScope.primaryOnly(workspace_root)
-                else
-                    appAccessScope(app),
+                .workspace_root = workspace.root,
+                .access_scope = workspace.access_scope,
                 .ignored_list_entries = ignored_list_entries,
                 .max_list_entries = max_list_entries,
                 .max_read_file_bytes = max_read_file_bytes,
@@ -215,6 +227,7 @@ pub fn Runtime(comptime App: type) type {
                 .max_read_file_line_len = max_read_file_line_len,
                 .max_command_output_bytes = max_command_output_bytes,
                 .max_tool_result_bytes = agent_settings.max_tool_result_bytes,
+                .auto_compact_percent = agent_settings.auto_compact_percent,
                 .api_key = app.auth.apiKey() orelse "",
                 .agent_stream_provider = if (comptime @hasDecl(App, "agentStreamProvider"))
                     app.agentStreamProvider()
@@ -231,12 +244,16 @@ pub fn Runtime(comptime App: type) type {
                 else
                     host.unavailable_secret_store,
                 .model = provider_runtime.model(app),
+                .reviewer_model = if (comptime @hasField(App, "review_model")) app.review_model else "",
                 .gateway_retry_count = gateway_retry_count,
                 .gateway_chat_url = gateway_chat_url,
                 .gateway_models_path = if (comptime @hasField(App, "web_search_models_path")) app.web_search_models_path else "/v1/models",
                 .agent_step_limit = app.agent_step_limit,
                 .fast_mode = agent_settings.fast_mode,
+                .ultrafast_mode = agent_settings.ultrafast_mode,
                 .effort = agent_settings.effort,
+                .provider_order = if (selected_provider == .gateway) agent_settings.provider_order else &.{},
+                .provider_strict = selected_provider == .gateway and agent_settings.provider_strict,
                 .first_call_tool_choice = agent_settings.first_call_tool_choice,
                 .tool_registry = if (comptime @hasDecl(App, "toolRegistry")) app.toolRegistry() else .{},
                 .subagent_host = if (comptime @hasField(App, "session_persistence"))
@@ -338,6 +355,7 @@ pub fn Runtime(comptime App: type) type {
                 };
             }
             ctx.model_capability_resolver = app_callbacks.Bindings(App).modelCapabilityResolver(app);
+            ctx.model_override_resolver = app_callbacks.Bindings(App).modelOverrideResolver(app);
             return ctx;
         }
 
@@ -350,6 +368,7 @@ pub fn Runtime(comptime App: type) type {
             return mcp_elicitation_interaction.respond(alloc, origin, required, .{
                 .questioner = .{ .context = raw_ctx, .ask_fn = askMcpQuestion },
                 .browser = .{ .context = raw_ctx, .open_fn = openMcpUrl },
+                .compact_forms = true,
                 .capabilities = .{ .form = true, .url = true },
             });
         }
@@ -825,18 +844,23 @@ pub fn Runtime(comptime App: type) type {
             try app.contextRegistry().appendDefaultStatic(.{
                 .project_context = project_context orelse modelVisibleProjectContext(app),
             }, arena, messages);
-            var snapshot = if (comptime @hasDecl(App, "snapshotMcpModelCatalog"))
+            var report = if (comptime @hasDecl(App, "snapshotMcpModelCatalog"))
                 try app.snapshotMcpModelCatalog(
                     arena,
                     if (comptime @hasField(App, "permission_engine")) app.permission_engine.rules else .{},
                     false,
                 )
             else
-                try mcp_model_catalog.Snapshot.empty(arena);
-            defer snapshot.deinit(arena);
-            const section = try mcp_model_catalog.render(arena, snapshot);
+                mcp_model_catalog.Report{ .snapshot = try mcp_model_catalog.Snapshot.empty(arena) };
+            // The request arena retains the change notice, which outlives this
+            // function inside `messages`; only the snapshot names are released.
+            defer report.snapshot.deinit(arena);
+            const section = try mcp_model_catalog.render(arena, report.snapshot);
             if (section.text.len > 0) {
                 try messages.append(arena, .{ .role = .system, .content = section.text });
+            }
+            if (report.change_notice) |notice| {
+                try messages.append(arena, .{ .role = .system, .content = notice });
             }
             if (section.notice) |notice| try pushMcpModelCatalogNotice(app, notice);
         }
@@ -878,21 +902,15 @@ pub fn Runtime(comptime App: type) type {
             _ = gateway_chat_url;
             const permission_snapshot = app_permission_runtime.Runtime(App).livePermissionSnapshot(app);
             const host_workspace = appHostWorkspaceInfo(app);
-            const workspace_root = if (host_workspace) |info|
-                info.root()
-            else
-                app.workspace_root;
+            const workspace = turnWorkspace(app);
             try app.contextRegistry().appendDefaultTransient(.{
-                .workspace_root = workspace_root,
+                .workspace_root = workspace.root,
                 .host_workspace = if (host_workspace) |info| .{
                     .root = info.root(),
                     .cwd = info.cwd(),
                     .home = info.home(),
                 } else null,
-                .access_scope = if (host_workspace != null)
-                    workspace_access.AccessScope.primaryOnly(workspace_root)
-                else
-                    appAccessScope(app),
+                .access_scope = workspace.access_scope,
                 .interactive = true,
                 .permission_mode = permission_snapshot.mode,
                 .stale_shell_handles = app.session.has_stale_shell_handles,
@@ -903,9 +921,10 @@ pub fn Runtime(comptime App: type) type {
             app.context_snapshot.deinit(app.alloc);
             if (!app.context_enabled) return;
 
+            const workspace = turnWorkspace(app);
             app.context_snapshot = app.contextRegistry().gatherDefaultSnapshot(app.alloc, .{
-                .workspace_root = app.workspace_root,
-                .access_scope = appAccessScope(app),
+                .workspace_root = workspace.root,
+                .access_scope = workspace.access_scope,
                 .targets = targets,
                 .context_limits = if (comptime @hasField(App, "context_limits")) app.context_limits else .{},
             }) catch |err| {
@@ -1072,7 +1091,7 @@ pub fn Runtime(comptime App: type) type {
             if (failure_provenance) |out| out.* = null;
             const operation_id = job.operation_id orelse app.worker.beginCompactionActivity(.manual, job.turn_id);
             app.worker.runCompactionActivity(operation_id, .preparation);
-            // Covers early cancellation before the transaction; acknowledged settlement wins.
+            // Covers early cancellation before compaction starts; acknowledged settlement wins.
             defer if (app.worker.isCancelRequested()) {
                 app.worker.settleCompactionActivity(operation_id, .{ .outcome = .cancelled });
             };
@@ -1084,111 +1103,55 @@ pub fn Runtime(comptime App: type) type {
             defer arena_state.deinit();
             const arena = arena_state.allocator();
 
-            const result_storage: runtime_context_compaction.ResultStorage =
-                if (app_session_runtime.Runtime(App).childCapability(app)) |capability|
-                    .{ .managed = capability }
-                else
-                    .unavailable;
-            var messages: std.ArrayList(ChatMessage) = .empty;
-            defer messages.deinit(arena);
-            const uncertain_history_count = @min(
-                job.unversioned_history_count,
-                job.history.len,
-            );
-            _ = try session_runtime.appendCompactionHistoryChatMessages(
-                arena,
-                &messages,
-                job.history,
-                uncertain_history_count,
-            );
-            const source_tokens = runtime_prompt_context.estimateCompactionSourceTokens(
-                messages.items,
-            );
             var deps = app_callbacks.Bindings(App).agentRuntimeDeps(app);
-            if (comptime @hasDecl(App, "providerSet")) deps.agent_stream_provider = app.providerSet().select(job.provider).agent_stream_or_unavailable();
+            const provider_capabilities: provider_set.Bundle.Capabilities = if (comptime @hasDecl(App, "providerSet")) blk: {
+                const bundle = app.providerSet().select(job.provider);
+                deps.agent_stream_provider = bundle.agent_stream_or_unavailable();
+                break :blk bundle.capabilities;
+            } else .{};
             const capabilities = deps.available_model_capabilities(deps.ctx, job.model);
-            const permission_mode = app_permission_runtime.Runtime(App).livePermissionSnapshot(app).mode;
-            var tool_projection = try app.snapshotModelToolProjection(arena, permission_mode);
-            defer tool_projection.deinit(arena);
-            var skill_catalog = app.skills.acquireCatalog();
-            defer skill_catalog.deinit();
-            const config = buildQueuedPromptConfig(app, .{
-                .prompt = @constCast(""),
-                .images = &.{},
-                .model = job.model,
+            const settings = app.worker.effectiveAgentTurnSettings();
+            var provider_options = model_capabilities.resolveProviderOptionsForCapabilities(capabilities, settings.effort, settings.fast_mode);
+            provider_options.prompt_caching = provider_capabilities.gateway_prompt_caching;
+            if (job.provider == .gateway) {
+                provider_options.provider_order = settings.provider_order;
+                provider_options.provider_strict = settings.provider_strict;
+            }
+            var summary_model: agent_runtime.CompactorCaller = .{
+                .stream_provider = deps.agent_stream_provider,
+                .cooperative_transport_pulse = deps.cooperative_transport_pulse,
                 .provider = job.provider,
+                .model = job.model,
                 .api_key = job.api_key,
-                .permission_mode = permission_mode,
-                .history = &.{},
-                .grants = &.{},
-                .agent_settings = app.worker.effectiveAgentTurnSettings(),
-            }, .{ .skills = skill_catalog.items, .diagnostics = skill_catalog.diagnostics }, &.{}, gateway_retry_count, "", &tool_projection, null);
-            const base_continuation = try agent_runtime.prepareManualCompactionContinuation(
-                arena,
-                &deps,
-                config,
-                job.model,
-                capabilities,
-            );
-            var retention_target = runtime_prompt_context.recentContextTarget(capabilities, source_tokens);
-            while (true) {
-                if (app.worker.worker_cancel_requested.load(.seq_cst)) return;
-                var continuation = base_continuation;
-                const window = try agent_runtime.prepareRetainedCompactionWindow(arena, job.history, null, capabilities, source_tokens, deps.agent_stream_provider, .{ .provider = job.provider, .model = job.model }, .{ .target = retention_target });
-                const continuation_messages = try arena.alloc(ChatMessage, continuation.request.messages.len + window.retained_messages.len);
-                @memcpy(continuation_messages[0..continuation.request.messages.len], continuation.request.messages);
-                @memcpy(continuation_messages[continuation.request.messages.len..], window.retained_messages);
-                continuation.request.messages = continuation_messages;
-                const refine = window.refine_budget(arena, deps.agent_stream_provider, continuation, capabilities, source_tokens, &retention_target) catch |err| {
-                    if (err == error.Cancelled and app.worker.worker_cancel_requested.load(.seq_cst)) return;
-                    return @as(anyerror!void, err);
-                };
-                if (refine) continue;
-                var compaction_count: usize = 0;
-                for (job.history) |turn| switch (turn) {
-                    .compacted_summary => |summary| {
-                        compaction_count = @max(
-                            compaction_count,
-                            summary.compaction_count,
-                        );
-                    },
-                    else => {},
-                };
-                const transaction = agent_runtime.compactContextTransaction(arena, &deps, .{
-                    .trigger = .manual,
-                    .operation_id = operation_id,
-                    .activity_origin = .manual,
-                    .provider = job.provider,
-                    .working_capabilities = capabilities,
-                    .request_tokens = source_tokens,
-                    .source_tokens = runtime_prompt_context.estimateCompactionSourceTokens(window.source),
-                    .continuation = continuation,
-                    .retained_from = window.cut,
-                    .newest_exchange_tokens = window.newest_exchange_tokens,
-                    .source_messages = window.source,
-                    .uncertain_source_message_count = if (uncertain_history_count > 0) window.source.len else 0,
-                    .result_storage = result_storage,
-                    .api_key = job.api_key,
-                    .credential_source = job.credential_source,
-                    .account_id = job.account_id,
-                    .gateway_team = job.gateway_team,
-                    .session_id = app_session_runtime.Runtime(App).activeSessionId(app),
-                    .retry_count = gateway_retry_count,
+                .credential_source = job.credential_source,
+                .account_id = job.account_id,
+                .gateway_team = job.gateway_team,
+                .session_id = app_session_runtime.Runtime(App).activeSessionId(app),
+                .retry_count = gateway_retry_count,
+                .provider_options = provider_options,
+                .max_output_tokens = model_capabilities.requestOutputTokens(capabilities),
+                .capabilities_context = deps.ctx,
+                .capabilities_fn = deps.available_model_capabilities,
+                .usage = deps.usage,
+                .usage_allocator = deps.usage_allocator,
+            };
+            const result = agent_runtime.compactContext(arena, &deps, .{
+                .operation_id = operation_id,
+                .activity_origin = .manual,
+                .compactor = .{
+                    .history = job.history,
+                    .append_messages = session_runtime.appendHistoryChatMessages,
+                    .size = agent_runtime.compactionSize(&app.session.agent, capabilities, settings.auto_compact_percent, job.model),
+                    .caller = summary_model.caller(),
+                    .records = if (app_session_runtime.Runtime(App).childCapability(app)) |capability| result_store.compactorStore(capability) else null,
                     .cancel_flag = &app.worker.worker_cancel_requested,
                     .trace_ctx = .{ .turn_id = job.turn_id },
-                    .removed_turn_count = window.cut.turns,
-                    .compaction_count = compaction_count + 1,
-                }) catch |err| {
-                    if (err == error.Cancelled and
-                        app.worker.worker_cancel_requested.load(.seq_cst))
-                    {
-                        return;
-                    }
-                    return @as(anyerror!void, err);
-                };
-                _ = transaction;
-                return;
-            }
+                },
+            }) catch |err| {
+                if (err == error.Cancelled and app.worker.worker_cancel_requested.load(.seq_cst)) return;
+                return @as(anyerror!void, err);
+            };
+            if (result == null) app.worker.settleCompactionActivity(operation_id, .{ .outcome = .no_op });
         }
 
         fn lifecycleContext(app: *App) agent_runtime.LifecycleContext {
@@ -1291,6 +1254,7 @@ pub fn Runtime(comptime App: type) type {
             session_child_capability: ?*session_child_store.SessionChildCapability,
         ) agent_runtime.Config {
             const prompt_policy = app.promptPolicy();
+            const workspace = turnWorkspace(app);
             return .{
                 .system_prompt = prompt_policy.system_prompt,
                 .model_prompt_overlay = prompt_policy.modelPromptOverlay(job.model),
@@ -1313,13 +1277,17 @@ pub fn Runtime(comptime App: type) type {
                 .custom_tool_guidance = tool_projection.custom_guidance,
                 .agent_step_limit = app.agent_step_limit,
                 .max_tool_result_bytes = job.agent_settings.max_tool_result_bytes,
+                .auto_compact_percent = job.agent_settings.auto_compact_percent,
                 .cancel_flag = &app.worker.worker_cancel_requested,
                 .review_enabled = false,
                 .fast_mode = job.agent_settings.fast_mode,
+                .ultrafast_mode = job.agent_settings.ultrafast_mode,
                 .effort = job.agent_settings.effort,
+                .provider_order = if (job.provider == .gateway) job.agent_settings.provider_order else &.{},
+                .provider_strict = job.provider == .gateway and job.agent_settings.provider_strict,
                 .first_call_tool_choice = job.agent_settings.first_call_tool_choice,
-                .workspace_root = app.workspace_root,
-                .access_scope = appAccessScope(app),
+                .workspace_root = workspace.root,
+                .access_scope = workspace.access_scope,
                 .origin = if (app.session_persistence.writable) |writable|
                     if (writable.external_prompt_origin == .persistent_child) .subagent else .root
                 else
@@ -1370,7 +1338,7 @@ fn formatToolAction(
             .completed => "Ran",
             .denied => denied_label.?,
         };
-        return formatToolActionValue(
+        return formatCommandActionValue(
             arena,
             label,
             activity.detail,
@@ -1434,7 +1402,23 @@ fn formatInvalidArgsToolAction(arena: Allocator, state: ToolActionState, denied_
 }
 
 fn formatToolActionValue(arena: Allocator, label: []const u8, value: []const u8) ![]const u8 {
-    return std.fmt.allocPrint(arena, "● {s}\x1b[0m \x1b[38;5;245m{s}\x1b[0m", .{ label, value });
+    return std.fmt.allocPrint(arena, "● {s}\x1b[0m {s}{s}\x1b[0m", .{ label, shared_theme.current().tool_stdout_style, value });
+}
+
+/// Command rows keep the muted tool-text base and add shell syntax colors for
+/// quoted strings, numbers, comments, and keywords.
+fn formatCommandActionValue(arena: Allocator, label: []const u8, command: []const u8) ![]const u8 {
+    const theme = shared_theme.current();
+    const profile = code_highlight_languages.resolve("sh") orelse
+        return formatToolActionValue(arena, label, command);
+    const highlighted = try code_highlight.highlight(
+        arena,
+        command,
+        profile,
+        if (theme.light) .light else .dark,
+        theme.tool_stdout_style,
+    );
+    return std.fmt.allocPrint(arena, "● {s}\x1b[0m {s}\x1b[0m", .{ label, highlighted });
 }
 
 fn specLabel(spec: *const tool_dispatch.Tool, state: ToolActionState, denied_label: ?[]const u8) []const u8 {
@@ -1591,9 +1575,14 @@ const RefreshContextApp = struct {
     context_notice_tone: ?types.NoticeTone = null,
     context_notice_visibility: ?types.NoticeVisibility = null,
     session: session_runtime.SessionRuntime = .{ .max_history_turns = 8 },
+    host_info: ?js_host_workspace.Info = null,
 
     fn contextRegistry(self: *const RefreshContextApp) context_contract.Registry {
         return self.context_registry;
+    }
+
+    fn workspaceHostInfo(self: *const RefreshContextApp) ?*const js_host_workspace.Info {
+        return if (self.host_info) |*info| info else null;
     }
 
     fn deinit(self: *RefreshContextApp) void {
@@ -1664,6 +1653,7 @@ const FakeApp = struct {
     mcp_name: []const u8 = "mcp_lookup",
     mcp_has_tool_calls: usize = 0,
     mcp_result: []const u8 = "{\"ok\":true}",
+    mcp_change_notice: ?[]const u8 = null,
     diff_blocks: usize = 0,
     web_fetch_runtime: web_fetch_runtime.Runtime = web_fetch_runtime.Runtime.init(.{}),
     web_search_runtime: web_search_runtime.Runtime = web_search_runtime.Runtime.init(.{
@@ -1705,12 +1695,15 @@ const FakeApp = struct {
     }
 
     fn snapshotMcpModelCatalog(
-        _: *FakeApp,
+        self: *FakeApp,
         alloc: Allocator,
         _: types.PermissionRuleSet,
         _: bool,
-    ) !mcp_model_catalog.Snapshot {
-        return mcp_model_catalog.Snapshot.empty(alloc);
+    ) !mcp_model_catalog.Report {
+        return .{
+            .snapshot = try mcp_model_catalog.Snapshot.empty(alloc),
+            .change_notice = if (self.mcp_change_notice) |notice| try alloc.dupe(u8, notice) else null,
+        };
     }
 
     fn promptPolicy(_: *const FakeApp) prompt_policy_contract.Policy {
@@ -2047,6 +2040,7 @@ test "interactive app prepared file mutation callback applies app permission pol
         .workspace_root = workspace,
     })) {
         .tool_failure => return error.TestExpectedPreparedFileMutation,
+        .not_file_mutation => return error.TestExpectedPreparedFileMutation,
         .prepared => |value| value,
     };
     defer prepared.deinit(arena);
@@ -2237,7 +2231,8 @@ test "app agent runtime formats active completed denied and MCP tool actions" {
     try std.testing.expect(std.mem.find(u8, active, "⏺") == null);
     try std.testing.expect(std.mem.find(u8, active, "▸") == null);
     try std.testing.expect(std.mem.find(u8, active, "Running") != null);
-    try std.testing.expect(std.mem.find(u8, active, "zig build") != null);
+    try std.testing.expect(std.mem.find(u8, active, "\x1b[38;5;252mzig\x1b[39m") != null);
+    try std.testing.expect(std.mem.find(u8, active, " build") != null);
 
     const completed = try app.describeToolActionCompleted(arena, run_call);
     try std.testing.expect(std.mem.find(u8, completed, "● ") != null);
@@ -2245,11 +2240,13 @@ test "app agent runtime formats active completed denied and MCP tool actions" {
     try std.testing.expect(std.mem.find(u8, completed, "⏺") == null);
     try std.testing.expect(std.mem.find(u8, completed, "▸") == null);
     try std.testing.expect(std.mem.find(u8, completed, "Ran") != null);
-    try std.testing.expect(std.mem.find(u8, completed, "zig build") != null);
+    try std.testing.expect(std.mem.find(u8, completed, "\x1b[38;5;252mzig\x1b[39m") != null);
+    try std.testing.expect(std.mem.find(u8, completed, " build") != null);
 
     const denied = try app.describeToolActionDenied(arena, run_call, "Denied");
     try std.testing.expect(std.mem.find(u8, denied, "Denied") != null);
-    try std.testing.expect(std.mem.find(u8, denied, "zig build") != null);
+    try std.testing.expect(std.mem.find(u8, denied, "\x1b[38;5;252mzig\x1b[39m") != null);
+    try std.testing.expect(std.mem.find(u8, denied, " build") != null);
 
     const malformed_registered: ToolCall = .{
         .id = "malformed_registered",
@@ -2537,6 +2534,62 @@ test "app agent runtime refreshes enabled project context through registry" {
     try std.testing.expectEqual(types.NoticeVisibility.full_only, app.context_notice_visibility.?);
 }
 
+const TestHostWorkspace = struct {
+    pub fn workspaceAvailable() i32 {
+        return 1;
+    }
+
+    pub fn workspaceInfo(out_ptr: [*]u8, out_cap: usize) i32 {
+        const json = "{\"version\":1,\"root\":\"/workspace\",\"cwd\":\"/workspace\",\"home\":\"/home/visitor\",\"git\":false,\"ephemeral\":true,\"permission\":\"allow-sandboxed\"}";
+        if (json.len > out_cap) return -3;
+        @memcpy(out_ptr[0..json.len], json);
+        return json.len;
+    }
+};
+
+test "app agent runtime turn workspace prefers the host workspace root" {
+    const alloc = std.testing.allocator;
+    var app = RefreshContextApp{
+        .alloc = alloc,
+        .workspace_root = "/",
+        .context_enabled = true,
+        .context_snapshot = .{},
+        .context_registry = fresh_context_registry,
+    };
+    defer app.deinit();
+
+    const local = Runtime(RefreshContextApp).turnWorkspace(&app);
+    try std.testing.expectEqualStrings("/", local.root);
+    try std.testing.expect(local.access_scope == null);
+
+    app.host_info = try js_host_workspace.Adapter(TestHostWorkspace).loadInfo(alloc);
+    const hosted = Runtime(RefreshContextApp).turnWorkspace(&app);
+    try std.testing.expectEqualStrings("/workspace", hosted.root);
+    const scope = hosted.access_scope orelse return error.TestExpectedEqual;
+    try std.testing.expectEqualStrings("/workspace", scope.primary_directory);
+    try std.testing.expectEqual(@as(usize, 0), scope.additional_directories.len);
+}
+
+test "app agent runtime gathers project context from the host workspace root" {
+    const alloc = std.testing.allocator;
+    refresh_gather_calls = 0;
+    var app = RefreshContextApp{
+        .alloc = alloc,
+        .workspace_root = "/",
+        .context_enabled = true,
+        .context_snapshot = .{},
+        .context_registry = fresh_context_registry,
+        .host_info = try js_host_workspace.Adapter(TestHostWorkspace).loadInfo(alloc),
+    };
+    defer app.deinit();
+
+    try Runtime(RefreshContextApp).refreshProjectContext(&app, &.{});
+
+    try std.testing.expectEqual(@as(usize, 1), refresh_gather_calls);
+    const contribution = app.context_snapshot.contribution orelse return error.TestExpectedEqual;
+    try std.testing.expectEqualStrings("fresh:/workspace", contribution.content);
+}
+
 test "app agent runtime clears disabled project context without gathering" {
     const alloc = std.testing.allocator;
     refresh_gather_calls = 0;
@@ -2626,6 +2679,26 @@ test "app agent runtime prefers active queued project context snapshot" {
     try std.testing.expect(std.mem.find(u8, messages.items[1].content.?, "<mcp_servers>") != null);
     const tool_context = testToolContext(&app);
     try std.testing.expectEqualStrings("test.default_context", tool_context.context_registry.defaultProvider().id);
+}
+
+test "app agent runtime shows MCP availability changes to the model" {
+    const alloc = std.testing.allocator;
+    var app = try FakeApp.init(alloc);
+    defer app.deinit();
+    app.mcp_change_notice = "MCP server availability changed since earlier in this session:\n  linear: authentication_required -> ready (74 tools)\n";
+
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var messages: std.ArrayList(ChatMessage) = .empty;
+    defer messages.deinit(arena);
+
+    try Runtime(FakeApp).appendStaticContextMessage(&app, arena, null, &messages, &test_ignored_list_entries, 100, 1024, 40, 120, 2048, 2, test_gateway_chat_url);
+
+    try std.testing.expectEqual(@as(usize, 3), messages.items.len);
+    try std.testing.expect(std.mem.find(u8, messages.items[1].content.?, "<mcp_servers>") != null);
+    try std.testing.expectEqual(types.ChatRole.system, messages.items[2].role);
+    try std.testing.expect(std.mem.find(u8, messages.items[2].content.?, "linear: authentication_required -> ready (74 tools)") != null);
 }
 
 fn makeQueuedPrompt(alloc: Allocator) !worker_runtime.QueuedPrompt {
@@ -2864,9 +2937,21 @@ test "manual compaction worker call commits a checkpoint without a continuation"
         .history = try alloc.alloc(types.HistoryTurn, 2),
     };
     defer worker_runtime.freeContextCompactionTask(alloc, job);
+    // A tool call leaves work to summarize, so the model is asked.
+    const calls = [_]types.ToolCall{.{ .id = "read-1", .name = "read_file", .arguments_json = "{\"path\":\"notes.md\"}" }};
+    const results = [_]types.PersistedToolResult{.{
+        .tool_call_id = @constCast("read-1"),
+        .tool_name = @constCast("read_file"),
+        .status = .success,
+        .output = @constCast("notes"),
+        .output_bytes = 5,
+        .stored_output_bytes = 5,
+    }};
+    const steps = [_]types.ToolExecutionStep{.{ .tool_calls = @constCast(&calls), .tool_results = @constCast(&results) }};
     job.history[0] = try types.dupeHistoryTurn(alloc, .{ .assistant = .{
         .user = .{ .text = @constCast("exact user request") },
         .assistant = @constCast("exact completed response\n" ++ ("evidence " ** 1_000)),
+        .execution = .{ .tool_steps = @constCast(&steps) },
     } });
     job.history[1] = try types.dupeHistoryTurn(alloc, .{ .assistant = .{
         .user = .{ .text = @constCast("second user request") },
@@ -2936,16 +3021,15 @@ test "manual compaction worker call commits a checkpoint without a continuation"
     app.worker.finishProcessing();
     try std.testing.expectEqualDeep(completed_activity, app.worker.compactionActivitySnapshot());
 
-    app.snapshot_custom_guidance = "fixed tool guidance " ** 20_000;
-    var provenance: ?compaction_activity.ErrorProvenance = null;
-    try std.testing.expectError(error.ContextCapacityExceeded, Runtime(FakeApp).processContextCompaction(&app, job, 1, &provenance));
-    const failed_activity = app.worker.compactionActivitySnapshot();
-    try std.testing.expectEqual(failed_activity.operation.?.id, provenance.?.operation_id);
-    try std.testing.expectEqual(error.ContextCapacityExceeded, provenance.?.err);
-    try std.testing.expectEqual(error.ContextCapacityExceeded, failed_activity.operation.?.phase.terminal.err.?);
-    try std.testing.expect(failed_activity.operation.?.id != completed_activity.operation.?.id);
-    try std.testing.expectEqual(@as(usize, 1), gateway.request_count);
-    try std.testing.expectEqual(@as(usize, 0), app.worker.worker_events.items.len);
+    // The oldest turn is compacted: its user message is kept word for word,
+    // and the newest turn stays unchanged after the checkpoint.
+    const checkpoint = events.items[0].context_compaction.summary;
+    try std.testing.expectEqual(@as(usize, 1), checkpoint.removed_turn_count);
+    const model_text = (try session_runtime.formatCompactedContinuationMessage(alloc, checkpoint.summary));
+    defer alloc.free(model_text);
+    try std.testing.expect(std.mem.find(u8, model_text, "User 1:\nexact user request\n") != null);
+    try std.testing.expect(std.mem.find(u8, model_text, "Continue after manual compaction") != null);
+    try std.testing.expect(std.mem.find(u8, model_text, "second user request") == null);
 }
 
 test "app agent runtime processes a cancelled queued prompt" {
@@ -3409,4 +3493,42 @@ test "app agent runtime queued prompt config uses captured job settings over sta
     try std.testing.expectEqualStrings("test model overlay", config.model_prompt_overlay.?);
     try std.testing.expect(!app.fast_mode);
     try std.testing.expectEqual(types.ReasoningEffort.literal("low"), app.effort);
+}
+
+test "app agent runtime highlights shell command rows over the tool text base" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var app = try FakeApp.init(alloc);
+    defer app.deinit();
+
+    const run_call: ToolCall = .{
+        .id = "1",
+        .name = "shell",
+        .arguments_json = "{\"action\":\"run\",\"command\":\"printf 'hello world' | wc -c\"}",
+    };
+    const completed = try app.describeToolActionCompleted(arena, run_call);
+
+    // The label and untokenized command text keep the muted tool-text base,
+    // while the command verb and quoted string pick up syntax palette colors
+    // and return to the base after their closes.
+    try std.testing.expect(std.mem.startsWith(u8, completed, "● Ran\x1b[0m \x1b[38;5;245m"));
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        completed,
+        "\x1b[38;5;252mprintf\x1b[39m\x1b[38;5;245m",
+    ) != null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        completed,
+        "\x1b[38;5;250m'hello world'\x1b[39m\x1b[38;5;245m",
+    ) != null);
+    try std.testing.expect(std.mem.endsWith(u8, completed, "\x1b[0m"));
+    // The pipe and the command after it take the keyword color, the flag the
+    // number color; plain bytes are intact beneath the styling.
+    try std.testing.expect(std.mem.indexOf(u8, completed, "\x1b[38;5;252m|\x1b[39m") != null);
+    try std.testing.expect(std.mem.indexOf(u8, completed, "\x1b[38;5;252mwc\x1b[39m") != null);
+    try std.testing.expect(std.mem.indexOf(u8, completed, "\x1b[38;5;250m-c\x1b[39m") != null);
 }

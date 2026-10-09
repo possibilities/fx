@@ -1,9 +1,11 @@
 const std = @import("std");
 const debug_trace = @import("../shared/debug_trace.zig");
 const io_mod = @import("../shared/io.zig");
+const mem_utils = @import("../shared/mem_utils.zig");
 const profile_paths = @import("../shared/profile_paths.zig");
 const types = @import("../shared/types.zig");
 const tool_result_limits = @import("../tooling/tool_result_limits.zig");
+const compactor = @import("../compactor/compactor.zig");
 const context_limits = @import("context_limits.zig");
 const project_config = @import("../mcp/project_config.zig");
 const model_provider = @import("model_provider.zig");
@@ -101,6 +103,7 @@ pub const UserSettingsPatch = struct {
     yolo_acknowledged: ?bool = null,
     effort: ?types.ReasoningEffort = null,
     fast_mode: ?bool = null,
+    ultrafast_mode: ?bool = null,
     slash_menu_categories: ?bool = null,
     collapse_tool_calls: ?bool = null,
     update_channel: ?update_target.Channel = null,
@@ -121,6 +124,7 @@ pub const UserSettingsPatch = struct {
             self.yolo_acknowledged == null and
             self.effort == null and
             self.fast_mode == null and
+            self.ultrafast_mode == null and
             self.slash_menu_categories == null and
             self.collapse_tool_calls == null and
             self.update_channel == null and
@@ -215,6 +219,7 @@ const UserPreferenceField = enum(u4) {
     permission_mode,
     effort,
     fast_mode,
+    ultrafast_mode,
     slash_menu_categories,
     collapse_tool_calls,
     update_channel,
@@ -234,6 +239,7 @@ const UserPreferenceField = enum(u4) {
             .permission_mode => "settings.json.preference-migration.permission_mode.json",
             .effort => "settings.json.preference-migration.effort.json",
             .fast_mode => "settings.json.preference-migration.fast_mode.json",
+            .ultrafast_mode => "settings.json.preference-migration.ultrafast_mode.json",
             .slash_menu_categories => "settings.json.preference-migration.slash_menu_categories.json",
             .collapse_tool_calls => "settings.json.preference-migration.collapse_tool_calls.json",
             .update_channel => "settings.json.preference-migration.update_channel.json",
@@ -251,6 +257,7 @@ const user_preference_fields = [_]UserPreferenceField{
     .permission_mode,
     .effort,
     .fast_mode,
+    .ultrafast_mode,
     .slash_menu_categories,
     .collapse_tool_calls,
     .update_channel,
@@ -501,7 +508,7 @@ pub const Store = struct {
 
             const original_fingerprint = fingerprintOptional(existing);
             var arena_state = std.heap.ArenaAllocator.init(alloc);
-            defer arena_state.deinit();
+            defer mem_utils.deinit_arena(arena_state);
             const arena = arena_state.allocator();
 
             var root = if (existing) |bytes|
@@ -895,6 +902,21 @@ pub fn validateModel(model: []const u8) !void {
     }
 }
 
+/// Bounds on the gateway provider routing list (`provider_order`). Slugs are
+/// the gateway's provider identifiers (for example `anthropic`, `bedrock`,
+/// `vertexAnthropic`; case matters).
+pub const max_provider_order_entries: usize = 8;
+pub const max_provider_slug_bytes: usize = 64;
+
+pub fn validateProviderSlug(slug: []const u8) bool {
+    if (slug.len == 0 or slug.len > max_provider_slug_bytes) return false;
+    if (!std.ascii.isAlphanumeric(slug[0])) return false;
+    for (slug) |byte| {
+        if (!std.ascii.isAlphanumeric(byte) and byte != '-') return false;
+    }
+    return true;
+}
+
 fn validateUserPatch(patch: UserSettingsPatch) !void {
     if (patch.model_preference) |preference| try validateModel(preference.model);
 }
@@ -923,6 +945,19 @@ test "clearing the credential choice removes the key rather than blanking it" {
 
     application = try applyUserPatchToRoot(arena.allocator(), &root, .{ .clear_credential_source = true });
     try std.testing.expect(!application.changed);
+}
+
+test "ultrafast user patch writes a profile-owned bool" {
+    const alloc = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    var parsed = try std.json.parseFromSlice(std.json.Value, arena.allocator(), "{}", .{});
+    defer parsed.deinit();
+    var root = parsed.value;
+
+    const application = try applyUserPatchToRoot(arena.allocator(), &root, .{ .ultrafast_mode = false });
+    try std.testing.expect(application.changed);
+    try std.testing.expect(!root.object.get("ultrafast_mode").?.bool);
 }
 
 test "collapse tool calls user patch writes the profile preference" {
@@ -1025,6 +1060,7 @@ fn applyUserPatchToRoot(
     if (patch.yolo_acknowledged) |value| application.changed = try putBool(arena, &root.object, "yolo_acknowledged", value) or application.changed;
     if (patch.effort) |value| application.changed = try putString(arena, &root.object, "effort", value.label()) or application.changed;
     if (patch.fast_mode) |value| application.changed = try putBool(arena, &root.object, "fast_mode", value) or application.changed;
+    if (patch.ultrafast_mode) |value| application.changed = try putBool(arena, &root.object, "ultrafast_mode", value) or application.changed;
     if (patch.model_preference != null and patch.fast_mode != null) {
         application.changed = try putBool(arena, &root.object, "fast_mode_model_bound", true) or application.changed;
     } else if ((patch.model_preference != null or patch.fast_mode != null) and root.object.contains("fast_mode_model_bound")) {
@@ -1150,6 +1186,13 @@ fn cleanupLegacyWorkspacePreferences(
             "fast_mode",
             .fast_mode,
             patch.fast_mode != null,
+            application,
+        );
+        removeLegacyLeaf(
+            &entry.value_ptr.object,
+            "ultrafast_mode",
+            .ultrafast_mode,
+            patch.ultrafast_mode != null,
             application,
         );
         if ((patch.model_preference != null or patch.fast_mode != null) and
@@ -1892,6 +1935,9 @@ fn validateKnownSettingsObject(
             return error.InvalidSettingsFormat;
         }
     }
+    if (object.get("theme")) |value| {
+        if (value != .string) return error.InvalidSettingsFormat;
+    }
     if (object.get("credential_source")) |value| {
         if (value != .string or types.parseCredentialSource(value.string) == null) {
             return error.InvalidSettingsFormat;
@@ -1905,13 +1951,32 @@ fn validateKnownSettingsObject(
             return error.InvalidSettingsFormat;
         }
     }
+    if (object.get("auto_compact_percent")) |value| {
+        if (value != .integer or value.integer < 0 or !compactor.isValidPercent(@intCast(value.integer))) {
+            return error.InvalidSettingsFormat;
+        }
+    }
     if (object.get("skill_match_fuzzy")) |value| {
         if (value != .bool) return error.InvalidSettingsFormat;
     }
     if (object.get("context_limits")) |value| {
         _ = context_limits.parseJsonObject(value) catch return error.InvalidSettingsFormat;
     }
-    inline for (&.{ "context", "fast_mode", "auto_upgrade", "slash_menu_categories", "startup_scrollback", "yolo_acknowledged" }) |key| {
+    if (object.get("provider_order")) |value| {
+        // An empty array explicitly clears an inherited routing list.
+        if (value != .array or value.array.items.len > max_provider_order_entries) {
+            return error.InvalidSettingsFormat;
+        }
+        for (value.array.items, 0..) |item, index| {
+            if (item != .string or !validateProviderSlug(item.string)) return error.InvalidSettingsFormat;
+            for (value.array.items[0..index]) |previous| {
+                if (previous == .string and std.mem.eql(u8, item.string, previous.string)) {
+                    return error.InvalidSettingsFormat;
+                }
+            }
+        }
+    }
+    inline for (&.{ "context", "fast_mode", "ultrafast_mode", "auto_upgrade", "slash_menu_categories", "startup_scrollback", "yolo_acknowledged", "provider_strict" }) |key| {
         if (object.get(key)) |value| {
             if (value != .bool) return error.InvalidSettingsFormat;
         }
