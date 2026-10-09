@@ -44,8 +44,18 @@ fn fetchCliModelCatalog(
         .view = .full,
     })) {
         .loaded => |loaded| blk: {
+            var catalog = loaded.catalog;
+            const ids = model_catalog.projectModelIds(alloc, catalog.items) catch {
+                model_catalog.freeModelCatalog(alloc, &catalog);
+                return .{ .failure = .{
+                    .access = loaded.provenance.access,
+                    .anonymous_fallback_used = false,
+                    .failure = .{ .category = .resource_exhausted },
+                } };
+            };
             break :blk .{ .loaded = .{
-                .catalog = loaded.catalog,
+                .ids = ids,
+                .entries = catalog,
                 .provenance = loaded.provenance,
             } };
         },

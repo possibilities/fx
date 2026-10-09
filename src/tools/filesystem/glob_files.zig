@@ -2,6 +2,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const glob_pattern = @import("../../core/workspace/glob_pattern.zig");
 const io_mod = @import("../../core/shared/io.zig");
+const mem_utils = @import("../../core/shared/mem_utils.zig");
 const pathing = @import("../../core/workspace/pathing.zig");
 const tool_dispatch = @import("../../core/tooling/tool_dispatch.zig");
 const tool_result_errors = @import("../../core/tooling/tool_result_errors.zig");
@@ -97,7 +98,7 @@ fn callWithWorkspaceOptions(ctx: tool_dispatch.DispatchContext, erased: tool_dis
     const input = erased.as(Input);
 
     var arena_state = std.heap.ArenaAllocator.init(ctx.allocator);
-    defer arena_state.deinit();
+    defer mem_utils.deinit_arena(arena_state);
     const arena = arena_state.allocator();
 
     const requested_root = resolveSearchRoot(arena, ctx.workspace_root, input.path) catch |err| {

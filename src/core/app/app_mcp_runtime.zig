@@ -115,6 +115,7 @@ const ReloadPolicy = enum {
 
 pub const PresentationOrigin = union(enum) {
     command,
+    slack_setup,
     menu: u64,
 };
 
@@ -840,7 +841,7 @@ fn makeMenuPreview(alloc: Allocator, heading: []const u8, raw: []const u8) !Menu
 
 fn makeMenuPreviewOwned(alloc: Allocator, heading: []const u8, insert: []u8) !MenuPreview {
     errdefer alloc.free(insert);
-    var encoded = try text_utils.encodeTerminalSafe(alloc, insert, max_menu_preview_bytes);
+    var encoded = try text_utils.encodeTerminalSafeInline(alloc, insert, max_menu_preview_bytes);
     defer encoded.deinit(alloc);
     return .{
         .display = try std.mem.concat(alloc, u8, &.{ heading, encoded.bytes }),
@@ -942,6 +943,9 @@ pub const State = struct {
     pending_reload: ?*PendingReload = null,
     pending_authentication: ?*PendingAuthentication = null,
     pending_menu_operation: ?*PendingMenuOperation = null,
+    /// Set by process-exit teardown before it joins a pending reload, so the
+    /// reload discards its candidate runtime without grace or session DELETEs.
+    process_exiting: std.atomic.Value(bool) = .init(false),
     last_reload_completion_origin: PresentationOrigin = .command,
     last_authentication_completion_origin: PresentationOrigin = .command,
     project_prompts_suppressed: bool = false,
@@ -954,6 +958,15 @@ pub const State = struct {
     menu_feedback: ?[]u8 = null,
     menu_add_form: MenuAddForm = .{},
     menu_argument_form: MenuArgumentForm = .{},
+    /// Main-thread only, like the menu fields: a startup summary notice is
+    /// owed once discovery settles with servers that need attention.
+    startup_health_notice_pending: bool = false,
+    model_catalog_baseline_lock: std.Io.Mutex = .init,
+    /// Server availability as of the previous model-catalog report, used to
+    /// surface mid-session changes (authentication, reload, recovery) to the
+    /// model explicitly. Owned by the `baseline_alloc` passed to
+    /// `snapshotModelCatalog`.
+    model_catalog_baseline: ?[]mcp_model_catalog.BaselineEntry = null,
 
     pub const MenuView = struct {
         state: mcp_menu_state.State,
@@ -1631,7 +1644,7 @@ pub const State = struct {
                     "MCP authentication for '",
                     completion.server_name,
                     "' failed: ",
-                    @errorName(err),
+                    mcp_auth.authentication_error_message(err),
                 },
             );
         }
@@ -1712,6 +1725,30 @@ pub const State = struct {
         var lease = self.acquire() orelse return;
         defer lease.deinit();
         lease.runtime.startDiscovery(registry);
+        // Main-thread only, like the menu fields: post one summary notice once
+        // startup discovery settles with servers that need attention.
+        self.startup_health_notice_pending = true;
+    }
+
+    /// Returns the one-shot startup summary notice once discovery has settled
+    /// with servers needing attention. Main-thread only, like the menu fields.
+    pub fn takeStartupHealthNotice(self: *State, alloc: Allocator) !?[]u8 {
+        if (!self.startup_health_notice_pending) return null;
+        var lease = self.acquire() orelse {
+            debug_trace.logf(
+                "mcp",
+                "dropping startup health notice: runtime unavailable",
+                .{},
+            );
+            self.startup_health_notice_pending = false;
+            return null;
+        };
+        defer lease.deinit();
+        if (lease.runtime.isDiscovering()) return null;
+        self.startup_health_notice_pending = false;
+        var snapshot = try lease.runtime.snapshotHealth(alloc, @intCast(@max(io_mod.milliTimestamp(), 0)));
+        defer snapshot.deinit(alloc);
+        return try mcp_health.renderStartupNotice(alloc, snapshot);
     }
 
     pub fn acquire(self: *State) ?Lease {
@@ -1865,16 +1902,78 @@ pub const State = struct {
     pub fn snapshotModelCatalog(
         self: *State,
         alloc: Allocator,
+        baseline_alloc: Allocator,
         permission_rules: types.PermissionRuleSet,
         include_ask_deferred: bool,
-    ) !mcp_model_catalog.Snapshot {
-        var lease = self.acquire() orelse return mcp_model_catalog.Snapshot.empty(alloc);
+    ) !mcp_model_catalog.Report {
+        var lease = self.acquire() orelse return .{
+            .snapshot = try mcp_model_catalog.Snapshot.empty(alloc),
+        };
         defer lease.deinit();
-        return lease.runtime.snapshotModelCatalog(
+        var snapshot = try lease.runtime.snapshotModelCatalog(
             alloc,
             permission_rules,
             include_ask_deferred,
         );
+        errdefer snapshot.deinit(alloc);
+        const notice = try self.updateModelCatalogBaseline(alloc, baseline_alloc, snapshot.servers);
+        return .{ .snapshot = snapshot, .change_notice = notice };
+    }
+
+    /// Compares the freshly rendered model catalog against the availability
+    /// the previous report showed the model, returning an owned note when it
+    /// changed. `baseline_alloc` owns the retained baseline and must be the
+    /// same long-lived allocator across calls and `deinit`.
+    fn updateModelCatalogBaseline(
+        self: *State,
+        alloc: Allocator,
+        baseline_alloc: Allocator,
+        current: []const mcp_model_catalog.ServerSummary,
+    ) !?[]u8 {
+        // A discovery pass that is still settling is not a model-visible
+        // change; wait for a stable listing before teaching the model about
+        // availability deltas so session startup never renders a notice.
+        for (current) |server| {
+            if (server.availability == .discovering) return null;
+        }
+        self.model_catalog_baseline_lock.lockUncancelable(io_mod.getIo());
+        defer self.model_catalog_baseline_lock.unlock(io_mod.getIo());
+        const notice = if (self.model_catalog_baseline) |baseline|
+            try mcp_model_catalog.renderChangeNotice(alloc, baseline, current)
+        else
+            null;
+        errdefer if (notice) |text| alloc.free(text);
+        try self.replaceModelCatalogBaselineLocked(baseline_alloc, current);
+        return notice;
+    }
+
+    fn replaceModelCatalogBaselineLocked(
+        self: *State,
+        baseline_alloc: Allocator,
+        current: []const mcp_model_catalog.ServerSummary,
+    ) !void {
+        var next = try baseline_alloc.alloc(mcp_model_catalog.BaselineEntry, current.len);
+        var initialized: usize = 0;
+        errdefer {
+            for (next[0..initialized]) |entry| baseline_alloc.free(entry.name);
+            baseline_alloc.free(next);
+        }
+        for (current, 0..) |server, index| {
+            next[index] = .{
+                .name = try baseline_alloc.dupe(u8, server.name),
+                .availability = server.availability,
+            };
+            initialized += 1;
+        }
+        self.clearModelCatalogBaselineLocked(baseline_alloc);
+        self.model_catalog_baseline = next;
+    }
+
+    fn clearModelCatalogBaselineLocked(self: *State, baseline_alloc: Allocator) void {
+        const baseline = self.model_catalog_baseline orelse return;
+        for (baseline) |entry| baseline_alloc.free(entry.name);
+        baseline_alloc.free(baseline);
+        self.model_catalog_baseline = null;
     }
 
     pub fn waitForRequired(
@@ -2060,6 +2159,29 @@ pub const State = struct {
             registry,
             captured_at_ms,
             .command,
+            spawnPendingReload,
+        );
+    }
+
+    pub fn beginSlackSetup(
+        self: *State,
+        alloc: Allocator,
+        workspace_root: []const u8,
+        elicitation_capabilities: elicitation.Capabilities,
+        loader: mcp_runtime.LoadRuntimeFn,
+        preview_workspace_authority: mcp_runtime.PreviewNativeWorkspaceAuthorityFn,
+        registry: tool_dispatch.Registry,
+        captured_at_ms: u64,
+    ) !void {
+        return self.beginReloadWithOriginAndSpawner(
+            alloc,
+            workspace_root,
+            elicitation_capabilities,
+            loader,
+            preview_workspace_authority,
+            registry,
+            captured_at_ms,
+            .slack_setup,
             spawnPendingReload,
         );
     }
@@ -2423,7 +2545,11 @@ pub const State = struct {
         refresh_catalogs: bool,
     ) !ReloadOutcome {
         var candidate_owned = candidate != null;
-        defer if (candidate_owned) destroyRuntime(alloc, candidate.?);
+        defer if (candidate_owned) destroyRuntime(
+            alloc,
+            candidate.?,
+            if (self.process_exiting.load(.acquire)) .process_exit else .discard,
+        );
         self.lock.lockSharedUncancelable(io_mod.getIo());
         const stale = cancel_requested.load(.acquire) or (pending != null and self.pending_reload != pending.?);
         self.lock.unlockShared(io_mod.getIo());
@@ -2463,6 +2589,33 @@ pub const State = struct {
     }
 
     pub fn deinit(self: *State, alloc: Allocator) void {
+        self.deinitWithMode(alloc, .discard);
+    }
+
+    /// Teardown immediately followed by process exit: stdio servers are
+    /// killed without grace and remote sessions are left to expire.
+    pub fn deinitForProcessExit(self: *State, alloc: Allocator) void {
+        // A reload still in flight must see this before its children die.
+        self.process_exiting.store(true, .release);
+        if (!mcp_runtime.killAllStdioChildrenForProcessExit()) {
+            return self.deinitWithMode(alloc, .process_exit);
+        }
+        // Every stdio child is dead. Work the user started is still cancelled
+        // and logged, but runtimes, pending reloads, and their threads are
+        // left to the exiting process: joining them would only wait for each
+        // killed child to be reaped.
+        self.cancelPendingAuthentication("shutdown");
+        self.cancelPendingMenuOperation("shutdown");
+    }
+
+    fn deinitWithMode(self: *State, alloc: Allocator, mode: RuntimeTeardown) void {
+        if (mode == .process_exit) {
+            // A reload still in flight must see this before it is joined.
+            self.process_exiting.store(true, .release);
+            self.lock.lockSharedUncancelable(io_mod.getIo());
+            if (self.runtime) |runtime| runtime.prepareForProcessExit();
+            self.lock.unlockShared(io_mod.getIo());
+        }
         self.cancelPendingAuthentication("shutdown");
         self.cancelPendingReload();
         self.cancelPendingMenuOperation("shutdown");
@@ -2470,8 +2623,11 @@ pub const State = struct {
         const previous = self.runtime;
         self.runtime = null;
         self.lock.unlock(io_mod.getIo());
-        if (previous) |runtime| destroyRuntime(alloc, runtime);
+        if (previous) |runtime| destroyRuntime(alloc, runtime, mode);
         self.clearMenuOwned(alloc);
+        self.model_catalog_baseline_lock.lockUncancelable(io_mod.getIo());
+        self.clearModelCatalogBaselineLocked(alloc);
+        self.model_catalog_baseline_lock.unlock(io_mod.getIo());
         self.* = .{};
     }
 };
@@ -2489,10 +2645,32 @@ fn cancelAndDeinitAuthentication(
     pending.deinit();
 }
 
-fn destroyRuntime(alloc: Allocator, runtime: *mcp_runtime.McpRuntime) void {
+const RuntimeTeardown = enum { discard, process_exit };
+
+fn destroyRuntime(
+    alloc: Allocator,
+    runtime: *mcp_runtime.McpRuntime,
+    mode: RuntimeTeardown,
+) void {
     runtime.retireAndWait();
-    runtime.deinit();
+    switch (mode) {
+        .discard => runtime.deinit(),
+        .process_exit => runtime.deinitForProcessExit(),
+    }
     alloc.destroy(runtime);
+}
+
+test "MCP menu preview display flattens untrusted multi-line content" {
+    const alloc = std.testing.allocator;
+    var preview = try makeMenuPreview(alloc, "heading\n\n", "line one\n\nline two\x1b]0;owned\x07");
+    defer preview.deinit(alloc);
+
+    try std.testing.expectEqualStrings(
+        "heading\n\nline one line two\\x1b]0;owned\\x07",
+        preview.display,
+    );
+    try std.testing.expect(std.mem.find(u8, preview.display, "\\x0a") == null);
+    try std.testing.expectEqualStrings("line one\n\nline two\x1b]0;owned\x07", preview.insert);
 }
 
 test "MCP menu expands every resource template argument" {
@@ -3252,4 +3430,98 @@ test "superseding and deinitializing a stalled pending reload cancel before join
     const deinit_started_ms = io_mod.milliTimestamp();
     state.deinit(alloc);
     try std.testing.expect(io_mod.milliTimestamp() - deinit_started_ms < 1_000);
+}
+
+test "model catalog baseline surfaces availability changes once" {
+    const alloc = std.testing.allocator;
+    var state: State = .{};
+    defer state.deinit(alloc);
+
+    const before = [_]mcp_model_catalog.ServerSummary{
+        .{ .name = @constCast("linear"), .availability = .authentication_required },
+    };
+    const first = try state.updateModelCatalogBaseline(alloc, alloc, &before);
+    try std.testing.expectEqual(@as(?[]u8, null), first);
+
+    const after = [_]mcp_model_catalog.ServerSummary{
+        .{ .name = @constCast("linear"), .availability = .ready, .tool_count = 74 },
+    };
+    const changed = try state.updateModelCatalogBaseline(alloc, alloc, &after);
+    defer if (changed) |notice| alloc.free(notice);
+    try std.testing.expect(changed != null);
+    try std.testing.expect(std.mem.find(u8, changed.?, "linear: authentication_required -> ready (74 tools)") != null);
+
+    const settled = try state.updateModelCatalogBaseline(alloc, alloc, &after);
+    try std.testing.expectEqual(@as(?[]u8, null), settled);
+}
+
+test "model catalog baseline waits out discovery before recording state" {
+    const alloc = std.testing.allocator;
+    var state: State = .{};
+    defer state.deinit(alloc);
+
+    const discovering = [_]mcp_model_catalog.ServerSummary{
+        .{ .name = @constCast("linear"), .availability = .discovering },
+    };
+    const during_discovery = try state.updateModelCatalogBaseline(alloc, alloc, &discovering);
+    try std.testing.expectEqual(@as(?[]u8, null), during_discovery);
+    try std.testing.expect(state.model_catalog_baseline == null);
+
+    const ready = [_]mcp_model_catalog.ServerSummary{
+        .{ .name = @constCast("linear"), .availability = .ready, .tool_count = 74 },
+    };
+    const settled = try state.updateModelCatalogBaseline(alloc, alloc, &ready);
+    try std.testing.expectEqual(@as(?[]u8, null), settled);
+    try std.testing.expect(state.model_catalog_baseline != null);
+
+    const failed = [_]mcp_model_catalog.ServerSummary{
+        .{ .name = @constCast("linear"), .availability = .failed },
+    };
+    const outage = try state.updateModelCatalogBaseline(alloc, alloc, &failed);
+    defer if (outage) |notice| alloc.free(notice);
+    try std.testing.expect(outage != null);
+    try std.testing.expect(std.mem.find(u8, outage.?, "linear: ready -> failed") != null);
+}
+
+test "model catalog baseline reports removals" {
+    const alloc = std.testing.allocator;
+    var state: State = .{};
+    defer state.deinit(alloc);
+
+    const before = [_]mcp_model_catalog.ServerSummary{
+        .{ .name = @constCast("slack"), .availability = .ready, .tool_count = 3 },
+    };
+    _ = try state.updateModelCatalogBaseline(alloc, alloc, &before);
+
+    const removed = try state.updateModelCatalogBaseline(alloc, alloc, &.{});
+    defer if (removed) |notice| alloc.free(notice);
+    try std.testing.expect(removed != null);
+    try std.testing.expect(std.mem.find(u8, removed.?, "slack: removed") != null);
+}
+
+test "startup health notice is held during discovery and consumed once" {
+    const alloc = std.testing.allocator;
+    var state: State = .{};
+    const runtime = try alloc.create(mcp_runtime.McpRuntime);
+    runtime.* = mcp_runtime.McpRuntime.init(alloc);
+    state.installInitial(runtime);
+    defer state.deinit(alloc);
+
+    try std.testing.expect(!state.startup_health_notice_pending);
+    try std.testing.expectEqual(@as(?[]u8, null), try state.takeStartupHealthNotice(alloc));
+
+    state.startDiscovery(.{});
+    try std.testing.expect(state.startup_health_notice_pending);
+
+    // Zero configured servers settle quickly; until then the notice is held.
+    const deadline = io_mod.milliTimestamp() + 5_000;
+    var notice: ?[]u8 = null;
+    while (io_mod.milliTimestamp() < deadline) {
+        notice = try state.takeStartupHealthNotice(alloc);
+        if (!state.startup_health_notice_pending) break;
+        io_mod.sleep(std.time.ns_per_ms);
+    }
+    try std.testing.expect(!state.startup_health_notice_pending);
+    try std.testing.expectEqual(@as(?[]u8, null), notice);
+    try std.testing.expectEqual(@as(?[]u8, null), try state.takeStartupHealthNotice(alloc));
 }

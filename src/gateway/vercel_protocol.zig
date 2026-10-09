@@ -343,6 +343,7 @@ fn buildGatewayRequestBodyValidated(
             const results = tool_result_prefix(messages[i..]);
             try write_tool_result_group(alloc, &out.writer, results, budget, &ids);
             i += results.len;
+            try write_tool_image_user_message(&out.writer, results, budget);
             if (budget) |active| try active.check();
             continue;
         }
@@ -450,18 +451,46 @@ fn validatePendingToolReviewMessages(
 }
 
 pub fn writeProviderOptions(writer: *std.Io.Writer, options: model_capabilities.ResolvedProviderOptions) !void {
-    const gateway_options = options.fast or options.prompt_caching;
+    const routing = options.provider_order.len > 0;
+    if (options.ultrafast and options.provider_strict and routing) {
+        var allows_openai = false;
+        for (options.provider_order) |provider| {
+            if (std.mem.eql(u8, provider, "openai")) allows_openai = true;
+        }
+        if (!allows_openai) return error.UltrafastProviderRestricted;
+    }
+    const gateway_options = options.fast or options.ultrafast or options.prompt_caching or routing;
     if (!gateway_options and options.parallel_tool_calls == null) return;
 
     try writer.writeAll(",\"providerOptions\":{");
     if (gateway_options) {
         try writer.writeAll("\"gateway\":{");
-        if (options.fast) try writer.writeAll("\"speed\":\"fast\"");
+        var needs_comma = false;
+        if (options.fast and !options.ultrafast) {
+            try writer.writeAll("\"speed\":\"fast\"");
+            needs_comma = true;
+        }
         if (options.prompt_caching) {
-            if (options.fast) try writer.writeByte(',');
+            if (needs_comma) try writer.writeByte(',');
             try writer.writeAll("\"caching\":\"auto\"");
+            needs_comma = true;
+        }
+        if (options.ultrafast) {
+            if (needs_comma) try writer.writeByte(',');
+            try writer.writeAll("\"only\":[\"openai\"]");
+        } else if (routing) {
+            if (needs_comma) try writer.writeByte(',');
+            try writer.writeAll(if (options.provider_strict) "\"only\":[" else "\"order\":[");
+            for (options.provider_order, 0..) |slug, index| {
+                if (index > 0) try writer.writeByte(',');
+                try std.json.Stringify.value(slug, .{}, writer);
+            }
+            try writer.writeByte(']');
         }
         try writer.writeByte('}');
+    }
+    if (options.ultrafast) {
+        try writer.writeAll(",\"openai\":{\"serviceTier\":\"ultrafast\"}");
     }
     if (options.parallel_tool_calls) |parallel_tool_calls| {
         if (gateway_options) try writer.writeByte(',');
@@ -470,6 +499,16 @@ pub fn writeProviderOptions(writer: *std.Io.Writer, options: model_capabilities.
         try writer.writeByte('}');
     }
     try writer.writeByte('}');
+}
+
+test "Ultrafast serializes only the OpenAI tier and strict OpenAI routing" {
+    var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+    try writeProviderOptions(&out.writer, .{ .ultrafast = true, .fast = true, .prompt_caching = true });
+    try std.testing.expect(std.mem.find(u8, out.written(), "\"openai\":{\"serviceTier\":\"ultrafast\"}") != null);
+    try std.testing.expect(std.mem.find(u8, out.written(), "\"only\":[\"openai\"]") != null);
+    try std.testing.expect(std.mem.find(u8, out.written(), "\"speed\"") == null);
+    try std.testing.expectError(error.UltrafastProviderRestricted, writeProviderOptions(&out.writer, .{ .ultrafast = true, .provider_strict = true, .provider_order = &.{"azure"} }));
 }
 
 pub fn validateToolMessageHistory(alloc: std.mem.Allocator, messages: []const ChatMessage) !void {
@@ -636,6 +675,45 @@ fn write_tool_result_group(
     try writer.writeAll("]}");
 }
 
+const tool_image_followup_text = "Attached image(s) from the tool result.";
+
+// Retained tool images ride in a user message following the contiguous tool
+// run: user-position file parts are the one image position every gateway
+// provider route renders as vision input, while tool-result-position images
+// are ignored by several routes (and the legacy "image-data" part type was
+// removed from the gateway spec). Writes nothing when the run has no images.
+fn write_tool_image_user_message(writer: *std.Io.Writer, results: []const ChatMessage, budget: ?BuildBudget) !void {
+    var has_images = false;
+    for (results) |result| {
+        const memory = result.tool_result_memory orelse continue;
+        if (memory.tool_images.len == 0) continue;
+        const failed = if (result.tool_result_status) |status| status == .failure else false;
+        if (failed and tool_result_errors.toolPermissionDenialReason(result.content orelse "") != null) continue;
+        has_images = true;
+        break;
+    }
+    if (!has_images) return;
+    try writer.writeAll(",{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":");
+    try std.json.Stringify.value(tool_image_followup_text, .{}, writer);
+    try writer.writeByte('}');
+    for (results) |result| {
+        // Mirror the tool-result gate: images from permission-denied results
+        // never leave the process.
+        const failed = if (result.tool_result_status) |status| status == .failure else false;
+        if (failed and tool_result_errors.toolPermissionDenialReason(result.content orelse "") != null) continue;
+        const memory = result.tool_result_memory orelse continue;
+        for (memory.tool_images) |image| {
+            if (budget) |active| try active.check();
+            try writer.writeAll(",{\"type\":\"file\",\"mediaType\":");
+            try std.json.Stringify.value(image.mime_type, .{}, writer);
+            try writer.writeAll(",\"data\":{\"type\":\"data\",\"data\":");
+            try std.json.Stringify.value(image.data, .{}, writer);
+            try writer.writeAll("}}");
+        }
+    }
+    try writer.writeAll("]}");
+}
+
 fn write_tool_result_part(scratch_alloc: std.mem.Allocator, writer: *std.Io.Writer, message: ChatMessage, ids: *const tool_call_ids.Projection) !void {
     try writer.writeAll("{\"type\":\"tool-result\",\"toolCallId\":");
     try std.json.Stringify.value(ids.resolve(message.tool_call_id orelse ""), .{}, writer);
@@ -649,23 +727,16 @@ fn write_tool_result_part(scratch_alloc: std.mem.Allocator, writer: *std.Io.Writ
     const denied = failed and tool_result_errors.toolPermissionDenialReason(content) != null;
     const tool_images = if (message.tool_result_memory) |memory| memory.tool_images else &.{};
     if (tool_images.len > 0 and !denied) {
+        // Retained tool images are delivered in a follow-up user message (see
+        // write_tool_image_user_message). Tool-result-position image parts are
+        // ignored by several gateway provider routes, so only the text
+        // acknowledgment stays here.
         try writer.writeAll(",\"output\":{\"type\":\"content\",\"value\":[");
         const text = if (failed) try std.fmt.allocPrint(scratch_alloc, "Tool error: {s}", .{content}) else content;
         defer if (failed) scratch_alloc.free(text);
-        if (text.len > 0) {
-            try writer.writeAll("{\"type\":\"text\",\"text\":");
-            try std.json.Stringify.value(text, .{}, writer);
-            try writer.writeByte('}');
-        }
-        for (tool_images, 0..) |image, index| {
-            if (index > 0 or text.len > 0) try writer.writeByte(',');
-            try writer.writeAll("{\"type\":\"image-data\",\"data\":");
-            try std.json.Stringify.value(image.data, .{}, writer);
-            try writer.writeAll(",\"mediaType\":");
-            try std.json.Stringify.value(image.mime_type, .{}, writer);
-            try writer.writeByte('}');
-        }
-        try writer.writeAll("]}}");
+        try writer.writeAll("{\"type\":\"text\",\"text\":");
+        try std.json.Stringify.value(text, .{}, writer);
+        try writer.writeAll("}]}}");
         return;
     }
     if (denied) {
@@ -1668,6 +1739,35 @@ test "buildGatewayRequestBodyWithOptions serializes Gateway Fast provider option
     try std.testing.expect(parsed_automatic.value.object.get("providerOptions") == null);
 }
 
+test "buildGatewayRequestBodyWithOptions serializes provider routing options" {
+    const alloc = std.testing.allocator;
+    const messages = [_]ChatMessage{
+        .{ .role = .user, .content = "question" },
+    };
+    const order = [_][]const u8{ "azure", "anthropic" };
+
+    const ordered = try buildGatewayRequestBodyWithOptions(alloc, "[]", &messages, .{
+        .provider_order = &order,
+    }, .auto);
+    defer alloc.free(ordered);
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, ordered, .{});
+    defer parsed.deinit();
+    const gateway = parsed.value.object.get("providerOptions").?.object.get("gateway").?.object;
+    try std.testing.expect(gateway.get("only") == null);
+    const order_items = gateway.get("order").?.array.items;
+    try std.testing.expectEqual(@as(usize, 2), order_items.len);
+    try std.testing.expectEqualStrings("azure", order_items[0].string);
+    try std.testing.expectEqualStrings("anthropic", order_items[1].string);
+
+    const strict = try buildGatewayRequestBodyWithOptions(alloc, "[]", &messages, .{
+        .fast = true,
+        .provider_order = &order,
+        .provider_strict = true,
+    }, .auto);
+    defer alloc.free(strict);
+    try std.testing.expect(std.mem.find(u8, strict, "\"gateway\":{\"speed\":\"fast\",\"only\":[\"azure\",\"anthropic\"]}") != null);
+}
+
 test "buildGatewayRequestBodyWithOptions combines Gateway Fast and xai options" {
     const alloc = std.testing.allocator;
     const messages = [_]ChatMessage{
@@ -1832,7 +1932,7 @@ test "grouped tool results retain images and individual error status" {
         var parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
         defer parsed.deinit();
         const prompt = parsed.value.object.get("prompt").?.array.items;
-        try std.testing.expectEqual(@as(usize, 2), prompt.len);
+        try std.testing.expectEqual(@as(usize, 3), prompt.len);
         const results = prompt[1].object.get("content").?.array.items;
         try std.testing.expectEqual(@as(usize, 2), results.len);
         const projected_id = prompt[0].object.get("content").?.array.items[0].object.get("toolCallId").?.string;
@@ -1844,15 +1944,23 @@ test "grouped tool results retain images and individual error status" {
         const media = results[0].object.get("output").?.object;
         try std.testing.expectEqualStrings("content", media.get("type").?.string);
         const parts = media.get("value").?.array.items;
-        try std.testing.expectEqual(@as(usize, 2), parts.len);
+        try std.testing.expectEqual(@as(usize, 1), parts.len);
         try std.testing.expectEqualStrings(if (status == .failure) "Tool error: capture" else "capture", parts[0].object.get("text").?.string);
-        try std.testing.expectEqualStrings("image-data", parts[1].object.get("type").?.string);
-        try std.testing.expectEqualStrings(images[0].data, parts[1].object.get("data").?.string);
-        try std.testing.expectEqualStrings("image/png", parts[1].object.get("mediaType").?.string);
         try std.testing.expectEqualStrings("labels", results[1].object.get("toolCallId").?.string);
         const plain = results[1].object.get("output").?.object;
         try std.testing.expectEqualStrings("text", plain.get("type").?.string);
         try std.testing.expectEqualStrings("labels", plain.get("value").?.string);
+        const followup = prompt[2].object;
+        try std.testing.expectEqualStrings("user", followup.get("role").?.string);
+        const followup_parts = followup.get("content").?.array.items;
+        try std.testing.expectEqual(@as(usize, 2), followup_parts.len);
+        try std.testing.expectEqualStrings(tool_image_followup_text, followup_parts[0].object.get("text").?.string);
+        const file_part = followup_parts[1].object;
+        try std.testing.expectEqualStrings("file", file_part.get("type").?.string);
+        try std.testing.expectEqualStrings("image/png", file_part.get("mediaType").?.string);
+        const data = file_part.get("data").?.object;
+        try std.testing.expectEqualStrings("data", data.get("type").?.string);
+        try std.testing.expectEqualStrings(images[0].data, data.get("data").?.string);
     }
 }
 

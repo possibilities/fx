@@ -3,6 +3,7 @@ const builtin = @import("builtin");
 const command_policy = @import("command_policy.zig");
 const managed_execution = @import("../execution/managed_execution.zig");
 const file_mutation_contract = @import("file_mutation_contract.zig");
+const mem_utils = @import("../shared/mem_utils.zig");
 const text_utils = @import("../shared/text_utils.zig");
 const tool_args = @import("tool_args.zig");
 const tool_dispatch = @import("tool_dispatch.zig");
@@ -56,7 +57,7 @@ pub fn subagentAction(
 ) Allocator.Error!?SubagentAction {
     if (!std.mem.eql(u8, call.name, "subagent")) return null;
     var scratch_state = std.heap.ArenaAllocator.init(alloc);
-    defer scratch_state.deinit();
+    defer mem_utils.deinit_arena(scratch_state);
     const scratch = scratch_state.allocator();
     const outer = tool_args.parseToolArgsObject(scratch, call.arguments_json) catch |err| return switch (err) {
         error.OutOfMemory => error.OutOfMemory,
@@ -163,7 +164,7 @@ pub fn subagentFailureLabel(alloc: Allocator, call: ToolCall, output: []const u8
     for ([_][]const u8{ "feedback_capacity", "operation_conflict", "override_after_create" }) |rejection| {
         if (std.mem.eql(u8, code, rejection)) return "Message not sent to";
     }
-    return if (std.mem.eql(u8, code, "child_cancelled") or std.mem.eql(u8, code, "child_interrupted")) "Interrupted" else "Failed";
+    return if (std.mem.eql(u8, code, "child_cancelled") or std.mem.eql(u8, code, "child_interrupted") or std.mem.eql(u8, code, "child_lost")) "Interrupted" else "Failed";
 }
 
 test "subagent pending result does not claim completion" {
@@ -211,6 +212,7 @@ test "subagent failure labels trust structured terminal codes only" {
     const call: ToolCall = .{ .id = "child", .name = "subagent", .arguments_json = "{}" };
     try std.testing.expectEqualStrings("Interrupted", try subagentFailureLabel(alloc, call, "{\"ok\":false,\"error_code\":\"child_interrupted\"}"));
     try std.testing.expectEqualStrings("Interrupted", try subagentFailureLabel(alloc, call, "{\"ok\":false,\"error_code\":\"child_cancelled\"}"));
+    try std.testing.expectEqualStrings("Interrupted", try subagentFailureLabel(alloc, call, "{\"ok\":false,\"error_code\":\"child_lost\"}"));
     for ([_][]const u8{ "child_interrupted", "{", "<tool_result_preview>child_interrupted</tool_result_preview>", "{\"ok\":true,\"error_code\":\"child_interrupted\"}", "{\"ok\":false,\"error_code\":\"child_failed\"}" }) |output| {
         try std.testing.expectEqualStrings("Failed", try subagentFailureLabel(alloc, call, output));
     }
@@ -353,7 +355,7 @@ pub fn formatRunCommandPermissionLabel(
     command: []const u8,
 ) ![]const u8 {
     var scratch_state = std.heap.ArenaAllocator.init(alloc);
-    defer scratch_state.deinit();
+    defer mem_utils.deinit_arena(scratch_state);
     const scratch = scratch_state.allocator();
     const encoded = try text_utils.encodeTerminalSafe(
         scratch,
@@ -397,7 +399,7 @@ pub fn formatRunCommandActivity(
     call: ToolCall,
 ) !?RunCommandActivity {
     var scratch_state = std.heap.ArenaAllocator.init(std.heap.c_allocator);
-    defer scratch_state.deinit();
+    defer mem_utils.deinit_arena(scratch_state);
     const scratch = scratch_state.allocator();
 
     const args = tool_args.commandArguments(
@@ -458,7 +460,7 @@ fn resolveTerminalDisplayTargetFromRows(
     max_encoded_bytes: usize,
 ) !?[]const u8 {
     var scratch_state = std.heap.ArenaAllocator.init(alloc);
-    defer scratch_state.deinit();
+    defer mem_utils.deinit_arena(scratch_state);
     const session_id = terminalDisplayTargetSessionId(
         scratch_state.allocator(),
         registry,
@@ -551,7 +553,7 @@ pub fn resolveTerminalDisplayTargetBounded(
     max_encoded_bytes: usize,
 ) !?[]const u8 {
     var scratch_state = std.heap.ArenaAllocator.init(std.heap.c_allocator);
-    defer scratch_state.deinit();
+    defer mem_utils.deinit_arena(scratch_state);
     const session_id = terminalDisplayTargetSessionId(
         scratch_state.allocator(),
         registry,
@@ -592,7 +594,7 @@ pub fn terminalSessionCompletedActionLabel(
     const spec = registry.lookup(call.name) orelse return null;
     if (spec.executor_kind != .terminal) return null;
     var scratch_state = std.heap.ArenaAllocator.init(alloc);
-    defer scratch_state.deinit();
+    defer mem_utils.deinit_arena(scratch_state);
     const args = tool_args.parseToolArgsObject(scratch_state.allocator(), call.arguments_json) catch return null;
     const presentation = tool_dispatch.presentationForArgs(spec.*, args);
     if (presentation.label_arg_kind != .session_id) return null;
@@ -653,7 +655,7 @@ pub fn formatPlainAction(alloc: Allocator, input: ToolActionInput) ![]const u8 {
     }
 
     var scratch_state = std.heap.ArenaAllocator.init(alloc);
-    defer scratch_state.deinit();
+    defer mem_utils.deinit_arena(scratch_state);
     const scratch = scratch_state.allocator();
 
     const spec = input.tool_registry.lookup(call.name) orelse {
@@ -684,7 +686,7 @@ pub fn formatPlainAction(alloc: Allocator, input: ToolActionInput) ![]const u8 {
 /// The caller owns the returned allocation and must free it with `alloc`.
 pub fn formatPermissionLabel(alloc: Allocator, registry: tool_dispatch.Registry, call: ToolCall) ![]const u8 {
     var scratch_state = std.heap.ArenaAllocator.init(alloc);
-    defer scratch_state.deinit();
+    defer mem_utils.deinit_arena(scratch_state);
     const scratch = scratch_state.allocator();
 
     if (try runCommandCompatibilitySource(scratch, registry, call)) |source| {

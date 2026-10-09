@@ -180,6 +180,11 @@ fn dupeCommittedFilePresentation(
         .call_id = try durableIdentifier(alloc, id.call_id),
     } else null;
     errdefer if (lifecycle_id) |id| alloc.free(@constCast(id.call_id));
+    const content_handle = if (presentation.content_handle) |handle|
+        try alloc.dupe(u8, handle)
+    else
+        null;
+    errdefer if (content_handle) |handle| alloc.free(handle);
     return .{
         .path = path,
         .kind = presentation.kind,
@@ -190,6 +195,7 @@ fn dupeCommittedFilePresentation(
         .previous_content = previous_content,
         .after_content = after_content,
         .lifecycle_id = lifecycle_id,
+        .content_handle = content_handle,
     };
 }
 
@@ -209,9 +215,12 @@ pub fn appendFileEvidenceForTool(
     const object = parsed.value.object;
 
     const path = switch (action) {
-        .search => stringField(object, "path") orelse stringField(object, "directory") orelse stringField(object, "query"),
-        else => stringField(object, "path"),
-    } orelse return;
+        .search => non_empty_string_field(object, "path") orelse
+            non_empty_string_field(object, "directory") orelse
+            non_empty_string_field(object, "query") orelse
+            ".",
+        else => non_empty_string_field(object, "path") orelse return,
+    };
 
     const evidence = try makeFileEvidence(
         alloc,
@@ -786,9 +795,9 @@ fn fileEvidenceActionForTool(tool_name: []const u8) types.FileEvidenceAction {
     return .unknown;
 }
 
-fn stringField(object: std.json.ObjectMap, name: []const u8) ?[]const u8 {
+fn non_empty_string_field(object: std.json.ObjectMap, name: []const u8) ?[]const u8 {
     const value = object.get(name) orelse return null;
-    if (value != .string) return null;
+    if (value != .string or value.string.len == 0) return null;
     return value.string;
 }
 
@@ -1113,6 +1122,35 @@ test "file evidence does not parse unknown tool arguments" {
 
     try std.testing.expectEqual(@as(usize, 0), failing_allocator.alloc_index);
     try std.testing.expectEqual(@as(usize, 0), files.items.len);
+}
+
+test "search file evidence normalizes missing and empty roots" {
+    const alloc = std.testing.allocator;
+    var files: std.ArrayList(types.FileEvidence) = .empty;
+    defer {
+        for (files.items) |file| freeTransientFileEvidence(alloc, file);
+        files.deinit(alloc);
+    }
+
+    const calls = [_]ToolCall{
+        .{
+            .id = "call_empty_root",
+            .name = "grep_files",
+            .arguments_json = "{\"pattern\":\"needle\",\"path\":\"\"}",
+        },
+        .{
+            .id = "call_default_root",
+            .name = "glob_files",
+            .arguments_json = "{\"pattern\":\"*.zig\"}",
+        },
+    };
+    for (calls) |call| {
+        try appendFileEvidenceForTool(alloc, &files, call, .success, null);
+    }
+
+    try std.testing.expectEqual(@as(usize, 2), files.items.len);
+    try std.testing.expectEqualStrings(".", files.items[0].path);
+    try std.testing.expectEqualStrings(".", files.items[1].path);
 }
 
 test "read evidence trusts typed model coverage instead of output text" {

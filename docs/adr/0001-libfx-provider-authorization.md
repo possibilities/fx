@@ -23,3 +23,28 @@ provider tags. Credential preparation stages new storage until existing session
 borrowers stop. A process-wide source-only recent-verification stamp is never
 sufficient for Codex: independent libfx stores and account pins must still be
 validated on the request path.
+
+The upstream durable-session facade does not replace this contract. It defers
+authorization until a turn, re-creates engines across deliveries, and supplies
+ambient Gateway credentials. Re-creating an engine would also reset the
+selected-account pin. Keep the eagerly authorized single-conversation Agent;
+`createFxEngine()` names that same factory. Its explicit journal persistence,
+checkpoint recovery, steering, and raw attachment transport can be retained
+without exposing sub-sessions or selecting background workers and stores.
+Provider authorization remains owned by the live Agent and is never recovered
+from conversation persistence. The package declarations and supported SDK
+documentation follow this surface.
+
+A single-session wrapper around the durable facade could hide sub-sessions
+and await initial authorization. That alone would not keep the selected-account
+pin or configuration across replacement engines. Retaining queue delivery,
+worker takeover, and redeployment would require a new authorization-lifetime
+contract outside the native runtime, including where the account pin lives and
+how a replacement worker receives it. Holding one engine instead would remove
+those durability guarantees. Neither change is part of this carry's contract.
+
+The supported Agent therefore does not select local or Vercel storage, expose
+queue wake handlers, or automatically resume work after process loss. Hosts
+can still supply explicit engine persistence, restore checkpoints, and resume
+interrupted turns. The optional upstream durability modules remain separate;
+they do not select credentials or storage for the supported Agent.

@@ -260,7 +260,7 @@ Emitted after Fx durably installs native metadata for the active main session:
 { "title": "Prompt submit session naming" }
 ```
 
-The title is the same value used by `/rename`, `display.json`, the resume
+The title is the same value used by `/rename`, the durable session, the resume
 index, the status line, and the terminal tab. A fresh session can first publish
 a prompt-derived fallback and then replace it with a generated title. Resuming
 or switching sessions publishes that session's existing title after the
@@ -270,7 +270,7 @@ within one active session.
 This is a raw metadata fact rather than a lifecycle transition. Receivers may
 use it immediately for their own presentation, but Fx remains the persistence
 authority. After a sequence gap, a receiver that needs the current value can
-read `~/.fx/sessions/<session_id>/display.json`.
+query Fx's session listing for the active persistence backend.
 
 ### `PromptQueued`
 

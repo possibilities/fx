@@ -3,7 +3,10 @@ const runtime_profile = @import("../hosts/runtime_profile.zig");
 const app_permission_runtime = @import("app_permission_runtime.zig");
 const app_profile_runtime = @import("app_profile_runtime.zig");
 const app_session_runtime = @import("app_session_runtime.zig");
+const app_lifecycle = @import("app_lifecycle.zig");
+const app_bootstrap_runtime = @import("app_bootstrap_runtime.zig");
 const io_mod = @import("../shared/io.zig");
+const shell_snapshot = @import("../terminal/shell_snapshot.zig");
 const auth_runtime = @import("../auth/auth_runtime.zig");
 const credentials = @import("../auth/credentials.zig");
 const gateway_provider = @import("../gateway/gateway_provider.zig");
@@ -31,6 +34,7 @@ const permissions = @import("../permissions/permissions.zig");
 const session_permission_state = @import("../permissions/session_permission_state.zig");
 const skill_commands = @import("../skills/skill_commands.zig");
 const skill_runtime = @import("../skills/skill_runtime.zig");
+const display_width = @import("../shared/display_width.zig");
 const text_utils = @import("../shared/text_utils.zig");
 const tool_presentation = @import("../tooling/tool_presentation.zig");
 const session_commands = @import("../session/session_commands.zig");
@@ -227,6 +231,19 @@ fn refreshWorkspaceAvailabilityForList(app: anytype) !void {
     }
 }
 
+fn handleShellCommand(app: anytype, rest: []const u8) !void {
+    if (!std.mem.eql(u8, std.mem.trim(u8, rest, " \t"), "reload")) {
+        try app.writeDomainNotice(.{ .topic = "", .tone = .@"error", .body = "usage: /shell reload" }, true);
+        return;
+    }
+    shell_snapshot.processOwner().markDirty(.user_reload);
+    try app.writeDomainNotice(.{
+        .topic = "shell",
+        .tone = .neutral,
+        .body = "The next command reloads your shell startup files. Remembered command approvals were reset.",
+    }, true);
+}
+
 fn handleWorkspaceCommand(app: anytype, rest: []const u8) !void {
     const maybe_action = parseWorkspaceCommand(rest) catch {
         try app.writeDomainNotice(.{
@@ -371,7 +388,7 @@ pub fn Handlers(comptime App: type) type {
                 .new_session = commandNewSession,
                 .reset_session = commandResetSession,
                 .resume_session = commandResumeSession,
-                .continue_recovery = commandContinueRecovery,
+
                 .show_help = commandShowHelp,
                 .login = commandLogin,
                 .logout = commandLogout,
@@ -396,13 +413,28 @@ pub fn Handlers(comptime App: type) type {
                 .show_credits = commandShowCredits,
                 .paste_clipboard = commandPasteClipboard,
                 .toggle_fast = commandToggleFast,
+                .handle_ultrafast = commandHandleUltrafast,
                 .handle_statusline = commandHandleStatusline,
                 .rename_session = commandRenameSession,
                 .handle_notifications = commandHandleNotifications,
                 .handle_workspace = commandHandleWorkspace,
+                .handle_shell = commandHandleShell,
                 .show_version = commandShowVersion,
                 .unknown = commandUnknown,
             };
+        }
+
+        pub fn collectMcpStartupHealthFacts(app: *App) !void {
+            if (comptime !@hasDecl(App, "takeMcpStartupHealthNotice")) return;
+            const notice = (try app.takeMcpStartupHealthNotice()) orelse return;
+            defer app.alloc.free(notice);
+            try app.writeDomainNotice(.{ .topic = "mcp", .tone = .warning, .body = notice }, true);
+        }
+
+        pub fn collectShellSnapshotFacts(app: *App) !void {
+            var buffer: [shell_snapshot.max_notice_bytes]u8 = undefined;
+            const notice = shell_snapshot.processOwner().takeUiNotice(&buffer) orelse return;
+            try app.writeDomainNotice(.{ .topic = "shell", .tone = .warning, .body = notice }, true);
         }
 
         pub fn collectMcpReloadFacts(app: *App) !void {
@@ -414,6 +446,14 @@ pub fn Handlers(comptime App: type) type {
             {
                 switch (app.mcpReloadCompletionOrigin()) {
                     .command => {},
+                    .slack_setup => {
+                        if (comptime @hasDecl(App, "acquireMcpRuntime")) {
+                            if (completion == .outcome and completion.outcome == .published) {
+                                try connectSlackAfterReload(app);
+                                return;
+                            }
+                        }
+                    },
                     .menu => |generation| {
                         try app.applyMcpMenuReloadCompletion(generation, &completion);
                         return;
@@ -506,7 +546,7 @@ pub fn Handlers(comptime App: type) type {
                 @hasDecl(App, "applyMcpMenuAuthenticationCompletion"))
             {
                 switch (app.mcpAuthenticationCompletionOrigin()) {
-                    .command => {},
+                    .command, .slack_setup => {},
                     .menu => |generation| {
                         try app.applyMcpMenuAuthenticationCompletion(generation, &completion);
                         return;
@@ -517,7 +557,9 @@ pub fn Handlers(comptime App: type) type {
             if (completion.result) |authentication| {
                 switch (authentication) {
                     .authenticated => |authenticated| {
-                        const success = if (authenticated.repaired_entries == 0)
+                        const success = if (std.mem.eql(u8, completion.server_name, "slack") and completion.reconnect_error == null)
+                            try app.alloc.dupe(u8, "Slack connected. You can now use Slack.")
+                        else if (authenticated.repaired_entries == 0)
                             try std.fmt.allocPrint(
                                 app.alloc,
                                 "Authenticated MCP server '{s}'.",
@@ -563,7 +605,7 @@ pub fn Handlers(comptime App: type) type {
                     try std.fmt.allocPrint(
                         app.alloc,
                         "MCP authentication for '{s}' failed: {s}.",
-                        .{ completion.server_name, @errorName(err) },
+                        .{ completion.server_name, mcp_auth.authentication_error_message(err) },
                     );
                 defer app.alloc.free(body);
                 try app.writeDomainNotice(.{ .topic = "mcp", .tone = .warning, .body = body }, true);
@@ -660,27 +702,6 @@ pub fn Handlers(comptime App: type) type {
                 return;
             }
             try app_session_runtime.Runtime(App).openSessionPicker(app);
-        }
-
-        fn commandContinueRecovery(ctx: *anyopaque) !void {
-            const app: *App = @ptrCast(@alignCast(ctx));
-            const queued = app.continuePausedRecovery() catch |err| switch (err) {
-                error.RecoveryBusy => {
-                    try app.writeDomainNotice(.{
-                        .topic = "recovery",
-                        .tone = .neutral,
-                        .body = "wait for the current response to finish before continuing recovery",
-                    }, true);
-                    return;
-                },
-                else => return err,
-            };
-            if (queued) return;
-            try app.writeDomainNotice(.{
-                .topic = "recovery",
-                .tone = .neutral,
-                .body = "there is no paused model response to continue",
-            }, true);
         }
 
         fn commandRenameSession(ctx: *anyopaque, rest: []const u8) !void {
@@ -1281,9 +1302,29 @@ pub fn Handlers(comptime App: type) type {
             }, true);
         }
 
+        pub fn addSlack(app: *App) !void {
+            try commandHandleMcp(@ptrCast(app), "add slack");
+        }
+
+        fn connectSlackAfterReload(app: *App) !void {
+            var lease = app.acquireMcpRuntime() orelse return error.McpServerNotFound;
+            defer lease.deinit();
+            var snapshot = try lease.runtime.snapshotHealth(app.alloc, @intCast(@max(io_mod.milliTimestamp(), 0)));
+            defer snapshot.deinit(app.alloc);
+            for (snapshot.servers) |server| {
+                if (!std.mem.eql(u8, server.identity(), "slack")) continue;
+                if (server.connection == .ready) {
+                    try app.writeDomainNotice(.{ .topic = "mcp", .tone = .neutral, .body = "Slack connected. You can now use Slack." }, true);
+                    return;
+                }
+            }
+            try commandHandleMcp(@ptrCast(app), "auth slack --open");
+        }
+
         fn commandHandleMcp(ctx: *anyopaque, rest: []const u8) !void {
             const app: *App = @ptrCast(@alignCast(ctx));
-            if (std.mem.trim(u8, rest, " \t").len == 0 and
+            const command = std.mem.trim(u8, rest, " \t");
+            if ((command.len == 0 or std.mem.eql(u8, command, "list")) and
                 comptime @hasDecl(App, "openMcpMenu"))
             {
                 closeModelMenuIfPresent(app);
@@ -1301,6 +1342,14 @@ pub fn Handlers(comptime App: type) type {
                 try app.openMcpMenu();
                 app.shell.render_requests.request(.footer);
                 return;
+            }
+            if (std.mem.eql(u8, std.mem.trim(u8, rest, " \t"), "add slack")) {
+                if (comptime @hasDecl(App, "mcpAuthenticationPending")) {
+                    if (app.mcpAuthenticationPending("slack")) {
+                        try app.writeDomainNotice(.{ .topic = "mcp", .tone = .neutral, .body = "Slack authorization is already in progress. Finish it in your browser." }, true);
+                        return;
+                    }
+                }
             }
             const result = try app.mcpCommandProvider().handle(app.alloc, rest, .{
                 .home = app_profile_runtime.home(app),
@@ -1333,7 +1382,11 @@ pub fn Handlers(comptime App: type) type {
                 return;
             }
             if (result.reload) {
-                app.beginMcpReload() catch |err| {
+                const reload = if (result.connect_slack) reload: {
+                    if (comptime @hasDecl(App, "beginMcpSlackSetup")) break :reload app.beginMcpSlackSetup();
+                    break :reload error.McpAuthenticationUnavailable;
+                } else app.beginMcpReload();
+                reload catch |err| {
                     reload_warning = true;
                     reload_notice = if (result.report_reload)
                         try app.alloc.dupe(
@@ -1734,11 +1787,15 @@ pub fn Handlers(comptime App: type) type {
                 try app.writeDomainNotice(.{
                     .topic = "skills",
                     .tone = .@"error",
-                    .body = "Skills could not be refreshed. The previous catalog was not shown as current.",
+                    .body = if (ready.action == .startup_notice)
+                        "Skills could not be loaded. Run /skills to try again."
+                    else
+                        "Skills could not be refreshed. The previous catalog was not shown as current.",
                 }, true);
                 return;
             }
             switch (ready.action) {
+                .startup_notice => try app_bootstrap_runtime.Runtime(App).writeSkillDiagnosticsNotice(app),
                 .list => try executeSkillsCommand(
                     app,
                     app.skillsCommandProvider(),
@@ -1790,8 +1847,8 @@ pub fn Handlers(comptime App: type) type {
 
             var result = try provider.executeCommand(app.alloc, command, .{
                 .skills_dir = app.skills.dir,
-                .invocation_skill_roots = if (comptime @hasField(App, "skill_root_policy"))
-                    app.skill_root_policy.invocation_roots
+                .invocation_skill_roots = if (comptime @hasField(App, "invocation_skill_roots"))
+                    app.invocation_skill_roots
                 else
                     &.{},
                 .find_ctx = @ptrCast(app),
@@ -2041,6 +2098,11 @@ pub fn Handlers(comptime App: type) type {
             try session_commands.Commands(App).toggleFast(app);
         }
 
+        fn commandHandleUltrafast(ctx: *anyopaque, rest: []const u8) !void {
+            const app: *App = @ptrCast(@alignCast(ctx));
+            try session_commands.Commands(App).handleUltrafast(app, rest);
+        }
+
         fn commandHandleStatusline(ctx: *anyopaque, rest: []const u8) !void {
             const app: *App = @ptrCast(@alignCast(ctx));
             if (std.mem.trim(u8, rest, " \t").len == 0) {
@@ -2059,6 +2121,11 @@ pub fn Handlers(comptime App: type) type {
         fn commandHandleNotifications(ctx: *anyopaque, rest: []const u8) !void {
             const app: *App = @ptrCast(@alignCast(ctx));
             try handleNotificationsCommand(app, rest);
+        }
+
+        fn commandHandleShell(ctx: *anyopaque, rest: []const u8) !void {
+            const app: *App = @ptrCast(@alignCast(ctx));
+            try handleShellCommand(app, rest);
         }
 
         fn commandHandleWorkspace(ctx: *anyopaque, rest: []const u8) !void {
@@ -2209,10 +2276,12 @@ fn buildTraceReport(app: anytype) ![]u8 {
 
     try writeCurrentStateSummary(&out.writer, app, app.alloc);
     try writeProblemsSummary(&out.writer, app, app.alloc);
+    try writeLastShutdownSection(&out.writer, app.alloc);
     try writeCompactionSummary(&out.writer, app.alloc);
     try writeLastInterruptedDetail(&out.writer, app.session.agent.history.items, app.alloc);
     try writeSessionTitleSummary(&out.writer, app, app.alloc);
     try writeNetworkCallsSummary(&out.writer);
+    try writeModelCatalogSummary(&out.writer, app);
     try writeToolCallsSummary(&out.writer, app.alloc, app.session.agent.history.items);
     try writePermissionsSummary(&out.writer, app.permission_engine.grants.items);
     try writeRuntimeContextSummary(&out.writer, app, app.alloc);
@@ -2472,6 +2541,48 @@ fn writeAuthStateSummary(writer: *std.Io.Writer, app: anytype) !void {
     );
 }
 
+fn writeLastShutdownSection(writer: *std.Io.Writer, alloc: std.mem.Allocator) !void {
+    try writer.writeAll("\n## Last Shutdown\n");
+    const contents = app_lifecycle.readLastShutdownReport(alloc) orelse {
+        try writer.writeAll("(none recorded)\n");
+        return;
+    };
+    defer alloc.free(contents);
+    const parsed = std.json.parseFromSlice(std.json.Value, alloc, contents, .{}) catch {
+        try writer.writeAll("(last shutdown report unreadable)\n");
+        return;
+    };
+    defer parsed.deinit();
+    const root = parsed.value.object;
+    const total_ms = if (root.get("total_ms")) |value| value.integer else -1;
+    try writer.print("total_ms={d}", .{total_ms});
+    if (root.get("recorded_at_ms")) |value| {
+        if (value.integer >= 0) {
+            const epoch_secs: std.time.epoch.EpochSeconds = .{ .secs = @intCast(@divFloor(value.integer, 1000)) };
+            const day_seconds = epoch_secs.getDaySeconds();
+            const year_day = epoch_secs.getEpochDay().calculateYearDay();
+            const month_day = year_day.calculateMonthDay();
+            try writer.print(" recorded={d}-{d:0>2}-{d:0>2}T{d:0>2}:{d:0>2}:{d:0>2}Z", .{
+                year_day.year,
+                month_day.month.numeric(),
+                month_day.day_index + 1,
+                day_seconds.getHoursIntoDay(),
+                day_seconds.getMinutesIntoHour(),
+                day_seconds.getSecondsIntoMinute(),
+            });
+        }
+    }
+    try writer.writeByte('\n');
+    if (root.get("stages")) |stages_value| {
+        for (stages_value.array.items) |stage_value| {
+            const stage = stage_value.object;
+            const name = if (stage.get("name")) |v| v.string else "?";
+            const step_ms = if (stage.get("step_ms")) |v| v.integer else -1;
+            try writer.print("- {s} step_ms={d}\n", .{ name, step_ms });
+        }
+    }
+}
+
 fn writeProblemsSummary(writer: *std.Io.Writer, app: anytype, alloc: std.mem.Allocator) !void {
     const App = @TypeOf(app.*);
     try writer.writeAll("\n## Problems\n");
@@ -2576,9 +2687,15 @@ fn writeProblemsSummary(writer: *std.Io.Writer, app: anytype, alloc: std.mem.All
             var diagnostics_snapshot = try mcp.snapshotServerDiagnostics(alloc);
             defer diagnostics_snapshot.deinit(alloc);
             for (diagnostics_snapshot.items) |server| {
-                if (server.state != .failed) continue;
-                count += 1;
-                try writer.print("- mcp server failed name={s}", .{server.name});
+                if (server.status == .needs_auth) {
+                    count += 1;
+                    try writer.print("- mcp server needs authentication name={s}", .{server.name});
+                } else if (server.status == .failed) {
+                    count += 1;
+                    try writer.print("- mcp server failed name={s}", .{server.name});
+                } else {
+                    continue;
+                }
                 if (server.last_error) |err| {
                     try writer.writeAll(" error=");
                     try writeMaskedInline(writer, alloc, err);
@@ -2588,7 +2705,32 @@ fn writeProblemsSummary(writer: *std.Io.Writer, app: anytype, alloc: std.mem.All
         }
     }
 
-    if (count == 0) try writer.writeAll("- no obvious errors captured in recent network, tool, compaction, or MCP state\n");
+    count += try writeModelCatalogProblems(writer);
+
+    if (count == 0) try writer.writeAll("- no obvious errors captured in recent network, tool, compaction, MCP, or model catalog state\n");
+}
+
+/// Surfaces failed model-catalog loads, capability lookup misses, and image
+/// gate rejections under Problems so an unverifiable-capability failure is
+/// never reported as "no obvious errors".
+fn writeModelCatalogProblems(writer: *std.Io.Writer) !usize {
+    var buf: [diagnostics.model_catalog_ring_capacity]diagnostics.ModelCatalogEvent = undefined;
+    const total = diagnostics.snapshotModelCatalogEvents(&buf);
+    var count: usize = 0;
+    var index = total;
+    while (index > 0 and count < 3) {
+        index -= 1;
+        const event = &buf[index];
+        if (!event.failed) continue;
+        count += 1;
+        try writer.print("- model catalog {s}", .{event.name()});
+        if (event.detail().len > 0) {
+            try writer.writeByte(' ');
+            try writer.writeAll(event.detail());
+        }
+        try writer.writeByte('\n');
+    }
+    return count;
 }
 
 const trace_compaction_max_events: usize = 24;
@@ -2723,7 +2865,7 @@ fn writeRuntimeContextSummary(writer: *std.Io.Writer, app: anytype, alloc: std.m
             } else {
                 try writer.print("mcp_servers ({d}):\n", .{diagnostics_snapshot.items.len});
                 for (diagnostics_snapshot.items) |server| {
-                    try writer.print("  - {s} state={s} tools={d} command=", .{ server.name, @tagName(server.state), server.tool_count });
+                    try writer.print("  - {s} state={s} status={s} tools={d} command=", .{ server.name, @tagName(server.state), @tagName(server.status), server.tool_count });
                     try writeMaskedInline(writer, alloc, server.command);
                     try writer.writeByte('\n');
                     if (server.last_error) |err| {
@@ -2855,7 +2997,7 @@ fn lastInterruptedTurn(items: []const types.HistoryTurn) ?types.InterruptedHisto
 const trace_tool_args_max_bytes: usize = 1200;
 
 fn networkCallIsError(call: diagnostics.NetworkCall) bool {
-    return call.errorName().len > 0 or (call.status != 0 and call.status >= 400);
+    return call.isError();
 }
 
 fn writeNetworkCallCompact(writer: *std.Io.Writer, call: diagnostics.NetworkCall) !void {
@@ -2901,8 +3043,104 @@ fn writeNetworkCallsSummary(writer: *std.Io.Writer) !void {
     const avg_ms: u64 = if (n > 0) total_ms / n else 0;
 
     try writer.print("\n## Network Calls\nlast={d} ok={d} errors={d} avg={d}ms min={d}ms max={d}ms\n", .{ n, ok_count, error_count, avg_ms, min_ms, max_ms });
+    try writeNetworkSessionTotals(writer, buf[0..n]);
     for (buf[0..n]) |call| {
         try writeNetworkCallCompact(writer, call);
+    }
+}
+
+/// Renders session-wide totals, the per-turn model-call rollup, and an
+/// explicit coverage statement so a shared trace cannot be misread as
+/// describing the whole session when the ring has already evicted history.
+fn writeNetworkSessionTotals(writer: *std.Io.Writer, window: []const diagnostics.NetworkCall) !void {
+    const lifetime = diagnostics.networkLifetimeStats();
+    try writer.print(
+        "session: calls={d} ok={d} errors={d} total_time={d}s\n",
+        .{ lifetime.total_calls, lifetime.ok_calls, lifetime.error_calls, lifetime.total_duration_ms / 1000 },
+    );
+    if (window.len > 0 and lifetime.total_calls > window.len) {
+        try writer.print(
+            "coverage: window holds only the last {d} of {d} calls, oldest retained ",
+            .{ window.len, lifetime.total_calls },
+        );
+        try writeTraceTimestampUtc(writer, window[0].started_at_ms);
+        try writer.writeAll("; run with FX_TRACE_LOG for a complete transport record\n");
+    } else {
+        try writer.writeAll("coverage: complete (window holds every recorded call)\n");
+    }
+
+    var rollups: [diagnostics.network_turn_rollup_capacity]diagnostics.NetworkTurnRollup = undefined;
+    const rollup_n = diagnostics.snapshotNetworkTurnRollups(&rollups);
+    if (rollup_n == 0) return;
+    if (lifetime.evicted_turns > 0) {
+        try writer.print("turns: most recent {d} shown, {d} older evicted\n", .{ rollup_n, lifetime.evicted_turns });
+    } else {
+        try writer.writeAll("turns:\n");
+    }
+    for (rollups[0..rollup_n]) |rollup| {
+        try writer.print(
+            "  turn {d}: calls={d} errors={d} total_time={d}s",
+            .{ rollup.turn_id, rollup.calls, rollup.error_calls, rollup.total_duration_ms / 1000 },
+        );
+        if (rollup.subagent_calls > 0) try writer.print(" subagent_calls={d}", .{rollup.subagent_calls});
+        if (rollup.first_started_at_ms > 0) {
+            try writer.writeAll(" started ");
+            try writeTraceTimestampUtc(writer, rollup.first_started_at_ms);
+        }
+        try writer.writeByte('\n');
+    }
+}
+
+/// Renders catalog cache state, the selected model's resolved capabilities,
+/// and the always-on catalog event ring so a shared trace explains why an
+/// image submission or capability-dependent feature was rejected.
+fn writeModelCatalogSummary(writer: *std.Io.Writer, app: anytype) !void {
+    const App = @TypeOf(app.*);
+    try writer.writeAll("\n## Model Catalog\n");
+    if (comptime @hasField(App, "model_cache")) {
+        const snapshot = app.model_cache.snapshotForTrace();
+        try writer.print("state={s} entries={d}", .{ snapshot.state, snapshot.entries });
+        if (snapshot.last_attempt_ms > 0) {
+            const age_ms = io_mod.milliTimestamp() - snapshot.last_attempt_ms;
+            try writer.print(" last_attempt={d}s ago", .{@divFloor(@max(age_ms, 0), @as(i64, 1000))});
+        }
+        if (snapshot.failure_category) |category| {
+            try writer.print(" failure={s} retryable={s}", .{ category, boolLabel(snapshot.failure_retryable) });
+            if (snapshot.failure_http_status) |status| try writer.print(" status={d}", .{@intFromEnum(status)});
+            if (snapshot.anonymous_fallback) try writer.writeAll(" anonymous_fallback=true");
+        }
+        try writer.writeByte('\n');
+    }
+    if (comptime @hasDecl(App, "resolvedModelCapabilities")) {
+        const model = provider_runtime.model(app);
+        const capabilities = app.resolvedModelCapabilities(model);
+        try writer.print("selected_model={s} image_input={s} vision={s} file_input={s} tool_use={s}", .{
+            model,
+            @tagName(capabilities.image_input_support),
+            boolLabel(capabilities.supports_vision),
+            boolLabel(capabilities.supports_file_input),
+            boolLabel(capabilities.supports_tool_use),
+        });
+        if (capabilities.context_window) |window| try writer.print(" context_window={d}", .{window});
+        try writer.writeByte('\n');
+    }
+    var buf: [diagnostics.model_catalog_ring_capacity]diagnostics.ModelCatalogEvent = undefined;
+    const total = diagnostics.snapshotModelCatalogEvents(&buf);
+    if (total == 0) {
+        try writer.writeAll("(no catalog events recorded)\n");
+        return;
+    }
+    try writer.print("events={d} (always recorded; does not require FX_TRACE)\n", .{total});
+    for (buf[0..total]) |*event| {
+        try writeTraceTimestampUtc(writer, event.timestamp_ms);
+        try writer.print(" seq={d} {s}", .{ event.sequence, event.name() });
+        if (event.failed) try writer.writeAll(" failed");
+        if (event.detail().len > 0) {
+            try writer.writeByte(' ');
+            try writer.writeAll(event.detail());
+        }
+        if (event.truncated) try writer.writeAll(" [truncated]");
+        try writer.writeByte('\n');
     }
 }
 
@@ -3033,6 +3271,27 @@ noinline fn writeToolCallsSummary(
             "last={d} succeeded={d} rejected={d} command_failed={d} tool_failed={d} runtime_failed={d} total={d}ms\n",
             .{ n, succeeded_count, rejected_count, command_failed_count, tool_failed_count, runtime_failed_count, total_ms },
         );
+        const lifetime = diagnostics.toolCallLifetimeStats();
+        try writer.print(
+            "session: calls={d} succeeded={d} rejected={d} command_failed={d} tool_failed={d} runtime_failed={d} total_time={d}s\n",
+            .{
+                lifetime.total_calls,
+                lifetime.countFor(.succeeded),
+                lifetime.countFor(.rejected),
+                lifetime.countFor(.command_failed),
+                lifetime.countFor(.tool_failed),
+                lifetime.countFor(.runtime_failed),
+                lifetime.total_duration_ms / 1000,
+            },
+        );
+        if (lifetime.total_calls > n) {
+            try writer.print(
+                "coverage: window holds only the last {d} of {d} tool calls; full results persist in the session directory\n",
+                .{ n, lifetime.total_calls },
+            );
+        } else {
+            try writer.writeAll("coverage: complete (window holds every recorded tool call)\n");
+        }
         if (succeeded_count != n) {
             try writer.writeAll("non-successes first:\n");
             for (buf[0..n]) |call| {
@@ -3558,36 +3817,7 @@ fn stripAnsiEscapes(alloc: std.mem.Allocator, input: []const u8) ![]u8 {
     while (i < input.len) {
         const c = input[i];
         if (c == 0x1b and i + 1 < input.len) {
-            const next = input[i + 1];
-            if (next == '[') {
-                // CSI: ESC '[' params... final-byte (0x40-0x7E)
-                i += 2;
-                while (i < input.len) {
-                    const b = input[i];
-                    i += 1;
-                    if (b >= 0x40 and b <= 0x7E) break;
-                }
-                continue;
-            }
-            if (next == ']') {
-                // OSC: ESC ']' ... BEL (0x07) or ESC '\'
-                i += 2;
-                while (i < input.len) {
-                    const b = input[i];
-                    if (b == 0x07) {
-                        i += 1;
-                        break;
-                    }
-                    if (b == 0x1b and i + 1 < input.len and input[i + 1] == '\\') {
-                        i += 2;
-                        break;
-                    }
-                    i += 1;
-                }
-                continue;
-            }
-            // Other ESC sequences: skip ESC + one byte
-            i += 2;
+            i = display_width.ansiSequenceEnd(input, i);
             continue;
         }
         if (c == '\r') {
@@ -3823,10 +4053,16 @@ pub fn settingsCatalogSnapshot(app: anytype) settings_catalog.Snapshot {
     if (comptime provider_runtime.supported(App)) snapshot.model = provider_runtime.model(app);
     if (comptime @hasField(App, "effort")) snapshot.effort = app.effort.displayLabel();
     if (comptime @hasField(App, "fast_mode")) snapshot.fast_mode = app.fast_mode;
+    if (comptime @hasField(App, "worker") and
+        @hasField(@TypeOf(app.worker), "agent_turn_settings"))
+    {
+        snapshot.ultrafast_mode = app.worker.agent_turn_settings.ultrafast_mode;
+    }
     if (comptime @hasDecl(App, "resolvedModelCapabilities") and provider_runtime.supported(App)) {
         const capabilities = app.resolvedModelCapabilities(provider_runtime.model(app));
         snapshot.reasoning_efforts = capabilities.reasoning_efforts;
         snapshot.supports_fast_mode = capabilities.supports_fast_mode;
+        snapshot.supports_ultrafast_mode = capabilities.supports_ultrafast_mode;
     }
     if (comptime @hasField(App, "permission_engine")) snapshot.permission_mode = @tagName(app.permission_engine.mode);
     if (comptime @hasField(App, "input_runtime")) {
@@ -3967,6 +4203,15 @@ pub fn applySettingsCatalogChange(app: anytype, change: settings_catalog.Change)
             const enabled = parseOnOff(change.value) orelse return error.InvalidSettingsCatalogValue;
             if (enabled != app.fast_mode) try session_commands.Commands(@TypeOf(app.*)).toggleFast(app);
         },
+        .ultrafast_mode => {
+            const enabled = parseOnOff(change.value) orelse return error.InvalidSettingsCatalogValue;
+            if (enabled != app.worker.agent_turn_settings.ultrafast_mode) {
+                try session_commands.Commands(@TypeOf(app.*)).handleUltrafast(
+                    app,
+                    if (enabled) "on" else "off",
+                );
+            }
+        },
         .permission_mode => try session_commands.Commands(@TypeOf(app.*)).handlePermissions(app, change.value),
         .sound_level => try handleNotificationsCommand(app, change.value),
         .startup_scrollback => {
@@ -4055,8 +4300,10 @@ const McpCommandFakeApp = struct {
     };
 
     alloc: std.mem.Allocator,
+    shell: transcript_runtime.TranscriptRuntime = .{},
     notice_body: std.ArrayList(u8) = .empty,
     list_count: usize = 0,
+    menu_open_count: usize = 0,
     reload_count: usize = 0,
     notice_count: usize = 0,
     last_topic: ?[]const u8 = null,
@@ -4070,7 +4317,12 @@ const McpCommandFakeApp = struct {
     menu_authentication_completions: usize = 0,
 
     fn deinit(self: *McpCommandFakeApp) void {
+        self.shell.deinit(self.alloc);
         self.notice_body.deinit(self.alloc);
+    }
+
+    fn openMcpMenu(self: *McpCommandFakeApp) !void {
+        self.menu_open_count += 1;
     }
 
     fn mcpCommandProvider(_: *const McpCommandFakeApp) mcp_command_provider.Provider {
@@ -4346,7 +4598,7 @@ const SkillsInstallReplayApp = struct {
         return self.reload_count;
     }
 
-    noinline fn writeDomainNotice(self: *SkillsInstallReplayApp, notice: types.SemanticNotice, _: bool) !void {
+    pub noinline fn writeDomainNotice(self: *SkillsInstallReplayApp, notice: types.SemanticNotice, _: bool) !void {
         self.write_count += 1;
         self.last_tone = notice.tone;
         _ = try self.shell.appendSemanticNotice(self.alloc, notice);
@@ -4415,6 +4667,7 @@ test "trace notice distinguishes Markdown file outcomes without a feedback CTA" 
 }
 
 test "trace compaction summary renders recorded events without file tracing" {
+    const compactor = @import("../compactor/compactor.zig");
     const alloc = std.testing.allocator;
     diagnostics.resetForTest();
     defer diagnostics.resetForTest();
@@ -4424,8 +4677,8 @@ test "trace compaction summary renders recorded events without file tracing" {
     try writeCompactionSummary(&empty.writer, alloc);
     try std.testing.expect(std.mem.find(u8, empty.written(), "\n## Context Compaction\n(none recorded)\n") != null);
 
-    diagnostics.traceCompactionEvent(.{ .turn_id = 10, .step_id = 176 }, "decision", "decision=compact estimated_tokens={d}", .{279466});
-    diagnostics.traceCompactionFailure(.{ .turn_id = 10 }, "retention_exhausted", "estimated_tokens={d}", .{59000});
+    compactor.traceEvent(.{ .turn_id = 10, .step_id = 176 }, .decision, "decision=compact estimated_tokens={d}", .{279466});
+    compactor.traceFailure(.{ .turn_id = 10 }, .retention_exhausted, "estimated_tokens={d}", .{59000});
 
     var out: std.Io.Writer.Allocating = .init(alloc);
     defer out.deinit();
@@ -4436,12 +4689,100 @@ test "trace compaction summary renders recorded events without file tracing" {
 
     diagnostics.resetForTest();
     for (0..diagnostics.compaction_ring_capacity + 3) |index| {
-        diagnostics.traceCompactionEvent(.{ .turn_id = 11 }, "decision", "decision=compact index={d}", .{index});
+        compactor.traceEvent(.{ .turn_id = 11 }, .decision, "decision=compact index={d}", .{index});
     }
     var wrapped: std.Io.Writer.Allocating = .init(alloc);
     defer wrapped.deinit();
     try writeCompactionSummary(&wrapped.writer, alloc);
     try std.testing.expect(std.mem.find(u8, wrapped.written(), "overwritten_before=3") != null);
+}
+
+test "trace model catalog summary and problems render recorded events" {
+    const alloc = std.testing.allocator;
+    diagnostics.resetForTest();
+    defer diagnostics.resetForTest();
+
+    const StubApp = struct {};
+    var stub: StubApp = .{};
+
+    var empty: std.Io.Writer.Allocating = .init(alloc);
+    defer empty.deinit();
+    try writeModelCatalogSummary(&empty.writer, &stub);
+    try std.testing.expect(std.mem.find(u8, empty.written(), "\n## Model Catalog\n(no catalog events recorded)\n") != null);
+
+    diagnostics.recordModelCatalogEvent(true, .load, "outcome=failed category={s} status={d}", .{ "transport", @as(u16, 503) });
+    diagnostics.recordModelCatalogEvent(true, .lookup, "outcome=cache_failed model={s}", .{"moonshotai/kimi-k3"});
+    diagnostics.recordModelCatalogEvent(false, .load, "outcome=ready entries={d}", .{41});
+    diagnostics.recordModelCatalogEvent(true, .image_gate, "model={s} image_support=unknown err=ModelImageCapabilityUnavailable", .{"moonshotai/kimi-k3"});
+
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    defer out.deinit();
+    try writeModelCatalogSummary(&out.writer, &stub);
+    try std.testing.expect(std.mem.find(u8, out.written(), "events=4 (always recorded; does not require FX_TRACE)\n") != null);
+    try std.testing.expect(std.mem.find(u8, out.written(), "load failed outcome=failed category=transport status=503\n") != null);
+    try std.testing.expect(std.mem.find(u8, out.written(), "lookup failed outcome=cache_failed model=moonshotai/kimi-k3\n") != null);
+    try std.testing.expect(std.mem.find(u8, out.written(), "image_gate failed model=moonshotai/kimi-k3 image_support=unknown err=ModelImageCapabilityUnavailable\n") != null);
+
+    var problems: std.Io.Writer.Allocating = .init(alloc);
+    defer problems.deinit();
+    const problem_count = try writeModelCatalogProblems(&problems.writer);
+    try std.testing.expectEqual(@as(usize, 3), problem_count);
+    try std.testing.expect(std.mem.find(u8, problems.written(), "- model catalog image_gate model=moonshotai/kimi-k3 image_support=unknown err=ModelImageCapabilityUnavailable\n") != null);
+    try std.testing.expect(std.mem.find(u8, problems.written(), "- model catalog load outcome=failed category=transport status=503\n") != null);
+    try std.testing.expect(std.mem.find(u8, problems.written(), "outcome=ready") == null);
+}
+
+test "trace model catalog summary renders cache state and failure detail" {
+    const alloc = std.testing.allocator;
+    diagnostics.resetForTest();
+    defer diagnostics.resetForTest();
+
+    const Snapshot = struct {
+        state: []const u8,
+        entries: usize,
+        last_attempt_ms: i64,
+        failure_category: ?[]const u8,
+        failure_http_status: ?std.http.Status,
+        failure_retryable: bool,
+        anonymous_fallback: bool,
+    };
+    const CacheStub = struct {
+        snapshot: Snapshot,
+        fn snapshotForTrace(self: *@This()) Snapshot {
+            return self.snapshot;
+        }
+    };
+    const StubApp = struct {
+        model_cache: CacheStub,
+    };
+
+    var stub: StubApp = .{ .model_cache = .{ .snapshot = .{
+        .state = "failed",
+        .entries = 0,
+        .last_attempt_ms = 0,
+        .failure_category = "transport",
+        .failure_http_status = .service_unavailable,
+        .failure_retryable = true,
+        .anonymous_fallback = true,
+    } } };
+    var failed: std.Io.Writer.Allocating = .init(alloc);
+    defer failed.deinit();
+    try writeModelCatalogSummary(&failed.writer, &stub);
+    try std.testing.expect(std.mem.find(u8, failed.written(), "state=failed entries=0 failure=transport retryable=true status=503 anonymous_fallback=true\n") != null);
+
+    stub.model_cache.snapshot = .{
+        .state = "ready",
+        .entries = 41,
+        .last_attempt_ms = 0,
+        .failure_category = null,
+        .failure_http_status = null,
+        .failure_retryable = false,
+        .anonymous_fallback = false,
+    };
+    var ready: std.Io.Writer.Allocating = .init(alloc);
+    defer ready.deinit();
+    try writeModelCatalogSummary(&ready.writer, &stub);
+    try std.testing.expect(std.mem.find(u8, ready.written(), "state=ready entries=41\n") != null);
 }
 
 test "trace report file uses private randomized markdown path" {
@@ -4831,6 +5172,99 @@ test "trace renders gateway schema diagnostics without raw payload content" {
     try std.testing.expect(std.mem.find(u8, text, "SECRET_RAW_PROMPT") == null);
 }
 
+test "trace network section reports session totals and window coverage" {
+    const alloc = std.testing.allocator;
+    diagnostics.resetForTest();
+    defer diagnostics.resetForTest();
+
+    // More calls than the ring holds so the coverage line must admit eviction.
+    var i: u64 = 0;
+    while (i < diagnostics.network_ring_capacity + 2) : (i += 1) {
+        var call: diagnostics.NetworkCall = .{
+            .started_at_ms = 1_000 + @as(i64, @intCast(i)) * 1_000,
+            .duration_ms = 100,
+            .status = if (i == 0) 500 else 200,
+            .turn_id = if (i < 2) 1 else 2,
+        };
+        call.setModel("openai/gpt-5.6-sol");
+        diagnostics.recordNetworkCall(call);
+    }
+
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    defer out.deinit();
+    try writeNetworkCallsSummary(&out.writer);
+    const text = out.written();
+
+    const total = diagnostics.network_ring_capacity + 2;
+    var expect_buf: [160]u8 = undefined;
+    const session_line = try std.fmt.bufPrint(&expect_buf, "session: calls={d} ok={d} errors=1", .{ total, total - 1 });
+    try std.testing.expect(std.mem.find(u8, text, session_line) != null);
+    try std.testing.expect(std.mem.find(u8, text, "coverage: window holds only the last") != null);
+    try std.testing.expect(std.mem.find(u8, text, "turns:\n") != null);
+    try std.testing.expect(std.mem.find(u8, text, "turn 1: calls=2 errors=1") != null);
+    try std.testing.expect(std.mem.find(u8, text, "turn 2: calls=32 errors=0") != null);
+}
+
+test "trace network section states complete coverage when nothing was evicted" {
+    const alloc = std.testing.allocator;
+    diagnostics.resetForTest();
+    defer diagnostics.resetForTest();
+
+    diagnostics.recordNetworkCall(.{ .started_at_ms = 5_000, .duration_ms = 10, .status = 200, .turn_id = 3 });
+
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    defer out.deinit();
+    try writeNetworkCallsSummary(&out.writer);
+    const text = out.written();
+
+    try std.testing.expect(std.mem.find(u8, text, "session: calls=1 ok=1 errors=0") != null);
+    try std.testing.expect(std.mem.find(u8, text, "coverage: complete") != null);
+}
+
+test "trace tool section reports session totals and window coverage" {
+    const alloc = std.testing.allocator;
+    diagnostics.resetForTest();
+    defer diagnostics.resetForTest();
+
+    // More calls than the ring holds so the coverage line must admit eviction.
+    var i: u64 = 0;
+    while (i < diagnostics.tool_call_ring_capacity + 2) : (i += 1) {
+        var call: diagnostics.ToolCallMetric = .{
+            .started_at_ms = 1_000 + @as(i64, @intCast(i)) * 100,
+            .duration_ms = 50,
+            .outcome = if (i == 0) .rejected else .succeeded,
+        };
+        call.setName("shell");
+        diagnostics.recordToolCall(call);
+    }
+
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    defer out.deinit();
+    const history: []const types.HistoryTurn = &.{};
+    try writeToolCallsSummary(&out.writer, alloc, history);
+    const text = out.written();
+
+    const total = diagnostics.tool_call_ring_capacity + 2;
+    var expect_buf: [200]u8 = undefined;
+    const session_line = try std.fmt.bufPrint(
+        &expect_buf,
+        "session: calls={d} succeeded={d} rejected=1 command_failed=0 tool_failed=0 runtime_failed=0",
+        .{ total, total - 1 },
+    );
+    try std.testing.expect(std.mem.find(u8, text, session_line) != null);
+    try std.testing.expect(std.mem.find(u8, text, "coverage: window holds only the last") != null);
+
+    // Ring-complete sessions state full coverage instead.
+    diagnostics.resetForTest();
+    var ok_call: diagnostics.ToolCallMetric = .{ .started_at_ms = 9_000, .duration_ms = 5, .outcome = .succeeded };
+    ok_call.setName("read_file");
+    diagnostics.recordToolCall(ok_call);
+    var fresh: std.Io.Writer.Allocating = .init(alloc);
+    defer fresh.deinit();
+    try writeToolCallsSummary(&fresh.writer, alloc, history);
+    try std.testing.expect(std.mem.find(u8, fresh.written(), "coverage: complete") != null);
+}
+
 test "app_commands exposes active handler API surface" {
     const HandlerSurface = Handlers(SurfaceOnlyApp);
 
@@ -4965,6 +5399,18 @@ test "copy command reports missing replies and host failures" {
         try std.testing.expectEqualStrings("Failed to copy to clipboard.", app.last_body.?);
     }
     try std.testing.expectEqual(@as(usize, 2), app.copy_calls);
+}
+
+test "MCP list opens the menu without writing a transcript notice" {
+    var app = McpCommandFakeApp{ .alloc = std.testing.allocator };
+    defer app.deinit();
+
+    try Handlers(McpCommandFakeApp).commandHandleMcp(@ptrCast(&app), " list ");
+
+    try std.testing.expectEqual(@as(usize, 1), app.menu_open_count);
+    try std.testing.expectEqual(@as(usize, 0), app.list_count);
+    try std.testing.expectEqual(@as(usize, 0), app.notice_count);
+    try std.testing.expect(app.shell.render_requests.hasReason(.footer));
 }
 
 test "app_commands renders transactional status for explicit MCP reload" {

@@ -20,6 +20,7 @@ import {
   fakeGatewayToolCall,
   hasEmptyComposer,
   heldFakeGatewayFinalText,
+  startDynamicFakeGateway,
   startFakeGateway,
   type FakeGatewayResponse,
   TmuxSession,
@@ -122,7 +123,10 @@ async function startFx(
   fixtureImagePath = join(workspace, "i.png");
   writeFileSync(
     fixtureImagePath,
-    Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+    Buffer.from(
+      "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==",
+      "base64",
+    ),
   );
   writeFileSync(join(workspace, "target.txt"), "target\n");
   const skillRoot = join(home, ".fx", "skills", "review");
@@ -805,6 +809,107 @@ tmuxTest(
 
     expect(finalUserText()).toBe("RECOVERY_PROMPT");
     expectCleanRuntime(active);
+  },
+  TIMEOUT * 2,
+);
+
+tmuxTest(
+  "long paste submitted at a full bottom edge leaves no preview fragment in scrollback",
+  async () => {
+    root = realpathSync(mkdtempSync(join(tmpdir(), "fx-paste-submit-")));
+    const home = join(root, "home");
+    const workspace = join(root, "workspace");
+    mkdirSync(join(home, ".fx"), { recursive: true });
+    mkdirSync(workspace);
+    writeFileSync(join(home, ".fx", "settings.json"), JSON.stringify({}));
+    stderrPath = join(root, "stderr.log");
+    writeFileSync(stderrPath, "");
+
+    // The first answer overflows the viewport so its summary sits mid-line at
+    // the band bottom; the submitted card is taller than the screen.
+    const filler = Array.from(
+      { length: 240 },
+      (_, index) => `FILLER_ANSWER_LINE_${String(index).padStart(3, "0")}`,
+    ).join("\n");
+    const dynamicGateway = startDynamicFakeGateway((body) => {
+      writeFileSync(join(root!, `request-${dynamicGateway.requests.length}.json`), body);
+      return fakeGatewayFinalText(
+        dynamicGateway.requests.length === 1 ? filler : "SECOND_ANSWER_OK",
+      );
+    });
+    const pasteLines = ["# Pending card probe", ""];
+    for (let index = 1; index <= 380; index++) {
+      pasteLines.push(`- probe line ${String(index).padStart(3, "0")}`);
+    }
+    pasteLines.push("", "- PENDING_PROBE_LAST_LINE");
+
+    session = await TmuxSession.create({
+      cmd: FX_BIN,
+      cwd: workspace,
+      width: 168,
+      height: 75,
+      isolated: true,
+      remainOnExit: true,
+      minimumHistoryLines: 20_000,
+      stderrPath,
+      env: {
+        PATH: process.env.PATH ?? "/usr/bin:/bin",
+        HOME: home,
+        AI_GATEWAY_API_KEY: "fake-paste-submit-key",
+        VERCEL_OIDC_TOKEN: undefined,
+        FX_DISABLE_KEYCHAIN: "1",
+        FX_E2E_DISABLE_DOTENV: "1",
+        FX_MODEL: FAKE_GATEWAY_MODEL,
+        FX_AUTO_UPGRADE: "0",
+        FX_SOUND: "0",
+        FX_SKIP_ONBOARDING: "1",
+        FX_PERMISSION_MODE: "full-access",
+        FX_GATEWAY_BASE_URL: dynamicGateway.baseUrl,
+        FX_GATEWAY_CHAT_URL: dynamicGateway.chatUrl,
+        FX_E2E_GATEWAY_CHAT_URL: dynamicGateway.chatUrl,
+        FX_E2E_GATEWAY_MODELS_URL: `${dynamicGateway.baseUrl}/coding-agent/v1/models`,
+      },
+    });
+    try {
+      await session.waitForStableComposer(20_000);
+      await session.sendText("Fill the screen.");
+      await session.waitForText("FILLER_ANSWER_LINE_239", TIMEOUT);
+      await session.waitForStableComposer(20_000);
+      const beforeSubmit = await session.captureFullScrollback();
+      const priorSummary = beforeSubmit
+        .split("\n")
+        .find((line) => line.includes("↑") && line.includes("↓") && line.includes("("))
+        ?.trim();
+      expect(priorSummary).toBeTruthy();
+
+      await session.pasteText(pasteLines.join("\n"));
+      await session.waitForText("Pasted text", 15_000);
+      await session.sendKeys("Enter");
+      await session.waitForText("SECOND_ANSWER_OK", TIMEOUT);
+      await session.waitForStableComposer(20_000);
+      const after = await session.captureFullScrollback();
+
+      const cardTailCandidates = after
+        .split("\n")
+        .filter((line) => line.trim().startsWith("┃ - PEND"));
+      expect(
+        cardTailCandidates.filter(
+          (line) => line.trim() === "┃ - PENDING_PROBE_LAST_LINE",
+        ),
+      ).toHaveLength(1);
+      expect(
+        cardTailCandidates.filter(
+          (line) => line.trim() !== "┃ - PENDING_PROBE_LAST_LINE",
+        ),
+      ).toHaveLength(0);
+      expect(
+        after.split("\n").filter((line) => line.trim() === priorSummary),
+      ).toHaveLength(1);
+      expect(dynamicGateway.requests).toHaveLength(2);
+      expectCleanRuntime(session);
+    } finally {
+      dynamicGateway.stop();
+    }
   },
   TIMEOUT * 2,
 );

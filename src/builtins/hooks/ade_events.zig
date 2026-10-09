@@ -1050,7 +1050,6 @@ test "ADE feed serializes an additive Git root discovery record" {
         output.written(),
     );
 }
-
 test "ADE feed serializes native session metadata as a generic raw event" {
     var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer output.deinit();
@@ -1264,7 +1263,6 @@ test "ADE nested-child Git root discovery preserves owning root lifecycle parent
         discovery_context.get("session_id").?.string,
     );
 }
-
 test "ADE session metadata deduplicates per active session and resets on identity change" {
     const alloc = std.testing.allocator;
     var client = Client{

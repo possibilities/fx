@@ -30,6 +30,7 @@ const modelFetch = async (_url, init) => {
   modelMethods.push(method);
   if (method === "GET") return Response.json({ object: "list", data: [] });
   assert.equal(method, "POST");
+  assert.equal(new Headers(init.headers).get("authorization"), "Bearer async-asset-key");
   return new Response('data: {"type":"text-delta","delta":"async asset"}\n\ndata: {"type":"finish","finishReason":{"unified":"stop","raw":"stop"},"usage":{"inputTokens":{"total":1},"outputTokens":{"total":1}}}\n\ndata: [DONE]\n\n', {
     headers: { "content-type": "text/event-stream" },
   });
@@ -41,7 +42,7 @@ watchdog.unref();
 
 async function exercise(sdk, surface, options) {
   if (surface === "agent") {
-    const agent = await sdk.createFxAgent({ ...options, apiKey: "async-asset-key", model: "async/model", fetch: modelFetch });
+    const agent = await sdk.createFxAgent({ ...options, auth: { provider: "gateway", apiKey: "async-asset-key" }, model: "async/model", fetch: modelFetch });
     try {
       const turn = agent.prompt("hello");
       let text = "";
