@@ -78,6 +78,8 @@ pub const Config = struct {
     /// Borrowed invocation policy; the server duplicates it during initialize.
     permission_rules_override: ?types.PermissionRuleSet = null,
     allow_acp_mcp: bool = true,
+    /// The inherited Codex credential channel, when the launch selected one.
+    codex_credential_fd: ?u8 = null,
     allow_native_tools: bool = true,
     native_tool_set: ?tool_set_contract.ToolSet = null,
     project_instructions_enabled: bool = true,

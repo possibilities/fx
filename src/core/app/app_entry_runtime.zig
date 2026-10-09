@@ -227,8 +227,38 @@ fn unavailableCliDispatch(_: ?*anyopaque, _: Allocator, _: []const [:0]const u8,
     return error.UnknownCliCommand;
 }
 
+/// A host that serves the inherited Codex credential channel owns the type
+/// that holds it between launch parsing and broker startup. Every other host
+/// gets an inert stand-in, so the entry sequence stays one shape.
+fn CodexCredentialBrokerActivationType(comptime App: type) type {
+    if (@hasDecl(App, "CodexCredentialBrokerActivation")) {
+        return App.CodexCredentialBrokerActivation;
+    }
+    return struct {
+        fn deinit(self: *@This()) void {
+            self.* = .{};
+        }
+    };
+}
+
 fn runInteractiveWithDeps(comptime App: type, comptime cooperative: bool, app: *App, alloc: Allocator, launch: *cli_surface.InteractiveLaunch, auth_mode: credentials.AuthMode, deps: RunDeps) !RunOutcome {
+    if (comptime cooperative) {
+        if (launch.modifiers.hasCodexCredentialBrokerActivation()) {
+            return error.CodexCredentialBrokerUnsupported;
+        }
+    }
     const resume_requested = launch.requested_resume != null;
+    // The descriptor is validated and closed on exec before anything the app
+    // bootstrap might spawn exists.
+    var codex_credential_activation: CodexCredentialBrokerActivationType(App) =
+        if (comptime !cooperative and @hasDecl(App, "prepareCodexCredentialBrokerActivation"))
+            App.prepareCodexCredentialBrokerActivation(launch) catch |err| {
+                reportUnexpectedInteractiveError(deps, err);
+                return err;
+            }
+        else
+            .{};
+    defer codex_credential_activation.deinit();
     app.* = App.init(alloc, launch, auth_mode) catch |err| {
         switch (err) {
             error.NotATerminal => {
@@ -304,6 +334,18 @@ fn runInteractiveWithDeps(comptime App: type, comptime cooperative: bool, app: *
             },
         }
     };
+    if (comptime !cooperative) {
+        // All-or-none: the broker is serving before any other startup callback
+        // runs, or the launch fails here rather than reporting Fx as started.
+        if (comptime @hasDecl(App, "startCodexCredentialBroker")) {
+            app.startCodexCredentialBroker(&codex_credential_activation) catch |err| {
+                app.releaseTerminal();
+                reportUnexpectedInteractiveError(deps, err);
+                app.deinit();
+                return err;
+            };
+        }
+    }
     var app_needs_deinit = true;
     defer if (app_needs_deinit) {
         if (comptime cooperative) {
@@ -362,6 +404,8 @@ fn runInteractiveWithDeps(comptime App: type, comptime cooperative: bool, app: *
         app.takeUpgradeRelaunchRequest()
     else
         null;
+    const broker_relaunch_blocked = !cooperative and
+        launch.modifiers.hasCodexCredentialBrokerActivation();
     const relaunch_skill_roots = try cloneInvocationSkillRootsForRelaunch(
         App,
         alloc,
@@ -391,6 +435,15 @@ fn runInteractiveWithDeps(comptime App: type, comptime cooperative: bool, app: *
             handoff.deinit(alloc);
         }
         reportShutdownFailure(deps, err);
+        return .{ .exit = 1 };
+    }
+    if (relaunch_request != null and broker_relaunch_blocked) {
+        if (handoff_value) |value| {
+            var handoff = value;
+            handoff.deinit(alloc);
+        }
+        // A replacement process cannot authenticate the existing broker nonce.
+        writeStderr(deps, "fx: upgrade installed; restart from your host to apply it. This session's credential channel cannot survive a restart.\n");
         return .{ .exit = 1 };
     }
     if (relaunch_request) |request| {
@@ -797,6 +850,9 @@ fn formatResumeHandoff(buffer: []u8, session_id: []const u8, sessions_v2: bool) 
 }
 
 fn formatUnexpectedError(buffer: []u8, err: anyerror) ![]const u8 {
+    if (launchControlErrorMessage(err)) |message| {
+        return std.fmt.bufPrint(buffer, "fx: {s}\n", .{message});
+    }
     return std.fmt.bufPrint(buffer, "fx: {s}\n", .{config_runtime.modelNotSelectedMessage(err) orelse @errorName(err)});
 }
 
@@ -808,6 +864,24 @@ fn v2StorageFaultMessage(err: anyerror) ?[]const u8 {
         error.ReadOnlyFileSystem => "fx: this session cannot be opened for writing: the disk is read-only.\n",
         error.NoSpaceLeft => "fx: this session cannot be saved: the disk is full. Free some space, then resume again.\n",
         error.FileTooBig => "fx: this session cannot be saved: a file-size limit was reached.\n",
+        else => null,
+    };
+}
+
+/// Launch-control failures the operator can act on. Error values are global,
+/// so this stays readable without importing the surface that raises them.
+fn launchControlErrorMessage(err: anyerror) ?[]const u8 {
+    return switch (err) {
+        error.CodexCredentialFdUnavailable => "--codex-credential-fd does not name a usable inherited descriptor",
+        error.CodexCredentialFdNotLocalStream => "--codex-credential-fd must name a local stream socket",
+        error.CodexCredentialFdNotConnected => "--codex-credential-fd must name an already connected socket",
+        error.CodexCredentialPeerUnavailable => "--codex-credential-fd peer credentials are unavailable",
+        error.CodexCredentialPeerRejected => "--codex-credential-fd peer belongs to another user",
+        error.CodexCredentialBrokerHostManagedAuth => "--codex-credential-fd has nothing to lease under host-managed authentication",
+        error.CodexCredentialBrokerBorrowedAuth => "--codex-credential-fd cannot lease a borrowed read-only credential",
+        error.CodexCredentialBrokerCredentialUnavailable => "--codex-credential-fd requires a usable Codex subscription credential",
+        error.CodexCredentialBrokerAlreadyStarted => "--codex-credential-fd may only start one credential broker",
+        error.CodexCredentialBrokerUnsupported => "--codex-credential-fd is unsupported on this host",
         else => null,
     };
 }
@@ -824,7 +898,7 @@ fn writeStderr(deps: RunDeps, text: []const u8) void {
 
 fn tryWriteErrorMessage(deps: RunDeps, err: anyerror) void {
     writeStderr(deps, "fx: ");
-    writeStderr(deps, config_runtime.modelNotSelectedMessage(err) orelse @errorName(err));
+    writeStderr(deps, launchControlErrorMessage(err) orelse config_runtime.modelNotSelectedMessage(err) orelse @errorName(err));
     writeStderr(deps, "\n");
 }
 
@@ -948,6 +1022,7 @@ const TestCapture = struct {
     bench_value: ?[]const u8 = null,
     init_error: ?anyerror = null,
     configure_error: ?anyerror = null,
+    broker_error: ?anyerror = null,
     worker_error: ?anyerror = null,
     run_error: ?anyerror = null,
     stderr_error: ?anyerror = null,
@@ -1919,6 +1994,230 @@ test "app entry maps unavailable session state to one expected startup failure" 
         try std.testing.expectEqual(@as(usize, 1), capture.stderr_calls);
         try expectEvents(&.{"init:none"});
     }
+}
+
+const BrokerLifecycleTestApp = struct {
+    terminal_released: bool = false,
+    broker_started: bool = false,
+
+    const CodexCredentialBrokerActivation = struct {
+        configured_fd: ?u8 = null,
+        transferred: bool = false,
+
+        fn deinit(self: *@This()) void {
+            if (self.configured_fd != null and !self.transferred) {
+                appendTestEvent("credential-broker-activation-close");
+            }
+            self.* = .{};
+        }
+    };
+
+    fn prepareCodexCredentialBrokerActivation(
+        launch: *const cli_surface.InteractiveLaunch,
+    ) !CodexCredentialBrokerActivation {
+        if (launch.modifiers.codex_credential_fd != null) {
+            appendTestEvent("credential-broker-prepare");
+        }
+        return .{ .configured_fd = launch.modifiers.codex_credential_fd };
+    }
+
+    fn init(
+        _: Allocator,
+        launch: *cli_surface.InteractiveLaunch,
+        _: credentials.AuthMode,
+    ) !BrokerLifecycleTestApp {
+        appendInitEvent(launch);
+        if (active_capture.?.init_error) |err| return err;
+        return .{};
+    }
+
+    fn startCodexCredentialBroker(
+        self: *BrokerLifecycleTestApp,
+        activation: *CodexCredentialBrokerActivation,
+    ) !void {
+        appendTestEvent("credential-broker-start");
+        if (active_capture.?.broker_error) |err| return err;
+        self.broker_started = true;
+        if (activation.configured_fd) |fd| {
+            if (fd != 3) return error.TestUnexpectedCredentialFd;
+            appendTestEvent("credential-broker-fd-three");
+        }
+        activation.transferred = true;
+    }
+
+    fn startMcpDiscovery(_: *BrokerLifecycleTestApp) void {
+        appendTestEvent("mcp-discovery");
+    }
+
+    fn startAutoUpgrade(_: *BrokerLifecycleTestApp) void {
+        appendTestEvent("auto-upgrade");
+    }
+
+    fn startFileIndex(_: *BrokerLifecycleTestApp) void {
+        appendTestEvent("file-index");
+    }
+
+    fn startResumedSessionReconciliation(_: *BrokerLifecycleTestApp) void {
+        appendTestEvent("resume-reconciliation");
+    }
+
+    fn startModelCacheWarmup(_: *BrokerLifecycleTestApp) void {
+        appendTestEvent("model-cache");
+    }
+
+    fn run(_: *BrokerLifecycleTestApp) !void {
+        appendTestEvent("run");
+    }
+
+    fn releaseTerminal(self: *BrokerLifecycleTestApp) void {
+        if (self.terminal_released) return;
+        self.terminal_released = true;
+        appendTestEvent("terminal-release");
+    }
+
+    fn deinit(self: *BrokerLifecycleTestApp) void {
+        if (self.broker_started) appendTestEvent("credential-broker-stop");
+        self.releaseTerminal();
+        appendTestEvent("deinit");
+        self.* = undefined;
+    }
+
+    fn shutdownForProcessExit(self: *BrokerLifecycleTestApp) app_session_runtime.ShutdownOutcome {
+        const handoff: ?app_session_runtime.ResumeHandoff = if (active_capture.?.resume_handoff_id) |id| blk: {
+            const session_id = std.testing.allocator.dupe(u8, id) catch {
+                self.deinit();
+                return .{ .failure = error.OutOfMemory };
+            };
+            break :blk .{ .session_id = session_id };
+        } else null;
+        self.deinit();
+        return .{ .handoff = handoff, .failure = active_capture.?.shutdown_failure };
+    }
+
+    fn takeUpgradeRelaunchRequest(_: *BrokerLifecycleTestApp) ?auto_upgrade.RelaunchRequest {
+        const path = active_capture.?.upgrade_relaunch_path orelse return null;
+        var request = auto_upgrade.RelaunchRequest{
+            .executable_path_len = path.len,
+        };
+        @memcpy(request.executable_path_buf[0..path.len], path);
+        return request;
+    }
+};
+
+test "app entry starts the Codex credential broker before every other startup callback" {
+    const alloc = std.testing.allocator;
+    var capture = TestCapture.init(.{ .interactive = .{
+        .modifiers = .{ .codex_credential_fd = 3 },
+    } });
+    defer capture.deinit();
+
+    const outcome = try runWithDeps(
+        BrokerLifecycleTestApp,
+        alloc,
+        &.{},
+        testConfig(),
+        capture.deps(),
+    );
+
+    try std.testing.expectEqual(RunOutcome.returned, outcome);
+    try expectEvents(&.{
+        "credential-broker-prepare",
+        "init:none",
+        "credential-broker-start",
+        "credential-broker-fd-three",
+        "mcp-discovery",
+        "auto-upgrade",
+        "file-index",
+        "worker-thread",
+        "model-cache",
+        "run",
+        "credential-broker-stop",
+        "terminal-release",
+        "deinit",
+    });
+
+    // A cooperative host declares no broker, so the activation is refused
+    // before bootstrap rather than silently ignored.
+    var launch = cli_surface.InteractiveLaunch{ .modifiers = .{ .codex_credential_fd = 3 } };
+    defer launch.deinit(alloc);
+    var app: BrokerLifecycleTestApp = undefined;
+    resetTestEvents();
+    try std.testing.expectError(
+        error.CodexCredentialBrokerUnsupported,
+        runInteractiveWithDeps(
+            BrokerLifecycleTestApp,
+            true,
+            &app,
+            alloc,
+            &launch,
+            .local,
+            capture.deps(),
+        ),
+    );
+    try expectEvents(&.{});
+
+    // A broker that cannot start ends the launch with the terminal released
+    // and the inherited descriptor closed, never a started Fx without a broker.
+    resetTestEvents();
+    capture.broker_error = error.TestCredentialBrokerStartFailed;
+    capture.record_stderr_event = true;
+    try std.testing.expectError(
+        error.TestCredentialBrokerStartFailed,
+        runWithDeps(
+            BrokerLifecycleTestApp,
+            alloc,
+            &.{},
+            testConfig(),
+            capture.deps(),
+        ),
+    );
+    try expectEvents(&.{
+        "credential-broker-prepare",
+        "init:none",
+        "credential-broker-start",
+        "terminal-release",
+        "stderr-attempt",
+        "deinit",
+        "credential-broker-activation-close",
+    });
+
+    // The upgrade remains installed, but process replacement cannot preserve
+    // the broker's per-instance nonce. Ask the host for a fresh launch and do
+    // not print a recovery command that silently drops credential authority.
+    var relaunch_capture = TestCapture.init(.{ .interactive = .{
+        .modifiers = .{ .codex_credential_fd = 3 },
+    } });
+    defer relaunch_capture.deinit();
+    relaunch_capture.resume_handoff_id = "session-123";
+    relaunch_capture.upgrade_relaunch_path = "/tmp/fx-upgraded";
+    const relaunch_outcome = try runWithDeps(
+        BrokerLifecycleTestApp,
+        alloc,
+        &.{},
+        testConfig(),
+        relaunch_capture.deps(),
+    );
+    try std.testing.expectEqual(@as(u8, 1), relaunch_outcome.exit);
+    try std.testing.expectEqual(@as(usize, 0), relaunch_capture.replace_calls);
+    try std.testing.expectEqualStrings(
+        "fx: upgrade installed; restart from your host to apply it. This session's credential channel cannot survive a restart.\n",
+        relaunch_capture.stderr.written(),
+    );
+    try expectEvents(&.{
+        "credential-broker-prepare",
+        "init:none",
+        "credential-broker-start",
+        "credential-broker-fd-three",
+        "mcp-discovery",
+        "auto-upgrade",
+        "file-index",
+        "worker-thread",
+        "model-cache",
+        "run",
+        "credential-broker-stop",
+        "terminal-release",
+        "deinit",
+    });
 }
 
 test "app entry names a v2 storage fault at startup, and v1 keeps the bare error" {

@@ -165,6 +165,10 @@ pub const LaunchModifiers = struct {
     requested_skill_root_count: usize = 0,
     effective_system_prompt_replaces_base: bool = false,
     selected_native_tools: [][]u8 = &.{},
+    /// The inherited Codex credential channel. The descriptor number is the
+    /// only capability this control carries: nothing about the channel appears
+    /// in the environment, logs, telemetry, or crash output.
+    codex_credential_fd: ?u8 = null,
     no_default_skills: bool = false,
     project_instructions_enabled: bool = true,
     permission_policy: ?config_runtime.LaunchPermissionPolicy = null,
@@ -280,6 +284,10 @@ pub const LaunchModifiers = struct {
 
     pub fn hasNativeToolSelection(self: LaunchModifiers) bool {
         return self.selected_native_tools.len > 0;
+    }
+
+    pub fn hasCodexCredentialBrokerActivation(self: LaunchModifiers) bool {
+        return self.codex_credential_fd != null;
     }
 
     pub fn hasSkillModifiers(self: LaunchModifiers) bool {
@@ -589,6 +597,7 @@ fn parseGlobalLaunchArgs(
         for (selected_native_tools.items) |name| alloc.free(name);
         selected_native_tools.deinit(alloc);
     }
+    var codex_credential_fd: ?u8 = null;
     var no_default_skills = false;
     var project_instructions_enabled = true;
     var permission_policy: ?config_runtime.LaunchPermissionPolicy = null;
@@ -737,6 +746,16 @@ fn parseGlobalLaunchArgs(
                 alloc.free(name);
                 return err;
             };
+        } else if (std.mem.eql(u8, arg, "--codex-credential-fd")) {
+            if (codex_credential_fd != null) return error.DuplicateCodexCredentialFd;
+            index += 1;
+            if (index >= args.len) return error.MissingCodexCredentialFd;
+            codex_credential_fd = parseCodexCredentialFd(args[index]) catch
+                return error.InvalidCodexCredentialFd;
+        } else if (std.mem.startsWith(u8, arg, "--codex-credential-fd=")) {
+            if (codex_credential_fd != null) return error.DuplicateCodexCredentialFd;
+            codex_credential_fd = parseCodexCredentialFd(arg["--codex-credential-fd=".len..]) catch
+                return error.InvalidCodexCredentialFd;
         } else if (std.mem.eql(u8, arg, "--no-default-skills")) {
             if (no_default_skills) return error.DuplicateDefaultSkillsSuppression;
             no_default_skills = true;
@@ -883,6 +902,7 @@ fn parseGlobalLaunchArgs(
             },
             .allow_native_tools = allow_native_tools,
             .selected_native_tools = selected_tool_slice,
+            .codex_credential_fd = codex_credential_fd,
             .no_default_skills = no_default_skills,
             .project_instructions_enabled = project_instructions_enabled,
             .permission_policy = permission_policy,
@@ -977,6 +997,14 @@ fn canonicalizeConfigFile(alloc: Allocator, path: []const u8) ![]u8 {
     return canonical;
 }
 
+/// Standard input, output, and error are never a credential channel, and the
+/// number must stay inside the range the launch modifier can carry.
+fn parseCodexCredentialFd(value: []const u8) !u8 {
+    const parsed = try std.fmt.parseUnsigned(u8, value, 10);
+    if (parsed < 3) return error.InvalidCodexCredentialFd;
+    return parsed;
+}
+
 /// Returns the command that follows the supported global launch modifiers.
 /// Startup uses this same surface to select the full runtime configuration
 /// before the allocating parser runs.
@@ -1006,6 +1034,7 @@ pub fn argsAfterGlobalLaunchArgs(args: []const [:0]const u8) []const [:0]const u
             std.mem.eql(u8, arg, "--identity") or
             std.mem.eql(u8, arg, "--history-dir") or
             std.mem.eql(u8, arg, "--mcp-config") or
+            std.mem.eql(u8, arg, "--codex-credential-fd") or
             std.mem.eql(u8, arg, "--provider") or
             std.mem.eql(u8, arg, "--model") or
             std.mem.eql(u8, arg, "--effort"))
@@ -1015,11 +1044,12 @@ pub fn argsAfterGlobalLaunchArgs(args: []const [:0]const u8) []const [:0]const u
         } else if (!std.mem.startsWith(u8, arg, "--context-limit=") and
             !std.mem.startsWith(u8, arg, "--add-dir=") and
             !std.mem.startsWith(u8, arg, "--system-prompt-file=") and
-            !std.mem.startsWith(u8, arg, "--append-system-prompt-file=") and
             !std.mem.startsWith(u8, arg, "--shape=") and
             !std.mem.startsWith(u8, arg, "--identity=") and
             !std.mem.startsWith(u8, arg, "--history-dir=") and
             !std.mem.startsWith(u8, arg, "--mcp-config=") and
+            !std.mem.startsWith(u8, arg, "--codex-credential-fd=") and
+            !std.mem.startsWith(u8, arg, "--append-system-prompt-file=") and
             !std.mem.startsWith(u8, arg, "--skills-dir=") and
             !std.mem.startsWith(u8, arg, "--tool=") and
             !std.mem.eql(u8, arg, "--no-native-tools") and
@@ -1206,6 +1236,14 @@ pub fn parseInteractiveLaunch(
     }
 
     const command = parse(command_catalog, effective_args);
+    if (global_args.modifiers.hasCodexCredentialBrokerActivation()) {
+        // The broker leases the process's own Codex authority, so it exists
+        // only on the launches that host an agent for the caller.
+        switch (command) {
+            .interactive, .resume_session, .acp => {},
+            else => return error.CodexCredentialBrokerRequiresAgentLaunch,
+        }
+    }
     if (topLevelHelpRequest(command_catalog, effective_args) != null) {
         return .{ .noninteractive = .{
             .global_args = global_args,
@@ -1842,6 +1880,7 @@ fn runNonInteractiveWithDeps(
                 .mcp_config_path = global_args.modifiers.mcp_config_path,
                 .shape = shape_authority.derive(acp_shape_declaration),
                 .shape_label = global_args.modifiers.shapeLabel(acp_opts.allow_acp_mcp),
+                .codex_credential_fd = global_args.modifiers.codex_credential_fd,
             });
             return .handled_success;
         },
@@ -4668,6 +4707,10 @@ fn globalLaunchErrorMessage(err: anyerror) ?[]const u8 {
         error.MissingMcpConfigValue => "--mcp-config requires a file path",
         error.DuplicateMcpConfig => "--mcp-config may only be specified once",
         error.InvalidMcpConfig => "--mcp-config must name an existing regular file",
+        error.MissingCodexCredentialFd => "--codex-credential-fd requires an inherited descriptor number",
+        error.InvalidCodexCredentialFd => "--codex-credential-fd requires an inherited descriptor number of 3 or more",
+        error.DuplicateCodexCredentialFd => "--codex-credential-fd may only be specified once",
+        error.CodexCredentialBrokerRequiresAgentLaunch => "--codex-credential-fd is supported only on interactive, resume, and acp launches",
         error.MissingModelValue => "--model requires a model id",
         error.MissingEffortValue => "--effort requires a value",
         error.InvalidEffortValue => "--effort value is not a valid reasoning effort",
@@ -8190,7 +8233,79 @@ test "ask launch retains state MCP permission context and native tool controls" 
         .{ .allow_native_tools = false },
     );
     defer suppressed.deinit(std.testing.allocator);
-    try std.testing.expectEqual(@as(usize, 0), suppressed.tool_set.registry.tools.len);
+}
+
+test "hidden Codex credential activation stays all-or-none on agent-hosting launches" {
+    const alloc = std.testing.allocator;
+    const command_catalog = testCommandCatalog();
+
+    const parsed = try parseInteractiveLaunch(alloc, &.{
+        @constCast("--codex-credential-fd"),
+        @constCast("3"),
+    }, command_catalog);
+    var launch = switch (parsed) {
+        .interactive => |value| value,
+        .noninteractive => return error.TestExpectedInteractiveLaunch,
+    };
+    defer launch.deinit(alloc);
+    try std.testing.expectEqual(@as(?u8, 3), launch.modifiers.codex_credential_fd);
+    try std.testing.expect(launch.modifiers.hasCodexCredentialBrokerActivation());
+
+    // The control stays a global launch modifier, so the command behind it is
+    // still discovered without allocating.
+    try std.testing.expectEqualStrings("acp", commandAfterGlobalLaunchArgs(&.{
+        @constCast("--codex-credential-fd"),
+        @constCast("3"),
+        @constCast("acp"),
+    }).?);
+    try std.testing.expectEqualStrings("resume", commandAfterGlobalLaunchArgs(&.{
+        @constCast("--codex-credential-fd=7"),
+        @constCast("resume"),
+    }).?);
+
+    var resumed = try parseGlobalLaunchArgs(alloc, &.{
+        @constCast("--codex-credential-fd=7"),
+        @constCast("resume"),
+    });
+    defer resumed.deinit(alloc);
+    try std.testing.expectEqual(@as(?u8, 7), resumed.modifiers.codex_credential_fd);
+
+    // Standard descriptors are never a credential channel, and the number is
+    // the only value this control accepts.
+    try std.testing.expectError(
+        error.MissingCodexCredentialFd,
+        parseGlobalLaunchArgs(alloc, &.{@constCast("--codex-credential-fd")}),
+    );
+    try std.testing.expectError(
+        error.InvalidCodexCredentialFd,
+        parseGlobalLaunchArgs(alloc, &.{ @constCast("--codex-credential-fd"), @constCast("2") }),
+    );
+    try std.testing.expectError(
+        error.InvalidCodexCredentialFd,
+        parseGlobalLaunchArgs(alloc, &.{ @constCast("--codex-credential-fd"), @constCast("nine") }),
+    );
+    try std.testing.expectError(
+        error.DuplicateCodexCredentialFd,
+        parseGlobalLaunchArgs(alloc, &.{
+            @constCast("--codex-credential-fd"),
+            @constCast("3"),
+            @constCast("--codex-credential-fd=4"),
+        }),
+    );
+
+    // Only the launches that host an agent for the caller may serve a lease.
+    try std.testing.expectError(
+        error.CodexCredentialBrokerRequiresAgentLaunch,
+        parseInteractiveLaunch(alloc, &.{
+            @constCast("--codex-credential-fd"),
+            @constCast("3"),
+            @constCast("ask"),
+            @constCast("hello"),
+        }, command_catalog),
+    );
+    try std.testing.expect(globalLaunchErrorMessage(
+        error.CodexCredentialBrokerRequiresAgentLaunch,
+    ) != null);
 }
 
 test "global launch modifiers own ordered invocation skill roots" {
