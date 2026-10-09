@@ -993,6 +993,7 @@ const App = struct {
         self.worker.requestShutdown();
         SessionAppRuntime.requestPersistenceShutdown(self);
         SessionAppRuntime.abandonProfileLedgerForProcessExit(self);
+        SessionNamingAppRuntime.requestStop(self);
         self.upgrader.stopForProcessExit();
         self.file_index.requestStop();
         WorkspaceAppRuntime.requestStop(self);
