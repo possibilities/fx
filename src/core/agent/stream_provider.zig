@@ -88,6 +88,13 @@ pub const ProviderAttemptOwner = enum {
 pub const NetworkFailureCause = enum {
     transport_interrupted,
     system_resumed,
+    /// The network path is provably down (refused, unreachable, DNS). Nothing
+    /// was sent; probing it costs nothing and never consumes a provider
+    /// attempt.
+    connectivity_lost,
+    /// The stream produced no bytes past the stall threshold. Positive
+    /// evidence that this exchange is dead; restarting it is the recovery.
+    stream_stalled,
 };
 
 /// Stable native transport evidence consumed by model recovery policy.
@@ -343,7 +350,7 @@ pub const Result = union(enum) {
                 copy.completed.usage_ownership = .owned;
                 const dst = &copy.completed.completion;
                 const src = completed.completion;
-                const strings = .{ "content", "generation_id", "provider_failure_detail", "provider_state_json" };
+                const strings = .{ "content", "generation_id", "resolved_provider", "provider_failure_detail", "provider_state_json" };
                 inline for (strings) |field| @field(dst, field) = null;
                 dst.tool_calls = &.{};
                 dst.billing = null;
@@ -375,6 +382,7 @@ pub const Result = union(enum) {
             .completed => |completed| if (completed.ownership == .owned) {
                 if (completed.completion.content) |content| alloc.free(@constCast(content));
                 if (completed.completion.generation_id) |id| alloc.free(@constCast(id));
+                if (completed.completion.resolved_provider) |provider| alloc.free(@constCast(provider));
                 if (completed.completion.billing) |billing| alloc.free(@constCast(billing.model));
                 types.freeToolCallSlice(alloc, @constCast(completed.completion.tool_calls));
                 if (completed.completion.provider_failure_detail) |detail| alloc.free(@constCast(detail));
@@ -418,10 +426,11 @@ fn dupeUsageReference(alloc: Allocator, source: DeferredUsageReference) Allocato
     };
 }
 
-test "owned stream result copies survive the source allocator and allocation failures" {
+test "owned stream result copies preserve service tier metadata" {
     const source = Result{ .completed = .{
         .completion = .{
             .content = "answer",
+            .service_tier = .ultrafast,
             .tool_calls = &.{.{
                 .id = "call_1",
                 .name = "read_file",
@@ -466,6 +475,7 @@ test "owned stream result copies survive the source allocator and allocation fai
             defer copied.deinit(alloc);
             const completion = copied.completed.completion;
             try std.testing.expectEqualStrings("answer", completion.content.?);
+            try std.testing.expectEqual(types.ProviderServiceTier.ultrafast, completion.service_tier.?);
             try std.testing.expectEqualStrings("gen_1", completion.generation_id.?);
             try std.testing.expectEqualStrings("detail", completion.provider_failure_detail.?);
             try std.testing.expectEqualStrings("[]", completion.provider_state_json.?);

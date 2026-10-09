@@ -1,10 +1,11 @@
-import { appendFileSync, existsSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, readFileSync, writeFileSync } from "node:fs";
 
 const protocolVersion = "2026-07-28";
 const wireLogPath = process.env.FX_MCP_WIRE_LOG;
 const pidPath = process.env.FX_MCP_PID_PATH;
 const resultText = process.env.FX_MCP_RESULT_TEXT ?? "MODERN_MCP_TOOL_RESULT";
 const mode = process.env.FX_MCP_MODE ?? "normal";
+const imagePath = process.env.FX_MCP_IMAGE_PATH;
 const crashMarkerPath = process.env.FX_MCP_CRASH_MARKER;
 const recoveryFailureMarkerPath = crashMarkerPath
   ? `${crashMarkerPath}.recovery-failed`
@@ -23,6 +24,7 @@ const catalogDelayMs = Math.max(
   0,
   Number(process.env.FX_MCP_CATALOG_DELAY_MS ?? "0") || 0,
 );
+const compactField = process.env.FX_MCP_COMPACT_FIELD ? JSON.parse(process.env.FX_MCP_COMPACT_FIELD) : null;
 const elicitationUrl = process.env.FX_MCP_ELICITATION_URL ?? "https://example.test/connect";
 const collidingChoices = [
   { const: "Skip", title: "Skip" },
@@ -165,6 +167,11 @@ function handle(message) {
   }
 
   if (message.method === "server/discover") {
+    // Answer with output fx must reject; the process itself stays up.
+    if (mode === "startup_garbage") {
+      process.stdout.write("Server started on stdio\n");
+      return;
+    }
     if (
       mode === "crash_then_fail_recovery_once" &&
       recoveryGeneration &&
@@ -561,7 +568,9 @@ function handle(message) {
           content: [{
             type: "image",
             mimeType: "image/png",
-            data: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jP0cAAAAASUVORK5CYII=",
+            data: imagePath
+              ? readFileSync(imagePath).toString("base64")
+              : "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jP0cAAAAASUVORK5CYII=",
           }],
         },
       });
@@ -576,13 +585,26 @@ function handle(message) {
           isError: true,
           content: [{
             type: "text",
-            text: "Invalid input: labels require at least one item",
+            text: "Invalid input: labels require at least one item\nretry rejected",
           }],
         },
       });
       return;
     }
     if (mode === "crash_always") process.exit(42);
+    if (mode === "exit_after_result") {
+      // Answer, then exit so the next call finds the connection already closed.
+      const result = {
+        jsonrpc: "2.0",
+        id: message.id,
+        result: {
+          resultType: "complete",
+          content: [{ type: "text", text: `${resultText}:${message.params?.arguments?.text ?? ""}` }],
+        },
+      };
+      process.stdout.write(`${JSON.stringify(result)}\n`, () => process.exit(0));
+      return;
+    }
     if (
       [
         "crash_once",
@@ -630,7 +652,10 @@ function handle(message) {
       mode === "mrtr_unsafe_form"
     ) {
       if (message.params?.inputResponses === undefined) {
-        const params = mode === "mrtr_url_required"
+        const params = compactField ? {
+          message: "Choose the next step",
+          requestedSchema: { type: "object", properties: { answer: compactField }, required: ["answer"] },
+        } : mode === "mrtr_url_required"
           ? {
               mode: "url",
               message: "Authorize in the external browser",
