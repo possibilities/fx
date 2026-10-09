@@ -32,10 +32,11 @@ pub const Runtime = struct {
         alloc: Allocator,
         user: types.UserTurn,
         no_color: bool,
+        profile_home: ?[]const u8,
     ) !Runtime {
         const layout = zeroFooterLayout(try ui_terminal.queryLayout(std.posix.STDOUT_FILENO, 0));
         var terminal = shell_runtime.TerminalState{};
-        const cursor = probeTerminal(&terminal, layout, no_color);
+        const cursor = probeTerminal(&terminal, layout, no_color, profile_home);
         return initConfigured(
             alloc,
             user,
@@ -397,6 +398,7 @@ fn probeTerminal(
     terminal: *shell_runtime.TerminalState,
     layout: types.Layout,
     no_color: bool,
+    profile_home: ?[]const u8,
 ) shell_runtime.CursorPosition {
     const fallback = shell_runtime.CursorPosition{ .row = layout.rows, .col = 1 };
     // A light/dark pin was applied before presentation setup; leave it alone.
@@ -415,7 +417,7 @@ fn probeTerminal(
         if (shared_theme.sourceName()) |name| {
             // Custom themes resolve after detection picks the variant, same
             // rule as the interactive shell.
-            const custom = shared_theme.resolveNamed(std.heap.c_allocator, name, theme.light, .{ .truecolor = ui_render.truecolorIsEnabled() }) catch null;
+            const custom = shared_theme.resolveNamedFromHome(std.heap.c_allocator, profile_home, name, theme.light, .{ .truecolor = ui_render.truecolorIsEnabled() }) catch null;
             if (custom) |resolved| {
                 ui_render.applyTheme(resolved, theme.rgb);
             } else {

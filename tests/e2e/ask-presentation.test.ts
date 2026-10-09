@@ -602,6 +602,44 @@ describe("fx ask presentation", () => {
   );
 
   test.skipIf(!tmuxAvailable())(
+    "selected profile owns named themes in styled ask output",
+    async () => {
+      const root = createRoot();
+      const selected = join(root.root, "selected");
+      for (const [home, color] of [[root.home, "#00FF00"], [selected, "#FF0000"]]) {
+        mkdirSync(join(home!, ".fx", "themes"), { recursive: true });
+        writeFileSync(join(home!, ".fx", "themes", "ask-theme.json"), JSON.stringify({
+          name: "Ask theme", colors: { "editor.foreground": color },
+        }));
+      }
+      writeFileSync(join(selected, ".fx", "settings.json"), JSON.stringify({ theme: "ask-theme" }));
+      const gateway = startFakeGateway([fakeGatewayFinalText("THEMED_ANSWER")]);
+      gateways.push(gateway);
+      const stderrPath = join(root.root, "stderr.log");
+      writeFileSync(stderrPath, "");
+      const session = await TmuxSession.create({
+        isolated: true,
+        cmd: terminalCommand(["--state-dir", selected, "ask", "--no-save", "Render selected theme."]),
+        cwd: root.workspace,
+        env: { ...gatewayEnv(root.home, gateway), FX_THEME: undefined, NO_COLOR: undefined,
+          COLORFGBG: "15;0", COLORTERM: undefined, TERM_PROGRAM: "Apple_Terminal" },
+        width: 120, height: 40, remainOnExit: true, stderrPath,
+      });
+      sessions.push(session);
+      await session.waitForText("__FX_EXIT_0__", TIMEOUT);
+      const escaped = await session.captureFullScrollbackEscapes();
+      expect(escaped).toContain("THEMED_ANSWER");
+      expect({
+        selected: escaped.includes("38;5;196") || escaped.includes("38;2;255;0;0"),
+        ambient: escaped.includes("38;5;46") || escaped.includes("38;2;0;255;0"),
+      })
+        .toEqual({ selected: true, ambient: false });
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+    },
+    TIMEOUT,
+  );
+
+  test.skipIf(!tmuxAvailable())(
     "light theme uses readable syntax colors in TTY code blocks with redirected stdin",
     async () => {
       const root = createRoot();
