@@ -18,6 +18,7 @@
 
 const std = @import("std");
 const debug_trace = @import("../../core/shared/debug_trace.zig");
+const shared_theme = @import("../../core/shared/theme.zig");
 const io_mod = @import("../../core/shared/io.zig");
 const types = @import("../../core/shared/types.zig");
 const command_output_content = @import("../../core/tooling/command_output_content.zig");
@@ -2169,12 +2170,37 @@ fn commitAuthoritativeRecordedMutationStateFromEntry(
     rewrite_mode: TranscriptSourceRewriteMode,
     dirty_entry_id: ?u32,
 ) !void {
+    return commitAuthoritativeRecordedMutationStateKeepingSource(
+        self,
+        shadow,
+        alloc,
+        reason,
+        rewrite_mode,
+        dirty_entry_id,
+        null,
+    );
+}
+
+/// Commits like `commitAuthoritativeRecordedMutationStateFromEntry`. When
+/// `kept` is set and the commit neither trimmed nor rebased the published
+/// prefix, the caller receives ownership of the source prepared for the
+/// committed entries instead of it being discarded.
+fn commitAuthoritativeRecordedMutationStateKeepingSource(
+    self: anytype,
+    shadow: anytype,
+    alloc: Allocator,
+    reason: []const u8,
+    rewrite_mode: TranscriptSourceRewriteMode,
+    dirty_entry_id: ?u32,
+    kept: ?*?source_preparation.TranscriptPreparationSource,
+) !void {
     var authoritative_source = try source_preparation.prepareTranscriptSource(
         shadow,
         alloc,
         null,
     );
-    defer authoritative_source.deinit(alloc);
+    var source_kept = false;
+    defer if (!source_kept) authoritative_source.deinit(alloc);
     const prefix_trims = if (comptime @hasField(@TypeOf(shadow.*), "retention_prefix_trims"))
         if (shadow.retention_prefix_trims) |trims| trims.items else &.{}
     else
@@ -2190,6 +2216,12 @@ fn commitAuthoritativeRecordedMutationStateFromEntry(
         authoritative_source.bytes,
         dirty_entry_id,
     );
+    if (kept) |out| {
+        if (!rebased and prefix_trims.len == 0) {
+            out.* = authoritative_source;
+            source_kept = true;
+        }
+    }
 }
 
 fn commitMutationStateWithReconciliationSource(
@@ -2828,14 +2860,29 @@ pub fn writeUserPromptCard(
         skill_tokens,
     );
 
-    try commitAuthoritativeRecordedMutationStateFromEntry(
+    const Runtime = @TypeOf(self.*);
+    const reuses_source = comptime @hasDecl(Runtime, "adoptCommittedTranscriptSource");
+    const revision_before: u64 = if (comptime reuses_source) self.full_transcript_content_revision else 0;
+    var committed_source: ?source_preparation.TranscriptPreparationSource = null;
+    try commitAuthoritativeRecordedMutationStateKeepingSource(
         self,
         &shadow,
         alloc,
         "atomic_user_prompt_append",
         .preserve_same_epoch,
         if (admission.retention_changed) null else admission.entry_id,
+        if (comptime reuses_source) &committed_source else null,
     );
+    if (committed_source) |source| {
+        if (comptime reuses_source) {
+            // The frame that shows the card can reuse this source instead of
+            // rendering every entry again.
+            self.adoptCommittedTranscriptSource(alloc, source, revision_before);
+        } else {
+            var unused = source;
+            unused.deinit(alloc);
+        }
+    }
     self.forgetShimmer();
     return admission.entry_id;
 }
@@ -3674,11 +3721,15 @@ pub fn streamAssistantChunk(
 pub fn retintEntriesForTheme(
     self: anytype,
     alloc: Allocator,
-    from_light: bool,
-    to_light: bool,
+    from: shared_theme.Theme,
+    to: shared_theme.Theme,
 ) !void {
-    if (from_light == to_light) return;
+    if (from.light == to.light) return;
     try self.assertCanMutateTranscript();
+
+    var token_buf: [theme_retint_field_count]ThemeToken = undefined;
+    const tokens = retintTokens(from, to, &token_buf);
+    if (tokens.len == 0) return;
 
     var shadow = try cloneMutationState(self, alloc);
     var rewrite_trims: std.ArrayList(RetentionPrefixTrim) = .empty;
@@ -3692,13 +3743,13 @@ pub fn retintEntriesForTheme(
         switch (entry.*) {
             .raw_bytes => |*raw| {
                 if (!themeOwnsRawEntry(raw.class)) continue;
-                if (try retintThemeBytes(alloc, raw.bytes, from_light, to_light)) |replacement| {
+                if (try retintThemeBytes(alloc, raw.bytes, tokens)) |replacement| {
                     alloc.free(raw.bytes);
                     raw.bytes = replacement;
                 }
             },
             .assistant_turn => |*assistant| {
-                if (try retintThemeBytes(alloc, assistant.segments.text.items, from_light, to_light)) |replacement| {
+                if (try retintThemeBytes(alloc, assistant.segments.text.items, tokens)) |replacement| {
                     assistant.segments.text.deinit(alloc);
                     assistant.segments.text = .fromOwnedSlice(replacement);
                 }
@@ -3761,14 +3812,91 @@ fn themeOwnsRawEntry(class: RawEntryClass) bool {
     };
 }
 
+/// Build the escape rewrite map between two themes. Builtin-to-builtin flips
+/// keep the hand-pinned token table; any custom theme involved gets a dynamic
+/// map pairing every slot's old escape with its new one, longest first so
+/// combined forms match before their fg-only equivalents.
+fn retintTokens(
+    from: shared_theme.Theme,
+    to: shared_theme.Theme,
+    buf: *[theme_retint_field_count]ThemeToken,
+) []const ThemeToken {
+    const from_builtin = std.mem.eql(u8, from.name, shared_theme.fx_dark.name) or std.mem.eql(u8, from.name, shared_theme.fx_light.name);
+    const to_builtin = std.mem.eql(u8, to.name, shared_theme.fx_dark.name) or std.mem.eql(u8, to.name, shared_theme.fx_light.name);
+    if (from_builtin and to_builtin) {
+        return if (to.light) dark_to_light_theme_tokens[0..] else light_to_dark_theme_tokens[0..];
+    }
+
+    var n: usize = 0;
+    for (0..theme_retint_field_count) |index| {
+        n = appendTokenPair(
+            buf,
+            n,
+            themeRetintField(&from, index),
+            themeRetintField(&to, index),
+        );
+    }
+    sortThemeTokensLongestFirst(buf[0..n]);
+    return buf[0..n];
+}
+
+const theme_retint_field_count: usize = blk: {
+    var count: usize = 0;
+    for (@typeInfo(shared_theme.Theme).@"struct".fields) |field| {
+        if (field.type == []const u8 and !std.mem.eql(u8, field.name, "name")) count += 1;
+    }
+    for (@typeInfo(shared_theme.SyntaxPalette).@"struct".fields) |field| {
+        if (field.type == []const u8) count += 1;
+    }
+    break :blk count;
+};
+
+/// Keep field dispatch outside the admission loop so each theme slot does not
+/// expand another copy of duplicate detection and token insertion.
+noinline fn themeRetintField(theme: *const shared_theme.Theme, index: usize) []const u8 {
+    comptime var field_index: usize = 0;
+    inline for (@typeInfo(shared_theme.Theme).@"struct".fields) |field| {
+        if (comptime field.type == []const u8 and !std.mem.eql(u8, field.name, "name")) {
+            if (index == field_index) return @field(theme.*, field.name);
+            field_index += 1;
+        }
+    }
+    inline for (@typeInfo(shared_theme.SyntaxPalette).@"struct".fields) |field| {
+        if (comptime field.type == []const u8) {
+            if (index == field_index) return @field(theme.syntax, field.name);
+            field_index += 1;
+        }
+    }
+    unreachable;
+}
+
+fn appendTokenPair(buf: *[theme_retint_field_count]ThemeToken, n: usize, from: []const u8, to: []const u8) usize {
+    if (from.len == 0 or std.mem.eql(u8, from, to) or n >= buf.len) return n;
+    for (buf[0..n]) |existing| {
+        if (std.mem.eql(u8, existing.from, from)) return n;
+    }
+    buf[n] = .{ .from = from, .to = to };
+    return n + 1;
+}
+
+fn sortThemeTokensLongestFirst(tokens: []ThemeToken) void {
+    if (tokens.len < 2) return;
+    // The list is bounded by the theme's fields; a local insertion sort avoids
+    // pulling a general block-sort implementation into this cold path.
+    for (tokens[1..], 1..) |token, index| {
+        var insert_at = index;
+        while (insert_at > 0 and token.from.len > tokens[insert_at - 1].from.len) : (insert_at -= 1) {
+            tokens[insert_at] = tokens[insert_at - 1];
+        }
+        tokens[insert_at] = token;
+    }
+}
+
 fn retintThemeBytes(
     alloc: Allocator,
     bytes: []const u8,
-    from_light: bool,
-    to_light: bool,
+    tokens: []const ThemeToken,
 ) !?[]u8 {
-    if (from_light == to_light) return null;
-    const tokens = if (to_light) dark_to_light_theme_tokens[0..] else light_to_dark_theme_tokens[0..];
     var out: std.Io.Writer.Allocating = .init(alloc);
     errdefer out.deinit();
 

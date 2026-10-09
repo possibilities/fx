@@ -26,6 +26,7 @@ const hooks = @import("../hooks/hooks.zig");
 const execution_memory = @import("../agent/execution_memory.zig");
 const gateway_error_format = @import("../shared/gateway_error_format.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
+const mem_utils = @import("../shared/mem_utils.zig");
 const io_mod = @import("../shared/io.zig");
 const session_codec = @import("../session/session_codec.zig");
 const types = @import("../shared/types.zig");
@@ -35,6 +36,18 @@ const execution = @import("execution.zig");
 const tool_host = @import("tool_host.zig");
 
 const Allocator = std.mem.Allocator;
+
+// A parent disable caps resumed children too; durable child opt-ins cannot bypass it.
+fn childUltrafastMode(parent_requested: bool, child_preference: bool) bool {
+    return parent_requested and child_preference;
+}
+
+test "Ultrafast parent disable caps durable child opt-ins" {
+    try std.testing.expect(childUltrafastMode(true, true));
+    try std.testing.expect(!childUltrafastMode(false, true));
+    try std.testing.expect(!childUltrafastMode(true, false));
+    try std.testing.expect(!childUltrafastMode(false, false));
+}
 
 fn childModelCapabilityResolver(
     parent: ?model_capabilities.Resolver,
@@ -137,7 +150,7 @@ pub fn run(
     cancel: *std.atomic.Value(bool),
 ) execution.ServiceError!execution.RunOutcome {
     var arena_state = std.heap.ArenaAllocator.init(turn.alloc);
-    defer arena_state.deinit();
+    defer mem_utils.deinit_arena(arena_state);
     const arena = arena_state.allocator();
     var routed_credential: ?credentials.Credential = null;
     defer if (routed_credential) |*credential| credential.deinit(turn.alloc);
@@ -170,8 +183,10 @@ pub fn run(
         routed_config.tool_context.credential_source = credential.source;
         routed_config.tool_context.account_id = credential.accountId();
     }
+    const ultrafast_mode = childUltrafastMode(config.tool_context.ultrafast_mode, admission.ultrafast_mode);
     routed_config.tool_context.model = admission.model;
     routed_config.tool_context.provider = admission.provider;
+    routed_config.tool_context.ultrafast_mode = ultrafast_mode;
     routed_config.tool_context.provider_capabilities = config.provider_set.select(admission.provider).capabilities;
     debug_trace.logf(
         "subagent",
@@ -203,6 +218,11 @@ pub fn run(
         .subagent_id = trace_context.subagent_id,
     };
     defer if (context.refreshed_credential) |*credential| credential.deinit(turn.alloc);
+    turn.beginTurn() catch |err| {
+        if (err == error.OutOfMemory) return error.OutOfMemory;
+        turn.setFailureDiagnostic("turn_open_failed", @errorName(err));
+        return error.ProviderFailed;
+    };
     const recovery_checkpoint = turn.prepareRecoveryForActiveWork(arena) catch |err| {
         if (err == error.OutOfMemory) return error.OutOfMemory;
         turn.setFailureDiagnostic("recovery_admission_failed", @errorName(err));
@@ -235,9 +255,13 @@ pub fn run(
         .grants = types.dupePermissionGrantSlice(arena, admission.grants) catch return error.OutOfMemory,
         .agent_settings = .{
             .max_tool_result_bytes = config.tool_context.max_tool_result_bytes,
+            .auto_compact_percent = config.tool_context.auto_compact_percent,
             .first_call_tool_choice = config.tool_context.first_call_tool_choice,
             .fast_mode = config.tool_context.fast_mode,
+            .ultrafast_mode = ultrafast_mode,
             .effort = admission.effort,
+            .provider_order = if (admission.provider == .gateway) config.tool_context.provider_order else &.{},
+            .provider_strict = admission.provider == .gateway and config.tool_context.provider_strict,
         },
         .recovery_checkpoint = recovery_checkpoint,
         .recovery_source_already_presented = recovery_checkpoint != null,
@@ -296,9 +320,13 @@ pub fn run(
             .custom_tool_guidance = config.custom_tool_guidance,
             .agent_step_limit = config.tool_context.agent_step_limit,
             .max_tool_result_bytes = config.tool_context.max_tool_result_bytes,
+            .auto_compact_percent = config.tool_context.auto_compact_percent,
             .cancel_flag = cancel,
             .fast_mode = config.tool_context.fast_mode,
+            .ultrafast_mode = ultrafast_mode,
             .effort = admission.effort,
+            .provider_order = if (admission.provider == .gateway) config.tool_context.provider_order else &.{},
+            .provider_strict = admission.provider == .gateway and config.tool_context.provider_strict,
             .first_call_tool_choice = config.tool_context.first_call_tool_choice,
             .workspace_root = config.tool_context.workspace_root,
             .access_scope = config.tool_context.access_scope,
@@ -416,8 +444,14 @@ fn runtimeDeps(context: *Context) agent_runtime.AgentRuntimeDeps {
         .publish_committed_file_handoff = publishCommittedFileHandoff,
         .propagate_history_turn = propagateHistoryTurn,
         .commit_context_compaction = .{ .commit = commitContextCompaction },
-        .recovery_checkpoint = .{
-            .set = setRecoveryCheckpoint,
+        // v2 keeps no paused-response checkpoint (D31), so a v2 child, like
+        // a v2 root, offers the orchestrator no place to save one.
+        .recovery_checkpoint = switch (context.turn.loaded) {
+            .v1 => .{
+                .set = setRecoveryCheckpoint,
+                .clear = clearRecoveryCheckpoint,
+            },
+            .v2 => null,
         },
         .propagate_grant = discardGrant,
         .push_event = pushLiveEvent,
@@ -445,9 +479,17 @@ fn availableModelCapabilities(raw: *anyopaque, model: []const u8) model_capabili
     return model_capabilities.capabilitiesForModel(model);
 }
 
-fn resolveModelCapabilities(raw: *anyopaque, _: Allocator, model: []const u8) model_capabilities.ResolveError!model_capabilities.Capabilities {
+fn resolveModelCapabilities(raw: *anyopaque, arena: Allocator, model: []const u8) model_capabilities.ResolveError!model_capabilities.Capabilities {
     const context: *Context = @ptrCast(@alignCast(raw));
     if (context.cancel.load(.seq_cst)) return error.Cancelled;
+    // Prefer the host's shared resolver: it waits for the provider catalog and
+    // merges the loaded model cache, so gateway-hosted children resolve the
+    // same capabilities as the parent. The provider bundle's synchronous
+    // lookup is empty for providers that only fetch asynchronously (gateway),
+    // which previously left every gateway child at "unknown" support.
+    if (context.config.tool_context.model_capability_resolver) |resolver| {
+        return resolver.resolve(arena, model);
+    }
     return availableModelCapabilities(raw, model);
 }
 
@@ -458,6 +500,7 @@ test "child runtime capability callbacks preserve fallback and child cancellatio
     const Fixture = struct {
         fetches: usize = 0,
         lookups: usize = 0,
+        resolutions: usize = 0,
 
         fn resolve(_: ?*anyopaque, alloc: Allocator, _: []const u8) authority.HostResolveError!authority.HostAuthority {
             return authority.HostAuthority.capture(alloc, &.{}, &.{}, .{}, &.{});
@@ -471,6 +514,11 @@ test "child runtime capability callbacks preserve fallback and child cancellatio
             const self: *@This() = @ptrCast(@alignCast(raw.?));
             self.lookups += 1;
             return if (std.mem.eql(u8, model, "child-model")) .{ .context_window = 32768, .max_output_tokens = 512 } else .{};
+        }
+        fn resolveCapabilities(raw: *anyopaque, _: Allocator, model: []const u8) model_capabilities.ResolveError!model_capabilities.Capabilities {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.resolutions += 1;
+            return if (std.mem.eql(u8, model, "child-model")) .{ .supports_vision = true, .image_input_support = .native } else .{};
         }
         fn output(_: *anyopaque, _: ?types.ToolLifecycleId, _: command_output_content.Stream, _: []const u8) anyerror!void {}
     };
@@ -551,10 +599,16 @@ test "child runtime capability callbacks preserve fallback and child cancellatio
     try std.testing.expectEqual(@as(?u32, 32768), available.context_window);
     try std.testing.expectEqualDeep(available, try deps.resolve_model_capabilities(deps.ctx, alloc, "child-model"));
     try std.testing.expectEqualDeep(model_capabilities.Capabilities{}, deps.available_model_capabilities(deps.ctx, "unknown-fast"));
+    context.config.tool_context.model_capability_resolver = .{ .ctx = &fixture, .resolve_fn = Fixture.resolveCapabilities };
+    const resolved = try deps.resolve_model_capabilities(deps.ctx, alloc, "child-model");
+    try std.testing.expectEqual(model_capabilities.ImageInputSupport.native, resolved.image_input_support);
+    try std.testing.expectEqual(@as(usize, 1), fixture.resolutions);
+    try std.testing.expectEqual(@as(?u32, 512), deps.available_model_capabilities(deps.ctx, "child-model").max_output_tokens);
     const lookups = fixture.lookups;
     cancel.store(true, .seq_cst);
     try std.testing.expectError(error.Cancelled, deps.resolve_model_capabilities(deps.ctx, alloc, "child-model"));
     try std.testing.expectEqual(lookups, fixture.lookups);
+    try std.testing.expectEqual(@as(usize, 1), fixture.resolutions);
     try std.testing.expectEqual(@as(usize, 0), fixture.fetches);
 }
 
@@ -907,6 +961,11 @@ fn setRecoveryCheckpoint(
 ) !void {
     const context: *Context = @ptrCast(@alignCast(raw));
     try context.turn.setRecoveryCheckpoint(checkpoint, io_mod.milliTimestamp());
+}
+
+fn clearRecoveryCheckpoint(raw: *anyopaque) !void {
+    const context: *Context = @ptrCast(@alignCast(raw));
+    try context.turn.clearRecoveryCheckpoint(io_mod.milliTimestamp());
 }
 
 fn reportUsage(raw: *anyopaque, usage: types.Usage) void {
