@@ -2272,7 +2272,7 @@ fn buildTraceReport(app: anytype) ![]u8 {
 
     try writeCurrentStateSummary(&out.writer, app, app.alloc);
     try writeProblemsSummary(&out.writer, app, app.alloc);
-    try writeLastShutdownSection(&out.writer, app.alloc);
+    try writeLastShutdownSection(&out.writer, app.alloc, app_profile_runtime.home(app));
     try writeCompactionSummary(&out.writer, app.alloc);
     try writeLastInterruptedDetail(&out.writer, app.session.agent.history.items, app.alloc);
     try writeSessionTitleSummary(&out.writer, app, app.alloc);
@@ -2537,9 +2537,9 @@ fn writeAuthStateSummary(writer: *std.Io.Writer, app: anytype) !void {
     );
 }
 
-fn writeLastShutdownSection(writer: *std.Io.Writer, alloc: std.mem.Allocator) !void {
+fn writeLastShutdownSection(writer: *std.Io.Writer, alloc: std.mem.Allocator, home: ?[]const u8) !void {
     try writer.writeAll("\n## Last Shutdown\n");
-    const contents = app_lifecycle.readLastShutdownReport(alloc) orelse {
+    const contents = app_lifecycle.readLastShutdownReport(alloc, home) orelse {
         try writer.writeAll("(none recorded)\n");
         return;
     };
