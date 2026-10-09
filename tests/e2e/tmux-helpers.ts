@@ -7,7 +7,8 @@
  * Requires: tmux installed and available in PATH.
  */
 import { execFileSync, execSync } from "node:child_process";
-import { existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { FX_BIN, REPO_ROOT, providerVersionTestEnv } from "../evals/eval-helpers";
@@ -35,6 +36,7 @@ const MIRRORED_ENV_KEYS = [
   "FX_GATEWAY_CHAT_URL",
   "FX_MAX_AGENT_STEPS",
   "FX_MODEL",
+  "FX_SESSIONS_V2",
 ] as const;
 
 export function canonicalSubagentIdForStore(childId: string): string {
@@ -330,6 +332,9 @@ export type FakeGatewayOptions = {
     generationId: string,
     request: Request,
   ) => Response | Promise<Response>;
+  // Response for the /v4/ai/evaluation-model endpoint (TypeSafe Jev through
+  // the gateway). Defaults to a clear Jev decision.
+  evaluationResponse?: FakeGatewayResponse;
 };
 
 // Session title generation calls carry this instruction regardless of the
@@ -364,6 +369,7 @@ function serveFakeGateway(
 ) {
   const requests: Array<{ body: string; headers: Headers }> = [];
   const classifierRequests: Array<{ body: string; headers: Headers }> = [];
+  const evaluationRequests: Array<{ body: string; headers: Headers }> = [];
   const classifierResponses = [...(options.classifierResponses ?? [])];
   const titleRequests: Array<{ body: string; headers: Headers }> = [];
   const titleResponses = [...(options.titleResponses ?? [])];
@@ -395,6 +401,36 @@ function serveFakeGateway(
         }
         return new Response("not found", { status: 404 });
       }
+      if (
+        req.method === "POST" &&
+        new URL(req.url).pathname === "/v4/ai/evaluation-model"
+      ) {
+        evaluationRequests.push({
+          body: await req.text(),
+          headers: new Headers(req.headers),
+        });
+        // Mirrors the real AI Gateway evaluation-model envelope: camelCase
+        // usage and confidence under providerMetadata.typesafe.
+        const evaluationResponse = options.evaluationResponse ??
+          Response.json({
+            answers: {
+              decision: {
+                type: "choice",
+                choice: "clear",
+                probabilities: { clear: 0.99, caution: 0.01 },
+              },
+            },
+            rounding: { probabilityDecimals: 2, scoreDecimals: 2 },
+            usage: { inputTokens: 100, outputTokens: 10 },
+            warnings: [],
+            providerMetadata: {
+              typesafe: { confidence: { decision: 0.97 } },
+            },
+          });
+        return typeof evaluationResponse === "function"
+          ? await evaluationResponse(evaluationRequests[evaluationRequests.length - 1].body)
+          : evaluationResponse;
+      }
       if (req.method !== "POST") return new Response("not found", { status: 404 });
       const body = await req.text();
       const headers = new Headers(req.headers);
@@ -419,6 +455,7 @@ function serveFakeGateway(
     chatUrl: `http://127.0.0.1:${server.port}/v4/ai/language-model`,
     requests,
     classifierRequests,
+    evaluationRequests,
     titleRequests,
     generationRequests,
     modelRequests,
@@ -453,6 +490,65 @@ export function startDynamicFakeGateway(
   options: FakeGatewayOptions = {},
 ) {
   return serveFakeGateway(response, options);
+}
+
+// Serves a fake update channel whose "new" artifact is a wrapper script that
+// logs its argv to argvLogPath and execs the real FX_BIN, so upgrade relaunch
+// tests can drive the handoff without shipping a second binary.
+export function startUpgradeServer(
+  root: string,
+  argvLogPath: string,
+  options: {
+    revision?: string;
+  } = {},
+): { baseUrl: string; stop: () => void } {
+  const artifactDir = join(root, "release-artifact");
+  const wrapperPath = join(artifactDir, "fx");
+  const archivePath = join(root, "fx.tar.gz");
+  mkdirSync(artifactDir);
+  const script = `#!/bin/sh
+{
+  printf '%s' "$0"
+  for arg in "$@"; do
+    printf '\\t%s' "$arg"
+  done
+  printf '\\n'
+} >> ${shellQuote(argvLogPath)}
+exec ${shellQuote(FX_BIN)} "$@"
+`;
+  writeFileSync(wrapperPath, script);
+  chmodSync(wrapperPath, 0o755);
+  const tar = Bun.spawnSync(["tar", "-czf", archivePath, "-C", artifactDir, "fx"]);
+  if (tar.exitCode !== 0) throw new Error(tar.stderr.toString());
+
+  const archive = readFileSync(archivePath);
+  const checksum = createHash("sha256").update(archive).digest("hex");
+  const platform = `${process.platform === "darwin" ? "macos" : "linux"}-${process.arch === "arm64" ? "aarch64" : "x86_64"}`;
+  const revision = options.revision ?? "abcdef0123456789abcdef0123456789abcdef01";
+  const stableArchiveRoute = `/v9.9.9/fx-${platform}.tar.gz`;
+  const devArchiveRoute = `/dev/${revision}/fx-${platform}.tar.gz`;
+  const server = Bun.serve({
+    hostname: "127.0.0.1",
+    port: 0,
+    fetch(request) {
+      const path = new URL(request.url).pathname;
+      if (path === "/latest.txt") return new Response("v9.9.9\n");
+      if (path === "/dev.json") {
+        return Response.json({ version: "9.9.9", commit: revision });
+      }
+      if (path === stableArchiveRoute || path === devArchiveRoute) {
+        return new Response(archive);
+      }
+      if (path === `${stableArchiveRoute}.sha256` || path === `${devArchiveRoute}.sha256`) {
+        return new Response(`${checksum}\n`);
+      }
+      return new Response("not found", { status: 404 });
+    },
+  });
+  return {
+    baseUrl: `http://127.0.0.1:${server.port}`,
+    stop: () => server.stop(true),
+  };
 }
 
 export class TmuxSession {
