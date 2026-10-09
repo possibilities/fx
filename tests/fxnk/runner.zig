@@ -38,7 +38,7 @@ const expected_names = [_][]const u8{
     "builtins.hooks.ade_events.test.ADE sequence advances through record_too_large and queue_full drops",
     "builtins.hooks.ade_events.test.ADE feed refuses tool arguments that would break record framing",
     "builtins.hooks.ade_events.test.ADE child records keep their captured parent across a main session change",
-    "core.subagent.approval_registry.test.child approval publishes its resolution before the child is released",
+    "core.agent.worker_runtime.test.observed permission response projects before waiter release and keeps assigned turn",
     "core.subagent.approval_registry.test.parent prompt approval keeps exact child identity as the only answering surface",
     "core.subagent.approval_registry.test.two pending child approvals each resolve exactly once with their own identity",
     "builtins.hooks.lifecycle_state.test.lifecycle reducer carries attention through resolution and turn end",
