@@ -40,6 +40,7 @@ pub const Snapshot = struct {
     auth: auth_runtime.StatusSnapshot = .{},
     permission_mode: types.PermissionMode,
     agent_step_limit: usize,
+    effort: types.ReasoningEffort = .auto,
     checks: []Check,
 
     pub fn deinit(self: *Snapshot, alloc: Allocator) void {
@@ -107,6 +108,7 @@ pub fn collect(
     };
     defer detailed.deinit(alloc);
     snapshot.provider = detailed.settings.provider orelse .gateway;
+    snapshot.effort = config_runtime.resolveEffort(detailed.settings.effort);
 
     snapshot.auth = try auth_runtime.loadStatusSnapshotForProvider(
         alloc,
@@ -238,8 +240,13 @@ fn appendResolvedStartupCheck(
 
     const detail = try std.fmt.allocPrint(
         alloc,
-        "resolved model={s}, permission_mode={s}, agent_step_limit={d}",
-        .{ snapshot.model, permissionModeLabel(snapshot.permission_mode), snapshot.agent_step_limit },
+        "resolved model={s}, effort={s}, permission_mode={s}, agent_step_limit={d}",
+        .{
+            snapshot.model,
+            snapshot.effort.displayLabel(),
+            permissionModeLabel(snapshot.permission_mode),
+            snapshot.agent_step_limit,
+        },
     );
     try appendCheckOwned(checks, alloc, "startup", .ok, detail);
 }

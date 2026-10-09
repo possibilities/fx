@@ -132,6 +132,22 @@ Config precedence (highest wins):
 4. `<workspace>/.fx.json` (committed project defaults)
 5. Built-in defaults
 
+Supported user-facing `FX_` environment variables:
+
+| Name | Accepted values | Override or effect |
+| --- | --- | --- |
+| `FX_MODEL` | Non-empty model ID | Overrides the configured model for the current process without saving it. |
+| `FX_EFFORT` | `default`, `auto`, `adaptive`, or a case-sensitive effort name | Overrides the configured effort for the current process without saving it. The three aliases actively select the default effort instead of falling back to the saved setting. |
+| `FX_PERMISSION_MODE` | `ask`, `auto`, or `yolo` | Overrides `permission_mode` for the current process. |
+| `FX_MAX_AGENT_STEPS` | Non-negative integer; `0` is unbounded | Overrides `max_agent_steps` for the current process. |
+| `FX_SOUND` | `0`, `false`, or `off`; `max`; any other non-empty value enables ordinary sounds | Overrides saved notification sound settings for the current process. |
+| `FX_SKIP_ONBOARDING` | Any non-empty value except `0` or `false` | Skips credential onboarding. |
+| `FX_DISABLE_KEYCHAIN` | `1` or `true` | Uses the portable credential file instead of macOS Keychain. |
+| `FX_AUTO_UPGRADE` | `0` or `false` | Disables automatic upgrades for the current process, even when enabled in profile config. |
+| `FX_TRACE` | `1`, `true`, `yes`, or `on` | Writes a diagnostic trace to the default trace log. |
+| `FX_RECORD` | Non-empty tape path | Records terminal output, resizes, and interrupts to a deterministic replay tape. |
+| `FX_SKILL_SYMLINK_AUTHORITIES` | Colon-separated absolute paths without `..` components | Adds trusted roots for skill symlinks that resolve outside the workspace or home directory. |
+
 Project `.fx.json` accepts only repo-safe defaults: `sandbox`, `max_agent_steps`, `max_tool_result_bytes`, and `context`. Profile-owned keys such as `provider`, `providers`, `models`, `model`, `effort`, `fast_mode`, `slash_menu_categories`, `startup_scrollback`, `prompt_history`, `statusLine`, `skill_match_fuzzy`, `first_call_tool_choice`, `auto_upgrade`, `auto_compact_percent`, `update_channel`, `permission_mode`, `permission`, and `skill_symlink_authorities` are ignored from project config before their values are parsed.
 
 `skill_symlink_authorities` is an array of absolute directories that symlinked skills may resolve into, such as an app bundle or `/nix/store`. It is read at startup, a workspace override replaces the global list, and its entries are combined with the colon-separated `FX_SKILL_SYMLINK_AUTHORITIES` environment variable.

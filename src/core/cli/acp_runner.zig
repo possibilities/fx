@@ -15,6 +15,7 @@ const prompt_policy = @import("../config/prompt_policy.zig");
 const tool_set_contract = @import("../tooling/tool_set.zig");
 const skill_contract = @import("../skills/skill_contract.zig");
 const context_contract = @import("../workspace/context_contract.zig");
+const types = @import("../shared/types.zig");
 
 const Allocator = std.mem.Allocator;
 

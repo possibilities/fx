@@ -995,7 +995,7 @@ fn handleRestoreSession(
         const seed_preferences = session_codec.DurableSessionPreferences{
             .provider = state.provider,
             .model = state.configured_model,
-            .effort = state.effort,
+            .effort = state.configured_effort,
             .fast_mode = state.fast_mode,
             .ultrafast_mode = state.configured_ultrafast_mode,
         };
@@ -1100,7 +1100,7 @@ fn handleRestoreSession(
         .credential = if (staged_credential) |*credential| credential else null,
         .fast_mode = durable.preferences.fast_mode,
         .ultrafast_mode = restoredUltrafastMode(state, durable.preferences.ultrafast_mode),
-        .effort = durable.preferences.effort,
+        .effort = if (state.process_effort_override) state.effort else durable.preferences.effort,
         .session_rt = session_rt,
         .mcp = session_mcp,
         .client_system_prompt = client_system_prompt,
@@ -1385,7 +1385,7 @@ fn freshAcpState(
         .preferences = .{
             .provider = state.provider,
             .model = model,
-            .effort = state.effort,
+            .effort = state.configured_effort,
             .fast_mode = state.fast_mode,
             .ultrafast_mode = state.configured_ultrafast_mode,
         },
