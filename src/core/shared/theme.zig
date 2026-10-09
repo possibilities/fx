@@ -788,13 +788,17 @@ pub fn siblingName(alloc: std.mem.Allocator, name: []const u8, want_light: bool)
 /// mismatches, and returns null to signal the builtin variant when neither
 /// file fits. Used both at startup and on live terminal theme notifications.
 pub fn resolveNamed(alloc: std.mem.Allocator, name: []const u8, terminal_light: bool, options: ParseOptions) LoadError!?Theme {
-    const theme = loadNamed(alloc, name, options) catch |err| {
+    return resolveNamedFromHome(alloc, io_mod.getenv("HOME"), name, terminal_light, options);
+}
+
+pub fn resolveNamedFromHome(alloc: std.mem.Allocator, home: ?[]const u8, name: []const u8, terminal_light: bool, options: ParseOptions) LoadError!?Theme {
+    const theme = loadNamedFromHome(alloc, home, name, options) catch |err| {
         debug_trace.logf("theme", "custom_theme_load_failed name={s} err={s}", .{ name, @errorName(err) });
         return null;
     };
     if (theme.light == terminal_light) return theme;
     if (siblingName(alloc, name, terminal_light) catch null) |sibling| {
-        if (loadNamed(alloc, sibling, options)) |swapped| {
+        if (loadNamedFromHome(alloc, home, sibling, options)) |swapped| {
             if (swapped.light == terminal_light) {
                 debug_trace.logf("theme", "theme_variant_swapped from={s} to={s}", .{ name, sibling });
                 return swapped;
@@ -814,6 +818,10 @@ pub fn resolveNamed(alloc: std.mem.Allocator, name: []const u8, terminal_light: 
 /// capability. The returned Theme is process-lifetime state allocated from
 /// `alloc`; the caller keeps the allocation alive.
 pub fn loadNamed(alloc: std.mem.Allocator, name: []const u8, options: ParseOptions) LoadError!Theme {
+    return loadNamedFromHome(alloc, io_mod.getenv("HOME"), name, options);
+}
+
+fn loadNamedFromHome(alloc: std.mem.Allocator, selected_home: ?[]const u8, name: []const u8, options: ParseOptions) LoadError!Theme {
     if (name.len == 0 or name.len > 64) return error.InvalidName;
     for (name) |byte| {
         const ok = std.ascii.isAlphanumeric(byte) or byte == '-' or byte == '_' or byte == '.';
@@ -821,7 +829,7 @@ pub fn loadNamed(alloc: std.mem.Allocator, name: []const u8, options: ParseOptio
     }
     if (std.mem.eql(u8, name, ".") or std.mem.eql(u8, name, "..")) return error.InvalidName;
 
-    const home = io_mod.getenv("HOME") orelse return error.ThemeNotFound;
+    const home = selected_home orelse return error.ThemeNotFound;
     const dir_path = try std.fmt.allocPrint(alloc, "{s}/.fx/themes", .{home});
     defer alloc.free(dir_path);
     var dir = std.Io.Dir.openDirAbsolute(io_mod.getIo(), dir_path, .{}) catch return error.ThemeNotFound;
