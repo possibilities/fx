@@ -140,6 +140,33 @@ async function waitForProfileUsage(
   throw new Error("Timed out waiting for profile usage publication");
 }
 
+// Holds the profile-wide usage ledger lock the way another fx process would.
+async function holdProfileUsageLock(home: string) {
+  const holder = Bun.spawn(
+    [
+      "python3",
+      "-c",
+      "import fcntl, os, sys, time\n" +
+        "fd = os.open(sys.argv[1], os.O_RDWR)\n" +
+        "fcntl.flock(fd, fcntl.LOCK_EX)\n" +
+        "print('locked', flush=True)\n" +
+        "time.sleep(120)",
+      join(home, ".fx", "usage.lock"),
+    ],
+    { stdout: "pipe", stderr: "pipe" },
+  );
+  const reader = holder.stdout.getReader();
+  const decoder = new TextDecoder();
+  let output = "";
+  while (!output.includes("locked")) {
+    const chunk = await reader.read();
+    if (chunk.done) throw new Error("usage lock holder exited early");
+    output += decoder.decode(chunk.value);
+  }
+  reader.releaseLock();
+  return holder;
+}
+
 test(
   "fx ask settles authoritative stream usage without delayed reconciliation",
   async () => {
@@ -627,6 +654,86 @@ describe.skipIf(!tmuxAvailable())("tui: durable session cost", () => {
       expect(resumedSession).toMatch(/5 reasoning/);
       expect(resumedSession).toMatch(/1 request/);
       expect(gateway.generationRequests).toEqual([GENERATION_ID, GENERATION_ID]);
+    },
+    TIMEOUT * 3,
+  );
+
+  test(
+    "interactive exit keeps pending usage without waiting on a held ledger lock",
+    async () => {
+      root = mkdtempSync(join(tmpdir(), "fx-cost-held-ledger-"));
+      const home = join(root, "home");
+      const workspace = join(root, "workspace");
+      const stderrPath = join(root, "stderr.log");
+      mkdirSync(home, { recursive: true });
+      mkdirSync(workspace, { recursive: true });
+      gateway = startFakeGateway(
+        [
+          fakeGatewaySse([
+            { type: "response-metadata", modelId: MODEL },
+            {
+              type: "text-start",
+              id: "answer_1",
+              providerMetadata: {
+                gateway: { generationId: GENERATION_ID },
+              },
+            },
+            { type: "text-delta", id: "answer_1", delta: RESPONSE_TEXT },
+            { type: "text-end", id: "answer_1" },
+            {
+              type: "finish",
+              finishReason: { unified: "stop", raw: "stop" },
+            },
+          ]),
+        ],
+        {
+          models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
+          generationResponse() {
+            return new Response("unauthorized", { status: 401 });
+          },
+        },
+      );
+
+      const fixture = Bun.spawn([FX_BIN, "ask", "Create pending usage."], {
+        cwd: workspace,
+        env: { ...process.env, ...gatewayEnvironment(home) },
+        stdout: "pipe",
+        stderr: "pipe",
+      });
+      expect(await fixture.exited).toBe(0);
+      await waitForProfileUsage(home, GENERATION_ID);
+
+      const holder = await holdProfileUsageLock(home);
+      try {
+        session = await TmuxSession.create({
+          cmd: `${FX_BIN} --resume-last`,
+          cwd: workspace,
+          env: gatewayEnvironment(home),
+          stderrPath,
+        });
+        await session.waitForComposer(TIMEOUT);
+        await session.sendText("/quit");
+        await session.waitForSessionEnd(TIMEOUT);
+        session = null;
+      } finally {
+        holder.kill();
+        await holder.exited;
+      }
+
+      const report = JSON.parse(
+        readFileSync(
+          join(home, ".fx", "diagnostics", "last-shutdown.json"),
+          "utf8",
+        ),
+      );
+      const persistence = report.stages.find(
+        (stage: { name: string }) => stage.name === "persistence_finalized",
+      );
+      // Waiting on the held lock costs at least its 2s deadline per attempt.
+      expect(persistence.step_ms).toBeLessThan(1000);
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+      expect(latestUsageCheckpoint(home).pending.map((item) => item.id))
+        .toEqual([GENERATION_ID]);
     },
     TIMEOUT * 3,
   );

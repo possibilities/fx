@@ -1,8 +1,155 @@
 # fx
 
-## 0.0.10
+## 0.0.13
 
 <!-- release:start -->
+
+**fx now supports Ultrafast on supported OpenAI models and launches up to 23× faster. Shell calls are up to 8.6× faster, and exits are up to 44× faster in matched benchmarks.**
+
+### Breaking Changes
+
+- Terminals launched through the shell tool now stop when fx exits instead of staying alive for the next resume.
+- New libfx checkpoints cannot be restored by older versions. Existing checkpoints still load.
+- Invalid Base64 image input now throws directly from `prompt()` instead of failing the turn later.
+
+### New Features
+
+- Enable Ultrafast with `/ultrafast on` or `--ultrafast` on supported OpenAI models through AI Gateway. It uses a higher-priced inference tier.
+- Subagents and ACP sessions support Ultrafast. libfx supports it through `model.ultrafast`.
+- `/mcp add slack` now configures Slack, opens sign-in, and connects your account in one command.
+- Set `auto_compact_percent` from 10 to 80 to choose when automatic compaction starts.
+- libfx accepts raw image bytes and adds a `resizeImage` hook for preparing images before sending.
+- libfx image references survive checkpoints, so your app's tools can recover originals later.
+- ACP clients can steer running turns, supply session instructions and workspaces, and host MCP servers over the ACP connection.
+
+### Improvements
+
+- Launch benchmarks show 1.6–23× faster median first-screen rendering, depending on the terminal. Sign-in and skills finish loading afterward.
+- Shell calls are up to 8.6× faster with heavy startup files, dropping from 238.8 ms to 27.9 ms. Startup files load once per fx process; `/shell reload` refreshes them.
+- Exiting after a reply is up to 44× faster while a large usage history is loading, dropping from 1,003 ms to 23 ms.
+- Exiting with MCP servers is 2.8× faster in the matched macOS benchmark, dropping from 20.6 ms to 7.4 ms.
+- The shell overhaul removed 236–279 KB from native binaries in matched builds.
+- Compaction preserves original messages and final replies where they fit, while older turns and tool results remain searchable.
+- The Grok model picker now shows all supported subscription models.
+- Images can reach the model at up to 8,000 pixels per side when the request contains 20 images or fewer.
+
+### Bug Fixes
+
+- Steering sent after a tool result now survives cancellation and resume.
+- Subagents now start when the parent has more than 256 MCP tools.
+- Compaction no longer incorrectly flags answers to questions as unsupported rules.
+- Sessions v2 now retain assistant text around interrupted tool calls and generate titles after a crashed first turn.
+
+### Security
+
+- Reloading shell configuration clears remembered command approvals. Auto mode reviews routine commands that use captured aliases or functions.
+- ACP sessions use profile MCP servers only when the client explicitly opts in.
+
+<!-- release:end -->
+
+## 0.0.12
+
+**Session listing is up to 560× faster, large stores resume in under a second, and GitHub-flavored Markdown now renders better throughout the terminal.**
+
+### Breaking Changes
+
+- libfx now uses `LIBFX_MODEL_UNSUPPORTED_EFFORT` and `LIBFX_MODEL_UNSUPPORTED_FAST` for unsupported model settings. Callers checking the old error codes must update.
+
+### New Features
+
+- libfx accepts `model: { id, effort, fast }` and supports `Blob` or `File` images directly.
+- Detached processes such as `tmux`, `ssh-agent`, and browser drivers now stay alive between shell calls.
+- `/mcp list` now opens the interactive Servers menu.
+
+### Improvements
+
+- In a 14,600-session benchmark, `fx sessions` dropped from 95 seconds to 0.17 seconds and `fx --resume last` from 33 seconds to 0.5 seconds.
+- `/new`, `/clear`, and `/reset` now preserve the previous conversation in terminal scrollback.
+- Oversized PNGs shrink before being sent without changing the original file. fx tells you when another image cannot be sent.
+- Structured replies now use GitHub-flavored Markdown. Wide tables wrap inside their cells, and long URLs stay clickable.
+- Steering stays intact through compaction and session recovery.
+- MCP startup errors now explain whether the server exited, timed out, or returned invalid output.
+
+### Bug Fixes
+
+- Prompt-too-long errors now trigger compaction and one retry.
+- Numpad keys now work in the composer, including digits, operators, Enter, and navigation.
+- Codex, Grok, and custom connections now start with `--model` or `FX_MODEL` even when no model is saved.
+- `/model` now identifies models from custom connection settings without suggesting a Gateway sign-in.
+- Clearing the terminal with `Cmd+K` or `Ctrl+L` no longer crashes conversations containing tool calls.
+- tmux's session switcher and copy mode now stay open during terminal resizing.
+- `fx pr --create` and `fx issue --create` now publish the final response instead of earlier progress text.
+- Messages sent after interrupting a response now wait for the previous turn to close.
+- Malformed tool arguments no longer break the next model request.
+
+### Security
+
+- Slack MCP sign-in now requests only approved fx scopes and rejects unexpected OAuth resources or scope changes.
+- Symlinked skills outside fx's usual directories can now be allowed through `skill_symlink_authorities` in profile settings. Project settings cannot grant that access.
+
+## 0.0.11
+
+**fx now supports custom model connections and themes. Resume, file lookup and request handling are up to 100× faster, long turns use 17× less memory, and libfx adds steering, images, web search and model controls.**
+
+### Breaking Changes
+
+- **Automatic recovery:** `/continue` has been removed. fx now retries and continues on its own.
+
+### New Features
+
+- **Default model:** fx now uses Grok 4.7 as its default model. Fast mode remains opt-in.
+- **Custom connections:** fx now supports named OpenAI Chat Completions connections for local servers and other gateways. Configure them in `~/.fx/settings.json`, then select one with `fx provider <name>` or `FX_PROVIDER`.
+- **Provider routing:** Gateway users can set `provider_order` and `provider_strict`, or pass `--provider-order` and `--provider-strict`, to prefer or restrict which providers serve a model.
+- **Interactive flags:** Interactive sessions accept `--provider`, `--model`, `--effort`, and `--fast`; `fx ask` accepts `--model`, `--effort`, and `--fast` for one run without changing saved preferences. Grok models now support Fast mode.
+- **Slack bot:** fx can now install and manage your Slack workspace bot from the CLI.
+- **Custom themes:** fx now loads custom TUI themes from `~/.fx/themes/<name>.json`, including VS Code themes. Set `theme` in `~/.fx/settings.json` or use `FX_THEME`.
+- **Image reading:** `read_file` now attaches PNG, JPEG, GIF, and WebP files to supported vision models.
+- **libfx steering:** libfx turns support `turn.steer()` for mid-turn guidance. Applied steering arrives as a `user_message` event and remains in checkpoints.
+- **libfx model controls:** `createFxAgent()` now accepts image blocks plus `effort` and `fast` options. libfx now supports `web_search`.
+- **libfx activity:** libfx hosts receive `transport.activity` while responses stream, and `tool_start` now includes tool input or a bounded preview.
+- **libfx tool boundaries:** libfx now keeps host tools separate from fx's built-in tools, even when they share a name.
+
+### Improvements
+
+- **Recovery:** Transient model failures now retry until the connection recovers. Silent streams use liveness checks, and retries slow to once a minute after 15 minutes.
+- **Session resume:** `/resume` opens up to 60× faster with better session caching.
+- **File suggestions:** `@` file suggestions are 6–40× faster with a saved index and background scanning.
+- **Gateway setup:** Gateway connection setup is up to 48× faster by warming and reusing connections across turns.
+- **Usage tracking:** Usage tracking is over 100× faster on large local histories.
+- **Memory use:** Long tool-heavy turns use over 17× less memory in the release benchmark.
+- **Compaction:** Compaction now preserves conversation history more accurately for better continuation afterward.
+- **Syntax highlighting:** Shell commands and code blocks now have better syntax highlighting across more languages.
+- **MCP errors:** MCP now shows clearer startup and authentication errors, including what to do next.
+- **MCP forms:** Small MCP forms with one choice and up to three options submit directly from the terminal prompt.
+- **Diagnostics:** Logs in `/trace` and `ctrl+o` are cleaner and more useful for diagnosing session issues.
+- **Subagents:** Subagent rows show the child's model, effort, token use, and task status. Exact and unambiguous partial model names now work in subagent overrides.
+- **Faster exits:** Double `Ctrl+C` exits up to 40× faster when MCP servers are stuck, and no longer waits on upgrade downloads.
+- **Command rendering:** Command rows now resize with the terminal, giving long shell commands cleaner rendering.
+
+### Bug Fixes
+
+- **Multiple images:** Reading multiple images in one turn no longer crashes fx, and images returned by tools now reach vision models through Gateway.
+- **Image accounting:** Tool images no longer count as text during request estimation. Automatic compaction now uses the real image cost.
+- **Session titles:** Resuming an untitled session now generates a title from its first committed prompt instead of preserving `Untitled session`.
+- **Session saving:** A completed turn that fails to save no longer exits fx. The response stays in memory and the save error remains visible.
+- **Workspace search:** `grep_files` and `glob_files` no longer end an otherwise completed turn when searching from the workspace root.
+- **Full-screen views:** Typing while `ctrl+o` or another full-screen view is open no longer disturbs the main conversation. Queued prompt previews also stay clear of active transcript rows.
+- **Tool recovery:** Tool failures now name the unresolved path and tell the model when to reread a file or choose another approach instead of retrying blindly.
+- **Cancelled recovery:** Cancelling response recovery no longer revives the stopped turn on resume. After restarting, the model is also told that old background shell sessions no longer exist.
+- **MCP capabilities:** MCP resources and prompts no longer fail the whole tool call when a server never advertised that capability.
+- **MCP authentication:** Rejected or expired MCP credentials now show `needs_auth` and the right re-authentication command instead of appearing authenticated.
+- **Terminal resume:** Resumed terminal rows show the recorded launch command, including after moving the workspace, instead of raw session IDs or fixed-width text.
+- **Transcript retention:** Transcript retention no longer overwrites finalized conversation rows or loses pending rows during resize and full-transcript viewing.
+- **Fast mode fallback:** When the model catalog is unavailable, fx reports that the requested Fast mode could not be enabled and continues normally.
+- **Steering recovery:** Steering and response recovery no longer lose buffered assistant output or completed turn summaries.
+
+### Security
+
+- **Custom connection credentials:** Custom connections read credentials only from their named environment variable, and committed project configuration cannot define model endpoints. Saved sessions refuse to resume against a changed endpoint or authentication identity.
+- **Review model:** Set `review_model` or `FX_REVIEW_MODEL` to choose the model used for auto-mode safety reviews. Review transport failures and malformed replies retry once; cautions never retry for approval, and an unresolved action stays blocked.
+- **Safe tool errors:** Tool failure details now redact secrets and escape terminal control sequences before rendering.
+
+## 0.0.10
 
 **fx now completes turns up to 1.6× faster and starts model requests up to 2.5× faster.**
 
@@ -22,8 +169,6 @@
 ### Security
 
 - MCP errors now have stronger secret protection.
-
-<!-- release:end -->
 
 ## 0.0.9
 

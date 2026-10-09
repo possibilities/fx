@@ -4,6 +4,7 @@ const ansi = @import("ansi.zig");
 const tu = @import("text_util.zig");
 const unicode_classes = @import("unicode_classes.zig");
 const payload = @import("payload.zig");
+const shared_theme = @import("../../shared/theme.zig");
 
 /// Renders heading content: emphasis is resolved normally, but bold tags are
 /// suppressed because the heading style already owns bold.
@@ -440,7 +441,20 @@ fn emitTokens(
         .entity => |entity| try out.appendSlice(alloc, entity.utf8[0..entity.len]),
         .code => |content| {
             try out.appendSlice(alloc, ansi.inline_code_open);
-            try out.appendSlice(alloc, content);
+            if (codeSpanUrlEnd(content)) |url_end| {
+                const id = link_id.*;
+                link_id.* +%= 1;
+                var id_buf: [32]u8 = undefined;
+                const open = try std.fmt.bufPrint(&id_buf, "\x1b]8;id=fx-{d};", .{id});
+                try out.appendSlice(alloc, open);
+                try out.appendSlice(alloc, content[0..url_end]);
+                try out.appendSlice(alloc, "\x1b\\");
+                try out.appendSlice(alloc, content[0..url_end]);
+                try out.appendSlice(alloc, "\x1b]8;;\x1b\\");
+                try out.appendSlice(alloc, content[url_end..]);
+            } else {
+                try out.appendSlice(alloc, content);
+            }
             try out.appendSlice(alloc, ansi.inline_code_close);
         },
         .link => |item| try emitInlineLink(alloc, out, item.link, options.restore_underline_after_link, item.visible_prefix, link_id),
@@ -528,6 +542,9 @@ fn emitInlineLink(
     try out.appendSlice(alloc, link.destination_prefix);
     try out.appendSlice(alloc, link.url);
     try out.appendSlice(alloc, "\x1b\\");
+    // Link text carries the theme's link color in addition to the underline.
+    const link_style = shared_theme.current().link_style;
+    try out.appendSlice(alloc, link_style);
     try out.appendSlice(alloc, ansi.underline_open);
     if (visible_prefix) |prefix| try out.appendSlice(alloc, prefix);
     const visible_text = if (link.text.len == 0 and visible_prefix != null) "image" else link.text;
@@ -536,6 +553,7 @@ fn emitInlineLink(
         .literal => try out.appendSlice(alloc, visible_text),
     }
     try out.appendSlice(alloc, ansi.underline_close);
+    try out.appendSlice(alloc, shared_theme.closingFor(link_style));
     try out.appendSlice(alloc, "\x1b]8;;\x1b\\");
     if (restore_underline_after_link) try out.appendSlice(alloc, ansi.underline_open);
 }
@@ -834,6 +852,25 @@ fn isValidAngleAutolinkEmailDomainLabel(label: []const u8) bool {
         }
     }
     return true;
+}
+
+fn codeSpanUrlEnd(content: []const u8) ?usize {
+    const scheme_len: usize = if (std.mem.startsWith(u8, content, "https://"))
+        "https://".len
+    else if (std.mem.startsWith(u8, content, "http://"))
+        "http://".len
+    else
+        return null;
+
+    // Only a sentence-final period is excluded; other suffixes can be URI bytes
+    // in literal code, including _, *, ~, !, ?, ;, :, and ,.
+    const end = if (content.len > scheme_len and content[content.len - 1] == '.')
+        content.len - 1
+    else
+        content.len;
+    if (end == scheme_len or !isValidLinkUrl(content[0..end])) return null;
+    for (content) |byte| if (byte <= ' ' or byte == 0x7f) return null;
+    return end;
 }
 
 /// Bare URL starting at `start`, or null. The extent does not depend on any

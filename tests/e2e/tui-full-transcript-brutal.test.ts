@@ -843,6 +843,15 @@ async function verifyOldestTranscriptEntrySurvives(
     if (pane.includes(firstChatMarker(config))) break;
   }
   const oldestMarker = firstChatMarker(config);
+  // The full transcript opens with a session/network record block, so the
+  // oldest conversation entry can sit just below the clamped top viewport;
+  // page back down until it is visible.
+  let oldestPane = await session.capturePane();
+  for (let page = 0; page < 128 && !oldestPane.includes(oldestMarker); page += 1) {
+    await session.sendKeys("NPage");
+    await Bun.sleep(50);
+    oldestPane = await session.capturePane();
+  }
   const oldest = await session.waitForText(oldestMarker, TIMEOUT * 4);
   expect(oldest).toContain(oldestMarker);
 

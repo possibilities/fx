@@ -90,6 +90,17 @@ pub noinline fn composeMcpMenuRow(
         ) catch "Filter";
         return composeTextRow(alloc, filter, width, ui_render.dim_style, 2);
     }
+    if (show_header and row_index == 1 and
+        projection.state.screen == .browse and
+        projection.state.section == .servers and
+        projection.configuration_issues.len > 0)
+    {
+        return composeConfigurationIssueRow(
+            alloc,
+            projection.configuration_issues,
+            width,
+        );
+    }
     if (show_header and row_index == 1) {
         if (projection.state.section == .resources or projection.state.section == .prompts) {
             if (projection.selectedServer()) |server| return composeFactRow(alloc, "Server", server.configured_name, width);
@@ -221,7 +232,7 @@ fn composeBrowseRow(
         const text = if (projection.state.query_len > 0)
             "No matching MCP items."
         else switch (projection.state.section) {
-            .servers => if (projection.configuration_issue_count == 0)
+            .servers => if (projection.configuration_issues.len == 0)
                 "No MCP servers configured."
             else
                 "No MCP servers available; configuration errors need attention.",
@@ -285,7 +296,7 @@ fn composeInfoRow(alloc: Allocator, row_index: u16, width: u16) !std.ArrayList(u
     return switch (row_index) {
         0 => composeFactRow(alloc, "Profile config", "~/.fx/mcp.json", width),
         1 => composeFactRow(alloc, "Project config", "<workspace>/.mcp.json", width),
-        2 => composeTextRow(alloc, "servers: a add · r reload · enter inspect", width, ui_render.dim_style, 2),
+        2 => composeTextRow(alloc, "servers: s add Slack · a add · r reload · enter inspect", width, ui_render.dim_style, 2),
         3 => composeTextRow(alloc, "project trust: p approve all · z reset", width, ui_render.dim_style, 2),
         4 => composeTextRow(alloc, "details: enter sign in · l logout · d remove", width, ui_render.dim_style, 2),
         5 => composeTextRow(alloc, "project details: a approve · x reject", width, ui_render.dim_style, 2),
@@ -373,9 +384,9 @@ fn composeServerRow(
 fn serverStateLabel(server: mcp_health.ServerSnapshot) []const u8 {
     if (server.reloading) return "Reloading";
     if (server.workspace_admission == .pending) return "Pending trust";
-    if (server.authentication == .required) return "Needs authentication";
-    return switch (server.connection) {
-        .disconnected => "Disconnected",
+    return switch (mcp_health.classify(server.connection, server.authentication, false)) {
+        .needs_auth => "Needs authentication",
+        .unavailable, .on_demand => "Disconnected",
         .disabled => "Disabled",
         .connecting => "Connecting",
         .ready => "Ready",
@@ -596,6 +607,42 @@ fn composeTextRow(
     return row;
 }
 
+fn composeConfigurationIssueRow(
+    alloc: Allocator,
+    issues: []const mcp_health.ConfigurationIssue,
+    width: u16,
+) !std.ArrayList(u8) {
+    var row: std.ArrayList(u8) = .empty;
+    errdefer row.deinit(alloc);
+    try row.appendSlice(alloc, ui_render.warning_style);
+    const indent: usize = @min(2, width);
+    try row.appendNTimes(alloc, ' ', indent);
+    const content_width = @as(usize, width) -| indent;
+    var summary_buf: [96]u8 = undefined;
+    const summary = if (issues.len == 1)
+        "1 project MCP configuration error. Run fx mcp list for details. "
+    else
+        std.fmt.bufPrint(
+            &summary_buf,
+            "{d} project MCP configuration errors. Run fx mcp list for details. ",
+            .{issues.len},
+        ) catch "Project MCP configuration errors. Run fx mcp list for details. ";
+    const summary_width = display_width.visibleWidth(summary);
+    if (summary_width >= content_width) {
+        try appendTerminalSafeSingleLine(alloc, &row, summary, content_width);
+    } else {
+        try row.appendSlice(alloc, summary);
+        try appendTerminalSafeSingleLine(
+            alloc,
+            &row,
+            issues[0].message,
+            content_width - summary_width,
+        );
+    }
+    try row.appendSlice(alloc, ui_render.reset_style);
+    return row;
+}
+
 fn cloneClipped(alloc: Allocator, text: []const u8, width: u16) !std.ArrayList(u8) {
     var row: std.ArrayList(u8) = .empty;
     errdefer row.deinit(alloc);
@@ -609,7 +656,7 @@ fn appendTerminalSafeSingleLine(
     text: []const u8,
     width: usize,
 ) !void {
-    var encoded = try text_utils.encodeTerminalSafe(alloc, text, 4096);
+    var encoded = try text_utils.encodeTerminalSafeInline(alloc, text, 4096);
     defer encoded.deinit(alloc);
     try row_text.appendSingleLineEllipsized(alloc, row, encoded.bytes, width);
 }
@@ -659,6 +706,24 @@ test "MCP menu catalog text cannot inject terminal control sequences" {
     defer row.deinit(std.testing.allocator);
     try std.testing.expect(std.mem.find(u8, row.items, "\x1b]0;owned") == null);
     try std.testing.expect(std.mem.find(u8, row.items, "\\x1b") != null);
+}
+
+test "MCP menu catalog text flattens line breaks into single-line rows" {
+    const tools = [_][]const u8{"mcp_multi\nline\tname"};
+    const projection: McpMenuProjection = .{
+        .state = .{
+            .active = true,
+            .section = .tools,
+            .load_state = .ready,
+        },
+        .tools = &tools,
+    };
+    const rows = menuRowCount(projection, 100, 10);
+    var row = try composeMcpMenuRow(std.testing.allocator, projection, 2, 100, rows);
+    defer row.deinit(std.testing.allocator);
+    try std.testing.expect(std.mem.find(u8, row.items, "mcp_multi line name") != null);
+    try std.testing.expect(std.mem.find(u8, row.items, "\\x0a") == null);
+    try std.testing.expect(std.mem.findScalar(u8, row.items, '\n') == null);
 }
 
 test "MCP menu keeps selection visible when the terminal has one body row" {
@@ -856,6 +921,20 @@ test "MCP menu every screen and section renders through the VT" {
         max_inline_rows,
         &.{ "MCP 1", "[Servers]", "fixture", "Ready", "stdio · Profile" },
     );
+
+    const configuration_issues = [_]mcp_health.ConfigurationIssue{
+        .{ .message = @constCast(".mcp.json server 'broken' is missing MISSING_COMMAND in field command") },
+        .{ .message = @constCast(".mcp.json server 'other' is invalid") },
+    };
+    projection.configuration_issues = &configuration_issues;
+    try expectMcpMenuVtContains(
+        alloc,
+        projection,
+        width,
+        max_inline_rows,
+        &.{ "MCP 1", "fixture", "2 project MCP configuration errors", "fx mcp list", ".mcp.json server 'broken'" },
+    );
+    projection.configuration_issues = &.{};
 
     var unauthenticated = server;
     unauthenticated.transport = .http;
