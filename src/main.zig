@@ -1,4 +1,5 @@
 const std = @import("std");
+const app_profile_runtime = @import("core/app/app_profile_runtime.zig");
 const builtin = @import("builtin");
 const build_options = @import("build_options");
 const io_mod = @import("core/shared/io.zig");
@@ -1109,7 +1110,7 @@ const App = struct {
         self.mcp.deinitForProcessExit(self.alloc);
         shutdown_trace.mark("mcp_children_terminated");
         shutdown_trace.mark("complete");
-        if (was_interactive) app_lifecycle.writeLastShutdownReport(self.alloc, &shutdown_trace);
+        if (was_interactive) app_lifecycle.writeLastShutdownReport(self.alloc, app_profile_runtime.home(self), &shutdown_trace);
         return .{ .handoff = resume_handoff, .failure = shutdown_failure };
     }
 
@@ -1211,7 +1212,7 @@ const App = struct {
         if (self.workspace_root.len > 0) self.alloc.free(self.workspace_root);
         if (self.review_model.len > 0) self.alloc.free(self.review_model);
         shutdown_trace.mark("complete");
-        if (was_interactive) app_lifecycle.writeLastShutdownReport(self.alloc, &shutdown_trace);
+        if (was_interactive) app_lifecycle.writeLastShutdownReport(self.alloc, app_profile_runtime.home(self), &shutdown_trace);
     }
 
     pub fn releaseTerminal(self: *App) void {

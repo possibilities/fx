@@ -1,10 +1,13 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { execFileSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import {
+  chmodSync,
   existsSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
+  readdirSync,
   realpathSync,
   rmSync,
   writeFileSync,
@@ -1034,6 +1037,8 @@ describe.skipIf(SKIP_TMUX)("tui: selected state root", () => {
       const mcpPidPath = join(root, "mcp.pid");
       const mcpEnvironmentPath = join(root, "mcp-environment.json");
       const ambientMcpMarker = join(root, "ambient-mcp-launched");
+      const traceDirectory = join(root, "tmp");
+      mkdirSync(traceDirectory);
       mkdirSync(join(home, ".fx", "skills", "ambient-state-skill"), {
         recursive: true,
       });
@@ -1047,10 +1052,26 @@ describe.skipIf(SKIP_TMUX)("tui: selected state root", () => {
         recursive: true,
       });
       mkdirSync(workspace, { recursive: true });
+      writeFileSync(join(workspace, "selected-index-entry.txt"), "indexed");
+      for (const [profile, color] of [[stateHome, "#FF0000"], [home, "#00FF00"]]) {
+        mkdirSync(join(profile!, ".fx", "themes"), { recursive: true });
+        writeFileSync(join(profile!, ".fx", "themes", "selected-theme.json"), JSON.stringify({
+          name: "Selected profile theme", colors: { "editor.foreground": color },
+        }));
+      }
       writeFileSync(stderrPath, "");
+      for (const [profile, marker] of [[stateHome, "SELECTED_SHUTDOWN"], [home, "AMBIENT_SHUTDOWN"]]) {
+        chmodSync(join(profile!, ".fx"), 0o700);
+        mkdirSync(join(profile!, ".fx", "diagnostics"), { mode: 0o700 });
+        writeFileSync(join(profile!, ".fx", "diagnostics", "last-shutdown.json"), JSON.stringify({
+          version: 1, recorded_at_ms: 1, total_ms: 1,
+          stages: [{ name: marker, step_ms: 1, total_ms: 1 }],
+        }), { mode: 0o600 });
+      }
+      const ambientShutdown = readFileSync(join(home, ".fx", "diagnostics", "last-shutdown.json"), "utf8");
       writeFileSync(
         join(stateHome, ".fx", "settings.json"),
-        JSON.stringify({ model: FAKE_GATEWAY_MODEL }) + "\n",
+        JSON.stringify({ model: FAKE_GATEWAY_MODEL, theme: "selected-theme" }) + "\n",
       );
       writeFileSync(
         join(home, ".fx", "settings.json"),
@@ -1137,12 +1158,31 @@ describe.skipIf(SKIP_TMUX)("tui: selected state root", () => {
             FX_MODEL: undefined,
             FX_PERMISSION_MODE: "yolo",
             FX_AUTO_UPGRADE: "0",
+            FX_THEME: undefined,
+            COLORFGBG: "15;0",
+            COLORTERM: undefined,
+            TERM_PROGRAM: "Apple_Terminal",
+            TMPDIR: traceDirectory,
           },
           stderrPath,
           width: 120,
           height: 40,
         });
         await session.waitForComposer(10_000);
+        const cacheName = createHash("sha256").update(workspace).update("\0").digest("hex") + ".idx";
+        const selectedCache = join(stateHome, ".fx", "file-index", cacheName);
+        const ambientCache = join(home, ".fx", "file-index", cacheName);
+        const cacheDeadline = Date.now() + 5_000;
+        while (!existsSync(selectedCache) && !existsSync(ambientCache) && Date.now() < cacheDeadline) {
+          await new Promise(resolve => setTimeout(resolve, 10));
+        }
+        const startupColors = await session.capturePaneEscapes();
+        expect({
+          selectedCache: existsSync(selectedCache),
+          ambientCache: existsSync(ambientCache),
+          selectedTheme: startupColors.includes("38;5;196"),
+          ambientTheme: startupColors.includes("38;5;46"),
+        }).toEqual({ selectedCache: true, ambientCache: false, selectedTheme: true, ambientTheme: false });
         await waitForPath(mcpEnvironmentPath);
         await waitForPath(mcpPidPath);
         mcpPid = Number(readFileSync(mcpPidPath, "utf8").trim());
@@ -1171,6 +1211,17 @@ describe.skipIf(SKIP_TMUX)("tui: selected state root", () => {
         );
         expect(mcpEnvironment.home).toBe(home);
         expect(existsSync(ambientMcpMarker)).toBe(false);
+        await session.waitForComposer(5_000);
+        await session.sendText("/trace");
+        let traceReport = "";
+        const traceDeadline = Date.now() + 5_000;
+        while (Date.now() < traceDeadline && !traceReport.includes("## Transcript Timeline")) {
+          const report = readdirSync(traceDirectory).find(name => name.startsWith("fx-trace-") && name.endsWith(".md"));
+          if (report) traceReport = readFileSync(join(traceDirectory, report), "utf8");
+          if (!traceReport.includes("## Transcript Timeline")) await new Promise(resolve => setTimeout(resolve, 10));
+        }
+        expect(traceReport).toContain("SELECTED_SHUTDOWN");
+        expect(traceReport).not.toContain("AMBIENT_SHUTDOWN");
 
         await session.waitForComposer(5_000);
         await session.sendText("/quit");
@@ -1178,6 +1229,9 @@ describe.skipIf(SKIP_TMUX)("tui: selected state root", () => {
         session = null;
         await waitForProcessExit(mcpPid);
         expect(readFileSync(stderrPath, "utf8")).toBe("");
+        const shutdown = JSON.parse(readFileSync(join(stateHome, ".fx", "diagnostics", "last-shutdown.json"), "utf8"));
+        expect(shutdown.stages.at(-1).name).toBe("complete");
+        expect(readFileSync(join(home, ".fx", "diagnostics", "last-shutdown.json"), "utf8")).toBe(ambientShutdown);
       } finally {
         if (session) {
           await session.kill();
