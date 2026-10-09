@@ -5,7 +5,9 @@ const js_host_stream_provider = @import("gateway/js_host_stream_provider.zig");
 const context_contract = @import("core/workspace/context_contract.zig");
 const gateway_provider = @import("core/gateway/gateway_provider.zig");
 const provider_set = @import("core/gateway/provider_set.zig");
+const agent_steps = @import("core/config/agent_steps.zig");
 const host = @import("core/hosts/host.zig");
+const js_host_attachments = @import("core/hosts/js_host_attachments.zig");
 const io_mod = @import("core/shared/io.zig");
 const model_catalog = @import("core/gateway/model_catalog.zig");
 const js_host_model_catalog = @import("gateway/js_host_model_catalog.zig");
@@ -31,7 +33,7 @@ pub fn main(init: std.process.Init) !void {
     io_mod.setEnvironMap(init.environ_map);
     try acp_server.run(std.heap.c_allocator, .{
         .default_model = builtin_gateway.default_model,
-        .default_agent_step_limit = 64,
+        .default_agent_step_limit = agent_steps.default_max_agent_steps,
         .gateway_retry_count = 0,
         .gateway_chat_url = builtin_gateway.default_chat_url,
         .gateway_models_path = builtin_gateway.models_path,
@@ -51,10 +53,14 @@ pub fn main(init: std.process.Init) !void {
         .mode_registry = builtin_modes.registry,
         .credential_override = io_mod.getenv("AI_GATEWAY_API_KEY"),
         .model_override = io_mod.getenv("FX_MODEL"),
+        .effort_override = io_mod.getenv("FX_EFFORT"),
+        .fast_override = fastOverrideFromEnv(io_mod.getenv("FX_FAST")),
+        .ultrafast_override = fastOverrideFromEnv(io_mod.getenv("FX_ULTRAFAST")),
         .workspace_root_override = "/",
         .allow_acp_mcp = false,
         .allow_native_tools = false,
         .minimal_kernel = true,
+        .host_attachments = js_host_attachments.store,
     });
 }
 
@@ -90,8 +96,18 @@ fn fetchCliModelCatalog(
     });
     return switch (result) {
         .loaded => |loaded| project: {
+            var catalog = loaded.catalog;
+            const ids = model_catalog.projectModelIds(alloc, catalog.items) catch {
+                model_catalog.freeModelCatalog(alloc, &catalog);
+                return .{ .failure = .{
+                    .access = loaded.provenance.access,
+                    .anonymous_fallback_used = loaded.provenance.anonymous_fallback_used,
+                    .failure = .{ .category = .resource_exhausted },
+                } };
+            };
             break :project .{ .loaded = .{
-                .catalog = loaded.catalog,
+                .ids = ids,
+                .entries = catalog,
                 .provenance = loaded.provenance,
             } };
         },
@@ -105,4 +121,13 @@ fn fetchCredits(
     _: gateway_provider.CreditsLookupInput,
 ) output_contracts.CreditsSnapshot {
     return .{};
+}
+
+/// Parses an FX_FAST or FX_ULTRAFAST host toggle: "true"/"1" enable the
+/// lane, "false"/"0" disable it, and anything else leaves the default in place.
+fn fastOverrideFromEnv(value: ?[]const u8) ?bool {
+    const raw = value orelse return null;
+    if (std.ascii.eqlIgnoreCase(raw, "true") or std.mem.eql(u8, raw, "1")) return true;
+    if (std.ascii.eqlIgnoreCase(raw, "false") or std.mem.eql(u8, raw, "0")) return false;
+    return null;
 }

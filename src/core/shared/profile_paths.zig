@@ -8,6 +8,11 @@ pub const chatgpt_auth_file_name = "chatgpt-auth.json";
 pub const grok_auth_file_name = "grok-auth.json";
 pub const api_key_file_name = "api-key";
 pub const sessions_dir_name = "sessions";
+/// Side folders older v2 sessions kept (D27): v1's per-session layout, one
+/// folder per session id. A session moves out on its first open (D47).
+pub const session_files_dir_name = "session-files";
+/// Hosted terminal state of v2 sessions, one folder per session id (D45).
+pub const terminal_dir_name = "terminal";
 pub const prompt_history_file_name = "history.jsonl";
 pub const usage_file_name = "usage.jsonl";
 pub const usage_recovery_dir_name = "usage-recovery";
@@ -91,6 +96,13 @@ pub fn logsDir(alloc: Allocator, home: []const u8) ![]u8 {
 
 pub fn traceLogPath(alloc: Allocator, home: []const u8) ![]u8 {
     return std.fs.path.join(alloc, &.{ home, root_dir_name, logs_dir_name, trace_log_file_name });
+}
+
+pub const diagnostics_dir_name = "diagnostics";
+pub const last_shutdown_report_file_name = "last-shutdown.json";
+
+pub fn lastShutdownReportPath(alloc: Allocator, home: []const u8) ![]u8 {
+    return std.fs.path.join(alloc, &.{ home, root_dir_name, diagnostics_dir_name, last_shutdown_report_file_name });
 }
 
 pub fn recordingsDir(alloc: Allocator, home: []const u8) ![]u8 {

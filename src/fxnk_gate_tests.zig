@@ -43,6 +43,7 @@ test {
     _ = @import("core/session/session_log.zig");
     _ = @import("core/session/session_naming.zig");
     _ = @import("core/skills/skill_runtime.zig");
+    _ = @import("core/subagent/tool_host.zig");
     _ = @import("core/subagent/approval_registry.zig");
     _ = @import("core/tooling/tool_runtime.zig");
     _ = @import("core/tooling/tool_selection.zig");

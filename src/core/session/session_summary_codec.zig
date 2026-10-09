@@ -143,7 +143,7 @@ pub fn sessionListPageFromSummaries(
     return page;
 }
 
-fn summaryFollowsContinuation(
+pub fn summaryFollowsContinuation(
     summary: SessionSummary,
     continuation: ResumableSessionContinuation,
 ) bool {

@@ -1,5 +1,6 @@
 const std = @import("std");
 
+pub const mcp_add_usage = "mcp add slack | mcp add NAME COMMAND [ARGS...] | mcp add --transport http NAME URL";
 pub const mcp_auth_usage = "mcp auth NAME";
 const display_width = @import("../shared/display_width.zig");
 const list_window = @import("../shared/list_window.zig");
@@ -19,6 +20,7 @@ pub const TopLevelKind = enum {
     status,
     permissions,
     mcp,
+    slack,
     models,
     provider,
     doctor,
@@ -40,7 +42,6 @@ pub const SlashKind = enum {
     new_session,
     reset_session,
     resume_session,
-    continue_recovery,
     rename_session,
     help,
     login,
@@ -66,9 +67,11 @@ pub const SlashKind = enum {
     credits,
     paste,
     fast,
+    ultrafast,
     statusline,
     notifications,
     workspace,
+    shell,
     version,
 };
 
@@ -1588,12 +1591,10 @@ test "rendered top-level help is a complete CLI navigation page" {
     try std.testing.expect(std.mem.find(u8, text, "Set name=bytes|off; repeatable") != null);
     try std.testing.expect(std.mem.find(u8, text, "--add-dir <path>") != null);
     try std.testing.expect(std.mem.find(u8, text, "--no-native-tools") != null);
-    try std.testing.expect(std.mem.find(u8, text, "--permissions-file <path>") != null);
-    try std.testing.expect(std.mem.find(u8, text, "--no-project-instructions") != null);
-    try std.testing.expect(std.mem.find(u8, text, "--state-dir <path>") != null);
+    try std.testing.expect(std.mem.find(u8, text, "--tool <name>") != null);
     try std.testing.expect(std.mem.find(u8, text, "--skills-dir <path>") != null);
     try std.testing.expect(std.mem.find(u8, text, "--no-default-skills") != null);
-    try std.testing.expect(std.mem.find(u8, text, "--tool <name>") != null);
+    try std.testing.expect(std.mem.find(u8, text, "--no-project-instructions") != null);
     try std.testing.expect(std.mem.find(u8, text, "-c, --continue") != null);
     try std.testing.expect(std.mem.find(u8, text, "-r") != null);
     try std.testing.expect(std.mem.find(u8, text, "-c, -r, --continue") == null);
@@ -1656,17 +1657,15 @@ test "top-level help renders flags as compact aligned rows" {
     const narrow = try renderTopLevelHelp(std.testing.allocator, testTopLevelRegistry(), 60, "9.8.7");
     defer std.testing.allocator.free(narrow);
 
-    try std.testing.expect(lineContainsBoth(wide, "--skills-dir <path>", "Load an invocation skill root; repeatable"));
     try std.testing.expect(lineContainsBoth(wide, "--system-prompt-file <path>", "Replace launch system prompt"));
     try std.testing.expect(lineContainsBoth(wide, "--append-system-prompt-file <path>", "Append UTF-8 system prompt"));
+    try std.testing.expect(lineContainsBoth(wide, "--skills-dir <path>", "Load an invocation skill root; repeatable"));
     try std.testing.expect(lineContainsBoth(wide, "--context-limit <spec>", "Set name=bytes|off; repeatable"));
     try std.testing.expect(lineContainsBoth(wide, "--add-dir <path>", "Add a workspace directory; repeatable"));
     try std.testing.expect(lineContainsBoth(wide, "--no-native-tools", "Disable native tools for TUI or ACP"));
-    try std.testing.expect(lineContainsBoth(wide, "--permissions-file <path>", "Replace configured rules for TUI or ACP"));
-    try std.testing.expect(lineContainsBoth(wide, "--no-project-instructions", "Ignore repository instructions for TUI or ACP"));
-    try std.testing.expect(lineContainsBoth(wide, "--state-dir <path>", "Use an isolated Fx profile and prompt for TUI or ACP"));
-    try std.testing.expect(lineContainsBoth(wide, "--no-default-skills", "Use only --skills-dir roots"));
     try std.testing.expect(lineContainsBoth(wide, "--tool <name>", "Allow only this native tool; repeatable"));
+    try std.testing.expect(lineContainsBoth(wide, "--no-default-skills", "Use only --skills-dir roots"));
+    try std.testing.expect(lineContainsBoth(wide, "--no-project-instructions", "Ignore repository instructions for TUI or ACP"));
     try std.testing.expect(lineContainsBoth(wide, "-c, --continue", "Resume the remembered workspace session"));
     try std.testing.expect(lineContainsBoth(wide, "-r", "Open the saved-session picker"));
     try std.testing.expect(lineContainsBoth(wide, "--resume [last|<id>]", "Resume the latest workspace session or an exact ID"));
@@ -1724,12 +1723,11 @@ test "ACP help documents ACP-specific accepted options" {
     defer std.testing.allocator.free(text);
 
     try std.testing.expect(std.mem.find(u8, text, "fx acp\n") != null);
-    try std.testing.expect(std.mem.find(u8, text, "Usage:\n  fx acp [--model <id>] [--effort <name>] [--log-file <path>] [--no-acp-mcp]") != null);
+    try std.testing.expect(std.mem.find(u8, text, "Usage:\n  fx acp [--model <id>] [--effort <name>] [--ultrafast|--no-ultrafast] [--log-file <path>] [--no-acp-mcp]") != null);
     try std.testing.expect(std.mem.find(u8, text, "--model <id>") != null);
     try std.testing.expect(std.mem.find(u8, text, "--effort <name>") != null);
     try std.testing.expect(std.mem.find(u8, text, "--log-file <path>") != null);
     try std.testing.expect(std.mem.find(u8, text, "--no-native-tools") == null);
-    try std.testing.expect(std.mem.find(u8, text, "--permissions-file") == null);
     try std.testing.expect(std.mem.find(u8, text, "--no-acp-mcp") != null);
     try std.testing.expect(std.mem.find(u8, text, "--no-project-instructions") == null);
 }
@@ -1807,7 +1805,7 @@ test "slash completion categories follow canonical entries" {
 test "help catalog groups visible commands and searches all command metadata" {
     const registry = testSlashRegistry();
 
-    try std.testing.expectEqual(@as(usize, 35), helpCatalogCount(registry, ""));
+    try std.testing.expectEqual(@as(usize, 36), helpCatalogCount(registry, ""));
     try std.testing.expectEqualStrings("/help", helpCatalogSpecAt(registry, "", 0).?.command);
     try std.testing.expectEqual(@as(usize, 5), helpCatalogCategoryCount(registry, "", .general));
     try std.testing.expectEqual(@as(usize, 3), helpCatalogCount(registry, "appearance"));
@@ -2177,3 +2175,18 @@ test "top-level help lines fit representative terminal widths" {
         try expectAllLinesFit(text, width);
     }
 }
+
+pub const slack_install_spec: TopLevelSpec = .{
+    .kind = .slack,
+    .token = "slack",
+    .usage = "slack <install|status|refresh> [--json]",
+    .summary = "Install and manage the workspace Slack bot locally",
+    .options = &.{.{ .flag = "--json", .description = "Emit installation metadata without credentials" }},
+    .details = &.{
+        "install opens Slack authorization through fx.sh and saves the bot credentials on this computer.",
+        "status shows local installation metadata; refresh renews tokens without browser authorization.",
+        "This is a workspace bot installer. Employee MCP login remains fx mcp auth NAME.",
+        "Credentials are saved in ~/.fx/slack/installation.json with owner-only permissions.",
+        "Refresh runs only when requested; no background service is installed.",
+    },
+};

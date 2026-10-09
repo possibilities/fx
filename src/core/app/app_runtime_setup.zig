@@ -28,30 +28,28 @@ pub fn resolveSkillsHome(alloc: Allocator) Allocator.Error!?[]u8 {
     };
 }
 
+/// The managed skills directory under the configured HOME, or null without
+/// one. The caller owns the returned path.
+pub fn resolveManagedSkillsDir(alloc: Allocator) Allocator.Error!?[]u8 {
+    const home = (try resolveSkillsHome(alloc)) orelse return null;
+    defer alloc.free(home);
+    return try profile_paths.managedSkillsDir(alloc, home);
+}
+
 pub fn loadSkills(
     alloc: Allocator,
     workspace_root: []const u8,
+    invocation_skill_roots: []const []const u8,
     root_policy: skill_contract.RootPolicy,
 ) LoadSkillsError!LoadedSkills {
-    const configured_home = io_mod.getenv("HOME") orelse {
-        const discovery = try skill_runtime.loadVisibleSkillsWithHomes(
-            alloc,
-            workspace_root,
-            null,
-            null,
-            "",
-            root_policy,
-        );
-        return .{
-            .skills = discovery.skills,
-            .diagnostics = discovery.diagnostics,
-        };
-    };
+    const configured_home = io_mod.getenv("HOME");
+    if (configured_home == null and invocation_skill_roots.len == 0) return .{};
     return loadSkillsFromHomes(
         alloc,
         workspace_root,
         configured_home,
         configured_home,
+        invocation_skill_roots,
         root_policy,
     );
 }
@@ -59,7 +57,8 @@ pub fn loadSkills(
 pub fn loadSkillsFromHome(
     alloc: Allocator,
     workspace_root: []const u8,
-    configured_home: []const u8,
+    configured_home: ?[]const u8,
+    invocation_skill_roots: []const []const u8,
     root_policy: skill_contract.RootPolicy,
 ) LoadSkillsError!LoadedSkills {
     return loadSkillsFromHomes(
@@ -67,6 +66,7 @@ pub fn loadSkillsFromHome(
         workspace_root,
         io_mod.getenv("HOME"),
         configured_home,
+        invocation_skill_roots,
         root_policy,
     );
 }
@@ -75,13 +75,14 @@ fn loadSkillsFromHomes(
     alloc: Allocator,
     workspace_root: []const u8,
     workspace_home: ?[]const u8,
-    configured_home: []const u8,
+    configured_home: ?[]const u8,
+    invocation_skill_roots: []const []const u8,
     root_policy: skill_contract.RootPolicy,
 ) LoadSkillsError!LoadedSkills {
-    const canonical_home = io_mod.realpathAlloc(alloc, configured_home) catch |err| switch (err) {
+    const canonical_home = if (configured_home) |value| io_mod.realpathAlloc(alloc, value) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         else => null,
-    };
+    } else null;
     defer if (canonical_home) |home| alloc.free(home);
     const home = canonical_home orelse configured_home;
     const canonical_workspace_home = if (workspace_home) |value|
@@ -93,15 +94,18 @@ fn loadSkillsFromHomes(
         null;
     defer if (canonical_workspace_home) |value| alloc.free(value);
     const workspace_home_root = canonical_workspace_home orelse workspace_home;
-    const dir = try profile_paths.managedSkillsDir(alloc, home);
+    const dir = if (home) |value| try profile_paths.managedSkillsDir(alloc, value) else try alloc.dupe(u8, "");
     errdefer alloc.free(dir);
+    var effective_policy = root_policy;
+    if (home == null) effective_policy.managed_root_source = null;
     const discovery = try skill_runtime.loadVisibleSkillsWithHomes(
         alloc,
         workspace_root,
         workspace_home_root,
         home,
         dir,
-        root_policy,
+        invocation_skill_roots,
+        effective_policy,
     );
 
     return .{
@@ -185,7 +189,7 @@ test "loadSkills returns empty defaults when HOME is missing" {
     const home = try TestHome.install(alloc, null);
     defer home.deinit();
 
-    var loaded = try loadSkills(alloc, "/tmp/workspace", test_root_policy);
+    var loaded = try loadSkills(alloc, "/tmp/workspace", &.{}, test_root_policy);
     defer loaded.deinit(alloc);
 
     try std.testing.expectEqual(@as(usize, 0), loaded.dir.len);
@@ -224,10 +228,7 @@ test "loadSkills discovers ordered invocation roots when HOME is missing" {
     const home = try TestHome.install(alloc, null);
     defer home.deinit();
 
-    var loaded = try loadSkills(alloc, workspace, .{
-        .invocation_roots = &roots,
-        .managed_root_source = .global_fx,
-    });
+    var loaded = try loadSkills(alloc, workspace, &roots, test_root_policy);
     defer loaded.deinit(alloc);
 
     try std.testing.expectEqual(@as(usize, 0), loaded.dir.len);
@@ -262,7 +263,7 @@ test "loadSkills loads managed skills under HOME" {
     const home = try TestHome.install(alloc, home_path);
     defer home.deinit();
 
-    var loaded = try loadSkills(alloc, workspace_path, test_root_policy);
+    var loaded = try loadSkills(alloc, workspace_path, &.{}, test_root_policy);
     defer loaded.deinit(alloc);
 
     const expected_dir = try profile_paths.managedSkillsDir(alloc, home_path);
@@ -324,6 +325,7 @@ test "selected skill profile preserves workspace roots without ambient global ro
         alloc,
         workspace,
         selected_home,
+        &.{},
         test_split_home_root_policy,
     );
     defer loaded.deinit(alloc);
@@ -366,7 +368,7 @@ test "loadSkills canonicalizes a symlinked HOME before discovering optional root
     const home = try TestHome.install(alloc, linked_home);
     defer home.deinit();
 
-    var loaded = try loadSkills(alloc, workspace_path, test_root_policy);
+    var loaded = try loadSkills(alloc, workspace_path, &.{}, test_root_policy);
     defer loaded.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 0), loaded.skills.len);
     try std.testing.expectEqual(@as(usize, 0), loaded.diagnostics.len);
@@ -388,6 +390,6 @@ test "loadSkills propagates allocation failure instead of returning an empty inv
     var failing = std.testing.FailingAllocator.init(alloc, .{ .fail_index = 0 });
     try std.testing.expectError(
         error.OutOfMemory,
-        loadSkills(failing.allocator(), workspace_path, test_root_policy),
+        loadSkills(failing.allocator(), workspace_path, &.{}, test_root_policy),
     );
 }

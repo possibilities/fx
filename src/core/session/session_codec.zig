@@ -1,8 +1,10 @@
 const std = @import("std");
+const image_attachments = @import("../images/image_attachments.zig");
 const image_data = @import("../images/image_data.zig");
 const session = @import("session.zig");
 const session_usage = @import("session_usage.zig");
 const session_permission_state = @import("../permissions/session_permission_state.zig");
+const mem_utils = @import("../shared/mem_utils.zig");
 const types = @import("../shared/types.zig");
 const captured_command = @import("../tooling/captured_command.zig");
 const model_provider = @import("../config/model_provider.zig");
@@ -18,6 +20,7 @@ pub const DurableSessionPreferences = struct {
     model: []u8,
     effort: types.ReasoningEffort,
     fast_mode: bool,
+    ultrafast_mode: bool = false,
 
     pub fn deinit(self: *DurableSessionPreferences, alloc: Allocator) void {
         alloc.free(self.model);
@@ -30,6 +33,7 @@ pub const DurableSessionPreferences = struct {
             .model = try alloc.dupe(u8, self.model),
             .effort = self.effort,
             .fast_mode = self.fast_mode,
+            .ultrafast_mode = self.ultrafast_mode,
         };
     }
 };
@@ -38,10 +42,19 @@ pub const DurableSessionPreferences = struct {
 pub fn parse_preferences(alloc: Allocator, value: std.json.Value) !DurableSessionPreferences {
     const raw = try requireObject(value);
     const legacy = raw.contains("connection_id") or raw.contains("model_id");
+    const has_ultrafast_mode = raw.contains("ultrafast_mode");
     const object = if (legacy)
-        try exactObject(value, &.{ "connection_id", "model_id", "effort", "fast_mode" })
+        if (has_ultrafast_mode)
+            try exactObject(value, &.{ "connection_id", "model_id", "effort", "fast_mode", "ultrafast_mode" })
+        else
+            try exactObject(value, &.{ "connection_id", "model_id", "effort", "fast_mode" })
     else if (raw.contains("provider"))
-        try exactObject(value, &.{ "provider", "model", "effort", "fast_mode" })
+        if (has_ultrafast_mode)
+            try exactObject(value, &.{ "provider", "model", "effort", "fast_mode", "ultrafast_mode" })
+        else
+            try exactObject(value, &.{ "provider", "model", "effort", "fast_mode" })
+    else if (has_ultrafast_mode)
+        try exactObject(value, &.{ "model", "effort", "fast_mode", "ultrafast_mode" })
     else
         try exactObject(value, &.{ "model", "effort", "fast_mode" });
     const provider: model_provider.ProviderId = if (legacy) blk: {
@@ -55,7 +68,8 @@ pub fn parse_preferences(alloc: Allocator, value: std.json.Value) !DurableSessio
     try validateModel(model);
     const effort = types.ReasoningEffort.parse(try requireString(object, "effort")) orelse return error.InvalidDurableField;
     const fast_mode = try requireBool(object, "fast_mode");
-    return .{ .provider = provider, .model = try alloc.dupe(u8, model), .effort = effort, .fast_mode = fast_mode };
+    const ultrafast_mode = if (has_ultrafast_mode) try requireBool(object, "ultrafast_mode") else false;
+    return .{ .provider = provider, .model = try alloc.dupe(u8, model), .effort = effort, .fast_mode = fast_mode, .ultrafast_mode = ultrafast_mode };
 }
 
 test "legacy connection preferences decode through the shared state codec" {
@@ -166,6 +180,8 @@ pub const RecoveryCheckpoint = struct {
     authority: TurnAuthority,
     requested_fast_mode: bool,
     fast_mode: bool,
+    requested_ultrafast_mode: bool = false,
+    ultrafast_mode: bool = false,
     max_provider_attempts: usize,
     consumed_provider_attempts: usize,
     outstanding_reservation: bool = false,
@@ -209,6 +225,8 @@ pub const RecoveryCheckpoint = struct {
             .authority = authority,
             .requested_fast_mode = self.requested_fast_mode,
             .fast_mode = self.fast_mode,
+            .requested_ultrafast_mode = self.requested_ultrafast_mode,
+            .ultrafast_mode = self.ultrafast_mode,
             .max_provider_attempts = self.max_provider_attempts,
             .consumed_provider_attempts = self.consumed_provider_attempts,
             .outstanding_reservation = self.outstanding_reservation,
@@ -353,6 +371,8 @@ pub const SessionMetadata = struct {
     model: []const u8,
     effort: []const u8,
     fast_mode: bool,
+    /// Omitted when false so schema-v4 headers remain readable by old binaries.
+    ultrafast_mode: ?bool = null,
     title: ?[]const u8 = null,
     subagent_child: bool = false,
     /// The shape and credential that created this conversation. Absent for a
@@ -438,7 +458,11 @@ pub fn encodeSessionMetadata(
     try validateSessionMetadata(metadata);
     var out: std.Io.Writer.Allocating = .init(alloc);
     errdefer out.deinit();
-    try std.json.Stringify.value(metadata, .{}, &out.writer);
+    try std.json.Stringify.value(
+        metadata,
+        .{ .emit_null_optional_fields = false },
+        &out.writer,
+    );
     if (out.written().len == 0 or out.written().len > max_session_metadata_bytes) {
         return error.SessionMetadataTooLarge;
     }
@@ -598,15 +622,21 @@ pub fn parseDurableBytes(alloc: Allocator, value: std.json.Value) ![]u8 {
                 return error.InvalidDurableBytes;
             if (std.unicode.utf8ValidateSlice(decoded)) return error.InvalidDurableBytes;
 
-            const canonical_len = std.base64.standard.Encoder.calcSize(decoded.len);
-            const canonical = try alloc.alloc(u8, canonical_len);
-            defer alloc.free(canonical);
-            const written = std.base64.standard.Encoder.encode(canonical, decoded);
-            if (!std.mem.eql(u8, written, encoded)) return error.InvalidDurableBytes;
             return decoded;
         },
         else => return error.InvalidDurableBytes,
     }
+}
+
+test "durable binary decoding uses only decoded storage" {
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, "{\"encoding\":\"base64\",\"data\":\"/w==\"}", .{});
+    defer parsed.deinit();
+    var storage: [1]u8 = undefined;
+    var fixed = std.heap.FixedBufferAllocator.init(&storage);
+    const alloc = fixed.allocator();
+    const decoded = try parseDurableBytes(alloc, parsed.value);
+    defer alloc.free(decoded);
+    try std.testing.expectEqualSlices(u8, "\xff", decoded);
 }
 
 pub fn encodeState(state: DurableSessionState, writer: *std.Io.Writer) !EncodeSummary {
@@ -642,7 +672,49 @@ fn decodeStateWithUsageContract(alloc: Allocator, source: *std.Io.Reader, limits
     };
 }
 
+/// Collects inline image bytes outside the JSON. Durable session files embed
+/// those bytes; the libfx kernel checkpoint stores them raw in its blob
+/// section and writes each image's blob index instead.
+pub const ImageBlobs = struct {
+    alloc: Allocator,
+    items: *std.ArrayList([]const u8),
+};
+
+/// Hands out a libfx kernel checkpoint's raw image blobs in the order
+/// `ImageBlobs` collected them. Each image must name the next unread blob, so a
+/// checkpoint cannot decode one blob into many images.
+pub const ImageBlobReader = struct {
+    blobs: []const []const u8,
+    next: usize = 0,
+
+    fn take(self: *ImageBlobReader, index: usize) ![]const u8 {
+        if (index != self.next or index >= self.blobs.len) return error.InvalidSessionFormat;
+        self.next += 1;
+        return self.blobs[index];
+    }
+
+    pub fn consumedAll(self: ImageBlobReader) bool {
+        return self.next == self.blobs.len;
+    }
+};
+
 pub fn writeHistoryTurn(writer: *std.Io.Writer, turn: session.HistoryTurn) !void {
+    return writeHistoryTurnTo(writer, turn, {});
+}
+
+/// Like `writeHistoryTurn`, but appends inline image bytes to `image_blobs`
+/// and writes their indexes. The appended slices borrow from `turn`.
+pub fn writeHistoryTurnWithImageBlobs(
+    writer: *std.Io.Writer,
+    turn: session.HistoryTurn,
+    image_blobs: ImageBlobs,
+) !void {
+    return writeHistoryTurnTo(writer, turn, image_blobs);
+}
+
+/// `image_blobs` is `void` to embed inline image bytes or `ImageBlobs` to
+/// collect them. The choice is comptime so durable writers keep their error set.
+fn writeHistoryTurnTo(writer: *std.Io.Writer, turn: session.HistoryTurn, image_blobs: anytype) !void {
     switch (turn) {
         .compacted_summary => |entry| {
             try writer.writeAll("{\"kind\":\"compacted_summary\",\"summary\":");
@@ -655,23 +727,23 @@ pub fn writeHistoryTurn(writer: *std.Io.Writer, turn: session.HistoryTurn) !void
         },
         .assistant => |entry| {
             try writer.writeAll("{\"kind\":\"assistant\",\"user\":");
-            try writeUserTurn(writer, entry.user);
+            try writeUserTurn(writer, entry.user, image_blobs);
             try writer.writeAll(",\"assistant\":");
             try writeDurableBytes(writer, entry.assistant);
             try writer.writeAll(",\"provider_replay\":");
             try std.json.Stringify.value(entry.provider_replay, .{}, writer);
             try writer.writeAll(",\"execution\":");
-            try writeExecutionMemory(writer, entry.execution);
+            try writeExecutionMemoryJson(writer, entry.execution, .durable);
             try writer.writeByte('}');
         },
         .interrupted => |entry| {
             try writer.writeAll("{\"kind\":\"interrupted\",\"user\":");
-            try writeUserTurn(writer, entry.user);
+            try writeUserTurn(writer, entry.user, image_blobs);
             try writer.writeAll(",\"assistant\":");
             try writeOptionalDurableBytes(writer, entry.assistant);
             try writer.writeAll(",\"tool_call\":");
             if (entry.tool_call) |tool_call| {
-                try writeToolCall(writer, tool_call);
+                try writeExecutionToolCall(writer, tool_call, .durable);
             } else {
                 try writer.writeAll("null");
             }
@@ -688,7 +760,7 @@ pub fn writeHistoryTurn(writer: *std.Io.Writer, turn: session.HistoryTurn) !void
             }
             if (hasDurableExecutionMemory(entry.execution)) {
                 try writer.writeAll(",\"execution\":");
-                try writeExecutionMemory(writer, entry.execution);
+                try writeExecutionMemoryJson(writer, entry.execution, .durable);
             }
             if (entry.cancelled_command) |presentation| {
                 try writer.writeAll(",\"cancelled_command\":");
@@ -723,6 +795,16 @@ fn formatLegacyBackgroundAssistant(
 }
 
 pub fn parseHistoryTurn(alloc: Allocator, value: std.json.Value) !session.HistoryTurn {
+    return parseHistoryTurnWithImageBlobs(alloc, value, null);
+}
+
+/// Like `parseHistoryTurn`, but resolves `inline_blob` image references
+/// against `image_blobs`, the raw blob section of a libfx kernel checkpoint.
+pub fn parseHistoryTurnWithImageBlobs(
+    alloc: Allocator,
+    value: std.json.Value,
+    image_blobs: ?*ImageBlobReader,
+) !session.HistoryTurn {
     const kind = try requireString(try requireObject(value), "kind");
     if (std.mem.eql(u8, kind, "compacted_summary")) {
         const raw_object = try requireObject(value);
@@ -742,7 +824,7 @@ pub fn parseHistoryTurn(alloc: Allocator, value: std.json.Value) !session.Histor
         else
             try exactObject(value, &.{ "kind", "summary", "removed_turn_count", "compaction_count" });
         const summary = try parseRequiredDurableBytes(alloc, object, "summary");
-        errdefer alloc.free(summary);
+        errdefer mem_utils.free(alloc, summary);
         const root_user_messages: [][]u8 = if (has_root_user_messages)
             try parseDurableBytesArray(
                 alloc,
@@ -779,10 +861,10 @@ pub fn parseHistoryTurn(alloc: Allocator, value: std.json.Value) !session.Histor
     if (std.mem.eql(u8, kind, "assistant")) {
         const shape = try exactVariantObject(value, &.{ "kind", "user", "assistant", "execution" }, &.{ "kind", "user", "assistant", "execution", "provider_replay" });
         const object = shape.object;
-        const user = try parseUserTurn(alloc, object.get("user") orelse return error.InvalidSessionFormat);
+        const user = try parseUserTurn(alloc, object.get("user") orelse return error.InvalidSessionFormat, image_blobs);
         errdefer session.freeUserTurn(alloc, user);
         const assistant = try parseRequiredDurableBytes(alloc, object, "assistant");
-        errdefer alloc.free(assistant);
+        errdefer mem_utils.free(alloc, assistant);
         const execution = try parseExecutionMemory(alloc, object.get("execution") orelse return error.InvalidSessionFormat);
         errdefer session.freeExecutionMemory(alloc, execution);
         const replay = try parseProviderReplay(alloc, object.get("provider_replay") orelse .null);
@@ -800,22 +882,22 @@ pub fn parseHistoryTurn(alloc: Allocator, value: std.json.Value) !session.Histor
             &.{ "kind", "user", "log_path", "expect_url", "url", "background_record_id", "assistant", "execution" },
         );
         const object = shape.object;
-        const user = try parseUserTurn(alloc, object.get("user") orelse return error.InvalidSessionFormat);
+        const user = try parseUserTurn(alloc, object.get("user") orelse return error.InvalidSessionFormat, image_blobs);
         errdefer session.freeUserTurn(alloc, user);
         const legacy_assistant = if (shape.extended)
             try parseOptionalDurableBytes(alloc, object.get("assistant") orelse return error.InvalidSessionFormat)
         else
             null;
-        defer if (legacy_assistant) |owned| alloc.free(owned);
+        defer if (legacy_assistant) |owned| mem_utils.free(alloc, owned);
         const execution = if (shape.extended)
             try parseExecutionMemory(alloc, object.get("execution") orelse return error.InvalidSessionFormat)
         else
             session.ExecutionMemory{};
         errdefer session.freeExecutionMemory(alloc, execution);
         const log_path = try parseRequiredDurableBytes(alloc, object, "log_path");
-        defer alloc.free(log_path);
+        defer mem_utils.free(alloc, log_path);
         const url = try parseOptionalDurableBytes(alloc, object.get("url") orelse return error.InvalidSessionFormat);
-        defer if (url) |owned| alloc.free(owned);
+        defer if (url) |owned| mem_utils.free(alloc, owned);
         _ = try requireBool(object, "expect_url");
         _ = try parseOptionalIdentifier(object.get("background_record_id") orelse return error.InvalidSessionFormat);
         const assistant = try formatLegacyBackgroundAssistant(
@@ -843,10 +925,10 @@ pub fn parseHistoryTurn(alloc: Allocator, value: std.json.Value) !session.Histor
             has_terminal_reason,
             has_cancellation_origin,
         );
-        const user = try parseUserTurn(alloc, object.get("user") orelse return error.InvalidSessionFormat);
+        const user = try parseUserTurn(alloc, object.get("user") orelse return error.InvalidSessionFormat, image_blobs);
         errdefer session.freeUserTurn(alloc, user);
         const assistant = try parseOptionalDurableBytes(alloc, object.get("assistant") orelse return error.InvalidSessionFormat);
-        errdefer if (assistant) |owned| alloc.free(owned);
+        errdefer if (assistant) |owned| mem_utils.free(alloc, owned);
         const tool_call = try parseOptionalToolCall(alloc, object.get("tool_call") orelse return error.InvalidSessionFormat);
         errdefer if (tool_call) |call| session.freeToolCall(alloc, call);
         const completed_tool_names = try parseDurableBytesArray(
@@ -1000,9 +1082,13 @@ fn writeState(writer: *std.Io.Writer, state: DurableSessionState) !void {
     try writeJsonString(writer, state.preferences.model);
     try writer.writeAll(",\"effort\":");
     try writeJsonString(writer, state.preferences.effort.label());
-    try writer.print(",\"fast_mode\":{s},\"provider\":", .{
+    try writer.print(",\"fast_mode\":{s}", .{
         if (state.preferences.fast_mode) "true" else "false",
     });
+    if (state.preferences.ultrafast_mode) {
+        try writer.writeAll(",\"ultrafast_mode\":true");
+    }
+    try writer.writeAll(",\"provider\":");
     try std.json.Stringify.value(state.preferences.provider, .{}, writer);
     try writer.writeAll("},\"history\":[");
     for (state.history, 0..) |turn, i| {
@@ -1176,11 +1262,11 @@ pub fn writeRecoveryCheckpoint(writer: *std.Io.Writer, checkpoint: RecoveryCheck
         checkpoint.version,
         checkpoint.turn_id,
     });
-    try writeUserTurn(writer, checkpoint.user);
+    try writeUserTurn(writer, checkpoint.user, {});
     try writer.writeAll(",\"assistant_source\":");
     try writeDurableBytes(writer, checkpoint.assistant_source);
     try writer.writeAll(",\"execution\":");
-    try writeExecutionMemory(writer, checkpoint.execution);
+    try writeExecutionMemoryJson(writer, checkpoint.execution, .durable);
     try writer.writeAll(",\"cause\":");
     try writeJsonString(writer, @tagName(checkpoint.cause));
     try writer.writeAll(",\"action\":");
@@ -1204,13 +1290,190 @@ pub fn writeRecoveryCheckpoint(writer: *std.Io.Writer, checkpoint: RecoveryCheck
         try writeShapeAuthorityFields(writer, shape);
     }
     try writer.writeByte('}');
-    try writer.print(",\"requested_fast_mode\":{s},\"fast_mode\":{s},\"max_provider_attempts\":{d},\"consumed_provider_attempts\":{d},\"outstanding_reservation\":{s}}}", .{
+    try writer.print(",\"requested_fast_mode\":{s},\"fast_mode\":{s}", .{
         if (checkpoint.requested_fast_mode) "true" else "false",
         if (checkpoint.fast_mode) "true" else "false",
+    });
+    // Old readers exact-match the v2 checkpoint keys. Keep the optional pair
+    // absent at its all-false default, but preserve both values once either
+    // reports an Ultra selection.
+    if (checkpoint.requested_ultrafast_mode or checkpoint.ultrafast_mode) {
+        try writer.print(",\"requested_ultrafast_mode\":{s},\"ultrafast_mode\":{s}", .{
+            if (checkpoint.requested_ultrafast_mode) "true" else "false",
+            if (checkpoint.ultrafast_mode) "true" else "false",
+        });
+    }
+    try writer.print(",\"max_provider_attempts\":{d},\"consumed_provider_attempts\":{d},\"outstanding_reservation\":{s}}}", .{
         checkpoint.max_provider_attempts,
         checkpoint.consumed_provider_attempts,
         if (checkpoint.outstanding_reservation) "true" else "false",
     });
+}
+
+const DecodedStateTail = struct {
+    total_input_tokens: u64,
+    total_output_tokens: u64,
+    context_history_start: usize,
+    permission_state: session_permission_state.State,
+    usage: ?session_usage.Snapshot,
+    last_subagent_work_id: ?[]u8,
+    subagent_child: bool,
+    recovery_checkpoint: ?RecoveryCheckpoint,
+    provenance: ?SessionProvenance,
+
+    fn deinit(self: *DecodedStateTail, alloc: Allocator) void {
+        if (self.recovery_checkpoint) |*checkpoint| checkpoint.deinit(alloc);
+        if (self.last_subagent_work_id) |work_id| mem_utils.free(alloc, work_id);
+        if (self.usage) |*snapshot| snapshot.deinit(alloc);
+        self.permission_state.deinit(alloc);
+        if (self.provenance) |*value| value.deinit(alloc);
+        self.* = undefined;
+    }
+};
+
+fn decodeHistory(
+    alloc: Allocator,
+    json_reader: *std.json.Reader,
+    limits: DecodeLimits,
+) ![]session.HistoryTurn {
+    try expectKey(json_reader, alloc, "history");
+    try expectToken(try json_reader.next(), .array_begin);
+    var history: std.ArrayList(session.HistoryTurn) = .empty;
+    errdefer {
+        for (history.items) |turn| session.freeHistoryTurn(alloc, turn);
+        mem_utils.deinitList(alloc, &history);
+    }
+    while (try json_reader.peekNextTokenType() != .array_end) {
+        if (history.items.len == limits.max_history_turns) {
+            return error.InvalidSessionFormat;
+        }
+        var arena = std.heap.ArenaAllocator.init(alloc);
+        defer arena.deinit();
+        const value = try std.json.Value.jsonParse(arena.allocator(), json_reader, .{
+            .max_value_len = limits.max_value_bytes,
+            .allocate = .alloc_always,
+            .parse_numbers = false,
+        });
+        const turn = try parseHistoryTurn(alloc, value);
+        errdefer session.freeHistoryTurn(alloc, turn);
+        try history.append(alloc, turn);
+    }
+    try expectToken(try json_reader.next(), .array_end);
+    return history.toOwnedSlice(alloc);
+}
+
+fn decodeStateTail(
+    alloc: Allocator,
+    json_reader: *std.json.Reader,
+    limits: DecodeLimits,
+    legacy_usage: bool,
+) !DecodedStateTail {
+    try expectKey(json_reader, alloc, "total_input_tokens");
+    const total_input_tokens = try readU64(json_reader, alloc);
+    try expectKey(json_reader, alloc, "total_output_tokens");
+    const total_output_tokens = try readU64(json_reader, alloc);
+    var context_history_start: usize = 0;
+    var context_seen = false;
+    var permission_state: session_permission_state.State = .{};
+    errdefer permission_state.deinit(alloc);
+    var permission_state_seen = false;
+    var usage: ?session_usage.Snapshot = null;
+    errdefer if (usage) |*snapshot| snapshot.deinit(alloc);
+    var usage_seen = false;
+    var last_subagent_work_id: ?[]u8 = null;
+    errdefer if (last_subagent_work_id) |work_id| mem_utils.free(alloc, work_id);
+    var subagent_child = false;
+    var subagent_child_seen = false;
+    var recovery_checkpoint: ?RecoveryCheckpoint = null;
+    errdefer if (recovery_checkpoint) |*checkpoint| checkpoint.deinit(alloc);
+    var provenance: ?SessionProvenance = null;
+    errdefer if (provenance) |*value| value.deinit(alloc);
+    while (try json_reader.peekNextTokenType() != .object_end) {
+        const key = try readStringOwned(json_reader, alloc, 64);
+        defer mem_utils.free(alloc, key);
+        if (std.mem.eql(u8, key, "context_history_start")) {
+            if (context_seen or permission_state_seen or usage_seen or last_subagent_work_id != null or subagent_child_seen or recovery_checkpoint != null or provenance != null) {
+                return error.InvalidSessionFormat;
+            }
+            const raw = try readU64(json_reader, alloc);
+            context_history_start = std.math.cast(usize, raw) orelse
+                return error.InvalidSessionFormat;
+            context_seen = true;
+        } else if (std.mem.eql(u8, key, "permission_state")) {
+            if (permission_state_seen or usage_seen or last_subagent_work_id != null or subagent_child_seen or recovery_checkpoint != null or provenance != null) {
+                return error.InvalidSessionFormat;
+            }
+            var arena = std.heap.ArenaAllocator.init(alloc);
+            defer arena.deinit();
+            const value = try std.json.Value.jsonParse(arena.allocator(), json_reader, .{
+                .max_value_len = limits.max_value_bytes,
+                .allocate = .alloc_always,
+                .parse_numbers = false,
+            });
+            permission_state = try parsePermissionState(alloc, value);
+            permission_state_seen = true;
+        } else if (std.mem.eql(u8, key, "usage")) {
+            if (usage_seen or last_subagent_work_id != null or subagent_child_seen or recovery_checkpoint != null or provenance != null) return error.InvalidSessionFormat;
+            const parse_limit = @min(
+                limits.max_value_bytes,
+                session_usage.max_snapshot_bytes,
+            );
+            const parse_buffer = try alloc.alloc(u8, parse_limit);
+            defer mem_utils.free(alloc, parse_buffer);
+            var fixed = std.heap.FixedBufferAllocator.init(parse_buffer);
+            const value = try std.json.Value.jsonParse(fixed.allocator(), json_reader, .{
+                .max_value_len = parse_limit,
+                .allocate = .alloc_always,
+                .parse_numbers = false,
+            });
+            usage = if (legacy_usage)
+                try session_usage.parseLegacySnapshotValue(alloc, value)
+            else
+                try session_usage.parseSnapshotValue(alloc, value);
+            usage_seen = true;
+        } else if (std.mem.eql(u8, key, "last_subagent_work_id")) {
+            if (last_subagent_work_id != null or subagent_child_seen or recovery_checkpoint != null or provenance != null) return error.InvalidSessionFormat;
+            last_subagent_work_id = try readStringOwned(json_reader, alloc, 128);
+        } else if (std.mem.eql(u8, key, "subagent_child")) {
+            if (subagent_child_seen or recovery_checkpoint != null or provenance != null) return error.InvalidSessionFormat;
+            subagent_child = try readBool(json_reader);
+            if (!subagent_child) return error.InvalidDurableField;
+            subagent_child_seen = true;
+        } else if (std.mem.eql(u8, key, "recovery_checkpoint")) {
+            if (recovery_checkpoint != null or provenance != null) return error.InvalidSessionFormat;
+            var arena = std.heap.ArenaAllocator.init(alloc);
+            defer arena.deinit();
+            const value = try std.json.Value.jsonParse(arena.allocator(), json_reader, .{
+                .max_value_len = limits.max_value_bytes,
+                .allocate = .alloc_always,
+                .parse_numbers = false,
+            });
+            recovery_checkpoint = try parseRecoveryCheckpoint(alloc, value);
+        } else if (std.mem.eql(u8, key, "provenance")) {
+            if (provenance != null) return error.InvalidSessionFormat;
+            var arena = std.heap.ArenaAllocator.init(alloc);
+            defer arena.deinit();
+            const value = try std.json.Value.jsonParse(arena.allocator(), json_reader, .{
+                .max_value_len = limits.max_value_bytes,
+                .allocate = .alloc_always,
+                .parse_numbers = false,
+            });
+            provenance = try parseSessionProvenance(alloc, value);
+        } else return error.InvalidSessionFormat;
+    }
+    try expectToken(try json_reader.next(), .object_end);
+    try expectToken(try json_reader.next(), .end_of_document);
+    return .{
+        .total_input_tokens = total_input_tokens,
+        .total_output_tokens = total_output_tokens,
+        .context_history_start = context_history_start,
+        .permission_state = permission_state,
+        .usage = usage,
+        .last_subagent_work_id = last_subagent_work_id,
+        .subagent_child = subagent_child,
+        .recovery_checkpoint = recovery_checkpoint,
+        .provenance = provenance,
+    };
 }
 
 fn decodeStateImpl(alloc: Allocator, source: *std.Io.Reader, limits: DecodeLimits, legacy_usage: bool) !DurableSessionState {
@@ -1220,20 +1483,20 @@ fn decodeStateImpl(alloc: Allocator, source: *std.Io.Reader, limits: DecodeLimit
     try expectToken(try json_reader.next(), .object_begin);
     try expectKey(&json_reader, alloc, "id");
     const id = try readStringOwned(&json_reader, alloc, 255);
-    errdefer alloc.free(id);
+    errdefer mem_utils.free(alloc, id);
     try expectKey(&json_reader, alloc, "origin_workspace_root");
     const origin_workspace_root = try readStringOwned(&json_reader, alloc, std.Io.Dir.max_path_bytes);
-    errdefer alloc.free(origin_workspace_root);
+    errdefer mem_utils.free(alloc, origin_workspace_root);
     try expectKey(&json_reader, alloc, "workspace_root");
     const workspace_root = try readStringOwned(&json_reader, alloc, std.Io.Dir.max_path_bytes);
-    errdefer alloc.free(workspace_root);
+    errdefer mem_utils.free(alloc, workspace_root);
     try expectKey(&json_reader, alloc, "created_at_ms");
     const created_at_ms = try readI64(&json_reader, alloc);
     try expectKey(&json_reader, alloc, "updated_at_ms");
     const updated_at_ms = try readI64(&json_reader, alloc);
     try expectKey(&json_reader, alloc, "conversation_language");
     const language_raw = try readStringOwned(&json_reader, alloc, session.ConversationLanguage.max_len);
-    defer alloc.free(language_raw);
+    defer mem_utils.free(alloc, language_raw);
     const conversation_language = try parseConversationLanguage(language_raw);
 
     try expectKey(&json_reader, alloc, "preferences");
@@ -1251,126 +1514,10 @@ fn decodeStateImpl(alloc: Allocator, source: *std.Io.Reader, limits: DecodeLimit
     };
     errdefer preferences.deinit(alloc);
 
-    try expectKey(&json_reader, alloc, "history");
-    try expectToken(try json_reader.next(), .array_begin);
-    var history: std.ArrayList(session.HistoryTurn) = .empty;
-    errdefer {
-        for (history.items) |turn| session.freeHistoryTurn(alloc, turn);
-        history.deinit(alloc);
-    }
-    while (try json_reader.peekNextTokenType() != .array_end) {
-        if (history.items.len == limits.max_history_turns) return error.InvalidSessionFormat;
-        var arena = std.heap.ArenaAllocator.init(alloc);
-        defer arena.deinit();
-        const value = try std.json.Value.jsonParse(arena.allocator(), &json_reader, .{
-            .max_value_len = limits.max_value_bytes,
-            .allocate = .alloc_always,
-            .parse_numbers = false,
-        });
-        const turn = try parseHistoryTurn(alloc, value);
-        errdefer session.freeHistoryTurn(alloc, turn);
-        try history.append(alloc, turn);
-    }
-    try expectToken(try json_reader.next(), .array_end);
-
-    try expectKey(&json_reader, alloc, "total_input_tokens");
-    const total_input_tokens = try readU64(&json_reader, alloc);
-    try expectKey(&json_reader, alloc, "total_output_tokens");
-    const total_output_tokens = try readU64(&json_reader, alloc);
-    var context_history_start: usize = 0;
-    var context_seen = false;
-    var permission_state: session_permission_state.State = .{};
-    errdefer permission_state.deinit(alloc);
-    var permission_state_seen = false;
-    var usage: ?session_usage.Snapshot = null;
-    errdefer if (usage) |*snapshot| snapshot.deinit(alloc);
-    var usage_seen = false;
-    var last_subagent_work_id: ?[]u8 = null;
-    errdefer if (last_subagent_work_id) |work_id| alloc.free(work_id);
-    var subagent_child = false;
-    var subagent_child_seen = false;
-    var recovery_checkpoint: ?RecoveryCheckpoint = null;
-    errdefer if (recovery_checkpoint) |*checkpoint| checkpoint.deinit(alloc);
-    var provenance: ?SessionProvenance = null;
-    errdefer if (provenance) |*value| value.deinit(alloc);
-    while (try json_reader.peekNextTokenType() != .object_end) {
-        const key = try readStringOwned(&json_reader, alloc, 64);
-        defer alloc.free(key);
-        if (std.mem.eql(u8, key, "context_history_start")) {
-            if (context_seen or permission_state_seen or usage_seen or last_subagent_work_id != null or subagent_child_seen or recovery_checkpoint != null or provenance != null) {
-                return error.InvalidSessionFormat;
-            }
-            const raw = try readU64(&json_reader, alloc);
-            context_history_start = std.math.cast(usize, raw) orelse
-                return error.InvalidSessionFormat;
-            context_seen = true;
-        } else if (std.mem.eql(u8, key, "permission_state")) {
-            if (permission_state_seen or usage_seen or last_subagent_work_id != null or subagent_child_seen or recovery_checkpoint != null or provenance != null) {
-                return error.InvalidSessionFormat;
-            }
-            var arena = std.heap.ArenaAllocator.init(alloc);
-            defer arena.deinit();
-            const value = try std.json.Value.jsonParse(arena.allocator(), &json_reader, .{
-                .max_value_len = limits.max_value_bytes,
-                .allocate = .alloc_always,
-                .parse_numbers = false,
-            });
-            permission_state = try parsePermissionState(alloc, value);
-            permission_state_seen = true;
-        } else if (std.mem.eql(u8, key, "usage")) {
-            if (usage_seen or last_subagent_work_id != null or subagent_child_seen or recovery_checkpoint != null or provenance != null) return error.InvalidSessionFormat;
-            const parse_limit = @min(
-                limits.max_value_bytes,
-                session_usage.max_snapshot_bytes,
-            );
-            const parse_buffer = try alloc.alloc(u8, parse_limit);
-            defer alloc.free(parse_buffer);
-            var fixed = std.heap.FixedBufferAllocator.init(parse_buffer);
-            const value = try std.json.Value.jsonParse(fixed.allocator(), &json_reader, .{
-                .max_value_len = parse_limit,
-                .allocate = .alloc_always,
-                .parse_numbers = false,
-            });
-            usage = if (legacy_usage)
-                try session_usage.parseLegacySnapshotValue(alloc, value)
-            else
-                try session_usage.parseSnapshotValue(alloc, value);
-            usage_seen = true;
-        } else if (std.mem.eql(u8, key, "last_subagent_work_id")) {
-            if (last_subagent_work_id != null or subagent_child_seen or recovery_checkpoint != null or provenance != null) return error.InvalidSessionFormat;
-            last_subagent_work_id = try readStringOwned(&json_reader, alloc, 128);
-        } else if (std.mem.eql(u8, key, "subagent_child")) {
-            if (subagent_child_seen or recovery_checkpoint != null or provenance != null) return error.InvalidSessionFormat;
-            subagent_child = try readBool(&json_reader);
-            if (!subagent_child) return error.InvalidDurableField;
-            subagent_child_seen = true;
-        } else if (std.mem.eql(u8, key, "recovery_checkpoint")) {
-            if (recovery_checkpoint != null or provenance != null) return error.InvalidSessionFormat;
-            var arena = std.heap.ArenaAllocator.init(alloc);
-            defer arena.deinit();
-            const value = try std.json.Value.jsonParse(arena.allocator(), &json_reader, .{
-                .max_value_len = limits.max_value_bytes,
-                .allocate = .alloc_always,
-                .parse_numbers = false,
-            });
-            recovery_checkpoint = try parseRecoveryCheckpoint(alloc, value);
-        } else if (std.mem.eql(u8, key, "provenance")) {
-            if (provenance != null) return error.InvalidSessionFormat;
-            var arena = std.heap.ArenaAllocator.init(alloc);
-            defer arena.deinit();
-            const value = try std.json.Value.jsonParse(arena.allocator(), &json_reader, .{
-                .max_value_len = limits.max_value_bytes,
-                .allocate = .alloc_always,
-                .parse_numbers = false,
-            });
-            provenance = try parseSessionProvenance(alloc, value);
-        } else return error.InvalidSessionFormat;
-    }
-    try expectToken(try json_reader.next(), .object_end);
-    try expectToken(try json_reader.next(), .end_of_document);
-
-    const owned_history = try history.toOwnedSlice(alloc);
-    errdefer session.freeHistoryTurnSlice(alloc, owned_history);
+    const history = try decodeHistory(alloc, &json_reader, limits);
+    errdefer session.freeHistoryTurnSlice(alloc, history);
+    var tail = try decodeStateTail(alloc, &json_reader, limits, legacy_usage);
+    errdefer tail.deinit(alloc);
     const state = DurableSessionState{
         .id = id,
         .origin_workspace_root = origin_workspace_root,
@@ -1379,16 +1526,16 @@ fn decodeStateImpl(alloc: Allocator, source: *std.Io.Reader, limits: DecodeLimit
         .updated_at_ms = updated_at_ms,
         .conversation_language = conversation_language,
         .preferences = preferences,
-        .history = owned_history,
-        .context_history_start = context_history_start,
-        .total_input_tokens = total_input_tokens,
-        .total_output_tokens = total_output_tokens,
-        .permission_state = permission_state,
-        .last_subagent_work_id = last_subagent_work_id,
-        .subagent_child = subagent_child,
-        .usage = usage,
-        .recovery_checkpoint = recovery_checkpoint,
-        .provenance = provenance,
+        .history = history,
+        .context_history_start = tail.context_history_start,
+        .total_input_tokens = tail.total_input_tokens,
+        .total_output_tokens = tail.total_output_tokens,
+        .permission_state = tail.permission_state,
+        .last_subagent_work_id = tail.last_subagent_work_id,
+        .subagent_child = tail.subagent_child,
+        .usage = tail.usage,
+        .recovery_checkpoint = tail.recovery_checkpoint,
+        .provenance = tail.provenance,
     };
     try validateStateWithPermissionMigration(state, true);
     return state;
@@ -1420,14 +1567,20 @@ pub fn parseRecoveryCheckpoint(alloc: Allocator, value: std.json.Value) !Recover
                 "cause",     "action",                "tool_state",                 "route_model",             "requested_fast_mode",
                 "fast_mode", "max_provider_attempts", "consumed_provider_attempts", "outstanding_reservation",
             }),
-        2 => try exactObject(value, &.{
-            "version",   "turn_id",               "user",                       "assistant_source",        "execution",
-            "cause",     "action",                "tool_state",                 "authority",               "requested_fast_mode",
-            "fast_mode", "max_provider_attempts", "consumed_provider_attempts", "outstanding_reservation",
-        }),
+        2 => if (raw_object.contains("requested_ultrafast_mode") or raw_object.contains("ultrafast_mode"))
+            try exactObject(value, &.{
+                "version",             "turn_id",   "user",                     "assistant_source", "execution",             "cause",                      "action",                  "tool_state", "authority",
+                "requested_fast_mode", "fast_mode", "requested_ultrafast_mode", "ultrafast_mode",   "max_provider_attempts", "consumed_provider_attempts", "outstanding_reservation",
+            })
+        else
+            try exactObject(value, &.{
+                "version",   "turn_id",               "user",                       "assistant_source",        "execution",
+                "cause",     "action",                "tool_state",                 "authority",               "requested_fast_mode",
+                "fast_mode", "max_provider_attempts", "consumed_provider_attempts", "outstanding_reservation",
+            }),
         else => return error.InvalidDurableField,
     };
-    const user = try parseUserTurn(alloc, object.get("user") orelse return error.InvalidSessionFormat);
+    const user = try parseUserTurn(alloc, object.get("user") orelse return error.InvalidSessionFormat, null);
     errdefer session.freeUserTurn(alloc, user);
     const assistant_source = try parseDurableBytes(alloc, object.get("assistant_source") orelse return error.InvalidSessionFormat);
     errdefer alloc.free(assistant_source);
@@ -1470,6 +1623,8 @@ pub fn parseRecoveryCheckpoint(alloc: Allocator, value: std.json.Value) !Recover
         .authority = authority,
         .requested_fast_mode = try requireBool(object, "requested_fast_mode"),
         .fast_mode = try requireBool(object, "fast_mode"),
+        .requested_ultrafast_mode = if (object.contains("requested_ultrafast_mode")) try requireBool(object, "requested_ultrafast_mode") else false,
+        .ultrafast_mode = if (object.contains("ultrafast_mode")) try requireBool(object, "ultrafast_mode") else false,
         .max_provider_attempts = max_provider_attempts,
         .consumed_provider_attempts = consumed_provider_attempts,
         .outstanding_reservation = try requireBool(object, "outstanding_reservation"),
@@ -1640,7 +1795,12 @@ fn parseTurnAuthority(alloc: Allocator, value: std.json.Value) !TurnAuthority {
     };
 }
 
-fn writeUserTurn(writer: *std.Io.Writer, user: session.UserTurn) !void {
+fn writeUserTurn(writer: *std.Io.Writer, user: session.UserTurn, image_blobs: anytype) !void {
+    const collect_blobs = comptime switch (@TypeOf(image_blobs)) {
+        void => false,
+        ImageBlobs => true,
+        else => @compileError("image_blobs must be void or ImageBlobs"),
+    };
     try writer.writeAll("{\"text\":");
     try writeDurableBytes(writer, user.text);
     try writer.writeAll(",\"images\":[");
@@ -1654,6 +1814,22 @@ fn writeUserTurn(writer: *std.Io.Writer, user: session.UserTurn) !void {
         try writeSnapshotLocator(writer, image.snapshot_path);
         try writer.writeAll(",\"snapshot_sha256\":");
         try writeOptionalDurableBytes(writer, image.snapshot_sha256);
+        // Inline image bytes appear only for sessions without a filesystem
+        // snapshot backend, so durable sessions keep their exact format.
+        if (image.inline_data) |inline_data| {
+            if (collect_blobs) {
+                try writer.print(",\"inline_blob\":{d}", .{image_blobs.items.items.len});
+                try image_blobs.items.append(image_blobs.alloc, inline_data);
+            } else {
+                try writer.writeAll(",\"inline_data\":");
+                try writeDurableBytes(writer, inline_data);
+            }
+        }
+        if (image.source_ref) |source_ref| {
+            if (!image_data.validSourceRef(source_ref)) return error.InvalidSessionFormat;
+            try writer.writeAll(",\"source_ref\":");
+            try writeJsonString(writer, source_ref);
+        }
         try writer.writeByte('}');
     }
     try writer.writeByte(']');
@@ -1674,45 +1850,63 @@ fn writeSnapshotLocator(writer: *std.Io.Writer, value: ?[]const u8) !void {
     try writeDurableBytes(writer, locator);
 }
 
-fn writeExecutionMemory(writer: *std.Io.Writer, execution: session.ExecutionMemory) !void {
-    try writer.writeAll("{\"schema_version\":10,\"tool_steps\":[");
+pub const ExecutionMemoryJsonFormat = enum {
+    durable,
+    presentation,
+};
+
+pub noinline fn writeExecutionMemoryJson(
+    writer: *std.Io.Writer,
+    execution: session.ExecutionMemory,
+    format: ExecutionMemoryJsonFormat,
+) !void {
+    try writer.writeAll(if (format == .durable)
+        "{\"schema_version\":10,\"tool_steps\":["
+    else
+        "{\"schema_version\":3,\"tool_steps\":[");
     for (execution.tool_steps, 0..) |step, i| {
         if (i > 0) try writer.writeByte(',');
         try writer.writeAll("{\"assistant\":");
-        try writeOptionalDurableBytes(writer, step.assistant);
-        try writer.writeAll(",\"provider_replay\":");
-        try std.json.Stringify.value(step.provider_replay, .{}, writer);
+        try writeOptionalExecutionBytes(writer, step.assistant, format);
+        if (format == .durable) {
+            try writer.writeAll(",\"provider_replay\":");
+            try std.json.Stringify.value(step.provider_replay, .{}, writer);
+        }
         try writer.writeAll(",\"tool_calls\":[");
         for (step.tool_calls, 0..) |tool_call, call_index| {
             if (call_index > 0) try writer.writeByte(',');
-            try writeToolCall(writer, tool_call);
+            try writeExecutionToolCall(writer, tool_call, format);
         }
         try writer.writeAll("],\"tool_results\":[");
         for (step.tool_results, 0..) |result, result_index| {
             if (result_index > 0) try writer.writeByte(',');
-            try writePersistedToolResult(writer, result);
+            try writeExecutionToolResult(writer, result, format);
         }
         try writer.writeAll("]}");
     }
     try writer.writeAll("],\"files\":[");
     for (execution.files, 0..) |file, i| {
         if (i > 0) try writer.writeByte(',');
-        try writeFileEvidence(writer, file);
+        try writeExecutionFileEvidence(writer, file, format);
     }
     try writer.writeAll("],\"steering\":[");
     for (execution.steering, 0..) |steering, i| {
         if (i > 0) try writer.writeByte(',');
         try writer.writeAll("{\"text\":");
-        try writeDurableBytes(writer, steering.text);
+        try writeExecutionBytes(writer, steering.text, format);
         try writer.writeAll(",\"assistant_prefix\":");
-        try writeOptionalDurableBytes(writer, steering.assistant_prefix);
+        try writeOptionalExecutionBytes(writer, steering.assistant_prefix, format);
         try writer.print(",\"after_tool_step_count\":{d}}}", .{steering.after_tool_step_count});
     }
-    try writer.writeAll("],\"turn_summary\":");
-    if (execution.turn_summary) |summary| {
-        try writeTurnSummary(writer, summary);
+    if (format == .durable) {
+        try writer.writeAll("],\"turn_summary\":");
+        if (execution.turn_summary) |summary| {
+            try writeTurnSummary(writer, summary);
+        } else {
+            try writer.writeAll("null");
+        }
     } else {
-        try writer.writeAll("null");
+        try writer.writeByte(']');
     }
     try writer.writeByte('}');
 }
@@ -1737,82 +1931,122 @@ fn writeTurnSummary(writer: *std.Io.Writer, summary: types.TurnSummary) !void {
     );
 }
 
-fn writeToolCall(writer: *std.Io.Writer, tool_call: session.ToolCall) !void {
+fn writeExecutionBytes(
+    writer: *std.Io.Writer,
+    bytes: []const u8,
+    format: ExecutionMemoryJsonFormat,
+) !void {
+    if (format == .durable) {
+        try writeDurableBytes(writer, bytes);
+    } else {
+        try writeJsonString(writer, bytes);
+    }
+}
+
+fn writeOptionalExecutionBytes(
+    writer: *std.Io.Writer,
+    value: ?[]const u8,
+    format: ExecutionMemoryJsonFormat,
+) !void {
+    if (value) |bytes| {
+        try writeExecutionBytes(writer, bytes, format);
+    } else {
+        try writer.writeAll("null");
+    }
+}
+
+fn writeExecutionToolCall(
+    writer: *std.Io.Writer,
+    tool_call: session.ToolCall,
+    format: ExecutionMemoryJsonFormat,
+) !void {
     try writer.writeAll("{\"id\":");
-    try writeDurableBytes(writer, tool_call.id);
+    try writeExecutionBytes(writer, tool_call.id, format);
     try writer.writeAll(",\"name\":");
-    try writeDurableBytes(writer, tool_call.name);
+    try writeExecutionBytes(writer, tool_call.name, format);
     try writer.writeAll(",\"arguments_json\":");
-    try writeDurableBytes(writer, tool_call.arguments_json);
+    try writeExecutionBytes(writer, tool_call.arguments_json, format);
     try writer.writeAll(",\"provider_result\":");
-    try writeOptionalDurableBytes(writer, tool_call.provider_result);
+    try writeOptionalExecutionBytes(writer, tool_call.provider_result, format);
     try writer.writeByte('}');
 }
 
-fn writePersistedToolResult(writer: *std.Io.Writer, result: session.PersistedToolResult) !void {
-    if (result.review_feedback and (result.status != .failure or result.provider_native)) {
+fn writeExecutionToolResult(
+    writer: *std.Io.Writer,
+    result: session.PersistedToolResult,
+    format: ExecutionMemoryJsonFormat,
+) !void {
+    if (format == .durable and
+        result.review_feedback and
+        (result.status != .failure or result.provider_native))
+    {
         return error.InvalidSessionFormat;
     }
     try writer.writeAll("{\"tool_call_id\":");
-    try writeDurableBytes(writer, result.tool_call_id);
+    try writeExecutionBytes(writer, result.tool_call_id, format);
     try writer.writeAll(",\"tool_name\":");
-    try writeDurableBytes(writer, result.tool_name);
+    try writeExecutionBytes(writer, result.tool_name, format);
     try writer.writeAll(",\"status\":");
     try writeJsonString(writer, @tagName(result.status));
     try writer.writeAll(",\"output\":");
-    try writeDurableBytes(writer, result.output);
-    try writer.writeAll(",\"output_handle\":");
-    try writeOptionalDurableBytes(writer, result.output_handle);
-    try writer.writeAll(",\"preview\":");
-    try writeOptionalDurableBytes(writer, result.preview);
+    try writeExecutionBytes(writer, result.output, format);
+    if (format == .durable or result.output_handle != null) {
+        try writer.writeAll(",\"output_handle\":");
+        try writeOptionalExecutionBytes(writer, result.output_handle, format);
+    }
+    if (format == .durable or result.preview != null) {
+        try writer.writeAll(",\"preview\":");
+        try writeOptionalExecutionBytes(writer, result.preview, format);
+    }
     try writer.print(
-        ",\"output_bytes\":{d},\"stored_output_bytes\":{d},\"truncated\":{s},\"provider_native\":{s},\"review_feedback\":{s},\"created_at_ms\":{d}",
+        ",\"output_bytes\":{d},\"stored_output_bytes\":{d},\"truncated\":{s},\"provider_native\":{s}",
         .{
             result.output_bytes,
             result.stored_output_bytes,
             if (result.truncated) "true" else "false",
             if (result.provider_native) "true" else "false",
-            if (result.review_feedback) "true" else "false",
-            result.created_at_ms,
         },
     );
+    if (format == .durable) {
+        try writer.print(",\"review_feedback\":{s}", .{if (result.review_feedback) "true" else "false"});
+    }
+    try writer.print(",\"created_at_ms\":{d}", .{result.created_at_ms});
     try writer.writeAll(",\"permission_feedback\":[");
     for (result.permission_feedback, 0..) |feedback, i| {
         if (i > 0) try writer.writeByte(',');
-        try writeDurableBytes(writer, feedback);
+        try writeExecutionBytes(writer, feedback, format);
     }
-    try writer.writeAll("],\"committed_file_presentation\":");
     if (result.committed_file_presentation) |presentation| {
-        try writeCommittedFilePresentation(writer, presentation);
+        try writer.writeAll("],\"committed_file_presentation\":");
+        try writeExecutionFilePresentation(writer, presentation, format);
+    } else if (format == .durable) {
+        try writer.writeAll("],\"committed_file_presentation\":null");
     } else {
-        try writer.writeAll("null");
-    }
-    try writer.writeAll(",\"command_output_replay\":");
-    try writeOptionalCommandOutputReplay(writer, result.command_output_replay);
-    try writer.writeAll(",\"command_process_presentation\":");
-    try writeOptionalCommandProcessPresentation(
-        writer,
-        result.command_process_presentation,
-    );
-    try writer.writeAll(",\"terminal_action_presentation\":");
-    try writeOptionalTerminalActionPresentation(
-        writer,
-        result.terminal_action_presentation,
-    );
-    if (result.tool_image_handle) |handle| {
-        try writer.writeAll(",\"tool_image_handle\":");
-        try writeDurableBytes(writer, handle);
-    } else if (result.tool_images.len > 0) {
-        try writer.writeAll(",\"tool_images\":[");
-        for (result.tool_images, 0..) |image, index| {
-            if (index > 0) try writer.writeByte(',');
-            try writer.writeAll("{\"type\":\"image\",\"mimeType\":");
-            try std.json.Stringify.value(image.mime_type, .{}, writer);
-            try writer.writeAll(",\"data\":");
-            try std.json.Stringify.value(image.data, .{}, writer);
-            try writer.writeByte('}');
-        }
         try writer.writeByte(']');
+    }
+    if (format == .durable) {
+        try writer.writeAll(",\"command_output_replay\":");
+        try writeOptionalCommandOutputReplay(writer, result.command_output_replay);
+        try writer.writeAll(",\"command_process_presentation\":");
+        try writeOptionalCommandProcessPresentation(
+            writer,
+            result.command_process_presentation,
+        );
+        try writer.writeAll(",\"terminal_action_presentation\":");
+        try writeOptionalTerminalActionPresentation(
+            writer,
+            result.terminal_action_presentation,
+        );
+        if (result.tool_image_handle) |handle| {
+            try writer.writeAll(",\"tool_image_handle\":");
+            try writeDurableBytes(writer, handle);
+        } else if (result.tool_images.len > 0) {
+            try writer.writeAll(",\"tool_images\":");
+            writePersistedToolImages(writer, result.tool_images) catch |err| switch (err) {
+                error.InvalidSourceRef, error.InvalidImage => return error.InvalidSessionFormat,
+                else => |write_err| return write_err,
+            };
+        }
     }
     try writer.writeByte('}');
 }
@@ -1933,12 +2167,16 @@ fn writeTerminalReturnPresentation(
     }
 }
 
-fn writeCommittedFilePresentation(
+fn writeExecutionFilePresentation(
     writer: *std.Io.Writer,
     presentation: types.CommittedFilePresentation,
+    format: ExecutionMemoryJsonFormat,
 ) !void {
+    if (!types.committedFilePresentationContentSourceValid(presentation)) {
+        return error.InvalidSessionFormat;
+    }
     try writer.writeAll("{\"path\":");
-    try writeDurableBytes(writer, presentation.path);
+    try writeExecutionBytes(writer, presentation.path, format);
     try writer.writeAll(",\"kind\":");
     try writeJsonString(writer, @tagName(presentation.kind));
     try writer.writeAll(",\"lines\":[");
@@ -1951,7 +2189,7 @@ fn writeCommittedFilePresentation(
         try writer.writeAll(",\"new_line\":");
         try writeOptionalU32(writer, line.new_line);
         try writer.writeAll(",\"text\":");
-        try writeDurableBytes(writer, line.text);
+        try writeExecutionBytes(writer, line.text, format);
         try writer.writeByte('}');
     }
     try writer.print(
@@ -1962,29 +2200,41 @@ fn writeCommittedFilePresentation(
             if (presentation.truncated) "true" else "false",
         },
     );
-    try writeOptionalDurableBytes(writer, presentation.previous_content);
+    try writeOptionalExecutionBytes(writer, presentation.previous_content, format);
     try writer.writeAll(",\"after_content\":");
-    try writeOptionalDurableBytes(writer, presentation.after_content);
+    try writeOptionalExecutionBytes(writer, presentation.after_content, format);
     try writer.writeAll(",\"lifecycle_id\":");
     if (presentation.lifecycle_id) |lifecycle_id| {
         try writer.print("{{\"turn_id\":{d},\"call_id\":", .{lifecycle_id.turn_id});
-        try writeDurableBytes(writer, lifecycle_id.call_id);
+        try writeExecutionBytes(writer, lifecycle_id.call_id, format);
         try writer.writeByte('}');
     } else {
         try writer.writeAll("null");
     }
+    // Durable records omit an absent handle for compatibility with the
+    // shipped 9-key shape. Presentation JSON always includes the key.
+    if (presentation.content_handle) |handle| {
+        try writer.writeAll(",\"content_handle\":");
+        try writeExecutionBytes(writer, handle, format);
+    } else if (format == .presentation) {
+        try writer.writeAll(",\"content_handle\":null");
+    }
     try writer.writeByte('}');
 }
 
-fn writeFileEvidence(writer: *std.Io.Writer, file: session.FileEvidence) !void {
+fn writeExecutionFileEvidence(
+    writer: *std.Io.Writer,
+    file: session.FileEvidence,
+    format: ExecutionMemoryJsonFormat,
+) !void {
     try writer.writeAll("{\"path\":");
-    try writeDurableBytes(writer, file.path);
+    try writeExecutionBytes(writer, file.path, format);
     try writer.writeAll(",\"new_path\":");
-    try writeOptionalDurableBytes(writer, file.new_path);
+    try writeOptionalExecutionBytes(writer, file.new_path, format);
     try writer.writeAll(",\"tool_call_id\":");
-    try writeDurableBytes(writer, file.tool_call_id);
+    try writeExecutionBytes(writer, file.tool_call_id, format);
     try writer.writeAll(",\"tool_name\":");
-    try writeDurableBytes(writer, file.tool_name);
+    try writeExecutionBytes(writer, file.tool_name, format);
     try writer.writeAll(",\"action\":");
     try writeJsonString(writer, @tagName(file.action));
     try writer.writeAll(",\"status\":");
@@ -1996,26 +2246,26 @@ fn writeFileEvidence(writer: *std.Io.Writer, file: session.FileEvidence) !void {
     try writer.writeByte('}');
 }
 
-fn parseUserTurn(alloc: Allocator, value: std.json.Value) !session.UserTurn {
+fn parseUserTurn(alloc: Allocator, value: std.json.Value, image_blobs: ?*ImageBlobReader) !session.UserTurn {
     const source = try requireObject(value);
     const object = if (source.count() == 2)
         try exactObject(value, &.{ "text", "images" })
     else
         try exactObject(value, &.{ "text", "images", "work_id" });
     const text = try parseRequiredDurableBytes(alloc, object, "text");
-    errdefer alloc.free(text);
+    errdefer mem_utils.free(alloc, text);
     const work_id = if (object.get("work_id")) |_|
         try alloc.dupe(u8, try requireString(object, "work_id"))
     else
         null;
-    errdefer if (work_id) |id| alloc.free(id);
+    errdefer if (work_id) |id| mem_utils.free(alloc, id);
     if (work_id) |id| session.validateWorkId(id) catch return error.InvalidSessionFormat;
     const images_value = object.get("images") orelse return error.InvalidSessionFormat;
     if (images_value != .array) return error.InvalidSessionFormat;
     if (images_value.array.items.len == 0) return .{ .text = text, .work_id = work_id };
 
     const images = try alloc.alloc(session.ImageAttachment, images_value.array.items.len);
-    errdefer alloc.free(images);
+    errdefer mem_utils.free(alloc, images);
     var parsed_count: usize = 0;
     errdefer {
         for (images[0..parsed_count]) |image| {
@@ -2025,30 +2275,60 @@ fn parseUserTurn(alloc: Allocator, value: std.json.Value) !session.UserTurn {
     for (images_value.array.items, 0..) |image_value, i| {
         const image = try imageAttachmentObject(image_value);
         const path = try parseRequiredDurableBytes(alloc, image, "path");
-        errdefer alloc.free(path);
+        errdefer mem_utils.free(alloc, path);
         const media_type = try parseRequiredDurableBytes(alloc, image, "media_type");
-        errdefer alloc.free(media_type);
+        errdefer mem_utils.free(alloc, media_type);
         const snapshot_path = try parseOptionalDurableBytes(
             alloc,
             image.get("snapshot_path") orelse .null,
         );
-        errdefer if (snapshot_path) |path_bytes| alloc.free(path_bytes);
+        errdefer if (snapshot_path) |path_bytes| mem_utils.free(alloc, path_bytes);
         const snapshot_sha256 = try parseOptionalDurableBytes(
             alloc,
             image.get("snapshot_sha256") orelse .null,
         );
-        errdefer if (snapshot_sha256) |sha256_bytes| alloc.free(sha256_bytes);
-        if ((snapshot_path == null) != (snapshot_sha256 == null)) return error.InvalidSessionFormat;
+        errdefer if (snapshot_sha256) |sha256_bytes| mem_utils.free(alloc, sha256_bytes);
+        const inline_data = try parseInlineImageBytes(alloc, image, image_blobs);
+        errdefer if (inline_data) |inline_bytes| mem_utils.free(alloc, inline_bytes);
+        const source_ref = if (image.get("source_ref")) |_| source: {
+            const source_bytes = try requireString(image, "source_ref");
+            if (!image_data.validSourceRef(source_bytes)) return error.InvalidSessionFormat;
+            break :source try alloc.dupe(u8, source_bytes);
+        } else null;
+        errdefer if (source_ref) |source_bytes| alloc.free(source_bytes);
+        if (inline_data) |inline_bytes| {
+            // Inline images carry their own bytes: no snapshot file, but the
+            // digest stays so request-time verification is unchanged.
+            if (snapshot_path != null or snapshot_sha256 == null) return error.InvalidSessionFormat;
+            try validateInlineImageBytes(inline_bytes, media_type);
+        } else if ((snapshot_path == null) != (snapshot_sha256 == null)) return error.InvalidSessionFormat;
         images[i] = .{
             .id = try requireUsize(image, "id"),
             .path = path,
             .media_type = media_type,
             .snapshot_path = snapshot_path,
             .snapshot_sha256 = snapshot_sha256,
+            .inline_data = inline_data,
+            .source_ref = source_ref,
         };
         parsed_count += 1;
     }
     return .{ .text = text, .images = images, .work_id = work_id };
+}
+
+/// Reads an inline image's bytes from `inline_data` or, inside a libfx kernel
+/// checkpoint, from the raw blob named by `inline_blob`. Caller owns the result.
+fn parseInlineImageBytes(
+    alloc: Allocator,
+    image: std.json.ObjectMap,
+    image_blobs: ?*ImageBlobReader,
+) !?[]u8 {
+    const blob_value = image.get("inline_blob") orelse
+        return parseOptionalDurableBytes(alloc, image.get("inline_data") orelse .null);
+    const blobs = image_blobs orelse return error.InvalidSessionFormat;
+    if (image.get("inline_data") != null or blob_value != .integer) return error.InvalidSessionFormat;
+    const index = std.math.cast(usize, blob_value.integer) orelse return error.InvalidSessionFormat;
+    return try alloc.dupe(u8, try blobs.take(index));
 }
 
 fn imageAttachmentObject(value: std.json.Value) !std.json.ObjectMap {
@@ -2065,7 +2345,10 @@ fn imageAttachmentObject(value: std.json.Value) !std.json.ObjectMap {
         } else if (std.mem.eql(u8, entry.key_ptr.*, "media_type")) {
             has_media_type = true;
         } else if (std.mem.eql(u8, entry.key_ptr.*, "snapshot_path") or
-            std.mem.eql(u8, entry.key_ptr.*, "snapshot_sha256"))
+            std.mem.eql(u8, entry.key_ptr.*, "snapshot_sha256") or
+            std.mem.eql(u8, entry.key_ptr.*, "inline_data") or
+            std.mem.eql(u8, entry.key_ptr.*, "inline_blob") or
+            std.mem.eql(u8, entry.key_ptr.*, "source_ref"))
         {
             continue;
         } else {
@@ -2074,6 +2357,19 @@ fn imageAttachmentObject(value: std.json.Value) !std.json.ObjectMap {
     }
     if (!has_id or !has_path or !has_media_type) return error.InvalidSessionFormat;
     return value.object;
+}
+
+/// Format-level validation for image bytes embedded in a checkpoint or host
+/// session: bounded, non-empty, and sniffing to the declared media type.
+/// Content integrity beyond the payload envelope is verified at request time
+/// by `loadVerifiedSnapshot`.
+fn validateInlineImageBytes(bytes: []const u8, media_type: []const u8) !void {
+    if (bytes.len == 0 or bytes.len > image_attachments.max_image_bytes) {
+        return error.InvalidSessionFormat;
+    }
+    const detected = image_data.detectMediaTypeFromBytes(bytes) orelse
+        return error.InvalidSessionFormat;
+    if (!std.mem.eql(u8, detected, media_type)) return error.InvalidSessionFormat;
 }
 
 fn parseExecutionMemory(alloc: Allocator, value: std.json.Value) !session.ExecutionMemory {
@@ -2211,10 +2507,10 @@ fn parseToolSteps(
     if (value != .array) return error.InvalidSessionFormat;
     if (value.array.items.len == 0) return &.{};
     const steps = try alloc.alloc(session.ToolExecutionStep, value.array.items.len);
-    errdefer alloc.free(steps);
+    errdefer mem_utils.free(alloc, steps);
     var parsed_count: usize = 0;
     errdefer for (steps[0..parsed_count]) |step| {
-        if (step.assistant) |assistant| alloc.free(assistant);
+        if (step.assistant) |assistant| mem_utils.free(alloc, assistant);
         if (step.provider_replay) |replay| types.freeProviderReplay(alloc, replay);
         session.freeToolCallSlice(alloc, step.tool_calls);
         session.freePersistedToolResults(alloc, step.tool_results);
@@ -2225,7 +2521,7 @@ fn parseToolSteps(
         else
             try exactObject(step_value, &.{ "assistant", "tool_calls", "tool_results" });
         const assistant = try parseOptionalDurableBytes(alloc, object.get("assistant") orelse return error.InvalidSessionFormat);
-        errdefer if (assistant) |owned| alloc.free(owned);
+        errdefer if (assistant) |owned| mem_utils.free(alloc, owned);
         const tool_calls = try parseToolCalls(alloc, object.get("tool_calls") orelse return error.InvalidSessionFormat);
         errdefer session.freeToolCallSlice(alloc, tool_calls);
         const tool_results = try parseToolResults(
@@ -2261,11 +2557,22 @@ fn parseProviderReplay(alloc: Allocator, value: std.json.Value) !?types.Provider
     return try types.dupeProviderReplay(alloc, replay);
 }
 
-fn parseToolCalls(alloc: Allocator, value: std.json.Value) ![]session.ToolCall {
+/// Writes `calls` as the JSON array durable history stores them in.
+pub fn writeToolCalls(writer: *std.Io.Writer, calls: []const session.ToolCall) !void {
+    try writer.writeByte('[');
+    for (calls, 0..) |tool_call, index| {
+        if (index > 0) try writer.writeByte(',');
+        try writeExecutionToolCall(writer, tool_call, .durable);
+    }
+    try writer.writeByte(']');
+}
+
+/// Parses the array `writeToolCalls` writes. The caller owns the result.
+pub fn parseToolCalls(alloc: Allocator, value: std.json.Value) ![]session.ToolCall {
     if (value != .array) return error.InvalidSessionFormat;
     if (value.array.items.len == 0) return &.{};
     const calls = try alloc.alloc(session.ToolCall, value.array.items.len);
-    errdefer alloc.free(calls);
+    errdefer mem_utils.free(alloc, calls);
     var parsed_count: usize = 0;
     errdefer for (calls[0..parsed_count]) |call| session.freeToolCall(alloc, call);
     for (value.array.items, 0..) |call_value, i| {
@@ -2283,15 +2590,15 @@ fn parseToolCall(alloc: Allocator, value: std.json.Value) !session.ToolCall {
         "provider_result",
     });
     const id = try parseRequiredDurableBytes(alloc, object, "id");
-    errdefer alloc.free(id);
+    errdefer mem_utils.free(alloc, id);
     const name = try parseRequiredDurableBytes(alloc, object, "name");
-    errdefer alloc.free(name);
+    errdefer mem_utils.free(alloc, name);
     var arguments_json = try parseRequiredDurableBytes(alloc, object, "arguments_json");
-    errdefer alloc.free(arguments_json);
+    errdefer mem_utils.free(alloc, arguments_json);
     const argument_integrity = try types.ToolArgumentIntegrity.classifyFunctionInput(alloc, arguments_json);
     if (argument_integrity == .malformed_json) {
         const safe_arguments = try alloc.dupe(u8, "{}");
-        alloc.free(arguments_json);
+        mem_utils.free(alloc, arguments_json);
         arguments_json = safe_arguments;
     }
     const provider_result = try parseOptionalDurableBytes(
@@ -2328,16 +2635,16 @@ fn parseToolResults(
     if (value != .array) return error.InvalidSessionFormat;
     if (value.array.items.len == 0) return &.{};
     const results = try alloc.alloc(session.PersistedToolResult, value.array.items.len);
-    errdefer alloc.free(results);
+    errdefer mem_utils.free(alloc, results);
     var parsed_count: usize = 0;
     errdefer for (results[0..parsed_count]) |result| {
-        alloc.free(result.tool_call_id);
-        alloc.free(result.tool_name);
-        alloc.free(result.output);
+        mem_utils.free(alloc, result.tool_call_id);
+        mem_utils.free(alloc, result.tool_name);
+        mem_utils.free(alloc, result.output);
         types.freeToolImages(alloc, result.tool_images);
-        if (result.tool_image_handle) |handle| alloc.free(handle);
-        if (result.output_handle) |handle| alloc.free(handle);
-        if (result.preview) |preview| alloc.free(preview);
+        if (result.tool_image_handle) |handle| mem_utils.free(alloc, handle);
+        if (result.output_handle) |handle| mem_utils.free(alloc, handle);
+        if (result.preview) |preview| mem_utils.free(alloc, preview);
         types.freePermissionFeedback(alloc, result.permission_feedback);
         if (result.committed_file_presentation) |presentation| {
             types.freeCommittedFilePresentation(alloc, presentation);
@@ -2465,22 +2772,80 @@ fn parseToolResult(
     const provider_native = try requireBool(object, "provider_native");
     const review_feedback = if (schema_version >= 10) try requireBool(object, "review_feedback") else false;
     if (review_feedback and (status != .failure or provider_native)) return error.InvalidSessionFormat;
+    var text = try parseToolResultText(alloc, object, schema_version);
+    errdefer text.deinit(alloc);
+    var presentations = try parseToolResultPresentations(
+        alloc,
+        object,
+        schema_version,
+        result_shape.extended,
+    );
+    errdefer presentations.deinit(alloc);
+    var images = try parseToolResultImages(alloc, object, &text.output);
+    errdefer images.deinit(alloc);
+    return .{
+        .tool_images = images.items,
+        .tool_image_handle = images.handle,
+        .tool_call_id = text.tool_call_id,
+        .tool_name = text.tool_name,
+        .status = status,
+        .output = text.output,
+        .output_handle = text.output_handle,
+        .preview = text.preview,
+        .output_bytes = try requireUsize(object, "output_bytes"),
+        .stored_output_bytes = try requireUsize(object, "stored_output_bytes"),
+        .truncated = try requireBool(object, "truncated"),
+        .provider_native = provider_native,
+        .review_feedback = review_feedback,
+        .created_at_ms = try requireI64(object, "created_at_ms"),
+        .permission_feedback = text.permission_feedback,
+        .committed_file_presentation = presentations.committed_file,
+        .command_output_replay = presentations.command_output_replay,
+        .command_process_presentation = presentations.command_process,
+        .terminal_action_presentation = presentations.terminal_action,
+    };
+}
+
+const ParsedToolResultText = struct {
+    tool_call_id: []u8,
+    tool_name: []u8,
+    output: []u8,
+    output_handle: ?[]u8,
+    preview: ?[]u8,
+    permission_feedback: [][]u8,
+
+    fn deinit(self: *ParsedToolResultText, alloc: Allocator) void {
+        types.freePermissionFeedback(alloc, self.permission_feedback);
+        if (self.preview) |preview| mem_utils.free(alloc, preview);
+        if (self.output_handle) |handle| mem_utils.free(alloc, handle);
+        mem_utils.free(alloc, self.output);
+        mem_utils.free(alloc, self.tool_name);
+        mem_utils.free(alloc, self.tool_call_id);
+        self.* = undefined;
+    }
+};
+
+fn parseToolResultText(
+    alloc: Allocator,
+    object: std.json.ObjectMap,
+    schema_version: u64,
+) !ParsedToolResultText {
     const tool_call_id = try parseRequiredDurableBytes(alloc, object, "tool_call_id");
-    errdefer alloc.free(tool_call_id);
+    errdefer mem_utils.free(alloc, tool_call_id);
     const tool_name = try parseRequiredDurableBytes(alloc, object, "tool_name");
-    errdefer alloc.free(tool_name);
-    var output = try parseRequiredDurableBytes(alloc, object, "output");
-    errdefer alloc.free(output);
+    errdefer mem_utils.free(alloc, tool_name);
+    const output = try parseRequiredDurableBytes(alloc, object, "output");
+    errdefer mem_utils.free(alloc, output);
     const output_handle = try parseOptionalDurableBytes(
         alloc,
         object.get("output_handle") orelse return error.InvalidSessionFormat,
     );
-    errdefer if (output_handle) |owned| alloc.free(owned);
+    errdefer if (output_handle) |owned| mem_utils.free(alloc, owned);
     const preview = try parseOptionalDurableBytes(
         alloc,
         object.get("preview") orelse return error.InvalidSessionFormat,
     );
-    errdefer if (preview) |owned| alloc.free(owned);
+    errdefer if (preview) |owned| mem_utils.free(alloc, owned);
     const permission_feedback: [][]u8 = if (schema_version == 1)
         &.{}
     else
@@ -2488,15 +2853,47 @@ fn parseToolResult(
             alloc,
             object.get("permission_feedback") orelse return error.InvalidSessionFormat,
         );
-    errdefer types.freePermissionFeedback(alloc, permission_feedback);
-    const committed_file_presentation = if (result_shape.extended)
+    return .{
+        .tool_call_id = tool_call_id,
+        .tool_name = tool_name,
+        .output = output,
+        .output_handle = output_handle,
+        .preview = preview,
+        .permission_feedback = permission_feedback,
+    };
+}
+
+const ParsedToolResultPresentations = struct {
+    committed_file: ?types.CommittedFilePresentation,
+    command_output_replay: ?types.CommandOutputReplay,
+    command_process: ?types.CommandProcessPresentation,
+    terminal_action: ?types.TerminalActionPresentation,
+
+    fn deinit(self: *ParsedToolResultPresentations, alloc: Allocator) void {
+        if (self.command_output_replay) |replay| {
+            types.freeCommandOutputReplay(alloc, replay);
+        }
+        if (self.committed_file) |presentation| {
+            types.freeCommittedFilePresentation(alloc, presentation);
+        }
+        self.* = undefined;
+    }
+};
+
+fn parseToolResultPresentations(
+    alloc: Allocator,
+    object: std.json.ObjectMap,
+    schema_version: u64,
+    extended: bool,
+) !ParsedToolResultPresentations {
+    const committed_file = if (extended)
         try parseOptionalCommittedFilePresentation(
             alloc,
             object.get("committed_file_presentation") orelse return error.InvalidSessionFormat,
         )
     else
         null;
-    errdefer if (committed_file_presentation) |presentation| {
+    errdefer if (committed_file) |presentation| {
         types.freeCommittedFilePresentation(alloc, presentation);
     };
     const command_output_replay = if (schema_version >= 3)
@@ -2509,60 +2906,125 @@ fn parseToolResult(
     errdefer if (command_output_replay) |replay| {
         types.freeCommandOutputReplay(alloc, replay);
     };
-    const command_process_presentation = if (schema_version >= 3)
-        try parseOptionalCommandProcessPresentation(
-            object.get("command_process_presentation") orelse return error.InvalidSessionFormat,
-        )
-    else
-        null;
-    const terminal_action_presentation = if (schema_version >= 4)
-        try parseOptionalTerminalActionPresentation(
-            object.get("terminal_action_presentation") orelse return error.InvalidSessionFormat,
-        )
-    else
-        null;
-    const tool_image_handle = if (object.get("tool_image_handle")) |value_handle| try parseOptionalDurableBytes(alloc, value_handle) else null;
-    errdefer if (tool_image_handle) |handle| alloc.free(handle);
-    const tool_images = if (object.get("tool_images")) |images| images: {
-        if (images != .array) return error.InvalidSessionFormat;
-        const parsed_images = image_data.parseToolImages(alloc, images.array.items) catch |err| {
-            if (err == error.OutOfMemory) return error.OutOfMemory;
-            const notice = try std.fmt.allocPrint(alloc, "{s}\n[Saved tool image unavailable: {s}]", .{ output, @errorName(err) });
-            alloc.free(output);
-            output = notice;
-            break :images try alloc.alloc(types.ToolImage, 0);
-        };
-        if (parsed_images.len != images.array.items.len) {
-            types.freeToolImages(alloc, parsed_images);
-            const notice = try std.fmt.allocPrint(alloc, "{s}\n[Saved tool image unavailable: unsupported content]", .{output});
-            alloc.free(output);
-            output = notice;
-            break :images try alloc.alloc(types.ToolImage, 0);
-        }
-        break :images parsed_images;
-    } else try alloc.alloc(types.ToolImage, 0);
-    errdefer types.freeToolImages(alloc, tool_images);
     return .{
-        .tool_images = tool_images,
-        .tool_image_handle = tool_image_handle,
-        .tool_call_id = tool_call_id,
-        .tool_name = tool_name,
-        .status = status,
-        .output = output,
-        .output_handle = output_handle,
-        .preview = preview,
-        .output_bytes = try requireUsize(object, "output_bytes"),
-        .stored_output_bytes = try requireUsize(object, "stored_output_bytes"),
-        .truncated = try requireBool(object, "truncated"),
-        .provider_native = provider_native,
-        .review_feedback = review_feedback,
-        .created_at_ms = try requireI64(object, "created_at_ms"),
-        .permission_feedback = permission_feedback,
-        .committed_file_presentation = committed_file_presentation,
+        .committed_file = committed_file,
         .command_output_replay = command_output_replay,
-        .command_process_presentation = command_process_presentation,
-        .terminal_action_presentation = terminal_action_presentation,
+        .command_process = if (schema_version >= 3)
+            try parseOptionalCommandProcessPresentation(
+                object.get("command_process_presentation") orelse return error.InvalidSessionFormat,
+            )
+        else
+            null,
+        .terminal_action = if (schema_version >= 4)
+            try parseOptionalTerminalActionPresentation(
+                object.get("terminal_action_presentation") orelse return error.InvalidSessionFormat,
+            )
+        else
+            null,
     };
+}
+
+/// Writes typed image blocks with persistence-owned source_ref spelling.
+pub fn writePersistedToolImages(writer: *std.Io.Writer, images: []const types.ToolImage) !void {
+    try writer.writeByte('[');
+    for (images, 0..) |image, index| {
+        if (index > 0) try writer.writeByte(',');
+        if (image.source_ref) |source_ref| {
+            if (!image_data.validSourceRef(source_ref)) return error.InvalidSourceRef;
+        } else if (image.data.len == 0) return error.InvalidImage;
+        try writer.writeAll("{\"type\":\"image\",\"mimeType\":");
+        try writeJsonString(writer, image.mime_type);
+        try writer.writeAll(",\"data\":");
+        try writeJsonString(writer, image.data);
+        if (image.source_ref) |source_ref| {
+            try writer.writeAll(",\"source_ref\":");
+            try writeJsonString(writer, source_ref);
+        }
+        try writer.writeByte('}');
+    }
+    try writer.writeByte(']');
+}
+
+/// Caller owns the images. Only field spelling is adapted; shared image
+/// admission retains its byte, count, media-type, and source-ref checks.
+pub fn parsePersistedToolImages(alloc: Allocator, content: []const std.json.Value) ![]types.ToolImage {
+    if (content.len > image_data.max_tool_images) return error.ImageLimitExceeded;
+    var has_source_ref = false;
+    for (content) |item| {
+        if (item != .object) return error.InvalidImage;
+        if (item.object.contains("sourceRef")) return error.InvalidSourceRef;
+        if (item.object.get("source_ref")) |value| {
+            if (value != .string or !image_data.validSourceRef(value.string)) return error.InvalidSourceRef;
+            has_source_ref = true;
+        }
+    }
+    if (!has_source_ref) return image_data.parseToolImages(alloc, content);
+
+    var normalized: [image_data.max_tool_images]std.json.Value = undefined;
+    var initialized: usize = 0;
+    defer for (normalized[0..initialized]) |*item| item.object.deinit(alloc);
+    for (content, 0..) |item, index| {
+        var object = try item.object.clone(alloc);
+        errdefer object.deinit(alloc);
+        if (object.get("source_ref")) |value| {
+            try object.put(alloc, "sourceRef", value);
+            _ = object.swapRemove("source_ref");
+        }
+        normalized[index] = .{ .object = object };
+        initialized += 1;
+    }
+    return image_data.parseToolImages(alloc, normalized[0..initialized]);
+}
+
+const ParsedToolResultImages = struct {
+    handle: ?[]u8,
+    items: []types.ToolImage,
+
+    fn deinit(self: *ParsedToolResultImages, alloc: Allocator) void {
+        types.freeToolImages(alloc, self.items);
+        if (self.handle) |handle| mem_utils.free(alloc, handle);
+        self.* = undefined;
+    }
+};
+
+fn parseToolResultImages(
+    alloc: Allocator,
+    object: std.json.ObjectMap,
+    output: *[]u8,
+) !ParsedToolResultImages {
+    const handle = if (object.get("tool_image_handle")) |value|
+        try parseOptionalDurableBytes(alloc, value)
+    else
+        null;
+    errdefer if (handle) |owned| mem_utils.free(alloc, owned);
+    const items = if (object.get("tool_images")) |images| items: {
+        if (images != .array) return error.InvalidSessionFormat;
+        const parsed = parsePersistedToolImages(alloc, images.array.items) catch |err| {
+            if (err == error.OutOfMemory) return error.OutOfMemory;
+            if (err == error.InvalidSourceRef) return error.InvalidSessionFormat;
+            const notice = try std.fmt.allocPrint(
+                alloc,
+                "{s}\n[Saved tool image unavailable: {s}]",
+                .{ output.*, @errorName(err) },
+            );
+            mem_utils.free(alloc, output.*);
+            output.* = notice;
+            break :items try alloc.alloc(types.ToolImage, 0);
+        };
+        if (parsed.len != images.array.items.len) {
+            types.freeToolImages(alloc, parsed);
+            const notice = try std.fmt.allocPrint(
+                alloc,
+                "{s}\n[Saved tool image unavailable: unsupported content]",
+                .{output.*},
+            );
+            mem_utils.free(alloc, output.*);
+            output.* = notice;
+            break :items try alloc.alloc(types.ToolImage, 0);
+        }
+        break :items parsed;
+    } else try alloc.alloc(types.ToolImage, 0);
+    return .{ .handle = handle, .items = items };
 }
 
 fn parseOptionalCommandOutputReplay(
@@ -2682,7 +3144,7 @@ fn parseCommittedFilePresentation(
     alloc: Allocator,
     value: std.json.Value,
 ) !types.CommittedFilePresentation {
-    const object = try exactObject(value, &.{
+    const presentation_legacy_keys = [_][]const u8{
         "path",
         "kind",
         "lines",
@@ -2692,9 +3154,15 @@ fn parseCommittedFilePresentation(
         "previous_content",
         "after_content",
         "lifecycle_id",
-    });
+    };
+    const presentation_extended_keys = presentation_legacy_keys ++ [_][]const u8{"content_handle"};
+    const object = (try exactVariantObject(
+        value,
+        &presentation_legacy_keys,
+        &presentation_extended_keys,
+    )).object;
     const path = try parseRequiredDurableBytes(alloc, object, "path");
-    errdefer alloc.free(path);
+    errdefer mem_utils.free(alloc, path);
     const lines = try parseCommittedFilePresentationLines(
         alloc,
         object.get("lines") orelse return error.InvalidSessionFormat,
@@ -2704,18 +3172,24 @@ fn parseCommittedFilePresentation(
         alloc,
         object.get("previous_content") orelse return error.InvalidSessionFormat,
     );
-    errdefer if (previous_content) |content| alloc.free(content);
+    errdefer if (previous_content) |content| mem_utils.free(alloc, content);
     const after_content = try parseOptionalDurableBytes(
         alloc,
         object.get("after_content") orelse return error.InvalidSessionFormat,
     );
-    errdefer if (after_content) |content| alloc.free(content);
+    errdefer if (after_content) |content| mem_utils.free(alloc, content);
     const lifecycle_id = try parseOptionalToolLifecycleId(
         alloc,
         object.get("lifecycle_id") orelse return error.InvalidSessionFormat,
     );
-    errdefer if (lifecycle_id) |id| alloc.free(id.call_id);
-    return .{
+    errdefer if (lifecycle_id) |id| mem_utils.free(alloc, id.call_id);
+    // Older records predate externalized diff snapshots and carry no key.
+    const content_handle = if (object.get("content_handle")) |handle_value|
+        try parseOptionalDurableBytes(alloc, handle_value)
+    else
+        null;
+    errdefer if (content_handle) |handle| mem_utils.free(alloc, handle);
+    const presentation = types.CommittedFilePresentation{
         .path = path,
         .kind = std.meta.stringToEnum(
             types.CommittedFilePresentationKind,
@@ -2728,7 +3202,12 @@ fn parseCommittedFilePresentation(
         .previous_content = previous_content,
         .after_content = after_content,
         .lifecycle_id = lifecycle_id,
+        .content_handle = content_handle,
     };
+    if (!types.committedFilePresentationContentSourceValid(presentation)) {
+        return error.InvalidSessionFormat;
+    }
+    return presentation;
 }
 
 fn parseCommittedFilePresentationLines(
@@ -2740,13 +3219,13 @@ fn parseCommittedFilePresentationLines(
     const lines = try alloc.alloc(types.CommittedFilePresentationLine, value.array.items.len);
     var parsed_count: usize = 0;
     errdefer {
-        for (lines[0..parsed_count]) |line| alloc.free(@constCast(line.text));
-        alloc.free(lines);
+        for (lines[0..parsed_count]) |line| mem_utils.free(alloc, @constCast(line.text));
+        mem_utils.free(alloc, lines);
     }
     for (value.array.items, 0..) |line_value, index| {
         const object = try exactObject(line_value, &.{ "kind", "old_line", "new_line", "text" });
         const text = try parseRequiredDurableBytes(alloc, object, "text");
-        errdefer alloc.free(text);
+        errdefer mem_utils.free(alloc, text);
         lines[index] = .{
             .kind = std.meta.stringToEnum(
                 types.CommittedFilePresentationLineKind,
@@ -2765,8 +3244,8 @@ fn freeCommittedFilePresentationLines(
     alloc: Allocator,
     lines: []const types.CommittedFilePresentationLine,
 ) void {
-    for (lines) |line| alloc.free(@constCast(line.text));
-    if (lines.len > 0) alloc.free(@constCast(lines));
+    for (lines) |line| mem_utils.free(alloc, @constCast(line.text));
+    if (lines.len > 0) mem_utils.free(alloc, @constCast(lines));
 }
 
 fn parseOptionalToolLifecycleId(
@@ -2778,7 +3257,7 @@ fn parseOptionalToolLifecycleId(
         .object => {
             const object = try exactObject(value, &.{ "turn_id", "call_id" });
             const call_id = try parseRequiredDurableBytes(alloc, object, "call_id");
-            errdefer alloc.free(call_id);
+            errdefer mem_utils.free(alloc, call_id);
             return .{
                 .turn_id = try requireU64(object, "turn_id"),
                 .call_id = call_id,
@@ -2792,13 +3271,13 @@ fn parseFiles(alloc: Allocator, value: std.json.Value) ![]session.FileEvidence {
     if (value != .array) return error.InvalidSessionFormat;
     if (value.array.items.len == 0) return &.{};
     const files = try alloc.alloc(session.FileEvidence, value.array.items.len);
-    errdefer alloc.free(files);
+    errdefer mem_utils.free(alloc, files);
     var parsed_count: usize = 0;
     errdefer for (files[0..parsed_count]) |file| {
-        alloc.free(file.path);
-        if (file.new_path) |new_path| alloc.free(new_path);
-        alloc.free(file.tool_call_id);
-        alloc.free(file.tool_name);
+        mem_utils.free(alloc, file.path);
+        if (file.new_path) |new_path| mem_utils.free(alloc, new_path);
+        mem_utils.free(alloc, file.tool_call_id);
+        mem_utils.free(alloc, file.tool_name);
     };
     for (value.array.items, 0..) |file_value, i| {
         files[i] = try parseFile(alloc, file_value);
@@ -2819,16 +3298,16 @@ fn parseFile(alloc: Allocator, value: std.json.Value) !session.FileEvidence {
         "stale",
     });
     const path = try parseRequiredDurableBytes(alloc, object, "path");
-    errdefer alloc.free(path);
+    errdefer mem_utils.free(alloc, path);
     const new_path = try parseOptionalDurableBytes(
         alloc,
         object.get("new_path") orelse return error.InvalidSessionFormat,
     );
-    errdefer if (new_path) |owned| alloc.free(owned);
+    errdefer if (new_path) |owned| mem_utils.free(alloc, owned);
     const tool_call_id = try parseRequiredDurableBytes(alloc, object, "tool_call_id");
-    errdefer alloc.free(tool_call_id);
+    errdefer mem_utils.free(alloc, tool_call_id);
     const tool_name = try parseRequiredDurableBytes(alloc, object, "tool_name");
-    errdefer alloc.free(tool_name);
+    errdefer mem_utils.free(alloc, tool_name);
     return .{
         .path = path,
         .new_path = new_path,
@@ -3205,6 +3684,31 @@ test "durable byte fields use canonical string or padded base64 representation" 
     }
 }
 
+test "durable tool image validation preserves the session format error contract" {
+    const alloc = std.testing.allocator;
+    const invalid_images = [_]types.ToolImage{
+        .{ .data = @constCast(""), .mime_type = @constCast("image/png"), .source_ref = @constCast("bad\nref") },
+        .{ .data = @constCast(""), .mime_type = @constCast("image/png") },
+    };
+    for (invalid_images) |image| {
+        var images = [_]types.ToolImage{image};
+        var out: std.Io.Writer.Allocating = .init(alloc);
+        defer out.deinit();
+        try std.testing.expectError(error.InvalidSessionFormat, writeExecutionToolResult(&out.writer, .{
+            .tool_call_id = @constCast("call"),
+            .tool_name = @constCast("host_image"),
+            .status = .success,
+            .output = @constCast(""),
+            .output_bytes = 0,
+            .stored_output_bytes = 0,
+            .truncated = false,
+            .provider_native = false,
+            .created_at_ms = 0,
+            .tool_images = &images,
+        }, .durable));
+    }
+}
+
 test "durable state round trips live history while discarding legacy authority" {
     const alloc = std.testing.allocator;
     const invalid_a = [_]u8{ 'a', 0xff };
@@ -3485,12 +3989,12 @@ test "non-object interrupted inputs repair locally and preserve provider-owned r
     for ([_]bool{ false, true }) |native| {
         var out: std.Io.Writer.Allocating = .init(alloc);
         defer out.deinit();
-        try writeToolCall(&out.writer, .{
+        try writeExecutionToolCall(&out.writer, .{
             .id = "interrupted",
             .name = "read_file",
             .arguments_json = "[]",
             .provider_result = if (native) "provider result" else null,
-        });
+        }, .durable);
         var parsed = try std.json.parseFromSlice(std.json.Value, alloc, out.written(), .{});
         defer parsed.deinit();
         const repaired = (try parseOptionalToolCall(alloc, parsed.value)).?;
@@ -3699,7 +4203,7 @@ test "review feedback survives durable execution memory round trip" {
         var steps = [_]session.ToolExecutionStep{.{ .tool_calls = &calls, .tool_results = &results }};
         var encoded: std.Io.Writer.Allocating = .init(alloc);
         defer encoded.deinit();
-        try writeExecutionMemory(&encoded.writer, .{ .tool_steps = &steps });
+        try writeExecutionMemoryJson(&encoded.writer, .{ .tool_steps = &steps }, .durable);
         var parsed = try std.json.parseFromSlice(std.json.Value, alloc, encoded.written(), .{});
         defer parsed.deinit();
         const decoded = try parseExecutionMemory(alloc, parsed.value);
@@ -3718,7 +4222,7 @@ test "review feedback durable codec rejects invalid provenance and unknown field
     result.review_feedback = true;
     var encoded: std.Io.Writer.Allocating = .init(alloc);
     defer encoded.deinit();
-    try writePersistedToolResult(&encoded.writer, result);
+    try writeExecutionToolResult(&encoded.writer, result, .durable);
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, encoded.written(), .{});
     defer parsed.deinit();
     const cases = [_]struct { status: []const u8, provider_native: bool, marker: std.json.Value }{
@@ -3742,7 +4246,10 @@ test "review feedback durable codec rejects invalid provenance and unknown field
         var invalid = result;
         invalid.status = if (native) .failure else .success;
         invalid.provider_native = native;
-        try std.testing.expectError(error.InvalidSessionFormat, writePersistedToolResult(&encoded.writer, invalid));
+        try std.testing.expectError(
+            error.InvalidSessionFormat,
+            writeExecutionToolResult(&encoded.writer, invalid, .durable),
+        );
     }
 }
 
@@ -3753,7 +4260,7 @@ test "review feedback defaults old durable results without inspecting output" {
     result.output = @constCast("Security review held this action.");
     var encoded: std.Io.Writer.Allocating = .init(alloc);
     defer encoded.deinit();
-    try writePersistedToolResult(&encoded.writer, result);
+    try writeExecutionToolResult(&encoded.writer, result, .durable);
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, encoded.written(), .{});
     defer parsed.deinit();
     try std.testing.expect(parsed.value.object.swapRemove("review_feedback"));
@@ -3959,6 +4466,86 @@ test "execution memory codec preserves feedback and reads v1 results without it"
     try std.testing.expectError(
         error.InvalidSessionFormat,
         parseHistoryTurn(alloc, invalid_v7_parsed.value),
+    );
+}
+
+test "committed file presentation codec reads shipped and spilled shapes" {
+    const alloc = std.testing.allocator;
+
+    // Shipped shape: every record written by released fx has exactly these
+    // nine keys, with the snapshots inline and no content_handle key.
+    const shipped =
+        "{\"path\":\"note.txt\",\"kind\":\"added\",\"lines\":[{\"kind\":\"addition\",\"old_line\":null,\"new_line\":1,\"text\":\"line\"}],\"additions\":1,\"deletions\":0,\"truncated\":false,\"previous_content\":null,\"after_content\":\"line\\n\",\"lifecycle_id\":{\"turn_id\":9,\"call_id\":\"call_write\"}}";
+    var shipped_parsed = try std.json.parseFromSlice(std.json.Value, alloc, shipped, .{});
+    defer shipped_parsed.deinit();
+    const shipped_presentation = try parseCommittedFilePresentation(alloc, shipped_parsed.value);
+    defer types.freeCommittedFilePresentation(alloc, shipped_presentation);
+    try std.testing.expectEqualStrings("note.txt", shipped_presentation.path);
+    try std.testing.expectEqualStrings("line\n", shipped_presentation.after_content.?);
+    try std.testing.expect(shipped_presentation.content_handle == null);
+
+    // Spilled shape: snapshots live in the result store and the record
+    // carries only the handle.
+    const spilled =
+        "{\"path\":\"note.txt\",\"kind\":\"edited\",\"lines\":[],\"additions\":1,\"deletions\":1,\"truncated\":false,\"previous_content\":null,\"after_content\":null,\"lifecycle_id\":null,\"content_handle\":\"diff-0123456789abcdef-0123456789abcdef.json\"}";
+    var spilled_parsed = try std.json.parseFromSlice(std.json.Value, alloc, spilled, .{});
+    defer spilled_parsed.deinit();
+    const spilled_presentation = try parseCommittedFilePresentation(alloc, spilled_parsed.value);
+    defer types.freeCommittedFilePresentation(alloc, spilled_presentation);
+    try std.testing.expectEqualStrings(
+        "diff-0123456789abcdef-0123456789abcdef.json",
+        spilled_presentation.content_handle.?,
+    );
+    try std.testing.expect(spilled_presentation.previous_content == null);
+    try std.testing.expect(spilled_presentation.after_content == null);
+
+    const competing_sources =
+        "{\"path\":\"note.txt\",\"kind\":\"edited\",\"lines\":[],\"additions\":1,\"deletions\":1,\"truncated\":false,\"previous_content\":\"inline\",\"after_content\":null,\"lifecycle_id\":null,\"content_handle\":\"diff-0123456789abcdef-0123456789abcdef.json\"}";
+    var competing_parsed = try std.json.parseFromSlice(std.json.Value, alloc, competing_sources, .{});
+    defer competing_parsed.deinit();
+    try std.testing.expectError(
+        error.InvalidSessionFormat,
+        parseCommittedFilePresentation(alloc, competing_parsed.value),
+    );
+
+    // Unknown keys still fail closed.
+    const unknown_key =
+        "{\"path\":\"note.txt\",\"kind\":\"added\",\"lines\":[],\"additions\":1,\"deletions\":0,\"truncated\":false,\"previous_content\":null,\"after_content\":null,\"lifecycle_id\":null,\"surprise\":true}";
+    var unknown_parsed = try std.json.parseFromSlice(std.json.Value, alloc, unknown_key, .{});
+    defer unknown_parsed.deinit();
+    try std.testing.expectError(
+        error.InvalidSessionFormat,
+        parseCommittedFilePresentation(alloc, unknown_parsed.value),
+    );
+
+    // The writer omits content_handle for unspilled presentations, keeping
+    // the shipped 9-key shape readable by older builds.
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    defer out.deinit();
+    try writeExecutionFilePresentation(&out.writer, shipped_presentation, .durable);
+    try std.testing.expect(std.mem.find(u8, out.written(), "content_handle") == null);
+    var roundtrip_parsed = try std.json.parseFromSlice(std.json.Value, alloc, out.written(), .{});
+    defer roundtrip_parsed.deinit();
+    const roundtrip = try parseCommittedFilePresentation(alloc, roundtrip_parsed.value);
+    defer types.freeCommittedFilePresentation(alloc, roundtrip);
+    try std.testing.expectEqualStrings("line\n", roundtrip.after_content.?);
+    try std.testing.expect(roundtrip.content_handle == null);
+
+    // The writer emits the handle only when present, and it roundtrips.
+    out.clearRetainingCapacity();
+    try writeExecutionFilePresentation(&out.writer, spilled_presentation, .durable);
+    try std.testing.expect(std.mem.find(
+        u8,
+        out.written(),
+        "\"content_handle\":\"diff-0123456789abcdef-0123456789abcdef.json\"",
+    ) != null);
+    var spilled_roundtrip_parsed = try std.json.parseFromSlice(std.json.Value, alloc, out.written(), .{});
+    defer spilled_roundtrip_parsed.deinit();
+    const spilled_roundtrip = try parseCommittedFilePresentation(alloc, spilled_roundtrip_parsed.value);
+    defer types.freeCommittedFilePresentation(alloc, spilled_roundtrip);
+    try std.testing.expectEqualStrings(
+        "diff-0123456789abcdef-0123456789abcdef.json",
+        spilled_roundtrip.content_handle.?,
     );
 }
 
@@ -4576,6 +5163,8 @@ fn expectUserTurnEqual(expected: session.UserTurn, actual: session.UserTurn) !vo
         try std.testing.expectEqualSlices(u8, image.media_type, got.media_type);
         try expectOptionalBytesEqual(image.snapshot_path, got.snapshot_path);
         try expectOptionalBytesEqual(image.snapshot_sha256, got.snapshot_sha256);
+        try expectOptionalBytesEqual(image.inline_data, got.inline_data);
+        try expectOptionalBytesEqual(image.source_ref, got.source_ref);
     }
 }
 
@@ -4621,6 +5210,124 @@ test "durable image snapshots serialize as session-relative locators" {
     ) != null);
 }
 
+test "inline image bytes round trip through the history turn codec" {
+    const alloc = std.testing.allocator;
+    const png = "\x89PNG\r\n\x1a\ninline-bytes";
+    var digest: [Sha256.digest_length]u8 = undefined;
+    Sha256.hash(png, &digest, .{});
+    const digest_hex = std.fmt.bytesToHex(digest, .lower);
+    var images = [_]session.ImageAttachment{
+        .{
+            .id = 2,
+            .path = @constCast("inline://image-2"),
+            .media_type = @constCast("image/png"),
+            .snapshot_sha256 = @constCast(&digest_hex),
+            .inline_data = @constCast(png),
+            .source_ref = @constCast("host:original"),
+        },
+        .{
+            .id = 3,
+            .path = @constCast("inline://image-3"),
+            .media_type = @constCast("image/png"),
+            .source_ref = @constCast("host:deferred"),
+        },
+    };
+    const turn: session.HistoryTurn = .{ .assistant = .{
+        .user = .{ .text = @constCast("look [Image #2]\n[Image #3]"), .images = &images },
+        .assistant = @constCast("done"),
+    } };
+    for ([_]bool{ false, true }) |raw| {
+        var encoded: std.Io.Writer.Allocating = .init(alloc);
+        defer encoded.deinit();
+        var blobs: std.ArrayList([]const u8) = .empty;
+        defer blobs.deinit(alloc);
+        if (raw) {
+            try writeHistoryTurnWithImageBlobs(&encoded.writer, turn, .{ .alloc = alloc, .items = &blobs });
+            try std.testing.expect(std.mem.find(u8, encoded.written(), "\"inline_blob\":0") != null);
+            try std.testing.expect(std.mem.find(u8, encoded.written(), "\"inline_data\"") == null);
+            try std.testing.expectEqual(@as(usize, 1), blobs.items.len);
+            try std.testing.expectEqualStrings(png, blobs.items[0]);
+        } else {
+            try writeHistoryTurn(&encoded.writer, turn);
+            try std.testing.expect(std.mem.find(u8, encoded.written(), "\"inline_data\":{") != null);
+        }
+        try std.testing.expect(std.mem.find(u8, encoded.written(), "\"snapshot_path\":null") != null);
+        try std.testing.expect(std.mem.find(u8, encoded.written(), "\"source_ref\":\"host:original\"") != null);
+
+        var parsed_value = try std.json.parseFromSlice(std.json.Value, alloc, encoded.written(), .{});
+        defer parsed_value.deinit();
+        var reader = ImageBlobReader{ .blobs = blobs.items };
+        const decoded = try parseHistoryTurnWithImageBlobs(alloc, parsed_value.value, if (raw) &reader else null);
+        defer types.freeHistoryTurn(alloc, decoded);
+        try expectUserTurnEqual(turn.assistant.user, decoded.assistant.user);
+        try std.testing.expect(decoded.assistant.user.images[0].inline_data.?.ptr != images[0].inline_data.?.ptr);
+        try std.testing.expect(decoded.assistant.user.images[0].source_ref.?.ptr != images[0].source_ref.?.ptr);
+        try std.testing.expect(reader.consumedAll());
+    }
+}
+
+test "inline image parsing rejects missing digest and mismatched bytes" {
+    const alloc = std.testing.allocator;
+    const png = "\x89PNG\r\n\x1a\ninline-bytes";
+    var digest: [Sha256.digest_length]u8 = undefined;
+    Sha256.hash(png, &digest, .{});
+    const digest_hex = std.fmt.bytesToHex(digest, .lower);
+    const wrong_digest = "0" ** (Sha256.digest_length * 2);
+
+    const Template = struct {
+        snapshot_sha256: ?[]const u8,
+        media_type: []const u8,
+        bytes: []const u8,
+    };
+    const cases = [_]Template{
+        // Inline bytes without their digest cannot be verified at request time.
+        .{ .snapshot_sha256 = null, .media_type = "image/png", .bytes = png },
+        // Bytes must sniff to the declared media type.
+        .{ .snapshot_sha256 = &digest_hex, .media_type = "image/jpeg", .bytes = png },
+        // Empty and un sniffable payloads are not images.
+        .{ .snapshot_sha256 = &digest_hex, .media_type = "image/png", .bytes = "" },
+        .{ .snapshot_sha256 = &digest_hex, .media_type = "image/png", .bytes = "plain text" },
+        // A digest mismatch alone does not fail the codec parse (the payload
+        // envelope covers integrity), but the bytes must stay image-shaped.
+        .{ .snapshot_sha256 = wrong_digest, .media_type = "image/png", .bytes = png },
+    };
+    const expect_failure = [_]bool{ true, true, true, true, false };
+    for (cases, expect_failure) |case, should_fail| {
+        var images = [_]session.ImageAttachment{.{
+            .id = 1,
+            .path = @constCast("inline://image-1"),
+            .media_type = @constCast(case.media_type),
+            .snapshot_sha256 = if (case.snapshot_sha256) |value| @constCast(value) else null,
+            .inline_data = @constCast(case.bytes),
+            .source_ref = @constCast("host:original"),
+        }};
+        const turn: session.HistoryTurn = .{ .assistant = .{
+            .user = .{ .text = @constCast("[Image #1]"), .images = &images },
+            .assistant = @constCast("done"),
+        } };
+        for ([_]bool{ false, true }) |raw| {
+            var encoded: std.Io.Writer.Allocating = .init(alloc);
+            defer encoded.deinit();
+            var blobs: std.ArrayList([]const u8) = .empty;
+            defer blobs.deinit(alloc);
+            if (raw) {
+                try writeHistoryTurnWithImageBlobs(&encoded.writer, turn, .{ .alloc = alloc, .items = &blobs });
+            } else {
+                try writeHistoryTurn(&encoded.writer, turn);
+            }
+            var parsed_value = try std.json.parseFromSlice(std.json.Value, alloc, encoded.written(), .{});
+            defer parsed_value.deinit();
+            var reader = ImageBlobReader{ .blobs = blobs.items };
+            if (should_fail) {
+                try std.testing.expectError(error.InvalidSessionFormat, parseHistoryTurnWithImageBlobs(alloc, parsed_value.value, if (raw) &reader else null));
+            } else {
+                const decoded = try parseHistoryTurnWithImageBlobs(alloc, parsed_value.value, if (raw) &reader else null);
+                types.freeHistoryTurn(alloc, decoded);
+            }
+        }
+    }
+}
+
 test "codec structural helpers enforce exact objects and required strings" {
     const alloc = std.testing.allocator;
 
@@ -4660,6 +5367,35 @@ test "codec structural helpers enforce exact objects and required strings" {
     try std.testing.expectEqualStrings("value", try requireString(valid_object, "known"));
 }
 
+test "default ultrafast state writes the legacy-compatible preference shape" {
+    const alloc = std.testing.allocator;
+    const state = DurableSessionState{
+        .id = @constCast("legacy-compatible"),
+        .origin_workspace_root = @constCast("/workspace"),
+        .workspace_root = @constCast("/workspace"),
+        .created_at_ms = 1,
+        .updated_at_ms = 2,
+        .conversation_language = session.ConversationLanguage.literal("en"),
+        .preferences = .{
+            .model = @constCast("test/model"),
+            .effort = .auto,
+            .fast_mode = false,
+        },
+        .history = &.{},
+        .total_input_tokens = 0,
+        .total_output_tokens = 0,
+    };
+    var encoded: std.Io.Writer.Allocating = .init(alloc);
+    defer encoded.deinit();
+    _ = try encodeState(state, &encoded.writer);
+    try std.testing.expect(std.mem.find(u8, encoded.written(), "\"ultrafast_mode\"") == null);
+
+    var source = std.Io.Reader.fixed(encoded.written());
+    var decoded = try decodeState(alloc, &source, .{});
+    defer decoded.deinit(alloc);
+    try std.testing.expect(!decoded.preferences.ultrafast_mode);
+}
+
 test "recovery checkpoint round trips while legacy state stays absent" {
     const alloc = std.testing.allocator;
     const checkpoint = RecoveryCheckpoint{
@@ -4680,6 +5416,8 @@ test "recovery checkpoint round trips while legacy state stays absent" {
         },
         .requested_fast_mode = true,
         .fast_mode = true,
+        .requested_ultrafast_mode = true,
+        .ultrafast_mode = true,
         .max_provider_attempts = 10,
         .consumed_provider_attempts = 4,
         .outstanding_reservation = true,
@@ -4696,6 +5434,7 @@ test "recovery checkpoint round trips while legacy state stays absent" {
             .model = @constCast("gpt-5.4-mini"),
             .effort = .auto,
             .fast_mode = false,
+            .ultrafast_mode = true,
         },
         .history = &.{},
         .total_input_tokens = 0,
@@ -4706,6 +5445,8 @@ test "recovery checkpoint round trips while legacy state stays absent" {
     var encoded: std.Io.Writer.Allocating = .init(alloc);
     defer encoded.deinit();
     _ = try encodeState(state, &encoded.writer);
+    try std.testing.expect(std.mem.find(u8, encoded.written(), "\"requested_ultrafast_mode\":true") != null);
+    try std.testing.expect(std.mem.find(u8, encoded.written(), "\"ultrafast_mode\":true") != null);
     var source = std.Io.Reader.fixed(encoded.written());
     var decoded = try decodeState(alloc, &source, .{});
     defer decoded.deinit(alloc);
@@ -4724,6 +5465,9 @@ test "recovery checkpoint round trips while legacy state stays absent" {
     try std.testing.expectEqual(model_provider.ProviderId.codex, decoded.preferences.provider);
     try std.testing.expect(restored.requested_fast_mode);
     try std.testing.expect(restored.fast_mode);
+    try std.testing.expect(restored.requested_ultrafast_mode);
+    try std.testing.expect(restored.ultrafast_mode);
+    try std.testing.expect(decoded.preferences.ultrafast_mode);
     try std.testing.expectEqual(@as(usize, 4), restored.consumed_provider_attempts);
     try std.testing.expect(restored.outstanding_reservation);
 
@@ -4733,6 +5477,7 @@ test "recovery checkpoint round trips while legacy state stays absent" {
     var legacy_state = try decodeState(alloc, &legacy_source, .{});
     defer legacy_state.deinit(alloc);
     try std.testing.expectEqual(model_provider.ProviderId.gateway, legacy_state.preferences.provider);
+    try std.testing.expect(!legacy_state.preferences.ultrafast_mode);
     try std.testing.expectEqual(@as(?RecoveryCheckpoint, null), legacy_state.recovery_checkpoint);
 }
 
@@ -4757,6 +5502,14 @@ test "recovery checkpoint accepts the exact composer byte limit" {
     defer alloc.free(encoded);
     try std.testing.expect(encoded.len > prompt.len);
     try std.testing.expect(encoded.len <= max_recovery_checkpoint_bytes);
+    try std.testing.expect(std.mem.find(u8, encoded, "\"requested_ultrafast_mode\"") == null);
+    try std.testing.expect(std.mem.find(u8, encoded, "\"ultrafast_mode\"") == null);
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, encoded, .{});
+    defer parsed.deinit();
+    var decoded = try parseRecoveryCheckpoint(alloc, parsed.value);
+    defer decoded.deinit(alloc);
+    try std.testing.expect(!decoded.requested_ultrafast_mode);
+    try std.testing.expect(!decoded.ultrafast_mode);
 }
 
 test "session permission state round trips while legacy state stays empty" {
@@ -5134,6 +5887,119 @@ test "durable provenance rejects malformed shapes and out-of-order placement" {
     );
 }
 
+test "recovery checkpoint image and tool source refs round trip with independent ownership" {
+    const alloc = std.testing.allocator;
+    const png = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jP0cAAAAASUVORK5CYII=";
+    const pixels = image_data.testPngHeader(1, 1);
+    var attachments = [_]types.ImageAttachment{
+        .{
+            .id = 1,
+            .path = @constCast("inline://image-1"),
+            .media_type = @constCast("image/png"),
+            .inline_data = @constCast(&pixels),
+            .snapshot_sha256 = @constCast("digest"),
+            .source_ref = @constCast("host:original"),
+        },
+        .{
+            .id = 2,
+            .path = @constCast("inline://image-2"),
+            .media_type = @constCast("image/jpeg"),
+            .source_ref = @constCast("host:large"),
+        },
+    };
+    var tool_images = [_]types.ToolImage{
+        .{ .data = @constCast(png), .mime_type = @constCast("image/png"), .source_ref = @constCast("host:copy") },
+        .{ .data = @constCast(""), .mime_type = @constCast("image/jpeg"), .source_ref = @constCast("host:large") },
+    };
+    var results = [_]types.PersistedToolResult{.{
+        .tool_call_id = @constCast("recover"),
+        .tool_name = @constCast("host_image"),
+        .status = .success,
+        .output = @constCast("image result"),
+        .output_bytes = 12,
+        .stored_output_bytes = 12,
+        .tool_images = &tool_images,
+    }};
+    var calls = [_]types.ToolCall{.{ .id = "recover", .name = "host_image", .arguments_json = @constCast("{}") }};
+    var steps = [_]types.ToolExecutionStep{.{ .tool_calls = &calls, .tool_results = &results }};
+    const checkpoint: RecoveryCheckpoint = .{
+        .turn_id = 1,
+        .user = .{ .text = @constCast("inspect"), .images = &attachments },
+        .assistant_source = @constCast("partial"),
+        .execution = .{ .tool_steps = &steps },
+        .cause = .response_interrupted,
+        .action = .continuing_response,
+        .authority = .{ .provider = .gateway, .model = @constCast("test/model") },
+        .requested_fast_mode = false,
+        .fast_mode = false,
+        .max_provider_attempts = 3,
+        .consumed_provider_attempts = 1,
+    };
+    const bytes = try encodeRecoveryCheckpoint(alloc, checkpoint);
+    defer alloc.free(bytes);
+    try std.testing.expect(std.mem.find(u8, bytes, "\"sourceRef\"") == null);
+    try std.testing.checkAllAllocationFailures(alloc, struct {
+        fn check(a: Allocator, encoded: []const u8) !void {
+            var parsed = try std.json.parseFromSlice(std.json.Value, a, encoded, .{});
+            defer parsed.deinit();
+            var decoded = try parseRecoveryCheckpoint(a, parsed.value);
+            defer decoded.deinit(a);
+            var copy = try decoded.dupe(a);
+            defer copy.deinit(a);
+            decoded.user.images[0].source_ref.?[0] = 'X';
+            decoded.execution.tool_steps[0].tool_results[0].tool_images[0].source_ref.?[0] = 'X';
+            try std.testing.expectEqualStrings("host:original", copy.user.images[0].source_ref.?);
+            try std.testing.expectEqualStrings("host:large", copy.user.images[1].source_ref.?);
+            try std.testing.expectEqualStrings("inline://image-2", copy.user.images[1].path);
+            try std.testing.expect(copy.user.images[1].inline_data == null);
+            try std.testing.expect(copy.user.images[1].snapshot_path == null);
+            try std.testing.expect(copy.user.images[1].snapshot_sha256 == null);
+            const images = copy.execution.tool_steps[0].tool_results[0].tool_images;
+            try std.testing.expectEqualStrings("host:copy", images[0].source_ref.?);
+            try std.testing.expectEqualStrings("host:large", images[1].source_ref.?);
+            try std.testing.expectEqualStrings("", images[1].data);
+            try std.testing.expectEqual(@as(u8, 2), copy.version);
+        }
+    }.check, .{bytes});
+}
+
+test "persisted image source refs reject malformed metadata and preserve the byte bound" {
+    const alloc = std.testing.allocator;
+    var user = try std.json.parseFromSlice(std.json.Value, alloc, "{\"text\":\"inspect\",\"images\":[{\"id\":1,\"path\":\"inline://image-1\",\"media_type\":\"image/png\",\"source_ref\":\"host:original\"}]}", .{});
+    defer user.deinit();
+    var tools = try std.json.parseFromSlice(std.json.Value, alloc, "[{\"type\":\"image\",\"mimeType\":\"image/png\",\"source_ref\":\"host:original\"}]", .{});
+    defer tools.deinit();
+    const invalid = [_]std.json.Value{
+        .null,
+        .{ .integer = 7 },
+        .{ .string = "" },
+        .{ .string = "host\x00bad" },
+        .{ .string = "host\nbad" },
+        .{ .string = "host\x1fbad" },
+        .{ .string = "host\x7fbad" },
+        .{ .string = "\xff" },
+        .{ .string = "r" ** 513 },
+    };
+    const user_ref = user.value.object.getPtr("images").?.array.items[0].object.getPtr("source_ref").?;
+    const tool_ref = tools.value.array.items[0].object.getPtr("source_ref").?;
+    for (invalid) |value| {
+        user_ref.* = value;
+        tool_ref.* = value;
+        try std.testing.expectError(error.InvalidSessionFormat, parseUserTurn(alloc, user.value, null));
+        try std.testing.expectError(error.InvalidSourceRef, parsePersistedToolImages(alloc, tools.value.array.items));
+    }
+    const boundary = "é" ** 256;
+    user_ref.* = .{ .string = boundary };
+    tool_ref.* = .{ .string = boundary };
+    const decoded_user = try parseUserTurn(alloc, user.value, null);
+    defer session.freeUserTurn(alloc, decoded_user);
+    const decoded_tools = try parsePersistedToolImages(alloc, tools.value.array.items);
+    defer types.freeToolImages(alloc, decoded_tools);
+    try std.testing.expectEqualStrings(boundary, decoded_user.images[0].source_ref.?);
+    try std.testing.expectEqualStrings(boundary, decoded_tools[0].source_ref.?);
+    try std.testing.expectEqualStrings("", decoded_tools[0].data);
+}
+
 test "session metadata round trips without conversation or control state" {
     const alloc = std.testing.allocator;
     const encoded = try encodeSessionMetadata(alloc, .{
@@ -5155,11 +6021,53 @@ test "session metadata round trips without conversation or control state" {
     try std.testing.expect(std.mem.find(u8, encoded, "usage") == null);
     try std.testing.expect(std.mem.find(u8, encoded, "permission") == null);
     try std.testing.expect(std.mem.find(u8, encoded, "checkpoint") == null);
+    try std.testing.expect(std.mem.find(u8, encoded, "ultrafast_mode") == null);
 
     var decoded = try decodeSessionMetadata(alloc, encoded);
     defer decoded.deinit();
     try std.testing.expectEqualStrings("session-1", decoded.value.id);
     try std.testing.expectEqualStrings("/tmp/current", decoded.value.workspace_root);
     try std.testing.expectEqualStrings("openai/gpt-5.6", decoded.value.model);
+    try std.testing.expect(decoded.value.ultrafast_mode == null);
     try std.testing.expectEqualStrings("Compaction work", decoded.value.title.?);
+}
+
+test "session metadata persists opted-in ultrafast mode" {
+    const alloc = std.testing.allocator;
+    const encoded = try encodeSessionMetadata(alloc, .{
+        .id = "session-ultrafast",
+        .origin_workspace_root = "/tmp/origin",
+        .workspace_root = "/tmp/current",
+        .created_at_ms = 10,
+        .updated_at_ms = 20,
+        .conversation_language = "en",
+        .provider = .gateway,
+        .model = "openai/gpt-5.6",
+        .effort = "high",
+        .fast_mode = false,
+        .ultrafast_mode = true,
+    });
+    defer alloc.free(encoded);
+    try std.testing.expect(std.mem.find(u8, encoded, "\"ultrafast_mode\":true") != null);
+    var decoded = try decodeSessionMetadata(alloc, encoded);
+    defer decoded.deinit();
+    try std.testing.expectEqual(@as(?bool, true), decoded.value.ultrafast_mode);
+}
+
+test "ultrafast durable preference requires a bool when present" {
+    const alloc = std.testing.allocator;
+    var parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        alloc,
+        "{\"provider\":\"gateway\",\"model\":\"test/model\",\"effort\":\"auto\",\"fast_mode\":false,\"ultrafast_mode\":\"true\"}",
+        .{},
+    );
+    defer parsed.deinit();
+    if (parse_preferences(alloc, parsed.value)) |preferences| {
+        var owned = preferences;
+        owned.deinit(alloc);
+        return error.TestUnexpectedResult;
+    } else |err| {
+        try std.testing.expect(err == error.InvalidSessionFormat or err == error.InvalidDurableField);
+    }
 }
