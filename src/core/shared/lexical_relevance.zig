@@ -9,12 +9,19 @@ pub const PrepareError = error{
 };
 
 pub const PreparedQuery = struct {
+    const TokenRange = struct {
+        start: u16,
+        end: u16,
+    };
+
     raw: []const u8,
-    tokens: [max_query_tokens][]const u8,
+    tokens: [max_query_tokens]TokenRange,
     token_count: usize,
 
-    pub fn tokenSlice(self: *const PreparedQuery) []const []const u8 {
-        return self.tokens[0..self.token_count];
+    pub fn tokenAt(self: *const PreparedQuery, index: usize) []const u8 {
+        std.debug.assert(index < self.token_count);
+        const token = self.tokens[index];
+        return self.raw[token.start..token.end];
     }
 };
 
@@ -53,12 +60,12 @@ pub fn prepare(query: []const u8) PrepareError!PreparedQuery {
             continue;
         }
         if (start) |token_start| {
-            appendToken(&prepared, query[token_start..index]);
+            appendToken(&prepared, token_start, index);
             start = null;
         }
     }
     if (start) |token_start| {
-        appendToken(&prepared, query[token_start..]);
+        appendToken(&prepared, token_start, query.len);
     }
     return prepared;
 }
@@ -73,7 +80,8 @@ pub fn score(
         .exact_identity = containsCompleteIdentity(query.raw, exact_identities),
     };
 
-    for (query.tokenSlice()) |token| {
+    for (0..query.token_count) |index| {
+        const token = query.tokenAt(index);
         if (containsAnyCompleteToken(strong_fields, token)) {
             result.strong_hits += 1;
         } else if (containsAnySubstring(weak_fields, token)) {
@@ -101,13 +109,19 @@ pub fn order(a: Score, b: Score) std.math.Order {
 
 fn appendToken(
     prepared: *PreparedQuery,
-    token: []const u8,
+    start: usize,
+    end: usize,
 ) void {
-    for (prepared.tokenSlice()) |existing| {
+    const token = prepared.raw[start..end];
+    for (0..prepared.token_count) |index| {
+        const existing = prepared.tokenAt(index);
         if (std.ascii.eqlIgnoreCase(existing, token)) return;
     }
     std.debug.assert(prepared.token_count < max_query_tokens);
-    prepared.tokens[prepared.token_count] = token;
+    prepared.tokens[prepared.token_count] = .{
+        .start = @intCast(start),
+        .end = @intCast(end),
+    };
     prepared.token_count += 1;
 }
 
@@ -180,10 +194,11 @@ test "prepared queries accept long requests within the byte bound" {
 test "prepared queries enforce bounds and deduplicate case-insensitively" {
     const prepared = try prepare("GitHub github GITHUB issue");
     try std.testing.expectEqual(@as(usize, 2), prepared.token_count);
-    try std.testing.expectEqualStrings("GitHub", prepared.tokenSlice()[0]);
-    try std.testing.expectEqualStrings("issue", prepared.tokenSlice()[1]);
+    try std.testing.expectEqualStrings("GitHub", prepared.tokenAt(0));
+    try std.testing.expectEqualStrings("issue", prepared.tokenAt(1));
 
-    _ = try prepare("a" ** max_query_bytes);
+    const maximum = try prepare("a" ** max_query_bytes);
+    try std.testing.expectEqualStrings("a" ** max_query_bytes, maximum.tokenAt(0));
     try std.testing.expectError(error.QueryTooLong, prepare("a" ** (max_query_bytes + 1)));
 
     const max_tokens = "a " ** max_query_tokens;

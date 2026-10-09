@@ -11,6 +11,7 @@ const secret = @import("../core/auth/secret.zig");
 const collections = @import("../core/shared/collections.zig");
 const debug_trace = @import("../core/shared/debug_trace.zig");
 const gateway_error_format = @import("../core/shared/gateway_error_format.zig");
+const http_pool = @import("../core/shared/http_pool.zig");
 const gateway_client = @import("../gateway/client.zig");
 const vercel_failure_diagnostics = @import("../gateway/vercel_failure_diagnostics.zig");
 const vercel_protocol = @import("../gateway/vercel_protocol.zig");
@@ -41,7 +42,7 @@ const Request = web_search_contract.ProviderRequest;
 const Response = web_search_contract.ProviderResponse;
 const ProgressFn = web_search_contract.ProgressFn;
 
-pub const default_model = "moonshotai/kimi-k3";
+pub const default_model = "spacexai/grok-4.7";
 pub const title_model = "openai/gpt-5.6-luna";
 pub const default_chat_url = "https://ai-gateway.vercel.sh/v4/ai/language-model";
 pub const models_path = "/coding-agent/v1/models";
@@ -568,10 +569,13 @@ test "required vision request contains only the registered vision schema" {
 }
 
 fn streamAgentCompletion(
-    _: ?*anyopaque,
+    context: ?*anyopaque,
     alloc: Allocator,
     request: agent_stream_provider_contract.ModelRequest,
 ) anyerror!agent_stream_provider_contract.Result {
+    // The provider runtime installs a process-long gateway connection pool as
+    // the provider context; nothing else uses this context today.
+    const shared_pool: ?*http_pool.HttpPool = if (context) |ctx| @ptrCast(@alignCast(ctx)) else null;
     const credential_source = request.credential.credentialSource();
     if (credential_source == .configured) return agent_stream_provider_contract.failResult(error.ConfiguredCredentialCannotAuthorizeGateway);
     if (credential_source == .chatgpt_subscription or credential_source == .grok_subscription) {
@@ -601,6 +605,7 @@ fn streamAgentCompletion(
             .transport => .transport,
             .agent => .agent,
         },
+        .shared_pool = shared_pool,
     };
     const result = (if (request.deadline) |deadline|
         gateway_client.streamGatewayCompletionBounded(
@@ -992,14 +997,17 @@ fn fetchCliModelCatalog(
     return switch (result) {
         .loaded => |loaded| project: {
             var catalog = loaded.catalog;
-            defer freeModelCatalog(alloc, &catalog);
-            const ids = model_catalog.projectModelIds(alloc, catalog.items) catch return .{ .failure = .{
-                .access = loaded.provenance.access,
-                .anonymous_fallback_used = loaded.provenance.anonymous_fallback_used,
-                .failure = .{ .category = .resource_exhausted },
-            } };
+            const ids = model_catalog.projectModelIds(alloc, catalog.items) catch {
+                freeModelCatalog(alloc, &catalog);
+                break :project .{ .failure = .{
+                    .access = loaded.provenance.access,
+                    .anonymous_fallback_used = loaded.provenance.anonymous_fallback_used,
+                    .failure = .{ .category = .resource_exhausted },
+                } };
+            };
             break :project .{ .loaded = .{
                 .ids = ids,
+                .entries = catalog,
                 .provenance = loaded.provenance,
             } };
         },
@@ -2049,7 +2057,7 @@ test "possibly sent web search failure marks billing incomplete" {
 }
 
 test "built-in gateway defaults preserve active provider policy" {
-    try std.testing.expectEqualStrings("moonshotai/kimi-k3", default_model);
+    try std.testing.expectEqualStrings("spacexai/grok-4.7", default_model);
     try std.testing.expectEqualStrings("https://ai-gateway.vercel.sh/v4/ai/language-model", default_chat_url);
     try std.testing.expectEqualStrings("/coding-agent/v1/models", models_path);
     try std.testing.expectEqual(@as(usize, 3), retry_count);
@@ -2854,15 +2862,19 @@ fn parseModelCatalogEntry(alloc: std.mem.Allocator, entry: std.json.Value) !?Mod
     errdefer alloc.free(id);
     const owned_model_type = try alloc.dupe(u8, model_type);
     errdefer alloc.free(owned_model_type);
+    const name = try parseModelName(alloc, entry.object.get("name"));
+    errdefer if (name) |value| alloc.free(value);
 
     return .{
         .id = id,
+        .name = name,
         .model_type = owned_model_type,
         .released = released,
         .has_tool_use = has_tool_use,
         .has_reasoning = has_reasoning,
         .reasoning_efforts = reasoning_efforts,
         .supports_fast_mode = supports_fast_mode,
+        .supports_ultrafast_mode = supportsUltrafastMode(entry.object),
         .has_vision = has_vision,
         .has_file_input = has_file_input,
         .has_web_search = has_web_search,
@@ -2872,6 +2884,15 @@ fn parseModelCatalogEntry(alloc: std.mem.Allocator, entry: std.json.Value) !?Mod
         .max_tokens = max_tokens,
         .web_search_price = web_search_price,
     };
+}
+
+/// The catalog's display name without surrounding whitespace; null when it is missing, not a string, or blank.
+fn parseModelName(alloc: std.mem.Allocator, value: ?std.json.Value) !?[]u8 {
+    const raw = value orelse return null;
+    if (raw != .string) return null;
+    const trimmed = std.mem.trim(u8, raw.string, &std.ascii.whitespace);
+    if (trimmed.len == 0) return null;
+    return try alloc.dupe(u8, trimmed);
 }
 
 fn parseReasoningEfforts(alloc: std.mem.Allocator, options: ?std.json.Value) !std.ArrayList(shared_types.ReasoningEffort) {
@@ -2918,6 +2939,65 @@ fn supportsFastMode(entry: std.json.ObjectMap) bool {
     const owned_by = entry.get("owned_by") orelse return false;
     if (owned_by != .string or !std.ascii.eqlIgnoreCase(owned_by.string, "openai")) return false;
     return hasObjectField(objectField(pricing, "service_tiers"), "priority");
+}
+
+fn supportsUltrafastMode(entry: std.json.ObjectMap) bool {
+    const owner = entry.get("owned_by") orelse return false;
+    if (owner != .string or !std.ascii.eqlIgnoreCase(owner.string, "openai")) return false;
+    const pricing = entry.get("pricing");
+    const tier = objectField(objectField(pricing, "service_tiers"), "ultrafast") orelse return false;
+    if (!positivePrice(objectField(tier, "input")) or !positivePrice(objectField(tier, "output"))) return false;
+    if (objectField(pricing, "input_cache_read") != null and !positivePrice(objectField(tier, "input_cache_read"))) return false;
+    return true;
+}
+
+fn positivePrice(value: ?std.json.Value) bool {
+    const actual = value orelse return false;
+    const price: f64 = switch (actual) {
+        .string => std.fmt.parseFloat(f64, actual.string) catch return false,
+        .float => actual.float,
+        .integer => @floatFromInt(actual.integer),
+        else => return false,
+    };
+    return std.math.isFinite(price) and price > 0;
+}
+
+test "Ultrafast catalog support requires OpenAI priced metadata rather than model names or tags" {
+    const json =
+        \\{"data":[
+        \\{"id":"openai/gpt-6-astra","type":"language","owned_by":"openai","pricing":{"input_cache_read":"0.000001","service_tiers":{"ultrafast":{"input":"0.00006","output":"0.0003","input_cache_read":"0.000006"}}}},
+        \\{"id":"openai/gpt-5.6-sol","type":"language","owned_by":"openai","tags":["ultrafast"],"pricing":{"service_tiers":{"priority":{"input":"0.1","output":"0.2"}}}},
+        \\{"id":"openai/incomplete","type":"language","owned_by":"openai","pricing":{"service_tiers":{"ultrafast":{"input":"0.1"}}}},
+        \\{"id":"provider/model","type":"language","owned_by":"provider","pricing":{"service_tiers":{"ultrafast":{"input":"0.1","output":"0.2"}}}}
+        \\]}
+    ;
+    var catalog = try parseSortedModelCatalog(std.testing.allocator, json);
+    defer freeModelCatalog(std.testing.allocator, &catalog);
+    try std.testing.expectEqual(@as(usize, 4), catalog.items.len);
+    for (catalog.items) |entry| {
+        try std.testing.expectEqual(std.mem.eql(u8, entry.id, "openai/gpt-6-astra"), entry.supports_ultrafast_mode);
+    }
+}
+
+test "Gateway catalog entries keep the trimmed display name" {
+    const json =
+        \\{"data":[
+        \\{"id":"openai/gpt-6-astra","name":"GPT-6 Astra ","type":"language"},
+        \\{"id":"provider/blank","name":"  ","type":"language"},
+        \\{"id":"provider/unnamed","type":"language"},
+        \\{"id":"provider/numeric","name":7,"type":"language"}
+        \\]}
+    ;
+    var catalog = try parseSortedModelCatalog(std.testing.allocator, json);
+    defer freeModelCatalog(std.testing.allocator, &catalog);
+    try std.testing.expectEqual(@as(usize, 4), catalog.items.len);
+    for (catalog.items) |entry| {
+        if (std.mem.eql(u8, entry.id, "openai/gpt-6-astra")) {
+            try std.testing.expectEqualStrings("GPT-6 Astra", entry.name.?);
+        } else {
+            try std.testing.expectEqual(@as(?[]u8, null), entry.name);
+        }
+    }
 }
 
 fn objectField(value: ?std.json.Value, key: []const u8) ?std.json.Value {

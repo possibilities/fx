@@ -48,6 +48,7 @@ const tool_dispatch = @import("tool_dispatch.zig");
 const tool_specs = @import("tool_specs.zig");
 const tool_result_errors = @import("tool_result_errors.zig");
 const tool_result_limits = @import("tool_result_limits.zig");
+const compactor = @import("../compactor/compactor.zig");
 const file_mutation_execution = @import("file_mutation_execution.zig");
 const tool_mcp_registry = @import("tool_mcp_registry.zig");
 const tool_mcp_runtime = @import("tool_mcp_runtime.zig");
@@ -121,6 +122,8 @@ pub const Context = struct {
     max_read_file_line_len: usize,
     max_command_output_bytes: usize,
     max_tool_result_bytes: usize = tool_result_limits.default_max_tool_result_bytes,
+    /// Passed to subagent turns. See `Config.auto_compact_percent`.
+    auto_compact_percent: u8 = compactor.default_percent,
     api_key: []const u8,
     agent_stream_provider: agent_stream_provider.Provider = agent_stream_provider.unavailable_provider,
     gateway_team: ?[]const u8 = null,
@@ -134,6 +137,9 @@ pub const Context = struct {
     oauth_transport: oauth_transport.Provider = oauth_transport.unavailable_provider,
     secret_store: host_mod.SecretStore = host_mod.unavailable_secret_store,
     model: []const u8,
+    /// Resolved review-model override for automatic permission review. Empty
+    /// keeps the reviewer provider's compiled default.
+    reviewer_model: []const u8 = "",
     permission_review_turn: ?permission_auto_classifier.ReviewTurnContext = null,
     root_user_intent_context: []const u8 = "",
     root_user_messages: []const []const u8 = &.{},
@@ -144,7 +150,13 @@ pub const Context = struct {
     gateway_models_path: []const u8 = "/v1/models",
     agent_step_limit: usize,
     fast_mode: bool = false,
+    ultrafast_mode: bool = false,
     effort: types.ReasoningEffort = .auto,
+    /// Borrowed gateway provider routing inherited by subagent turns. Never
+    /// applied to tool-internal provider requests (vision, web search), which
+    /// keep gateway-default routing.
+    provider_order: []const []const u8 = &.{},
+    provider_strict: bool = false,
     first_call_tool_choice: types.ToolChoice = .auto,
     tool_registry: tool_dispatch.Registry = .{},
     host_tool_provider: ?tool_dispatch.HostToolProvider = null,
@@ -217,6 +229,7 @@ pub const Context = struct {
     workspace_executor: ?js_host_workspace.Executor = null,
     host_sandbox_default: tool_admission.HostSandboxDefault = .none,
     model_capability_resolver: ?model_capabilities.Resolver = null,
+    model_override_resolver: ?subagent_tool_host.ModelOverrideResolver = null,
     /// False when running outside an interactive TUI (e.g. ACP). Tools
     /// that require a live user (like `ask_user_question`) short-circuit
     /// in that case.
@@ -303,6 +316,7 @@ pub const Context = struct {
             .account_id = self.account_id,
             .tenant = self.gateway_team,
             .endpoint = self.gateway_chat_url,
+            .reviewer_model = self.reviewer_model,
             .cancel_flag = self.cancel_flag,
             .usage = &self.session.usage,
             .usage_allocator = self.session_allocator,
@@ -465,10 +479,7 @@ pub fn executeToolCallAuthorized(
         .name = request.call.name,
         .arguments_json = request.call.arguments_json,
         .model_output = result.model_output,
-        .outcome = classifyReturnedToolCallOutcome(
-            uses_file_mutation_contract,
-            result,
-        ),
+        .outcome = classifyReturnedToolCallOutcome(result),
         .started_at_ms = started_at_ms,
         .subagent_id = execution_ctx.lifecycle_scope.subagent_id orelse 0,
     });
@@ -487,18 +498,27 @@ fn classifyToolExecutionError(err: anyerror) diagnostics.ToolCallOutcome {
 }
 
 fn classifyReturnedToolCallOutcome(
-    uses_file_mutation_contract: bool,
     result: ToolExecutionResult,
 ) diagnostics.ToolCallOutcome {
     if (result.status == .success) return .succeeded;
     if (result.command_result_json != null) return .command_failed;
-    if (uses_file_mutation_contract) return .rejected;
-    return .tool_failed;
+    // Only an explicit denial records a rejection. An authorized execution
+    // that failed — with or without a declared kind — is a tool failure, so
+    // a producer that forgets to declare a kind cannot silently masquerade
+    // as a rejection in diagnostics.
+    return switch (result.failure_kind) {
+        .denied => .rejected,
+        .none, .preflight, .apply => .tool_failed,
+    };
 }
 
 test "returned tool results retain diagnostic outcome identity" {
     const success = ToolExecutionResult{ .model_output = "ok" };
-    const rejection = ToolExecutionResult{ .model_output = "rejected", .status = .failure };
+    const rejection = ToolExecutionResult{
+        .model_output = "rejected",
+        .status = .failure,
+        .failure_kind = .denied,
+    };
     const command_failure = ToolExecutionResult{
         .model_output = "exit 7",
         .status = .failure,
@@ -508,19 +528,19 @@ test "returned tool results retain diagnostic outcome identity" {
 
     try std.testing.expectEqual(
         diagnostics.ToolCallOutcome.succeeded,
-        classifyReturnedToolCallOutcome(false, success),
+        classifyReturnedToolCallOutcome(success),
     );
     try std.testing.expectEqual(
         diagnostics.ToolCallOutcome.rejected,
-        classifyReturnedToolCallOutcome(true, rejection),
+        classifyReturnedToolCallOutcome(rejection),
     );
     try std.testing.expectEqual(
         diagnostics.ToolCallOutcome.command_failed,
-        classifyReturnedToolCallOutcome(false, command_failure),
+        classifyReturnedToolCallOutcome(command_failure),
     );
     try std.testing.expectEqual(
         diagnostics.ToolCallOutcome.tool_failed,
-        classifyReturnedToolCallOutcome(false, tool_failure),
+        classifyReturnedToolCallOutcome(tool_failure),
     );
     try std.testing.expectEqual(
         diagnostics.ToolCallOutcome.rejected,
@@ -533,6 +553,47 @@ test "returned tool results retain diagnostic outcome identity" {
     try std.testing.expectEqual(
         diagnostics.ToolCallOutcome.runtime_failed,
         classifyToolExecutionError(error.Unexpected),
+    );
+}
+
+test "executed file mutation failures classify as tool failures, not rejections" {
+    const preflight_failure = ToolExecutionResult{
+        .model_output = "edit_file failed: old_string not found in file",
+        .status = .failure,
+        .failure_kind = .preflight,
+    };
+    const apply_failure = ToolExecutionResult{
+        .model_output = "file mutation rejected because the file changed after preview; make a new tool call for a fresh preview",
+        .status = .failure,
+        .failure_kind = .apply,
+    };
+    const denied_failure = ToolExecutionResult{
+        .model_output = "file mutation execution requires prepared approval",
+        .status = .failure,
+        .failure_kind = .denied,
+    };
+    const undeclared_failure = ToolExecutionResult{
+        .model_output = "some producer forgot its kind",
+        .status = .failure,
+    };
+
+    try std.testing.expectEqual(
+        diagnostics.ToolCallOutcome.tool_failed,
+        classifyReturnedToolCallOutcome(preflight_failure),
+    );
+    try std.testing.expectEqual(
+        diagnostics.ToolCallOutcome.tool_failed,
+        classifyReturnedToolCallOutcome(apply_failure),
+    );
+    try std.testing.expectEqual(
+        diagnostics.ToolCallOutcome.rejected,
+        classifyReturnedToolCallOutcome(denied_failure),
+    );
+    // A producer that does not declare a kind is still a tool failure; only
+    // explicit denials record rejections.
+    try std.testing.expectEqual(
+        diagnostics.ToolCallOutcome.tool_failed,
+        classifyReturnedToolCallOutcome(undeclared_failure),
     );
 }
 
@@ -555,16 +616,12 @@ pub fn executeHostToolCallAuthorized(
         request.call,
     );
     dispatch_ctx.execution_authority = request.authority;
-    var status_detail: ?[]u8 = null;
     const dispatched = try tool_dispatch.dispatchAuthorizedToolCall(
         dispatch_ctx,
         execution_ctx.tool_registry,
         request.call,
-        &status_detail,
     );
-    var result = toolExecutionResultFromDispatch(dispatched, .{});
-    result.status_detail = status_detail;
-    return result;
+    return toolExecutionResultFromDispatch(dispatched, .{});
 }
 
 fn rebindMcpAuthorityGeneration(
@@ -685,7 +742,6 @@ fn executeWorkspaceToolCallInner(
         dispatch_ctx,
         ctx.tool_registry,
         call,
-        &dispatch_metadata.status_detail,
     );
     if (command_backend.execution_error) |err| {
         dispatched.deinit(arena);
@@ -694,7 +750,6 @@ fn executeWorkspaceToolCallInner(
     var execution = command_backend.completion orelse
         toolExecutionResultFromDispatch(dispatched, dispatch_metadata);
     execution.model_output = dispatched.body;
-    if (dispatch_metadata.status_detail) |detail| execution.status_detail = detail;
     return execution;
 }
 
@@ -838,7 +893,6 @@ fn executeRegisteredTool(
         dispatch_ctx,
         registry,
         call,
-        &dispatch_metadata.status_detail,
     );
     if (command_backend.execution_error) |err| {
         dispatched.deinit(arena);
@@ -861,7 +915,6 @@ fn executeRegisteredTool(
     else
         toolExecutionResultFromDispatch(dispatched, dispatch_metadata);
     execution.model_output = dispatched.body;
-    if (dispatch_metadata.status_detail) |detail| execution.status_detail = detail;
     if (mcp_call_status == .input_required or
         (execution.status == .failure and
             tool_mcp_feature_dispatch.isInputRequiredFailure(execution.model_output)))
@@ -923,7 +976,6 @@ fn executeRunCommandBackend(
 
 const DispatchMetadata = struct {
     model_content_kind: tool_dispatch.ModelContentKind = .ordinary,
-    status_detail: ?[]u8 = null,
     inner_usage: ?types.ToolUsage = null,
     web_search_completion: ?types.WebSearchCompletion = null,
     web_fetch_completion: ?types.WebFetchCompletion = null,
@@ -955,7 +1007,6 @@ fn toolExecutionResultFromDispatch(
         .success => .{
             .model_content_kind = metadata.model_content_kind,
             .model_output = result.body,
-            .status_detail = metadata.status_detail,
             .inner_usage = metadata.inner_usage,
             .web_search_completion = metadata.web_search_completion,
             .web_fetch_completion = metadata.web_fetch_completion,
@@ -966,7 +1017,6 @@ fn toolExecutionResultFromDispatch(
         .failure => .{
             .status = .failure,
             .model_output = result.body,
-            .status_detail = metadata.status_detail,
             .inner_usage = metadata.inner_usage,
             .web_search_completion = metadata.web_search_completion,
             .web_fetch_completion = metadata.web_fetch_completion,
@@ -981,6 +1031,34 @@ pub fn snapshotMcpDefinition(ctx: Context, arena: Allocator, name: []const u8, k
     const runtime = ctx.mcp_ctx orelse return .unavailable;
     const snapshot = ctx.mcp_snapshot_tool orelse return .unavailable;
     return snapshot(runtime, arena, name, known, ctx.permission_rules, ctx.context_limits, ctx.mcp_access);
+}
+
+/// Resolves the exact exposed name of a live MCP tool the model called
+/// without selecting it. Returns null for unknown, denied, inaccessible, or
+/// oversized definitions. The result is allocated in `arena`.
+pub fn resolveUnselectedMcpTool(ctx: Context, arena: Allocator, name: []const u8) !?tool_mcp_runtime.SelectedTool {
+    const runtime_context = ctx.mcp_ctx orelse return null;
+    const schema_fn = ctx.mcp_tool_schema orelse return null;
+    const projection = (schema_fn(
+        runtime_context,
+        arena,
+        name,
+        ctx.permission_rules,
+        ctx.context_limits,
+        ctx.mcp_access,
+        runtimeCancelFlag(ctx),
+    ) catch |err| switch (err) {
+        error.OutOfMemory, error.Cancelled => return err,
+        else => return null,
+    }) orelse return null;
+    return switch (projection) {
+        .selected => |payload| .{
+            .name = name,
+            .schema_json = payload.model_output,
+            .mcp_binding = payload.mcp_binding,
+        },
+        .rejected => null,
+    };
 }
 
 fn refreshChangedMcpTool(ctx: Context, arena: Allocator, name: []const u8) !ToolExecutionResult {
@@ -2113,6 +2191,7 @@ fn executeSubagentProvider(
             .model = ctx.model,
             .effort = ctx.effort,
             .fast_mode = ctx.fast_mode,
+            .ultrafast_mode = ctx.ultrafast_mode,
             .conversation_language = ctx.session.languageSnapshot(),
         },
         .max_result_bytes = ctx.max_tool_result_bytes,
@@ -2122,6 +2201,7 @@ fn executeSubagentProvider(
         .steering_worker = if (ctx.interactive) ctx.worker else null,
         .progress = if (progress_bridge) |*bridge| bridge.sink() else null,
         .model_capability_resolver = ctx.model_capability_resolver,
+        .model_override_resolver = ctx.model_override_resolver,
     }) catch |err| {
         if (err == error.OutOfMemory) return error.OutOfMemory;
         if (err == error.Cancelled) return error.Cancelled;
@@ -2264,7 +2344,6 @@ const test_captured_shell = blk: {
     tool.call = callTestCapturedShell;
     tool.captured_command_fn = null;
     tool.process_local_fn = null;
-    tool.authorized_result_mapper = null;
     tool.reads_only_fn = testCapturedShellFalse;
     tool.irreversible_fn = testCapturedShellFalse;
     break :blk tool;
@@ -2377,6 +2456,7 @@ const TestRuntime = struct {
     subagent_host: ?*subagent_tool_host.Runtime = null,
     subagent_caller_id: ?[]const u8 = null,
     model: []const u8 = "",
+    reviewer_model: []const u8 = "",
     session_allocator: Allocator = std.testing.allocator,
     workspace_root: []const u8 = "/tmp",
     ignored_list_entries: []const []const u8 = &.{},
@@ -2449,6 +2529,7 @@ const TestRuntime = struct {
             .provider = self.provider,
             .provider_capabilities = self.provider_capabilities,
             .model = self.model,
+            .reviewer_model = self.reviewer_model,
             .gateway_retry_count = self.gateway_retry_count,
             .gateway_chat_url = self.gateway_chat_url,
             .agent_step_limit = 0,
@@ -7473,7 +7554,7 @@ test "vision parsed record transfer allocation failure releases the parsed owner
     );
 }
 
-test "vision authorized catalog retains historical access outside budgeted model history" {
+test "vision authorized catalog retains historical access outside compacted model history" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -7485,6 +7566,11 @@ test "vision authorized catalog retains historical access outside budgeted model
             .user = .{ .text = @constCast("historical turn"), .images = source_images },
             .assistant = @constCast("historical answer"),
         } },
+        .{ .compacted_summary = .{
+            .summary = @constCast("historical turn inspected an image"),
+            .removed_turn_count = 1,
+            .compaction_count = 1,
+        } },
         .{ .assistant = .{
             .user = .{ .text = @constCast("newer turn without images") },
             .assistant = @constCast("newer answer"),
@@ -7492,17 +7578,19 @@ test "vision authorized catalog retains historical access outside budgeted model
     };
     const catalog = try session_runtime.collect_image_catalog(alloc, &history, &.{});
     defer types.freeImageAttachmentSlice(alloc, catalog);
-    var budget_arena_state = std.heap.ArenaAllocator.init(alloc);
-    defer budget_arena_state.deinit();
-    var budgeted_messages: std.ArrayList(ChatMessage) = .empty;
-    try session_runtime.appendHistoryChatMessagesBudgeted(
-        budget_arena_state.allocator(),
-        &budgeted_messages,
+    var context_arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer context_arena_state.deinit();
+    var context_messages: std.ArrayList(ChatMessage) = .empty;
+    try session_runtime.appendActiveContextHistoryChatMessages(
+        context_arena_state.allocator(),
+        &context_messages,
         &history,
-        .{ .max_tokens = 1 },
+        1,
     );
-    for (budgeted_messages.items) |message| {
+    try std.testing.expect(context_messages.items.len > 0);
+    for (context_messages.items) |message| {
         try std.testing.expectEqual(@as(usize, 0), message.images.len);
+        if (message.content) |content| try std.testing.expect(std.mem.find(u8, content, "historical answer") == null);
     }
 
     const provider_json = try visionProviderSuccess(alloc, &.{41});

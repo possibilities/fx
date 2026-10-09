@@ -6,6 +6,7 @@ const session_usage = @import("session_usage.zig");
 const types = @import("../shared/types.zig");
 const model_provider = @import("../config/model_provider.zig");
 const context_limits = @import("../config/context_limits.zig");
+const debug_trace = @import("../shared/debug_trace.zig");
 
 const Allocator = std.mem.Allocator;
 const Sha256 = std.crypto.hash.sha2.Sha256;
@@ -15,7 +16,17 @@ pub const raw_state_chunk_bytes: usize = 4 * 1024 * 1024;
 pub const Identifier = [16]u8;
 pub const Digest = [Sha256.digest_length]u8;
 
-pub const conversation_schema_version: u8 = 2;
+// Version 3 adds CommittedFilePresentation.content_handle on tool_result
+// frames: previous/after snapshots may live in a result-store artifact with
+// only the handle inline. Version 1 and 2 frames never carry the field and
+// remain readable.
+pub const conversation_schema_version: u8 = 3;
+
+/// Every historical frame version a reader must still accept. Writers always
+/// emit conversation_schema_version.
+fn supportedConversationSchema(version: u8) bool {
+    return version >= 1 and version <= conversation_schema_version;
+}
 pub const max_conversation_text_bytes: usize = event_frame_max_bytes;
 pub const max_conversation_identity_bytes: usize = types.ConversationIdentity.max_bytes;
 pub const max_conversation_arguments_bytes: usize = event_frame_max_bytes;
@@ -207,13 +218,13 @@ pub fn validateConversationTransition(
     state: ConversationStateView,
     envelope: ConversationEnvelope,
 ) ConversationTransitionError!void {
-    if (envelope.schema_version != 1 and envelope.schema_version != conversation_schema_version) {
+    if (!supportedConversationSchema(envelope.schema_version)) {
         return error.UnsupportedConversationSchema;
     }
     const expected_seq = std.math.add(u64, state.last_seq, 1) catch
         return error.OutOfOrderConversationEvent;
     if (envelope.seq != expected_seq) return error.OutOfOrderConversationEvent;
-    if (envelope.timestamp_ms < 0) return error.InvalidConversationEvent;
+    if (envelope.timestamp_ms < 0) return rejectInvalidConversationEvent("envelope-timestamp");
     try validateConversationEventShape(envelope.event, envelope.schema_version);
 
     switch (envelope.event) {
@@ -250,11 +261,19 @@ pub fn validateConversationTransition(
     }
 }
 
-fn validateConversationEventShape(event: ConversationEvent, schema_version: u8) ConversationTransitionError!void {
+/// Validation rejects with the same bare error at every site, which leaves
+/// persistence failures undiagnosable. Name the rule so the trace log (and
+/// /trace reports) identify the exact rejected invariant without content.
+fn rejectInvalidConversationEvent(comptime rule: []const u8) ConversationTransitionError {
+    debug_trace.logf("session", "conversation event rejected rule={s}", .{rule});
+    return error.InvalidConversationEvent;
+}
+
+pub fn validateConversationEventShape(event: ConversationEvent, schema_version: u8) ConversationTransitionError!void {
     switch (event) {
         .user => |value| {
             try validateConversationText(value.text);
-            if (value.images.len > 128) return error.InvalidConversationEvent;
+            if (value.images.len > 128) return rejectInvalidConversationEvent("user-images-count");
             for (value.images) |image| {
                 if (image.path.len == 0 or
                     image.path.len > std.Io.Dir.max_path_bytes or
@@ -263,18 +282,18 @@ fn validateConversationEventShape(event: ConversationEvent, schema_version: u8) 
                     !std.unicode.utf8ValidateSlice(image.path) or
                     !std.unicode.utf8ValidateSlice(image.media_type))
                 {
-                    return error.InvalidConversationEvent;
+                    return rejectInvalidConversationEvent("user-image-field");
                 }
             }
             if (value.work_id) |work_id| try validateConversationIdentity(work_id);
         },
         .assistant => |value| {
-            if (schema_version == 1 and (value.text.len == 0 or value.provider_replay != null)) return error.InvalidConversationEvent;
+            if (schema_version == 1 and (value.text.len == 0 or value.provider_replay != null)) return rejectInvalidConversationEvent("assistant-schema-v1");
             try validateOptionalConversationText(value.text);
             if (value.provider_replay) |replay| {
                 try validateConversationIdentity(replay.source.model);
                 if (replay.parts_json.len == 0 or replay.parts_json.len > types.ProviderReplay.max_bytes or
-                    !std.unicode.utf8ValidateSlice(replay.parts_json)) return error.InvalidConversationEvent;
+                    !std.unicode.utf8ValidateSlice(replay.parts_json)) return rejectInvalidConversationEvent("assistant-replay-parts");
             }
         },
         .steering => |value| try validateConversationText(value.text),
@@ -285,20 +304,20 @@ fn validateConversationEventShape(event: ConversationEvent, schema_version: u8) 
                 call.arguments_json.len > max_conversation_arguments_bytes or
                 !std.unicode.utf8ValidateSlice(call.arguments_json))
             {
-                return error.InvalidConversationEvent;
+                return rejectInvalidConversationEvent("tool-call-arguments");
             }
             if (call.provisional_id) |value| try validateConversationIdentity(value);
             if (call.provider_result) |value| {
                 if (value.len > max_conversation_arguments_bytes or
                     !std.unicode.utf8ValidateSlice(value))
                 {
-                    return error.InvalidConversationEvent;
+                    return rejectInvalidConversationEvent("tool-call-provider-result");
                 }
             }
         },
         .tool_result => |result| {
             if (result.review_feedback and (result.status != .failure or result.provider_native)) {
-                return error.InvalidConversationEvent;
+                return rejectInvalidConversationEvent("tool-result-review-feedback");
             }
             try validateConversationIdentity(result.call_id);
             try validateConversationIdentity(result.tool_name);
@@ -306,23 +325,26 @@ fn validateConversationEventShape(event: ConversationEvent, schema_version: u8) 
                 result.artifact_ref.len > max_conversation_identity_bytes or
                 !std.unicode.utf8ValidateSlice(result.artifact_ref))
             {
-                return error.InvalidConversationEvent;
+                return rejectInvalidConversationEvent("tool-result-artifact-ref");
             }
             if (result.preview) |preview| {
                 if (preview.len > max_conversation_preview_bytes or
                     !std.unicode.utf8ValidateSlice(preview))
                 {
-                    return error.InvalidConversationEvent;
+                    return rejectInvalidConversationEvent("tool-result-preview");
                 }
             }
             if (result.tool_image_handle) |handle| {
                 try validateConversationIdentity(handle);
             }
-            if (result.created_at_ms < 0) return error.InvalidConversationEvent;
+            if (result.created_at_ms < 0) return rejectInvalidConversationEvent("tool-result-created-at");
             for (result.permission_feedback) |feedback| {
                 try validateOptionalConversationText(feedback);
             }
             if (result.committed_file_presentation) |presentation| {
+                if (!types.committedFilePresentationContentSourceValid(presentation)) {
+                    return rejectInvalidConversationEvent("tool-result-file-presentation-source");
+                }
                 try validateConversationPath(presentation.path);
                 for (presentation.lines) |line| {
                     try validateOptionalConversationText(line.text);
@@ -336,11 +358,14 @@ fn validateConversationEventShape(event: ConversationEvent, schema_version: u8) 
                 if (presentation.lifecycle_id) |lifecycle_id| {
                     try validateConversationIdentity(lifecycle_id.call_id);
                 }
+                if (presentation.content_handle) |handle| {
+                    try validateConversationIdentity(handle);
+                }
             }
             if ((result.command_replay_ref == null) !=
                 (result.command_replay_bytes == null))
             {
-                return error.InvalidConversationEvent;
+                return rejectInvalidConversationEvent("tool-result-command-replay-pair");
             }
             if (result.command_replay_ref) |handle| {
                 try validateConversationIdentity(handle);
@@ -351,7 +376,7 @@ fn validateConversationEventShape(event: ConversationEvent, schema_version: u8) 
             if ((interrupted.command_replay_ref == null) !=
                 (interrupted.command_replay_bytes == null))
             {
-                return error.InvalidConversationEvent;
+                return rejectInvalidConversationEvent("interrupted-command-replay-pair");
             }
             if (interrupted.command_replay_ref) |handle| {
                 try validateConversationIdentity(handle);
@@ -380,24 +405,24 @@ fn validateConversationPath(path: []const u8) ConversationTransitionError!void {
         path.len > std.Io.Dir.max_path_bytes or
         !std.unicode.utf8ValidateSlice(path))
     {
-        return error.InvalidConversationEvent;
+        return rejectInvalidConversationEvent("file-path");
     }
 }
 
 fn validateConversationText(text: []const u8) ConversationTransitionError!void {
-    if (text.len == 0) return error.InvalidConversationEvent;
+    if (text.len == 0) return rejectInvalidConversationEvent("text-empty");
     return validateOptionalConversationText(text);
 }
 
 fn validateOptionalConversationText(text: []const u8) ConversationTransitionError!void {
     if (text.len > max_conversation_text_bytes or !std.unicode.utf8ValidateSlice(text)) {
-        return error.InvalidConversationEvent;
+        return rejectInvalidConversationEvent("text-field");
     }
 }
 
 fn validateConversationIdentity(value: []const u8) ConversationTransitionError!void {
     if (types.ConversationIdentity.invalidReason(value) != null) {
-        return error.InvalidConversationEvent;
+        return rejectInvalidConversationEvent("identity");
     }
 }
 
@@ -419,7 +444,7 @@ pub fn encodeConversationFrame(
         envelope.seq == 0 or
         envelope.timestamp_ms < 0)
     {
-        return error.InvalidConversationEvent;
+        return rejectInvalidConversationEvent("envelope-header");
     }
     try validateConversationEventShape(envelope.event, envelope.schema_version);
     var out: std.Io.Writer.Allocating = .init(alloc);
@@ -445,7 +470,7 @@ pub fn decodeConversationFrame(
         else => return error.InvalidConversationFrame,
     };
     errdefer parsed.deinit();
-    if ((parsed.value.schema_version != 1 and parsed.value.schema_version != conversation_schema_version) or
+    if (!supportedConversationSchema(parsed.value.schema_version) or
         parsed.value.seq == 0 or
         parsed.value.timestamp_ms < 0)
     {
@@ -548,7 +573,7 @@ fn interruptedCommandReplayBytes(
     };
 }
 
-fn appendExecutionConversationEvents(
+pub fn appendExecutionConversationEvents(
     alloc: Allocator,
     events: *std.ArrayList(ConversationEvent),
     execution: types.ExecutionMemory,
@@ -595,9 +620,9 @@ fn appendExecutionConversationEvents(
                 .artifact_ref = artifact_ref,
                 .tool_image_handle = result.tool_image_handle,
                 .output_bytes = std.math.cast(u64, result.output_bytes) orelse
-                    return error.InvalidConversationEvent,
+                    return rejectInvalidConversationEvent("tool-result-output-bytes"),
                 .stored_bytes = std.math.cast(u64, result.stored_output_bytes) orelse
-                    return error.InvalidConversationEvent,
+                    return rejectInvalidConversationEvent("tool-result-stored-bytes"),
                 .completeness = if (result.truncated) .partial else .complete,
                 .preview = result.preview orelse if (result.output.len <= max_conversation_preview_bytes)
                     result.output
@@ -623,7 +648,7 @@ fn appendExecutionConversationEvents(
         }
     }
     if (steering_index != execution.steering.len) {
-        return error.InvalidConversationEvent;
+        return rejectInvalidConversationEvent("steering-boundary");
     }
 }
 
@@ -710,6 +735,7 @@ pub const PreferencesChanged = struct {
     model: ?[]u8 = null,
     effort: ?types.ReasoningEffort = null,
     fast_mode: ?bool = null,
+    ultrafast_mode: ?bool = null,
 
     fn deinit(self: *PreferencesChanged, alloc: Allocator) void {
         if (self.model) |model| alloc.free(model);
@@ -1385,6 +1411,7 @@ fn applyDelta(
             if (payload.model) |model| proposed.preferences.model = model;
             if (payload.effort) |effort| proposed.preferences.effort = effort;
             if (payload.fast_mode) |fast_mode| proposed.preferences.fast_mode = fast_mode;
+            if (payload.ultrafast_mode) |ultrafast_mode| proposed.preferences.ultrafast_mode = ultrafast_mode;
             proposed.updated_at_ms = envelope.timestamp_ms;
             try session_codec.validateState(proposed);
             const model_copy = if (payload.model) |model|
@@ -1398,6 +1425,7 @@ fn applyDelta(
             if (payload.provider) |provider| current.preferences.provider = provider;
             if (payload.effort) |effort| current.preferences.effort = effort;
             if (payload.fast_mode) |fast_mode| current.preferences.fast_mode = fast_mode;
+            if (payload.ultrafast_mode) |ultrafast_mode| current.preferences.ultrafast_mode = ultrafast_mode;
             current.updated_at_ms = envelope.timestamp_ms;
         },
         .workspace_rebound => |payload| {
@@ -1502,7 +1530,7 @@ fn validateEnvelope(envelope: Envelope) !void {
             try session_codec.validateState(state);
         },
         .preferences_changed => |payload| {
-            if (payload.provider == null and payload.model == null and payload.effort == null and payload.fast_mode == null) {
+            if (payload.provider == null and payload.model == null and payload.effort == null and payload.fast_mode == null and payload.ultrafast_mode == null) {
                 return error.InvalidEventFrame;
             }
             if (payload.model) |model| {
@@ -1622,6 +1650,11 @@ fn writePayload(writer: *std.Io.Writer, event: Event) !void {
             if (payload.fast_mode) |fast_mode| {
                 if (wrote) try writer.writeByte(',');
                 try writer.print("\"fast_mode\":{s}", .{if (fast_mode) "true" else "false"});
+                wrote = true;
+            }
+            if (payload.ultrafast_mode) |ultrafast_mode| {
+                if (wrote) try writer.writeByte(',');
+                try writer.print("\"ultrafast_mode\":{s}", .{if (ultrafast_mode) "true" else "false"});
             }
             try writer.writeByte('}');
         },
@@ -1750,8 +1783,8 @@ fn parsePayload(alloc: Allocator, kind: Kind, value: std.json.Value) !Event {
         },
         .preferences_changed => blk: {
             const object = try requireObject(value);
-            if (object.count() == 0 or object.count() > 4) return error.InvalidEventFrame;
-            try rejectUnknownKeys(object, &.{ "provider", "model", "effort", "fast_mode" });
+            if (object.count() == 0 or object.count() > 5) return error.InvalidEventFrame;
+            try rejectUnknownKeys(object, &.{ "provider", "model", "effort", "fast_mode", "ultrafast_mode" });
             const provider = if (object.get("provider")) |provider_value| provider_blk: {
                 break :provider_blk model_provider.parse_saved(provider_value) catch return error.InvalidEventFrame;
             } else null;
@@ -1763,11 +1796,13 @@ fn parsePayload(alloc: Allocator, kind: Kind, value: std.json.Value) !Event {
             else
                 null;
             const fast_mode = if (object.get("fast_mode")) |_| try requireBool(object, "fast_mode") else null;
+            const ultrafast_mode = if (object.get("ultrafast_mode")) |_| try requireBool(object, "ultrafast_mode") else null;
             break :blk .{ .preferences_changed = .{
                 .provider = provider,
                 .model = model,
                 .effort = effort,
                 .fast_mode = fast_mode,
+                .ultrafast_mode = ultrafast_mode,
             } };
         },
         .workspace_rebound => blk: {
@@ -1873,10 +1908,6 @@ fn parsePayload(alloc: Allocator, kind: Kind, value: std.json.Value) !Event {
             const bytes = try alloc.alloc(u8, decoded_len);
             errdefer alloc.free(bytes);
             std.base64.standard.Decoder.decode(bytes, encoded) catch return error.InvalidEventFrame;
-            const canonical = try alloc.alloc(u8, std.base64.standard.Encoder.calcSize(bytes.len));
-            defer alloc.free(canonical);
-            const rendered = std.base64.standard.Encoder.encode(canonical, bytes);
-            if (!std.mem.eql(u8, rendered, encoded)) return error.InvalidEventFrame;
             break :blk .{ .state_replacement_chunk = .{
                 .replacement_id = try parseIdentifier(try requireString(object, "replacement_id")),
                 .chunk_index = try requireU64(object, "chunk_index"),
@@ -1900,6 +1931,18 @@ fn parsePayload(alloc: Allocator, kind: Kind, value: std.json.Value) !Event {
             } };
         },
     };
+}
+
+test "replacement chunk decoding uses only decoded storage" {
+    const json = "{\"replacement_id\":\"" ++ "ab" ** 16 ++ "\",\"chunk_index\":0,\"raw_bytes\":1,\"chunk_sha256\":\"" ++ "00" ** 32 ++ "\",\"base64\":\"/w==\"}";
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, json, .{});
+    defer parsed.deinit();
+    var storage: [1]u8 = undefined;
+    var fixed = std.heap.FixedBufferAllocator.init(&storage);
+    const alloc = fixed.allocator();
+    var event = try parsePayload(alloc, .state_replacement_chunk, parsed.value);
+    defer event.deinit(alloc);
+    try std.testing.expectEqualSlices(u8, "\xff", event.state_replacement_chunk.bytes);
 }
 
 fn readFrameLine(alloc: Allocator, source: *std.Io.Reader) ![]u8 {
@@ -1941,9 +1984,13 @@ fn writePreferences(
     try writeJsonString(writer, preferences.model);
     try writer.writeAll(",\"effort\":");
     try writeJsonString(writer, preferences.effort.label());
-    try writer.print(",\"fast_mode\":{s},\"provider\":", .{
+    try writer.print(",\"fast_mode\":{s}", .{
         if (preferences.fast_mode) "true" else "false",
     });
+    if (preferences.ultrafast_mode) {
+        try writer.writeAll(",\"ultrafast_mode\":true");
+    }
+    try writer.writeAll(",\"provider\":");
     try std.json.Stringify.value(preferences.provider, .{}, writer);
     try writer.writeByte('}');
 }
@@ -3329,10 +3376,10 @@ test "conversation cancellation provenance preserves ordinary frame bytes" {
     });
     defer alloc.free(encoded);
     try std.testing.expectEqualStrings(
-        "{\"schema_version\":2,\"seq\":1,\"timestamp_ms\":1,\"event\":{\"interrupted\":{\"reason\":\"cancelled\",\"partial_text\":null,\"command_replay_ref\":null,\"command_replay_bytes\":null,\"command_artifact_ref\":null,\"files\":[],\"turn_summary\":null}}}\n",
+        "{\"schema_version\":3,\"seq\":1,\"timestamp_ms\":1,\"event\":{\"interrupted\":{\"reason\":\"cancelled\",\"partial_text\":null,\"command_replay_ref\":null,\"command_replay_bytes\":null,\"command_artifact_ref\":null,\"files\":[],\"turn_summary\":null}}}\n",
         encoded,
     );
-    for ([_]u8{ 1, 2 }) |version| {
+    for ([_]u8{ 1, 2, 3 }) |version| {
         for (std.enums.values(session.InterruptedTerminalReason)) |reason| {
             const old = try std.fmt.allocPrint(alloc, "{{\"schema_version\":{d},\"seq\":1,\"timestamp_ms\":1,\"event\":{{\"interrupted\":{{\"reason\":\"{s}\"}}}}}}\n", .{ version, @tagName(reason) });
             defer alloc.free(old);
@@ -3520,6 +3567,99 @@ test "review feedback conversation metadata defaults old records and omits false
     }
 }
 
+test "conversation frame carries a spilled diff content handle" {
+    const alloc = std.testing.allocator;
+    const encoded = try encodeConversationFrame(alloc, .{
+        .seq = 3,
+        .timestamp_ms = 7,
+        .event = .{ .tool_result = .{
+            .call_id = "call-edit",
+            .tool_name = "edit_file",
+            .status = .success,
+            .artifact_ref = "result-edit_file-aaaa.txt",
+            .stored_bytes = 6,
+            .completeness = .complete,
+            .committed_file_presentation = .{
+                .path = "src/a.zig",
+                .kind = .edited,
+                .lines = &.{.{ .kind = .addition, .new_line = 1, .text = "new line" }},
+                .additions = 1,
+                .deletions = 0,
+                .truncated = false,
+                .lifecycle_id = .{ .turn_id = 1, .call_id = "call-edit" },
+                .content_handle = "diff-0123456789abcdef-0123456789abcdef.json",
+            },
+        } },
+    });
+    defer alloc.free(encoded);
+    try std.testing.expect(std.mem.find(u8, encoded, "\"content_handle\":\"diff-") != null);
+
+    var decoded = try decodeConversationFrame(alloc, encoded);
+    defer decoded.deinit();
+    const presentation = decoded.value.event.tool_result.committed_file_presentation.?;
+    try std.testing.expectEqualStrings("diff-0123456789abcdef-0123456789abcdef.json", presentation.content_handle.?);
+    try std.testing.expect(presentation.previous_content == null);
+}
+
+test "conversation frame rejects competing inline and artifact diff sources" {
+    const alloc = std.testing.allocator;
+    try std.testing.expectError(error.InvalidConversationEvent, encodeConversationFrame(alloc, .{
+        .seq = 1,
+        .timestamp_ms = 1,
+        .event = .{ .tool_result = .{
+            .call_id = "call-edit",
+            .tool_name = "edit_file",
+            .status = .success,
+            .artifact_ref = "result.txt",
+            .stored_bytes = 0,
+            .completeness = .complete,
+            .committed_file_presentation = .{
+                .path = "src/a.zig",
+                .kind = .edited,
+                .lines = &.{},
+                .additions = 1,
+                .deletions = 1,
+                .truncated = false,
+                .after_content = "inline",
+                .content_handle = "diff-0123456789abcdef-0123456789abcdef.json",
+            },
+        } },
+    }));
+}
+
+test "conversation frame rejects a wrongly typed diff content handle" {
+    const alloc = std.testing.allocator;
+    try std.testing.expectError(error.InvalidConversationEvent, encodeConversationFrame(alloc, .{
+        .seq = 1,
+        .timestamp_ms = 1,
+        .event = .{ .tool_result = .{
+            .call_id = "call-edit",
+            .tool_name = "edit_file",
+            .status = .success,
+            .artifact_ref = "result.txt",
+            .stored_bytes = 0,
+            .completeness = .complete,
+            .committed_file_presentation = .{
+                .path = "src/a.zig",
+                .kind = .edited,
+                .lines = &.{},
+                .additions = 1,
+                .deletions = 1,
+                .truncated = false,
+                .content_handle = "result-shell-0123456789abcdef.txt",
+            },
+        } },
+    }));
+}
+
+test "conversation frame rejects an oversized diff content handle" {
+    const alloc = std.testing.allocator;
+    const oversized = "diff-0123456789abcdef-0123456789abcdef.json" ++ ("x" ** 300);
+    const frame = try std.fmt.allocPrint(alloc, "{{\"schema_version\":3,\"seq\":1,\"timestamp_ms\":1,\"event\":{{\"tool_result\":{{\"call_id\":\"call-edit\",\"tool_name\":\"edit_file\",\"status\":\"success\",\"artifact_ref\":\"result.txt\",\"stored_bytes\":0,\"completeness\":\"complete\",\"committed_file_presentation\":{{\"path\":\"src/a.zig\",\"kind\":\"edited\",\"lines\":[],\"additions\":1,\"deletions\":1,\"truncated\":false,\"previous_content\":null,\"after_content\":null,\"lifecycle_id\":null,\"content_handle\":\"{s}\"}}}}}}}}}}\n", .{oversized});
+    defer alloc.free(frame);
+    try std.testing.expectError(error.InvalidConversationFrame, decodeConversationFrame(alloc, frame));
+}
+
 test "conversation frame round trips an external tool result reference" {
     const alloc = std.testing.allocator;
     const encoded = try encodeConversationFrame(alloc, .{
@@ -3563,7 +3703,7 @@ test "conversation frame reads old records and preserves new reasoning-only assi
     defer alloc.free(encoded);
     var current = try decodeConversationFrame(alloc, encoded);
     defer current.deinit();
-    try std.testing.expectEqual(@as(u8, 2), current.value.schema_version);
+    try std.testing.expectEqual(conversation_schema_version, current.value.schema_version);
     try std.testing.expectEqualStrings(replay.parts_json, current.value.event.assistant.provider_replay.?.parts_json);
     try validateConversationTransition(.{ .last_seq = 1 }, current.value);
 }
