@@ -1,6 +1,9 @@
 import {
-  createFxAgent as createWasmAgent,
+  createFxEngine as createWasmAgent,
   createFxTerminal as createWasmTerminal,
+  createMemoryPersistence,
+  FxFencedError,
+  FxJournalVersionError,
   encodeXtermKeyEvent,
   fxSdkApiVersion,
   listModels,
@@ -8,7 +11,7 @@ import {
   xtermAdapter,
 } from "./fx-sdk.js";
 
-export { encodeXtermKeyEvent, fxSdkApiVersion, listModels, supportsJspi, xtermAdapter };
+export { createMemoryPersistence, encodeXtermKeyEvent, FxFencedError, FxJournalVersionError, fxSdkApiVersion, listModels, supportsJspi, xtermAdapter };
 export const libfxApiVersion = 3;
 
 const defaultCoreWasm = new URL("./fx-core.wasm", import.meta.url).href;
@@ -36,10 +39,12 @@ function normalizeBrowserAgentAuth(options) {
   return { ...rest, apiKey: entries[0].apiKey };
 }
 
-export function createFxAgent(options = {}) {
+export function createFxEngine(options = {}) {
   const normalized = normalizeBrowserAgentAuth(options);
   return createWasmAgent({ ...normalized, wasm: normalized.wasm ?? defaultCoreWasm });
 }
+
+export const createFxAgent = createFxEngine;
 
 export function createFxTerminal(options = {}) {
   return createWasmTerminal({ ...options, wasm: options.wasm ?? defaultTermWasm });

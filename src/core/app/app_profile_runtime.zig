@@ -59,7 +59,7 @@ pub fn attemptUserPreferences(
     patch: config_runtime.UserSettingsPatch,
 ) config_runtime.CommitAttempt {
     if (explicitHome(app)) |profile_home| {
-        return config_runtime.attemptUserPreferencesFromHome(
+        return config_runtime.attemptUserPreferencesInHome(
             app.alloc,
             profile_home,
             patch,

@@ -7,11 +7,12 @@ const gateway_provider = @import("../gateway/gateway_provider.zig");
 const model_catalog = @import("../gateway/model_catalog.zig");
 const provider_set = @import("../gateway/provider_set.zig");
 const host = @import("../hosts/host.zig");
+const host_attachments = @import("../hosts/host_attachments.zig");
 const credentials = @import("../auth/credentials.zig");
 const mode_registry = @import("../modes/mode_registry.zig");
 const prompt_policy = @import("../config/prompt_policy.zig");
-const skill_contract = @import("../skills/skill_contract.zig");
 const tool_set_contract = @import("../tooling/tool_set.zig");
+const skill_contract = @import("../skills/skill_contract.zig");
 const context_contract = @import("../workspace/context_contract.zig");
 const types = @import("../shared/types.zig");
 
@@ -41,9 +42,17 @@ pub const Config = struct {
     context_registry: context_contract.Registry,
     mode_registry: mode_registry.Registry,
     model_override: ?[]const u8 = null,
-    effort_override: ?types.ReasoningEffort = null,
     provider_override: ?model_provider.ProviderId = null,
     allowed_providers: std.EnumSet(std.meta.Tag(model_provider.ProviderId)) = .initFull(),
+    /// Raw reasoning-effort override using the kernel's ReasoningEffort.parse
+    /// vocabulary. Borrowed; must outlive the server run.
+    effort_override: ?[]const u8 = null,
+    /// Fast-lane override matching --fast/--no-fast. Null leaves the startup
+    /// and session defaults untouched.
+    fast_override: ?bool = null,
+    /// Ultrafast-lane override. Null leaves the startup and session defaults
+    /// untouched.
+    ultrafast_override: ?bool = null,
     credential_override: ?[]const u8 = null,
     chatgpt_session_store: chatgpt_session.Store = chatgpt_session.default_store,
     home_override: ?[]const u8 = null,
@@ -51,15 +60,19 @@ pub const Config = struct {
     log_file: ?[]const u8 = null,
     context_limit_overrides: []const config_runtime.context_limits.Override = &.{},
     additional_directories: []const []const u8 = &.{},
+    invocation_skill_roots: []const []const u8 = &.{},
     saved_directories_suppressed: bool = false,
+    skill_root_policy: skill_contract.RootPolicy = .{ .managed_root_source = null },
     /// Borrowed invocation policy; the server duplicates it during initialize.
     permission_rules_override: ?types.PermissionRuleSet = null,
-    skill_root_policy: skill_contract.RootPolicy = .{ .managed_root_source = null },
     allow_acp_mcp: bool = true,
     allow_native_tools: bool = true,
-    project_instructions_enabled: bool = true,
     native_tool_set: ?tool_set_contract.ToolSet = null,
+    project_instructions_enabled: bool = true,
     minimal_kernel: bool = false,
+    /// Raw prompt image and checkpoint bytes from a libfx host. Null for
+    /// hosts that only speak standard ACP, such as `fx acp`.
+    host_attachments: ?host_attachments.Store = null,
 };
 
 pub const RunFn = *const fn (?*anyopaque, Allocator, Config) anyerror!void;
