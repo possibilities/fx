@@ -1361,10 +1361,11 @@ describe("acp: model-independent", () => {
         ) as any;
         expect(native_disabled.error).toBeUndefined();
         await client.readLine();
-        await client.request("session/set_mode", { modeId: "code" }, 3);
+        await client.request("session/set_mode", { modeId: "auto" }, 3);
         const disabled_prompt = await runPrompt(client, "Answer without tools.", TIMEOUT);
         expect(disabled_prompt.promptResult.result.stopReason).toBe("end_turn");
-        expect(acpGatewayRequest(gateway.requests[0]!.body).tools).toEqual([]);
+        expect(acpGatewayRequest(gateway.requests[0]!.body).tools.map((tool) => tool.name))
+          .toEqual(["mcp_fixture_echo"]);
         await client.close();
         await expectMcpProcessExited(allowedMcpPid);
 
@@ -1381,7 +1382,7 @@ describe("acp: model-independent", () => {
         ) as any;
         expect(native_enabled.error).toBeUndefined();
         await client.readLine();
-        await client.request("session/set_mode", { modeId: "code" }, 12);
+        await client.request("session/set_mode", { modeId: "auto" }, 12);
         const enabled_prompt = await runPrompt(client, "Answer with the normal tool catalog.", TIMEOUT);
         expect(enabled_prompt.promptResult.result.stopReason).toBe("end_turn");
         expect(acpGatewayRequest(gateway.requests[1]!.body).tools.map((tool) => tool.name))
