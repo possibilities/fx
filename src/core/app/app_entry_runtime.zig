@@ -484,7 +484,7 @@ const UpgradeRelaunchArguments = struct {
         if (launch.modifiers.model_override) |model| {
             try result.appendPair(alloc, "--model", model);
         }
-        if (launch.modifiers.effort_override) |effort| {
+        if (launch.modifiers.effort_override) |*effort| {
             try result.appendPair(alloc, "--effort", effort.label());
         }
         if (launch.modifiers.fast_override) |fast| {
@@ -945,8 +945,8 @@ const TestCapture = struct {
     replace_error: std.process.ReplaceError = error.InvalidExe,
     replace_calls: usize = 0,
     replace_arg_count: usize = 0,
-    replace_arg_bufs: [32][256]u8 = undefined,
-    replace_arg_lens: [32]usize = [_]usize{0} ** 32,
+    replace_arg_bufs: [48][256]u8 = undefined,
+    replace_arg_lens: [48]usize = [_]usize{0} ** 48,
     fail_unexpected_format: bool = false,
 
     fn init(run_result: cli_surface.RunResult) TestCapture {
@@ -1051,13 +1051,16 @@ fn startWorkerThreadForTest(ctx: ?*anyopaque, _: *anyopaque) !void {
 
 const TestApp = struct {
     requested_resume: ?cli_surface.ResumeTarget = null,
+    invocation_skill_roots: [][]u8 = &.{},
     terminal_released: bool = false,
 
     fn init(_: Allocator, launch: *cli_surface.InteractiveLaunch, _: credentials.AuthMode) !TestApp {
         appendInitEvent(launch);
         if (active_capture.?.init_error) |err| return err;
 
-        var app = TestApp{};
+        var app = TestApp{
+            .invocation_skill_roots = launch.modifiers.takeInvocationSkillRoots(),
+        };
         if (launch.requested_resume) |target| {
             app.requested_resume = target;
             launch.requested_resume = null;
@@ -1068,6 +1071,7 @@ const TestApp = struct {
     fn deinit(self: *TestApp) void {
         self.releaseTerminal();
         if (self.requested_resume) |*target| target.deinit(std.testing.allocator);
+        freeInvocationSkillRoots(std.testing.allocator, self.invocation_skill_roots);
         appendTestEvent("deinit");
         self.* = undefined;
     }
