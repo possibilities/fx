@@ -3181,11 +3181,12 @@ fn retainAcpGrant(raw_ctx: *anyopaque, tool_name: []const u8, target_path: []con
 
 fn pushEvent(raw_ctx: *anyopaque, event: worker_runtime.WorkerEvent) !void {
     const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
+    defer worker_runtime.freeWorkerEvent(std.heap.c_allocator, event);
+    try ctx.state.worker.observeEvent(std.heap.c_allocator, event);
     switch (event) {
         .clear_route_recovery_status => try ctx.clearModelRecoveryStatus(),
         else => {},
     }
-    worker_runtime.freeWorkerEvent(std.heap.c_allocator, event);
 }
 
 fn pushRouteRecoveryStatus(
@@ -3222,6 +3223,7 @@ fn pushReasoningDelta(raw_ctx: *anyopaque, delta: []const u8) !void {
 
 fn pushToolLifecycle(raw_ctx: *anyopaque, event: types.ToolLifecycleEvent) !void {
     const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
+    try ctx.state.worker.observeEvent(std.heap.c_allocator, .{ .tool_lifecycle = event });
     switch (event) {
         .provisional => |provisional| {
             const tool_name = provisional.tool_name orelse return;

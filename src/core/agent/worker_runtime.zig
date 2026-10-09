@@ -924,6 +924,16 @@ pub const WorkerRuntime = struct {
         self.worker_cond.broadcast(io_mod.getIo());
     }
 
+    pub fn observeEvent(self: *WorkerRuntime, alloc: std.mem.Allocator, event: WorkerEvent) !void {
+        self.worker_mutex.lockUncancelable(io_mod.getIo());
+        defer self.worker_mutex.unlock(io_mod.getIo());
+        const tool_transition = try self.prepareActiveToolTransitionLocked(alloc, event);
+        self.applyActiveToolTransitionLocked(tool_transition);
+        self.applyToolBoundaryPhaseLocked(event);
+        self.applyRecoveryStateEvent(event);
+        self.worker_cond.broadcast(io_mod.getIo());
+    }
+
     /// Transfers already-owned events to the front of the queue on success.
     /// Every heap payload must have been allocated by `alloc`.
     pub fn prependOwnedEvents(
