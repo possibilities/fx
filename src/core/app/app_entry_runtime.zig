@@ -365,7 +365,7 @@ fn runInteractiveWithDeps(comptime App: type, comptime cooperative: bool, app: *
     const relaunch_skill_roots = try cloneInvocationSkillRootsForRelaunch(
         App,
         alloc,
-        &app,
+        app,
         relaunch_request != null,
     );
     defer freeInvocationSkillRoots(alloc, relaunch_skill_roots);
@@ -478,6 +478,28 @@ const UpgradeRelaunchArguments = struct {
         errdefer result.deinit(alloc);
 
         if (sessions_v2) try result.append(alloc, cli_surface.sessions_v2_arg);
+        if (launch.modifiers.provider_override) |provider| {
+            try result.appendPair(alloc, "--provider", provider.label());
+        }
+        if (launch.modifiers.model_override) |model| {
+            try result.appendPair(alloc, "--model", model);
+        }
+        if (launch.modifiers.effort_override) |effort| {
+            try result.appendPair(alloc, "--effort", effort.label());
+        }
+        if (launch.modifiers.fast_override) |fast| {
+            try result.append(alloc, if (fast) "--fast" else "--no-fast");
+        }
+        if (launch.modifiers.ultrafast_override) |ultrafast| {
+            try result.append(alloc, if (ultrafast) "--ultrafast" else "--no-ultrafast");
+        }
+        if (launch.modifiers.provider_order_override) |order| {
+            try result.append(alloc, "--provider-order");
+            try result.appendOwned(alloc, try std.mem.join(alloc, ",", order));
+        }
+        if (launch.modifiers.provider_strict_override) |strict| {
+            try result.append(alloc, if (strict) "--provider-strict" else "--no-provider-strict");
+        }
         for (launch.modifiers.context_limit_overrides) |override| {
             try result.append(alloc, "--context-limit");
             const rendered = switch (override.value) {
@@ -1380,8 +1402,18 @@ test "app entry preserves every launch control across an upgrade relaunch" {
     skill_roots[1] = try alloc.dupe(u8, "/opt/shared-skills");
     const state_home = try alloc.dupe(u8, "/tmp/fx-state");
     const permission_path = try alloc.dupe(u8, "/tmp/fx-policy.json");
+    const provider_order = try alloc.alloc([]const u8, 2);
+    provider_order[0] = try alloc.dupe(u8, "vertex");
+    provider_order[1] = try alloc.dupe(u8, "bedrock");
     var capture = TestCapture.init(.{ .interactive = .{
         .modifiers = .{
+            .provider_override = .gateway,
+            .model_override = try alloc.dupe(u8, "provider/model"),
+            .effort_override = @import("../shared/types.zig").ReasoningEffort.literal("high"),
+            .fast_override = false,
+            .ultrafast_override = true,
+            .provider_order_override = provider_order,
+            .provider_strict_override = true,
             .context_limit_overrides = overrides,
             .additional_directories = directories,
             .saved_directories_suppressed = true,
@@ -1416,6 +1448,17 @@ test "app entry preserves every launch control across an upgrade relaunch" {
     try std.testing.expectEqual(@as(u8, 1), outcome.exit);
     const expected = [_][]const u8{
         "/tmp/fx-upgraded",
+        "--provider",
+        "gateway",
+        "--model",
+        "provider/model",
+        "--effort",
+        "high",
+        "--no-fast",
+        "--ultrafast",
+        "--provider-order",
+        "vertex,bedrock",
+        "--provider-strict",
         "--context-limit",
         "skill_chunk_bytes=4096",
         "--add-dir",
@@ -1451,7 +1494,9 @@ test "app entry preserves every launch control across an upgrade relaunch" {
     }
     try std.testing.expectEqualStrings(
         "fx: upgrade installed, but relaunch failed: InvalidExe\n" ++
-            "Continue session with: fx --context-limit skill_chunk_bytes=4096" ++
+            "Continue session with: fx --provider gateway --model provider/model" ++
+            " --effort high --no-fast --ultrafast --provider-order vertex,bedrock --provider-strict" ++
+            " --context-limit skill_chunk_bytes=4096" ++
             " --add-dir '/tmp/fx extra' --no-additional-dirs" ++
             " --system-prompt-file '/tmp/base prompt.md'" ++
             " --append-system-prompt-file /tmp/first-extra.md" ++
