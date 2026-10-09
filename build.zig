@@ -188,7 +188,7 @@ pub fn build(b: *std.Build) void {
             "ADE sequence advances through record_too_large and queue_full drops",
             "ADE feed refuses tool arguments that would break record framing",
             "ADE child records keep their captured parent across a main session change",
-            "child approval publishes its resolution before the child is released",
+            "observed permission response projects before waiter release and keeps assigned turn",
             "parent prompt approval keeps exact child identity as the only answering surface",
             "two pending child approvals each resolve exactly once with their own identity",
             "lifecycle reducer carries attention through resolution and turn end",
