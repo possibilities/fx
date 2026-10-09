@@ -5812,7 +5812,7 @@ pub fn Runtime(comptime App: type) type {
                 return;
             };
             children.* = subagent_child_state.V2Children.init(app.alloc, v2, app.workspace_root);
-            app.session_persistence.subagent_host = subagent_tool_host.Runtime.createV2(
+            const host = subagent_tool_host.Runtime.createV2(
                 app.alloc,
                 children,
                 subagentAuthorityResolver(app),
@@ -5826,6 +5826,13 @@ pub fn Runtime(comptime App: type) type {
                 app.alloc.destroy(children);
                 return;
             };
+            if (comptime @hasDecl(App, "invalidateSubagentAttentionToken")) {
+                host.approvals.setAttentionInvalidationObserver(.{
+                    .context = app,
+                    .observe_fn = observeSubagentAttentionInvalidation,
+                });
+            }
+            app.session_persistence.subagent_host = host;
             app.session_persistence.v2_children = children;
         }
 
