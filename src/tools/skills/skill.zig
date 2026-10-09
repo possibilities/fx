@@ -147,6 +147,7 @@ fn prepareInput(ctx: tool_dispatch.DispatchContext, input: *const Input) !skill_
         ctx.skills_dir,
         ctx.invocation_skill_roots,
         ctx.skill_root_policy orelse builtin_skills.root_policy,
+        ctx.profile_home,
     );
     defer discovery.deinit(ctx.allocator);
     skill_runtime.traceDiagnostics("skill_tool", discovery.diagnostics);
@@ -200,6 +201,7 @@ fn loadByIdentity(
     skills_dir: []const u8,
     invocation_skill_roots: []const []const u8,
     root_policy: @import("../../core/skills/skill_contract.zig").RootPolicy,
+    profile_home: ?[]const u8,
     name: []const u8,
     location: ?[]const u8,
     resource: ?[]const u8,
@@ -213,6 +215,7 @@ fn loadByIdentity(
         skills_dir,
         invocation_skill_roots,
         root_policy,
+        profile_home,
     );
     defer discovery.deinit(alloc);
     skill_runtime.traceDiagnostics("skill_tool", discovery.diagnostics);

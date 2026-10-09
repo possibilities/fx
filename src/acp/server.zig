@@ -420,6 +420,45 @@ fn credentialMatchesProvider(
     return model_provider.authorizesCredential(provider, source);
 }
 
+fn prepareConfiguredCredential(
+    state: *const ServerState,
+    alloc: Allocator,
+    provider: model_provider.ProviderId,
+    preferred: ?credentials.Source,
+) !?credentials.Credential {
+    const borrowed_authorization_home =
+        try credentials.readOnlyAuthorizationHomeFromEnvironment(
+            alloc,
+            state.cfg.home_override,
+        );
+    defer if (borrowed_authorization_home) |home| alloc.free(home);
+    if (state.cfg.home_override) |home| {
+        if (provider != .configured) if (borrowed_authorization_home) |authorization_home| {
+            const resolution = try credentials.resolveReadOnlyForProviderFromHome(
+                alloc,
+                provider,
+                preferred,
+                authorization_home,
+            );
+            return resolution.credential;
+        };
+        return auth_runtime.prepareCredentialFromHome(
+            alloc,
+            state.cfg.gateway_provider.oauth_transport,
+            provider,
+            preferred,
+            home,
+        );
+    }
+    return auth_runtime.prepareCredential(
+        alloc,
+        state.cfg.gateway_provider.oauth_transport,
+        state.cfg.secret_store,
+        provider,
+        preferred,
+    );
+}
+
 fn credentialReadyAt(
     source: ?types.CredentialSource,
     token: []const u8,
@@ -525,10 +564,9 @@ pub fn prepareCredentialForProvider(state: *ServerState, provider: model_provide
             .source = .ai_gateway_api_key,
         }
     else blk: {
-        break :blk (try auth_runtime.prepareCredential(
+        break :blk (try prepareConfiguredCredential(
+            state,
             state.alloc,
-            state.cfg.gateway_provider.oauth_transport,
-            state.cfg.secret_store,
             provider,
             if (provider == .gateway) state.gateway_source_preference else state.credential_source,
         )) orelse return error.ProviderCredentialUnavailable;
@@ -576,17 +614,27 @@ pub fn refreshModelCredential(
     expected_account_id: ?[]const u8,
 ) !?[]u8 {
     const state: *ServerState = @ptrCast(@alignCast(raw));
-    if (mode == .if_needed and auth_runtime.requestPathCredentialVerifiedRecently(source)) {
+    if (state.cfg.home_override == null and mode == .if_needed and auth_runtime.requestPathCredentialVerifiedRecently(source)) {
         debug_trace.logf("auth", "credential refresh skipped source={t} reason=verified_recently", .{source});
         return null;
     }
-    var refreshed = (try auth_runtime.refreshCredentialForAccount(
-        state.cfg.gateway_provider.oauth_transport,
-        state.alloc,
-        source,
-        mode,
-        expected_account_id,
-    )) orelse return null;
+    var refreshed = (if (state.cfg.home_override) |home|
+        try auth_runtime.refreshCredentialForAccountFromHome(
+            state.cfg.gateway_provider.oauth_transport,
+            state.alloc,
+            source,
+            mode,
+            expected_account_id,
+            home,
+        )
+    else
+        try auth_runtime.refreshCredentialForAccount(
+            state.cfg.gateway_provider.oauth_transport,
+            state.alloc,
+            source,
+            mode,
+            expected_account_id,
+        )) orelse return null;
     defer refreshed.deinit(state.alloc);
 
     const worker_token = try alloc.dupe(u8, refreshed.token);
@@ -745,7 +793,10 @@ pub fn enableSubagentHost(state: *ServerState) void {
     const active = if (state.active_session) |*session| session else return;
     if (active.v2) |v2| return enableSubagentHostV2(state, active, v2);
     if (active.writable == null) return;
-    state.subagent_store = session_store.Store.init(state.alloc, state.workspace_root) catch |err| {
+    state.subagent_store = (if (state.cfg.home_override) |home|
+        session_store.Store.initFromHome(state.alloc, home, state.workspace_root)
+    else
+        session_store.Store.init(state.alloc, state.workspace_root)) catch |err| {
         debug_trace.logf("acp", "subagent host store unavailable session={s} err={s}", .{ active.session_id, @errorName(err) });
         return;
     };
@@ -2519,19 +2570,24 @@ fn loadConfiguredStartupState(state: *const ServerState, alloc: Allocator) !app_
             state.cfg.default_agent_step_limit,
         );
     }
+    const borrowed_authorization_home =
+        try credentials.readOnlyAuthorizationHomeFromEnvironment(
+            alloc,
+            state.cfg.home_override,
+        );
+    defer if (borrowed_authorization_home) |home| alloc.free(home);
     if (state.cfg.home_override) |home_dir| {
-        if (state.cfg.workspace_root_override) |workspace_root| {
-            var startup = try app_lifecycle.loadEmbeddedStartupState(
-                alloc,
-                home_dir,
-                workspace_root,
-                state.cfg.default_model,
-                state.cfg.default_agent_step_limit,
-                state.cfg.model_override,
-            );
-            startup.auth_mode = state.cfg.auth_mode;
-            return startup;
-        }
+        const workspace_root = state.cfg.workspace_root_override orelse ".";
+        var startup = try app_lifecycle.loadEmbeddedStartupState(
+            alloc,
+            home_dir,
+            workspace_root,
+            state.cfg.default_model,
+            state.cfg.default_agent_step_limit,
+            state.cfg.model_override,
+        );
+        startup.auth_mode = state.cfg.auth_mode;
+        return startup;
     }
     return app_lifecycle.loadStartupStateForRun(
         alloc,
@@ -2653,10 +2709,9 @@ fn handleInitialize(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message
         } else if (startup_credential_is_final)
             &startup_credential.?
         else routed: {
-            routed_credential = try auth_runtime.prepareCredential(
+            routed_credential = try prepareConfiguredCredential(
+                state,
                 alloc,
-                state.cfg.gateway_provider.oauth_transport,
-                state.cfg.secret_store,
                 state.provider,
                 if (state.provider == .gateway) startup.credential_source_preference else null,
             );
@@ -2707,12 +2762,10 @@ fn handleInitialize(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message
 
     if (comptime !host_target.is_wasm) {
         if (!state.cfg.minimal_kernel) {
-            var loaded_skills = try app_runtime_setup.loadSkills(
-                alloc,
-                state.workspace_root,
-                state.cfg.invocation_skill_roots,
-                state.cfg.skill_root_policy,
-            );
+            var loaded_skills = if (state.cfg.home_override) |home|
+                try app_runtime_setup.loadSkillsFromHome(alloc, state.workspace_root, home, state.cfg.invocation_skill_roots, state.cfg.skill_root_policy)
+            else
+                try app_runtime_setup.loadSkills(alloc, state.workspace_root, state.cfg.invocation_skill_roots, state.cfg.skill_root_policy);
             errdefer loaded_skills.deinit(alloc);
             skill_runtime.traceDiagnostics("acp_startup", loaded_skills.diagnostics);
             try state.skills.replaceLoaded(alloc, loaded_skills.dir, loaded_skills.skills, loaded_skills.diagnostics);
@@ -3268,10 +3321,9 @@ fn handleSetConfigOption(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Me
                     .source = .ai_gateway_api_key,
                 }
             else credential: {
-                break :credential (try auth_runtime.prepareCredential(
+                break :credential (try prepareConfiguredCredential(
+                    state,
                     alloc,
-                    state.cfg.gateway_provider.oauth_transport,
-                    state.cfg.secret_store,
                     target,
                     if (target == .gateway) state.gateway_source_preference else null,
                 )) orelse
@@ -4146,6 +4198,29 @@ test "ACP permission responses map canonical option ids" {
         defer parsed.deinit();
         try std.testing.expect(parsePermissionDecision(parsed.value) == null);
     }
+}
+
+test "ACP selected profile state loads settings without workspace override" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "state/.fx");
+    {
+        var file = try tmp.dir.createFile(std.testing.io, "state/.fx/settings.json", .{});
+        defer file.close(std.testing.io);
+        try file.writeStreamingAll(std.testing.io, "{\"model\":\"isolated/model\"}\n");
+    }
+    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "state");
+    defer alloc.free(home);
+
+    var state: ServerState = undefined;
+    state.cfg.home_override = home;
+    state.cfg.workspace_root_override = null;
+    state.cfg.default_model = "default/model";
+    state.cfg.default_agent_step_limit = 50;
+    var startup = try loadConfiguredStartupState(&state, alloc);
+    defer startup.deinit(alloc);
+    try std.testing.expectEqualStrings("isolated/model", startup.configured_model);
 }
 
 test "ACP outbound waiters resolve to deny on cancellation" {

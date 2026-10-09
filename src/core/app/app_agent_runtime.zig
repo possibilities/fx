@@ -223,6 +223,7 @@ pub fn Runtime(comptime App: type) type {
             var ctx: tool_runtime.Context = .{
                 .workspace_root = workspace.root,
                 .access_scope = workspace.access_scope,
+                .profile_home = if (comptime @hasField(App, "profile_home")) app.profile_home else null,
                 .ignored_list_entries = ignored_list_entries,
                 .max_list_entries = max_list_entries,
                 .max_read_file_bytes = max_read_file_bytes,
@@ -933,6 +934,7 @@ pub fn Runtime(comptime App: type) type {
                 .workspace_root = workspace.root,
                 .access_scope = workspace.access_scope,
                 .project_instructions_enabled = if (comptime @hasField(App, "project_instructions_enabled")) app.project_instructions_enabled else true,
+                .profile_home = if (comptime @hasField(App, "profile_home")) app.profile_home else null,
                 .targets = targets,
                 .context_limits = if (comptime @hasField(App, "context_limits")) app.context_limits else .{},
             }) catch |err| {
@@ -1296,6 +1298,7 @@ pub fn Runtime(comptime App: type) type {
                 .provider_strict = job.provider == .gateway and job.agent_settings.provider_strict,
                 .first_call_tool_choice = job.agent_settings.first_call_tool_choice,
                 .workspace_root = workspace.root,
+                .profile_home = if (comptime @hasField(App, "profile_home")) app.profile_home else null,
                 .access_scope = workspace.access_scope,
                 .origin = if (app.session_persistence.writable) |writable|
                     if (writable.external_prompt_origin == .persistent_child) .subagent else .root

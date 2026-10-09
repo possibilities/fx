@@ -422,6 +422,7 @@ const AcpContext = struct {
         }
         var tc: tool_runtime.Context = .{
             .workspace_root = self.state.workspace_root,
+            .profile_home = self.state.cfg.home_override,
             .access_scope = self.state.workspace_access.scope(self.state.workspace_root),
             .ignored_list_entries = self.state.cfg.ignored_list_entries,
             .max_list_entries = self.state.cfg.max_list_entries,
@@ -1342,6 +1343,7 @@ fn refreshProjectContext(
 
     state.context_snapshot = state.cfg.context_registry.gatherDefaultSnapshot(alloc, .{
         .workspace_root = state.workspace_root,
+        .profile_home = state.cfg.home_override,
         .access_scope = state.workspace_access.scope(state.workspace_root),
         .project_instructions_enabled = state.cfg.project_instructions_enabled,
         .targets = targets,
@@ -1431,6 +1433,7 @@ fn buildAgentConfig(
         .effort = session.effort,
         .first_call_tool_choice = session.first_call_tool_choice,
         .workspace_root = state.workspace_root,
+        .profile_home = state.cfg.home_override,
         .access_scope = state.workspace_access.scope(state.workspace_root),
         .origin = if (session.writable) |writable|
             if (writable.external_prompt_origin == .persistent_child) .subagent else .root

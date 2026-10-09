@@ -468,7 +468,7 @@ pub fn handleNewSession(state: *server.ServerState, alloc: Allocator, msg: *json
     );
     var session_rt_owned = true;
     defer if (session_rt_owned) session_rt.deinit(alloc);
-    _ = try session_rt.initializeProfileUsage(alloc, io_mod.getenv("HOME"));
+    _ = try session_rt.initializeProfileUsage(alloc, state.cfg.home_override orelse io_mod.getenv("HOME"));
     if (writable.state.usage) |usage| {
         try session_rt.usage.restore(
             alloc,
@@ -1018,7 +1018,7 @@ fn handleRestoreSession(
     );
     var session_rt_owned = true;
     defer if (session_rt_owned) session_rt.deinit(alloc);
-    _ = try session_rt.initializeProfileUsage(alloc, io_mod.getenv("HOME"));
+    _ = try session_rt.initializeProfileUsage(alloc, state.cfg.home_override orelse io_mod.getenv("HOME"));
     try session_rt.restoreWithPermissionState(
         alloc,
         durable.conversation_language,

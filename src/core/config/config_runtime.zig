@@ -318,8 +318,7 @@ pub fn discoverPathsFromHome(alloc: Allocator, home_dir: []const u8, workspace_r
 
 pub fn providerEnvOverride() ?[]const u8 {
     const raw = io_mod.getenv("FX_PROVIDER") orelse return null;
-    if (std.mem.trim(u8, raw, " \t\r\n").len == 0) return null;
-    return raw;
+    return std.mem.trim(u8, raw, " \t\r\n");
 }
 
 /// Trimmed FX_MODEL, or null when unset or blank. Borrows process environment storage.
@@ -377,6 +376,16 @@ fn resolve_provider_selection(settings: *Settings) !void {
 pub fn loadConfiguredProviders(alloc: Allocator) !configured_provider.Registry {
     var paths = try discoverPaths(alloc, ".");
     defer paths.deinit(alloc);
+    return loadConfiguredProvidersFromPaths(alloc, paths);
+}
+
+pub fn loadConfiguredProvidersFromHome(alloc: Allocator, home: []const u8) !configured_provider.Registry {
+    var paths = try discoverPathsFromHome(alloc, home, ".");
+    defer paths.deinit(alloc);
+    return loadConfiguredProvidersFromPaths(alloc, paths);
+}
+
+fn loadConfiguredProvidersFromPaths(alloc: Allocator, paths: Paths) !configured_provider.Registry {
     const bytes = (try readOptionalUserSettingsFile(alloc, paths)) orelse return .{};
     defer alloc.free(bytes);
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, bytes, .{ .duplicate_field_behavior = .@"error" });
@@ -1176,6 +1185,15 @@ pub fn attemptProjectMcpMutation(
     action: project_config.ProjectMcpAction,
 ) CommitAttempt {
     const home = io_mod.getenv("HOME") orelse return .{ .failure = .{ .err = error.HomeNotSet } };
+    return attemptProjectMcpMutationFromHome(alloc, home, workspace_root, action);
+}
+
+pub fn attemptProjectMcpMutationFromHome(
+    alloc: Allocator,
+    home: []const u8,
+    workspace_root: []const u8,
+    action: project_config.ProjectMcpAction,
+) CommitAttempt {
     var store = settings_store.Store.initFromHome(alloc, home, .writable) catch |err| {
         return .{ .failure = .{ .err = err } };
     };
@@ -1205,6 +1223,14 @@ pub fn mutateWorkspaceDirectory(
     mutation: WorkspaceDirectoryMutation,
 ) !CommitOutcome {
     const home = io_mod.getenv("HOME") orelse return error.HomeNotSet;
+    return mutateWorkspaceDirectoryFromHome(alloc, home, mutation);
+}
+
+pub fn mutateWorkspaceDirectoryFromHome(
+    alloc: Allocator,
+    home: []const u8,
+    mutation: WorkspaceDirectoryMutation,
+) !CommitOutcome {
     var store = try settings_store.Store.initFromHome(alloc, home, .writable);
     defer store.deinit(alloc);
     return store.applyWorkspaceDirectoryPatch(alloc, mutation);
@@ -1215,6 +1241,14 @@ pub fn mutatePermission(
     mutation: PermissionMutation,
 ) !CommitOutcome {
     const home = io_mod.getenv("HOME") orelse return error.HomeNotSet;
+    return mutatePermissionFromHome(alloc, home, mutation);
+}
+
+pub fn mutatePermissionFromHome(
+    alloc: Allocator,
+    home: []const u8,
+    mutation: PermissionMutation,
+) !CommitOutcome {
     var store = try settings_store.Store.initFromHome(alloc, home, .writable);
     defer store.deinit(alloc);
     return store.applyPermissionPatch(alloc, mutation);
@@ -1229,6 +1263,26 @@ pub fn addPermissionRule(
     action: types.PermissionAction,
 ) !CommitOutcome {
     return mutatePermission(alloc, .{
+        .scope = scope,
+        .workspace_root = workspace_root,
+        .patch = .{ .add = .{
+            .category = category,
+            .pattern = pattern,
+            .action = action,
+        } },
+    });
+}
+
+pub fn addPermissionRuleFromHome(
+    alloc: Allocator,
+    home: []const u8,
+    scope: PermissionScope,
+    workspace_root: ?[]const u8,
+    category: []const u8,
+    pattern: []const u8,
+    action: types.PermissionAction,
+) !CommitOutcome {
+    return mutatePermissionFromHome(alloc, home, .{
         .scope = scope,
         .workspace_root = workspace_root,
         .patch = .{ .add = .{
@@ -1256,6 +1310,24 @@ pub fn removePermissionRule(
     });
 }
 
+pub fn removePermissionRuleFromHome(
+    alloc: Allocator,
+    home: []const u8,
+    scope: PermissionScope,
+    workspace_root: ?[]const u8,
+    category: []const u8,
+    pattern: []const u8,
+) !CommitOutcome {
+    return mutatePermissionFromHome(alloc, home, .{
+        .scope = scope,
+        .workspace_root = workspace_root,
+        .patch = .{ .remove = .{
+            .category = category,
+            .pattern = pattern,
+        } },
+    });
+}
+
 pub fn removeAllowlistRules(
     alloc: Allocator,
     permission_scope: PermissionScope,
@@ -1263,6 +1335,20 @@ pub fn removeAllowlistRules(
     reset_scope: AllowlistResetScope,
 ) !CommitOutcome {
     return mutatePermission(alloc, .{
+        .scope = permission_scope,
+        .workspace_root = workspace_root,
+        .patch = .{ .reset = reset_scope },
+    });
+}
+
+pub fn removeAllowlistRulesFromHome(
+    alloc: Allocator,
+    home: []const u8,
+    permission_scope: PermissionScope,
+    workspace_root: ?[]const u8,
+    reset_scope: AllowlistResetScope,
+) !CommitOutcome {
+    return mutatePermissionFromHome(alloc, home, .{
         .scope = permission_scope,
         .workspace_root = workspace_root,
         .patch = .{ .reset = reset_scope },
@@ -4450,7 +4536,7 @@ test "ignored workspace provider definitions with broken protocols stay inert du
     try std.testing.expect(result.settings.providers.?.get("shadow") == null);
 }
 
-test "empty FX_PROVIDER is ignored like an empty FX_MODEL" {
+test "empty FX_PROVIDER fails before selected profile startup" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
@@ -4466,11 +4552,10 @@ test "empty FX_PROVIDER is ignored like an empty FX_MODEL" {
     defer home.deinit();
     try home.map.put("FX_PROVIDER", "");
 
-    var result = try loadMergedSettingsDetailedFromHome(std.testing.allocator, home_root, workspace_root);
-    defer result.deinit(std.testing.allocator);
-
-    try std.testing.expect(result.settings.provider == null);
-    try std.testing.expectEqual(ConfigSource.compiled_default, result.sources.provider);
+    try std.testing.expectError(
+        error.InvalidProviderValue,
+        loadMergedSettingsDetailedFromHome(std.testing.allocator, home_root, workspace_root),
+    );
 }
 
 test "invalid user model emits typed diagnostic and project model is ignored" {

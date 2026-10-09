@@ -419,17 +419,31 @@ pub fn Bindings(comptime App: type) type {
             expected_account_id: ?[]const u8,
         ) !?[]u8 {
             const app: *App = @ptrCast(@alignCast(raw_ctx));
-            if (mode == .if_needed and auth_runtime.requestPathCredentialVerifiedRecently(source)) {
+            if ((if (comptime @hasField(App, "profile_home")) app.profile_home == null else true) and mode == .if_needed and auth_runtime.requestPathCredentialVerifiedRecently(source)) {
                 debug_trace.logf("auth", "credential refresh skipped source={t} reason=verified_recently", .{source});
                 return null;
             }
-            var refreshed = (try auth_runtime.refreshCredentialForAccount(
-                app.auth.oauthTransport(),
-                std.heap.c_allocator,
-                source,
-                mode,
-                expected_account_id,
-            )) orelse return null;
+            const isolated_home: ?[]const u8 = if (comptime @hasField(App, "profile_home"))
+                app.profile_home
+            else
+                null;
+            var refreshed = (if (isolated_home) |home_dir|
+                try auth_runtime.refreshCredentialForAccountFromHome(
+                    app.auth.oauthTransport(),
+                    std.heap.c_allocator,
+                    source,
+                    mode,
+                    expected_account_id,
+                    home_dir,
+                )
+            else
+                try auth_runtime.refreshCredentialForAccount(
+                    app.auth.oauthTransport(),
+                    std.heap.c_allocator,
+                    source,
+                    mode,
+                    expected_account_id,
+                )) orelse return null;
             var owns_refreshed = true;
             defer if (owns_refreshed) refreshed.deinit(std.heap.c_allocator);
             if (app.auth.preparedCredentialChange(refreshed) == .authority) {

@@ -44,6 +44,11 @@ const FX_SLACK_SCOPES = [
   "files:write", "search:read.public", "search:read.users", "users:read",
 ];
 const inheritedKeychainDisable = process.env.FX_DISABLE_KEYCHAIN;
+
+function shellQuote(value: string): string {
+  return `'${value.replaceAll("'", `'"'"'`)}'`;
+}
+
 const MCP_KEYCHAIN_PROBE_SCRIPT = `
 ObjC.import("Security");
 ObjC.import("Foundation");
@@ -697,10 +702,11 @@ function seedExpiredCredentials(
   root: ReturnType<typeof createRoot>,
   activeAuth: AuthFixture,
   expiresAtMs = 0,
+  profileHome = root.home,
 ) {
   const endpoint = activeAuth.url;
   const origin = new URL(endpoint).origin;
-  const directory = join(root.home, ".fx", "mcp-credentials");
+  const directory = join(profileHome, ".fx", "mcp-credentials");
   mkdirSync(directory, { recursive: true, mode: 0o700 });
   const path = join(directory, "credentials.json");
   writeFileSync(
@@ -2795,16 +2801,28 @@ describe("MCP remote authentication lifecycle", () => {
       auth = startAuthFixture(upstream.url);
       const root = createRoot(auth, true, "http", auth.url, false);
       moveAuthFixtureToWorkspace(root);
+      const selectedHome = join(root.root, "selected-state");
+      mkdirSync(join(selectedHome, ".fx"), { recursive: true, mode: 0o700 });
+      writeFileSync(join(selectedHome, ".fx", "settings.json"), "{}");
+      writeFileSync(join(selectedHome, ".fx", "mcp.json"), '{"mcp":{}}');
+      const ambientCredentialPath = seedExpiredCredentials(
+        root,
+        auth,
+        Date.now() + 3_600_000,
+      );
+      const ambientCredentials = readFileSync(ambientCredentialPath, "utf8");
       const credentialPath = seedExpiredCredentials(
         root,
         auth,
         Date.now() + 3_600_000,
+        selectedHome,
       );
       gateway = startFakeGateway([], {
         models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
       });
       tui = await TmuxSession.create({
         isolated: true,
+        cmd: `${shellQuote(FX_BIN)} --state-dir ${shellQuote(selectedHome)}`,
         cwd: root.workspace,
         env: {
           ...baseEnv(root),
@@ -2838,6 +2856,9 @@ describe("MCP remote authentication lifecycle", () => {
       await tui.waitForText("Logged out of MCP server 'fixture'", 10_000);
       await Bun.sleep(250);
       expect(existsSync(credentialPath)).toBe(false);
+      expect(readFileSync(ambientCredentialPath, "utf8")).toBe(
+        ambientCredentials,
+      );
       expect(auth.revocations).toBe(0);
       expect(auth.requests).toHaveLength(requestsBeforeLogout);
     },

@@ -387,6 +387,10 @@ pub const top_level_flags = [_]TopLevelFlag{
         .description = "Replace configured rules for TUI or ACP",
     },
     .{
+        .usage = "--state-dir <path>",
+        .description = "Use an isolated Fx profile for TUI or ACP",
+    },
+    .{
         .usage = "--provider <name>",
         .description = "Override the model provider for an interactive session (gateway, codex, grok, or a configured name)",
     },

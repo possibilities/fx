@@ -543,6 +543,8 @@ const App = struct {
     provider_selection: provider_runtime.Runtime = provider_runtime.Runtime.init(std.heap.c_allocator),
     model_cache: model_cache_runtime.Runtime = model_cache_runtime.Runtime.init(std.heap.c_allocator, builtin_gateway.models_path),
     usage_dashboard: usage_dashboard_runtime.Runtime = usage_dashboard_runtime.Runtime.init(std.heap.c_allocator),
+    /// Explicit Fx profile home; child processes continue to inherit real HOME.
+    profile_home: ?[]const u8 = null,
     workspace_root: []u8 = &.{},
     workspace_identity: statusline_identity.Runtime = .{},
     workspace_host: WorkspaceHostRuntime = .{},
@@ -634,6 +636,7 @@ const App = struct {
         _: Allocator,
         _: []const u8,
         _: @import("core/mcp/elicitation.zig").Capabilities,
+        _: ?[]const u8,
     ) !?*mcp_runtime_mod.McpRuntime {
         return null;
     }
@@ -701,6 +704,9 @@ const App = struct {
                 );
             }
         }
+        app.profile_home = launch.modifiers.state_home;
+        app.mcp.setProfileHome(app.profile_home);
+        app.auth.setProfileHome(app.profile_home);
         app.shell.max_transcript_bytes = max_transcript_bytes;
         if (launch.requested_resume) |target| {
             app.requested_resume = target;
@@ -2096,6 +2102,14 @@ const App = struct {
     }
 
     pub fn requestSkillsRefresh(self: *App) !u64 {
+        if (self.profile_home) |home_dir| {
+            return self.skills.requestRefresh(
+                std.heap.c_allocator,
+                self.workspace_root,
+                home_dir,
+                builtin_skills.root_policy,
+            );
+        }
         const home = try app_runtime_setup.resolveSkillsHome(std.heap.c_allocator);
         defer if (home) |value| std.heap.c_allocator.free(value);
         var root_policy = self.skill_root_policy;
@@ -4899,6 +4913,7 @@ test {
     _ = @import("core/app/app_bootstrap_runtime.zig");
     _ = @import("core/app/app_callbacks.zig");
     _ = @import("core/app/app_commands.zig");
+    _ = @import("core/app/app_profile_runtime.zig");
     _ = @import("core/app/app_entry_runtime.zig");
     _ = @import("core/app/app_input_runtime.zig");
     _ = input_submit_runtime;
@@ -4984,6 +4999,7 @@ test {
     _ = @import("core/permissions/auto_classifier.zig");
     _ = @import("core/permissions/command_admission.zig");
     _ = @import("core/mcp/mcp_runtime.zig");
+    _ = @import("core/mcp/mcp_auth_store.zig");
     _ = @import("core/mcp/connection_control.zig");
     _ = @import("core/mcp/server_transport.zig");
     _ = @import("core/mcp/stdio_dispatcher.zig");

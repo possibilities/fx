@@ -80,7 +80,10 @@ pub fn prepare(state: *const server.ServerState, alloc: Allocator, params_raw: ?
 
     var access = try loadAccess(state, alloc, root);
     errdefer access.deinit(alloc);
-    var skills = try app_runtime_setup.loadSkills(alloc, root, state.cfg.invocation_skill_roots, state.cfg.skill_root_policy);
+    var skills = if (state.cfg.home_override) |home|
+        try app_runtime_setup.loadSkillsFromHome(alloc, root, home, state.cfg.invocation_skill_roots, state.cfg.skill_root_policy)
+    else
+        try app_runtime_setup.loadSkills(alloc, root, state.cfg.invocation_skill_roots, state.cfg.skill_root_policy);
     errdefer skills.deinit(alloc);
     skill_runtime.traceDiagnostics("acp_session_workspace", skills.diagnostics);
 

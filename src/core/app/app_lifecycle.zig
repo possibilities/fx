@@ -380,6 +380,7 @@ pub const BootstrapConfig = struct {
     default_model: []const u8,
     default_agent_step_limit: usize,
     secret_store: host.SecretStore,
+    profile_home: ?[]const u8 = null,
     auth_mode: credentials.AuthMode = .local,
     resize_handler: ResizeHandler,
     fx_version: []const u8 = "",
@@ -429,12 +430,12 @@ pub fn loadStartupStateForRun(
     model_override: ?[]const u8,
 ) !StartupState {
     const workspace_root = try io_mod.realpathAlloc(alloc, ".");
-    return loadStartupStateFromOwnedWorkspace(alloc, transport, secret_store, workspace_root, default_model, default_agent_step_limit, auth_mode, null, .refresh_if_needed, null, model_override);
+    return loadStartupStateFromOwnedWorkspace(alloc, transport, secret_store, workspace_root, default_model, default_agent_step_limit, auth_mode, null, null, .refresh_if_needed, null, model_override);
 }
 
 pub fn loadStartupStateWithoutCredentials(alloc: Allocator, default_model: []const u8, default_agent_step_limit: usize) !StartupState {
     const workspace_root = try io_mod.realpathAlloc(alloc, ".");
-    return loadStartupStateFromOwnedWorkspace(alloc, oauth_transport.unavailable_provider, host.unavailable_secret_store, workspace_root, default_model, default_agent_step_limit, .local, null, null, null, null);
+    return loadStartupStateFromOwnedWorkspace(alloc, oauth_transport.unavailable_provider, host.unavailable_secret_store, workspace_root, default_model, default_agent_step_limit, .local, null, null, null, null, null);
 }
 
 pub fn loadEmbeddedStartupState(
@@ -455,6 +456,7 @@ pub fn loadEmbeddedStartupState(
         default_agent_step_limit,
         .local,
         home_dir,
+        null,
         null,
         null,
         model_override,
@@ -495,7 +497,7 @@ pub fn loadCatalogStartupStateWithAuthMode(
     model_override: ?[]const u8,
 ) !StartupState {
     const workspace_root = try io_mod.realpathAlloc(alloc, ".");
-    return loadStartupStateFromOwnedWorkspace(alloc, oauth_transport.unavailable_provider, secret_store, workspace_root, default_model, default_agent_step_limit, auth_mode, null, .stored, provider_override, model_override);
+    return loadStartupStateFromOwnedWorkspace(alloc, oauth_transport.unavailable_provider, secret_store, workspace_root, default_model, default_agent_step_limit, auth_mode, null, null, .stored, provider_override, model_override);
 }
 
 /// The interactive launch counterpart of `loadCatalogStartupStateWithAuthMode`:
@@ -511,7 +513,67 @@ pub fn loadInteractiveStartupState(
     model_override: ?[]const u8,
 ) !StartupState {
     const workspace_root = try io_mod.realpathAlloc(alloc, ".");
-    return loadStartupStateWithKeychainRead(alloc, oauth_transport.unavailable_provider, secret_store, workspace_root, default_model, default_agent_step_limit, auth_mode, null, .stored, provider_override, model_override, .deferred);
+    return loadStartupStateWithKeychainRead(alloc, oauth_transport.unavailable_provider, secret_store, workspace_root, default_model, default_agent_step_limit, auth_mode, null, null, .stored, provider_override, model_override, .deferred);
+}
+
+pub fn loadCatalogStartupStateFromHome(
+    alloc: Allocator,
+    home_dir: []const u8,
+    default_model: []const u8,
+    default_agent_step_limit: usize,
+    provider_override: ?model_provider.ProviderId,
+    model_override: ?[]const u8,
+) !StartupState {
+    const workspace_root = try io_mod.realpathAlloc(alloc, ".");
+    return loadStartupStateFromOwnedWorkspace(
+        alloc,
+        oauth_transport.unavailable_provider,
+        host.unavailable_secret_store,
+        workspace_root,
+        default_model,
+        default_agent_step_limit,
+        .local,
+        home_dir,
+        home_dir,
+        .stored,
+
+        provider_override,
+        model_override,
+    );
+}
+
+pub fn loadCatalogStartupStateFromHomes(
+    alloc: Allocator,
+    state_home: []const u8,
+    authorization_home: []const u8,
+    default_model: []const u8,
+    default_agent_step_limit: usize,
+    provider_override: ?model_provider.ProviderId,
+    model_override: ?[]const u8,
+) !StartupState {
+    const workspace_root = try io_mod.realpathAlloc(alloc, ".");
+    var state = try loadStartupStateFromOwnedWorkspace(
+        alloc,
+        oauth_transport.unavailable_provider,
+        host.unavailable_secret_store,
+        workspace_root,
+        default_model,
+        default_agent_step_limit,
+        .local,
+        state_home,
+        authorization_home,
+        .stored,
+
+        provider_override,
+        model_override,
+    );
+    if (state.credential) |*credential| {
+        if (credential.needsRefreshAt(io_mod.milliTimestamp())) {
+            credential.deinit(alloc);
+            state.credential = null;
+        }
+    }
+    return state;
 }
 
 pub fn loadStartupStatus(
@@ -602,7 +664,7 @@ pub fn applyWorkspaceLaunch(
 
 fn loadStartupStateForWorkspace(alloc: Allocator, workspace_root: []const u8, default_model: []const u8, default_agent_step_limit: usize) !StartupState {
     const owned_workspace_root = try alloc.dupe(u8, workspace_root);
-    return loadStartupStateFromOwnedWorkspace(alloc, oauth_transport.unavailable_provider, host.unavailable_secret_store, owned_workspace_root, default_model, default_agent_step_limit, .local, null, null, null, null);
+    return loadStartupStateFromOwnedWorkspace(alloc, oauth_transport.unavailable_provider, host.unavailable_secret_store, owned_workspace_root, default_model, default_agent_step_limit, .local, null, null, null, null, null);
 }
 
 const CredentialLoadMode = credentials.LoadMode;
@@ -644,11 +706,12 @@ fn loadStartupStateFromOwnedWorkspace(
     default_agent_step_limit: usize,
     auth_mode: credentials.AuthMode,
     profile_home: ?[]const u8,
+    authorization_home: ?[]const u8,
     credential_mode: ?CredentialLoadMode,
     provider_override: ?model_provider.ProviderId,
     model_override: ?[]const u8,
 ) !StartupState {
-    return loadStartupStateWithKeychainRead(alloc, transport, secret_store, owned_workspace_root, default_model, default_agent_step_limit, auth_mode, profile_home, credential_mode, provider_override, model_override, .blocking);
+    return loadStartupStateWithKeychainRead(alloc, transport, secret_store, owned_workspace_root, default_model, default_agent_step_limit, auth_mode, profile_home, authorization_home, credential_mode, provider_override, model_override, .blocking);
 }
 
 fn loadStartupStateWithKeychainRead(
@@ -660,6 +723,7 @@ fn loadStartupStateWithKeychainRead(
     default_agent_step_limit: usize,
     auth_mode: credentials.AuthMode,
     profile_home: ?[]const u8,
+    authorization_home: ?[]const u8,
     credential_mode: ?CredentialLoadMode,
     provider_override: ?model_provider.ProviderId,
     model_override: ?[]const u8,
@@ -738,7 +802,7 @@ fn loadStartupStateWithKeychainRead(
     state.credential_source_preference = settings.credential_source;
     if (auth_mode == .local and !state.model_requests_blocked) {
         if (credential_mode) |mode| defer_or_resolve: {
-            if (keychain_read == .deferred and mode == .stored and keychainReadDeferrable(
+            if (profile_home == null and keychain_read == .deferred and mode == .stored and keychainReadDeferrable(
                 builtin.os.tag == .macos,
                 secret_store.isDisabled(),
                 state.provider,
@@ -751,14 +815,25 @@ fn loadStartupStateWithKeychainRead(
                 };
                 break :defer_or_resolve;
             }
-            const resolution = try credentials.resolveForProvider(
-                alloc,
-                transport,
-                secret_store,
-                mode,
-                state.provider,
-                settings.credential_source,
-            );
+            const credential_home = if (state.provider == .configured) profile_home else authorization_home orelse profile_home;
+            const resolution = if (credential_home) |home_dir|
+                try credentials.resolveForProviderFromHome(
+                    alloc,
+                    transport,
+                    mode,
+                    state.provider,
+                    settings.credential_source,
+                    home_dir,
+                )
+            else
+                try credentials.resolveForProvider(
+                    alloc,
+                    transport,
+                    secret_store,
+                    mode,
+                    state.provider,
+                    settings.credential_source,
+                );
             state.credential = resolution.credential;
             state.credential_load_failure = resolution.failure;
             state.stored_key_status = resolution.stored_key_status;
@@ -857,15 +932,45 @@ pub fn bootstrapInteractiveApp(cfg: BootstrapConfig) !StartupState {
     cfg.shell.layout = minimalLayout();
     try cfg.shell.initBacking(cfg.alloc);
 
-    var state = try loadInteractiveStartupState(
-        cfg.alloc,
-        cfg.secret_store,
-        cfg.default_model,
-        cfg.default_agent_step_limit,
-        cfg.auth_mode,
-        cfg.provider_override,
-        cfg.model_override,
-    );
+    const borrowed_authorization_home =
+        try credentials.readOnlyAuthorizationHomeFromEnvironment(
+            cfg.alloc,
+            cfg.profile_home,
+        );
+    defer if (borrowed_authorization_home) |home| cfg.alloc.free(home);
+    var state = if (cfg.profile_home) |home_dir|
+        if (borrowed_authorization_home) |authorization_home|
+            try loadCatalogStartupStateFromHomes(
+                cfg.alloc,
+                home_dir,
+                authorization_home,
+                cfg.default_model,
+                cfg.default_agent_step_limit,
+
+                cfg.provider_override,
+                cfg.model_override,
+            )
+        else
+            try loadCatalogStartupStateFromHome(
+                cfg.alloc,
+                home_dir,
+                cfg.default_model,
+                cfg.default_agent_step_limit,
+
+                cfg.provider_override,
+                cfg.model_override,
+            )
+    else
+        try loadInteractiveStartupState(
+            cfg.alloc,
+            cfg.secret_store,
+            cfg.default_model,
+            cfg.default_agent_step_limit,
+            cfg.auth_mode,
+
+            cfg.provider_override,
+            cfg.model_override,
+        );
     errdefer state.deinit(cfg.alloc);
 
     state.credential_onboarding_skipped = cfg.auth_mode == .host_managed or credentialOnboardingDisabled();
@@ -1690,6 +1795,7 @@ test "loadStartupState seeds a provider without a saved model from the launch --
         .local,
         null,
         null,
+        null,
         .codex,
         "gpt-flag",
     );
@@ -1747,6 +1853,23 @@ test "loadStartupStatus reports where the selected model came from" {
         try std.testing.expectEqualStrings("gpt-saved", status.selected_model);
         try std.testing.expectEqual(ModelOrigin.settings, status.model_origin);
     }
+}
+
+test "FX_PROVIDER selects one process provider and FX_MODEL supplies its missing profile model" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "home/.fx");
+    const home = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "home");
+    defer std.testing.allocator.free(home);
+    var env = try TestEnv.install(std.testing.allocator, &.{
+        .{ .key = "FX_PROVIDER", .value = "  CODEX  " },
+        .{ .key = "FX_MODEL", .value = "  gpt-process  " },
+    });
+    defer env.deinit();
+    var state = try loadCatalogStartupStateFromHome(std.testing.allocator, home, "gateway-default", 12, null, null);
+    defer state.deinit(std.testing.allocator);
+    try std.testing.expectEqual(model_provider.ProviderId.codex, state.provider);
+    try std.testing.expectEqualStrings("gpt-process", state.selected_model);
 }
 
 fn loadInitialModel(alloc: Allocator, default_model: []const u8, configured: ?[]const u8) ![]u8 {
@@ -2515,6 +2638,48 @@ test "startup credential modes select a refresh policy, never a narrower source 
     try std.testing.expectEqualStrings("refresh_if_needed", modes[1].name);
 }
 
+test "selected state loads settings locally while borrowing only a stored credential" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "state/.fx");
+    try tmp.dir.createDirPath(std.testing.io, "authorization/.fx");
+    try writeFixtureFile(
+        tmp.dir,
+        "state/.fx/settings.json",
+        "{\"provider\":\"codex\",\"codex_model\":\"state-model\",\"effort\":\"low\"}\n",
+    );
+    try writePrivateFixtureFile(
+        tmp.dir,
+        "authorization/.fx/chatgpt-auth.json",
+        "{\"version\":1,\"access_token\":\"borrowed-token\",\"refresh_token\":\"borrowed-refresh\",\"expires_at_ms\":4000000000000,\"account_id\":\"borrowed-account\"}\n",
+    );
+
+    const state_home = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "state");
+    defer std.testing.allocator.free(state_home);
+    const authorization_home = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "authorization");
+    defer std.testing.allocator.free(authorization_home);
+    var env = try TestEnv.install(std.testing.allocator, &.{});
+    defer env.deinit();
+
+    var state = try loadCatalogStartupStateFromHomes(
+        std.testing.allocator,
+        state_home,
+        authorization_home,
+        "gateway-default",
+        12,
+
+        null,
+        null,
+    );
+    defer state.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(model_provider.ProviderId.codex, state.provider);
+    try std.testing.expectEqualStrings("state-model", state.selected_model);
+    try std.testing.expect(state.effort.eql(types.ReasoningEffort.literal("low")));
+    try std.testing.expectEqual(credentials.Source.chatgpt_subscription, state.credential.?.source);
+    try std.testing.expectEqualStrings("borrowed-token", state.apiKey().?);
+}
+
 test "loadStartupState applies core env overrides" {
     var env = try TestEnv.install(std.testing.allocator, &.{
         .{ .key = "FX_MODEL", .value = "  env-model  " },
@@ -2897,7 +3062,7 @@ test "interactive launch leaves a Keychain credential unresolved for the caller"
     var keychain_store = host.unavailable_secret_store;
     keychain_store.is_disabled_fn = keychainEnabledForTest;
     for ([_]KeychainRead{ .blocking, .deferred }) |keychain_read| {
-        var state = try loadStartupStateWithKeychainRead(alloc, oauth_transport.unavailable_provider, keychain_store, try alloc.dupe(u8, workspace_root), "default/model", 25, .local, null, .stored, null, null, keychain_read);
+        var state = try loadStartupStateWithKeychainRead(alloc, oauth_transport.unavailable_provider, keychain_store, try alloc.dupe(u8, workspace_root), "default/model", 25, .local, null, null, .stored, null, null, keychain_read);
         defer state.deinit(alloc);
         try std.testing.expect(state.credential == null);
         if (keychain_read == .deferred and builtin.os.tag == .macos) {
@@ -2915,6 +3080,15 @@ test "interactive launch leaves a Keychain credential unresolved for the caller"
 
 fn writeFixtureFile(dir: std.Io.Dir, sub_path: []const u8, text: []const u8) !void {
     var file = try dir.createFile(io_mod.getIo(), sub_path, .{ .truncate = true });
+    defer file.close(io_mod.getIo());
+    try file.writeStreamingAll(io_mod.getIo(), text);
+}
+
+fn writePrivateFixtureFile(dir: std.Io.Dir, sub_path: []const u8, text: []const u8) !void {
+    var file = try dir.createFile(io_mod.getIo(), sub_path, .{
+        .truncate = true,
+        .permissions = std.Io.File.Permissions.fromMode(0o600),
+    });
     defer file.close(io_mod.getIo());
     try file.writeStreamingAll(io_mod.getIo(), text);
 }

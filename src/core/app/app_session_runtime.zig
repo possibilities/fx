@@ -19,6 +19,7 @@ const host_target = @import("../hosts/target.zig");
 const diff = @import("../output/diff.zig");
 const diagnostics = @import("../workspace/diagnostics.zig");
 const app_lifecycle = @import("app_lifecycle.zig");
+const app_profile_runtime = @import("app_profile_runtime.zig");
 const provider_runtime = @import("provider_runtime.zig");
 const input_completion_runtime = @import("input_completion_runtime.zig");
 const image_attachments = @import("../images/image_attachments.zig");
@@ -1542,16 +1543,25 @@ pub fn Runtime(comptime App: type) type {
             if (comptime !runtime_profile.allows(App, .durable_sessions)) return;
             // One backend per process (D26): with v2 on, v1's store stays closed.
             if (session_adapter.enabled(app.session_persistence.sessions_v2)) {
-                app.session_persistence.v2_store = session_adapter.Store.openFromEnv(app.alloc) catch |err| {
+                app.session_persistence.v2_store = (if (comptime @hasField(App, "profile_home"))
+                    if (app.profile_home) |home|
+                        session_adapter.Store.open(app.alloc, home)
+                    else
+                        session_adapter.Store.openFromEnv(app.alloc)
+                else
+                    session_adapter.Store.openFromEnv(app.alloc)) catch |err| {
                     if (required) return err;
                     return;
                 };
                 return;
             }
-            var store = session_store.Store.init(
-                app.alloc,
-                app.workspace_root,
-            ) catch |err| {
+            var store = (if (comptime @hasField(App, "profile_home"))
+                if (app.profile_home) |home_dir|
+                    session_store.Store.initFromHome(app.alloc, home_dir, app.workspace_root)
+                else
+                    session_store.Store.init(app.alloc, app.workspace_root)
+            else
+                session_store.Store.init(app.alloc, app.workspace_root)) catch |err| {
                 if (required) return err;
                 return;
             };
@@ -3479,8 +3489,8 @@ pub fn Runtime(comptime App: type) type {
                     patch.model != null and patch.fast_mode != null;
             }
 
-            var settings_attempt = config_runtime.attemptUserPreferences(
-                app.alloc,
+            var settings_attempt = app_profile_runtime.attemptUserPreferences(
+                app,
                 patch.userSettingsPatch(),
             );
             switch (settings_attempt) {
