@@ -17,6 +17,7 @@ const scripts = [
   "test-agent-request-context.mjs",
   "test-agent-transport-retry.mjs",
   "test-native-core-stream.mjs",
+  "test-native-core-http-cleanup.mjs",
   "test-native-core-fetch-failure.mjs",
   "test-native-core-image-framing.mjs",
   "test-native-host-tool-frame-limit.mjs",
@@ -27,6 +28,14 @@ const scripts = [
   "test-list-models.mjs",
   "test-libfx-loader.mjs",
   "test-agent-bootstrap.mjs",
+  "test-agent-step-limit.mjs",
+  "test-agent-effort.mjs",
+  "test-agent-fast.mjs",
+  "test-agent-images.mjs",
+  "test-agent-tool-start.mjs",
+  "test-agent-reserved-tool-names.mjs",
+  "test-agent-provider-tools.mjs",
+  "test-agent-steering.mjs",
   "test-instruction-limits.mjs",
 ];
 for (const script of scripts) {
