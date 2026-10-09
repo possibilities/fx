@@ -208,7 +208,7 @@ test "skill search includes invocation-only roots" {
     defer alloc.free(invocation_root);
     const invocation_skill_roots = [_][]const u8{invocation_root};
     const query = try lexical_relevance.prepare("invocation-only-search");
-    const output = try searchRequest(.{
+    var output = try searchRequest(.{
         .allocator = alloc,
         .workspace_root = workspace_root,
         .invocation_skill_roots = &invocation_skill_roots,
@@ -217,9 +217,9 @@ test "skill search includes invocation-only roots" {
         .kind = .skill,
         .limit = capability_retrieval.default_limit,
     }, 4096);
-    defer alloc.free(output);
+    defer output.deinit(alloc);
 
-    try std.testing.expect(std.mem.find(u8, output, "\"name\":\"invocation-only-search\"") != null);
+    try std.testing.expect(std.mem.find(u8, output.model_output, "\"name\":\"invocation-only-search\"") != null);
 }
 test "skill search ranks metadata and returns final-projection-stable JSON" {
     const alloc = std.testing.allocator;

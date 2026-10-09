@@ -3132,7 +3132,6 @@ test "ACP restore rejects MCP servers when host capability is disabled" {
             "{\"sessionId\":\"missing\",\"cwd\":\"/\",\"mcpServers\":[" ++
             "{\"name\":\"blocked\",\"command\":\"/usr/bin/true\",\"args\":[],\"env\":[]}" ++
             "]}";
-        "{\"name\":\"blocked\",\"command\":\"/usr/bin/true\",\"args\":[],\"env\":[]}]}";
         var load_msg = jsonrpc.Message{
             .id = .{ .integer = 1 },
             .method = "session/load",
