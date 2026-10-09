@@ -912,6 +912,7 @@ const App = struct {
         self.worker.deinit(std.heap.c_allocator);
         self.clearPendingImages();
         SessionAppRuntime.deinitPersistenceForProcessExit(self);
+        self.notifications.deinit();
         self.question_prompt.deinit(self.alloc);
         shutdown_trace.mark("persistence_finalized");
 
@@ -1006,6 +1007,7 @@ const App = struct {
         self.context_snapshot.deinit(self.alloc);
         self.file_index.deinit(std.heap.c_allocator);
         self.lifecycle_runtime.deinit();
+        self.notifications.deinit();
 
         self.auth.deinit(self.alloc);
         WorkspaceAppRuntime.deinit(self);
@@ -3865,6 +3867,7 @@ test "footer runtime compatibility facade exports composeFooterFrame" {
 test "interactive app keeps notification handlers registered for live preference changes" {
     var app = App{ .alloc = std.testing.allocator };
     defer app.lifecycle_runtime.deinit();
+    defer app.notifications.deinit();
 
     try app.configureNotifications();
 
