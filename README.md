@@ -177,6 +177,18 @@ Automatic compaction starts when a request reaches 80 percent of the model's usa
 { "auto_compact_percent": 60 }
 ```
 
+Use `--permissions-file <path>` before an interactive launch, resume command, or `acp` command to replace profile, workspace, and project permission rules for that process. The file uses the same permission-rule JSON shape as `settings.json`; saved-session exact grants still apply, but cannot override a deny from the launch policy:
+
+```json
+{
+  "bash": {
+    "git *": "allow",
+    "git push *": "deny"
+  },
+  "edit": "deny"
+}
+```
+
 ## Embed fx
 
 fx builds as a native binary or WebAssembly. Applications embedding fx can provide network transport, session storage, configuration, permission handling, and terminal I/O.

@@ -2688,7 +2688,10 @@ fn handleInitialize(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message
     }
 
     state.permission_mode = startup.permission_mode;
-    state.permission_rules = startup.takePermissionRules();
+    state.permission_rules = if (state.cfg.permission_rules_override) |rules|
+        try types.dupePermissionRuleSet(alloc, rules)
+    else
+        startup.takePermissionRules();
     state.agent_step_limit = startup.agent_step_limit;
     state.max_tool_result_bytes = startup.max_tool_result_bytes;
     state.auto_compact_percent = startup.auto_compact_percent;
