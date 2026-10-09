@@ -9934,7 +9934,7 @@ describe("acp: voice control", () => {
           cwd: root.workspace,
           env: fakeGatewayEnv(root, gateway),
         });
-        await startCodeSession(client);
+        await startAutoSession(client);
         const collected: any[] = [];
         const promptId = 7301;
         sendPrompt(client, promptId, "Start the steerable ACP turn.");
@@ -10029,7 +10029,7 @@ describe("acp: voice control", () => {
           cwd: root.workspace,
           env: fakeGatewayEnv(root, gateway),
         });
-        await startCodeSession(client);
+        await startAutoSession(client);
         const collected: any[] = [];
         const steered = await voiceRequest(
           collected,
@@ -10110,7 +10110,7 @@ describe("acp: voice control", () => {
           cwd: root.workspace,
           env: fakeGatewayEnv(root, gateway),
         });
-        await startCodeSession(client);
+        await startAutoSession(client);
         const collected: any[] = [];
         const promptId = 7501;
         sendPrompt(client, promptId, "Hold this turn until cancelled.");
@@ -10195,7 +10195,7 @@ describe("acp: voice control", () => {
           cwd: root.workspace,
           env: fakeGatewayEnv(root, gateway),
         });
-        await startCodeSession(client);
+        await startAutoSession(client);
         client.setPermissionOption("allow_once");
         const result = await runPrompt(client, "Run the approved command.", TIMEOUT);
         expect(result.promptResult.result.stopReason).toBe("end_turn");
@@ -10257,7 +10257,7 @@ describe("acp: voice control", () => {
           cwd: root.workspace,
           env: fakeGatewayEnv(root, gateway),
         });
-        await startCodeSession(client);
+        await startAutoSession(client);
         client.setPermissionOption("allow_once");
         const result = await runPrompt(client, "Delegate the child command.", TIMEOUT);
         expect(result.promptResult.result.stopReason).toBe("end_turn");
@@ -10330,7 +10330,7 @@ describe("acp: voice control", () => {
           cwd: root.workspace,
           env: fakeGatewayEnv(root, gateway),
         });
-        await startCodeSession(client);
+        await startAutoSession(client);
         const collected: any[] = [];
         const promptId = 7601;
         sendPrompt(client, promptId, "Ask the voice control question.");
