@@ -10,6 +10,10 @@ const expected_names = [_][]const u8{
     "acp.server.test.ACP credential preparation preserves the existing borrowed credential",
 
     "acp.sessions.test.ACP restore rejects MCP servers when host capability is disabled",
+    "acp.voice.test.ACP voice lifecycle records carry the envelope every consumer keys on",
+    "acp.voice.test.ACP voice blocked subagent record names the child and its attention",
+    "acp.voice.test.ACP voice route recovery keeps the ADE feed's attention spelling",
+    "acp.voice.test.ACP voice single question answer decodes only for a single-question batch",
     "core.tooling.tool_admission.test.wrapped shell commands preserve exact normalized admission authority",
     "core.tooling.tool_admission.test.automatic review trace preserves the typed unavailable cause without action text",
     "core.slash_commands.command_specs.test.matchesTopLevel treats a kind absent from the supplied catalog as no match",

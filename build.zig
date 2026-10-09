@@ -141,6 +141,10 @@ pub fn build(b: *std.Build) void {
             "ACP credential preparation preserves the existing borrowed credential",
 
             "ACP restore rejects MCP servers when host capability is disabled",
+            "ACP voice lifecycle records carry the envelope every consumer keys on",
+            "ACP voice blocked subagent record names the child and its attention",
+            "ACP voice route recovery keeps the ADE feed's attention spelling",
+            "ACP voice single question answer decodes only for a single-question batch",
             "wrapped shell commands preserve exact normalized admission authority",
             "automatic review trace preserves the typed unavailable cause without action text",
             "matchesTopLevel treats a kind absent from the supplied catalog as no match",

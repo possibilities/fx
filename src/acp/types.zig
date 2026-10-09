@@ -164,9 +164,22 @@ pub fn writeSessionUpdate(w: *std.Io.Writer, session_id: []const u8, update_json
     try w.writeAll("}");
 }
 
-pub fn writeAgentMessageChunk(w: *std.Io.Writer, message_id: []const u8, text: []const u8) !void {
+/// `turn_id` is the fork's addition: a client that must attribute assistant
+/// text to a turn accumulates by it rather than by prompt boundaries, which a
+/// turn admitting steering no longer matches. Absent when no turn is active.
+pub fn writeAgentMessageChunk(
+    w: *std.Io.Writer,
+    message_id: []const u8,
+    text: []const u8,
+    turn_id: ?u64,
+) !void {
     try w.writeAll("{\"sessionUpdate\":\"agent_message_chunk\",\"messageId\":");
     try writeJsonStr(message_id, w);
+    if (turn_id) |value| {
+        var buffer: [32]u8 = undefined;
+        try w.writeAll(",\"turn_id\":");
+        try writeJsonStr(try std.fmt.bufPrint(&buffer, "{d}", .{value}), w);
+    }
     try w.writeAll(",\"content\":{\"type\":\"text\",\"text\":");
     try writeJsonStr(text, w);
     try w.writeAll("}}");
@@ -278,7 +291,19 @@ pub fn writeToolCallUpdateWithCommandResult(
     try w.writeAll("}");
 }
 
+/// The `_fx` extension a voice client reads instead of probing for the
+/// methods. `lifecycle` is the envelope revision, not a boolean, so a later
+/// envelope can be recognized without another handshake.
+pub const FxCapabilities = struct {
+    steer: bool = true,
+    snapshot: bool = true,
+    lifecycle: u32,
+    question: bool = true,
+};
+
 pub const AgentCapabilities = struct {
+    fx: ?FxCapabilities = null,
+    fx_identity_json: ?[]const u8 = null,
     image_prompts: bool,
     /// Accepts client `mcpServers` on session setup.
     mcp_servers: bool = true,
@@ -306,9 +331,25 @@ pub fn writeInitializeResponse(w: *std.Io.Writer, capabilities: AgentCapabilitie
     if (capabilities.system_prompt) try w.writeAll(",\"systemPrompt\":{}");
     try w.writeByte('}');
     try w.print(",\"_meta\":{{\"fx\":{{\"steering\":{s}}}}}", .{if (capabilities.steering) "true" else "false"});
+    if (capabilities.fx) |fx| {
+        try w.print(
+            ",\"_fx\":{{\"steer\":{s},\"snapshot\":{s},\"lifecycle\":{d},\"question\":{s}}}",
+            .{
+                if (fx.steer) "true" else "false",
+                if (fx.snapshot) "true" else "false",
+                fx.lifecycle,
+                if (fx.question) "true" else "false",
+            },
+        );
+    }
     try w.writeAll("},\"agentInfo\":{\"name\":\"fx\",\"title\":\"fx\",\"version\":");
     try writeJsonStr(build_options.app_version, w);
     try w.writeAll("},");
+    if (capabilities.fx_identity_json) |identity| {
+        try w.writeAll("\"_fx\":");
+        try w.writeAll(identity);
+        try w.writeByte(',');
+    }
     try w.writeAll("\"authMethods\":[]}");
 }
 
@@ -402,8 +443,8 @@ test "writeAgentMessageChunk produces valid json" {
     const alloc = std.testing.allocator;
     var out: std.Io.Writer.Allocating = .init(alloc);
     defer out.deinit();
-    try writeAgentMessageChunk(&out.writer, "message-1", "Hello world");
-    const expected = "{\"sessionUpdate\":\"agent_message_chunk\",\"messageId\":\"message-1\",\"content\":{\"type\":\"text\",\"text\":\"Hello world\"}}";
+    try writeAgentMessageChunk(&out.writer, "message-1", "Hello world", 41);
+    const expected = "{\"sessionUpdate\":\"agent_message_chunk\",\"messageId\":\"message-1\",\"turn_id\":\"41\",\"content\":{\"type\":\"text\",\"text\":\"Hello world\"}}";
     try std.testing.expectEqualStrings(expected, out.writer.buffered());
 }
 

@@ -90,6 +90,7 @@ else
 const types = @import("../core/shared/types.zig");
 const history_range = @import("../core/shared/history_range.zig");
 const worker_runtime = @import("../core/agent/worker_runtime.zig");
+const voice = @import("voice.zig");
 const agent_stream_provider = @import("../core/agent/stream_provider.zig");
 const runtime_gateway_step = @import("../core/agent/runtime/gateway_step.zig");
 
@@ -250,7 +251,13 @@ const AcpContext = struct {
         defer if (plain.ptr != text.ptr) self.alloc.free(plain);
         var out: std.Io.Writer.Allocating = .init(self.alloc);
         defer out.deinit();
-        try acp_types.writeAgentMessageChunk(&out.writer, message_id, plain);
+        const turn_id = self.state.worker.activeTurnId();
+        try acp_types.writeAgentMessageChunk(
+            &out.writer,
+            message_id,
+            plain,
+            if (turn_id == 0) null else turn_id,
+        );
         try self.sendUpdate(out.writer.buffered());
     }
 
@@ -466,7 +473,11 @@ const AcpContext = struct {
                 .request_fn = requestAcpPermission,
                 .retain_grant_fn = retainAcpGrant,
             } else null,
-            .cancel_flag = &session.cancel_flag,
+            .question_prompter = if (self.state.initialized) .{
+                .context = @ptrCast(self.state),
+                .request_fn = voice.requestQuestionBatch,
+            } else null,
+            .cancel_flag = &self.state.worker.worker_cancel_requested,
             .session = &session.session_rt,
             .session_allocator = self.alloc,
             .skills_dir = self.state.skills.dir,
@@ -787,10 +798,48 @@ fn appendMarkdownLinkClose(alloc: Allocator, out: *std.ArrayList(u8), uri: []con
 
 /// Runs a prompt turn under the mode and permission policy captured at
 /// dispatch. Mid-turn session/set_mode changes only affect later prompts.
+/// Where one ACP turn's text came from. A client request answers with a stop
+/// reason; work steering admitted while the session was idle answers with
+/// lifecycle events only, because no request is outstanding for it.
+const PromptSource = union(enum) {
+    client: *jsonrpc.Message,
+    queued: struct { text: []const u8, turn_id: u64 },
+};
+
 pub fn handlePrompt(
     state: *server.ServerState,
     alloc: Allocator,
     msg: *jsonrpc.Message,
+    captured_mode: []const u8,
+    captured_permission_mode: PermissionMode,
+) !TerminalOutcome {
+    return runPrompt(state, alloc, .{ .client = msg }, captured_mode, captured_permission_mode);
+}
+
+/// Runs one turn the worker already dequeued. The worker owns `processing`
+/// and the turn identity across this call, so this path neither begins nor
+/// finishes that marking.
+pub fn handleQueuedPrompt(
+    state: *server.ServerState,
+    alloc: Allocator,
+    text: []const u8,
+    turn_id: u64,
+    captured_mode: []const u8,
+    captured_permission_mode: PermissionMode,
+) !void {
+    _ = try runPrompt(
+        state,
+        alloc,
+        .{ .queued = .{ .text = text, .turn_id = turn_id } },
+        captured_mode,
+        captured_permission_mode,
+    );
+}
+
+fn runPrompt(
+    state: *server.ServerState,
+    alloc: Allocator,
+    prompt_source: PromptSource,
     captured_mode: []const u8,
     captured_permission_mode: PermissionMode,
 ) !TerminalOutcome {
@@ -820,13 +869,6 @@ pub fn handlePrompt(
         } };
     }
 
-    const params = msg.params_raw orelse return .{
-        .rpc_error = .{
-            .code = ErrorCode.invalid_params,
-            .message = "Missing params",
-        },
-    };
-
     var prior_image_catalog = try session.session_rt.snapshotImageCatalog(alloc, &.{});
     defer types.freeImageAttachmentSlice(alloc, prior_image_catalog);
     if (session.writable) |writable| {
@@ -845,12 +887,19 @@ pub fn handlePrompt(
         }
     }
     const next_image_id = (try image_attachments.calculate_next_image_id(prior_image_catalog)).next_id;
-    var prompt_input = parsePromptInputWithFirstImageId(
-        alloc,
-        params,
-        next_image_id,
-        state.cfg.host_attachments,
-    ) catch |err| return promptInputFailure(err);
+    var prompt_input = switch (prompt_source) {
+        .client => |msg| blk: {
+            const params = msg.params_raw orelse return .{
+                .rpc_error = .{
+                    .code = ErrorCode.invalid_params,
+                    .message = "Missing params",
+                },
+            };
+            break :blk parsePromptInputWithFirstImageId(alloc, params, next_image_id, state.cfg.host_attachments) catch |err|
+                return promptInputFailure(err);
+        },
+        .queued => |queued| ParsedPromptInput{ .text = try alloc.dupe(u8, queued.text) },
+    };
     defer prompt_input.deinit(alloc);
     if (prompt_input.pending_images.len > 0) {
         if (session.store == null and session.wasm_state == null and session.v2 == null) {
@@ -904,7 +953,10 @@ pub fn handlePrompt(
         prompt_input.omission_summary,
     );
 
-    session.pending_prompt_id = msg.id;
+    session.pending_prompt_id = switch (prompt_source) {
+        .client => |msg| msg.id,
+        .queued => null,
+    };
     defer session.pending_prompt_id = null;
 
     var ctx = AcpContext{
@@ -1052,8 +1104,26 @@ pub fn handlePrompt(
         try session.session_rt.snapshotImageCatalog(alloc, current_images);
     defer if (recovery_checkpoint == null) types.freeImageAttachmentSlice(alloc, authorized_image_catalog);
 
+    // The turn identity is minted before execution so steering, the work
+    // snapshot, and every lifecycle record name the same turn.
+    const assigned_turn_id: u64 = switch (prompt_source) {
+        .client => if (recovery_checkpoint) |checkpoint|
+            checkpoint.turn_id
+        else
+            debug_trace.nextTurnId(),
+        .queued => |queued| queued.turn_id,
+    };
+    const from_client = std.meta.activeTag(prompt_source) == .client;
+    if (from_client and !state.worker.beginDirectProcessing(assigned_turn_id)) {
+        return .{ .rpc_error = .{
+            .code = ErrorCode.invalid_request,
+            .message = "Prompt already in progress",
+        } };
+    }
+    defer if (from_client) state.worker.finishProcessing();
+
     const job: worker_runtime.QueuedPrompt = .{
-        .turn_id = if (recovery_checkpoint) |checkpoint| checkpoint.turn_id else 0,
+        .turn_id = assigned_turn_id,
         .prompt = @constCast(owned_prompt),
         .images = @constCast(current_images),
         .authorized_image_catalog = authorized_image_catalog,
@@ -1428,7 +1498,7 @@ fn buildAgentConfig(
         .agent_step_limit = session.agent_step_limit,
         .max_tool_result_bytes = session.max_tool_result_bytes,
         .auto_compact_percent = state.auto_compact_percent,
-        .cancel_flag = &session.cancel_flag,
+        .cancel_flag = &state.worker.worker_cancel_requested,
         .fast_mode = session.fast_mode,
         .ultrafast_mode = session.ultrafast_mode,
         .effort = session.effort,
@@ -1903,6 +1973,36 @@ fn localFileTargetPath(alloc: Allocator, uri_text: []const u8) Allocator.Error!?
     };
 }
 
+fn takeVoiceSteeringBoundary(
+    raw_ctx: *anyopaque,
+    arena: Allocator,
+    turn_id: u64,
+    kind: worker_runtime.SteeringBoundaryKind,
+) anyerror!worker_runtime.SteeringBoundaryResult {
+    const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
+    const result = try ctx.state.worker.takeSteeringBoundary(
+        std.heap.c_allocator,
+        turn_id,
+        kind,
+    );
+    return switch (result) {
+        .continue_turn => |owned| blk: {
+            defer {
+                for (owned) |message| std.heap.c_allocator.free(message);
+                std.heap.c_allocator.free(owned);
+            }
+            const copied = try arena.alloc([]u8, owned.len);
+            for (owned, copied) |message, *destination| {
+                destination.* = try arena.dupe(u8, message);
+            }
+            break :blk .{ .continue_turn = copied };
+        },
+        .none => .none,
+        .handoff => .handoff,
+        .interrupt => .interrupt,
+    };
+}
+
 fn agentRuntimeDeps(ctx: *AcpContext) agent_runtime.AgentRuntimeDeps {
     const session = if (ctx.state.active_session) |*active| active else unreachable;
     return .{
@@ -1987,7 +2087,7 @@ fn agentRuntimeDeps(ctx: *AcpContext) agent_runtime.AgentRuntimeDeps {
 fn takeSteeringBoundary(
     raw_ctx: *anyopaque,
     arena: Allocator,
-    _: u64,
+    turn_id: u64,
     kind: worker_runtime.SteeringBoundaryKind,
 ) !worker_runtime.SteeringBoundaryResult {
     const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
@@ -2004,6 +2104,10 @@ fn takeSteeringBoundary(
         return if (kind == .cancelled) .interrupt else .none;
     }
     const kernel = ctx.state.cfg.minimal_kernel;
+    if (!kernel) {
+        const voice_result = try takeVoiceSteeringBoundary(raw_ctx, arena, turn_id, kind);
+        if (voice_result != .none) return voice_result;
+    }
     if (kind == .cancelled and !kernel) return .interrupt;
     // ACP keeps accepting steering until the turn has fully returned: a
     // pending subagent can continue a turn past its final boundary, and a
@@ -2146,7 +2250,7 @@ fn resolveModelCapabilities(
                 session.account_id,
             ),
             .endpoint = ctx.state.cfg.gateway_models_path,
-            .cancel_flag = &session.cancel_flag,
+            .cancel_flag = &ctx.state.worker.worker_cancel_requested,
         },
         model,
         bundle.fallbackModelCapabilities(model),
@@ -2368,6 +2472,9 @@ fn requestAcpPermission(
         server.cancelPermissionRequest(ctx.state, request_id);
         _ = server.awaitPermissionDecision(ctx.state, request_id);
     }
+    const attention_actor = voice.Actor.main_actor(ctx.state.worker.activeTurnId());
+    voice.publishAttentionRequired(ctx.state, attention_actor, .permission, null);
+    defer voice.publishAttentionResolved(ctx.state, attention_actor, .permission, null);
 
     var pending_arena = std.heap.ArenaAllocator.init(alloc);
     defer pending_arena.deinit();

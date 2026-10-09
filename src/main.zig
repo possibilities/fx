@@ -1734,11 +1734,20 @@ const App = struct {
             false,
         );
         errdefer worker_runtime.freeQueuedPrompt(std.heap.c_allocator, queued);
+        var naming_admission = SessionNamingAppRuntime.prepareAdmission(self, prompt);
+        defer if (naming_admission) |*prepared| prepared.deinit();
+        var admission_context = PromptAdmissionContext{
+            .app = self,
+            .naming_admission = &naming_admission,
+        };
         const admission = try self.worker.admitPromptObserved(
             std.heap.c_allocator,
             queued,
             intent == .steer,
-            .{ .ctx = self, .report = reportPromptAdmission },
+            .{
+                .ctx = &admission_context,
+                .report = reportPromptAdmission,
+            },
         );
         LifecycleAppRuntime.reportPromptWorking(self);
         WorkerAppRuntime.syncState(

@@ -384,7 +384,16 @@ fn writeResponsePrefix(
 }
 
 fn writeSnapshot(writer: *std.Io.Writer, snapshot: worker_runtime.WorkSnapshot) !void {
-    try writer.writeAll("{\"active_turn_id\":");
+    try writer.writeByte('{');
+    try writeSnapshotFields(writer, snapshot);
+    try writer.writeByte('}');
+}
+
+/// The snapshot's fields without their enclosing braces, so a surface that
+/// must report more than work control does (ACP adds the parent's children)
+/// still reports the queue in exactly these bytes.
+pub fn writeSnapshotFields(writer: *std.Io.Writer, snapshot: worker_runtime.WorkSnapshot) !void {
+    try writer.writeAll("\"active_turn_id\":");
     if (snapshot.active_turn_id) |turn_id| try writeTurnId(writer, turn_id) else try writer.writeAll("null");
     try writer.print(",\"queue_paused\":{s},\"queue\":[", .{
         if (snapshot.queue_paused) "true" else "false",
@@ -403,7 +412,7 @@ fn writeSnapshot(writer: *std.Io.Writer, snapshot: worker_runtime.WorkSnapshot) 
             if (entry.has_review_draft) "true" else "false",
         });
     }
-    try writer.writeAll("]}");
+    try writer.writeByte(']');
 }
 
 fn writeTurnId(writer: *std.Io.Writer, turn_id: u64) !void {
