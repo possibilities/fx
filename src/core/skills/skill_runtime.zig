@@ -4827,7 +4827,7 @@ test "invocation root authority stays fixed after the selected path is rebound" 
         null,
         "",
         &invocation_roots,
-        test_root_policy,
+        .{ .managed_root_source = null },
     );
     defer initial.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 1), initial.skills.len);
@@ -4843,7 +4843,7 @@ test "invocation root authority stays fixed after the selected path is rebound" 
         null,
         "",
         &invocation_roots,
-        test_root_policy,
+        .{ .managed_root_source = null },
     );
     defer rebound.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 0), rebound.skills.len);
