@@ -1,6 +1,7 @@
 const std = @import("std");
 const builtin_skills = @import("../../builtins/skills.zig");
 const context_limits = @import("../../core/config/context_limits.zig");
+const io_mod = @import("../../core/shared/io.zig");
 const lexical_relevance = @import("../../core/shared/lexical_relevance.zig");
 const capability_retrieval = @import("../../core/tooling/capability_retrieval.zig");
 const skill_runtime = @import("../../core/skills/skill_runtime.zig");
@@ -41,6 +42,7 @@ pub fn searchRequest(
         ctx.allocator,
         ctx.workspace_root,
         ctx.skills_dir,
+        ctx.invocation_skill_roots,
     );
     defer discovery.deinit(ctx.allocator);
     skill_runtime.traceDiagnostics("capability_search", discovery.diagnostics);
@@ -186,6 +188,37 @@ fn renderRawSearch(
     };
 }
 
+test "skill search includes invocation-only roots" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(std.testing.io, "workspace");
+    try tmp.dir.createDirPath(std.testing.io, "invocation/invocation-only-search");
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "invocation/invocation-only-search/SKILL.md",
+        .data = "---\nname: invocation-only-search\ndescription: Locate the invocation-only workflow\n---\n\n# Invocation only\n",
+    });
+
+    const workspace_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
+    defer alloc.free(workspace_root);
+    const invocation_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "invocation");
+    defer alloc.free(invocation_root);
+    const invocation_skill_roots = [_][]const u8{invocation_root};
+    const query = try lexical_relevance.prepare("invocation-only-search");
+    const output = try searchRequest(.{
+        .allocator = alloc,
+        .workspace_root = workspace_root,
+        .invocation_skill_roots = &invocation_skill_roots,
+    }, .{
+        .query = &query,
+        .kind = .skill,
+        .limit = capability_retrieval.default_limit,
+    }, 4096);
+    defer alloc.free(output);
+
+    try std.testing.expect(std.mem.find(u8, output, "\"name\":\"invocation-only-search\"") != null);
+}
 test "skill search ranks metadata and returns final-projection-stable JSON" {
     const alloc = std.testing.allocator;
     const skills = [_]skill_runtime.Skill{

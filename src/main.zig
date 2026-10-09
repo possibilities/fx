@@ -585,6 +585,7 @@ const App = struct {
     change_tracker: change_tracker_mod.ChangeTracker = .{},
     mcp: app_mcp_runtime.State = .{},
     skills: skill_runtime.Runtime = .{},
+    invocation_skill_roots: [][]u8 = &.{},
     context_snapshot: context_contract.GatheredContextSnapshot = .{},
     file_index: file_index_mod.FileIndex = .{},
     context_enabled: bool = true,
@@ -685,6 +686,7 @@ const App = struct {
         }
         errdefer if (app.requested_resume) |*target| target.deinit(alloc);
         app.session_persistence.sessions_v2 = launch.modifiers.sessions_v2;
+        app.invocation_skill_roots = launch.modifiers.invocation_skill_roots;
         try BootstrapAppRuntime.bootstrap(
             &app,
             footer_rows,
@@ -694,6 +696,7 @@ const App = struct {
             .{
                 .load_mcp_runtime = if (comptime host_target.is_wasm) loadNoMcpRuntime else builtin_mcp.loadRuntime,
                 .skill_root_policy = if (comptime host_target.is_wasm) wasm_skill_root_policy else builtin_skills.root_policy,
+                .invocation_skill_roots = launch.modifiers.invocation_skill_roots,
                 .terminal_title = app.terminalTitle(),
             },
             .{
@@ -706,6 +709,7 @@ const App = struct {
                 .provider_strict = launch.modifiers.provider_strict_override,
             },
         );
+        app.invocation_skill_roots = launch.modifiers.takeInvocationSkillRoots();
         errdefer app.deinit();
         app.system_prompt_override = launch.modifiers.takeEffectiveSystemPrompt();
         try WorkspaceAppRuntime.applyLaunch(
@@ -1008,6 +1012,8 @@ const App = struct {
         self.mcp.deinit(self.alloc);
         shutdown_trace.mark("mcp_deinit");
         self.skills.deinit(std.heap.c_allocator);
+        for (self.invocation_skill_roots) |path| self.alloc.free(path);
+        if (self.invocation_skill_roots.len > 0) self.alloc.free(self.invocation_skill_roots);
         self.context_snapshot.deinit(self.alloc);
         self.file_index.deinit(std.heap.c_allocator);
         self.lifecycle_runtime.deinit();
@@ -2056,11 +2062,13 @@ const App = struct {
     pub fn requestSkillsRefresh(self: *App) !u64 {
         const home = try app_runtime_setup.resolveSkillsHome(std.heap.c_allocator);
         defer if (home) |value| std.heap.c_allocator.free(value);
+        var root_policy = builtin_skills.root_policy;
+        root_policy.invocation_roots = self.invocation_skill_roots;
         return self.skills.requestRefresh(
             std.heap.c_allocator,
             self.workspace_root,
             home,
-            builtin_skills.root_policy,
+            root_policy,
         );
     }
 
@@ -2082,10 +2090,12 @@ const App = struct {
     }
 
     fn pollSkillsRefresh(self: *App) !skill_runtime.RefreshCompletion {
+        var root_policy = builtin_skills.root_policy;
+        root_policy.invocation_roots = self.invocation_skill_roots;
         const completion = try self.skills.pollRefresh(
             std.heap.c_allocator,
             self.workspace_root,
-            builtin_skills.root_policy,
+            root_policy,
         );
         if (completion == .adopted) {
             skill_runtime.traceDiagnostics(
@@ -3426,6 +3436,9 @@ pub fn runWasmTerminal(init: std.process.Init) !void {
         },
     };
     defer launch.deinit(alloc);
+    if (launch.modifiers.hasInvocationSkillRoots()) {
+        return error.WasmTerminalInvocationSkillRootsUnsupported;
+    }
     const outcome = try app_entry_runtime.runInteractiveCooperative(App, alloc, &launch, .local);
     switch (outcome) {
         .returned => {},

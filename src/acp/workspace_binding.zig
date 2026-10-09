@@ -81,7 +81,7 @@ pub fn prepare(state: *const server.ServerState, alloc: Allocator, params_raw: ?
 
     var access = try loadAccess(state, alloc, root);
     errdefer access.deinit(alloc);
-    var skills = try app_runtime_setup.loadSkills(alloc, root, builtin_skills.root_policy);
+    var skills = try app_runtime_setup.loadSkills(alloc, root, state.cfg.invocation_skill_roots, builtin_skills.root_policy);
     errdefer skills.deinit(alloc);
     skill_runtime.traceDiagnostics("acp_session_workspace", skills.diagnostics);
 

@@ -193,6 +193,17 @@ ACP sessions offer the CLI's permission modes, `auto` (the default), `ask`, and 
 
 The SDK is published to npm as [libfx](https://www.npmjs.com/package/libfx). See the [WebAssembly SDK](sdk/README.md) and the runnable Node.js, browser, Next.js, and Nuxt [examples](examples/README.md). The WebAssembly SDK is experimental.
 
+Load additional skill roots for one invocation with repeatable `--skills-dir`
+flags. Each root contains one directory per skill and is scanned before
+automatically discovered roots:
+
+```bash
+fx --skills-dir ./team-skills --skills-dir /opt/shared-skills ask "Review this change"
+```
+
+Invocation skill roots are not saved, and skill installation continues to use
+`~/.fx/skills`.
+
 ## Connect your Slack account
 
 Run `/mcp add slack` in an fx session, or `fx mcp add slack` from your terminal.

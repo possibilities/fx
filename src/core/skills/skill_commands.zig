@@ -22,6 +22,7 @@ pub const FindSkillFn = *const fn (ctx: *anyopaque, name: []const u8) ?SkillInfo
 
 pub const CommandRequest = struct {
     skills_dir: []const u8,
+    invocation_skill_roots: []const []const u8 = &.{},
     find_ctx: *anyopaque,
     find_skill: FindSkillFn,
 };

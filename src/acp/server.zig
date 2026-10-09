@@ -2645,7 +2645,12 @@ fn handleInitialize(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message
 
     if (comptime !host_target.is_wasm) {
         if (!state.cfg.minimal_kernel) {
-            var loaded_skills = try app_runtime_setup.loadSkills(alloc, state.workspace_root, builtin_skills.root_policy);
+            var loaded_skills = try app_runtime_setup.loadSkills(
+                alloc,
+                state.workspace_root,
+                state.cfg.invocation_skill_roots,
+                builtin_skills.root_policy,
+            );
             errdefer loaded_skills.deinit(alloc);
             skill_runtime.traceDiagnostics("acp_startup", loaded_skills.diagnostics);
             try state.skills.replaceLoaded(alloc, loaded_skills.dir, loaded_skills.skills, loaded_skills.diagnostics);

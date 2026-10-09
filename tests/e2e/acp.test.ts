@@ -8905,6 +8905,56 @@ describe("acp: model-independent", () => {
   );
 
   test(
+    "ACP loads an invocation skill root from --skills-dir",
+    async () => {
+      const root = createIsolatedRoot("fx-acp-invocation-skill-");
+      const invocationRoot = join(root.root, "invocation-skills");
+      const skillDirectory = join(invocationRoot, "acp-invocation");
+      const skillBody = "ACP_INVOCATION_SKILL_BODY";
+      mkdirSync(skillDirectory, { recursive: true });
+      writeFileSync(
+        join(skillDirectory, "SKILL.md"),
+        `---\nname: acp-invocation\ndescription: invocation ACP fixture\n---\n\n${skillBody}\n`,
+      );
+      const gateway = startFakeGateway([
+        finalText("ACP invocation skill complete"),
+      ]);
+      try {
+        client = await AcpClient.create({
+          cwd: root.workspace,
+          args: ["--skills-dir", invocationRoot, "acp"],
+          env: fakeGatewayEnv(root, gateway),
+        });
+        await client.request("initialize", { protocolVersion: 1 }, 1);
+        await client.request("session/new", { cwd: root.external, mcpServers: [] }, 2);
+        await client.readLine();
+        await client.request("session/set_mode", { modeId: "auto" }, 3);
+        const result = await runPrompt(
+          client,
+          "$acp-invocation apply the selected skill.",
+          TIMEOUT,
+        );
+
+        expect(result.promptResult.error).toBeUndefined();
+        expect(result.promptResult.result.stopReason).toBe("end_turn");
+        expect(gateway.requests).toHaveLength(1);
+        const promptText = acpPromptText(gateway.requests[0]!.body);
+        expect(promptText).toContain("invocation ACP fixture");
+        expect(promptText).toContain(
+          `<skill_content name="acp-invocation" location="${skillDirectory}" resource="SKILL.md" complete="true">`,
+        );
+        expect(promptText).toContain(skillBody);
+        expect(client.stderr).toBe("");
+      } finally {
+        await client?.close();
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
     "ACP preserves skill identities by shortening descriptions independently of the request",
     async () => {
       const root = createIsolatedRoot("fx-acp-skill-catalog-");
@@ -8918,7 +8968,11 @@ describe("acp: model-independent", () => {
           `---\nname: ${name}\ndescription: ${distractorDescription}\n---\n\nDISTRACTOR_BODY\n`,
         );
       }
-      const targetDirectory = join(root.workspace, "skills", "system-design-method");
+      const targetDirectory = join(
+        root.workspace,
+        "skills",
+        "system-design-method",
+      );
       mkdirSync(targetDirectory, { recursive: true });
       writeFileSync(
         join(targetDirectory, "SKILL.md"),

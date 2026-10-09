@@ -266,6 +266,7 @@ pub const DispatchContext = struct {
     skills_dir: []const u8 = "",
     skill_locations: ?*const skill_contract.Locations = null,
     resolved_skill: ?*const skill_contract.PreparedSkill = null,
+    invocation_skill_roots: []const []const u8 = &.{},
     context_limits: context_limits.Values = .{},
     read_tracker: ?*read_tracker_mod.ReadTracker = null,
     change_tracker: ?*change_tracker.ChangeTracker = null,
