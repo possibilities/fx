@@ -609,14 +609,6 @@ fn appendManagedRoot(alloc: Allocator, roots: *std.ArrayList(SkillRoot), source:
     try appendOwnedRoot(alloc, roots, try alloc.dupe(u8, path), source, null);
 }
 
-fn appendInvocationRoot(alloc: Allocator, roots: *std.ArrayList(SkillRoot), path: []const u8) !void {
-    const canonical_path = io_mod.realpathAlloc(alloc, path) catch |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
-        else => try alloc.dupe(u8, path),
-    };
-    try appendOwnedRoot(alloc, roots, canonical_path, .invocation, null);
-}
-
 fn appendOwnedRoot(
     alloc: Allocator,
     roots: *std.ArrayList(SkillRoot),
@@ -2078,7 +2070,6 @@ const CatalogRefreshTask = struct {
             self.workspace_root,
             self.home,
             self.skills_dir,
-            self.root_policy.invocation_roots,
             self.root_policy,
             self.base_catalog,
         ) catch |err| {
@@ -2108,6 +2099,7 @@ const CatalogRefreshTask = struct {
             io_mod.getenv("HOME"),
             self.home,
             self.skills_dir,
+            self.root_policy.invocation_roots,
             self.root_policy,
         ) catch |err| {
             self.failure = err;

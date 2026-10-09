@@ -1,4 +1,5 @@
 const std = @import("std");
+const types = @import("../shared/types.zig");
 const config_runtime = @import("../config/config_runtime.zig");
 const process_provider = @import("../execution/process_provider.zig");
 const gateway_provider = @import("../gateway/gateway_provider.zig");
