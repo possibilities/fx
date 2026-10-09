@@ -4614,7 +4614,7 @@ fn writeInvocationSkillRootUsage(deps: RunDeps) !void {
 fn writeNativeToolModifierUsage(deps: RunDeps) !void {
     try writeStderr(
         deps,
-        "fx: --no-native-tools is only supported for interactive, resume, and ACP launches\n",
+        "fx: --no-native-tools is only supported for interactive, resume, ask, and ACP launches\n",
     );
 }
 
@@ -4646,25 +4646,25 @@ fn writeNativeToolSelectionIssue(
 fn writeSkillModifierUsage(deps: RunDeps) !void {
     try writeStderr(
         deps,
-        "fx: --skills-dir and --no-default-skills are only supported for interactive, resume, and ACP launches\n",
+        "fx: --no-default-skills is only supported for interactive, resume, ask, and ACP launches\n",
     );
 }
 fn writeProjectInstructionModifierUsage(deps: RunDeps) !void {
     try writeStderr(
         deps,
-        "fx: --no-project-instructions is only supported for interactive, resume, and ACP launches\n",
+        "fx: --no-project-instructions is only supported for interactive, resume, ask, and ACP launches\n",
     );
 }
 fn writeLaunchPermissionPolicyUsage(deps: RunDeps) !void {
     try writeStderr(
         deps,
-        "fx: --permissions-file is only supported for interactive, resume, and ACP launches\n",
+        "fx: --permissions-file is only supported for interactive, resume, ask, and ACP launches\n",
     );
 }
 fn writeStateHomeUsage(deps: RunDeps) !void {
     try writeStderr(
         deps,
-        "fx: --state-dir is only supported for interactive, resume, and ACP launches\n",
+        "fx: --state-dir is only supported for interactive, resume, ask, and ACP launches\n",
     );
 }
 fn writeModelModifierUsage(deps: RunDeps) !void {
