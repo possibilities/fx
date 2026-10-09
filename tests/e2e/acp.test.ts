@@ -9784,7 +9784,7 @@ describe("acp: model-independent", () => {
           cwd: root.workspace,
           env: fakeGatewayEnv(root, gateway),
         });
-        await startCodeSession(client);
+        await startAutoSession(client);
         const result = await runPromptBlocks(client, [
           { type: "text", text: "Inspect the attached local resource." },
           {
