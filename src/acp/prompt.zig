@@ -1936,7 +1936,7 @@ fn localFileTargetPath(alloc: Allocator, uri_text: []const u8) Allocator.Error!?
     };
 }
 
-fn takeSteeringBoundary(
+fn takeVoiceSteeringBoundary(
     raw_ctx: *anyopaque,
     arena: Allocator,
     turn_id: u64,
@@ -2047,7 +2047,7 @@ fn agentRuntimeDeps(ctx: *AcpContext) agent_runtime.AgentRuntimeDeps {
 fn takeSteeringBoundary(
     raw_ctx: *anyopaque,
     arena: Allocator,
-    _: u64,
+    turn_id: u64,
     kind: worker_runtime.SteeringBoundaryKind,
 ) !worker_runtime.SteeringBoundaryResult {
     const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
@@ -2064,6 +2064,10 @@ fn takeSteeringBoundary(
         return if (kind == .cancelled) .interrupt else .none;
     }
     const kernel = ctx.state.cfg.minimal_kernel;
+    if (!kernel) {
+        const voice_result = try takeVoiceSteeringBoundary(raw_ctx, arena, turn_id, kind);
+        if (voice_result != .none) return voice_result;
+    }
     if (kind == .cancelled and !kernel) return .interrupt;
     // ACP keeps accepting steering until the turn has fully returned: a
     // pending subagent can continue a turn past its final boundary, and a
