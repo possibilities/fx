@@ -61,6 +61,7 @@ pub const Config = struct {
     provider_strict: bool = false,
     first_call_tool_choice: types.ToolChoice = .auto,
     workspace_root: []const u8 = "",
+    profile_home: ?[]const u8 = null,
     access_scope: ?workspace_access.AccessScope = null,
     origin: TurnOrigin = .root,
     /// Root-user evidence inherited by a subagent turn. Unused for root turns.

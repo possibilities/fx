@@ -337,6 +337,7 @@ pub fn run(
             .provider_strict = admission.provider == .gateway and config.tool_context.provider_strict,
             .first_call_tool_choice = config.tool_context.first_call_tool_choice,
             .workspace_root = config.tool_context.workspace_root,
+            .profile_home = config.tool_context.profile_home,
             .access_scope = config.tool_context.access_scope,
             .origin = .subagent,
             .root_user_intent_context = prompt.root_user_intent_context,

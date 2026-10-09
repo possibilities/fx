@@ -6133,6 +6133,7 @@ fn reconstructProjectContext(
     if (config.cancel_flag.load(.seq_cst)) return error.Cancelled;
     var snapshot = try registry.gatherDefaultSnapshot(alloc, .{
         .workspace_root = config.workspace_root,
+        .profile_home = config.profile_home,
         .access_scope = config.access_scope,
         .targets = targets.items,
         .bounded_reconstruction = true,

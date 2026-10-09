@@ -8070,9 +8070,9 @@ describe("acp: model-independent", () => {
     TIMEOUT,
   );
 
-  test(
-    "ACP state root isolates profile data while children retain operator HOME",
-    async () => {
+  test.each(SESSION_BACKENDS)(
+    "ACP state root isolates profile data while children retain operator HOME$suffix",
+    async (backend) => {
       const root = createIsolatedRoot("fx-acp-state-isolation-");
       const stateA = join(root.root, "state-a");
       const stateB = join(root.root, "state-b");
@@ -8130,9 +8130,6 @@ describe("acp: model-independent", () => {
         join(root.home, ".codex", "skills", "ambient-profile-skill", "SKILL.md"),
         "---\nname: ambient-profile-skill\ndescription: ambient profile skill\n---\n\nAMBIENT_PROFILE_SKILL_BODY\n",
       );
-      writeAcpSession(stateA, root.workspace, "state-a-session", 30);
-      writeAcpSession(stateB, root.workspace, "state-b-session", 20);
-      writeAcpSession(root.home, root.workspace, "ambient-session", 10);
 
       // Upstream removed the memory tool. Selected-profile data isolation is
       // proved by the skill and instruction assertions on the first request;
@@ -8146,22 +8143,50 @@ describe("acp: model-independent", () => {
           },
         }),
         finalText("ACP isolated state complete"),
+        finalText("ACP selected state resumed"),
       ]);
       try {
+        const sessionIds: string[] = [];
+        const seedGateway = startFakeGateway([
+          finalText("selected state seed"),
+          finalText("other state seed"),
+          finalText("ambient state seed"),
+        ]);
+        try {
+          for (const selectedHome of [stateA, stateB, root.home]) {
+            const seedClient = await AcpClient.create({
+              cwd: root.workspace,
+              args: ["--state-dir", selectedHome, "acp"],
+              env: { ...fakeGatewayEnv(root, seedGateway), ...backend.env },
+            });
+            try {
+              sessionIds.push(await startAutoSession(seedClient));
+              const seeded = await runPrompt(seedClient, "Persist this state-root session.", TIMEOUT);
+              expect(seeded.promptResult.result.stopReason).toBe("end_turn");
+            } finally {
+              await seedClient.close();
+            }
+          }
+        } finally {
+          seedGateway.stop();
+        }
+        const [selectedSessionId, otherSessionId, ambientSessionId] = sessionIds;
+        const selectedEnv = {
+          HOME: root.home,
+          AI_GATEWAY_API_KEY: "",
+          VERCEL_OIDC_TOKEN: "",
+          FX_DISABLE_KEYCHAIN: "1",
+          FX_GATEWAY_BASE_URL: gateway.baseUrl,
+          FX_GATEWAY_CHAT_URL: gateway.chatUrl,
+          FX_MODEL: undefined,
+          FX_AUTO_UPGRADE: "0",
+          FX_MCP_PROTOCOL_VERSION: "2026-07-28",
+          ...backend.env,
+        };
         client = await AcpClient.create({
           cwd: root.workspace,
           args: ["--state-dir", stateA, "acp"],
-          env: {
-            HOME: root.home,
-            AI_GATEWAY_API_KEY: "",
-            VERCEL_OIDC_TOKEN: "",
-            FX_DISABLE_KEYCHAIN: "1",
-            FX_GATEWAY_BASE_URL: gateway.baseUrl,
-            FX_GATEWAY_CHAT_URL: gateway.chatUrl,
-            FX_MODEL: undefined,
-            FX_AUTO_UPGRADE: "0",
-            FX_MCP_PROTOCOL_VERSION: "2026-07-28",
-          },
+          env: selectedEnv,
         });
         await client.request("initialize", { protocolVersion: 1 }, 1);
         expect(gateway.modelRequests[0]?.headers.get("authorization")).toBe(
@@ -8171,8 +8196,8 @@ describe("acp: model-independent", () => {
         const listed = await client.request("session/list", {}, 2) as any;
         expect(listed.result.sessions.map((session: { sessionId: string }) =>
           session.sessionId
-        )).toEqual(["state-a-session"]);
-        for (const sessionId of ["state-b-session", "ambient-session"]) {
+        )).toEqual([selectedSessionId]);
+        for (const sessionId of [otherSessionId, ambientSessionId]) {
           for (const method of ["session/load", "session/resume"]) {
             const rejected = await client.request(
               method,
@@ -8185,6 +8210,7 @@ describe("acp: model-independent", () => {
         const created = await client.request(
           "session/new",
           {
+            cwd: root.external,
             mcpServers: [acpStdioServer(
               "state-isolation-mcp",
               mcpPidPath,
@@ -8196,7 +8222,7 @@ describe("acp: model-independent", () => {
         ) as any;
         expect(created.error).toBeUndefined();
         await client.readLine();
-        await client.request("session/set_mode", { modeId: "code" }, 4);
+        await client.request("session/set_mode", { modeId: "auto" }, 4);
         client.setPermissionOption("allow_once");
 
         const result = await runPrompt(
@@ -8223,6 +8249,26 @@ describe("acp: model-independent", () => {
         );
         expect(mcpEnvironment.home).toBe(root.home);
         expect(client.stderr).toBe("");
+        await client.close();
+        client = await AcpClient.create({
+          cwd: root.workspace,
+          args: ["--state-dir", stateA, "acp"],
+          env: selectedEnv,
+        });
+        await client.request("initialize", { protocolVersion: 1 });
+        const reloaded = await client.request("session/load", {
+          sessionId: created.result.sessionId,
+          cwd: root.external,
+          mcpServers: [],
+        }) as any;
+        expect(reloaded.error).toBeUndefined();
+        const resumed = await runPrompt(client, "Continue the selected state session.", TIMEOUT);
+        expect(resumed.promptResult.result.stopReason).toBe("end_turn");
+        expect(gateway.requests[2]!.body.includes("SELECTED_PROFILE_INSTRUCTIONS")).toBe(true);
+        expect(gateway.requests[2]!.body.includes("AMBIENT_PROFILE_INSTRUCTIONS")).toBe(false);
+        const resumedCatalog = await client.request("session/list", {}) as any;
+        expect(resumedCatalog.result.sessions.map((entry: { sessionId: string }) => entry.sessionId).sort())
+          .toEqual([selectedSessionId, created.result.sessionId].sort());
       } finally {
         await client?.close();
         if (existsSync(mcpPidPath)) await expectMcpProcessExited(mcpPidPath);

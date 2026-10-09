@@ -1285,6 +1285,7 @@ pub fn Runtime(comptime App: type) type {
                 .provider_strict = job.provider == .gateway and job.agent_settings.provider_strict,
                 .first_call_tool_choice = job.agent_settings.first_call_tool_choice,
                 .workspace_root = workspace.root,
+                .profile_home = if (comptime @hasField(App, "profile_home")) app.profile_home else null,
                 .access_scope = workspace.access_scope,
                 .origin = if (app.session_persistence.writable) |writable|
                     if (writable.external_prompt_origin == .persistent_child) .subagent else .root

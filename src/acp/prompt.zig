@@ -1401,6 +1401,7 @@ fn buildAgentConfig(
         .effort = session.effort,
         .first_call_tool_choice = session.first_call_tool_choice,
         .workspace_root = state.workspace_root,
+        .profile_home = state.cfg.home_override,
         .access_scope = state.workspace_access.scope(state.workspace_root),
         .origin = if (session.writable) |writable|
             if (writable.external_prompt_origin == .persistent_child) .subagent else .root

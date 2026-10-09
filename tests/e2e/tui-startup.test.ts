@@ -1,7 +1,6 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { execFileSync } from "node:child_process";
 import {
-  chmodSync,
   existsSync,
   mkdirSync,
   mkdtempSync,
@@ -12,7 +11,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { FX_BIN, HAS_API_KEY } from "../evals/eval-helpers";
+import { FX_BIN, HAS_API_KEY, runFx } from "../evals/eval-helpers";
 import {
   FAKE_GATEWAY_MODEL,
   fakeGatewayFinalText,
@@ -38,35 +37,6 @@ const MCP_STDIO_FIXTURE = join(
 
 function shellQuote(value: string): string {
   return `'${value.replaceAll("'", `'"'"'`)}'`;
-}
-
-function writeStateSession(
-  home: string,
-  workspaceRoot: string,
-  sessionId: string,
-  updatedAtMs: number,
-): void {
-  const sessionDir = join(home, ".fx", "sessions", sessionId);
-  mkdirSync(sessionDir, { recursive: true, mode: 0o700 });
-  chmodSync(join(home, ".fx"), 0o700);
-  chmodSync(join(home, ".fx", "sessions"), 0o700);
-  chmodSync(sessionDir, 0o700);
-  writeFileSync(
-    join(sessionDir, "session.json"),
-    JSON.stringify({
-      schema_version: 2,
-      id: sessionId,
-      created_at_ms: 1,
-      updated_at_ms: updatedAtMs,
-      workspace_root: workspaceRoot,
-      conversation_language: "en",
-      history_len: 0,
-      history: [],
-      total_input_tokens: 0,
-      total_output_tokens: 0,
-    }) + "\n",
-    { mode: 0o600 },
-  );
 }
 
 async function waitForPath(path: string, timeoutMs = 5_000): Promise<void> {
@@ -701,11 +671,12 @@ describe.skipIf(SKIP_TMUX)("tui: selected state root", () => {
       );
 
       const gateway = startFakeGateway([
-        fakeGatewayToolCall("state_memory", "memory", { action: "list" }),
-        fakeGatewayToolCall("state_home", "terminal", {
-          action: "exec",
-          command: "printf '%s' \"$HOME\"",
-          timeout_ms: 5_000,
+        fakeGatewayToolCall("state_home", "shell", {
+          request: {
+            action: "run",
+            command: "printf '%s' \"$HOME\"",
+            timeout_ms: 5_000,
+          },
         }),
         fakeGatewayFinalText("TUI isolated state complete"),
       ]);
@@ -738,7 +709,7 @@ describe.skipIf(SKIP_TMUX)("tui: selected state root", () => {
         );
         await session.waitForText("TUI isolated state complete", 15_000);
 
-        expect(gateway.requests).toHaveLength(3);
+        expect(gateway.requests).toHaveLength(2);
         expect(gateway.requests[0]!.headers.get("ai-language-model-id")).toBe(
           FAKE_GATEWAY_MODEL,
         );
@@ -751,7 +722,7 @@ describe.skipIf(SKIP_TMUX)("tui: selected state root", () => {
         expect(gateway.requests[0]!.body).not.toContain("ambient-state-skill");
         expect(gateway.requests[0]!.body).not.toContain("ambient-profile-skill");
         expect(gateway.requests[0]!.body).not.toContain("AMBIENT_PROFILE_INSTRUCTIONS");
-        expect(gateway.requests[2]!.body).toContain(home);
+        expect(gateway.requests[1]!.body).toContain(home);
         const mcpEnvironment = JSON.parse(
           readFileSync(mcpEnvironmentPath, "utf8"),
         );
@@ -779,9 +750,9 @@ describe.skipIf(SKIP_TMUX)("tui: selected state root", () => {
     TIMEOUT,
   );
 
-  test(
-    "TUI resume cannot cross selected state roots",
-    async () => {
+  test.each([false, true])(
+    "TUI resume cannot cross selected state roots (sessions v2: %s)",
+    async (sessionsV2) => {
       const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-e2e-tui-resume-state-")));
       const home = join(root, "home");
       const workspace = join(root, "workspace");
@@ -795,15 +766,36 @@ describe.skipIf(SKIP_TMUX)("tui: selected state root", () => {
       mkdirSync(join(stateB, ".fx"), { recursive: true });
       writeFileSync(validStderr, "");
       writeFileSync(invalidStderr, "");
-      writeStateSession(stateA, realpathSync(workspace), "state-a-session", 20);
-      writeStateSession(stateB, realpathSync(workspace), "state-b-session", 30);
-      writeStateSession(home, realpathSync(workspace), "ambient-session", 40);
-
+      const gateway = startFakeGateway([
+        fakeGatewayFinalText("selected state seed"),
+        fakeGatewayFinalText("other state seed"),
+        fakeGatewayFinalText("ambient state seed"),
+      ]);
+      const env = {
+        HOME: home,
+        AI_GATEWAY_API_KEY: "state-resume-test-key",
+        FX_MODEL: FAKE_GATEWAY_MODEL,
+        FX_GATEWAY_BASE_URL: gateway.baseUrl,
+        FX_GATEWAY_CHAT_URL: gateway.chatUrl,
+        FX_SESSIONS_V2: sessionsV2 ? "1" : undefined,
+        FX_AUTO_UPGRADE: "0",
+      };
       try {
+        const sessionIds: string[] = [];
+        for (const selectedHome of [stateA, stateB, home]) {
+          const seeded = await runFx(["ask", "--json", "Persist a resume-boundary fixture."], {
+            cwd: workspace,
+            env: { ...env, HOME: selectedHome },
+            timeoutMs: TIMEOUT,
+          });
+          expect(seeded.code).toBe(0);
+          sessionIds.push(JSON.parse(seeded.stdout).session_id);
+        }
+        const [selectedSessionId, otherSessionId, ambientSessionId] = sessionIds;
         session = await TmuxSession.create({
-          cmd: `${shellQuote(FX_BIN)} --state-dir ${shellQuote(stateA)} resume state-a-session`,
+          cmd: `${shellQuote(FX_BIN)} --state-dir ${shellQuote(stateA)} resume ${shellQuote(selectedSessionId!)}`,
           cwd: workspace,
-          env: { HOME: home, FX_AUTO_UPGRADE: "0" },
+          env,
           stderrPath: validStderr,
         });
         await session.waitForComposer(10_000);
@@ -812,23 +804,26 @@ describe.skipIf(SKIP_TMUX)("tui: selected state root", () => {
         session = null;
         expect(readFileSync(validStderr, "utf8")).toBe("");
 
-        session = await TmuxSession.create({
-          cmd: `${shellQuote(FX_BIN)} --state-dir ${shellQuote(stateA)} resume state-b-session`,
-          cwd: workspace,
-          env: { HOME: home, FX_AUTO_UPGRADE: "0" },
-          stderrPath: invalidStderr,
-          startupWaitMs: 100,
-        });
-        expect(await session.waitForSessionEnd(5_000)).toBe(true);
-        session = null;
-        expect(readFileSync(invalidStderr, "utf8")).toContain(
-          "saved session not found",
-        );
+        for (const deniedSessionId of [otherSessionId, ambientSessionId]) {
+          session = await TmuxSession.create({
+            cmd: `${shellQuote(FX_BIN)} --state-dir ${shellQuote(stateA)} resume ${shellQuote(deniedSessionId!)}`,
+            cwd: workspace,
+            env,
+            stderrPath: invalidStderr,
+            startupWaitMs: 100,
+          });
+          expect(await session.waitForSessionEnd(5_000)).toBe(true);
+          session = null;
+          expect(readFileSync(invalidStderr, "utf8")).toContain(
+            "saved session not found",
+          );
+        }
       } finally {
         if (session) {
           await session.kill();
           session = null;
         }
+        gateway.stop();
         rmSync(root, { recursive: true, force: true });
       }
     },
