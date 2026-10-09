@@ -273,6 +273,7 @@ const Generation = struct {
 
 pub const FileIndex = struct {
     const PendingScope = struct { roots: [][]u8, epoch: u64 };
+    profile_home: ?[]const u8 = null,
 
     /// The main thread is the sole owner allowed to replace or reclaim these
     /// generation pointers. The loader writes only `loading_generation`.
@@ -391,6 +392,7 @@ pub const FileIndex = struct {
             self.roots,
             &self.stop_requested,
             allow_cache,
+            self.profile_home orelse io_mod.getenv("HOME"),
         }) catch |err| {
             self.loading_generation = null;
             loading.destroy(alloc);
@@ -781,9 +783,10 @@ fn loaderThreadMain(
     roots: []const []const u8,
     stop_requested: *std.atomic.Value(bool),
     allow_cache: bool,
+    profile_home: ?[]const u8,
 ) void {
     debug_trace.logf("core", "file index loader entered generation={d} worker_thread={d}", .{ generation.id, std.Thread.getCurrentId() });
-    const outcome = loadGeneration(generation, alloc, roots, stop_requested, allow_cache);
+    const outcome = loadGeneration(generation, alloc, roots, stop_requested, allow_cache, profile_home);
     publishLoaderOutcomeAfterCleanup(generation, outcome);
 }
 
@@ -793,6 +796,7 @@ fn loadGeneration(
     roots: []const []const u8,
     stop_requested: *std.atomic.Value(bool),
     allow_cache: bool,
+    profile_home: ?[]const u8,
 ) LoaderOutcome {
     if (isStopRequested(stop_requested)) return .canceled;
 
@@ -801,7 +805,7 @@ fn loadGeneration(
     const arena = arena_state.allocator();
 
     if (allow_cache) {
-        if (file_index_cache.load(arena, roots) catch |err| blk: {
+        if ((if (profile_home) |home| file_index_cache.loadFrom(arena, home, roots) else null) catch |err| blk: {
             if (err == error.OutOfMemory) return .{ .failed = .{ .stage = .discovery, .err = err } };
             break :blk null;
         }) |loaded_value| {
@@ -827,7 +831,7 @@ fn loadGeneration(
     };
 
     // Persist before the fill so even a canceled publish leaves a warm cache.
-    file_index_cache.save(arena, roots, candidates) catch |err| {
+    if (profile_home) |home| file_index_cache.saveTo(arena, home, roots, candidates) catch |err| {
         debug_trace.logf("core", "file index cache not saved generation={d} err={s}", .{ generation.id, @errorName(err) });
     };
 
@@ -2540,35 +2544,11 @@ test "persisted file index paints a stale preview and the real scan replaces it"
         file.close(zio);
     }
 
-    const empty_environ = struct {
-        var map: ?*std.process.Environ.Map = null;
-        fn get() !*const std.process.Environ.Map {
-            if (map) |value| return value;
-            const value = try std.heap.page_allocator.create(std.process.Environ.Map);
-            value.* = std.process.Environ.Map.init(std.heap.page_allocator);
-            map = value;
-            return value;
-        }
-    };
-    {
-        const empty = try empty_environ.get();
-        io_mod.setEnvironMap(empty);
-    }
-    var home_map = std.process.Environ.Map.init(alloc);
-    defer home_map.deinit();
-    try home_map.put("HOME", home);
-    io_mod.setEnvironMap(&home_map);
-    defer {
-        if (empty_environ.get()) |empty| {
-            io_mod.setEnvironMap(empty);
-        } else |_| {}
-    }
-
     const scope = workspace_access.AccessScope.primaryOnly(root);
     const roots = [_][]const u8{root};
 
     // First launch: real scan, no cache yet.
-    var first = FileIndex{};
+    var first = FileIndex{ .profile_home = home };
     defer first.deinit(alloc);
     first.ensureScopeEpoch(alloc, scope, 1);
     var adoptions: usize = 0;
@@ -2593,7 +2573,7 @@ test "persisted file index paints a stale preview and the real scan replaces it"
 
     // Second launch: the cache paints one preview generation, then the real
     // scan replaces it with the added file.
-    var second = FileIndex{};
+    var second = FileIndex{ .profile_home = home };
     defer second.deinit(alloc);
     second.ensureScopeEpoch(alloc, scope, 2);
     adoptions = 0;

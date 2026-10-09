@@ -1,4 +1,5 @@
 const std = @import("std");
+const app_profile_runtime = @import("app_profile_runtime.zig");
 const question_prompt = @import("../agent/question_prompt.zig");
 const input_completion_runtime = @import("input_completion_runtime.zig");
 const app_commands = @import("app_commands.zig");
@@ -488,7 +489,7 @@ pub fn Runtime(comptime App: type) type {
             if (shared_theme.sourceName() orelse ui_render.explicitThemeName()) |name| {
                 // Custom themes re-resolve on live flips: sibling swap or
                 // builtin fallback, same rule as startup.
-                resolved_target = shared_theme.resolveNamed(app.alloc, name, light, .{ .truecolor = ui_render.truecolorIsEnabled() }) catch |err| blk: {
+                resolved_target = shared_theme.resolveNamedFromHome(app.alloc, app_profile_runtime.home(app), name, light, .{ .truecolor = ui_render.truecolorIsEnabled() }) catch |err| blk: {
                     debug_trace.logf("theme", "live_theme_resolve_failed name={s} err={s}", .{ name, @errorName(err) });
                     break :blk null;
                 };

@@ -1,4 +1,5 @@
 const std = @import("std");
+const app_profile_runtime = @import("app_profile_runtime.zig");
 const runtime_profile = @import("../hosts/runtime_profile.zig");
 const file_index = @import("../workspace/file_index.zig");
 const path_completion = @import("../workspace/path_completion.zig");
@@ -144,6 +145,7 @@ pub fn Runtime(comptime App: type) type {
 
         pub fn startFileIndex(app: *App) void {
             if (app.workspace_root.len == 0) return;
+            app.file_index.profile_home = app_profile_runtime.explicitHome(app);
             app.file_index.ensureScopeEpoch(std.heap.c_allocator, scope(app), app.workspace.scope_epoch);
         }
 
@@ -170,6 +172,7 @@ pub fn Runtime(comptime App: type) type {
 }
 
 const TestFileIndex = struct {
+    profile_home: ?[]const u8 = null,
     ensured_count: usize = 0,
     refreshed_count: usize = 0,
     last_additional_count: usize = 0,
