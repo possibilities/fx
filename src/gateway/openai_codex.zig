@@ -283,7 +283,7 @@ pub fn streamPrepared(
     var cancel_watch: gateway_client.CancelWatch = .{};
     defer cancel_watch.stop();
     if (http_request.connection) |connection|
-        try cancel_watch.start(request.cancel_flag, null, connection.stream_writer.stream);
+        try cancel_watch.start(request.cancel_flag, request.deadline, connection.stream_writer.stream);
     if (request.cancel_flag.load(.seq_cst)) return error.Cancelled;
 
     http_request.transfer_encoding = .{ .content_length = payload.len };
