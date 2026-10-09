@@ -3,6 +3,7 @@ const command_admission = @import("../../permissions/command_admission.zig");
 const managed_execution = @import("../../execution/managed_execution.zig");
 const permission_auto_classifier = @import("../../permissions/auto_classifier.zig");
 const types = @import("../../shared/types.zig");
+const shared_theme = @import("../../shared/theme.zig");
 const text_utils = @import("../../shared/text_utils.zig");
 const tool_dispatch = @import("../../tooling/tool_dispatch.zig");
 const tool_args = @import("../../tooling/tool_args.zig");
@@ -727,7 +728,7 @@ fn formatProvisionalProgressLabel(
     label_value: ?[]const u8,
 ) ![]const u8 {
     if (label_value) |value| {
-        return std.fmt.bufPrint(buf, "● {s}\x1b[0m \x1b[38;5;245m{s}\x1b[0m", .{ action_label, value });
+        return std.fmt.bufPrint(buf, "● {s}\x1b[0m {s}{s}\x1b[0m", .{ action_label, shared_theme.current().tool_stdout_style, value });
     }
     return std.fmt.bufPrint(buf, "● {s}\x1b[0m", .{action_label});
 }
@@ -956,6 +957,53 @@ fn isShellWaitCall(arena: Allocator, call: ToolCall) Allocator.Error!bool {
     return std.mem.eql(u8, action, "wait");
 }
 
+pub fn publishSubagentCompletionPreview(
+    hooks: *const AgentRuntimeDeps,
+    arena: Allocator,
+    turn_id: u64,
+    call: ToolCall,
+    result: ToolExecutionResult,
+    advertised_dynamic_tool_names: []const []const u8,
+) !bool {
+    if (!std.mem.eql(u8, call.name, "subagent")) return false;
+    const base_line = if (try tooling_presentation.subagentStatusLine(
+        arena,
+        call,
+        result.model_output,
+    )) |line|
+        try std.fmt.allocPrint(arena, "● {s}", .{line})
+    else switch (result.status) {
+        .success => try hooks.describe_tool_action_completed(
+            hooks.ctx,
+            arena,
+            call,
+            null,
+            advertised_dynamic_tool_names,
+        ),
+        .failure => try hooks.describe_tool_action_denied(
+            hooks.ctx,
+            arena,
+            call,
+            null,
+            try tooling_presentation.subagentFailureLabel(
+                arena,
+                call,
+                result.model_output,
+            ),
+            advertised_dynamic_tool_names,
+        ),
+    };
+    const line = if (result.subagent_completion) |status|
+        renderedSubagentSummary(hooks, arena, base_line, status)
+    else
+        base_line;
+    try hooks.push_tool_lifecycle(hooks.ctx, .{ .progress = .{
+        .id = .{ .turn_id = turn_id, .call_id = call.id },
+        .text = line,
+    } });
+    return true;
+}
+
 pub fn finishExecutedToolStatus(
     hooks: *const AgentRuntimeDeps,
     arena: Allocator,
@@ -1016,6 +1064,9 @@ pub fn finishExecutedToolStatus(
                 advertised_dynamic_tool_names,
             );
             if (std.mem.eql(u8, call.name, "shell")) {
+                if (try tool_result_errors.isTerminalEndedFailure(arena, safe_result)) {
+                    break :blk try std.fmt.allocPrint(arena, "{s} · ended when fx exited", .{base});
+                }
                 if (try tool_result_errors.inspectTerminalActionFieldCorrection(
                     arena,
                     safe_result,
@@ -1226,7 +1277,7 @@ fn failureStatusDetail(
                     std.mem.findScalar(u8, actionable, '\r') == null)
                 {
                     const masked = try text_utils.maskSecrets(arena, actionable);
-                    const encoded = try text_utils.encodeTerminalSafe(arena, masked, 256);
+                    const encoded = try text_utils.encodeTerminalSafeInline(arena, masked, 256);
                     return if (encoded.bytes.len == 0) detail else encoded.bytes;
                 }
             }
@@ -1234,7 +1285,7 @@ fn failureStatusDetail(
 
         if (safe_result.len == 0) return detail;
         const masked = try text_utils.maskSecrets(arena, safe_result);
-        const encoded = try text_utils.encodeTerminalSafe(arena, masked, 256);
+        const encoded = try text_utils.encodeTerminalSafeInline(arena, masked, 256);
         return if (encoded.bytes.len == 0) detail else encoded.bytes;
     }
 
@@ -1245,7 +1296,7 @@ fn failureStatusDetail(
     }
     const detail = try mcpFailureEnvelopeText(arena, safe_result) orelse safe_result;
     const masked_detail = try text_utils.maskSecrets(arena, detail);
-    const encoded = try text_utils.encodeTerminalSafe(arena, masked_detail, 256);
+    const encoded = try text_utils.encodeTerminalSafeInline(arena, masked_detail, 256);
     return if (encoded.bytes.len == 0) null else encoded.bytes;
 }
 
@@ -2357,6 +2408,40 @@ test "provider search completion keeps terminal result detail" {
     }
 }
 
+test "subagent completion preview updates progress without publishing a terminal" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var capture = ProvisionalStatusTestCapture{ .alloc = alloc };
+    defer capture.deinit();
+    const hooks = capture.hooks();
+    const call = ToolCall{
+        .id = "child",
+        .name = "subagent",
+        .arguments_json = "{\"action\":\"run\",\"task\":\"inspect auth\"}",
+    };
+
+    try std.testing.expect(try publishSubagentCompletionPreview(
+        &hooks,
+        arena,
+        3,
+        call,
+        .{ .model_output = "{\"ok\":true,\"pending\":true}" },
+        &.{},
+    ));
+
+    try std.testing.expectEqual(@as(usize, 1), capture.events.items.len);
+    switch (capture.events.items[0]) {
+        .progress => |progress| {
+            try std.testing.expectEqual(@as(u64, 3), progress.id.turn_id);
+            try std.testing.expectEqualStrings("child", progress.id.call_id);
+            try std.testing.expectEqualStrings("● Subagent still running · inspect auth", progress.text);
+        },
+        else => return error.TestExpectedEqual,
+    }
+}
+
 test "subagent terminal summary preserves request row before child status" {
     const alloc = std.testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(alloc);
@@ -2467,7 +2552,7 @@ test "permission target preflight failure reports the actionable reason" {
     var capture = ProvisionalStatusTestCapture{ .alloc = alloc };
     defer capture.deinit();
     const hooks = capture.hooks();
-    const failure = "Permission target resolution failed for grep_files: FileNotFound";
+    const failure = "Path not found: /tmp/missing";
 
     try finishExecutedToolStatus(
         &hooks,
@@ -2495,12 +2580,12 @@ test "permission target preflight failure reports the actionable reason" {
     const terminal = capture.events.items[0].terminal;
     try std.testing.expectEqual(types.ToolOutcomeKind.failed, terminal.outcome.kind);
     try std.testing.expectEqualStrings(
-        "Failed grep_files: Permission target resolution failed for grep_files: FileNotFound",
+        "Failed grep_files: Path not found: /tmp/missing",
         terminal.outcome.summary,
     );
 }
 
-test "dynamic MCP failure derives a bounded terminal-safe detail from the safe result" {
+test "dynamic MCP failure flattens a multi-line detail into a terminal-safe summary" {
     const alloc = std.testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(alloc);
     defer arena_state.deinit();
@@ -2509,7 +2594,7 @@ test "dynamic MCP failure derives a bounded terminal-safe detail from the safe r
     defer capture.deinit();
     const hooks = capture.hooks();
     const failure =
-        \\{"server":"plain","tool":"mcp_plain_getThreads","result":{"resultType":"complete","isError":true,"content":[{"type":"text","text":"Invalid input: labels require at least one item\nretry rejected"}]}}
+        \\{"server":"plain","tool":"mcp_plain_getThreads","result":{"resultType":"complete","isError":true,"content":[{"type":"text","text":"Invalid input:\u001b[31m labels require at least one item\nretry rejected\n"}]}}
     ;
     const advertised = [_][]const u8{"mcp_plain_getThreads"};
 
@@ -2534,7 +2619,48 @@ test "dynamic MCP failure derives a bounded terminal-safe detail from the safe r
     const terminal = capture.events.items[0].terminal;
     try std.testing.expectEqual(types.ToolOutcomeKind.failed, terminal.outcome.kind);
     try std.testing.expectEqualStrings(
-        "Failed mcp_plain_getThreads: Invalid input: labels require at least one item\\x0aretry rejected",
+        "Failed mcp_plain_getThreads: Invalid input:\\x1b[31m labels require at least one item retry rejected",
+        terminal.outcome.summary,
+    );
+    try std.testing.expect(std.mem.indexOfScalar(u8, terminal.outcome.summary, 0x1b) == null);
+    try std.testing.expect(std.mem.indexOfScalar(u8, terminal.outcome.summary, '\n') == null);
+}
+
+test "dynamic MCP failure flattens a pretty-printed JSON error body" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var capture = ProvisionalStatusTestCapture{ .alloc = alloc };
+    defer capture.deinit();
+    const hooks = capture.hooks();
+    const failure =
+        \\{"server":"vercel","tool":"mcp_vercel_web_fetch_vercel_url","result":{"resultType":"complete","isError":true,"content":[{"type":"text","text":"{\n  \"success\": false,\n  \"info\": \"Unable to create share\"\n}"}]}}
+    ;
+    const advertised = [_][]const u8{"mcp_vercel_web_fetch_vercel_url"};
+
+    try finishExecutedToolStatus(
+        &hooks,
+        arena,
+        7,
+        .{
+            .id = "vercel_failure",
+            .name = "mcp_vercel_web_fetch_vercel_url",
+            .arguments_json = "{}",
+        },
+        true,
+        null,
+        .{ .status = .failure, .model_output = failure },
+        failure,
+        .{ .output_bytes = failure.len, .stored_output_bytes = failure.len },
+        null,
+        &advertised,
+    );
+
+    const terminal = capture.events.items[0].terminal;
+    try std.testing.expectEqual(types.ToolOutcomeKind.failed, terminal.outcome.kind);
+    try std.testing.expectEqualStrings(
+        "Failed mcp_vercel_web_fetch_vercel_url: { \"success\": false, \"info\": \"Unable to create share\" }",
         terminal.outcome.summary,
     );
 }

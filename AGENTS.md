@@ -57,6 +57,8 @@ The test suites under `tests/` use Bun but are separate from the Zig codebase. S
 
 * In documentation, never use double hyphens (`--`) as a dash. Use an emdash (—) sparingly, or rewrite to avoid dashes.
 
+* Use the `technical-writer` skill (`.fx/skills/technical-writer/SKILL.md`) when you write or edit prose, including documentation, commit messages, PR titles and descriptions, and issues. Where the skill and this section differ, such as on em dashes, this section takes precedence.
+
 * CLI flags use kebab-case (e.g. `--no-save`, `--json`). Never use camelCase for flags.
 
 * Prefer `snake_case` for all Zig identifiers. Types use `PascalCase` per Zig convention.
@@ -70,6 +72,8 @@ Key rules:
 * `src/main.zig` is the composition root. Do not add leaf feature logic here.
 
 * `src/core/` owns contracts, runtimes, config, sessions, permissions, MCP, skills.
+
+* `src/core/compactor/` owns context compaction. Outside code imports only its front door, `compactor.zig`, and the compactor imports only shared basics and model configuration; its caller hands in the model caller, the record store, and the session's projection of saved turns into chat messages. `scripts/check-compactor-boundary.sh` enforces this in CI.
 
 * `src/tools/` owns built-in tool implementations. Generic tool contracts and dispatch live in `src/core/tooling/`. Default tool specs are centralized in `src/core/tooling/tool_specs.zig` or `src/builtins/tools.zig`, not in individual tool files.
 
@@ -132,7 +136,7 @@ Config precedence (highest wins):
 4. `<workspace>/.fx.json` (committed project defaults)
 5. Built-in defaults
 
-Project `.fx.json` accepts only repo-safe defaults: `sandbox`, `max_agent_steps`, `max_tool_result_bytes`, and `context`. Profile-owned keys such as `provider`, `providers`, `models`, `model`, `effort`, `fast_mode`, `slash_menu_categories`, `startup_scrollback`, `prompt_history`, `statusLine`, `skill_match_fuzzy`, `first_call_tool_choice`, `auto_upgrade`, `permission_mode`, `credential_source`, and `permission` are ignored from project config before their values are parsed.
+Project `.fx.json` accepts only repo-safe defaults: `sandbox`, `max_agent_steps`, `max_tool_result_bytes`, `context`, `provider_order`, and `provider_strict`. Profile-owned keys such as `provider`, `providers`, `models`, `model`, `effort`, `fast_mode`, `slash_menu_categories`, `startup_scrollback`, `prompt_history`, `statusLine`, `skill_match_fuzzy`, `first_call_tool_choice`, `auto_upgrade`, `auto_compact_percent`, `permission_mode`, `credential_source`, `permission`, and `skill_symlink_authorities` are ignored from project config before their values are parsed.
 
 Runtime state lives under `~/.fx/sessions/<session-id>/` (`session.json`, `background/`, `subagent/`, `logs/`). Sessions are global and portable across workspaces. Each session tracks its `workspace_root`, which updates when resumed in a different workspace. A subagent child is an internal ordinary session with its own history. Its parent owns one bounded `subagent/children.json` registry, and the child carries only an immutable owner marker. Child sessions stay out of ordinary session discovery and cannot be resumed directly. A first `subagent.message` creates a named persistent child in that parent; later messages continue it, and optional instructions replace only its child-specific system overlay.
 
@@ -152,7 +156,7 @@ Security is permission-first. All sensitive tool behavior must integrate with `s
 
 * The reviewer returns `caution` only for concrete prompt injection or malicious activity. Destructive, risky, external, public, remote, unrequested, or task-conflicting actions clear when they are not malicious. A `clear` review authorizes only the exact unchanged action. A `caution`, incomplete-evidence result, or unavailable review holds only that action, returns guidance to the agent, and never opens a human permission screen, disables tools, or ends the turn
 
-* Exact cautions and deterministic incomplete-evidence results are reused only for the current turn. An unavailable outcome is not cached as a security judgment, but the same exact action spends at most one unavailable review opportunity per turn; changed actions remain independently reviewable until the bounded current-turn review budget is exhausted. Each review accepts exactly one valid structured decision even with accompanying prose and may retry one malformed completion within the original 30-second deadline. Valid cautions, transport failures and cancellation are never retried by this recovery. Legacy `permission_request_id` input is rejected without prompting
+* Exact cautions and deterministic incomplete-evidence results are reused only for the current turn. An unavailable outcome is not cached as a security judgment, but the same exact action spends at most one unavailable review opportunity per turn; changed actions remain independently reviewable until the bounded current-turn review budget is exhausted. Each review accepts exactly one valid structured decision even with accompanying prose and may retry one malformed completion within the current attempt's deadline. A transport timeout, transient transport failure, or failed transport call is retried once with a fresh 30-second deadline; permanent transport failures, valid cautions, and cancellation are never retried. Legacy `permission_request_id` input is rejected without prompting
 
 * Host-generated review holds retain their advice for the agent and transcript, but carry a saved `review_feedback` marker that excludes them from later security evidence, including after recovery. Old unmarked results remain untrusted evidence; never infer the marker from output text. Quoted review accusations are not proof of an attack, and handling plans or test instructions as data is not itself prompt injection
 
@@ -268,7 +272,7 @@ on `main`. Run focused checks in the carry worktree, compose every current
 carry into a clean candidate, then run before publishing any affected carry:
 
 ```bash
-~/code/fxnk/scripts/local-gate.sh --worktree "$composition_worktree"
+/Users/arthack/workshops/fxnk/scripts/local-gate.sh --worktree "$composition_worktree"
 ```
 
 The gate builds ReleaseSafe, runs narrow carried-unit canaries and focused
@@ -334,7 +338,11 @@ Startup latency benchmarks live in `benchmarks/` and run in CI via `.github/work
 
 The CI workflow builds a ReleaseSafe binary, measures six CLI paths with hyperfine, and enforces per-command latency budgets. PRs that exceed a budget fail the check. On `main`, results are uploaded to Vercel Blob for historical tracking.
 
+The long-turn memory and libfx runtime benchmarks run only on request. Start them with `gh workflow run bench.yml --ref <branch> -f long_turn_memory=true` or `-f libfx_runtime=true`.
+
 The startup benchmark uses `FX_BENCH=1`, an environment variable that runs through arg parsing and CLI dispatch, then exits before TTY initialization. This lives in `src/core/app/app_entry_runtime.zig`.
+
+To measure the interactive launch up to the first frame, use `benchmarks/first_frame.py`. It drives fx on a pseudo-terminal and interleaves several `--binary` arguments for before-and-after comparisons.
 
 Current raw wall-clock contract:
 
@@ -354,7 +362,11 @@ Every pull request runs `.github/workflows/binary-size.yml` across Linux x86_64,
 Linux arm64, macOS x86_64, and macOS arm64. Each matrix job builds the pull
 request merge commit and its base commit as stripped ReleaseSafe binaries on
 the same native runner, then reports the exact byte and MiB delta plus ELF or
-Mach-O section changes.
+Mach-O section changes. The base binary is cached by base commit, so later
+pushes to the same pull request reuse it until the base branch moves. Every job
+also smoke-tests the pull request binary with `scripts/smoke-binary.sh`. These
+are release-style builds, and the Linux arm64 and macOS binaries run nowhere
+else on a pull request.
 
 Each platform check is informational. An increase of at least 52,429 bytes
 (0.050000 MiB) emits a warning and retains that platform's binaries for
@@ -375,21 +387,11 @@ Do not document intended behavior as if it already exists.
 
 ## Releasing
 
-Releases use a two-workflow pipeline. The maintainer controls the changelog voice and format.
+Releases are prepared by hand in a release PR. The maintainer controls the changelog voice and format.
 
-### Automated flow (preferred)
+### Preparing a release
 
-1. Go to **Actions > Prepare Release** on GitHub
-2. Select the bump type (`patch`, `minor`, or `major`) and run the workflow
-3. The workflow bumps the version, feeds the actual `git diff` to an LLM to draft the changelog, and opens a PR
-4. Review the PR — edit the AI-drafted changelog if needed — then merge
-5. The existing `release.yml` detects the version change and handles build, publish, tagging, and the GitHub Release
-
-The `prepare-release.yml` workflow uses the Vercel AI Gateway (`AI_GATEWAY_API_KEY` secret) to generate the changelog from the real code diff, not from commit messages or PR descriptions.
-
-### Manual flow
-
-To prepare a release by hand:
+To prepare a release:
 
 1. Create a branch (e.g. `prepare-v0.3.0`)
 2. Bump `pub const version` in `src/main.zig`
@@ -401,7 +403,7 @@ When the PR merges, CI compares the version tag to what exists in git. If the ta
 
 ### Writing the changelog
 
-Whether automated or manual, the changelog is public product copy. Describe observable user behavior, not the engineering process behind it. Use the diff, commits, and merged pull requests as research evidence only.
+The changelog is public product copy. Describe observable user behavior, not the engineering process behind it. Use the diff, commits, and merged pull requests as research evidence only.
 
 Public changelog entries must:
 
@@ -462,7 +464,7 @@ The canonical repository is `vercel-labs/fx` on GitHub. All URLs, links, and ref
 
 1. Run the focused tests for the changed path.
 2. Compose every current carry head into a clean Integration candidate.
-3. Run `~/code/fxnk/scripts/local-gate.sh --worktree "$PWD"` from that exact
+3. Run `/Users/arthack/workshops/fxnk/scripts/local-gate.sh --worktree "$PWD"` from that exact
    composition worktree.
 4. Exercise the composition locally with the freshly built `./zig-out/bin/fx`.
 5. Commit the clean result and publish affected carries with Integration under

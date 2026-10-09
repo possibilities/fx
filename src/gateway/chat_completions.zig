@@ -203,10 +203,15 @@ fn post(alloc: Allocator, definition: *const definitions.Definition, request: st
 
 /// The returned entry borrows its strings; fetch_catalog replaces them with owned copies.
 fn metadata_entry(metadata: definitions.ModelMetadata) catalog.ModelCatalogEntry {
+    const vision = metadata.supports_vision orelse false;
     return .{
         .id = @constCast(metadata.id),
         .model_type = @constCast("language"),
         .has_tool_use = metadata.supports_tool_use orelse false,
+        // Chat completions sends images as inline base64 content parts, so
+        // vision support implies file input through the same path.
+        .has_vision = vision,
+        .has_file_input = vision,
         .context_window = metadata.context_window orelse 0,
         .max_tokens = metadata.max_output_tokens orelse 0,
     };
@@ -245,8 +250,12 @@ test "configured capability lookup matches catalog projection and preserves unkn
     for (fetched.catalog.items) |entry| {
         const actual = provider.lookupCapabilities(entry.id).?;
         try std.testing.expectEqualDeep(model_capabilities.mergeCapabilities(.{}, model_catalog_metadata.fromCatalogEntry(entry)), actual);
-        try std.testing.expectEqual(model_capabilities.ImageInputSupport.non_native, actual.image_input_support);
-        try std.testing.expect(!actual.supports_vision);
+        const declared_vision = std.mem.eql(u8, entry.id, "small");
+        try std.testing.expectEqual(declared_vision, actual.supports_vision);
+        try std.testing.expectEqual(
+            if (declared_vision) model_capabilities.ImageInputSupport.native else model_capabilities.ImageInputSupport.non_native,
+            actual.image_input_support,
+        );
     }
     try std.testing.expectEqual(@as(?u32, 512), provider.lookupCapabilities("small").?.max_output_tokens);
     try std.testing.expectEqual(@as(?u32, 1024), provider.lookupCapabilities("large").?.max_output_tokens);
