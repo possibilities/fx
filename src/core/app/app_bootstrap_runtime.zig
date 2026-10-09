@@ -603,6 +603,9 @@ pub fn Runtime(comptime App: type) type {
             app.auto_upgrade_enabled = startup.auto_upgrade;
             app.upgrader.configure_channel(startup.update_channel);
             app.effort = startup.effort;
+            if (comptime @hasDecl(App, "configureSessionNaming")) {
+                app.configureSessionNaming(startup.takeSessionNamingConfig());
+            }
             if (comptime @hasField(App, "review_model")) app.review_model = startup.takeReviewModel();
             app.shell.setCommandOutputRenderPolicy(
                 app_render_runtime.Runtime(App).shellStyles(),

@@ -1119,7 +1119,6 @@ pub fn handlePrompt(
         .custom_tool_guidance = tool_projection.custom_guidance,
     }, current_prompt_is_root_authority);
     agent_config.session_child_capability = sessionChildCapability(session);
-    maybeStartAcpTitleTask(state, session, owned_prompt, recovery_checkpoint != null);
     defer if (session.title_task != null) completeAcpTitleTask(state, session, alloc);
     agent_runtime.processAgentPrompt(&session.session_rt.agent, &deps, null, .{
         .view = state.lifecycle_view,

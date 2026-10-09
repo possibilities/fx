@@ -75,6 +75,10 @@ const PromptCandidate = union(enum) {
     image_only,
 };
 
+pub fn hasPromptCandidate(history: []const session.HistoryTurn) bool {
+    return firstPromptCandidate(history) != null;
+}
+
 fn firstPromptCandidate(history: []const session.HistoryTurn) ?PromptCandidate {
     for (history) |turn| {
         switch (turn) {
