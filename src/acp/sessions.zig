@@ -773,20 +773,6 @@ pub fn handleListWasmSessions(state: *server.ServerState, alloc: Allocator, msg:
     try state.writer.writeResponse(alloc, msg.id, out.writer.buffered());
 }
 
-fn rejectUnavailableMcpServers(
-    state: *server.ServerState,
-    alloc: Allocator,
-    msg: *jsonrpc.Message,
-    server_count: usize,
-) !bool {
-    if (state.cfg.allow_acp_mcp or server_count == 0) return false;
-    try state.writer.writeError(alloc, msg.id, .{
-        .code = ErrorCode.invalid_params,
-        .message = "MCP servers are unavailable in this runtime",
-    });
-    return true;
-}
-
 pub fn handleRemoveWasmSession(state: *server.ServerState, alloc: Allocator, msg: *jsonrpc.Message) !void {
     const params = msg.params_raw orelse return state.writer.writeError(alloc, msg.id, .{ .code = ErrorCode.invalid_params, .message = "Missing params" });
     const parsed = std.json.parseFromSlice(std.json.Value, alloc, params, .{}) catch
