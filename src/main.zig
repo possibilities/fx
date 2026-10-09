@@ -1021,6 +1021,8 @@ const App = struct {
         self.worker.deinit(std.heap.c_allocator);
         self.clearPendingImages();
         SessionAppRuntime.deinitPersistenceForProcessExit(self);
+        LifecycleAppRuntime.prepareStopped(self);
+        self.ade_events.deinit();
         self.question_prompt.deinit(self.alloc);
         shutdown_trace.mark("persistence_finalized");
 
