@@ -1446,7 +1446,7 @@ describe("acp: model-independent", () => {
           env: fakeGatewayEnv(root, gateway),
         });
         client.setPermissionOption("allow_once");
-        await startCodeSession(client);
+        await startAutoSession(client);
         const result = await runPrompt(
           client,
           "Try the selected terminal surface.",
@@ -9679,7 +9679,7 @@ describe("acp: model-independent", () => {
           ],
           env: fakeGatewayEnv(root, gateway),
         });
-        await startCodeSession(client);
+        await startAutoSession(client);
         const result = await runPrompt(client, "Delegate workspace inspection.", TIMEOUT);
         expect(result.promptResult.result.stopReason).toBe("end_turn");
         await waitForCondition("canonical child completion", () => gateway.requests.length === 3);
