@@ -350,6 +350,7 @@ describe("cli: help", () => {
       expect(stdout).toContain("--context-limit <spec>");
       expect(stdout).toContain("Set name=bytes|off; repeatable");
       expect(stdout).toContain("--add-dir <path>");
+      expect(stdout).toContain("--no-native-tools");
       expect(stdout).toContain("-c, --continue");
       expect(stdout).toContain("-r");
       expect(stdout).toContain("Open the saved-session picker");
@@ -491,7 +492,7 @@ With --prompt-permissions, JSON and quiet requests may prompt on stderr only whe
         expect(result.code).toBe(1);
         expect(result.stdout).toBe("");
         expect(result.stderr).toBe(
-          "usage: fx acp [--model <id>] [--ultrafast|--no-ultrafast] [--log-file <path>]\n",
+          "usage: fx acp [--model <id>] [--ultrafast|--no-ultrafast] [--log-file <path>] [--no-acp-mcp]\n",
         );
       }
     },
@@ -5342,6 +5343,24 @@ describe("cli: workspace access", () => {
       );
       expect(duplicate.stderr).not.toContain(
         "DuplicateAdditionalDirectorySuppression",
+      );
+
+      const duplicateNativeToolGate = await runFx(
+        ["--no-native-tools", "--no-native-tools"],
+        { env: enabled },
+      );
+      expect(duplicateNativeToolGate.code).toBe(1);
+      expect(duplicateNativeToolGate.stderr).toContain(
+        "--no-native-tools may only be specified once",
+      );
+
+      const unsupportedNativeToolGate = await runFx(
+        ["--no-native-tools", "ask", "hello"],
+        { env: enabled },
+      );
+      expect(unsupportedNativeToolGate.code).toBe(1);
+      expect(unsupportedNativeToolGate.stderr).toContain(
+        "--no-native-tools is only supported for interactive, resume, and ACP launches",
       );
     },
     TIMEOUT,

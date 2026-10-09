@@ -69,13 +69,14 @@ pub const top_level_specs = [_]TopLevelSpec{
     .{
         .kind = .acp,
         .token = "acp",
-        .usage = "acp [--model <id>] [--ultrafast|--no-ultrafast] [--log-file <path>]",
+        .usage = "acp [--model <id>] [--ultrafast|--no-ultrafast] [--log-file <path>] [--no-acp-mcp]",
         .summary = "Start an ACP server over stdio",
         .options = &.{
             .{ .flag = "--model <id>", .description = "Override the default model" },
             .{ .flag = "--ultrafast", .description = "Request Ultra mode when the model supports it" },
             .{ .flag = "--no-ultrafast", .description = "Disable Ultra mode" },
             .{ .flag = "--log-file <path>", .description = "Write ACP logs to a file" },
+            .{ .flag = "--no-acp-mcp", .description = "Reject client-supplied MCP servers for this server" },
         },
     },
     .{
@@ -364,6 +365,10 @@ pub const top_level_flags = [_]TopLevelFlag{
     .{
         .usage = "--no-additional-dirs",
         .description = "Ignore saved additional directories",
+    },
+    .{
+        .usage = "--no-native-tools",
+        .description = "Disable native tools for TUI or ACP",
     },
     .{
         .usage = "--provider <name>",

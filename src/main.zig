@@ -589,6 +589,7 @@ const App = struct {
     context_snapshot: context_contract.GatheredContextSnapshot = .{},
     file_index: file_index_mod.FileIndex = .{},
     context_enabled: bool = true,
+    allow_native_tools: bool = true,
     context_limits: config_runtime.context_limits.Values = .{},
     fast_mode: bool = false,
     auto_upgrade_enabled: bool = true,
@@ -644,6 +645,7 @@ const App = struct {
                 process_provider.unavailable_provider
             else
                 shell_process_provider.provider,
+            .allow_native_tools = launch.modifiers.allow_native_tools,
         };
         auth_runtime.Runtime.initIntoWithMode(
             &app.auth,
@@ -1867,6 +1869,7 @@ const App = struct {
     }
 
     fn effectiveToolSet(self: *const App) tool_set_contract.ToolSet {
+        if (!self.allow_native_tools) return tool_set_contract.empty;
         if (comptime host_profile.tools) {
             return builtin_tools.advertisement_set;
         }
@@ -3857,6 +3860,7 @@ test "full entry config commands also use early threaded io" {
     try std.testing.expect(needsEarlyThreadedIo(&.{
         @as([:0]const u8, "--context-limit=project_bytes=2048"),
         @as([:0]const u8, "--no-additional-dirs"),
+        @as([:0]const u8, "--no-native-tools"),
         @as([:0]const u8, "acp"),
     }));
     try std.testing.expect(needsFullEntryConfig(&.{
@@ -3934,6 +3938,16 @@ test "native app preserves the built-in tool set without workspace metadata" {
     const advertised = app.toolAdvertisementSet();
     try std.testing.expect(advertised.order.ptr == builtin_tools.advertisement_set.order.ptr);
     try std.testing.expectEqual(builtin_tools.advertisement_set.order.len, advertised.order.len);
+}
+
+test "interactive native tool suppression controls advertisement and dispatch" {
+    var app = App{
+        .alloc = std.testing.allocator,
+        .allow_native_tools = false,
+    };
+
+    try std.testing.expectEqual(@as(usize, 0), app.toolRegistry().tools.len);
+    try std.testing.expectEqual(@as(usize, 0), app.toolAdvertisementSet().order.len);
 }
 
 fn fullEntryConfig(auth_mode: credentials.AuthMode) app_entry_runtime.Config {

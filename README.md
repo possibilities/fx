@@ -187,6 +187,10 @@ fx builds as a native binary or WebAssembly. Applications embedding fx can provi
 | `createFxAgent()` | Embed the agent core in a JavaScript host with `fx-core.wasm`. |
 | `createFxTerminal()` | Embed the interactive terminal with `fx-term.wasm`. |
 
+Interactive TUI and ACP launches can disable Fx-native tools with the global
+`--no-native-tools` option. ACP can independently reject client-supplied MCP
+servers with `fx acp --no-acp-mcp`.
+
 ACP clients can keep their MCP tools loaded on every turn, steer a running turn, supply a session system prompt, serve MCP servers over the ACP connection, and choose each session's workspace. See [ACP embedding](CONTRIBUTING.md#acp-embedding).
 
 ACP sessions offer the CLI's permission modes, `auto` (the default), `ask`, and `full-access`, as the `mode` config option and in `modes`. A session starts in the saved `permission_mode`, and choosing a mode with `session/set_config_option` or `session/set_mode` saves it, like `/permissions` in the shell. Any other mode returns an error. To show the choice before a session exists, `fx status --json` run in the workspace reports the `mode` a new session there starts in and lists the `modes`, each with its `id`, `name`, and `description`.
