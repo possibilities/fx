@@ -35,7 +35,7 @@ export async function mcp(): Promise<void> {
   });
   assertType<Equal<typeof adapter, McpAdapter>>();
 
-  const agent = createFxAgent({
+  const agent = await createFxAgent({
     apiKey,
     model,
     tools: adapter.tools,
@@ -56,7 +56,7 @@ export async function skills(): Promise<void> {
   assertType<Equal<typeof record, LoadedSkill>>();
   assertType<Equal<typeof record.description, string>>();
   const skills = createSkillsAdapter([record]);
-  const agent = createFxAgent({ apiKey, model, ...skills });
+  const agent = await createFxAgent({ apiKey, model, ...skills });
   await agent.close();
 
   const records: SkillRecord[] = [

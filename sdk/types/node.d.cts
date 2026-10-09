@@ -7,6 +7,7 @@ import type {
   FxBackendInfoOptions,
   FxEngine,
   FxEngineOptions,
+  FxGatewayAuthorization,
   FxNodeBackendOptions,
   FxTerminal,
   FxTerminalOptions,
@@ -19,7 +20,6 @@ export {
   FxJournalVersionError,
   fxSdkApiVersion,
   listModels,
-  memory,
   supportsJspi,
   xtermAdapter,
 } from "./libfx.cjs";
@@ -110,21 +110,44 @@ export type {
 } from "./libfx.cjs";
 
 /** Options for `createFxAgent()` on Node.js. */
-export type FxNodeAgentOptions = FxAgentOptions & FxNodeBackendOptions;
+export type FxNodeAgentOptions = FxNodeEngineOptions;
 
 /** Options for `createFxEngine()` on Node.js. */
-export type FxNodeEngineOptions = FxEngineOptions & FxNodeBackendOptions;
+declare const profileSessionBrand: unique symbol;
+
+export interface FxProfileSession {
+  readonly [profileSessionBrand]: true;
+  readonly home: string;
+}
+
+export interface FxCodexSessionStore {
+  load(options: { signal: AbortSignal }): Promise<{ bytes: Uint8Array; revision: string } | null>;
+  commit(bytes: Uint8Array, expectedRevision: string | undefined, options: { signal: AbortSignal }): Promise<{ revision: string }>;
+}
+
+export interface FxCodexAuthorization {
+  provider: "codex";
+  session: FxProfileSession | FxCodexSessionStore;
+}
+
+export type FxProviderAuthorization = FxGatewayAuthorization | FxCodexAuthorization;
+
+type FxNativeCredentials =
+  | { apiKey: string; auth?: FxProviderAuthorization | readonly FxProviderAuthorization[] }
+  | { apiKey?: string; auth: FxProviderAuthorization | readonly FxProviderAuthorization[] };
+
+type WithNativeCredentials<Options> = Options extends unknown
+  ? Omit<Options, "apiKey" | "auth"> & FxNativeCredentials
+  : never;
+
+export type FxNodeEngineOptions = WithNativeCredentials<FxEngineOptions> & FxNodeBackendOptions;
+
+export declare function fxProfileSession(options?: { home?: string }): FxProfileSession;
 
 /** Options for `createFxTerminal()` on Node.js. */
 export type FxNodeTerminalOptions = FxTerminalOptions & FxNodeBackendOptions;
 
-/**
- * An agent whose sessions survive crashes, timeouts, and redeployments. It
- * returns at once and does no I/O until a session runs a turn. Without
- * `durability`, sessions live in Vercel's World on Vercel and in local files
- * elsewhere.
- */
-export declare function createFxAgent(options?: FxNodeAgentOptions): FxAgent;
+export declare function createFxAgent(options: FxNodeAgentOptions): Promise<FxAgent>;
 
 /**
  * The kernel under `createFxAgent()`: one conversation, held in the memory of
@@ -140,4 +163,4 @@ export declare function createFxTerminal(options: FxNodeTerminalOptions): Promis
 export declare function getBackendInfo(options?: FxBackendInfoOptions): Promise<FxBackendInfo>;
 
 /** The version of the libfx agent API. */
-export declare const libfxApiVersion: 2;
+export declare const libfxApiVersion: 3;

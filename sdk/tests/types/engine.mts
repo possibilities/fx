@@ -204,7 +204,7 @@ export async function models(): Promise<void> {
   await createFxEngine({ apiKey, backend: "wasm", wasm: fetch("https://cdn.example.com/fx-core.wasm") });
   await createFxEngine({ apiKey, backend: "native", nativeAddon: "./libfx.darwin-arm64.node" });
 
-  assertType<Equal<typeof libfxApiVersion, 2>>();
+  assertType<Equal<typeof libfxApiVersion, 3>>();
   assertType<Equal<typeof fxSdkApiVersion, 2>>();
   assertType<Equal<ReturnType<typeof supportsJspi>, boolean>>();
 }

@@ -7,6 +7,7 @@ import { tmpdir } from "node:os";
 import { resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import {
+  createFxAgent,
   createFxEngine,
   createFxTerminal,
   fxSdkApiVersion,
@@ -14,10 +15,12 @@ import {
   listModels,
 } from "../node.js";
 import * as browser from "../browser.js";
+import { createFxAgent as createDirectWasmAgent } from "../fx-sdk.js";
 
-assert.equal(libfxApiVersion, 2);
+assert.equal(libfxApiVersion, 3);
 assert.equal(fxSdkApiVersion, 2);
-assert.equal(browser.libfxApiVersion, 2);
+assert.equal(browser.libfxApiVersion, 3);
+assert.equal(typeof browser.createFxAgent, "function");
 assert.equal(typeof browser.createFxEngine, "function");
 assert.equal(typeof browser.createFxTerminal, "function");
 assert.equal(typeof browser.listModels, "function");
@@ -28,15 +31,53 @@ const realNativeAddon = resolve(scriptDir, "../../zig-out/lib/libfx.node");
 const dir = await mkdtemp(resolve(tmpdir(), "libfx-loader-"));
 const nativePath = resolve(dir, "native.mjs");
 await writeFile(nativePath, `
-  export const libfxApiVersion = 2;
+  export const libfxApiVersion = 3;
   export async function createFxTerminal(options) { return { backend: "native-terminal", options }; }
 `);
 const nativeUrl = pathToFileURL(nativePath);
+const codexStore = {
+  async load() { return null; },
+  async commit() { return { revision: "1" }; },
+};
+
+assert.throws(
+  () => browser.createFxAgent({ auth: { provider: "codex", session: codexStore } }),
+  (error) => error?.code === "LIBFX_CODEX_NATIVE_REQUIRED",
+);
+assert.throws(
+  () => browser.createFxAgent({ auth: { provider: "gateway", apiKey: "key", session: codexStore } }),
+  /Gateway auth accepts only provider and apiKey/,
+);
+await assert.rejects(
+  createDirectWasmAgent({ auth: { provider: "codex", session: codexStore }, wasm: new Uint8Array() }),
+  (error) => error?.code === "LIBFX_CODEX_NATIVE_REQUIRED",
+);
+await assert.rejects(
+  createDirectWasmAgent({ auth: { provider: "gateway", apiKey: "key", session: codexStore } }),
+  /Gateway auth accepts only provider and apiKey/,
+);
+await assert.rejects(
+  createDirectWasmAgent({ [Symbol.for("libfx.internal.native-host-auth")]: true }),
+  /apiKey/,
+  "a public global symbol must not authorize a keyless direct WebAssembly runtime",
+);
+await assert.rejects(
+  createFxAgent({ nativeAddon: nativeUrl, backend: "wasm", auth: { provider: "codex", session: codexStore } }),
+  (error) => error?.code === "LIBFX_CODEX_NATIVE_REQUIRED",
+);
+await assert.rejects(
+  createFxAgent({
+    nativeAddon: nativeUrl,
+    backend: "wasm",
+    auth: { provider: "gateway", apiKey: "key", session: codexStore },
+  }),
+  /Gateway auth accepts only provider and apiKey/,
+);
 
 const highLevelAgentPath = resolve(dir, "high-level-agent.mjs");
 await writeFile(highLevelAgentPath, `
-  export const libfxApiVersion = 2;
-  export function createFxEngine() { throw new Error("high-level createFxEngine invoked"); }
+  export const libfxApiVersion = 3;
+  export function createFxAgent() { throw new Error("high-level createFxAgent invoked"); }
 `);
 
 // Complete the fixture directory before a runtime caches its module-resolution entries.
@@ -121,6 +162,24 @@ await assert.rejects(
 await assert.rejects(
   createFxEngine({ nativeAddon: nativeUrl, apiKey: "loader-key", env: undefined }),
   (error) => error instanceof TypeError && error.message.includes("apiKey") && error.message.includes("model"),
+);
+
+await assert.rejects(
+  createFxAgent({
+    nativeAddon: nativeUrl,
+    backend: "native",
+    auth: { provider: "codex", session: codexStore },
+  }),
+  (error) => error?.code === "LIBFX_NATIVE_UNAVAILABLE" &&
+    error.message.includes("createCore"),
+);
+
+await assert.rejects(
+  createFxAgent({
+    nativeAddon: nativeUrl,
+    auth: { provider: "gateway", apiKey: "key", session: codexStore },
+  }),
+  /Gateway auth accepts only provider and apiKey/,
 );
 
 for (const [options, errorType, message] of [

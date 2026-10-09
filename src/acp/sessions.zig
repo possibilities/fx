@@ -105,6 +105,12 @@ pub fn handleNewLibfxSession(
     );
     var session_rt_owned = true;
     defer if (session_rt_owned) session_rt.deinit(alloc);
+    if (comptime !host_target.is_wasm) {
+        _ = try session_rt.initializeProfileUsage(
+            alloc,
+            state.cfg.home_override orelse io_mod.getenv("HOME"),
+        );
+    }
 
     const start = server.loadStartingMode(state, alloc);
     state.active_session = .{
@@ -128,6 +134,9 @@ pub fn handleNewLibfxSession(
         .cancel_flag = std.atomic.Value(bool).init(false),
         .pending_prompt_id = null,
     };
+    if (comptime !host_target.is_wasm) {
+        state.active_session.?.session_rt.attachProfileUsagePublisher(alloc);
+    }
     session_id_owned = false;
     model_owned = false;
     session_rt_owned = false;
@@ -371,12 +380,12 @@ pub fn handleNewSession(state: *server.ServerState, alloc: Allocator, msg: *json
         }),
     };
     defer mcp_configs.deinit(alloc);
-    if (!state.cfg.allow_acp_mcp and mcp_configs.items.items.len > 0) {
-        return state.writer.writeError(alloc, msg.id, .{
-            .code = ErrorCode.invalid_params,
-            .message = "MCP servers are unavailable in this runtime",
-        });
-    }
+    if (try rejectUnavailableMcpServers(
+        state,
+        alloc,
+        msg,
+        mcp_configs.items.items.len,
+    )) return;
     if (state.cfg.allow_acp_mcp) {
         try appendProfileMcpConfigsIfRequested(state, alloc, msg.params_raw, &mcp_configs);
         try appendProjectMcpConfigs(state, alloc, workspace_root, &mcp_configs);
@@ -468,7 +477,10 @@ pub fn handleNewSession(state: *server.ServerState, alloc: Allocator, msg: *json
     );
     var session_rt_owned = true;
     defer if (session_rt_owned) session_rt.deinit(alloc);
-    _ = try session_rt.initializeProfileUsage(alloc, state.cfg.home_override orelse io_mod.getenv("HOME"));
+    _ = try session_rt.initializeProfileUsage(
+        alloc,
+        state.cfg.home_override orelse io_mod.getenv("HOME"),
+    );
     if (writable.state.usage) |usage| {
         try session_rt.usage.restore(
             alloc,
@@ -623,7 +635,12 @@ fn writeNewSessionResponse(
     try writeJsonStr(session_id, &out.writer);
     try out.writer.writeAll(",\"configOptions\":[");
     if (comptime !host_target.is_wasm) {
-        try writeProviderConfigOption(&out.writer, state.active_session.?.provider, state.configured_providers.definitions);
+        try writeProviderConfigOption(
+            &out.writer,
+            state.active_session.?.provider,
+            state.cfg.allowed_providers,
+            state.configured_providers.definitions,
+        );
         try out.writer.writeAll(",");
     }
     try writeModelConfigOption(
@@ -773,6 +790,20 @@ pub fn handleListWasmSessions(state: *server.ServerState, alloc: Allocator, msg:
     try state.writer.writeResponse(alloc, msg.id, out.writer.buffered());
 }
 
+fn rejectUnavailableMcpServers(
+    state: *server.ServerState,
+    alloc: Allocator,
+    msg: *jsonrpc.Message,
+    server_count: usize,
+) !bool {
+    if (state.cfg.allow_acp_mcp or server_count == 0) return false;
+    try state.writer.writeError(alloc, msg.id, .{
+        .code = ErrorCode.invalid_params,
+        .message = "MCP servers are unavailable in this runtime",
+    });
+    return true;
+}
+
 pub fn handleRemoveWasmSession(state: *server.ServerState, alloc: Allocator, msg: *jsonrpc.Message) !void {
     const params = msg.params_raw orelse return state.writer.writeError(alloc, msg.id, .{ .code = ErrorCode.invalid_params, .message = "Missing params" });
     const parsed = std.json.parseFromSlice(std.json.Value, alloc, params, .{}) catch
@@ -849,14 +880,13 @@ fn handleRestoreSession(
         }),
     };
     defer mcp_configs.deinit(alloc);
-    if (!state.cfg.allow_acp_mcp) {
-        if (mcp_configs.items.items.len > 0) {
-            return state.writer.writeError(alloc, msg.id, .{
-                .code = ErrorCode.invalid_params,
-                .message = "MCP servers are unavailable in this runtime",
-            });
-        }
-    } else {
+    if (try rejectUnavailableMcpServers(
+        state,
+        alloc,
+        msg,
+        mcp_configs.items.items.len,
+    )) return;
+    if (state.cfg.allow_acp_mcp) {
         try appendProfileMcpConfigsIfRequested(state, alloc, msg.params_raw, &mcp_configs);
         try appendProjectMcpConfigs(state, alloc, workspace_root, &mcp_configs);
     }
@@ -1018,7 +1048,10 @@ fn handleRestoreSession(
     );
     var session_rt_owned = true;
     defer if (session_rt_owned) session_rt.deinit(alloc);
-    _ = try session_rt.initializeProfileUsage(alloc, state.cfg.home_override orelse io_mod.getenv("HOME"));
+    _ = try session_rt.initializeProfileUsage(
+        alloc,
+        state.cfg.home_override orelse io_mod.getenv("HOME"),
+    );
     try session_rt.restoreWithPermissionState(
         alloc,
         durable.conversation_language,
@@ -1286,7 +1319,12 @@ fn writeLoadSessionResponse(
     defer out.deinit();
     try out.writer.writeAll("{\"configOptions\":[");
     if (comptime !host_target.is_wasm) {
-        try writeProviderConfigOption(&out.writer, state.active_session.?.provider, state.configured_providers.definitions);
+        try writeProviderConfigOption(
+            &out.writer,
+            state.active_session.?.provider,
+            state.cfg.allowed_providers,
+            state.configured_providers.definitions,
+        );
         try out.writer.writeAll(",");
     }
     try writeModelConfigOption(
@@ -2335,20 +2373,39 @@ pub fn writeModelConfigOption(
 pub fn writeProviderConfigOption(
     w: *std.Io.Writer,
     current: model_provider.ProviderId,
+    allowed: std.EnumSet(std.meta.Tag(model_provider.ProviderId)),
     definitions: []const @import("../core/config/configured_provider.zig").Definition,
 ) !void {
     try w.writeAll("{\"id\":\"provider\",\"name\":\"Provider\",\"category\":\"model\",\"type\":\"select\",\"currentValue\":");
     try writeJsonStr(current.label(), w);
-    try w.writeAll(",\"options\":[{\"value\":\"gateway\",\"name\":\"Vercel AI Gateway\"},{\"value\":\"codex\",\"name\":\"Codex subscription\"}");
+    try w.writeAll(",\"options\":[");
+    var wrote = false;
+    for ([_]model_provider.ProviderId{ .gateway, .codex, .grok }) |provider| {
+        if (!allowed.contains(std.meta.activeTag(provider))) continue;
+        if (comptime host_target.is_wasm) if (provider != .gateway) continue;
+        if (wrote) try w.writeAll(",");
+        try w.writeAll("{\"value\":");
+        try writeJsonStr(provider.label(), w);
+        try w.writeAll(",\"name\":");
+        try writeJsonStr(switch (provider) {
+            .gateway => "Vercel AI Gateway",
+            .codex => "Codex subscription",
+            .grok => "Grok subscription",
+            .configured => unreachable,
+        }, w);
+        try w.writeAll("}");
+        wrote = true;
+    }
     if (comptime !host_target.is_wasm) {
-        try w.writeAll(",{\"value\":\"grok\",\"name\":\"Grok subscription\"}");
-        for (definitions) |definition| {
-            try w.writeAll(",{\"value\":");
+        if (allowed.contains(.configured)) for (definitions) |definition| {
+            if (wrote) try w.writeAll(",");
+            try w.writeAll("{\"value\":");
             try writeJsonStr(definition.id, w);
             try w.writeAll(",\"name\":");
             try writeJsonStr(definition.id, w);
             try w.writeAll("}");
-        }
+            wrote = true;
+        };
     }
     try w.writeAll("]}");
 }
@@ -2990,6 +3047,7 @@ test "ACP restore rejects MCP servers when host capability is disabled" {
             "{\"sessionId\":\"missing\",\"cwd\":\"/\",\"mcpServers\":[" ++
             "{\"name\":\"blocked\",\"command\":\"/usr/bin/true\",\"args\":[],\"env\":[]}" ++
             "]}";
+        "{\"name\":\"blocked\",\"command\":\"/usr/bin/true\",\"args\":[],\"env\":[]}]}";
         var load_msg = jsonrpc.Message{
             .id = .{ .integer = 1 },
             .method = "session/load",
@@ -3019,6 +3077,10 @@ test "ACP restore rejects MCP servers when host capability is disabled" {
         std.mem.count(u8, captured, "MCP servers are unavailable in this runtime"),
     );
     try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, captured, "failed to start"));
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        std.mem.count(u8, captured, "failed to start"),
+    );
 }
 
 var acp_session_stable_test_environ: ?*std.process.Environ.Map = null;
@@ -3602,6 +3664,25 @@ test "ACP same-session restore retires the replaced MCP runtime after active use
     if (restore.err) |err| return err;
     try std.testing.expect(retired_before_destroy);
     try std.testing.expect(!completed_while_leased);
+}
+
+test "ACP provider options preserve host allowlist with configured providers" {
+    const alloc = std.testing.allocator;
+    const configured_provider = @import("../core/config/configured_provider.zig");
+    var registry = try configured_provider.Registry.parse_json(alloc, "{\"local\":{\"protocol\":\"openai-chat-completions\",\"base_url\":\"http://localhost:11434/v1\",\"auth\":{\"type\":\"none\"}}}");
+    defer registry.deinit(alloc);
+    var output: std.Io.Writer.Allocating = .init(alloc);
+    defer output.deinit();
+    var allowed = std.EnumSet(std.meta.Tag(model_provider.ProviderId)).initEmpty();
+    allowed.insert(.codex);
+    try writeProviderConfigOption(&output.writer, .codex, allowed, registry.definitions);
+    try std.testing.expect(std.mem.find(u8, output.written(), "\"value\":\"codex\"") != null);
+    try std.testing.expect(std.mem.find(u8, output.written(), "\"value\":\"gateway\"") == null);
+    try std.testing.expect(std.mem.find(u8, output.written(), "\"value\":\"local\"") == null);
+    output.clearRetainingCapacity();
+    try writeProviderConfigOption(&output.writer, .gateway, .initFull(), registry.definitions);
+    try std.testing.expect(std.mem.find(u8, output.written(), "\"value\":\"gateway\"") != null);
+    if (comptime !host_target.is_wasm) try std.testing.expect(std.mem.find(u8, output.written(), "\"value\":\"local\"") != null);
 }
 
 test "libfx/new uses a valid host session id and generates one when none is named" {

@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import { strict as assert } from "node:assert";
+import "./test-package-imports.mjs";
 import { spawnSync } from "node:child_process";
 import { existsSync } from "node:fs";
 import { cp, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";

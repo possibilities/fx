@@ -6,7 +6,6 @@ import {
   createFxTerminal,
   encodeXtermKeyEvent,
   libfxApiVersion,
-  memory,
   supportsJspi,
   xtermAdapter,
   type FxTerminal,
@@ -69,14 +68,16 @@ export function keys(event: KeyboardEvent): string | null {
 }
 
 export async function agents(): Promise<void> {
-  assertType<Equal<typeof libfxApiVersion, 2>>();
+  assertType<Equal<typeof libfxApiVersion, 3>>();
   if (!supportsJspi()) return;
-  const agent = createFxAgent({ apiKey: "<short-lived credential>", durability: memory() });
-  const turn = agent.session().prompt("Hello");
+  const agent = await createFxAgent({ auth: { provider: "gateway", apiKey: "<short-lived credential>" } });
+  const turn = agent.prompt("Hello");
   for await (const event of turn) if (event.type === "text_delta") console.log(event.delta);
   await agent.close();
 
-  createFxAgent({ wasm: fetch("/fx-core.wasm") });
+  createFxAgent({ apiKey: "key", wasm: fetch("/fx-core.wasm") });
+  // @ts-expect-error Codex is native-only
+  createFxAgent({ auth: { provider: "codex", session: {} } });
   const engine = await createFxEngine({ apiKey: "<short-lived credential>", wasm: await WebAssembly.compileStreaming(fetch("/fx-core.wasm")) });
   await engine.close();
 
@@ -97,8 +98,11 @@ export async function wasmEntry(): Promise<void> {
 
   // @ts-expect-error libfx/wasm needs an explicit wasm asset
   await wasm.createFxEngine({ apiKey: "k" });
-  // @ts-expect-error libfx/wasm has no durable agent
+  // @ts-expect-error libfx/wasm needs explicit authorization and assets
   wasm.createFxAgent();
+  await wasm.createFxAgent({ auth: { provider: "gateway", apiKey: "key" }, wasm: "/fx-core.wasm" });
+  // @ts-expect-error direct WebAssembly is Gateway-only
+  wasm.createFxAgent({ auth: { provider: "codex", session: {} }, wasm: "/fx-core.wasm" });
   // @ts-expect-error libfx/wasm has no memory() durability
   wasm.memory();
 }

@@ -1,3 +1,4 @@
+import { consumeNativeHostAuthorization } from "./internal.js";
 import { CoreOutput, maxCoreMessageBytes } from "./core-output.js";
 import { loadModule } from "./wasm-module.js";
 
@@ -139,11 +140,20 @@ export function normalizeAgentOptions(value) {
   if (!value || typeof value !== "object" || Array.isArray(value)) {
     throw new TypeError("createFxEngine() options must be an object");
   }
+  const nativeHostAuth = consumeNativeHostAuthorization(value);
   const options = { ...value };
   if (Object.hasOwn(options, "env")) {
     throw new TypeError("createFxEngine() does not accept env; pass apiKey and model directly");
   }
-  options.apiKey = boundedString(options.apiKey, "apiKey", maxApiKeyBytes, true);
+  if (Object.hasOwn(options, "durability")) {
+    throw new TypeError("createFxAgent() accepts explicit persistence, not durability or sub-sessions");
+  }
+  options.apiKey = boundedString(
+    options.apiKey,
+    "apiKey",
+    maxApiKeyBytes,
+    !nativeHostAuth,
+  );
   Object.assign(options, normalizeModelChoice(options));
   validateGatewayChatUrl(options.gatewayChatUrl);
   if (options.resizeImage !== undefined && typeof options.resizeImage !== "function") {
@@ -422,7 +432,7 @@ function journalMarks(events) {
 
 function agentEnvironment(options) {
   return {
-    AI_GATEWAY_API_KEY: options.apiKey,
+    ...(options.apiKey === undefined ? {} : { AI_GATEWAY_API_KEY: options.apiKey }),
     ...(options.model === undefined ? {} : { FX_MODEL: options.model }),
     ...(options.effort === undefined ? {} : { FX_EFFORT: options.effort }),
     ...(options.fast === undefined ? {} : { FX_FAST: options.fast ? "true" : "false" }),
@@ -2151,12 +2161,28 @@ function base64ToBytes(value) {
   return bytes;
 }
 
-/**
- * One session on one fx core, with no durability of its own: `createFxAgent`
- * runs each durable session's turns on one of these, and a host with its own
- * storage may pass `persistence`.
- */
+export const createFxAgent = createFxEngine;
+
 export async function createFxEngine(options = {}) {
+  if (options?.auth !== undefined) {
+    const entries = Array.isArray(options.auth) ? options.auth : [options.auth];
+    if (entries.length !== 1 || !entries[0] || entries[0].provider !== "gateway") {
+      const error = new Error("WebAssembly libfx supports only Gateway auth; Codex requires the native Node backend");
+      error.code = "LIBFX_CODEX_NATIVE_REQUIRED";
+      throw error;
+    }
+    if (Object.keys(entries[0]).some((key) => key !== "provider" && key !== "apiKey")) {
+      throw new TypeError("Gateway auth accepts only provider and apiKey");
+    }
+    if (typeof entries[0].apiKey !== "string" || !entries[0].apiKey.length) {
+      throw new TypeError("Gateway auth requires a non-empty apiKey");
+    }
+    if (options.apiKey !== undefined && options.apiKey !== entries[0].apiKey) {
+      throw new TypeError("Gateway auth conflicts with apiKey");
+    }
+    const { auth: _auth, ...rest } = options;
+    options = { ...rest, apiKey: entries[0].apiKey };
+  }
   options = normalizeAgentOptions(options);
   const hostTools = normalizeHostTools(options.tools);
   const instructions = normalizeInstructions(options.instructions);
@@ -2176,6 +2202,7 @@ export async function createFxEngine(options = {}) {
   const pending = new Map();
   let nextId = 1;
   let sessionId = null;
+  let configOptions = [];
   let activeTurn = null;
   let closing = false;
   let coreExitError = null;
@@ -2676,6 +2703,7 @@ export async function createFxEngine(options = {}) {
     const requestedSessionId = options.sessionId ?? null;
     const sessionResult = await request("libfx/new", requestedSessionId === null ? {} : { sessionId: requestedSessionId });
     sessionId = sessionResult.sessionId;
+    configOptions = Array.isArray(sessionResult.configOptions) ? sessionResult.configOptions : [];
     if (initialCheckpoint) {
       const [checkpointAttachment] = attachBytes([initialCheckpoint]);
       const restored = await request("libfx/restore", { sessionId, checkpointAttachment });
@@ -2726,6 +2754,25 @@ export async function createFxEngine(options = {}) {
   }
 
   const agent = {
+    get configOptions() { return configOptions; },
+    async setConfig(values) {
+      if (closing) throw new Error("fx agent is closed");
+      if (activeTurn) throw new Error("cannot change config while a prompt is active");
+      if (!values || typeof values !== "object" || Array.isArray(values)) {
+        throw new TypeError("config must be an object");
+      }
+      for (const [configId, value] of Object.entries(values)) {
+        if (typeof value !== "string" || value.length === 0) {
+          throw new TypeError(`config value for ${configId} must be a non-empty string`);
+        }
+        const response = await request("session/set_config_option", {
+          sessionId,
+          configId,
+          value,
+        });
+        if (Array.isArray(response?.configOptions)) configOptions = response.configOptions;
+      }
+    },
     get sessionId() {
       return sessionId;
     },
@@ -2879,6 +2926,7 @@ export async function createFxEngine(options = {}) {
       // A checkpoint being taken needs the core; it finishes first.
       await checkpointing;
       closing = true;
+      runtime.abortHostEffects({ preserveConsumed: true });
       // A journal keeps these; the next `resume()` runs them.
       for (const entry of followUps.splice(0)) entry.rejectTurn?.(new Error("fx agent closed before the follow-up ran"));
       runtime.closeStdin();

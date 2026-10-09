@@ -14,7 +14,7 @@ const agent = await createFxEngine({
   apiKey: "native-core-test-key",
   onEvent(event) { events.push(event); },
 });
-assert.deepEqual(Object.keys(agent).sort(), ["checkpoint", "close", "followUp", "prompt", "resume", "sessionId"]);
+assert.deepEqual(Object.keys(agent).sort(), ["checkpoint", "close", "configOptions", "followUp", "prompt", "resume", "sessionId", "setConfig"]);
 assert.ok((await agent.checkpoint()).length > 0);
 assert.equal(await agent.close(), undefined);
 assert.ok(events.some((event) => event.type === "runtime.ready"));

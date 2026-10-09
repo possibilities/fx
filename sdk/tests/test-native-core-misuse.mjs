@@ -47,6 +47,8 @@ for (const [name, args] of [
   ["takeCoreAttachment", []],
   ["discardCoreAttachments", []],
   ["takeCoreFetch", []],
+  ["takeCoreCodexSessionOperation", []],
+  ["finishCoreCodexSessionOperation", []],
   ["coreFetchActive", []],
   ["coreFetchDisposition", []],
   ["startCoreFetchResponse", []],

@@ -309,6 +309,7 @@ pub const ServerState = struct {
     gateway_source_preference: ?types.CredentialSource = null,
     credential_refresh_after_ms: ?i64 = null,
     account_id: ?[]u8 = null,
+    codex_account_id: ?[]u8 = null,
     gateway_team: ?[]u8 = null,
     selected_model: []u8 = &.{},
     provider: model_provider.ProviderId = .gateway,
@@ -383,6 +384,7 @@ pub const ServerState = struct {
         if (self.api_key.len > 0) secret.zeroAndFree(self.alloc, self.api_key);
         if (self.gateway_team) |team| self.alloc.free(team);
         if (self.account_id) |account_id| self.alloc.free(account_id);
+        if (self.codex_account_id) |account_id| self.alloc.free(account_id);
         if (self.selected_model.len > 0) self.alloc.free(self.selected_model);
         if (self.configured_model.len > 0) self.alloc.free(self.configured_model);
         self.permission_rules.deinit(self.alloc);
@@ -442,6 +444,16 @@ fn prepareConfiguredCredential(
             );
             return resolution.credential;
         };
+        if (provider == .codex and state.codex_account_id != null) {
+            return auth_runtime.refreshCredentialForAccountFromHome(
+                state.cfg.gateway_provider.oauth_transport,
+                alloc,
+                .chatgpt_subscription,
+                .if_needed,
+                state.codex_account_id,
+                home,
+            );
+        }
         return auth_runtime.prepareCredentialFromHome(
             alloc,
             state.cfg.gateway_provider.oauth_transport,
@@ -450,12 +462,23 @@ fn prepareConfiguredCredential(
             home,
         );
     }
-    return auth_runtime.prepareCredential(
+    if (provider == .codex and state.codex_account_id != null) {
+        return auth_runtime.refreshCredentialForAccountWithStore(
+            state.cfg.gateway_provider.oauth_transport,
+            alloc,
+            .chatgpt_subscription,
+            .if_needed,
+            state.codex_account_id,
+            state.cfg.chatgpt_session_store,
+        );
+    }
+    return auth_runtime.prepareCredentialWithStore(
         alloc,
         state.cfg.gateway_provider.oauth_transport,
         state.cfg.secret_store,
         provider,
         preferred,
+        state.cfg.chatgpt_session_store,
     );
 }
 
@@ -472,6 +495,16 @@ fn credentialReadyAt(
         return false;
     }
     return true;
+}
+
+fn ensureCodexAccountPin(state: *ServerState, credential: *const credentials.Credential) !void {
+    if (credential.source != .chatgpt_subscription) return;
+    const account_id = credential.accountId() orelse return error.ChatGptAccountChanged;
+    if (state.codex_account_id) |expected| {
+        if (!std.mem.eql(u8, expected, account_id)) return error.ChatGptAccountChanged;
+        return;
+    }
+    state.codex_account_id = try state.alloc.dupe(u8, account_id);
 }
 
 /// Transfers credential storage after the caller has stopped its prior borrowers.
@@ -514,6 +547,7 @@ pub fn selectCredentialForProvider(
     state: *ServerState,
     provider: model_provider.ProviderId,
 ) !bool {
+    if (!state.cfg.allowed_providers.contains(std.meta.activeTag(provider))) return false;
     if (state.cfg.auth_mode == .host_managed) {
         state.credential_source = .host_managed;
         state.credential_refresh_after_ms = null;
@@ -539,6 +573,7 @@ pub fn selectCredentialForProvider(
 /// Stages authorization without changing any in-flight credential storage.
 /// The caller owns a non-null credential; null retains the current authorization.
 pub fn prepareCredentialForProvider(state: *ServerState, provider: model_provider.ProviderId) !?credentials.Credential {
+    if (!state.cfg.allowed_providers.contains(std.meta.activeTag(provider))) return error.ProviderCredentialUnavailable;
     if (state.cfg.auth_mode == .host_managed) return null;
     const now_ms = io_mod.milliTimestamp();
     if (state.active_session) |active| {
@@ -564,12 +599,15 @@ pub fn prepareCredentialForProvider(state: *ServerState, provider: model_provide
             .source = .ai_gateway_api_key,
         }
     else blk: {
-        break :blk (try prepareConfiguredCredential(
+        var credential = (try prepareConfiguredCredential(
             state,
             state.alloc,
             provider,
             if (provider == .gateway) state.gateway_source_preference else state.credential_source,
         )) orelse return error.ProviderCredentialUnavailable;
+        errdefer credential.deinit(state.alloc);
+        try ensureCodexAccountPin(state, &credential);
+        break :blk credential;
     };
 }
 
@@ -578,6 +616,7 @@ test "ACP credential preparation preserves the existing borrowed credential" {
     var state: ServerState = undefined;
     state.alloc = alloc;
     state.cfg.auth_mode = .local;
+    state.cfg.allowed_providers = .initFull();
     state.cfg.credential_override = "next-token";
     state.active_session = null;
     state.credential_source = .configured;
@@ -603,6 +642,9 @@ pub fn catalogProviderFor(
     state: *const ServerState,
     provider: model_provider.ProviderId,
 ) ?@import("../core/gateway/model_catalog.zig").Provider {
+    if (state.cfg.minimal_kernel and provider == .gateway) {
+        if (state.cfg.libfx_gateway_model_catalog) |catalog| return catalog;
+    }
     return state.cfg.provider_set.select(provider).model_catalog;
 }
 
@@ -628,12 +670,13 @@ pub fn refreshModelCredential(
             home,
         )
     else
-        try auth_runtime.refreshCredentialForAccount(
+        try auth_runtime.refreshCredentialForAccountWithStore(
             state.cfg.gateway_provider.oauth_transport,
             state.alloc,
             source,
             mode,
             expected_account_id,
+            state.cfg.chatgpt_session_store,
         )) orelse return null;
     defer refreshed.deinit(state.alloc);
 
@@ -698,6 +741,7 @@ fn publishRefreshedCredential(
             }
         }
     }
+    try ensureCodexAccountPin(state, refreshed);
     adoptServerCredential(state, refreshed);
 }
 
@@ -2674,7 +2718,13 @@ fn handleInitialize(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message
         state.selected_model = startup.takeSelectedModel();
         state.process_model_override = startup.model_source == .process_override;
     }
-    state.provider = startup.provider;
+    state.provider = state.cfg.provider_override orelse startup.provider;
+    if (!state.cfg.allowed_providers.contains(std.meta.activeTag(state.provider))) {
+        return state.writer.writeError(alloc, msg.id, .{
+            .code = ErrorCode.invalid_request,
+            .message = "Selected provider was not authorized by this host",
+        });
+    }
     state.process_provider_override = config_runtime.providerEnvOverride() != null;
     state.configured_providers.deinit(alloc);
     state.configured_providers = startup.configured_providers;
@@ -2739,6 +2789,7 @@ fn handleInitialize(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message
                     credentials.missing_credential_message,
             });
         }
+        try ensureCodexAccountPin(state, credential);
         adoptServerCredential(state, credential);
     }
 
@@ -2752,7 +2803,7 @@ fn handleInitialize(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message
     state.auto_compact_percent = startup.auto_compact_percent;
     state.context_limits = startup.context_limits;
     state.context_limits.applyCommandLine(state.cfg.context_limit_overrides);
-    state.fast_mode = startup.fast_mode and
+    state.fast_mode = startup.fast_mode and state.provider.eql(startup.provider) and
         (state.cfg.model_override == null or startup.fast_mode_source != .compiled_default);
     configureUltrafastStartup(state, &startup);
     state.effort = startup.effort;
@@ -2773,7 +2824,7 @@ fn handleInitialize(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message
         }
     }
 
-    if (!state.cfg.minimal_kernel) {
+    if (!state.cfg.minimal_kernel or state.provider == .codex) {
         var catalog_cancel_flag = std.atomic.Value(bool).init(false);
         const startup_catalog = catalogProviderFor(state, state.provider) orelse
             return state.writer.writeError(alloc, msg.id, .{
@@ -2799,6 +2850,41 @@ fn handleInitialize(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message
             state.selected_model,
             state.cfg.provider_set.select(state.provider).fallbackModelCapabilities(state.selected_model),
         );
+        if (state.cfg.provider_override != null and state.cfg.provider_override.? == .codex) {
+            const entries = state.capability_resolver.catalogEntries() orelse
+                return state.writer.writeError(alloc, msg.id, .{
+                    .code = ErrorCode.invalid_request,
+                    .message = "Failed to load Codex model catalog",
+                });
+            if (entries.len == 0) {
+                return state.writer.writeError(alloc, msg.id, .{
+                    .code = ErrorCode.invalid_request,
+                    .message = "Codex provider returned no supported models",
+                });
+            }
+            var selected_available = false;
+            for (entries) |entry| {
+                if (std.mem.eql(u8, entry.id, state.selected_model)) {
+                    selected_available = true;
+                    break;
+                }
+            }
+            if (!selected_available and state.cfg.model_override != null) {
+                return state.writer.writeError(alloc, msg.id, .{
+                    .code = ErrorCode.invalid_request,
+                    .message = "Model is not available for the selected provider",
+                });
+            }
+            if (!selected_available) {
+                const selected = try alloc.dupe(u8, entries[0].id);
+                errdefer alloc.free(selected);
+                const configured = try alloc.dupe(u8, selected);
+                alloc.free(state.selected_model);
+                state.selected_model = selected;
+                alloc.free(state.configured_model);
+                state.configured_model = configured;
+            }
+        }
     }
 
     if (state.cfg.effort_override) |raw| {
@@ -3277,6 +3363,14 @@ fn handleSetConfigOption(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Me
                 });
             };
             alloc.free(previous_model);
+        } else if (state.cfg.minimal_kernel and session.writable == null) {
+            const next_model = alloc.dupe(u8, value) catch
+                return state.writer.writeError(alloc, msg.id, .{
+                    .code = ErrorCode.internal_error,
+                    .message = "Failed to update session model",
+                });
+            alloc.free(session.model);
+            session.model = next_model;
         } else commitActiveSessionModel(
             alloc,
             session,
@@ -3302,6 +3396,12 @@ fn handleSetConfigOption(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Me
             });
         const target = parsed_provider.bind(state.configured_providers) catch
             return state.writer.writeError(alloc, msg.id, .{ .code = ErrorCode.invalid_params, .message = "Unknown or changed configured provider" });
+        if (!state.cfg.allowed_providers.contains(std.meta.activeTag(target))) {
+            return state.writer.writeError(alloc, msg.id, .{
+                .code = ErrorCode.invalid_request,
+                .message = "Provider was not supplied by this host",
+            });
+        }
         const session = if (state.active_session) |*active| active else return state.writer.writeError(alloc, msg.id, .{
             .code = ErrorCode.invalid_request,
             .message = "No active session",
@@ -3321,12 +3421,21 @@ fn handleSetConfigOption(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Me
                     .source = .ai_gateway_api_key,
                 }
             else credential: {
-                break :credential (try prepareConfiguredCredential(
+                const prepared = prepareConfiguredCredential(
                     state,
                     alloc,
                     target,
                     if (target == .gateway) state.gateway_source_preference else null,
-                )) orelse
+                ) catch |err| {
+                    if (err == error.ChatGptAccountChanged) {
+                        return state.writer.writeError(alloc, msg.id, .{
+                            .code = ErrorCode.invalid_request,
+                            .message = "Codex account changed while this agent was active",
+                        });
+                    }
+                    return err;
+                };
+                break :credential prepared orelse
                     return state.writer.writeError(alloc, msg.id, .{
                         .code = ErrorCode.invalid_request,
                         .message = if (target == .codex)
@@ -3343,6 +3452,15 @@ fn handleSetConfigOption(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Me
                     .code = ErrorCode.invalid_request,
                     .message = "Credential cannot authorize the selected provider",
                 });
+            };
+            if (staged_credential) |*credential| ensureCodexAccountPin(state, credential) catch |err| {
+                if (err == error.ChatGptAccountChanged) {
+                    return state.writer.writeError(alloc, msg.id, .{
+                        .code = ErrorCode.invalid_request,
+                        .message = "Codex account changed while this agent was active",
+                    });
+                }
+                return err;
             };
             const catalog_provider = catalogProviderFor(state, target) orelse
                 return state.writer.writeError(alloc, msg.id, .{
@@ -3398,7 +3516,16 @@ fn handleSetConfigOption(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Me
                     }
                 }
             };
-            commitActiveSessionProvider(
+            if (state.cfg.minimal_kernel and session.writable == null) {
+                const next_model = alloc.dupe(u8, selected_model) catch
+                    return state.writer.writeError(alloc, msg.id, .{
+                        .code = ErrorCode.internal_error,
+                        .message = "Failed to update session provider",
+                    });
+                alloc.free(session.model);
+                session.model = next_model;
+                session.provider = target;
+            } else commitActiveSessionProvider(
                 alloc,
                 session,
                 target,
@@ -3493,6 +3620,7 @@ fn handleSetConfigOption(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Me
         try sessions.writeProviderConfigOption(
             &out.writer,
             if (state.active_session) |session| session.provider else state.provider,
+            state.cfg.allowed_providers,
             state.configured_providers.definitions,
         );
         try out.writer.writeAll(",");
@@ -4652,6 +4780,7 @@ test "ACP publishes an account-bound refreshed Codex token for later prompts" {
     state.credential_source = .chatgpt_subscription;
     state.credential_refresh_after_ms = 1;
     state.gateway_team = null;
+    state.codex_account_id = null;
     var active: ActiveSessionState = undefined;
     active.v2 = null;
     active.api_key = state.api_key;
@@ -4700,6 +4829,7 @@ test "ACP rejects refreshed Codex tokens for another account" {
     state.credential_source = .chatgpt_subscription;
     state.credential_refresh_after_ms = 1;
     state.gateway_team = null;
+    state.codex_account_id = null;
     state.active_session = null;
     defer {
         secret.zeroAndFree(alloc, state.api_key);

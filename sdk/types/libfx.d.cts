@@ -429,6 +429,8 @@ export type FxFollowUp = Promise<FxEngineTurn> & { readonly id: string; readonly
 
 /** One conversation held in the memory of the process that runs it, with no queue and no session store. */
 export interface FxEngine {
+  readonly configOptions: readonly FxConfigOption[];
+  setConfig(values: Readonly<Record<string, string>>): Promise<void>;
   /** The id the engine uses for AI Gateway session affinity and prompt caching. */
   readonly sessionId: string;
   /** Starts a turn. Only one top-level prompt may run at a time. */
@@ -459,9 +461,24 @@ export type FxEngineStorage =
   };
 
 /** Options for `createFxEngine()`. */
-export type FxEngineOptions = FxSharedOptions<FxEngineEvent> & FxModelChoice & FxEngineStorage & {
-  /** The AI Gateway credential. Required. */
+export interface FxGatewayAuthorization {
+  provider: "gateway";
   apiKey: string;
+}
+
+export interface FxConfigOption {
+  id: string;
+  name: string;
+  type: string;
+  currentValue: string;
+  options: readonly { value: string; name: string }[];
+}
+
+export type FxGatewayCredentials =
+  | { apiKey: string; auth?: FxGatewayAuthorization | readonly [FxGatewayAuthorization] }
+  | { apiKey?: string; auth: FxGatewayAuthorization | readonly [FxGatewayAuthorization] };
+
+export type FxEngineOptions = FxSharedOptions<FxEngineEvent> & FxModelChoice & FxEngineStorage & FxGatewayCredentials & {
   /** The id for AI Gateway session affinity: 1 to 255 letters, digits, `.`, `_`, or `-`. Give a restored session the id it had before. */
   sessionId?: string | null;
 };
@@ -491,14 +508,7 @@ export declare function memory(options?: MemoryOptions): Durability;
 // Durable agents
 
 /** Options for `createFxAgent()`. */
-export type FxAgentOptions = FxSharedOptions<FxAgentEvent> & FxModelChoice & {
-  /** The AI Gateway credential. Without it, libfx uses `AI_GATEWAY_API_KEY`, then on Vercel the deployment's OIDC token. */
-  apiKey?: string | undefined;
-  /** Where sessions live. Without it, libfx picks one from the environment. */
-  durability?: Durability | undefined;
-  /** Checkpoint bytes the agent's new sessions start from. */
-  checkpoint?: FxBytes;
-};
+export type FxAgentOptions = FxEngineOptions;
 
 /** Options for `agent.session()`. Each applies to the turns this session object starts. */
 export interface FxSessionOptions {
@@ -610,23 +620,7 @@ export interface FxSession {
   checkpoint(): Promise<Uint8Array>;
 }
 
-/** An agent: the configuration its sessions run under. Create one per server and open a session per conversation. */
-export interface FxAgent {
-  /** Opens the session `id`, or starts a new one without it. Any other value, `null` included, throws. */
-  session(id?: string, options?: FxSessionOptions): FxSession;
-  /** An id for a new session, before its first prompt. */
-  newSessionId(): Promise<string>;
-  /** The id of the session `agent.prompt()` uses, once known. */
-  readonly sessionId: string | null;
-  /** Prompts a session the agent opens for itself, for code that holds one conversation. */
-  prompt(input: FxSessionPromptInput, options?: FxPromptOptions): FxTurn;
-  /** The history of the session `agent.prompt()` uses, as opaque bytes. */
-  checkpoint(): Promise<Uint8Array>;
-  /** The request handler a deployment mounts for queue deliveries. */
-  wakeHandler(): (request: Request) => Promise<Response>;
-  /** Waits for the turns this process is running, then lets their sessions go. */
-  close(): Promise<void>;
-}
+export type FxAgent = FxEngine;
 
 // ---------------------------------------------------------------------------
 // Backend diagnostics (Node.js)

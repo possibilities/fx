@@ -41,7 +41,7 @@ try {
     gatewayChatUrl: `http://127.0.0.1:${port}/chat`,
     model: "minimal/model",
   });
-  assert.deepEqual(Object.keys(agent).sort(), ["checkpoint", "close", "followUp", "prompt", "resume", "sessionId"]);
+  assert.deepEqual(Object.keys(agent).sort(), ["checkpoint", "close", "configOptions", "followUp", "prompt", "resume", "sessionId", "setConfig"]);
   const turn = agent.prompt("hello");
   let text = "";
   let reasoning = "";

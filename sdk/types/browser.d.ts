@@ -16,7 +16,6 @@ export {
   FxJournalVersionError,
   fxSdkApiVersion,
   listModels,
-  memory,
   supportsJspi,
   xtermAdapter,
 } from "./libfx.cjs";
@@ -109,11 +108,7 @@ export type FxBrowserEngineOptions = FxEngineOptions & FxBrowserBackendOptions;
 /** Options for `createFxTerminal()` in browsers. */
 export type FxBrowserTerminalOptions = FxTerminalOptions & FxBrowserBackendOptions;
 
-/**
- * An agent whose sessions live in this page unless `durability` says
- * otherwise. It returns at once and does no I/O until a session runs a turn.
- */
-export declare function createFxAgent(options?: FxBrowserAgentOptions): FxAgent;
+export declare function createFxAgent(options: FxBrowserAgentOptions): Promise<FxAgent>;
 
 /** One fx session on WebAssembly, with no durability of its own. `apiKey` is required. */
 export declare function createFxEngine(options: FxBrowserEngineOptions): Promise<FxEngine>;
@@ -122,4 +117,4 @@ export declare function createFxEngine(options: FxBrowserEngineOptions): Promise
 export declare function createFxTerminal(options: FxBrowserTerminalOptions): Promise<FxTerminal>;
 
 /** The version of the libfx agent API. */
-export declare const libfxApiVersion: 2;
+export declare const libfxApiVersion: 3;

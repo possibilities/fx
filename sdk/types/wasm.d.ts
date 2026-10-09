@@ -86,6 +86,7 @@ export type FxWasmTerminalOptions = FxTerminalOptions & {
 
 /** One session on one fx core, with no durability of its own. Requires JSPI. */
 export declare function createFxEngine(options: FxWasmEngineOptions): Promise<FxEngine>;
+export declare const createFxAgent: typeof createFxEngine;
 
 /** The interactive terminal harness on WebAssembly. Requires JSPI. */
 export declare function createFxTerminal(options: FxWasmTerminalOptions): Promise<FxTerminal>;

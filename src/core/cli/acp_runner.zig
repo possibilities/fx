@@ -1,8 +1,11 @@
 const std = @import("std");
 const types = @import("../shared/types.zig");
+const chatgpt_session = @import("../auth/chatgpt_session.zig");
 const config_runtime = @import("../config/config_runtime.zig");
 const process_provider = @import("../execution/process_provider.zig");
+const model_provider = @import("../config/model_provider.zig");
 const gateway_provider = @import("../gateway/gateway_provider.zig");
+const model_catalog = @import("../gateway/model_catalog.zig");
 const provider_set = @import("../gateway/provider_set.zig");
 const host = @import("../hosts/host.zig");
 const host_attachments = @import("../hosts/host_attachments.zig");
@@ -24,6 +27,7 @@ pub const Config = struct {
     gateway_models_path: []const u8,
     gateway_provider: gateway_provider.Provider,
     provider_set: provider_set.Set,
+    libfx_gateway_model_catalog: ?model_catalog.Provider = null,
     process_provider: process_provider.Provider = process_provider.unavailable_provider,
     secret_store: host.SecretStore,
     prompt_policy: prompt_policy.Policy,
@@ -38,6 +42,8 @@ pub const Config = struct {
     context_registry: context_contract.Registry,
     mode_registry: mode_registry.Registry,
     model_override: ?[]const u8 = null,
+    provider_override: ?model_provider.ProviderId = null,
+    allowed_providers: std.EnumSet(std.meta.Tag(model_provider.ProviderId)) = .initFull(),
     /// Raw reasoning-effort override using the kernel's ReasoningEffort.parse
     /// vocabulary. Borrowed; must outlive the server run.
     effort_override: ?[]const u8 = null,
@@ -48,6 +54,7 @@ pub const Config = struct {
     /// untouched.
     ultrafast_override: ?bool = null,
     credential_override: ?[]const u8 = null,
+    chatgpt_session_store: chatgpt_session.Store = chatgpt_session.default_store,
     home_override: ?[]const u8 = null,
     workspace_root_override: ?[]const u8 = null,
     log_file: ?[]const u8 = null,

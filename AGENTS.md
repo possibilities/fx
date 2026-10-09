@@ -10,9 +10,14 @@ Before reporting the work as ready:
 
 1. Build succeeds.
 2. Focused tests for the changed path pass locally.
-3. **CI** passes for the exact current commit, including the **macOS arm64** check. See **CI on Pull Requests**.
+3. The fxnk Local development gate passes on the current worktree.
 4. Run the built binary locally and drive at least one real interaction that exercises the change end to end.
 5. Confirm the process did not abort, stderr is clean, and the behavior matches what you are about to tell the user.
+
+This is the maintained downstream fork. `integration` is its development and
+installation branch; `main` remains an exact upstream mirror. Hosted Full CI is
+nonblocking observability and never authorizes or prevents a downstream merge,
+publication, or install.
 
 If you cannot run the binary in your environment, say so explicitly and ask the user to verify. Do not silently skip this step and declare the work ready. "The tests pass" is not a substitute for running the app.
 
@@ -37,6 +42,7 @@ Build and test commands:
 ```bash
 zig build          # build the binary
 zig build test     # run all unit tests
+zig build test-fxnk -Doptimize=ReleaseSafe # narrow downstream unit canaries
 zig build run      # build and run
 zig fmt src/       # format all source files
 ```
@@ -216,7 +222,10 @@ Do not bypass the permission system for new tools.
 
 * Zig unit tests go inside the source file they test, using `test "description" { ... }` blocks.
 
-* Run the narrowest relevant tests while developing. The complete `zig build test` suite runs in ReleaseSafe in **CI** after the feature branch is pushed, and it must pass before the draft PR is marked ready.
+* Run the narrowest relevant tests while developing. Downstream work also runs
+  `zig build test-fxnk -Doptimize=ReleaseSafe` through the fxnk Local
+  development gate. The complete `zig build test` suite is hosted
+  observability, not a downstream shipping requirement.
 
 * Use `std.testing.expect`, `std.testing.expectEqual`, `std.testing.expectEqualStrings` for assertions.
 
@@ -250,47 +259,30 @@ cd tests/e2e && bun test tui-*.test.ts               # just TUI tests (requires 
 
 TUI tests use tmux to drive the interactive terminal. They require `tmux` to be installed.
 
-## Pull Request Classification
+## Downstream Fork Workflow
 
-Every pull request must have exactly one `type:` label before it merges, chosen by its primary intent:
+Regular maintenance does not open, update, or support upstream pull requests.
+Existing requests are historical evidence only, and their branches are not
+development or publication targets.
 
-* `type: bug`: fixes incorrect behavior
+Develop each carried feature on its durable `carry/<feature>` branch in a
+dedicated worktree, based on the exact current `main` mirror or a declared
+carry dependency. Do not work in the bound checkout or put downstream commits
+on `main`. Run focused checks in the carry worktree, compose every current
+carry into a clean candidate, then run before publishing any affected carry:
 
-* `type: feature`: adds a new user-facing capability
+```bash
+/Users/arthack/workshops/fxnk/scripts/local-gate.sh --worktree "$composition_worktree"
+```
 
-* `type: improvement`: improves existing user-facing behavior
-
-* `type: docs`: changes documentation only
-
-* `type: maintenance`: changes internal tooling, dependencies, CI, or implementation structure without a user-facing behavior change
-
-* `type: release`: prepares or repairs a release
-
-* `type: security`: fixes or hardens a security boundary
-
-If the authenticated contributor can manage labels on `vercel-labs/fx`, which takes triage access or higher, assign the label when the PR is opened and keep it accurate when the PR changes. For a mixed PR, choose the label that describes the primary reason the PR exists. If that is ambiguous, ask before applying or changing the label. Outside contributors cannot manage labels, so their pull requests do not need one when opened: a maintainer applies it during review. Do not hold an outside contributor's PR in draft for a missing label.
-
-Keep PR titles as clean imperative sentences, such as `Restore feedback report file clipboard`. Do not add bracketed prefixes such as `[bug]`, `[feature]`, or `[improvement]`. Type belongs in the label, not the title.
-
-## CI on Pull Requests
-
-Do not run the complete deterministic test suite locally as the default development loop. Run the focused test for the changed path, build the binary, and exercise that path with `./zig-out/bin/fx`.
-
-After the focused checks pass, create a clean checkpoint commit, push the non-`main` feature branch, and open a draft PR immediately. Linux is the gate for every change because most fx behavior is identical on every platform:
-
-* `.github/workflows/ci.yml` runs on Linux x86_64. It checks formatting, the PGSO corpus, the public surface, and the compactor boundary, then runs the ReleaseSafe unit tests. It builds fx once, smoke-tests it, and shares that binary with four duration-balanced E2E shards and the MCP conformance baseline. Checked-in weights assign every E2E file to exactly one shard, and files inside each shard run sequentially in separate Bun processes so terminal fixtures and process state cannot leak between files. A failed file receives one retry after its tmux server is reset. A file that passes only on retry gets a warning annotation; investigate it as a possible race. The SDK jobs build WASM and the Node-API addons once and run the complete package qualification. `Build & Test` passes only when the unit tests and every SDK job pass, because Publish libfx relies on that result instead of qualifying the package again.
-* `.github/workflows/binary-size.yml` builds each release target on its native runner, reports the size change, and smoke-tests every target's binary. See **Binary Size Observability**.
-* `.github/workflows/bench.yml` enforces the startup latency budget. See **Benchmarks**.
-
-Linux jobs install Zig through `.github/actions/setup-zig`, which restores the Zig cache that runs on `main` save with `.github/actions/save-zig-cache`. Pull requests never save a Zig cache through these actions, so they cannot push `main`'s entries out of the repository's cache quota. The PGSO workflow keeps its own cache through `.github/actions/setup-pgso`.
-
-macOS runs only when a change can behave differently there. `.github/workflows/macos.yml` uses `scripts/detect-macos-need.sh` to check the diff. The macOS arm64 unit tests and the E2E files in `tests/e2e/macos-platform-tests.json` run when the change touches a Zig file with a macOS, BSD, or Linux code path, `build.zig`, the macOS signing script, the native SDK addon, a listed E2E file, a shared E2E helper that reads the platform, or the macOS checks themselves. A Linux-only branch counts because macOS takes its other path; a Windows-only branch does not. The listed E2E files run in two weighted shards that share one macOS build. Native SDK addon changes also build and load the addon on macOS. If the detector cannot read the change, the `macOS arm64` check fails instead of passing. To request macOS for any other change, add the `ci:macos` label or run `gh workflow run macos.yml --ref <branch>`. The label needs triage access and the dispatch needs write access, so an outside contributor asks in the PR and a maintainer starts the run. When the change does not need macOS, the `macOS arm64` check passes without starting a macOS runner. Every E2E file that branches on `process.platform` or `platform()` being `darwin` or `linux` must appear in `tests/e2e/macos-platform-tests.json`, and `tests/e2e/ci-shards.test.ts` enforces that.
-
-The macOS arm64 PGSO workflow runs on a pull request only when the PGSO pipeline changes: `scripts/pgso/` other than `corpus.json`, the `setup-pgso` action, or `.github/workflows/pgso-macos-arm64.yml`. To qualify any other change, run `gh workflow run pgso-macos-arm64.yml --ref <branch>`. The stable release always runs it.
-
-Live model evals and the live ACP suite need credentials and are not deterministic, so they run only on request. Run the live ACP suite with `gh workflow run ci.yml --ref <branch> -f acp_live=true`.
-
-A CI result is valid only when it belongs to the exact current commit and `Build & Test`, `E2E (deterministic)`, `Shellcheck`, `Startup Latency`, and `macOS arm64` all succeed. Do not mark the draft PR ready or request review from a stale, partial, queued, cancelled, skipped, or failed run. If CI fails, make the smallest repair, rerun the focused local proof, push the new commit to the same draft PR, and wait for CI on the new exact commit. After CI passes, run the final ship gate and mark the PR ready only when it reports `SHIP` for that exact commit.
+The gate builds ReleaseSafe, runs narrow carried-unit canaries and focused
+macOS-arm64 integration tests, exercises `./zig-out/bin/fx`, and explicitly
+classifies the known fragile terminal probes. A failure outside the declared
+quarantine blocks. Publish the proved carry heads and exact Integration
+composition together under leases.
+The fxnk Workshop records and verifies the exact Integration SHA before
+publication and installation. Full CI can continue after publication as late
+cross-platform observability, but nobody waits for it to ship.
 
 ## Reproducing Render Bugs
 
@@ -468,10 +460,13 @@ The canonical repository is `vercel-labs/fx` on GitHub. All URLs, links, and ref
 
 * Do not report work as ready without running the binary. See **Declaring Work Ready**.
 
-## Before Marking a PR Ready
+## Before Merging to Integration
 
-1. Run `zig fmt --check src/` and the focused tests for the changed path.
-2. Build and exercise the change locally with `./zig-out/bin/fx`.
-3. Push a clean checkpoint commit and open a draft PR immediately.
-4. Require **CI**, including the **macOS arm64** check, and the final ship gate to pass on the exact current commit.
-5. Update docs if behavior changed.
+1. Run the focused tests for the changed path.
+2. Compose every current carry head into a clean Integration candidate.
+3. Run `/Users/arthack/workshops/fxnk/scripts/local-gate.sh --worktree "$PWD"` from that exact
+   composition worktree.
+4. Exercise the composition locally with the freshly built `./zig-out/bin/fx`.
+5. Commit the clean result and publish affected carries with Integration under
+   exact leases.
+6. Update docs if behavior changed.
